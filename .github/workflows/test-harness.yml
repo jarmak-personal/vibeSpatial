@@ -1,0 +1,47 @@
+name: Test Harness
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_gpu:
+        description: "Run the manual GPU smoke job on a self-hosted NVIDIA runner"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  cpu-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --group dev
+      - name: Validate docs
+        run: uv run python scripts/check_docs.py --check
+      - name: Run smoke tests
+        run: uv run pytest tests/test_geopandas_shim.py tests/test_runtime_harness.py tests/test_intake_v2.py tests/upstream/geopandas/tests/test_config.py
+
+  gpu-smoke:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu }}
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - gpu
+      - nvidia
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Sync dependencies
+        run: uv sync --group dev
+      - name: Run GPU harness smoke
+        run: uv run pytest --run-gpu tests/test_runtime_harness.py -m gpu

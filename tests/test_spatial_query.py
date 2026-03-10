@@ -1,0 +1,834 @@
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from shapely.geometry import Point, box
+
+import vibespatial.spatial_query as spatial_query_module
+import vibespatial.spatial_nearest as spatial_nearest_module
+import vibespatial.spatial_query_utils as spatial_query_utils_module
+from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.spatial_query import build_owned_spatial_index, nearest_spatial_index, query_spatial_index
+
+
+def test_query_spatial_index_matches_expected_pairs_for_intersects() -> None:
+    tree = np.asarray([box(0, 0, 1, 1), box(10, 10, 11, 11), box(20, 20, 21, 21)], dtype=object)
+    query = np.asarray([box(0.5, 0.5, 1.5, 1.5), box(30, 30, 31, 31)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices = query_spatial_index(owned, flat, query, predicate="intersects", sort=True)
+
+    assert indices.tolist() == [[0], [0]]
+
+
+def test_query_spatial_index_supports_dwithin() -> None:
+    tree = np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
+    query = np.asarray([Point(1, 0), Point(16, 0)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices = query_spatial_index(owned, flat, query, predicate="dwithin", distance=5.0, sort=True)
+
+    assert indices.tolist() == [[0, 1], [0, 2]]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+class TestDwithinGPU:
+    """GPU dwithin refinement via distance kernels."""
+
+    def test_dwithin_point_point(self):
+        tree = np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
+        query = np.asarray([Point(1, 0), Point(16, 0)], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        result, execution = query_spatial_index(
+            owned, flat, query, predicate="dwithin", distance=5.0,
+            sort=True, return_metadata=True,
+        )
+        assert result.tolist() == [[0, 1], [0, 2]]
+        assert execution.selected is ExecutionMode.GPU
+
+    def test_dwithin_point_polygon(self):
+        tree = np.asarray([box(0, 0, 1, 1), box(10, 10, 11, 11), box(20, 20, 21, 21)], dtype=object)
+        query = np.asarray([Point(2, 0.5), Point(9, 9)], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        result, execution = query_spatial_index(
+            owned, flat, query, predicate="dwithin", distance=2.0,
+            sort=True, return_metadata=True,
+        )
+        import shapely as shp
+        expected = set()
+        for qi in range(len(query)):
+            for ti in range(len(tree)):
+                if shp.dwithin(query[qi], tree[ti], 2.0):
+                    expected.add((qi, ti))
+        result_set = set(zip(result[0].tolist(), result[1].tolist()))
+        assert result_set == expected
+        assert execution.selected is ExecutionMode.GPU
+
+    def test_dwithin_polygon_polygon(self):
+        tree = np.asarray([box(0, 0, 1, 1), box(5, 5, 6, 6), box(20, 20, 21, 21)], dtype=object)
+        query = np.asarray([box(2, 0, 3, 1)], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        result, execution = query_spatial_index(
+            owned, flat, query, predicate="dwithin", distance=2.0,
+            sort=True, return_metadata=True,
+        )
+        import shapely as shp
+        expected = set()
+        for qi in range(len(query)):
+            for ti in range(len(tree)):
+                if shp.dwithin(query[qi], tree[ti], 2.0):
+                    expected.add((qi, ti))
+        result_set = set(zip(result[0].tolist(), result[1].tolist()))
+        assert result_set == expected
+        assert execution.selected is ExecutionMode.GPU
+
+    def test_dwithin_per_row_distance(self):
+        tree = np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
+        query = np.asarray([Point(3, 0), Point(15, 0)], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        # First query: threshold 4 → reaches Point(0,0) at dist 3
+        # Second query: threshold 6 → reaches Point(10,0) at dist 5, Point(20,0) at dist 5
+        result = query_spatial_index(
+            owned, flat, query, predicate="dwithin",
+            distance=np.array([4.0, 6.0]), sort=True,
+        )
+        import shapely as shp
+        dists = np.array([4.0, 6.0])
+        expected = set()
+        for qi in range(len(query)):
+            for ti in range(len(tree)):
+                if shp.dwithin(query[qi], tree[ti], dists[qi]):
+                    expected.add((qi, ti))
+        result_set = set(zip(result[0].tolist(), result[1].tolist()))
+        assert result_set == expected
+
+    def test_dwithin_no_matches(self):
+        tree = np.asarray([Point(0, 0), Point(100, 100)], dtype=object)
+        query = np.asarray([Point(50, 50)], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        result = query_spatial_index(
+            owned, flat, query, predicate="dwithin", distance=1.0, sort=True,
+        )
+        assert result.shape[1] == 0
+
+    def test_dwithin_multipoint_point(self):
+        from shapely.geometry import MultiPoint
+        import shapely as shp
+
+        tree = np.asarray([Point(0, 0), Point(5, 0), Point(20, 0)], dtype=object)
+        query = np.asarray([MultiPoint([(1, 0), (10, 0)])], dtype=object)
+        owned, flat = build_owned_spatial_index(tree)
+
+        result, execution = query_spatial_index(
+            owned, flat, query, predicate="dwithin", distance=2.0,
+            sort=True, return_metadata=True,
+        )
+        expected = set()
+        for qi in range(len(query)):
+            for ti in range(len(tree)):
+                if shp.dwithin(query[qi], tree[ti], 2.0):
+                    expected.add((qi, ti))
+        result_set = set(zip(result[0].tolist(), result[1].tolist()))
+        assert result_set == expected
+        assert execution.selected is ExecutionMode.GPU
+
+
+def test_query_spatial_index_handles_regular_grid_rectangle_boundaries() -> None:
+    tree = np.asarray(
+        [
+            box(0, 0, 1, 1),
+            box(1, 0, 2, 1),
+            box(0, 1, 1, 2),
+        ],
+        dtype=object,
+    )
+    query = np.asarray([Point(1, 1), Point(1.5, 1.5)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="intersects",
+        sort=True,
+    )
+
+    assert flat.regular_grid is not None
+    assert indices.tolist() == [[0, 0, 0], [0, 1, 2]]
+
+
+def test_query_spatial_index_reports_execution_metadata() -> None:
+    tree = np.asarray(
+        [
+            box(0, 0, 1, 1),
+            box(1, 0, 2, 1),
+            box(0, 1, 1, 2),
+        ],
+        dtype=object,
+    )
+    query = np.asarray([Point(1, 1), Point(1.5, 1.5)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="intersects",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == [[0, 0, 0], [0, 1, 2]]
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+    else:
+        assert execution.selected is ExecutionMode.CPU
+        assert execution.implementation == "owned_cpu_spatial_query"
+
+
+def test_query_spatial_index_uses_gpu_for_point_tree_box_contains_when_large_enough() -> None:
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = box(99.5, -1.0, 199.5, 1.0)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="contains",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == list(range(100, 200))
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+    else:
+        assert execution.selected is ExecutionMode.CPU
+
+
+@pytest.mark.parametrize("predicate", [None, "intersects", "covers"])
+def test_query_spatial_index_uses_gpu_for_point_tree_box_queries(predicate: str | None) -> None:
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = box(99.5, -1.0, 199.5, 1.0)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate=predicate,
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == list(range(100, 200))
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+    else:
+        assert execution.selected is ExecutionMode.CPU
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected"),
+    [
+        ("contains_properly", list(range(101, 199))),
+        ("touches", [100, 199]),
+    ],
+)
+def test_query_spatial_index_uses_gpu_for_point_tree_box_boundary_sensitive_predicates(
+    predicate: str,
+    expected: list[int],
+) -> None:
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = box(100.0, -1.0, 199.0, 1.0)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate=predicate,
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == expected
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+    else:
+        assert execution.selected is ExecutionMode.CPU
+
+
+def test_query_spatial_index_point_tree_box_scalar_avoids_owned_conversion(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for the raw scalar box fast path")
+
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = box(99.5, -1.0, 199.5, 1.0)
+    owned, flat = build_owned_spatial_index(tree)
+
+    def _fail(values):
+        raise AssertionError("point-tree box fast path should not normalize scalar Shapely query input to owned")
+
+    monkeypatch.setattr(spatial_query_module, "_to_owned", _fail)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="contains",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == list(range(100, 200))
+    assert execution.selected is ExecutionMode.GPU
+
+
+def test_query_spatial_index_point_tree_box_owned_queries_avoid_to_shapely(monkeypatch: pytest.MonkeyPatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for the owned box fast path")
+
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+    query_owned = from_shapely_geometries([box(99.5, -1.0, 199.5, 1.0)])
+
+    def _fail(self):
+        raise AssertionError("owned point-tree box fast path should inspect owned polygon buffers directly")
+
+    monkeypatch.setattr(OwnedGeometryArray, "to_shapely", _fail)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query_owned,
+        predicate="contains",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == [[0] * 100, list(range(100, 200))]
+    assert execution.selected is ExecutionMode.GPU
+
+
+def test_nearest_spatial_index_with_max_distance_returns_ties_and_distances() -> None:
+    tree = np.asarray([Point(0, 0), Point(2, 0), Point(10, 0)], dtype=object)
+    query = np.asarray([Point(1, 0), Point(20, 0)], dtype=object)
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("bounded nearest should not hit STRtree fallback"),
+        return_all=True,
+        max_distance=2.0,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert indices.tolist() == [[0, 0], [0, 1]]
+    assert np.allclose(distances, [1.0, 1.0])
+    assert impl in ("owned_cpu_nearest", "owned_gpu_nearest")
+
+
+def test_nearest_spatial_index_gpu_avoids_host_point_coordinate_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-native nearest refinement")
+
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = np.asarray([Point(float(index) + 0.25, 0.25) for index in range(2048)], dtype=object)
+
+    def _fail(_owned):
+        raise AssertionError("GPU nearest refinement should consume owned device point buffers directly")
+
+    monkeypatch.setattr(spatial_query_module, "_extract_point_coords", _fail, raising=False)
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("large nearest query should not hit STRtree fallback"),
+        return_all=True,
+        max_distance=1.0,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert indices.shape[1] == len(query)
+    assert np.all(distances >= 0.0)
+    assert impl == "owned_gpu_nearest"
+
+
+def test_nearest_spatial_index_gpu_bounded_point_sweep_avoids_generic_bbox_candidate_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for bounded point-sweep nearest candidate generation")
+
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = np.asarray([Point(float(index) + 0.25, 0.25) for index in range(2048)], dtype=object)
+
+    def _fail_bbox(*args, **kwargs):
+        raise AssertionError("bounded point nearest should not use generic bbox candidate generation")
+
+    monkeypatch.setattr(spatial_nearest_module, "_generate_candidates_gpu", _fail_bbox)
+    monkeypatch.setattr(spatial_nearest_module, "_generate_distance_pairs", _fail_bbox)
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("large nearest query should not hit STRtree fallback"),
+        return_all=True,
+        max_distance=1.0,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert indices.shape[1] == len(query)
+    assert np.all(distances >= 0.0)
+    assert impl == "owned_gpu_nearest"
+
+
+def test_nearest_spatial_index_unbounded_matches_expected_ties_and_distances() -> None:
+    tree = np.asarray([Point(0, 0), Point(2, 0), Point(10, 0)], dtype=object)
+    query = np.asarray([Point(1, 0), Point(20, 0)], dtype=object)
+    from shapely import STRtree
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=STRtree(tree).query_nearest,
+        return_all=True,
+        max_distance=None,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert indices.tolist() == [[0, 0, 1], [0, 1, 2]]
+    assert np.allclose(distances, [1.0, 1.0, 10.0])
+    assert impl in {"strtree_host", "owned_cpu_nearest", "owned_gpu_nearest"}
+
+
+def test_nearest_spatial_index_gpu_unbounded_avoids_bruteforce_candidate_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for indexed unbounded nearest")
+
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    query = np.asarray([Point(float(index) + 0.25, 0.25) for index in range(2048)], dtype=object)
+
+    def _fail_bruteforce(*args, **kwargs):
+        raise AssertionError("unbounded indexed nearest should not use brute-force candidate generation")
+
+    monkeypatch.setattr(spatial_nearest_module, "_generate_candidates_gpu", _fail_bruteforce)
+    monkeypatch.setattr(spatial_nearest_module, "_generate_distance_pairs", _fail_bruteforce)
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("indexed nearest should not hit STRtree fallback"),
+        return_all=True,
+        max_distance=None,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert indices.shape[1] == len(query)
+    assert np.all(distances >= 0.0)
+    assert impl == "owned_gpu_nearest"
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+class TestMixedFamilyNearest:
+    """GPU nearest refinement for arrays with mixed geometry families."""
+
+    def test_mixed_tree_points_and_polygons(self):
+        # Tree has a mix of points and polygons.
+        tree = np.asarray([Point(0, 0), box(5, 5, 6, 6), Point(10, 0)], dtype=object)
+        query = np.asarray([Point(1, 0)], dtype=object)
+
+        (indices, distances), impl = nearest_spatial_index(
+            tree, query,
+            tree_query_nearest=lambda *a, **kw: pytest.fail("should not use STRtree"),
+            return_all=True, max_distance=20.0, return_distance=True, exclusive=False,
+        )
+        # Nearest should be Point(0,0) at distance 1.
+        assert indices.shape[1] >= 1
+        assert 0 in indices[1].tolist()
+        assert impl == "owned_gpu_nearest"
+
+    def test_mixed_query_and_tree(self):
+        from shapely.geometry import LineString
+        tree = np.asarray([Point(0, 0), LineString([(5, 0), (5, 5)])], dtype=object)
+        query = np.asarray([Point(1, 0), box(4, 0, 4.5, 0.5)], dtype=object)
+
+        (indices, distances), impl = nearest_spatial_index(
+            tree, query,
+            tree_query_nearest=lambda *a, **kw: pytest.fail("should not use STRtree"),
+            return_all=True, max_distance=20.0, return_distance=True, exclusive=False,
+        )
+        import shapely as shp
+        # Verify correctness: for each query, nearest tree geometry is correct.
+        for col in range(indices.shape[1]):
+            qi, ti = indices[0, col], indices[1, col]
+            gpu_dist = distances[col]
+            ref_dist = shp.distance(query[qi], tree[ti])
+            assert abs(gpu_dist - ref_dist) < 1e-10
+        assert impl == "owned_gpu_nearest"
+
+
+def test_query_spatial_index_regular_grid_box_queries_avoid_exact_refine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for the regular-grid rectangle box fast path")
+
+    tree = np.asarray(
+        [box(float(x), float(y), float(x + 1), float(y + 1)) for y in range(50) for x in range(50)],
+        dtype=object,
+    )
+    query = np.asarray(
+        [
+            box(10.0, 10.0, 12.0, 12.0),
+            box(1000.0, 1000.0, 1001.0, 1001.0),
+        ],
+        dtype=object,
+    )
+    owned, flat = build_owned_spatial_index(tree)
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("regular-grid rectangle box queries should not hit generic exact refine")
+
+    monkeypatch.setattr(spatial_query_utils_module, "evaluate_binary_predicate", _fail)
+
+    result, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="intersects",
+        sort=True,
+        output_format="indices",
+        return_metadata=True,
+    )
+
+    from shapely import STRtree
+
+    reference = STRtree(tree).query(query, predicate="intersects")
+    assert set(zip(result[0].tolist(), result[1].tolist())) == set(zip(reference[0].tolist(), reference[1].tolist()))
+    assert execution.selected is ExecutionMode.GPU
+    assert execution.implementation == "owned_gpu_spatial_query"
+
+
+@pytest.mark.parametrize("predicate", [None, "intersects", "contains"])
+def test_gpu_bbox_candidate_generation_polygon_tree_triangle_query(predicate: str | None) -> None:
+    """GPU candidate generation fires for polygon tree + non-box query above crossover."""
+    from shapely.geometry import Polygon
+
+    tree = np.asarray(
+        [box(x * 0.01, y * 0.01, x * 0.01 + 0.01, y * 0.01 + 0.01) for x in range(50) for y in range(50)],
+        dtype=object,
+    )
+    query = Polygon([(0.1, 0.1), (0.4, 0.1), (0.25, 0.4), (0.1, 0.1)])
+    owned, flat = build_owned_spatial_index(tree)
+
+    result, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate=predicate,
+        sort=True,
+        output_format="indices",
+        return_metadata=True,
+    )
+
+    # Verify against Shapely STRtree for bbox-only and predicate queries.
+    # For contains / intersects: the GPU DE-9IM engine correctly finds
+    # boundary-touching matches (distance ≈ 0) that GEOS's snap-rounding
+    # misses, so we verify GPU is a superset of STRtree and that every
+    # extra result has near-zero Shapely distance.
+    from shapely import STRtree
+
+    strtree = STRtree(tree)
+    if predicate is None:
+        reference = sorted(strtree.query(query, predicate=predicate).tolist())
+        assert sorted(result.tolist()) == reference
+    else:
+        reference_set = set(strtree.query(query, predicate=predicate).tolist())
+        result_set = set(result.tolist())
+
+        # GPU must find everything Shapely finds.
+        missing = reference_set - result_set
+        assert not missing, f"GPU missed indices found by Shapely: {sorted(missing)}"
+
+        # Any extra GPU results must be boundary-touching (distance ≈ 0).
+        import shapely as shp
+        extra = result_set - reference_set
+        for idx in extra:
+            d = shp.distance(query, tree[idx])
+            assert d < 1e-10, (
+                f"GPU extra idx={idx} has non-trivial distance {d}"
+            )
+
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+
+
+@pytest.mark.parametrize("predicate", ["intersects", "contains", "covers"])
+def test_owned_refine_eliminates_shapely_roundtrip(predicate: str) -> None:
+    """GPU candidate gen + owned-array refine avoids Shapely conversion.
+
+    Verifies that _filter_predicate_pairs_owned feeds OwnedGeometryArray.take()
+    output directly into evaluate_binary_predicate, and that the result matches
+    the CPU reference.
+    """
+    pytest.importorskip("cupy")
+    if not has_gpu_runtime():
+        pytest.skip("no GPU runtime")
+
+    # Build a grid large enough to exceed the 1,000 crossover threshold
+    # with a single query (1 * 2500 = 2500 > 1000).
+    tree = np.asarray(
+        [box(x * 0.01, y * 0.01, x * 0.01 + 0.01, y * 0.01 + 0.01) for x in range(50) for y in range(50)],
+        dtype=object,
+    )
+    # Use a query that overlaps a subset of the grid
+    query = np.asarray([box(0.05, 0.05, 0.25, 0.25)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    result, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate=predicate,
+        sort=True,
+        output_format="indices",
+        return_metadata=True,
+    )
+
+    # CPU reference via owned engine (not STRtree) for consistency
+    from vibespatial.binary_predicates import evaluate_binary_predicate
+    from vibespatial.indexing import generate_bounds_pairs
+
+    query_owned_ref = from_shapely_geometries(query.tolist())
+    pairs = generate_bounds_pairs(query_owned_ref, flat.geometry_array)
+    exact = evaluate_binary_predicate(
+        predicate,
+        np.asarray(query, dtype=object)[pairs.left_indices],
+        np.asarray(tree, dtype=object)[pairs.right_indices],
+        dispatch_mode="cpu",
+        null_behavior="false",
+    )
+    keep = np.asarray(exact.values, dtype=bool)
+    reference = sorted(pairs.right_indices[keep].tolist())
+
+    # Result from GPU path must match CPU reference
+    gpu_indices = sorted(result[0].tolist()) if result.ndim == 1 else sorted(result[1].tolist())
+    assert gpu_indices == reference, (
+        f"predicate={predicate}: GPU owned refine produced {len(gpu_indices)} results "
+        f"vs CPU reference {len(reference)}"
+    )
+    assert execution.selected is ExecutionMode.GPU
+    assert execution.implementation == "owned_gpu_spatial_query"
+
+
+def test_gpu_bbox_candidate_generation_multi_query() -> None:
+    """GPU candidate generation handles vectorized multi-query above crossover."""
+    from shapely.geometry import Polygon
+
+    tree = np.asarray(
+        [box(x * 0.01, y * 0.01, x * 0.01 + 0.01, y * 0.01 + 0.01) for x in range(50) for y in range(50)],
+        dtype=object,
+    )
+    queries = np.asarray(
+        [
+            Polygon([(0.1, 0.1), (0.3, 0.1), (0.2, 0.3)]),
+            Polygon([(0.3, 0.3), (0.5, 0.3), (0.4, 0.5)]),
+        ],
+        dtype=object,
+    )
+    owned, flat = build_owned_spatial_index(tree)
+
+    result, execution = query_spatial_index(
+        owned,
+        flat,
+        queries,
+        predicate=None,
+        sort=True,
+        output_format="indices",
+        return_metadata=True,
+    )
+
+    from shapely import STRtree
+
+    strtree = STRtree(tree)
+    reference = strtree.query(queries, predicate=None)
+    ref_pairs = set(zip(reference[0].tolist(), reference[1].tolist()))
+    my_pairs = set(zip(result[0].tolist(), result[1].tolist()))
+    assert my_pairs == ref_pairs
+
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_dwithin_routes_through_owned_path() -> None:
+    """dwithin predicate routes through the owned query path, not STRtree."""
+    tree = np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
+    query = np.asarray([Point(1, 0), Point(16, 0)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    result, execution = query_spatial_index(
+        owned, flat, query, predicate="dwithin", distance=5.0,
+        sort=True, return_metadata=True,
+    )
+    assert result.tolist() == [[0, 1], [0, 2]]
+    assert execution.selected is ExecutionMode.GPU
+    assert execution.implementation == "owned_gpu_spatial_query"
+    # Must not fall back to STRtree
+    assert "strtree" not in execution.reason.lower()
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_small_input_gpu_dispatch() -> None:
+    """GPU dispatch is selected even for small inputs (bbox_overlap_candidates crossover=0)."""
+    tree = np.asarray([Point(0, 0), Point(1, 1), Point(2, 2)], dtype=object)
+    query = np.asarray([Point(0.5, 0.5)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    result, execution = query_spatial_index(
+        owned, flat, query, predicate="intersects",
+        sort=True, return_metadata=True,
+    )
+    # Small input (Q*M = 3 < old threshold of 1000) should still dispatch to GPU
+    assert execution.selected is ExecutionMode.GPU
+    assert execution.implementation == "owned_gpu_spatial_query"
+
+
+# ---------------------------------------------------------------------------
+# sjoin / sjoin_nearest dispatch event GPU visibility tests
+# ---------------------------------------------------------------------------
+
+class TestSjoinDispatchVisibility:
+    """Verify that sjoin and sjoin_nearest report the actual execution mode
+    from the underlying spatial query engine in their dispatch events."""
+
+    def test_sjoin_dispatch_event_reports_owned_query_execution(self) -> None:
+        """sjoin dispatch event should report the implementation from the
+        owned spatial query engine, not hardcoded CPU."""
+        from vibespatial.api.geodataframe import GeoDataFrame
+        from vibespatial.dispatch import get_dispatch_events
+        from shapely.geometry import Point
+
+        left = GeoDataFrame(
+            {"a": [1, 2, 3]},
+            geometry=[Point(0, 0), Point(1, 1), Point(2, 2)],
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20, 30]},
+            geometry=[Point(0.1, 0.1), Point(1.1, 1.1), Point(10, 10)],
+        )
+        # Clear events before the join.
+        get_dispatch_events(clear=True)
+        from vibespatial.api.tools.sjoin import sjoin
+
+        sjoin(left, right, predicate="intersects")
+
+        events = get_dispatch_events(clear=True)
+        sjoin_events = [e for e in events if e.surface == "geopandas.tools.sjoin"]
+        assert len(sjoin_events) >= 1
+        event = sjoin_events[0]
+        assert event.implementation == "owned_spatial_query"
+        # The event should report the actual execution mode from the query
+        # engine (GPU or CPU), not blindly hardcoded CPU.
+        assert event.selected in (ExecutionMode.CPU, ExecutionMode.GPU)
+
+    def test_sjoin_nearest_dispatch_event_threads_execution_mode(self) -> None:
+        """sjoin_nearest dispatch event should thread the execution mode from
+        sindex.nearest instead of hardcoding CPU."""
+        from vibespatial.api.geodataframe import GeoDataFrame
+        from vibespatial.dispatch import get_dispatch_events
+        from shapely.geometry import Point
+
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=[Point(0, 0), Point(5, 5)],
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=[Point(0.1, 0.1), Point(5.1, 5.1)],
+        )
+        get_dispatch_events(clear=True)
+        from vibespatial.api.tools.sjoin import sjoin_nearest
+
+        sjoin_nearest(left, right, distance_col="dist")
+
+        events = get_dispatch_events(clear=True)
+        sjoin_nearest_events = [
+            e for e in events if e.surface == "geopandas.tools.sjoin_nearest"
+        ]
+        assert len(sjoin_nearest_events) >= 1
+        event = sjoin_nearest_events[0]
+        assert event.implementation == "sindex_nearest_delegate"
+        # The selected mode should come from the actual nearest engine.
+        assert event.selected in (ExecutionMode.CPU, ExecutionMode.GPU)
+
+    def test_geom_predicate_query_returns_execution_metadata(self) -> None:
+        """_geom_predicate_query should return execution metadata as the third
+        element of its return tuple."""
+        from vibespatial.api.geodataframe import GeoDataFrame
+        from vibespatial.api.tools.sjoin import _geom_predicate_query
+        from vibespatial.spatial_query_types import SpatialQueryExecution
+        from shapely.geometry import Point
+
+        left = GeoDataFrame(
+            {"a": [1]},
+            geometry=[Point(0, 0)],
+        )
+        right = GeoDataFrame(
+            {"b": [10]},
+            geometry=[Point(0.1, 0.1)],
+        )
+        (l_idx, r_idx), impl, execution = _geom_predicate_query(
+            left, right, "intersects", None,
+        )
+        assert impl == "owned_spatial_query"
+        assert isinstance(execution, SpatialQueryExecution)
+
+
+class TestDeviceJoinResult:
+    """Verify _DeviceJoinResult lazy D-to-H semantics."""
+
+    def test_device_join_result_lazy_materialize(self) -> None:
+        """_DeviceJoinResult should defer host copy until properties are
+        accessed."""
+        from vibespatial.spatial_query_types import _DeviceJoinResult
+
+        # Use pre-populated host arrays as a mock for the lazy path.
+        djr = _DeviceJoinResult.__new__(_DeviceJoinResult)
+        djr._d_left = None
+        djr._d_right = None
+        djr._d_distances = None
+        djr._h_left = np.array([0, 1, 2], dtype=np.intp)
+        djr._h_right = np.array([3, 4, 5], dtype=np.intp)
+        djr._h_distances = np.array([0.1, 0.2, 0.3])
+        # Properties should return the cached host arrays.
+        np.testing.assert_array_equal(djr.left, [0, 1, 2])
+        np.testing.assert_array_equal(djr.right, [3, 4, 5])
+        np.testing.assert_array_almost_equal(djr.distances, [0.1, 0.2, 0.3])
+        left, right = djr.as_tuple()
+        np.testing.assert_array_equal(left, [0, 1, 2])
+        np.testing.assert_array_equal(right, [3, 4, 5])

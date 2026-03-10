@@ -1,0 +1,93 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vibespatial"
+version = "0.1.0"
+description = "GPU-first spatial analytics for Python"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=2",
+  "nvidia-ml-py>=13.590.48",
+  "orjson>=3.11.7",
+  "packaging",
+  "pandas>=2.2.0",
+  "pyogrio>=0.8",
+  "pyproj>=3.7.0",
+  "shapely>=2.1.0",
+  "vibeproj",
+]
+
+license = "Apache-2.0"
+
+[project.urls]
+Homepage = "https://github.com/vibeSpatial/vibeSpatial"
+Repository = "https://github.com/vibeSpatial/vibeSpatial"
+Documentation = "https://vibespatial.github.io/vibeSpatial/"
+Issues = "https://github.com/vibeSpatial/vibeSpatial/issues"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "pytest-xdist>=3.6",
+  "ruff>=0.11",
+  "furo>=2024.8",
+  "myst-parser>=4",
+  "sphinx>=8",
+  "sphinx-autodoc2>=0.5",
+  "sphinx-copybutton>=0.5",
+  "pyarrow>=23.0.1",
+]
+gpu-optional = [
+    "cupy-cuda12x>=13",
+    "cuda-cccl[cu12]",
+    "pylibcudf-cu12>=26.2.1",
+]
+upstream-optional = [
+  "fiona>=1.10",
+  "geodatasets",
+  "geopy>=2.4",
+  "folium>=0.18",
+  "mapclassify>=2.8",
+  "matplotlib>=3.9",
+  "psycopg[binary]>=3.2",
+  "pyarrow>=18",
+  "pysimdjson>=6.0.0",
+  "sqlalchemy>=2.0",
+  "xyzservices>=2025.1",
+  "fsspec>=2026.2.0",
+  "geoarrow-pyarrow>=0.2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/geopandas", "src/vibespatial"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra"]
+testpaths = ["tests"]
+markers = [
+  "upstream: vendored upstream contract tests",
+  "gpu: requires a CUDA-capable NVIDIA GPU",
+  "cpu_fallback: verifies explicit CPU fallback behavior",
+  "web: upstream tests that require network connectivity",
+]
+xfail_strict = true
+
+[tool.coverage.run]
+source = ["src/geopandas", "src/vibespatial"]
+omit = ["src/vibespatial/api/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["src/vibespatial/api", "tests/upstream"]
+
+[tool.uv.sources]
+vibeproj = { path = "../vibeProj", editable = true }

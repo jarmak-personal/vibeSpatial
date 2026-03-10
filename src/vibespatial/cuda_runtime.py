@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import os
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any, TypeAlias
+
+import numpy as np
+
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
+
+try:
+    from cuda.bindings import driver as cu
+    from cuda.bindings import nvrtc
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cu = None
+    nvrtc = None
+
+
+def _require_bindings() -> None:
+    if cu is None:
+        raise RuntimeError("cuda-python driver bindings are not installed")
+
+
+def _require_gpu_arrays() -> None:
+    if cp is None:
+        raise RuntimeError("CuPy is not installed; canonical GPU array support is unavailable")
+
+
+def _check_driver(result: tuple[Any, ...]) -> tuple[Any, ...]:
+    err = result[0]
+    if err != cu.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"CUDA driver call failed: {err.name}")
+    return result[1:]
+
+
+def _check_nvrtc(result: tuple[Any, ...]) -> tuple[Any, ...]:
+    err = result[0]
+    if err != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+        raise RuntimeError(f"NVRTC call failed: {nvrtc.nvrtcGetErrorString(err)}")
+    return result[1:]
+
+
+@lru_cache(maxsize=1)
+def cuda_device_count() -> int:
+    if cu is None:
+        return 0
+    try:
+        _check_driver(cu.cuInit(0))
+        count, = _check_driver(cu.cuDeviceGetCount())
+    except Exception:
+        return 0
+    return int(count)
+
+
+def has_cuda_device() -> bool:
+    return cuda_device_count() > 0
+
+
+def has_nvrtc_support() -> bool:
+    return nvrtc is not None
+
+
+DeviceArray: TypeAlias = Any
+
+
+@dataclass(frozen=True, slots=True)
+class CudaStream:
+    """Lightweight wrapper around a CUDA stream handle."""
+
+    handle: Any  # CUstream from cuda.bindings.driver
+
+    def synchronize(self) -> None:
+        """Block the host until all operations on this stream complete."""
+        _check_driver(cu.cuStreamSynchronize(self.handle))
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledKernel:
+    name: str
+    function: Any
+
+
+class CudaDriverRuntime:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._context: Any | None = None
+        self._device: Any | None = None
+        self._compute_capability: tuple[int, int] | None = None
+        self._fp64_to_fp32_ratio: float | None = None
+        self._module_cache: dict[str, dict[str, Any]] = {}
+        self._module_cache_lock = threading.Lock()
+        self._block_size_cache: dict[int, int] = {}
+        self._memory_pool: Any | None = None
+        self._configure_memory_pool()
+
+    def _configure_memory_pool(self) -> None:
+        """Configure CuPy memory pool for pipeline workloads."""
+        if cp is None:
+            return
+        pool = cp.cuda.MemoryPool()
+        pool_limit = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
+        if pool_limit:
+            pool.set_limit(size=int(pool_limit))
+        cp.cuda.set_allocator(pool.malloc)
+        self._memory_pool = pool
+
+    def memory_pool_stats(self) -> dict[str, int]:
+        """Return current memory pool statistics."""
+        if self._memory_pool is None:
+            return {}
+        pool = self._memory_pool
+        return {
+            "used_bytes": pool.used_bytes(),
+            "total_bytes": pool.total_bytes(),
+            "free_bytes": pool.free_bytes(),
+        }
+
+    def free_pool_memory(self) -> None:
+        """Release cached memory back to the device."""
+        if self._memory_pool is not None:
+            self._memory_pool.free_all_blocks()
+
+    def available(self) -> bool:
+        return has_cuda_device() and cp is not None
+
+    def _ensure_context(self) -> Any:
+        _require_bindings()
+        if not self.available():
+            raise RuntimeError("GPU execution was requested, but no CUDA device is available")
+        with self._lock:
+            if self._context is not None:
+                return self._context
+            _check_driver(cu.cuInit(0))
+            device, = _check_driver(cu.cuDeviceGet(0))
+            context, = _check_driver(cu.cuDevicePrimaryCtxRetain(device))
+            major, = _check_driver(
+                cu.cuDeviceGetAttribute(
+                    cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    device,
+                )
+            )
+            minor, = _check_driver(
+                cu.cuDeviceGetAttribute(
+                    cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    device,
+                )
+            )
+            try:
+                fp64_ratio_raw, = _check_driver(
+                    cu.cuDeviceGetAttribute(
+                        cu.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_SINGLE_TO_DOUBLE_PRECISION_PERF_RATIO,
+                        device,
+                    )
+                )
+                fp64_ratio = 1.0 / float(int(fp64_ratio_raw)) if int(fp64_ratio_raw) > 0 else 1.0 / 32.0
+            except Exception:
+                fp64_ratio = 1.0 / 32.0  # conservative consumer default
+            self._device = device
+            self._context = context
+            self._compute_capability = (int(major), int(minor))
+            self._fp64_to_fp32_ratio = fp64_ratio
+            return self._context
+
+    @property
+    def compute_capability(self) -> tuple[int, int]:
+        self._ensure_context()
+        assert self._compute_capability is not None
+        return self._compute_capability
+
+    @property
+    def fp64_to_fp32_ratio(self) -> float:
+        """Return fp64:fp32 throughput ratio from hardware (e.g., 0.5 for A100, 1/64 for RTX 4090)."""
+        self._ensure_context()
+        assert self._fp64_to_fp32_ratio is not None
+        return self._fp64_to_fp32_ratio
+
+    @contextmanager
+    def activate(self):
+        context = self._ensure_context()
+        _check_driver(cu.cuCtxPushCurrent(context))
+        try:
+            yield self
+        finally:
+            _check_driver(cu.cuCtxPopCurrent())
+
+    def allocate(self, shape: tuple[int, ...], dtype: np.dtype[Any], *, zero: bool = False) -> DeviceArray:
+        _require_gpu_arrays()
+        normalized_shape = tuple(int(dim) for dim in shape)
+        normalized_dtype = np.dtype(dtype)
+        if not normalized_shape:
+            raise ValueError("device arrays must have at least one dimension")
+        with self.activate():
+            if zero:
+                return cp.zeros(normalized_shape, dtype=normalized_dtype)
+            return cp.empty(normalized_shape, dtype=normalized_dtype)
+
+    def from_host(self, host_array: np.ndarray) -> DeviceArray:
+        _require_gpu_arrays()
+        host = np.ascontiguousarray(host_array)
+        with self.activate():
+            return cp.asarray(host)
+
+    def copy_host_to_device(self, host_array: np.ndarray, device_array: DeviceArray) -> None:
+        _require_gpu_arrays()
+        host = np.ascontiguousarray(host_array)
+        with self.activate():
+            device_array[...] = cp.asarray(host)
+
+    def copy_device_to_host(self, device_array: DeviceArray, host_array: np.ndarray | None = None) -> np.ndarray:
+        _require_gpu_arrays()
+        with self.activate():
+            host = cp.asnumpy(device_array)
+        if host_array is None:
+            return host
+        host_array[...] = host
+        return host_array
+
+    def pointer(self, device_array: DeviceArray | None) -> int:
+        if device_array is None:
+            return 0
+        return int(device_array.data.ptr)
+
+    def free(self, device_array: DeviceArray | None) -> None:
+        if device_array is None:
+            return
+        memory = getattr(getattr(device_array, "data", None), "mem", None)
+        if memory is not None:
+            try:
+                memory.free()
+            except Exception:
+                return
+
+    def synchronize(self) -> None:
+        with self.activate():
+            _check_driver(cu.cuCtxSynchronize())
+
+    # ------------------------------------------------------------------
+    # Stream management
+    # ------------------------------------------------------------------
+
+    def create_stream(self) -> CudaStream:
+        """Create a new CUDA stream for concurrent execution.
+
+        The returned stream can be passed to :meth:`launch`,
+        :meth:`copy_device_to_host_async`, and other stream-aware methods
+        to enable overlap of kernel execution and data transfers.
+        """
+        with self.activate():
+            stream, = _check_driver(cu.cuStreamCreate(0))
+        return CudaStream(handle=stream)
+
+    def destroy_stream(self, stream: CudaStream) -> None:
+        """Destroy a CUDA stream.
+
+        The caller must ensure all work submitted to the stream has
+        completed before calling this method.
+        """
+        with self.activate():
+            _check_driver(cu.cuStreamDestroy(stream.handle))
+
+    @contextmanager
+    def stream_context(self):
+        """Create a stream, yield it, and destroy it on exit.
+
+        The stream is automatically synchronised before destruction::
+
+            with runtime.stream_context() as stream:
+                runtime.launch(kernel, ..., stream=stream)
+                # stream.synchronize() called automatically
+        """
+        stream = self.create_stream()
+        try:
+            yield stream
+        finally:
+            stream.synchronize()
+            self.destroy_stream(stream)
+
+    # ------------------------------------------------------------------
+    # Async transfer helpers
+    # ------------------------------------------------------------------
+
+    def copy_device_to_host_async(
+        self,
+        device_array: DeviceArray,
+        stream: CudaStream,
+        host_array: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Enqueue an asynchronous device-to-host copy on *stream*.
+
+        If *host_array* is ``None`` a new contiguous host array is
+        allocated.  For true asynchronous behaviour the destination
+        should be pinned memory (see :meth:`allocate_pinned`).
+
+        The caller **must** synchronise the stream before reading the
+        returned array.
+        """
+        _require_gpu_arrays()
+        with self.activate():
+            if host_array is None:
+                host_array = np.empty(device_array.shape, dtype=device_array.dtype)
+            nbytes = host_array.nbytes
+            _check_driver(cu.cuMemcpyDtoHAsync(
+                host_array.ctypes.data, int(device_array.data.ptr), nbytes, stream.handle,
+            ))
+        return host_array
+
+    def copy_host_to_device_async(
+        self,
+        host_array: np.ndarray,
+        device_array: DeviceArray,
+        stream: CudaStream,
+    ) -> None:
+        """Enqueue an asynchronous host-to-device copy on *stream*.
+
+        For true asynchronous behaviour *host_array* should reside in
+        pinned memory (see :meth:`allocate_pinned`).
+
+        The caller **must** synchronise the stream before reusing or
+        freeing either buffer.
+        """
+        _require_gpu_arrays()
+        host = np.ascontiguousarray(host_array)
+        with self.activate():
+            nbytes = host.nbytes
+            _check_driver(cu.cuMemcpyHtoDAsync(
+                int(device_array.data.ptr), host.ctypes.data, nbytes, stream.handle,
+            ))
+
+    def allocate_pinned(self, shape: tuple[int, ...], dtype: np.dtype[Any]) -> np.ndarray:
+        """Allocate page-locked (pinned) host memory for async transfers.
+
+        Returns a normal :class:`numpy.ndarray` backed by CUDA
+        pinned memory.  Pinned memory enables truly asynchronous
+        DMA transfers that overlap with kernel execution.
+        """
+        _require_gpu_arrays()
+        n_elements = int(np.prod(shape))
+        nbytes = n_elements * np.dtype(dtype).itemsize
+        mem = cp.cuda.alloc_pinned_memory(nbytes)
+        # frombuffer may see the full allocation (which can be larger than
+        # requested due to driver alignment); slice to the exact count.
+        arr = np.frombuffer(mem, dtype=dtype)[:n_elements]
+        return arr.reshape(shape)
+
+    def launch(
+        self,
+        kernel: CompiledKernel,
+        *,
+        grid: tuple[int, int, int],
+        block: tuple[int, int, int],
+        params: tuple[tuple[Any, ...], tuple[Any, ...]],
+        shared_mem_bytes: int = 0,
+        stream: CudaStream | None = None,
+    ) -> None:
+        with self.activate():
+            _check_driver(
+                cu.cuLaunchKernel(
+                    kernel.function,
+                    int(grid[0]),
+                    int(grid[1]),
+                    int(grid[2]),
+                    int(block[0]),
+                    int(block[1]),
+                    int(block[2]),
+                    int(shared_mem_bytes),
+                    stream.handle if stream is not None else None,
+                    params,
+                    0,
+                )
+            )
+
+    def optimal_block_size(
+        self,
+        kernel: CompiledKernel,
+        shared_mem_bytes: int = 0,
+    ) -> int:
+        """Return optimal threads-per-block for *kernel* using CUDA occupancy API."""
+        cache_key = id(kernel.function)
+        cached = self._block_size_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            with self.activate():
+                _min_grid, block_size = _check_driver(
+                    cu.cuOccupancyMaxPotentialBlockSize(
+                        kernel.function, 0, shared_mem_bytes, 0
+                    )
+                )
+            result = int(block_size)
+        except (AttributeError, RuntimeError):
+            result = 256
+        self._block_size_cache[cache_key] = result
+        return result
+
+    def launch_config(
+        self,
+        kernel: CompiledKernel,
+        item_count: int,
+        shared_mem_bytes: int = 0,
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        """Return ``(grid, block)`` tuples sized for *item_count* work-items."""
+        block_size = self.optimal_block_size(kernel, shared_mem_bytes)
+        grid_x = max(1, (item_count + block_size - 1) // block_size)
+        return (grid_x, 1, 1), (block_size, 1, 1)
+
+    def compile_kernels(
+        self,
+        *,
+        cache_key: str,
+        source: str,
+        kernel_names: tuple[str, ...],
+        options: tuple[str, ...] = (),
+    ) -> dict[str, CompiledKernel]:
+        # Fast path: GIL-atomic dict read, no lock needed.
+        if cache_key in self._module_cache:
+            return self._module_cache[cache_key]
+        if nvrtc is None:
+            raise RuntimeError("NVRTC is not installed; cuda-python kernel compilation is unavailable")
+
+        # Double-checked locking: acquire lock only on cache miss.
+        with self._module_cache_lock:
+            if cache_key in self._module_cache:
+                return self._module_cache[cache_key]
+            with self.activate():
+                program_name = f"{cache_key}.cu".encode()
+                program, = _check_nvrtc(
+                    nvrtc.nvrtcCreateProgram(source.encode(), program_name, 0, [], [])
+                )
+                arch = f"--gpu-architecture=compute_{self.compute_capability[0]}{self.compute_capability[1]}"
+                compile_options = tuple(options) + (arch,)
+                encoded_options = [option.encode() for option in compile_options]
+                result = nvrtc.nvrtcCompileProgram(program, len(encoded_options), encoded_options)
+                if result[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+                    log_size, = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
+                    log = bytearray(log_size)
+                    _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
+                    raise RuntimeError(bytes(log).decode(errors="replace"))
+                ptx_size, = _check_nvrtc(nvrtc.nvrtcGetPTXSize(program))
+                ptx = bytearray(ptx_size)
+                _check_nvrtc(nvrtc.nvrtcGetPTX(program, ptx))
+                module, = _check_driver(cu.cuModuleLoadData(bytes(ptx)))
+                kernels = {
+                    name: CompiledKernel(
+                        name=name,
+                        function=_check_driver(cu.cuModuleGetFunction(module, name.encode()))[0],
+                    )
+                    for name in kernel_names
+                }
+            self._module_cache[cache_key] = kernels
+            return kernels
+
+_CUDA_RUNTIME = CudaDriverRuntime()
+
+
+def get_cuda_runtime() -> CudaDriverRuntime:
+    return _CUDA_RUNTIME
+
+
+def count_scatter_total(
+    runtime: CudaDriverRuntime,
+    device_counts: DeviceArray,
+    device_offsets: DeviceArray,
+) -> int:
+    """Get total output size from count-scatter arrays.
+
+    Uses a single async transfer of two last-elements on a dedicated
+    stream, replacing two sequential ``.get()`` calls (each of which
+    forces a full context sync) with one stream sync.
+    """
+    dtype = np.dtype(device_counts.dtype)
+    with runtime.stream_context() as xfer:
+        h_buf = runtime.allocate_pinned((2,), dtype)
+        runtime.copy_device_to_host_async(device_counts[-1:], xfer, h_buf[:1])
+        runtime.copy_device_to_host_async(device_offsets[-1:], xfer, h_buf[1:])
+    return int(h_buf[0]) + int(h_buf[1])
+
+
+def count_scatter_total_with_transfer(
+    runtime: CudaDriverRuntime,
+    device_counts: DeviceArray,
+    device_offsets: DeviceArray,
+) -> tuple[int, "CudaStream", np.ndarray]:
+    """Get total and start async full-counts transfer on a background stream.
+
+    Returns ``(total_verts, xfer_stream, pinned_host_counts)``.  The
+    caller **must** call ``xfer_stream.synchronize()`` before reading
+    *pinned_host_counts*, and ``runtime.destroy_stream(xfer_stream)``
+    when done.  The transfer overlaps with subsequent null-stream
+    kernel launches (e.g. the scatter pass).
+    """
+    dtype = np.dtype(device_counts.dtype)
+    n = int(device_counts.size)
+
+    # 1. Get total via single-sync async transfer of last elements.
+    total = count_scatter_total(runtime, device_counts, device_offsets)
+
+    # 2. Start async full-array transfer on a dedicated stream.
+    xfer = runtime.create_stream()
+    h_counts = runtime.allocate_pinned((n,), dtype)
+    runtime.copy_device_to_host_async(device_counts, xfer, h_counts)
+
+    return total, xfer, h_counts
+
+
+def compile_kernel_group(name: str, source: str, kernel_names: tuple[str, ...]):
+    """Compile a named group of NVRTC kernels, using the per-runtime cache."""
+    runtime = get_cuda_runtime()
+    cache_key = make_kernel_cache_key(name, source)
+    return runtime.compile_kernels(cache_key=cache_key, source=source, kernel_names=kernel_names)
+
+
+def make_kernel_cache_key(prefix: str, source: str) -> str:
+    digest = hashlib.sha1(source.encode()).hexdigest()
+    return f"{prefix}-{digest}"
+
+
+KERNEL_PARAM_PTR = ctypes.c_void_p
+KERNEL_PARAM_I32 = ctypes.c_int
+KERNEL_PARAM_F64 = ctypes.c_double

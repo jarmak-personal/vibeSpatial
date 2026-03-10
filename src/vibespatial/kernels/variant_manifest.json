@@ -1,0 +1,14 @@
+[
+  {
+    "geom_types": [
+      "point",
+      "polygon"
+    ],
+    "kernel": "point_bounds",
+    "module": "vibespatial.kernels.predicates",
+    "tier": 4,
+    "variants": [
+      "cpu"
+    ]
+  }
+]

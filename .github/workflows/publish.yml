@@ -1,0 +1,91 @@
+name: Publish to PyPI
+
+# Triggered when a GitHub Release is published.
+# Versioning follows effVer (MACRO.MESO.MICRO):
+# https://jacobtomlinson.dev/effver/
+#
+# Release workflow:
+#   1. Bump version in pyproject.toml + src/vibespatial/api/_version.py
+#   2. Create a GitHub Release with tag "v{version}" (e.g. v0.2.0)
+#   3. This workflow builds the wheel, attaches it to the release, and publishes to PyPI
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  # -- 1. Validate release tag matches pyproject.toml version ----------------
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(python3 -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              print(tomllib.load(f)['project']['version'])
+          ")
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match pyproject.toml version ($PKG_VERSION)"
+            exit 1
+          fi
+          echo "Version validated: $TAG_VERSION"
+
+  # -- 2. Build sdist + wheel ------------------------------------------------
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+      - name: Build package
+        run: uv build
+      - name: Verify distributions
+        run: |
+          ls -lh dist/
+          test $(ls dist/*.tar.gz | wc -l) -eq 1
+          test $(ls dist/*.whl | wc -l) -eq 1
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  # -- 3. Attach wheel + sdist to the GitHub Release -------------------------
+  release-assets:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
+
+  # -- 4. Publish to PyPI (trusted publishing / OIDC) ------------------------
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

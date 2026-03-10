@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+printf "pre-commit: refreshing generated docs and intake index...\n"
+uv run python scripts/check_docs.py --refresh --stage-generated
+
+printf "pre-commit: validating docs and intake index...\n"
+uv run python scripts/check_docs.py --check
+
+printf "pre-commit: checking architecture constraints...\n"
+uv run python scripts/check_architecture_lints.py --all

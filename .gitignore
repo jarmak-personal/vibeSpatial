@@ -1,0 +1,29 @@
+
+# Tooling
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+__pycache__/
+*.pyc
+.claude/worktrees/
+
+# Dolt database files (added by bd init)
+.dolt/
+*.db
+
+# Docs build
+docs/_build/
+
+# Runtime artifacts
+cufile.log
+result_images/
+
+# Benchmark fixture cache and results
+.benchmark_fixtures/
+benchmarks/results/
+
+# Example data (large downloads)
+examples/data/

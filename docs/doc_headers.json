@@ -1,0 +1,285 @@
+{
+  "version": 1,
+  "files": {
+    "AGENTS.md": {
+      "scope": "Repository-wide agent workflow, intake usage, and verification expectations.",
+      "readIf": "You are starting, routing, or landing work in this repository.",
+      "stopIf": "You only need a narrow API detail already covered by a routed doc.",
+      "sourceOfTruth": "Agent workflow and handoff policy for vibeSpatial.",
+      "maxBodyLines": 260
+    },
+    "docs/architecture/runtime.md": {
+      "scope": "GPU-first runtime rules, fallback policy, and execution invariants.",
+      "readIf": "You are changing runtime selection, GPU execution, fallback visibility, or kernels.",
+      "stopIf": "Your task is docs-only or limited to vendored test maintenance.",
+      "sourceOfTruth": "Runtime architecture policy for GPU-first execution.",
+      "maxBodyLines": 200
+    },
+    "docs/ops/intake.md": {
+      "scope": "Operational intake workflow and request-to-doc routing policy.",
+      "readIf": "You received a task request and need to decide what to open first.",
+      "stopIf": "You already have a confirmed work plan and relevant docs open.",
+      "sourceOfTruth": "Intake workflow and routing rules for agents in this repo.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/upstream-inventory.md": {
+      "scope": "Ranked upstream GeoPandas contract slices, dependencies, and runtime weight.",
+      "readIf": "You are choosing which vendored test groups to promote or implement next.",
+      "stopIf": "Your task is limited to a single already-routed upstream module.",
+      "sourceOfTruth": "Phase-0 upstream test inventory for implementation planning.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/performance-tiers.md": {
+      "scope": "Performance tier gates, reference datasets, and benchmark acceptance policy.",
+      "readIf": "You are defining kernel success criteria, benchmark rails, or performance gates.",
+      "stopIf": "Your task is limited to a single benchmark implementation detail already routed elsewhere.",
+      "sourceOfTruth": "Phase-0 performance gate policy for GPU kernel work.",
+      "maxBodyLines": 240
+    },
+    "docs/testing/profiling-rails.md": {
+      "scope": "Stage-timed profiling entrypoints, NVTX guidance, and trace interpretation for join and overlay work.",
+      "readIf": "You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.",
+      "stopIf": "You already have the profiling script open and only need a local implementation detail.",
+      "sourceOfTruth": "Stage-level profiling workflow for join and overlay kernel development.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/pipeline-benchmarks.md": {
+      "scope": "End-to-end pipeline benchmark suites, regression thresholds, and CI artifact workflow.",
+      "readIf": "You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.",
+      "stopIf": "You already have the benchmark scripts open and only need a local implementation detail.",
+      "sourceOfTruth": "Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/synthetic-data.md": {
+      "scope": "Synthetic geometry dataset generator workflow, shapes, and verification guidance.",
+      "readIf": "You are adding benchmark data, regression corpora, or synthetic geometry fixtures.",
+      "stopIf": "Your task already has a routed generator API file open and needs no workflow guidance.",
+      "sourceOfTruth": "Phase-0 synthetic data generator contract for tests and benchmarks.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/degeneracy-corpus.md": {
+      "scope": "Deterministic degeneracy corpus for overlay, clip, and segment-regression verification.",
+      "readIf": "You are adding or verifying degeneracy cases for overlay, clip, or constructive kernels.",
+      "stopIf": "You already have the corpus module open and only need local case detail.",
+      "sourceOfTruth": "Phase-5 degeneracy corpus policy for overlay and clip verification.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/kernel-inventory.md": {
+      "scope": "Scaffolded kernel inventory, benchmark stubs, and generated test surfaces.",
+      "readIf": "You are generating, reviewing, or extending owned kernel scaffolds.",
+      "stopIf": "You already have the target kernel module and generated files open.",
+      "sourceOfTruth": "Kernel scaffold inventory and generated surface map for repo-owned kernels.",
+      "maxBodyLines": 220
+    },
+    "docs/decisions/index.md": {
+      "scope": "Architecture decision log and index of accepted or superseded ADRs.",
+      "readIf": "You are resolving, revisiting, or querying a design decision.",
+      "stopIf": "You already have the specific ADR open and do not need the index.",
+      "sourceOfTruth": "Decision log for architecture choices.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/precision.md": {
+      "scope": "Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonical storage policy.",
+      "readIf": "You are designing kernel arithmetic, precision selection, or numerical policy.",
+      "stopIf": "Your task already has a settled precision plan and only needs implementation detail.",
+      "sourceOfTruth": "Phase-1 precision dispatch policy before owned kernel expansion.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/nulls.md": {
+      "scope": "Null versus empty geometry semantics, validity rules, and kernel-state policy.",
+      "readIf": "You are defining missing-geometry behavior, validity handling, or empty-geometry contracts.",
+      "stopIf": "Your task already has a settled null and empty contract and only needs implementation detail.",
+      "sourceOfTruth": "Phase-1 null and empty geometry policy before owned kernel expansion.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/robustness.md": {
+      "scope": "Exactness guarantees, fallback policy, and topology-preservation strategy for predicates and overlay.",
+      "readIf": "You are designing predicate math, intersection logic, or overlay correctness guarantees.",
+      "stopIf": "Your task already has a settled robustness contract and only needs implementation detail.",
+      "sourceOfTruth": "Phase-1 robustness policy for predicate and constructive kernels.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/determinism.md": {
+      "scope": "Deterministic versus performance-first runtime policy, reproducibility guarantees, and reduction-order rules.",
+      "readIf": "You are changing reproducibility behavior, reduction order, or deterministic mode for GPU-oriented kernels.",
+      "stopIf": "Your task already has the determinism policy module open and only needs local implementation detail.",
+      "sourceOfTruth": "Phase-2 determinism and reproducibility policy before broader GPU reductions land.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/residency.md": {
+      "scope": "Device residency defaults, transfer visibility rules, and zero-copy interop policy.",
+      "readIf": "You are designing buffer movement, interop adapters, or host/device materialization behavior.",
+      "stopIf": "Your task already has a settled residency contract and only needs implementation detail.",
+      "sourceOfTruth": "Phase-1 residency and transfer policy before owned geometry buffers land.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/crossover.md": {
+      "scope": "Per-kernel auto-dispatch thresholds and CPU/GPU crossover policy.",
+      "readIf": "You are changing auto mode, size thresholds, or CPU/GPU dispatch heuristics.",
+      "stopIf": "Your task already has a settled crossover policy and only needs implementation detail.",
+      "sourceOfTruth": "Phase-1 crossover policy before adaptive runtime lands.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/adaptive-runtime.md": {
+      "scope": "Probe-first adaptive planning, monitoring inputs, and chunk-boundary runtime decisions.",
+      "readIf": "You are changing variant selection, NVML monitoring, adaptive chunking, or runtime planning.",
+      "stopIf": "Your task already has a settled adaptive-runtime contract and only needs implementation detail.",
+      "sourceOfTruth": "Phase-1 adaptive runtime policy before broader kernel work lands.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/io-acceleration.md": {
+      "scope": "Post-Phase-6b GPU-native IO execution model, staged decode policy, and format-level speed targets.",
+      "readIf": "You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.",
+      "stopIf": "Your task already has the routed IO implementation files open and only needs local adapter detail.",
+      "sourceOfTruth": "IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.",
+      "maxBodyLines": 260
+    },
+    "docs/architecture/geometry-buffers.md": {
+      "scope": "Canonical owned geometry buffer schema for points, lines, polygons, and multiparts.",
+      "readIf": "You are designing adapters, kernels, or memory layout for owned geometry arrays.",
+      "stopIf": "Your task already has a settled buffer schema and only needs implementation detail.",
+      "sourceOfTruth": "Phase-2 owned geometry buffer layout contract.",
+      "maxBodyLines": 260
+    },
+    "docs/architecture/fusion.md": {
+      "scope": "Kernel-fusion policy, stage boundaries, and intermediate elimination rules.",
+      "readIf": "You are changing pipeline execution, fused chains, or intermediate materialization behavior.",
+      "stopIf": "Your task already has a settled fusion contract and only needs implementation detail.",
+      "sourceOfTruth": "Phase-2 fusion strategy before broad multi-kernel pipelines land.",
+      "maxBodyLines": 240
+    },
+    "docs/architecture/point-predicates.md": {
+      "scope": "Point-versus-bounds and point-in-polygon pipeline shape, stage boundaries, and fallback contract.",
+      "readIf": "You are changing point predicates, candidate refinement, or the first exact spatial query path.",
+      "stopIf": "Your task already has the staged point-predicate contract open and only needs local implementation detail.",
+      "sourceOfTruth": "Phase-4 point predicate architecture policy before sindex and join assembly.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/binary-predicates.md": {
+      "scope": "Exact binary-predicate refine strategy, coarse-filter staging, and GeoPandas adapter policy.",
+      "readIf": "You are changing exact predicate kernels, binary predicate dispatch, or GeoPandas predicate integration.",
+      "stopIf": "You already have the binary-predicate engine open and only need local implementation detail.",
+      "sourceOfTruth": "Phase-4 exact binary-predicate architecture policy before join assembly.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/spatial-joins.md": {
+      "scope": "Spatial-index query assembly, sjoin result semantics, bounded nearest strategy, and output-format policy.",
+      "readIf": "You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.",
+      "stopIf": "You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.",
+      "sourceOfTruth": "Phase-4 spatial query and join assembly policy before broader API dispatch work.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/segment-primitives.md": {
+      "scope": "Robust segment extraction, candidate generation, and exact intersection-classification strategy for constructive kernels.",
+      "readIf": "You are changing segment intersection math, degeneracy handling, or constructive-kernel foundations.",
+      "stopIf": "You already have the segment primitive implementation open and only need local implementation detail.",
+      "sourceOfTruth": "Phase-5 segment intersection primitive policy before overlay assembly.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/clip-fast-paths.md": {
+      "scope": "Rectangle clip fast-path strategy, owned constructive dataflow, and GeoPandas adapter policy.",
+      "readIf": "You are changing clip_by_rect, rectangle clip performance, or early constructive fast paths.",
+      "stopIf": "You already have the rectangle clip engine open and only need local implementation detail.",
+      "sourceOfTruth": "Phase-5 rectangle clip fast-path policy before broader overlay assembly.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/overlay-reconstruction.md": {
+      "scope": "Overlay reconstruction staging, face-labeling plan, and CCCL-oriented output assembly policy.",
+      "readIf": "You are changing union, difference, symmetric difference, or overlay output reconstruction.",
+      "stopIf": "You already have the reconstruction planner open and only need local implementation detail.",
+      "sourceOfTruth": "Phase-5 reconstruction plan from segment primitives to public overlay outputs.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/mixed-geometries.md": {
+      "scope": "Mixed-geometry storage and execution strategy for GPU-oriented geometry buffers.",
+      "readIf": "You are designing owned geometry buffers, mixed-type dispatch, or geometry-family layout policy.",
+      "stopIf": "Your task is limited to a single kernel implementation detail that already has a chosen layout.",
+      "sourceOfTruth": "Phase-1 design decision for mixed-geometry handling before buffer implementation.",
+      "maxBodyLines": 260
+    },
+    "tests/upstream/README.md": {
+      "scope": "Upstream GeoPandas test vendoring and contract-coverage workflow.",
+      "readIf": "You are refreshing, debugging, or expanding vendored upstream test coverage.",
+      "stopIf": "Your task does not touch vendored tests or compatibility contracts.",
+      "sourceOfTruth": "Vendored upstream test workflow for GeoPandas compatibility.",
+      "maxBodyLines": 200
+    },
+    "docs/architecture/api-dispatch.md": {
+      "scope": "GeoPandas method delegation, dispatch events, and object-construction avoidance.",
+      "readIf": "You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.",
+      "stopIf": "Your task already has the adapter implementation open and only needs local detail.",
+      "sourceOfTruth": "API dispatch policy for GeoPandas-facing method boundaries.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/dissolve.md": {
+      "scope": "Grouped dissolve pipeline staging, segmented union, and attribute aggregation policy.",
+      "readIf": "You are changing dissolve, grouped union, or segmented attribute aggregation.",
+      "stopIf": "Your task already has the dissolve pipeline open and only needs local implementation detail.",
+      "sourceOfTruth": "Dissolve pipeline architecture for grouped constructive work.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/fallbacks.md": {
+      "scope": "Observable CPU fallback policy for unsupported predicates, geometry mixes, and host-only query paths.",
+      "readIf": "You are changing fallback visibility, host-only geospatial paths, or runtime observability.",
+      "stopIf": "You already have the fallback event API open and only need local implementation detail.",
+      "sourceOfTruth": "Phase-4 explicit fallback policy for predicate and spatial-query surfaces.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/io-arrow.md": {
+      "scope": "Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and GPU-native decode paths.",
+      "readIf": "You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.",
+      "stopIf": "Your task already has the specific IO adapter open and only needs local implementation detail.",
+      "sourceOfTruth": "IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.",
+      "maxBodyLines": 260
+    },
+    "docs/architecture/io-files.md": {
+      "scope": "File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL adapters.",
+      "readIf": "You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.",
+      "stopIf": "Your task already has the specific format adapter open and only needs local implementation detail.",
+      "sourceOfTruth": "File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.",
+      "maxBodyLines": 280
+    },
+    "docs/architecture/io-support-matrix.md": {
+      "scope": "IO format classification as GPU-native, hybrid, or fallback-only.",
+      "readIf": "You are classifying a format pathway or adding a new IO format target.",
+      "stopIf": "Your task already has the specific format adapter open and only needs local implementation detail.",
+      "sourceOfTruth": "IO format classification matrix for GPU-native versus hybrid versus fallback paths.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/make-valid.md": {
+      "scope": "Compact-invalid-row make_valid pipeline staging and repair-only-invalids policy.",
+      "readIf": "You are changing make_valid, validity checking, or topology repair pipelines.",
+      "stopIf": "Your task already has the make_valid pipeline open and only needs local implementation detail.",
+      "sourceOfTruth": "Make-valid pipeline architecture for compact-and-repair staging.",
+      "maxBodyLines": 220
+    },
+    "docs/architecture/stroke-kernels.md": {
+      "scope": "Buffer and offset-curve kernel seam, prefix-sum emission strategy, and Shapely fallback policy.",
+      "readIf": "You are changing buffer, offset_curve, or stroke-style constructive kernels.",
+      "stopIf": "Your task already has the stroke kernel implementation open and only needs local implementation detail.",
+      "sourceOfTruth": "Stroke kernel architecture for buffer and offset-curve constructive work.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/contract-promotion.md": {
+      "scope": "Upstream GeoPandas contract promotion gates, test-group ordering, and promotion workflow.",
+      "readIf": "You are promoting, inspecting, or verifying upstream contract test groups.",
+      "stopIf": "Your task already has the specific test group open and only needs local pass criteria.",
+      "sourceOfTruth": "Contract promotion workflow for upstream GeoPandas test groups.",
+      "maxBodyLines": 260
+    },
+    "docs/testing/io-performance-rails.md": {
+      "scope": "IO benchmark rail suites, throughput floors, and format-level performance enforcement.",
+      "readIf": "You are adding or verifying IO benchmark rails, throughput floors, or format-specific performance gates.",
+      "stopIf": "Your task already has the benchmark scripts open and only needs local implementation detail.",
+      "sourceOfTruth": "Phase-6d IO performance rail and floor enforcement workflow.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/native-coverage.md": {
+      "scope": "Strict native mode upstream test pass rate as the real GeoPandas compatibility metric.",
+      "readIf": "You are measuring, reporting, or verifying strict native GeoPandas compatibility.",
+      "stopIf": "Your task already has the coverage script open and only needs the command.",
+      "sourceOfTruth": "Native coverage metric definition for upstream GeoPandas compatibility.",
+      "maxBodyLines": 220
+    }
+  }
+}

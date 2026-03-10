@@ -1,0 +1,901 @@
+/* ============================================================
+   NEON GRID — vibeSpatial Docs Theme
+   Shared across vibeProj, vibeSpatial, vibeSpatial-Raster.
+   Built on Furo. Inspired by NVIDIA CCCL docs.
+   ============================================================ */
+
+/* --- Fonts --- */
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;600;700;900&family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;1,400&family=Exo+2:wght@300;400;500;600;700&display=swap');
+
+/* ===========================
+   COLOR TOKENS
+   =========================== */
+:root {
+    /* Void / Backgrounds */
+    --cp-void: #050810;
+    --cp-surface-0: #0a0e1a;
+    --cp-surface-1: #111827;
+    --cp-surface-2: #1a2035;
+    --cp-surface-3: #232b42;
+
+    /* Primary accent — change per project:
+       vibeProj: cyan | vibeSpatial: magenta | vibeSpatial-Raster: purple */
+    --cp-accent: #ff2d6f;
+    --cp-accent-dim: #ff2d6f88;
+    --cp-accent-bg: #ff2d6f0a;
+    --cp-accent-glow: 0 0 8px #ff2d6f55, 0 0 30px #ff2d6f1a;
+    --cp-accent-glow-strong: 0 0 12px #ff2d6f88, 0 0 45px #ff2d6f33, 0 0 90px #ff2d6f11;
+
+    /* Secondary accents */
+    --cp-cyan: #00e5ff;
+    --cp-magenta: #ff2d6f;
+    --cp-purple: #a855f7;
+    --cp-green: #39ff14;
+    --cp-amber: #fbbf24;
+
+    /* Text */
+    --cp-text: #e2e8f0;
+    --cp-text-muted: #8892a8;
+    --cp-text-dim: #4a5568;
+
+    /* Borders */
+    --cp-border: #1e293b;
+    --cp-border-bright: #2d3a52;
+
+    /* Grid pattern */
+    --cp-grid-color: #ff2d6f06;
+    --cp-grid-size: 48px;
+    --cp-dot-color: #ff2d6f0d;
+}
+
+/* ===========================
+   FURO OVERRIDES — DARK MODE
+   =========================== */
+body,
+body[data-theme="dark"] {
+    --color-foreground-primary: var(--cp-text);
+    --color-foreground-secondary: var(--cp-text-muted);
+    --color-foreground-muted: var(--cp-text-dim);
+    --color-foreground-border: var(--cp-border);
+
+    --color-background-primary: var(--cp-surface-0);
+    --color-background-secondary: var(--cp-surface-1);
+    --color-background-hover: var(--cp-surface-2);
+    --color-background-hover--transparent: #1a203500;
+    --color-background-border: var(--cp-border);
+
+    --color-brand-primary: var(--cp-accent);
+    --color-brand-content: var(--cp-accent);
+
+    --color-sidebar-background: var(--cp-void);
+    --color-sidebar-background-border: var(--cp-border);
+    --color-sidebar-brand-text: var(--cp-accent);
+    --color-sidebar-caption-text: var(--cp-accent);
+    --color-sidebar-link-text: var(--cp-text-muted);
+    --color-sidebar-link-text--top-level: var(--cp-text);
+    --color-sidebar-item-background--current: var(--cp-surface-2);
+    --color-sidebar-item-background--hover: var(--cp-surface-1);
+    --color-sidebar-item-expander-color: var(--cp-text-dim);
+    --color-sidebar-item-expander-color--hover: var(--cp-accent);
+    --color-sidebar-search-background: var(--cp-surface-1);
+    --color-sidebar-search-border: var(--cp-border);
+
+    --color-toc-background: transparent;
+    --color-toc-title-text: var(--cp-accent);
+    --color-toc-item-text: var(--cp-text-muted);
+    --color-toc-item-text--hover: var(--cp-accent);
+    --color-toc-item-text--active: var(--cp-accent);
+
+    --color-content-foreground: var(--cp-text);
+    --color-content-code-background: var(--cp-surface-2);
+    --color-content-code-foreground: var(--cp-accent);
+
+    --color-link: var(--cp-cyan);
+    --color-link--hover: var(--cp-magenta);
+    --color-link-underline: var(--cp-cyan-dim, #00e5ff55);
+    --color-link-underline--hover: var(--cp-magenta);
+
+    --color-admonition-background: var(--cp-surface-1);
+    --color-admonition-title-background--important: #a855f715;
+
+    --color-announcement-background: var(--cp-surface-2);
+    --color-announcement-text: var(--cp-accent);
+
+    --color-highlight-on-target: #00e5ff0d;
+    --color-inline-code-background: var(--cp-surface-2);
+    --color-table-header-background: var(--cp-surface-2);
+    --color-table-border: var(--cp-border);
+
+    --color-api-background: var(--cp-surface-1);
+
+    /* Furo typography overrides */
+    --font-stack: 'Exo 2', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-stack--monospace: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    --font-stack--headings: 'Exo 2', var(--font-stack);
+    --font-size--normal: 15.5px;
+}
+
+/* Force dark mode — no light mode for cyberpunk */
+body[data-theme="light"] {
+    --color-foreground-primary: var(--cp-text);
+    --color-foreground-secondary: var(--cp-text-muted);
+    --color-foreground-muted: var(--cp-text-dim);
+    --color-foreground-border: var(--cp-border);
+    --color-background-primary: var(--cp-surface-0);
+    --color-background-secondary: var(--cp-surface-1);
+    --color-background-hover: var(--cp-surface-2);
+    --color-background-border: var(--cp-border);
+    --color-brand-primary: var(--cp-accent);
+    --color-brand-content: var(--cp-accent);
+    --color-sidebar-background: var(--cp-void);
+    --color-sidebar-background-border: var(--cp-border);
+    --color-link: var(--cp-cyan);
+    --color-link--hover: var(--cp-magenta);
+    --color-content-code-background: var(--cp-surface-2);
+    --color-content-code-foreground: var(--cp-accent);
+    --color-inline-code-background: var(--cp-surface-2);
+    --color-table-header-background: var(--cp-surface-2);
+    --color-table-border: var(--cp-border);
+}
+
+/* ===========================
+   BASE STYLES
+   =========================== */
+html {
+    scroll-behavior: smooth;
+    scrollbar-color: var(--cp-surface-3) var(--cp-void);
+}
+
+body {
+    background: var(--cp-void);
+    font-feature-settings: 'liga' 1, 'calt' 1;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+/* Dot-grid HUD background */
+.page {
+    background-image:
+        radial-gradient(circle, var(--cp-dot-color) 1px, transparent 1px);
+    background-size: var(--cp-grid-size) var(--cp-grid-size);
+    background-position: center center;
+}
+
+/* Subtle scanline overlay */
+.main {
+    position: relative;
+}
+.main::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        #00e5ff02 2px,
+        #00e5ff02 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+::-webkit-scrollbar-track {
+    background: var(--cp-void);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--cp-surface-3);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--cp-accent);
+    box-shadow: var(--cp-accent-glow);
+}
+
+/* Selection */
+::selection {
+    background: #ff2d6f44;
+    color: #fff;
+}
+
+/* ===========================
+   TYPOGRAPHY
+   =========================== */
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-stack--headings);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--cp-text);
+}
+
+h1 {
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    position: relative;
+    padding-bottom: 0.5em;
+}
+h1::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 120px;
+    height: 2px;
+    background: linear-gradient(90deg, var(--cp-accent), transparent);
+    border-radius: 1px;
+    box-shadow: 0 0 8px var(--cp-accent-dim);
+}
+
+h2 {
+    color: var(--cp-text);
+    border-bottom: 1px solid var(--cp-border);
+    padding-bottom: 0.3em;
+}
+
+/* ===========================
+   LINKS
+   =========================== */
+a {
+    transition: color 0.2s ease, text-shadow 0.2s ease;
+}
+a:hover {
+    text-shadow: 0 0 8px var(--cp-accent-dim);
+}
+
+/* ===========================
+   SIDEBAR
+   =========================== */
+.sidebar-drawer {
+    border-right: 1px solid var(--cp-border) !important;
+}
+
+/* Neon accent line on left edge */
+.sidebar-drawer::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 2px;
+    height: 100%;
+    background: linear-gradient(
+        180deg,
+        var(--cp-accent) 0%,
+        var(--cp-purple) 50%,
+        var(--cp-magenta) 100%
+    );
+    opacity: 0.6;
+    box-shadow: var(--cp-accent-glow);
+}
+
+/* Sidebar brand / title */
+.sidebar-brand {
+    padding: 1.2rem 1rem;
+}
+.sidebar-brand-text {
+    font-family: 'Orbitron', var(--font-stack);
+    font-weight: 700;
+    font-size: 1.2rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--cp-accent) !important;
+    text-shadow: 0 0 12px var(--cp-accent-dim);
+}
+
+/* Sidebar navigation links */
+.sidebar-tree .reference {
+    transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+    border-left: 2px solid transparent;
+    margin-left: -2px;
+    padding-left: calc(0.5rem + 2px);
+}
+.sidebar-tree .reference:hover {
+    color: var(--cp-accent) !important;
+    border-left-color: var(--cp-accent);
+    background: var(--cp-accent-bg);
+}
+.sidebar-tree .current-page > .reference {
+    color: var(--cp-accent) !important;
+    border-left-color: var(--cp-accent);
+    background: var(--cp-accent-bg);
+    font-weight: 600;
+}
+.sidebar-tree .current-page > .reference::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 2px;
+    height: 60%;
+    background: var(--cp-accent);
+    box-shadow: var(--cp-accent-glow);
+}
+
+/* Sidebar caption headers */
+.sidebar-tree .caption {
+    font-family: 'Orbitron', var(--font-stack);
+    font-size: 0.65rem;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: var(--cp-accent) !important;
+    opacity: 0.8;
+    margin-top: 1.2rem;
+}
+
+/* Sidebar search */
+.sidebar-search-container {
+    border: 1px solid var(--cp-border) !important;
+    background: var(--cp-surface-1) !important;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.sidebar-search-container:focus-within {
+    border-color: var(--cp-accent) !important;
+    box-shadow: var(--cp-accent-glow) !important;
+}
+
+/* ===========================
+   CODE BLOCKS — Terminal Style
+   =========================== */
+/* Container */
+div.highlight {
+    position: relative;
+    background: var(--cp-surface-1) !important;
+    border: 1px solid var(--cp-border);
+    border-left: 3px solid var(--cp-accent);
+    border-radius: 6px;
+    overflow: hidden;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+div.highlight:hover {
+    border-color: var(--cp-border-bright);
+    border-left-color: var(--cp-accent);
+    box-shadow: var(--cp-accent-glow);
+}
+
+/* Terminal header bar */
+div.highlight::before {
+    content: '';
+    display: block;
+    height: 32px;
+    background: var(--cp-surface-2);
+    border-bottom: 1px solid var(--cp-border);
+    background-image:
+        radial-gradient(circle at 16px 16px, #ff5f5788 4px, transparent 4px),
+        radial-gradient(circle at 34px 16px, #ffbd2e88 4px, transparent 4px),
+        radial-gradient(circle at 52px 16px, #28c84088 4px, transparent 4px);
+    background-repeat: no-repeat;
+}
+
+/* Pre inside highlight */
+div.highlight pre {
+    background: transparent !important;
+    margin: 0;
+    padding: 1em 1.2em;
+    font-size: 0.88rem;
+    line-height: 1.6;
+    overflow-x: auto;
+}
+
+/* Inline code */
+code.literal {
+    background: var(--cp-surface-2) !important;
+    border: 1px solid var(--cp-border);
+    border-radius: 4px;
+    padding: 0.15em 0.4em;
+    font-size: 0.88em;
+    color: var(--cp-accent) !important;
+    transition: border-color 0.2s ease;
+}
+code.literal:hover {
+    border-color: var(--cp-accent-dim);
+}
+
+/* ===========================
+   SYNTAX HIGHLIGHTING — Neon Palette
+   =========================== */
+.highlight .k,
+.highlight .kn,
+.highlight .kd,
+.highlight .kc,
+.highlight .kr { color: var(--cp-magenta); font-weight: 500; }     /* keywords */
+
+.highlight .s,
+.highlight .s1,
+.highlight .s2,
+.highlight .sa,
+.highlight .sb,
+.highlight .sc,
+.highlight .se { color: var(--cp-green); }                          /* strings */
+
+.highlight .c,
+.highlight .c1,
+.highlight .cm,
+.highlight .cs,
+.highlight .ch { color: var(--cp-text-dim); font-style: italic; }   /* comments */
+
+.highlight .nf,
+.highlight .fm,
+.highlight .nc { color: var(--cp-cyan); }                           /* functions, classes */
+
+.highlight .nb,
+.highlight .bp { color: var(--cp-purple); }                         /* builtins */
+
+.highlight .n,
+.highlight .nn,
+.highlight .no { color: var(--cp-text); }                           /* names */
+
+.highlight .o,
+.highlight .ow { color: var(--cp-magenta); opacity: 0.8; }         /* operators */
+
+.highlight .p  { color: var(--cp-text-muted); }                     /* punctuation */
+
+.highlight .mi,
+.highlight .mf,
+.highlight .mh,
+.highlight .mo,
+.highlight .mb,
+.highlight .il { color: var(--cp-amber); }                          /* numbers */
+
+.highlight .si { color: var(--cp-cyan); }                           /* string interpolation */
+.highlight .ss { color: var(--cp-purple); }                         /* symbol */
+
+.highlight .nd { color: var(--cp-amber); }                          /* decorator */
+
+/* ===========================
+   ADMONITIONS — Neon Borders
+   =========================== */
+.admonition {
+    background: var(--cp-surface-1) !important;
+    border: 1px solid var(--cp-border) !important;
+    border-left: 3px solid var(--cp-accent) !important;
+    border-radius: 6px;
+    overflow: hidden;
+    transition: box-shadow 0.2s ease;
+}
+.admonition:hover {
+    box-shadow: 0 0 12px #00e5ff11;
+}
+
+.admonition > .admonition-title {
+    background: var(--cp-surface-2) !important;
+    font-family: var(--font-stack--headings);
+    font-weight: 600;
+    letter-spacing: 0.02em;
+}
+
+/* Type-specific colors */
+.admonition.note { border-left-color: var(--cp-cyan) !important; }
+.admonition.note > .admonition-title { color: var(--cp-cyan); }
+
+.admonition.tip,
+.admonition.hint { border-left-color: var(--cp-green) !important; }
+.admonition.tip > .admonition-title,
+.admonition.hint > .admonition-title { color: var(--cp-green); }
+
+.admonition.warning,
+.admonition.caution { border-left-color: var(--cp-amber) !important; }
+.admonition.warning > .admonition-title,
+.admonition.caution > .admonition-title { color: var(--cp-amber); }
+
+.admonition.danger,
+.admonition.error { border-left-color: var(--cp-magenta) !important; }
+.admonition.danger > .admonition-title,
+.admonition.error > .admonition-title { color: var(--cp-magenta); }
+
+.admonition.important { border-left-color: var(--cp-purple) !important; }
+.admonition.important > .admonition-title { color: var(--cp-purple); }
+
+/* ===========================
+   TABLES
+   =========================== */
+table {
+    border-collapse: collapse;
+}
+table th {
+    background: var(--cp-surface-2) !important;
+    font-family: var(--font-stack--headings);
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    font-size: 0.82em;
+    color: var(--cp-accent);
+    border-bottom: 2px solid var(--cp-accent-dim) !important;
+}
+table td {
+    border-bottom: 1px solid var(--cp-border) !important;
+}
+table tr:hover td {
+    background: var(--cp-accent-bg);
+}
+
+/* ===========================
+   TOC (Right sidebar)
+   =========================== */
+.toc-tree a {
+    transition: color 0.15s ease;
+}
+.toc-tree a.active {
+    color: var(--cp-accent) !important;
+}
+
+/* ===========================
+   HERO SECTION (Landing page)
+   =========================== */
+.cp-hero {
+    position: relative;
+    margin: -1rem -1rem 2rem -1rem;
+    padding: 4rem 2rem;
+    background:
+        radial-gradient(ellipse at 30% 20%, #00e5ff08 0%, transparent 60%),
+        radial-gradient(ellipse at 70% 80%, #a855f708 0%, transparent 60%),
+        var(--cp-void);
+    border-bottom: 1px solid var(--cp-border);
+    overflow: hidden;
+    min-height: 280px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+/* Particle canvas sits behind content */
+.cp-hero canvas {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+.cp-hero-content {
+    position: relative;
+    z-index: 2;
+}
+
+/* Hero title with glitch effect */
+.cp-hero-title {
+    font-family: 'Orbitron', var(--font-stack);
+    font-weight: 900;
+    font-size: clamp(2.4rem, 5vw, 3.6rem);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: #fff;
+    text-shadow: 0 0 20px var(--cp-accent-dim), 0 0 60px #00e5ff22;
+    margin: 0 0 0.3em 0;
+    line-height: 1.1;
+    border: none;
+    padding-bottom: 0;
+}
+.cp-hero-title::after {
+    display: none; /* Remove the h1 gradient line in hero */
+}
+
+/* Accent color in title */
+.cp-hero-title .accent {
+    color: var(--cp-accent);
+    text-shadow: 0 0 20px var(--cp-accent), 0 0 60px var(--cp-accent-dim);
+}
+
+/* Glitch animation */
+.cp-hero-title[data-glitch] {
+    position: relative;
+}
+.cp-hero-title[data-glitch]::before,
+.cp-hero-title[data-glitch]::after {
+    content: attr(data-glitch);
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    pointer-events: none;
+}
+.cp-hero-title[data-glitch]::before {
+    color: var(--cp-cyan);
+    z-index: -1;
+}
+.cp-hero-title[data-glitch]::after {
+    color: var(--cp-magenta);
+    z-index: -1;
+}
+.cp-hero-title[data-glitch].glitch-active::before {
+    animation: glitch-shift-1 0.3s steps(2) 1;
+    opacity: 0.8;
+}
+.cp-hero-title[data-glitch].glitch-active::after {
+    animation: glitch-shift-2 0.3s steps(2) 1;
+    opacity: 0.8;
+}
+
+@keyframes glitch-shift-1 {
+    0%   { clip-path: inset(40% 0 20% 0); transform: translate(-3px, 1px); }
+    25%  { clip-path: inset(10% 0 60% 0); transform: translate(2px, -1px); }
+    50%  { clip-path: inset(70% 0 5% 0);  transform: translate(-1px, 2px); }
+    75%  { clip-path: inset(20% 0 40% 0); transform: translate(3px, 0); }
+    100% { clip-path: inset(0); transform: translate(0); opacity: 0; }
+}
+@keyframes glitch-shift-2 {
+    0%   { clip-path: inset(60% 0 10% 0); transform: translate(3px, -1px); }
+    25%  { clip-path: inset(5% 0 70% 0);  transform: translate(-2px, 2px); }
+    50%  { clip-path: inset(30% 0 30% 0); transform: translate(1px, -2px); }
+    75%  { clip-path: inset(50% 0 20% 0); transform: translate(-3px, 1px); }
+    100% { clip-path: inset(0); transform: translate(0); opacity: 0; }
+}
+
+/* Hero subtitle */
+.cp-hero-subtitle {
+    font-family: var(--font-stack);
+    font-size: 1.15rem;
+    font-weight: 300;
+    color: var(--cp-text-muted);
+    margin: 0 0 2rem 0;
+    max-width: 600px;
+    line-height: 1.5;
+}
+
+/* Hero CTA buttons */
+.cp-hero-actions {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+}
+
+.cp-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5em;
+    padding: 0.7em 1.8em;
+    font-family: 'Orbitron', var(--font-stack);
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    text-decoration: none !important;
+    border-radius: 4px;
+    transition: all 0.25s ease;
+    position: relative;
+    overflow: hidden;
+}
+
+/* Primary button — neon outline */
+.cp-btn--primary {
+    color: var(--cp-accent) !important;
+    border: 1.5px solid var(--cp-accent);
+    background: var(--cp-accent-bg);
+}
+.cp-btn--primary:hover {
+    background: #00e5ff18;
+    box-shadow: var(--cp-accent-glow-strong);
+    text-shadow: 0 0 8px var(--cp-accent-dim);
+    color: #fff !important;
+    transform: translateY(-1px);
+}
+
+/* Secondary button — muted */
+.cp-btn--secondary {
+    color: var(--cp-text-muted) !important;
+    border: 1.5px solid var(--cp-border-bright);
+    background: var(--cp-surface-1);
+}
+.cp-btn--secondary:hover {
+    border-color: var(--cp-purple);
+    color: var(--cp-purple) !important;
+    box-shadow: 0 0 8px #a855f733, 0 0 30px #a855f711;
+    transform: translateY(-1px);
+}
+
+/* Animated sweep on buttons */
+.cp-btn::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: -100%;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, transparent, #ffffff08, transparent);
+    transition: left 0.5s ease;
+}
+.cp-btn:hover::before {
+    left: 100%;
+}
+
+/* ===========================
+   FEATURE CARDS (Landing)
+   =========================== */
+.cp-features {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 1.2rem;
+    margin: 2rem 0;
+}
+
+.cp-card {
+    background: var(--cp-surface-1);
+    border: 1px solid var(--cp-border);
+    border-radius: 8px;
+    padding: 1.5rem;
+    transition: border-color 0.25s ease, box-shadow 0.25s ease, transform 0.25s ease;
+    position: relative;
+    overflow: hidden;
+}
+.cp-card:hover {
+    border-color: var(--cp-accent-dim);
+    box-shadow: var(--cp-accent-glow);
+    transform: translateY(-2px);
+}
+
+/* Top gradient line on cards */
+.cp-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, var(--cp-accent), var(--cp-purple));
+    opacity: 0;
+    transition: opacity 0.25s ease;
+}
+.cp-card:hover::before {
+    opacity: 1;
+}
+
+.cp-card h3 {
+    font-family: 'Orbitron', var(--font-stack);
+    font-size: 0.8rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--cp-accent);
+    margin: 0 0 0.6rem 0;
+}
+
+.cp-card p {
+    color: var(--cp-text-muted);
+    font-size: 0.9rem;
+    line-height: 1.5;
+    margin: 0;
+}
+
+/* ===========================
+   HUD CORNERS (Content area)
+   =========================== */
+.content-icon-container + article.bd-article {
+    position: relative;
+}
+
+/* ===========================
+   FOOTER
+   =========================== */
+footer {
+    border-top: 1px solid var(--cp-border) !important;
+}
+footer::before {
+    content: '';
+    display: block;
+    width: 80px;
+    height: 1px;
+    background: linear-gradient(90deg, var(--cp-accent), transparent);
+    margin-bottom: 1rem;
+    box-shadow: 0 0 6px var(--cp-accent-dim);
+}
+
+/* ===========================
+   COPY BUTTON
+   =========================== */
+button.copybtn {
+    background: var(--cp-surface-2) !important;
+    border: 1px solid var(--cp-border) !important;
+    color: var(--cp-text-muted) !important;
+    border-radius: 4px !important;
+    transition: all 0.2s ease !important;
+}
+button.copybtn:hover {
+    border-color: var(--cp-accent) !important;
+    color: var(--cp-accent) !important;
+    box-shadow: var(--cp-accent-glow) !important;
+}
+
+/* ===========================
+   API DOCS
+   =========================== */
+dl.py dt {
+    background: var(--cp-surface-1) !important;
+    border-left: 3px solid var(--cp-purple);
+    border-radius: 0 4px 4px 0;
+    padding: 0.5em 0.8em;
+    font-family: var(--font-stack--monospace);
+}
+dl.py dt:hover {
+    border-left-color: var(--cp-accent);
+}
+
+/* ===========================
+   GLOW-ON-SCROLL
+   =========================== */
+.cp-reveal {
+    opacity: 0;
+    transform: translateY(16px);
+    transition: opacity 0.5s ease, transform 0.5s ease;
+}
+.cp-reveal.visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* ===========================
+   HEADER / ANNOUNCEMENT BAR
+   =========================== */
+.announcement {
+    background: linear-gradient(90deg, var(--cp-surface-2), var(--cp-surface-1)) !important;
+    font-family: var(--font-stack--monospace);
+    font-size: 0.8rem;
+    letter-spacing: 0.03em;
+}
+
+/* ===========================
+   MOBILE / RESPONSIVE
+   =========================== */
+@media (max-width: 768px) {
+    .cp-hero {
+        padding: 2.5rem 1.2rem;
+        margin: -0.5rem -0.5rem 1.5rem -0.5rem;
+    }
+    .cp-hero-title {
+        font-size: 2rem;
+    }
+    .cp-features {
+        grid-template-columns: 1fr;
+    }
+    .cp-hero-actions {
+        flex-direction: column;
+    }
+    .cp-btn {
+        text-align: center;
+        justify-content: center;
+    }
+}
+
+/* ===========================
+   REDUCED MOTION
+   =========================== */
+@media (prefers-reduced-motion: reduce) {
+    .cp-hero-title[data-glitch].glitch-active::before,
+    .cp-hero-title[data-glitch].glitch-active::after {
+        animation: none !important;
+        opacity: 0 !important;
+    }
+    .cp-btn::before {
+        display: none;
+    }
+    .cp-reveal {
+        opacity: 1;
+        transform: none;
+        transition: none;
+    }
+    .main::before {
+        display: none;
+    }
+    canvas.cp-particles {
+        display: none !important;
+    }
+}
+
+/* ===========================
+   PRINT
+   =========================== */
+@media print {
+    .main::before,
+    canvas.cp-particles,
+    .sidebar-drawer::before {
+        display: none !important;
+    }
+    body {
+        background: #fff;
+        color: #000;
+    }
+}
