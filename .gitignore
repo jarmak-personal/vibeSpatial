@@ -20,6 +20,7 @@ docs/_build/
 # Runtime artifacts
 cufile.log
 result_images/
+<_io.BytesIO object at *>
 
 # Benchmark fixture cache and results
 .benchmark_fixtures/
