@@ -1,9 +1,9 @@
 """Sphinx configuration for vibeSpatial documentation."""
 
 project = "vibeSpatial"
-copyright = "2025, vibeSpatial Contributors"
+copyright = "2026, vibeSpatial Contributors"
 author = "vibeSpatial Contributors"
-release = "0.1.0"
+release = "0.1.2"
 
 extensions = [
     "myst_parser",
