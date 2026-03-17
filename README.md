@@ -6,6 +6,9 @@ predicates, buffer, overlay, dissolve, make-valid, spatial joins, and I/O all
 dispatch to GPU kernels automatically, with transparent CPU fallback when no
 GPU is available.
 
+> [!WARNING]
+> vibeSpatial is very early in development. Operations may be unoptimized or have multiple Host/Device transfers causing reduced performance. [File an issue](https://github.com/jarmak-personal/vibeSpatial/issues) if you hit a problem!
+
 ### Install
 
 ```bash
