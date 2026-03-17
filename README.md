@@ -94,7 +94,14 @@ kernels.
 
 All GPU kernels are **pure Python** — CUDA C source strings compiled at
 runtime via NVRTC with background warmup (ADR-0034).  No compiled extensions,
-no `nvcc` build step.
+no `nvcc` build step.  The entire suite ships as pure-Python wheels:
+
+| Package | Wheel size |
+|---|---|
+| vibespatial | 612 KB |
+| vibeproj | 57 KB |
+| vibespatial-raster | 51 KB |
+| **Total** | **720 KB** |
 
 ### Documentation
 
