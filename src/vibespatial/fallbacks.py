@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -23,6 +24,8 @@ class FallbackEvent:
     selected: ExecutionMode
     reason: str
     detail: str = ""
+    pipeline: str = ""
+    d2h_transfer: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -46,6 +49,8 @@ def record_fallback_event(
     detail: str = "",
     requested: ExecutionMode | str = ExecutionMode.AUTO,
     selected: ExecutionMode | str = ExecutionMode.CPU,
+    pipeline: str = "",
+    d2h_transfer: bool = False,
 ) -> FallbackEvent:
     event = FallbackEvent(
         surface=surface,
@@ -53,9 +58,30 @@ def record_fallback_event(
         selected=selected if isinstance(selected, ExecutionMode) else ExecutionMode(selected),
         reason=reason,
         detail=detail,
+        pipeline=pipeline,
+        d2h_transfer=d2h_transfer,
     )
     _FALLBACK_EVENTS.append(event)
     append_event_record("fallback", event.to_dict())
+    from vibespatial.execution_trace import notify_dispatch
+
+    notify_dispatch(
+        surface=surface,
+        operation="fallback",
+        selected=ExecutionMode.CPU,
+        implementation="cpu_fallback",
+    )
+    from vibespatial.execution_trace import VibeTraceWarning, _trace_warnings_enabled
+
+    if _trace_warnings_enabled():
+        parts = [f"[vibeSpatial] CPU fallback: {surface} -- {reason}"]
+        if pipeline:
+            parts.append(f"  pipeline: {pipeline}")
+        if d2h_transfer:
+            parts.append("  ** device-to-host transfer triggered **")
+        if detail:
+            parts.append(f"  detail: {detail}")
+        warnings.warn("\n".join(parts), VibeTraceWarning, stacklevel=2)
     if strict_native_mode_enabled():
         raise StrictNativeFallbackError(
             f"strict native mode disallows geopandas fallback: {surface} :: {reason}"

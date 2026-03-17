@@ -67,6 +67,14 @@ def record_dispatch_event(
     )
     _DISPATCH_EVENTS.append(event)
     append_event_record("dispatch", event.to_dict())
+    from vibespatial.execution_trace import notify_dispatch
+
+    notify_dispatch(
+        surface=event.surface,
+        operation=event.operation,
+        selected=event.selected,
+        implementation=event.implementation,
+    )
     return event
 
 

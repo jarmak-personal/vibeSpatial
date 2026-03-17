@@ -1522,32 +1522,35 @@ def evaluate_geopandas_clip_by_rect(
     xmax: float,
     ymax: float,
 ) -> tuple[np.ndarray | None, ExecutionMode]:
-    geometries = np.asarray(values, dtype=object)
-    non_null = np.fromiter((geometry is not None for geometry in geometries), dtype=bool, count=len(geometries))
-    gpu_available = False
-    if np.any(non_null):
-        type_ids = np.asarray(shapely.get_type_id(geometries[non_null]), dtype=np.int32)
-        gpu_available = bool(np.all(type_ids == _POINT_TYPE_ID))
+    from vibespatial.execution_trace import execution_trace
 
-    plan = plan_kernel_dispatch(
-        kernel_name="clip_by_rect",
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        row_count=len(geometries),
-        gpu_available=gpu_available,
-    )
-    dispatch_mode = ExecutionMode.GPU if plan.dispatch_decision is DispatchDecision.GPU else ExecutionMode.CPU
-    try:
-        result = clip_by_rect_owned(
-            geometries,
-            xmin,
-            ymin,
-            xmax,
-            ymax,
-            dispatch_mode=dispatch_mode,
+    with execution_trace("clip_by_rect"):
+        geometries = np.asarray(values, dtype=object)
+        non_null = np.fromiter((geometry is not None for geometry in geometries), dtype=bool, count=len(geometries))
+        gpu_available = False
+        if np.any(non_null):
+            type_ids = np.asarray(shapely.get_type_id(geometries[non_null]), dtype=np.int32)
+            gpu_available = bool(np.all(type_ids == _POINT_TYPE_ID))
+
+        plan = plan_kernel_dispatch(
+            kernel_name="clip_by_rect",
+            kernel_class=KernelClass.CONSTRUCTIVE,
+            row_count=len(geometries),
+            gpu_available=gpu_available,
         )
-    except NotImplementedError:
-        return None, ExecutionMode.CPU
-    return np.asarray(result.geometries, dtype=object), dispatch_mode
+        dispatch_mode = ExecutionMode.GPU if plan.dispatch_decision is DispatchDecision.GPU else ExecutionMode.CPU
+        try:
+            result = clip_by_rect_owned(
+                geometries,
+                xmin,
+                ymin,
+                xmax,
+                ymax,
+                dispatch_mode=dispatch_mode,
+            )
+        except NotImplementedError:
+            return None, ExecutionMode.CPU
+        return np.asarray(result.geometries, dtype=object), dispatch_mode
 
 
 def benchmark_clip_by_rect(

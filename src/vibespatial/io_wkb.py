@@ -712,6 +712,8 @@ def _write_geoparquet_native_device(
                     reason=f"device-side GeoArrow fast path unavailable for column {column_name}; falling back to WKB",
                     detail=fast_path_reason,
                     selected=ExecutionMode.CPU,
+                    pipeline="io/to_parquet",
+                    d2h_transfer=True,
                 )
             table_columns.append(_encode_owned_wkb_column_device(owned))
             geometry_encoding_dict[column_name] = "WKB"
@@ -1889,6 +1891,7 @@ def decode_wkb_owned(
             reason="explicit CPU fallback for unsupported or malformed WKB rows",
             detail=f"{partition_plan.fallback_rows} rows entered the fallback pool during staged decode",
             selected=ExecutionMode.CPU,
+            pipeline="io/wkb_decode",
         )
     return array
 
@@ -2011,6 +2014,8 @@ def encode_wkb_owned(
             reason="explicit CPU fallback for unsupported owned rows during WKB encode",
             detail=f"{partition_plan.fallback_rows} rows entered the fallback pool during staged encode",
             selected=ExecutionMode.CPU,
+            pipeline="io/wkb_encode",
+            d2h_transfer=True,
         )
     return values
 

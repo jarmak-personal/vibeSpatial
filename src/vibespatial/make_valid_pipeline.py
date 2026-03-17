@@ -559,7 +559,10 @@ def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: b
 
 
 def evaluate_geopandas_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True):
-    return make_valid_owned(values, method=method, keep_collapsed=keep_collapsed).geometries
+    from vibespatial.execution_trace import execution_trace
+
+    with execution_trace("make_valid"):
+        return make_valid_owned(values, method=method, keep_collapsed=keep_collapsed).geometries
 
 
 def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True, dataset: str = "make-valid"):

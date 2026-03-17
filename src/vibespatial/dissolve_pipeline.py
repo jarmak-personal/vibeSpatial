@@ -415,45 +415,48 @@ def evaluate_geopandas_dissolve(
     grid_size: float | None,
     agg_kwargs: dict[str, Any],
 ):
-    normalized_method = DissolveUnionMethod(method)
-    if normalized_method is not DissolveUnionMethod.UNARY and grid_size is not None:
-        raise ValueError(f"grid_size is not supported for method '{method}'.")
+    from vibespatial.execution_trace import execution_trace
 
-    if by is None and level is None:
-        by = np.zeros(len(frame), dtype="int64")
+    with execution_trace("dissolve"):
+        normalized_method = DissolveUnionMethod(method)
+        if normalized_method is not DissolveUnionMethod.UNARY and grid_size is not None:
+            raise ValueError(f"grid_size is not supported for method '{method}'.")
 
-    groupby_kwargs = {
-        "by": by,
-        "level": level,
-        "sort": sort,
-        "observed": observed,
-        "dropna": dropna,
-    }
+        if by is None and level is None:
+            by = np.zeros(len(frame), dtype="int64")
 
-    data = frame.drop(labels=frame.geometry.name, axis=1)
-    aggregated_data = data.groupby(**groupby_kwargs).agg(aggfunc, **agg_kwargs)
-    aggregated_data.columns = aggregated_data.columns.to_flat_index()
+        groupby_kwargs = {
+            "by": by,
+            "level": level,
+            "sort": sort,
+            "observed": observed,
+            "dropna": dropna,
+        }
 
-    grouped_geometry = frame.groupby(group_keys=False, **groupby_kwargs)[frame.geometry.name]
-    indices_items = list(grouped_geometry.indices.items())
-    group_positions = _normalize_group_positions(aggregated_data.index, indices_items)
-    grouped_union = execute_grouped_union(
-        np.asarray(frame.geometry.array, dtype=object),
-        group_positions,
-        method=normalized_method,
-        grid_size=grid_size,
-    )
+        data = frame.drop(labels=frame.geometry.name, axis=1)
+        aggregated_data = data.groupby(**groupby_kwargs).agg(aggfunc, **agg_kwargs)
+        aggregated_data.columns = aggregated_data.columns.to_flat_index()
 
-    geometry_frame = type(frame)(
-        {frame.geometry.name: grouped_union.geometries},
-        geometry=frame.geometry.name,
-        index=aggregated_data.index,
-        crs=frame.crs,
-    )
-    aggregated = geometry_frame.join(aggregated_data)
-    if not as_index:
-        aggregated = aggregated.reset_index()
-    return aggregated
+        grouped_geometry = frame.groupby(group_keys=False, **groupby_kwargs)[frame.geometry.name]
+        indices_items = list(grouped_geometry.indices.items())
+        group_positions = _normalize_group_positions(aggregated_data.index, indices_items)
+        grouped_union = execute_grouped_union(
+            np.asarray(frame.geometry.array, dtype=object),
+            group_positions,
+            method=normalized_method,
+            grid_size=grid_size,
+        )
+
+        geometry_frame = type(frame)(
+            {frame.geometry.name: grouped_union.geometries},
+            geometry=frame.geometry.name,
+            index=aggregated_data.index,
+            crs=frame.crs,
+        )
+        aggregated = geometry_frame.join(aggregated_data)
+        if not as_index:
+            aggregated = aggregated.reset_index()
+        return aggregated
 
 
 def benchmark_dissolve_pipeline(

@@ -39,6 +39,13 @@ from .cccl_precompile import (
     precompile_enabled,
     precompile_status,
 )
+from .execution_trace import (
+    ExecutionTraceContext,
+    TRACE_WARNINGS_ENV_VAR,
+    VibeTraceWarning,
+    execution_trace,
+    get_active_trace,
+)
 from .fallbacks import (
     FallbackEvent,
     STRICT_NATIVE_ENV_VAR,
@@ -364,6 +371,10 @@ __all__ = [
     "DevicePrecisionProfile",
     "DispatchDecision",
     "ExecutionMode",
+    "ExecutionTraceContext",
+    "TRACE_WARNINGS_ENV_VAR",
+    "VibeTraceWarning",
+    "execution_trace",
     "FallbackEvent",
     "FamilyGeometryBuffer",
     "FlatSpatialIndex",
@@ -483,6 +494,7 @@ __all__ = [
     "fusion_plan_for_dissolve",
     "fusion_plan_for_make_valid",
     "fusion_plan_for_stroke",
+    "get_active_trace",
     "get_dispatch_events",
     "get_fallback_events",
     "extract_segment_mbrs",

@@ -486,104 +486,108 @@ def evaluate_geopandas_buffer(
     mitre_limit: float,
     single_sided: bool,
 ):
-    geometries = np.asarray(values, dtype=object)
-    detail = (
-        f"cap_style={cap_style}, join_style={join_style}, mitre_limit={mitre_limit}, "
-        f"single_sided={single_sided}, quad_segs={quad_segs}, rows={len(geometries)}"
-    )
-    # --- Point buffer surface ---
-    if _supports_point_buffer_surface(
-        geometries,
-        cap_style=cap_style,
-        join_style=join_style,
-        single_sided=single_sided,
-    ):
-        gpu_available = has_gpu_runtime() and _supports_point_buffer_gpu_surface(
+    from vibespatial.execution_trace import execution_trace
+
+    with execution_trace("buffer"):
+        geometries = np.asarray(values, dtype=object)
+        detail = (
+            f"cap_style={cap_style}, join_style={join_style}, mitre_limit={mitre_limit}, "
+            f"single_sided={single_sided}, quad_segs={quad_segs}, rows={len(geometries)}"
+        )
+        # --- Point buffer surface ---
+        if _supports_point_buffer_surface(
             geometries,
-            quad_segs=quad_segs,
             cap_style=cap_style,
             join_style=join_style,
             single_sided=single_sided,
-        )
-        plan = plan_kernel_dispatch(
-            kernel_name="point_buffer",
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            row_count=len(geometries),
-            gpu_available=gpu_available,
-        )
-        dispatch_decision = plan.dispatch_decision
-        if dispatch_decision is DispatchDecision.GPU:
-            owned = from_shapely_geometries(geometries.tolist())
-            result = point_buffer_owned_array(
-                owned,
-                distance,
-                quad_segs=quad_segs,
-                dispatch_mode=ExecutionMode.GPU,
-            )
-            return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
-
-        result = point_buffer_owned(geometries, distance, quad_segs=quad_segs)
-        if result.fallback_rows.size == 0:
-            return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
-        record_fallback_event(
-            surface="geopandas.array.buffer",
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.CPU,
-            reason="repo-owned buffer kernel still needs host fallback rows on this input; using explicit CPU fallback",
-            detail=detail,
-        )
-        return None, ExecutionMode.CPU
-
-    # --- LineString buffer surface ---
-    if _supports_linestring_buffer_gpu_surface(
-        geometries,
-        quad_segs=quad_segs,
-        single_sided=single_sided,
-    ):
-        from vibespatial.linestring_constructive import linestring_buffer_owned_array
-
-        if plan_dispatch_selection(
-            kernel_name="linestring_buffer",
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            row_count=len(geometries),
-        ).selected is ExecutionMode.GPU:
-            owned = from_shapely_geometries(geometries.tolist())
-            result = linestring_buffer_owned_array(
-                owned,
-                distance,
+        ):
+            gpu_available = has_gpu_runtime() and _supports_point_buffer_gpu_surface(
+                geometries,
                 quad_segs=quad_segs,
                 cap_style=cap_style,
                 join_style=join_style,
-                mitre_limit=mitre_limit,
-                dispatch_mode=ExecutionMode.GPU,
+                single_sided=single_sided,
             )
-            return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
-
-    # --- Polygon buffer surface ---
-    if _supports_polygon_buffer_gpu_surface(
-        geometries,
-        quad_segs=quad_segs,
-        single_sided=single_sided,
-    ):
-        from vibespatial.polygon_constructive import polygon_buffer_owned_array
-
-        if plan_dispatch_selection(
-            kernel_name="polygon_buffer",
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            row_count=len(geometries),
-        ).selected is ExecutionMode.GPU:
-            owned = from_shapely_geometries(geometries.tolist())
-            result = polygon_buffer_owned_array(
-                owned,
-                distance,
-                quad_segs=quad_segs,
-                join_style=join_style,
-                mitre_limit=mitre_limit,
-                dispatch_mode=ExecutionMode.GPU,
+            plan = plan_kernel_dispatch(
+                kernel_name="point_buffer",
+                kernel_class=KernelClass.CONSTRUCTIVE,
+                row_count=len(geometries),
+                gpu_available=gpu_available,
             )
-            return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
+            dispatch_decision = plan.dispatch_decision
+            if dispatch_decision is DispatchDecision.GPU:
+                owned = from_shapely_geometries(geometries.tolist())
+                result = point_buffer_owned_array(
+                    owned,
+                    distance,
+                    quad_segs=quad_segs,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
 
-    return None, ExecutionMode.CPU
+            result = point_buffer_owned(geometries, distance, quad_segs=quad_segs)
+            if result.fallback_rows.size == 0:
+                return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
+            record_fallback_event(
+                surface="geopandas.array.buffer",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason="repo-owned buffer kernel still needs host fallback rows on this input; using explicit CPU fallback",
+                detail=detail,
+                pipeline="constructive/buffer",
+            )
+            return None, ExecutionMode.CPU
+
+        # --- LineString buffer surface ---
+        if _supports_linestring_buffer_gpu_surface(
+            geometries,
+            quad_segs=quad_segs,
+            single_sided=single_sided,
+        ):
+            from vibespatial.linestring_constructive import linestring_buffer_owned_array
+
+            if plan_dispatch_selection(
+                kernel_name="linestring_buffer",
+                kernel_class=KernelClass.CONSTRUCTIVE,
+                row_count=len(geometries),
+            ).selected is ExecutionMode.GPU:
+                owned = from_shapely_geometries(geometries.tolist())
+                result = linestring_buffer_owned_array(
+                    owned,
+                    distance,
+                    quad_segs=quad_segs,
+                    cap_style=cap_style,
+                    join_style=join_style,
+                    mitre_limit=mitre_limit,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
+
+        # --- Polygon buffer surface ---
+        if _supports_polygon_buffer_gpu_surface(
+            geometries,
+            quad_segs=quad_segs,
+            single_sided=single_sided,
+        ):
+            from vibespatial.polygon_constructive import polygon_buffer_owned_array
+
+            if plan_dispatch_selection(
+                kernel_name="polygon_buffer",
+                kernel_class=KernelClass.CONSTRUCTIVE,
+                row_count=len(geometries),
+            ).selected is ExecutionMode.GPU:
+                owned = from_shapely_geometries(geometries.tolist())
+                result = polygon_buffer_owned_array(
+                    owned,
+                    distance,
+                    quad_segs=quad_segs,
+                    join_style=join_style,
+                    mitre_limit=mitre_limit,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
+
+        return None, ExecutionMode.CPU
 
 
 def evaluate_geopandas_offset_curve(
@@ -594,33 +598,38 @@ def evaluate_geopandas_offset_curve(
     join_style,
     mitre_limit: float,
 ):
-    geometries = np.asarray(values, dtype=object)
-    detail = f"join_style={join_style}, mitre_limit={mitre_limit}, quad_segs={quad_segs}, rows={len(geometries)}"
-    if not _supports_offset_curve_surface(geometries, join_style=join_style):
+    from vibespatial.execution_trace import execution_trace
+
+    with execution_trace("offset_curve"):
+        geometries = np.asarray(values, dtype=object)
+        detail = f"join_style={join_style}, mitre_limit={mitre_limit}, quad_segs={quad_segs}, rows={len(geometries)}"
+        if not _supports_offset_curve_surface(geometries, join_style=join_style):
+            record_fallback_event(
+                surface="geopandas.array.offset_curve",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                reason="repo-owned offset-curve kernel cannot claim the GeoPandas surface for current rows/kwargs; using explicit CPU fallback",
+                detail=detail,
+                pipeline="constructive/offset_curve",
+            )
+            return None, ExecutionMode.CPU
+
+        result = offset_curve_owned(
+            geometries,
+            distance,
+            quad_segs=quad_segs,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
+        )
+        if result.fallback_rows.size == 0:
+            return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
         record_fallback_event(
             surface="geopandas.array.offset_curve",
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.CPU,
-            reason="repo-owned offset-curve kernel cannot claim the GeoPandas surface for current rows/kwargs; using explicit CPU fallback",
+            reason="repo-owned offset-curve kernel still needs host fallback rows on this input; using explicit CPU fallback",
             detail=detail,
+            pipeline="constructive/offset_curve",
         )
         return None, ExecutionMode.CPU
-
-    result = offset_curve_owned(
-        geometries,
-        distance,
-        quad_segs=quad_segs,
-        join_style=join_style,
-        mitre_limit=mitre_limit,
-    )
-    if result.fallback_rows.size == 0:
-        return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
-    record_fallback_event(
-        surface="geopandas.array.offset_curve",
-        reason="repo-owned offset-curve kernel still needs host fallback rows on this input; using explicit CPU fallback",
-        detail=detail,
-    )
-    return None, ExecutionMode.CPU
 
 
 def benchmark_point_buffer(values, *, distance: float, quad_segs: int = 16, dataset: str = "point-buffer") -> StrokeBenchmark:

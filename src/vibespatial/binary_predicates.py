@@ -763,44 +763,48 @@ def evaluate_geopandas_binary_predicate(
     right: object | np.ndarray,
     **kwargs: Any,
 ) -> np.ndarray | None:
-    if not supports_binary_predicate(predicate):
-        record_fallback_event(
-            surface=f"geopandas.array.{predicate}",
-            reason="predicate is not wired to a repo-owned kernel; using host Shapely path",
-            detail="unsupported by repo-owned exact predicate engine",
+    from vibespatial.execution_trace import execution_trace
+
+    with execution_trace(f"predicate/{predicate}"):
+        if not supports_binary_predicate(predicate):
+            record_fallback_event(
+                surface=f"geopandas.array.{predicate}",
+                reason="predicate is not wired to a repo-owned kernel; using host Shapely path",
+                detail="unsupported by repo-owned exact predicate engine",
+                pipeline="predicate",
+            )
+            return None
+        result = evaluate_binary_predicate(
+            predicate,
+            np.asarray(left, dtype=object),
+            right if np.isscalar(right) or right is None else np.asarray(right, dtype=object),
+            dispatch_mode=ExecutionMode.AUTO,
+            null_behavior=NullBehavior.FALSE,
+            **kwargs,
         )
-        return None
-    result = evaluate_binary_predicate(
-        predicate,
-        np.asarray(left, dtype=object),
-        right if np.isscalar(right) or right is None else np.asarray(right, dtype=object),
-        dispatch_mode=ExecutionMode.AUTO,
-        null_behavior=NullBehavior.FALSE,
-        **kwargs,
-    )
-    implementation = (
-        "owned_gpu_predicate"
-        if result.runtime_selection.selected is ExecutionMode.GPU
-        else "owned_cpu_predicate"
-    )
-    reason = (
-        "repo-owned binary predicate engine claimed the GeoPandas surface on GPU"
-        if result.runtime_selection.selected is ExecutionMode.GPU
-        else "repo-owned binary predicate engine claimed the GeoPandas surface on CPU"
-    )
-    record_dispatch_event(
-        surface=f"geopandas.array.{predicate}",
-        operation=predicate,
-        implementation=implementation,
-        reason=reason,
-        detail=(
-            f"rows={result.row_count}, candidate_rows={int(result.candidate_rows.size)}, "
-            f"selected={result.runtime_selection.selected.value}"
-        ),
-        requested=result.runtime_selection.requested,
-        selected=result.runtime_selection.selected,
-    )
-    return np.asarray(result.values, dtype=bool)
+        implementation = (
+            "owned_gpu_predicate"
+            if result.runtime_selection.selected is ExecutionMode.GPU
+            else "owned_cpu_predicate"
+        )
+        reason = (
+            "repo-owned binary predicate engine claimed the GeoPandas surface on GPU"
+            if result.runtime_selection.selected is ExecutionMode.GPU
+            else "repo-owned binary predicate engine claimed the GeoPandas surface on CPU"
+        )
+        record_dispatch_event(
+            surface=f"geopandas.array.{predicate}",
+            operation=predicate,
+            implementation=implementation,
+            reason=reason,
+            detail=(
+                f"rows={result.row_count}, candidate_rows={int(result.candidate_rows.size)}, "
+                f"selected={result.runtime_selection.selected.value}"
+            ),
+            requested=result.runtime_selection.requested,
+            selected=result.runtime_selection.selected,
+        )
+        return np.asarray(result.values, dtype=bool)
 
 
 def benchmark_binary_predicate(

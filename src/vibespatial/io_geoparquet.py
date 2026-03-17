@@ -578,6 +578,8 @@ def _read_geoparquet_with_pylibcudf(
             reason="explicit CPU fallback until pylibcudf device decode covers the written WKB family",
             detail=str(exc),
             selected=ExecutionMode.CPU,
+            pipeline="io/read_parquet",
+            d2h_transfer=True,
         )
         pyarrow_table = gpu_table.to_arrow()
         if schema is not None:
@@ -905,6 +907,8 @@ def _decode_geoparquet_table_to_owned(
                 reason="explicit CPU fallback until pylibcudf device decode covers the current GeoParquet shape",
                 detail=str(exc),
                 selected=ExecutionMode.CPU,
+                pipeline="io/read_parquet",
+                d2h_transfer=True,
             )
             table = table.to_arrow()
 
@@ -985,6 +989,7 @@ def read_geoparquet_owned(
             reason="explicit CPU fallback until GPU bbox expression pushdown lands",
             detail="owned scan used host-side filter path after row-group pruning",
             selected=ExecutionMode.CPU,
+            pipeline="io/read_parquet",
         )
 
     chunks: list[OwnedGeometryArray] = []
@@ -1151,6 +1156,8 @@ def _write_geoparquet_native(
                 reason=f"GeoArrow fast path unavailable for column {col_name}: {fast_path_reason}; falling back to WKB",
                 detail=fast_path_reason or "encode error",
                 selected=ExecutionMode.CPU,
+                pipeline="io/to_parquet",
+                d2h_transfer=True,
             )
 
         # WKB encoding — use owned-buffer WKB encoder when available

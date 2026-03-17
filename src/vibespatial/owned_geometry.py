@@ -185,6 +185,7 @@ class OwnedGeometryArray:
         elif target_residency is Residency.HOST:
             self._ensure_host_state()
         plan = select_residency_plan(current=self.residency, target=target, trigger=trigger)
+        old_residency = self.residency
         self.residency = plan.target
         self._record(
             DiagnosticKind.TRANSFER,
@@ -193,6 +194,21 @@ class OwnedGeometryArray:
             elapsed_seconds=self._last_transfer_seconds,
             bytes_transferred=self._last_transfer_bytes,
         )
+        if plan.transfer_required:
+            from vibespatial.execution_trace import notify_transfer
+
+            if old_residency is Residency.DEVICE and plan.target is Residency.HOST:
+                notify_transfer(
+                    direction="d2h",
+                    trigger=str(plan.trigger),
+                    reason=reason or plan.reason,
+                )
+            elif old_residency is Residency.HOST and plan.target is Residency.DEVICE:
+                notify_transfer(
+                    direction="h2d",
+                    trigger=str(plan.trigger),
+                    reason=reason or plan.reason,
+                )
         return self
 
     def record_runtime_selection(self, selection: RuntimeSelection) -> None:

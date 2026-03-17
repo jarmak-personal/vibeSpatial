@@ -111,6 +111,8 @@ def encode_owned_geoarrow(array: OwnedGeometryArray) -> MixedGeoArrowView:
         reason="explicit CPU fallback until the device-side GeoArrow encoder lands",
         detail="owned buffers were exposed as a shared host-visible Arrow-compatible view",
         selected=ExecutionMode.CPU,
+        pipeline="io/geoarrow_encode",
+        d2h_transfer=True,
     )
     return array.to_geoarrow(sharing=BufferSharingMode.SHARE)
 
@@ -129,6 +131,7 @@ def decode_owned_geoarrow(view: MixedGeoArrowView) -> OwnedGeometryArray:
         reason="explicit CPU fallback until the device-side GeoArrow decoder lands",
         detail="aligned Arrow-compatible geometry buffers were adopted zero-copy on host when possible",
         selected=ExecutionMode.CPU,
+        pipeline="io/geoarrow_decode",
     )
     return from_geoarrow(view, sharing=BufferSharingMode.AUTO)
 
@@ -336,6 +339,8 @@ def _construct_geoarrow_array_with_explicit_fallback(
             reason="explicit CPU fallback to WKB until native GeoArrow encoder covers this geometry mix",
             detail=str(exc),
             selected=ExecutionMode.CPU,
+            pipeline="io/geoarrow_encode",
+            d2h_transfer=True,
         )
         return construct_wkb_array(
             values,
