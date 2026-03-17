@@ -2720,12 +2720,14 @@ dependencies = [
 [package.optional-dependencies]
 cu12 = [
     { name = "cuda-cccl", extra = ["cu12"], marker = "extra == 'extra-11-vibespatial-cu12'" },
+    { name = "cuda-python", version = "12.9.6", source = { registry = "https://pypi.org/simple" } },
     { name = "cupy-cuda12x" },
     { name = "nvidia-ml-py" },
     { name = "pylibcudf-cu12" },
 ]
 cu13 = [
     { name = "cuda-cccl", extra = ["cu13"], marker = "extra == 'extra-11-vibespatial-cu13'" },
+    { name = "cuda-python", version = "13.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "cupy-cuda13x" },
     { name = "nvidia-ml-py" },
     { name = "pylibcudf-cu13" },
@@ -2764,6 +2766,8 @@ upstream-optional = [
 requires-dist = [
     { name = "cuda-cccl", extras = ["cu12"], marker = "extra == 'cu12'" },
     { name = "cuda-cccl", extras = ["cu13"], marker = "extra == 'cu13'" },
+    { name = "cuda-python", marker = "extra == 'cu12'", specifier = ">=12.9,<13" },
+    { name = "cuda-python", marker = "extra == 'cu13'", specifier = ">=13" },
     { name = "cupy-cuda12x", marker = "extra == 'cu12'", specifier = ">=13" },
     { name = "cupy-cuda13x", marker = "extra == 'cu13'", specifier = ">=14" },
     { name = "numpy", specifier = ">=2" },
