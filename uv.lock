@@ -2402,7 +2402,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
-    { name = "nvidia-ml-py" },
     { name = "orjson" },
     { name = "packaging" },
     { name = "pandas" },
@@ -2429,6 +2428,7 @@ dev = [
 gpu-optional = [
     { name = "cuda-cccl", extra = ["cu12"] },
     { name = "cupy-cuda12x" },
+    { name = "nvidia-ml-py" },
     { name = "pylibcudf-cu12" },
 ]
 upstream-optional = [
@@ -2450,7 +2450,6 @@ upstream-optional = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=2" },
-    { name = "nvidia-ml-py", specifier = ">=13.590.48" },
     { name = "orjson", specifier = ">=3.11.7" },
     { name = "packaging" },
     { name = "pandas", specifier = ">=2.2.0" },
@@ -2477,6 +2476,7 @@ dev = [
 gpu-optional = [
     { name = "cuda-cccl", extras = ["cu12"] },
     { name = "cupy-cuda12x", specifier = ">=13" },
+    { name = "nvidia-ml-py", specifier = ">=13.590.48" },
     { name = "pylibcudf-cu12", specifier = ">=26.2.1" },
 ]
 upstream-optional = [

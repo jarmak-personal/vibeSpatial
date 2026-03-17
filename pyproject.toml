@@ -5,12 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "vibespatial"
 version = "0.1.0"
-description = "GPU-first spatial analytics for Python"
+description = "GPU-first spatial analytics for Python — drop-in GeoPandas replacement backed by CUDA kernels"
 readme = "README.md"
 requires-python = ">=3.12"
+authors = [
+  { name = "Ben Jarmak", email = "ben@vibespatial.dev" },
+]
+keywords = [
+  "gis",
+  "geospatial",
+  "gpu",
+  "cuda",
+  "geopandas",
+  "spatial",
+  "geometry",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: GIS",
+  "Topic :: Scientific/Engineering",
+]
 dependencies = [
   "numpy>=2",
-  "nvidia-ml-py>=13.590.48",
   "orjson>=3.11.7",
   "packaging",
   "pandas>=2.2.0",
@@ -24,10 +46,10 @@ dependencies = [
 license = "Apache-2.0"
 
 [project.urls]
-Homepage = "https://github.com/vibeSpatial/vibeSpatial"
-Repository = "https://github.com/vibeSpatial/vibeSpatial"
+Homepage = "https://github.com/jarmak-personal/vibeSpatial"
+Repository = "https://github.com/jarmak-personal/vibeSpatial"
 Documentation = "https://vibespatial.github.io/vibeSpatial/"
-Issues = "https://github.com/vibeSpatial/vibeSpatial/issues"
+Issues = "https://github.com/jarmak-personal/vibeSpatial/issues"
 
 [dependency-groups]
 dev = [
@@ -45,6 +67,7 @@ dev = [
 gpu-optional = [
     "cupy-cuda12x>=13",
     "cuda-cccl[cu12]",
+    "nvidia-ml-py>=13.590.48",
     "pylibcudf-cu12>=26.2.1",
 ]
 upstream-optional = [
