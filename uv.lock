@@ -2386,30 +2386,15 @@ wheels = [
 [[package]]
 name = "vibeproj"
 version = "0.1.0"
-source = { editable = "../vibeProj" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "pyproj" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "cupy-cuda12x", marker = "extra == 'gpu'", specifier = ">=13" },
-    { name = "numpy", specifier = ">=2" },
-    { name = "pyproj", specifier = ">=3.7.0" },
+sdist = { url = "https://files.pythonhosted.org/packages/58/da/7172856c4d9dac269485617c8507fadc447018b072154215395f6386072c/vibeproj-0.1.0.tar.gz", hash = "sha256:5094a5215afdaa7ab254d0f2b2e9c7b865ea95f991d2714ebbabccbb1ec06d3e", size = 73616, upload-time = "2026-03-17T07:11:06.998Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/c6/80d765022df635ba08c1d4e574251771f87066791cfb4ff7c28606f17e2f/vibeproj-0.1.0-py3-none-any.whl", hash = "sha256:4fe0fa7b6709d3f20dc553d6f6c261307c3d06d574726993bb6d46f80ad10d9a", size = 57363, upload-time = "2026-03-17T07:11:05.803Z" },
 ]
-provides-extras = ["gpu"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "furo", specifier = ">=2025.12.19" },
-    { name = "myst-parser", specifier = ">=5.0.0" },
-    { name = "pytest", specifier = ">=8.3" },
-    { name = "pytest-cov", specifier = ">=6.0" },
-    { name = "ruff", specifier = ">=0.11" },
-    { name = "sphinx", specifier = ">=9.1.0" },
-]
-gpu = [{ name = "cupy-cuda12x", specifier = ">=13" }]
 
 [[package]]
 name = "vibespatial"
@@ -2471,7 +2456,7 @@ requires-dist = [
     { name = "pyogrio", specifier = ">=0.8" },
     { name = "pyproj", specifier = ">=3.7.0" },
     { name = "shapely", specifier = ">=2.1.0" },
-    { name = "vibeproj", editable = "../vibeProj" },
+    { name = "vibeproj" },
 ]
 
 [package.metadata.requires-dev]

@@ -89,5 +89,6 @@ line-length = 100
 target-version = "py312"
 extend-exclude = ["src/vibespatial/api", "tests/upstream"]
 
-[tool.uv.sources]
-vibeproj = { path = "../vibeProj", editable = true }
+# For local development with a sibling vibeProj checkout, uncomment:
+# [tool.uv.sources]
+# vibeproj = { path = "../vibeProj", editable = true }
