@@ -53,7 +53,7 @@ Issues = "https://github.com/jarmak-personal/vibeSpatial/issues"
 
 [project.optional-dependencies]
 cu12 = [
-  "cuda-python>=12.9,<13",
+  "cuda-python>=12,<13",
   "cuda-cccl[cu12]",
   "cupy-cuda12x>=13",
   "nvidia-ml-py>=13.590.48",

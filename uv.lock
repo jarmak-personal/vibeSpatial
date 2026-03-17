@@ -2703,7 +2703,7 @@ wheels = [
 
 [[package]]
 name = "vibespatial"
-version = "0.1.2"
+version = "0.1.3"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
@@ -2766,7 +2766,7 @@ upstream-optional = [
 requires-dist = [
     { name = "cuda-cccl", extras = ["cu12"], marker = "extra == 'cu12'" },
     { name = "cuda-cccl", extras = ["cu13"], marker = "extra == 'cu13'" },
-    { name = "cuda-python", marker = "extra == 'cu12'", specifier = ">=12.9,<13" },
+    { name = "cuda-python", marker = "extra == 'cu12'", specifier = ">=12,<13" },
     { name = "cuda-python", marker = "extra == 'cu13'", specifier = ">=13" },
     { name = "cupy-cuda12x", marker = "extra == 'cu12'", specifier = ">=13" },
     { name = "cupy-cuda13x", marker = "extra == 'cu13'", specifier = ">=14" },
