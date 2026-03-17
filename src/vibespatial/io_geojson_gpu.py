@@ -572,8 +572,19 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     runtime = get_cuda_runtime()
 
     # S0: Read file to device
+    # CuPy's cp.asarray uses int32 internally for some transfer paths,
+    # which fails for arrays > 2 GiB. Chunked transfer avoids this.
     host_bytes = np.fromfile(str(path), dtype=np.uint8)
-    d_bytes = cp.asarray(host_bytes)
+    _2GIB = 2 * 1024 * 1024 * 1024
+    if len(host_bytes) > _2GIB:
+        d_bytes = cp.empty(len(host_bytes), dtype=cp.uint8)
+        offset = 0
+        while offset < len(host_bytes):
+            end = min(offset + _2GIB, len(host_bytes))
+            d_bytes[offset:end] = cp.asarray(host_bytes[offset:end])
+            offset = end
+    else:
+        d_bytes = cp.asarray(host_bytes)
     n = len(d_bytes)
     n_i64 = np.int64(n)
     ptr = runtime.pointer
