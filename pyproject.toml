@@ -14,6 +14,7 @@ dependencies = [
   "orjson>=3.11.7",
   "packaging",
   "pandas>=2.2.0",
+  "pyarrow>=14.0",
   "pyogrio>=0.8",
   "pyproj>=3.7.0",
   "shapely>=2.1.0",
