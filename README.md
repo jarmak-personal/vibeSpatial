@@ -12,7 +12,9 @@ GPU is available.
 ### Install
 
 ```bash
-pip install vibespatial
+pip install vibespatial              # CPU-only (GeoPandas drop-in)
+pip install vibespatial[cu12]        # CUDA 12 GPU acceleration
+pip install vibespatial[cu13]        # CUDA 13 GPU acceleration
 ```
 
 ### Quick start

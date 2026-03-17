@@ -51,6 +51,20 @@ Repository = "https://github.com/jarmak-personal/vibeSpatial"
 Documentation = "https://jarmak-personal.github.io/vibeSpatial/"
 Issues = "https://github.com/jarmak-personal/vibeSpatial/issues"
 
+[project.optional-dependencies]
+cu12 = [
+  "cuda-cccl[cu12]",
+  "cupy-cuda12x>=13",
+  "nvidia-ml-py>=13.590.48",
+  "pylibcudf-cu12>=26.2.1",
+]
+cu13 = [
+  "cuda-cccl[cu13]",
+  "cupy-cuda13x>=14",
+  "nvidia-ml-py>=13.590.48",
+  "pylibcudf-cu13>=26.2.1",
+]
+
 [dependency-groups]
 dev = [
   "pytest>=8.3",
@@ -63,12 +77,6 @@ dev = [
   "sphinx-autodoc2>=0.5",
   "sphinx-copybutton>=0.5",
   "pyarrow>=23.0.1",
-]
-gpu-optional = [
-    "cupy-cuda12x>=13",
-    "cuda-cccl[cu12]",
-    "nvidia-ml-py>=13.590.48",
-    "pylibcudf-cu12>=26.2.1",
 ]
 upstream-optional = [
   "fiona>=1.10",
@@ -116,3 +124,11 @@ extend-exclude = ["src/vibespatial/api", "tests/upstream"]
 # For local development with a sibling vibeProj checkout, uncomment:
 # [tool.uv.sources]
 # vibeproj = { path = "../vibeProj", editable = true }
+
+[tool.uv]
+conflicts = [
+  [
+    { extra = "cu12" },
+    { extra = "cu13" },
+  ],
+]
