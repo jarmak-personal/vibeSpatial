@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Strict native mode upstream test pass rate as the real GeoPandas compatibility metric.
+Read If: You are measuring, reporting, or verifying strict native GeoPandas compatibility.
+STOP IF: Your task already has the coverage script open and only needs the command.
+Source Of Truth: Native coverage metric definition for upstream GeoPandas compatibility.
+Body Budget: 63/220 lines
+Document: docs/testing/native-coverage.md
 
-**Scope:** Strict native mode upstream test pass rate as the real GeoPandas compatibility metric.
-**Read If:** You are measuring, reporting, or verifying strict native GeoPandas compatibility.
-**STOP IF:** Your task already has the coverage script open and only needs the command.
-**Source Of Truth:** Native coverage metric definition for upstream GeoPandas compatibility.
-**Body Budget:** 63/220 lines
-**Document:** `docs/testing/native-coverage.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Intent |
@@ -21,7 +17,7 @@
 | 28-49 | Definition |
 | 50-57 | Command |
 | 58-63 | Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

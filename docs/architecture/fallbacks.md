@@ -1,18 +1,14 @@
 # Explicit Fallback Surfaces
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Observable CPU fallback policy for unsupported predicates, geometry mixes, and host-only query paths.
+Read If: You are changing fallback visibility, host-only geospatial paths, or runtime observability.
+STOP IF: You already have the fallback event API open and only need local implementation detail.
+Source Of Truth: Phase-4 explicit fallback policy for predicate and spatial-query surfaces.
+Body Budget: 76/220 lines
+Document: docs/architecture/fallbacks.md
 
-**Scope:** Observable CPU fallback policy for unsupported predicates, geometry mixes, and host-only query paths.
-**Read If:** You are changing fallback visibility, host-only geospatial paths, or runtime observability.
-**STOP IF:** You already have the fallback event API open and only need local implementation detail.
-**Source Of Truth:** Phase-4 explicit fallback policy for predicate and spatial-query surfaces.
-**Body Budget:** 76/220 lines
-**Document:** `docs/architecture/fallbacks.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
@@ -25,7 +21,7 @@
 | 50-60 | Current Surfaces |
 | 61-70 | Observability Contract |
 | 71-76 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Request Signals
 

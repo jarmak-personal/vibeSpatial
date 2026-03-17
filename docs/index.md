@@ -69,4 +69,7 @@ dissolved = gdf.dissolve(by="name")
 
 user/index
 dev/index
+architecture/index
+decisions/adr-index
+testing/index
 ```

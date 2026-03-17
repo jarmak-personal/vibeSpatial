@@ -1,18 +1,14 @@
 # Degeneracy Corpus
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Deterministic degeneracy corpus for overlay, clip, and segment-regression verification.
+Read If: You are adding or verifying degeneracy cases for overlay, clip, or constructive kernels.
+STOP IF: You already have the corpus module open and only need local case detail.
+Source Of Truth: Phase-5 degeneracy corpus policy for overlay and clip verification.
+Body Budget: 73/220 lines
+Document: docs/testing/degeneracy-corpus.md
 
-**Scope:** Deterministic degeneracy corpus for overlay, clip, and segment-regression verification.
-**Read If:** You are adding or verifying degeneracy cases for overlay, clip, or constructive kernels.
-**STOP IF:** You already have the corpus module open and only need local case detail.
-**Source Of Truth:** Phase-5 degeneracy corpus policy for overlay and clip verification.
-**Body Budget:** 73/220 lines
-**Document:** `docs/testing/degeneracy-corpus.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -24,7 +20,7 @@
 | 41-61 | Decision |
 | 62-68 | Performance Note |
 | 69-73 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Phase 5 needs a deterministic corpus for the cases most likely to break overlay,
 clip, and later GPU constructive kernels.

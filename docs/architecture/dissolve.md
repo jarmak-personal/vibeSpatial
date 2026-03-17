@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggregation policy.
+Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
+STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
+Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
+Body Budget: 63/220 lines
+Document: docs/architecture/dissolve.md
 
-**Scope:** Grouped dissolve pipeline staging, segmented union, and attribute aggregation policy.
-**Read If:** You are changing dissolve, grouped union, or segmented attribute aggregation.
-**STOP IF:** Your task already has the dissolve pipeline open and only needs local implementation detail.
-**Source Of Truth:** Dissolve pipeline architecture for grouped constructive work.
-**Body Budget:** 63/220 lines
-**Document:** `docs/architecture/dissolve.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Intent |
@@ -21,7 +17,7 @@
 | 33-41 | Decision |
 | 42-50 | Pipeline |
 | 51-63 | Performance Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

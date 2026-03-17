@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: IO format classification as GPU-native, hybrid, or fallback-only.
+Read If: You are classifying a format pathway or adding a new IO format target.
+STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
+Source Of Truth: IO format classification matrix for GPU-native versus hybrid versus fallback paths.
+Body Budget: 53/220 lines
+Document: docs/architecture/io-support-matrix.md
 
-**Scope:** IO format classification as GPU-native, hybrid, or fallback-only.
-**Read If:** You are classifying a format pathway or adding a new IO format target.
-**STOP IF:** Your task already has the specific format adapter open and only needs local implementation detail.
-**Source Of Truth:** IO format classification matrix for GPU-native versus hybrid versus fallback paths.
-**Body Budget:** 53/220 lines
-**Document:** `docs/architecture/io-support-matrix.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Intent |
@@ -21,7 +17,7 @@
 | 29-36 | Decision |
 | 37-47 | Matrix |
 | 48-53 | Performance Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

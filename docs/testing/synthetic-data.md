@@ -1,18 +1,14 @@
 # Synthetic Data
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Synthetic geometry dataset generator workflow, shapes, and verification guidance.
+Read If: You are adding benchmark data, regression corpora, or synthetic geometry fixtures.
+STOP IF: Your task already has a routed generator API file open and needs no workflow guidance.
+Source Of Truth: Phase-0 synthetic data generator contract for tests and benchmarks.
+Body Budget: 91/220 lines
+Document: docs/testing/synthetic-data.md
 
-**Scope:** Synthetic geometry dataset generator workflow, shapes, and verification guidance.
-**Read If:** You are adding benchmark data, regression corpora, or synthetic geometry fixtures.
-**STOP IF:** Your task already has a routed generator API file open and needs no workflow guidance.
-**Source Of Truth:** Phase-0 synthetic data generator contract for tests and benchmarks.
-**Body Budget:** 91/220 lines
-**Document:** `docs/testing/synthetic-data.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -25,7 +21,7 @@
 | 60-70 | Outputs |
 | 71-82 | Pytest Integration |
 | 83-91 | Verification |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use the synthetic generator for benchmarks, smoke tests, and future regression
 corpora instead of checked-in external datasets.

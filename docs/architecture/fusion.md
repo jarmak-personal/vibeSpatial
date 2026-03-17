@@ -1,18 +1,14 @@
 # Fusion Strategy
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Kernel-fusion policy, stage boundaries, and intermediate elimination rules.
+Read If: You are changing pipeline execution, fused chains, or intermediate materialization behavior.
+STOP IF: Your task already has a settled fusion contract and only needs implementation detail.
+Source Of Truth: Phase-2 fusion strategy before broad multi-kernel pipelines land.
+Body Budget: 96/240 lines
+Document: docs/architecture/fusion.md
 
-**Scope:** Kernel-fusion policy, stage boundaries, and intermediate elimination rules.
-**Read If:** You are changing pipeline execution, fused chains, or intermediate materialization behavior.
-**STOP IF:** Your task already has a settled fusion contract and only needs implementation detail.
-**Source Of Truth:** Phase-2 fusion strategy before broad multi-kernel pipelines land.
-**Body Budget:** 96/240 lines
-**Document:** `docs/architecture/fusion.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -27,7 +23,7 @@
 | 74-82 | Default Fusible Chains |
 | 83-91 | Persisted Intermediates |
 | 92-96 | Runtime Interaction |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use a lightweight staged operator DAG for fusion, not a whole-program lazy graph.
 

@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL adapters.
+Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
+STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
+Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
+Body Budget: 201/280 lines
+Document: docs/architecture/io-files.md
 
-**Scope:** File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL adapters.
-**Read If:** You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
-**STOP IF:** Your task already has the specific format adapter open and only needs local implementation detail.
-**Source Of Truth:** File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-**Body Budget:** 201/280 lines
-**Document:** `docs/architecture/io-files.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Intent |
@@ -22,7 +18,7 @@
 | 43-52 | Performance Notes |
 | 53-111 | Current Behavior |
 | 112-201 | Measured Local Baseline |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

@@ -1,18 +1,14 @@
 # Profiling Rails
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Stage-timed profiling entrypoints, NVTX guidance, and trace interpretation for join and overlay work.
+Read If: You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
+STOP IF: You already have the profiling script open and only need a local implementation detail.
+Source Of Truth: Stage-level profiling workflow for join and overlay kernel development.
+Body Budget: 123/220 lines
+Document: docs/testing/profiling-rails.md
 
-**Scope:** Stage-timed profiling entrypoints, NVTX guidance, and trace interpretation for join and overlay work.
-**Read If:** You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
-**STOP IF:** You already have the profiling script open and only need a local implementation detail.
-**Source Of Truth:** Stage-level profiling workflow for join and overlay kernel development.
-**Body Budget:** 123/220 lines
-**Document:** `docs/testing/profiling-rails.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -25,7 +21,7 @@
 | 65-99 | Stage Contracts |
 | 100-109 | Trace Interpretation |
 | 110-123 | NVTX |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 This repo now has a dedicated profiling rail for join and overlay kernel work.
 

@@ -1,18 +1,14 @@
 # Spatial Query And Join Assembly
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Spatial-index query assembly, sjoin result semantics, bounded nearest strategy, and output-format policy.
+Read If: You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.
+STOP IF: You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.
+Source Of Truth: Phase-4 spatial query and join assembly policy before broader API dispatch work.
+Body Budget: 129/220 lines
+Document: docs/architecture/spatial-joins.md
 
-**Scope:** Spatial-index query assembly, sjoin result semantics, bounded nearest strategy, and output-format policy.
-**Read If:** You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.
-**STOP IF:** You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.
-**Source Of Truth:** Phase-4 spatial query and join assembly policy before broader API dispatch work.
-**Body Budget:** 129/220 lines
-**Document:** `docs/architecture/spatial-joins.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
@@ -26,7 +22,7 @@
 | 103-113 | Nearest Strategy |
 | 114-123 | Pandas Semantics |
 | 124-129 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Request Signals
 

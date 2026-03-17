@@ -1,18 +1,14 @@
 # Geometry Buffer Schema
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Canonical owned geometry buffer schema for points, lines, polygons, and multiparts.
+Read If: You are designing adapters, kernels, or memory layout for owned geometry arrays.
+STOP IF: Your task already has a settled buffer schema and only needs implementation detail.
+Source Of Truth: Phase-2 owned geometry buffer layout contract.
+Body Budget: 131/260 lines
+Document: docs/architecture/geometry-buffers.md
 
-**Scope:** Canonical owned geometry buffer schema for points, lines, polygons, and multiparts.
-**Read If:** You are designing adapters, kernels, or memory layout for owned geometry arrays.
-**STOP IF:** Your task already has a settled buffer schema and only needs implementation detail.
-**Source Of Truth:** Phase-2 owned geometry buffer layout contract.
-**Body Budget:** 131/260 lines
-**Document:** `docs/architecture/geometry-buffers.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -28,7 +24,7 @@
 | 103-117 | Adapter Surface |
 | 118-124 | Offset Rules |
 | 125-131 | Execution Boundaries |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use separated fp64 coordinate buffers plus hierarchical offsets as the owned geometry core.
 

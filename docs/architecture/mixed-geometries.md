@@ -1,18 +1,14 @@
 # Mixed Geometries
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Mixed-geometry storage and execution strategy for GPU-oriented geometry buffers.
+Read If: You are designing owned geometry buffers, mixed-type dispatch, or geometry-family layout policy.
+STOP IF: Your task is limited to a single kernel implementation detail that already has a chosen layout.
+Source Of Truth: Phase-1 design decision for mixed-geometry handling before buffer implementation.
+Body Budget: 158/260 lines
+Document: docs/architecture/mixed-geometries.md
 
-**Scope:** Mixed-geometry storage and execution strategy for GPU-oriented geometry buffers.
-**Read If:** You are designing owned geometry buffers, mixed-type dispatch, or geometry-family layout policy.
-**STOP IF:** Your task is limited to a single kernel implementation detail that already has a chosen layout.
-**Source Of Truth:** Phase-1 design decision for mixed-geometry handling before buffer implementation.
-**Body Budget:** 158/260 lines
-**Document:** `docs/architecture/mixed-geometries.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -30,7 +26,7 @@
 | 125-135 | Buffer Implications |
 | 136-145 | Rejections |
 | ... | (2 additional sections omitted; open document body for full map) |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 GeoPandas permits mixed geometry families in one array. This doc defines the
 default storage and execution strategy before owned geometry buffers land.

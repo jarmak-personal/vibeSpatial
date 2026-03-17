@@ -1,18 +1,14 @@
 # Decision Log
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Architecture decision log and index of accepted or superseded ADRs.
+Read If: You are resolving, revisiting, or querying a design decision.
+STOP IF: You already have the specific ADR open and do not need the index.
+Source Of Truth: Decision log for architecture choices.
+Body Budget: 78/220 lines
+Document: docs/decisions/index.md
 
-**Scope:** Architecture decision log and index of accepted or superseded ADRs.
-**Read If:** You are resolving, revisiting, or querying a design decision.
-**STOP IF:** You already have the specific ADR open and do not need the index.
-**Source Of Truth:** Decision log for architecture choices.
-**Body Budget:** 78/220 lines
-**Document:** `docs/decisions/index.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -22,7 +18,7 @@
 | 26-30 | Verify |
 | 31-35 | Risks |
 | 36-78 | Decisions |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use this index to find accepted architecture decisions.
 

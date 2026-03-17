@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any
 
 
-HEADER_START = "<!-- DOC_HEADER:START -->"
-HEADER_END = "<!-- DOC_HEADER:END -->"
+HEADER_START = "<!-- DOC_HEADER:START"
+HEADER_END = "DOC_HEADER:END -->"
 REQUIRED_METADATA_FIELDS = ("scope", "readIf", "stopIf", "sourceOfTruth", "maxBodyLines")
 
 
@@ -99,18 +99,14 @@ def build_header(
     return "\n".join(
         [
             HEADER_START,
-            "> [!IMPORTANT]",
-            "> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.",
-            "> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.",
+            f"Scope: {metadata['scope']}",
+            f"Read If: {metadata['readIf']}",
+            f"STOP IF: {metadata['stopIf']}",
+            f"Source Of Truth: {metadata['sourceOfTruth']}",
+            f"Body Budget: {body_line_count}/{metadata['maxBodyLines']} lines",
+            f"Document: {relative_path}",
             "",
-            f"**Scope:** {metadata['scope']}",
-            f"**Read If:** {metadata['readIf']}",
-            f"**STOP IF:** {metadata['stopIf']}",
-            f"**Source Of Truth:** {metadata['sourceOfTruth']}",
-            f"**Body Budget:** {body_line_count}/{metadata['maxBodyLines']} lines",
-            f"**Document:** `{relative_path}`",
-            "",
-            "**Section Map (Body Lines)**",
+            "Section Map (Body Lines)",
             build_section_table(sections, max_rows),
             HEADER_END,
         ]

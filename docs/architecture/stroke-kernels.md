@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Buffer and offset-curve kernel seam, prefix-sum emission strategy, and Shapely fallback policy.
+Read If: You are changing buffer, offset_curve, or stroke-style constructive kernels.
+STOP IF: Your task already has the stroke kernel implementation open and only needs local implementation detail.
+Source Of Truth: Stroke kernel architecture for buffer and offset-curve constructive work.
+Body Budget: 60/220 lines
+Document: docs/architecture/stroke-kernels.md
 
-**Scope:** Buffer and offset-curve kernel seam, prefix-sum emission strategy, and Shapely fallback policy.
-**Read If:** You are changing buffer, offset_curve, or stroke-style constructive kernels.
-**STOP IF:** Your task already has the stroke kernel implementation open and only needs local implementation detail.
-**Source Of Truth:** Stroke kernel architecture for buffer and offset-curve constructive work.
-**Body Budget:** 60/220 lines
-**Document:** `docs/architecture/stroke-kernels.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Intent |
@@ -21,7 +17,7 @@
 | 31-41 | Decision |
 | 42-49 | Current Scope |
 | 50-60 | Performance Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

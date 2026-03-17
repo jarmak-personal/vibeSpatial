@@ -1,18 +1,14 @@
 # Upstream Test Inventory
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Ranked upstream GeoPandas contract slices, dependencies, and runtime weight.
+Read If: You are choosing which vendored test groups to promote or implement next.
+STOP IF: Your task is limited to a single already-routed upstream module.
+Source Of Truth: Phase-0 upstream test inventory for implementation planning.
+Body Budget: 106/220 lines
+Document: docs/testing/upstream-inventory.md
 
-**Scope:** Ranked upstream GeoPandas contract slices, dependencies, and runtime weight.
-**Read If:** You are choosing which vendored test groups to promote or implement next.
-**STOP IF:** Your task is limited to a single already-routed upstream module.
-**Source Of Truth:** Phase-0 upstream test inventory for implementation planning.
-**Body Budget:** 106/220 lines
-**Document:** `docs/testing/upstream-inventory.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Preamble |
@@ -26,7 +22,7 @@
 | 76-88 | Recommended Promotion Order |
 | 89-95 | Runtime Tiers |
 | 96-106 | Verification |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 This inventory ranks the vendored GeoPandas contract slices by expected
 implementation leverage, optional dependency pressure, and collected pytest

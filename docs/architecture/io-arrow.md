@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and GPU-native decode paths.
+Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
+STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
+Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
+Body Budget: 159/260 lines
+Document: docs/architecture/io-arrow.md
 
-**Scope:** Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and GPU-native decode paths.
-**Read If:** You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
-**STOP IF:** Your task already has the specific IO adapter open and only needs local implementation detail.
-**Source Of Truth:** IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-**Body Budget:** 159/260 lines
-**Document:** `docs/architecture/io-arrow.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Intent |
@@ -22,7 +18,7 @@
 | 52-73 | Performance Notes |
 | 74-121 | Current Behavior |
 | 122-159 | Measured Local Baseline |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

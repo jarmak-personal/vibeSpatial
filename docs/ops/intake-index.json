@@ -4777,6 +4777,18 @@
     },
     {
       "kind": "doc",
+      "path": "docs/architecture/index.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "architecture",
+        "docs",
+        "index",
+        "md"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/architecture/io-acceleration.md",
       "referenced_by": [
         "docs/architecture/io-acceleration.md"
@@ -5655,6 +5667,19 @@
     },
     {
       "kind": "doc",
+      "path": "docs/decisions/adr-index.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "adr",
+        "decisions",
+        "docs",
+        "index",
+        "md"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/decisions/index.md",
       "referenced_by": [
         "docs/decisions/index.md"
@@ -5791,6 +5816,18 @@
         "corpus",
         "degeneracy",
         "docs",
+        "md",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/index.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "docs",
+        "index",
         "md",
         "testing"
       ]

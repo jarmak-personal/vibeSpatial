@@ -1,18 +1,14 @@
 # Robustness Strategy
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Exactness guarantees, fallback policy, and topology-preservation strategy for predicates and overlay.
+Read If: You are designing predicate math, intersection logic, or overlay correctness guarantees.
+STOP IF: Your task already has a settled robustness contract and only needs implementation detail.
+Source Of Truth: Phase-1 robustness policy for predicate and constructive kernels.
+Body Budget: 107/240 lines
+Document: docs/architecture/robustness.md
 
-**Scope:** Exactness guarantees, fallback policy, and topology-preservation strategy for predicates and overlay.
-**Read If:** You are designing predicate math, intersection logic, or overlay correctness guarantees.
-**STOP IF:** Your task already has a settled robustness contract and only needs implementation detail.
-**Source Of Truth:** Phase-1 robustness policy for predicate and constructive kernels.
-**Body Budget:** 107/240 lines
-**Document:** `docs/architecture/robustness.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -28,7 +24,7 @@
 | 76-88 | Constructive Strategy |
 | 89-102 | GPU Strategy |
 | 103-107 | Rejected Defaults |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Predicate correctness and topology preservation require more than choosing fp32 or fp64.
 

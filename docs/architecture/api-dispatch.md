@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: GeoPandas method delegation, dispatch events, and object-construction avoidance.
+Read If: You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.
+STOP IF: Your task already has the adapter implementation open and only needs local detail.
+Source Of Truth: API dispatch policy for GeoPandas-facing method boundaries.
+Body Budget: 61/220 lines
+Document: docs/architecture/api-dispatch.md
 
-**Scope:** GeoPandas method delegation, dispatch events, and object-construction avoidance.
-**Read If:** You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.
-**STOP IF:** Your task already has the adapter implementation open and only needs local detail.
-**Source Of Truth:** API dispatch policy for GeoPandas-facing method boundaries.
-**Body Budget:** 61/220 lines
-**Document:** `docs/architecture/api-dispatch.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Intent |
@@ -21,7 +17,7 @@
 | 33-44 | Decision |
 | 45-54 | Performance Notes |
 | 55-61 | Current Behavior |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

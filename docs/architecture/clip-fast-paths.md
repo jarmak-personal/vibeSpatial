@@ -1,18 +1,14 @@
 # Rectangle Clip Fast Paths
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Rectangle clip fast-path strategy, owned constructive dataflow, and GeoPandas adapter policy.
+Read If: You are changing clip_by_rect, rectangle clip performance, or early constructive fast paths.
+STOP IF: You already have the rectangle clip engine open and only need local implementation detail.
+Source Of Truth: Phase-5 rectangle clip fast-path policy before broader overlay assembly.
+Body Budget: 107/220 lines
+Document: docs/architecture/clip-fast-paths.md
 
-**Scope:** Rectangle clip fast-path strategy, owned constructive dataflow, and GeoPandas adapter policy.
-**Read If:** You are changing clip_by_rect, rectangle clip performance, or early constructive fast paths.
-**STOP IF:** You already have the rectangle clip engine open and only need local implementation detail.
-**Source Of Truth:** Phase-5 rectangle clip fast-path policy before broader overlay assembly.
-**Body Budget:** 107/220 lines
-**Document:** `docs/architecture/clip-fast-paths.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -26,7 +22,7 @@
 | 71-87 | GeoPandas Adapter Policy |
 | 88-100 | CCCL Mapping |
 | 101-107 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 `o17.5.2` lands the first owned constructive fast path through axis-aligned
 rectangle clipping.

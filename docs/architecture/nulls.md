@@ -1,18 +1,14 @@
 # Null And Empty Geometry Semantics
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Null versus empty geometry semantics, validity rules, and kernel-state policy.
+Read If: You are defining missing-geometry behavior, validity handling, or empty-geometry contracts.
+STOP IF: Your task already has a settled null and empty contract and only needs implementation detail.
+Source Of Truth: Phase-1 null and empty geometry policy before owned kernel expansion.
+Body Budget: 87/240 lines
+Document: docs/architecture/nulls.md
 
-**Scope:** Null versus empty geometry semantics, validity rules, and kernel-state policy.
-**Read If:** You are defining missing-geometry behavior, validity handling, or empty-geometry contracts.
-**STOP IF:** Your task already has a settled null and empty contract and only needs implementation detail.
-**Source Of Truth:** Phase-1 null and empty geometry policy before owned kernel expansion.
-**Body Budget:** 87/240 lines
-**Document:** `docs/architecture/nulls.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -26,7 +22,7 @@
 | 58-73 | Empty Geometry Rules |
 | 74-80 | Batch Execution Rules |
 | 81-87 | Buffer Implications |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Null geometries and empty geometries are distinct states in `vibeSpatial`.
 

@@ -1,18 +1,14 @@
 # Determinism And Reproducibility
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Deterministic versus performance-first runtime policy, reproducibility guarantees, and reduction-order rules.
+Read If: You are changing reproducibility behavior, reduction order, or deterministic mode for GPU-oriented kernels.
+STOP IF: Your task already has the determinism policy module open and only needs local implementation detail.
+Source Of Truth: Phase-2 determinism and reproducibility policy before broader GPU reductions land.
+Body Budget: 112/220 lines
+Document: docs/architecture/determinism.md
 
-**Scope:** Deterministic versus performance-first runtime policy, reproducibility guarantees, and reduction-order rules.
-**Read If:** You are changing reproducibility behavior, reduction order, or deterministic mode for GPU-oriented kernels.
-**STOP IF:** Your task already has the determinism policy module open and only needs local implementation detail.
-**Source Of Truth:** Phase-2 determinism and reproducibility policy before broader GPU reductions land.
-**Body Budget:** 112/220 lines
-**Document:** `docs/architecture/determinism.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -26,7 +22,7 @@
 | 72-89 | Operations Affected |
 | 90-101 | Performance Budget |
 | 102-112 | Current Baseline |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 `vibeSpatial` defaults to maximum throughput, not maximum reproducibility.
 

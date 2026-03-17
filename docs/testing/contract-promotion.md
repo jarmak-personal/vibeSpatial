@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Upstream GeoPandas contract promotion gates, test-group ordering, and promotion workflow.
+Read If: You are promoting, inspecting, or verifying upstream contract test groups.
+STOP IF: Your task already has the specific test group open and only needs local pass criteria.
+Source Of Truth: Contract promotion workflow for upstream GeoPandas test groups.
+Body Budget: 142/260 lines
+Document: docs/testing/contract-promotion.md
 
-**Scope:** Upstream GeoPandas contract promotion gates, test-group ordering, and promotion workflow.
-**Read If:** You are promoting, inspecting, or verifying upstream contract test groups.
-**STOP IF:** Your task already has the specific test group open and only needs local pass criteria.
-**Source Of Truth:** Contract promotion workflow for upstream GeoPandas test groups.
-**Body Budget:** 142/260 lines
-**Document:** `docs/testing/contract-promotion.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Intent |
@@ -24,7 +20,7 @@
 | 83-113 | Constructive Promotion Gate |
 | 114-137 | IO Promotion Gate |
 | 138-142 | Workflow |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 

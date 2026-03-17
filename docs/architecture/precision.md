@@ -1,18 +1,14 @@
 # Precision Strategy
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonical storage policy.
+Read If: You are designing kernel arithmetic, precision selection, or numerical policy.
+STOP IF: Your task already has a settled precision plan and only needs implementation detail.
+Source Of Truth: Phase-1 precision dispatch policy before owned kernel expansion.
+Body Budget: 105/240 lines
+Document: docs/architecture/precision.md
 
-**Scope:** Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonical storage policy.
-**Read If:** You are designing kernel arithmetic, precision selection, or numerical policy.
-**STOP IF:** Your task already has a settled precision plan and only needs implementation detail.
-**Source Of Truth:** Phase-1 precision dispatch policy before owned kernel expansion.
-**Body Budget:** 105/240 lines
-**Document:** `docs/architecture/precision.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -27,7 +23,7 @@
 | 63-79 | Default Policy |
 | 80-95 | What Staged fp32 Means |
 | 96-105 | Buffer And Signature Implications |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use dual compute precision with one canonical storage precision.
 

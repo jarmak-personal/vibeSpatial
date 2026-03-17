@@ -1,18 +1,14 @@
 # Kernel Inventory
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Scaffolded kernel inventory, benchmark stubs, and generated test surfaces.
+Read If: You are generating, reviewing, or extending owned kernel scaffolds.
+STOP IF: You already have the target kernel module and generated files open.
+Source Of Truth: Kernel scaffold inventory and generated surface map for repo-owned kernels.
+Body Budget: 36/220 lines
+Document: docs/testing/kernel-inventory.md
 
-**Scope:** Scaffolded kernel inventory, benchmark stubs, and generated test surfaces.
-**Read If:** You are generating, reviewing, or extending owned kernel scaffolds.
-**STOP IF:** You already have the target kernel module and generated files open.
-**Source Of Truth:** Kernel scaffold inventory and generated surface map for repo-owned kernels.
-**Body Budget:** 36/220 lines
-**Document:** `docs/testing/kernel-inventory.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -22,7 +18,7 @@
 | 21-25 | Verify |
 | 26-30 | Risks |
 | 31-36 | Scaffolds |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Generated kernel scaffolds land here first so agents can audit what exists and which tier gate applies.
 

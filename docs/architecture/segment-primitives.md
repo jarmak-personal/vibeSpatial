@@ -1,18 +1,14 @@
 # Segment Intersection Primitives
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Robust segment extraction, candidate generation, and exact intersection-classification strategy for constructive kernels.
+Read If: You are changing segment intersection math, degeneracy handling, or constructive-kernel foundations.
+STOP IF: You already have the segment primitive implementation open and only need local implementation detail.
+Source Of Truth: Phase-5 segment intersection primitive policy before overlay assembly.
+Body Budget: 103/220 lines
+Document: docs/architecture/segment-primitives.md
 
-**Scope:** Robust segment extraction, candidate generation, and exact intersection-classification strategy for constructive kernels.
-**Read If:** You are changing segment intersection math, degeneracy handling, or constructive-kernel foundations.
-**STOP IF:** You already have the segment primitive implementation open and only need local implementation detail.
-**Source Of Truth:** Phase-5 segment intersection primitive policy before overlay assembly.
-**Body Budget:** 103/220 lines
-**Document:** `docs/architecture/segment-primitives.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Preamble |
@@ -26,7 +22,7 @@
 | 71-84 | CCCL Mapping |
 | 85-98 | Degeneracy Semantics |
 | 99-103 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 `o17.5.1` establishes the first constructive-kernel primitive layer: direct
 segment extraction from owned buffers, cheap candidate generation, and robust

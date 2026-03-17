@@ -1,18 +1,14 @@
 # Dispatch Crossover Policy
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Per-kernel auto-dispatch thresholds and CPU/GPU crossover policy.
+Read If: You are changing auto mode, size thresholds, or CPU/GPU dispatch heuristics.
+STOP IF: Your task already has a settled crossover policy and only needs implementation detail.
+Source Of Truth: Phase-1 crossover policy before adaptive runtime lands.
+Body Budget: 58/240 lines
+Document: docs/architecture/crossover.md
 
-**Scope:** Per-kernel auto-dispatch thresholds and CPU/GPU crossover policy.
-**Read If:** You are changing auto mode, size thresholds, or CPU/GPU dispatch heuristics.
-**STOP IF:** Your task already has a settled crossover policy and only needs implementation detail.
-**Source Of Truth:** Phase-1 crossover policy before adaptive runtime lands.
-**Body Budget:** 58/240 lines
-**Document:** `docs/architecture/crossover.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -24,7 +20,7 @@
 | 37-43 | Canonical Rule |
 | 44-53 | Provisional Thresholds |
 | 54-58 | Measurement Rule |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 `auto` mode should use per-kernel row thresholds, not one global size rule.
 

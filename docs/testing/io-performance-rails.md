@@ -1,18 +1,14 @@
 # IO Performance Rails
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: IO benchmark rail suites, throughput floors, and format-level performance enforcement.
+Read If: You are adding or verifying IO benchmark rails, throughput floors, or format-specific performance gates.
+STOP IF: Your task already has the benchmark scripts open and only needs local implementation detail.
+Source Of Truth: Phase-6d IO performance rail and floor enforcement workflow.
+Body Budget: 117/220 lines
+Document: docs/testing/io-performance-rails.md
 
-**Scope:** IO benchmark rail suites, throughput floors, and format-level performance enforcement.
-**Read If:** You are adding or verifying IO benchmark rails, throughput floors, or format-specific performance gates.
-**STOP IF:** Your task already has the benchmark scripts open and only needs local implementation detail.
-**Source Of Truth:** Phase-6d IO performance rail and floor enforcement workflow.
-**Body Budget:** 117/220 lines
-**Document:** `docs/testing/io-performance-rails.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -26,7 +22,7 @@
 | 69-92 | Result Contract |
 | 93-108 | Current Enforcement |
 | 109-117 | Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 This repo now has a standing IO benchmark rail for the accelerated format work in
 Phase 6d.

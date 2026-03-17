@@ -1,18 +1,14 @@
 # Point Predicate Pipeline
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Point-versus-bounds and point-in-polygon pipeline shape, stage boundaries, and fallback contract.
+Read If: You are changing point predicates, candidate refinement, or the first exact spatial query path.
+STOP IF: Your task already has the staged point-predicate contract open and only needs local implementation detail.
+Source Of Truth: Phase-4 point predicate architecture policy before sindex and join assembly.
+Body Budget: 105/220 lines
+Document: docs/architecture/point-predicates.md
 
-**Scope:** Point-versus-bounds and point-in-polygon pipeline shape, stage boundaries, and fallback contract.
-**Read If:** You are changing point predicates, candidate refinement, or the first exact spatial query path.
-**STOP IF:** Your task already has the staged point-predicate contract open and only needs local implementation detail.
-**Source Of Truth:** Phase-4 point predicate architecture policy before sindex and join assembly.
-**Body Budget:** 105/220 lines
-**Document:** `docs/architecture/point-predicates.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
@@ -26,7 +22,7 @@
 | 76-89 | CCCL Mapping |
 | 90-96 | Semantics |
 | 97-105 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Request Signals
 

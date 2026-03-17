@@ -1,18 +1,14 @@
 # Intake Router
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Operational intake workflow and request-to-doc routing policy.
+Read If: You received a task request and need to decide what to open first.
+STOP IF: You already have a confirmed work plan and relevant docs open.
+Source Of Truth: Intake workflow and routing rules for agents in this repo.
+Body Budget: 59/220 lines
+Document: docs/ops/intake.md
 
-**Scope:** Operational intake workflow and request-to-doc routing policy.
-**Read If:** You received a task request and need to decide what to open first.
-**STOP IF:** You already have a confirmed work plan and relevant docs open.
-**Source Of Truth:** Intake workflow and routing rules for agents in this repo.
-**Body Budget:** 59/220 lines
-**Document:** `docs/ops/intake.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -24,7 +20,7 @@
 | 38-47 | Route Families |
 | 48-54 | How It Works |
 | 55-59 | Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use this file to classify requests before opening more of the repository.
 

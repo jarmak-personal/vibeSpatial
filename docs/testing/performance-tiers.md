@@ -1,18 +1,14 @@
 # Performance Tiers
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Performance tier gates, reference datasets, and benchmark acceptance policy.
+Read If: You are defining kernel success criteria, benchmark rails, or performance gates.
+STOP IF: Your task is limited to a single benchmark implementation detail already routed elsewhere.
+Source Of Truth: Phase-0 performance gate policy for GPU kernel work.
+Body Budget: 131/240 lines
+Document: docs/testing/performance-tiers.md
 
-**Scope:** Performance tier gates, reference datasets, and benchmark acceptance policy.
-**Read If:** You are defining kernel success criteria, benchmark rails, or performance gates.
-**STOP IF:** Your task is limited to a single benchmark implementation detail already routed elsewhere.
-**Source Of Truth:** Phase-0 performance gate policy for GPU kernel work.
-**Body Budget:** 131/240 lines
-**Document:** `docs/testing/performance-tiers.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -28,7 +24,7 @@
 | 96-107 | Mapping To Roadmap |
 | 108-123 | Acceptance Policy |
 | 124-131 | Verification |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Define the minimum performance gates for GPU-first kernel work before the
 benchmark harness and synthetic datasets are fully implemented.

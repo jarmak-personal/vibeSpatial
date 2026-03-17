@@ -1,18 +1,14 @@
 # Binary Predicate Refine Pipeline
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Exact binary-predicate refine strategy, coarse-filter staging, and GeoPandas adapter policy.
+Read If: You are changing exact predicate kernels, binary predicate dispatch, or GeoPandas predicate integration.
+STOP IF: You already have the binary-predicate engine open and only need local implementation detail.
+Source Of Truth: Phase-4 exact binary-predicate architecture policy before join assembly.
+Body Budget: 137/220 lines
+Document: docs/architecture/binary-predicates.md
 
-**Scope:** Exact binary-predicate refine strategy, coarse-filter staging, and GeoPandas adapter policy.
-**Read If:** You are changing exact predicate kernels, binary predicate dispatch, or GeoPandas predicate integration.
-**STOP IF:** You already have the binary-predicate engine open and only need local implementation detail.
-**Source Of Truth:** Phase-4 exact binary-predicate architecture policy before join assembly.
-**Body Budget:** 137/220 lines
-**Document:** `docs/architecture/binary-predicates.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
@@ -26,7 +22,7 @@
 | 92-104 | CCCL Mapping |
 | 105-118 | Host Crossover |
 | 119-137 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Request Signals
 

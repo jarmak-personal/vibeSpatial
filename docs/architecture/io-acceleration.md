@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and format-level speed targets.
+Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
+STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
+Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
+Body Budget: 144/260 lines
+Document: docs/architecture/io-acceleration.md
 
-**Scope:** Post-Phase-6b GPU-native IO execution model, staged decode policy, and format-level speed targets.
-**Read If:** You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
-**STOP IF:** Your task already has the routed IO implementation files open and only needs local adapter detail.
-**Source Of Truth:** IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-**Body Budget:** 144/260 lines
-**Document:** `docs/architecture/io-acceleration.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Purpose |
@@ -25,7 +21,7 @@
 | 103-115 | CCCL Preference Order |
 | 116-134 | Performance Targets |
 | 135-144 | Non-Negotiable Constraints |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Purpose
 

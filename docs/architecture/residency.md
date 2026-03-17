@@ -1,18 +1,14 @@
 # Residency Policy
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Device residency defaults, transfer visibility rules, and zero-copy interop policy.
+Read If: You are designing buffer movement, interop adapters, or host/device materialization behavior.
+STOP IF: Your task already has a settled residency contract and only needs implementation detail.
+Source Of Truth: Phase-1 residency and transfer policy before owned geometry buffers land.
+Body Budget: 91/240 lines
+Document: docs/architecture/residency.md
 
-**Scope:** Device residency defaults, transfer visibility rules, and zero-copy interop policy.
-**Read If:** You are designing buffer movement, interop adapters, or host/device materialization behavior.
-**STOP IF:** Your task already has a settled residency contract and only needs implementation detail.
-**Source Of Truth:** Phase-1 residency and transfer policy before owned geometry buffers land.
-**Body Budget:** 91/240 lines
-**Document:** `docs/architecture/residency.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -26,7 +22,7 @@
 | 62-68 | Zero-Copy Rule |
 | 69-79 | Pipeline Rule |
 | 80-91 | Diagnostics Surface |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Owned geometry buffers are lazy-resident and move only at explicit boundaries.
 

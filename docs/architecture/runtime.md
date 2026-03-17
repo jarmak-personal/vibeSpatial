@@ -1,18 +1,14 @@
 # Runtime Model
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: GPU-first runtime rules, fallback policy, and execution invariants.
+Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
+STOP IF: Your task is docs-only or limited to vendored test maintenance.
+Source Of Truth: Runtime architecture policy for GPU-first execution.
+Body Budget: 100/200 lines
+Document: docs/architecture/runtime.md
 
-**Scope:** GPU-first runtime rules, fallback policy, and execution invariants.
-**Read If:** You are changing runtime selection, GPU execution, fallback visibility, or kernels.
-**STOP IF:** Your task is docs-only or limited to vendored test maintenance.
-**Source Of Truth:** Runtime architecture policy for GPU-first execution.
-**Body Budget:** 100/200 lines
-**Document:** `docs/architecture/runtime.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -25,7 +21,7 @@
 | 66-75 | Fallback |
 | 76-94 | Index-Array Boundary Model (ADR-0036) |
 | 95-100 | Compatibility |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
 

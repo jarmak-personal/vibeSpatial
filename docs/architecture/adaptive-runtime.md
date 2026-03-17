@@ -1,18 +1,14 @@
 # Adaptive Runtime
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Probe-first adaptive planning, monitoring inputs, and chunk-boundary runtime decisions.
+Read If: You are changing variant selection, NVML monitoring, adaptive chunking, or runtime planning.
+STOP IF: Your task already has a settled adaptive-runtime contract and only needs implementation detail.
+Source Of Truth: Phase-1 adaptive runtime policy before broader kernel work lands.
+Body Budget: 76/240 lines
+Document: docs/architecture/adaptive-runtime.md
 
-**Scope:** Probe-first adaptive planning, monitoring inputs, and chunk-boundary runtime decisions.
-**Read If:** You are changing variant selection, NVML monitoring, adaptive chunking, or runtime planning.
-**STOP IF:** Your task already has a settled adaptive-runtime contract and only needs implementation detail.
-**Source Of Truth:** Phase-1 adaptive runtime policy before broader kernel work lands.
-**Body Budget:** 76/240 lines
-**Document:** `docs/architecture/adaptive-runtime.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -25,7 +21,7 @@
 | 45-51 | Required Layers |
 | 52-66 | Decision Scope |
 | 67-76 | Upgrade Path |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 Use a probe-first planner now, and leave room for a fuller controller later.
 

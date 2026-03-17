@@ -1,18 +1,14 @@
 # Overlay Reconstruction
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented output assembly policy.
+Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
+STOP IF: You already have the reconstruction planner open and only need local implementation detail.
+Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
+Body Budget: 92/220 lines
+Document: docs/architecture/overlay-reconstruction.md
 
-**Scope:** Overlay reconstruction staging, face-labeling plan, and CCCL-oriented output assembly policy.
-**Read If:** You are changing union, difference, symmetric difference, or overlay output reconstruction.
-**STOP IF:** You already have the reconstruction planner open and only need local implementation detail.
-**Source Of Truth:** Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-**Body Budget:** 92/220 lines
-**Document:** `docs/architecture/overlay-reconstruction.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -25,7 +21,7 @@
 | 47-60 | Decision |
 | 61-74 | CCCL Mapping |
 | 75-92 | Consequences |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
 

@@ -1,18 +1,14 @@
 # Pipeline Benchmarks
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artifact workflow.
+Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
+STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
+Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
+Body Budget: 141/220 lines
+Document: docs/testing/pipeline-benchmarks.md
 
-**Scope:** End-to-end pipeline benchmark suites, regression thresholds, and CI artifact workflow.
-**Read If:** You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
-**STOP IF:** You already have the benchmark scripts open and only need a local implementation detail.
-**Source Of Truth:** Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-**Body Budget:** 141/220 lines
-**Document:** `docs/testing/pipeline-benchmarks.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-5 | Preamble |
@@ -27,7 +23,7 @@
 | 87-95 | Regression Rules |
 | 96-122 | Trace Contract |
 | 123-141 | CI Workflow |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
 gating.

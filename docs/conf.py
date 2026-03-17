@@ -24,7 +24,7 @@ myst_enable_extensions = [
 ]
 
 templates_path = ["_templates"]
-exclude_patterns = ["_build", "ops", "architecture", "decisions", "testing"]
+exclude_patterns = ["_build", "ops", "decisions/index.md"]
 
 # -- Theme: Furo + NEON GRID overlay -----------------------------------------
 html_theme = "furo"

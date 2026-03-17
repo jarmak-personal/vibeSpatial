@@ -1,16 +1,12 @@
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Compact-invalid-row make_valid pipeline staging and repair-only-invalids policy.
+Read If: You are changing make_valid, validity checking, or topology repair pipelines.
+STOP IF: Your task already has the make_valid pipeline open and only needs local implementation detail.
+Source Of Truth: Make-valid pipeline architecture for compact-and-repair staging.
+Body Budget: 46/220 lines
+Document: docs/architecture/make-valid.md
 
-**Scope:** Compact-invalid-row make_valid pipeline staging and repair-only-invalids policy.
-**Read If:** You are changing make_valid, validity checking, or topology repair pipelines.
-**STOP IF:** Your task already has the make_valid pipeline open and only needs local implementation detail.
-**Source Of Truth:** Make-valid pipeline architecture for compact-and-repair staging.
-**Body Budget:** 46/220 lines
-**Document:** `docs/architecture/make-valid.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Intent |
@@ -20,7 +16,7 @@
 | 26-30 | Risks |
 | 31-38 | Decision |
 | 39-46 | Performance Notes |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 ## Intent
 
