@@ -1,18 +1,14 @@
 # Agent Instructions
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Repository-wide agent workflow, intake usage, and verification expectations.
+Read If: You are starting, routing, or landing work in this repository.
+STOP IF: You only need a narrow API detail already covered by a routed doc.
+Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
+Body Budget: 197/260 lines
+Document: AGENTS.md
 
-**Scope:** Repository-wide agent workflow, intake usage, and verification expectations.
-**Read If:** You are starting, routing, or landing work in this repository.
-**STOP IF:** You only need a narrow API detail already covered by a routed doc.
-**Source Of Truth:** Agent workflow and handoff policy for vibeSpatial.
-**Body Budget:** 197/260 lines
-**Document:** `AGENTS.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Preamble |
@@ -30,7 +26,7 @@
 | 123-132 | Build And Tooling |
 | 133-146 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 This repository is an agent-maintained spatial analytics project with a
 GPU-first execution model. Optimize for fast intake, explicit fallbacks, and

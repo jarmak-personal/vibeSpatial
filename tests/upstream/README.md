@@ -1,18 +1,14 @@
 # Upstream Tests
 
-<!-- DOC_HEADER:START -->
-> [!IMPORTANT]
-> This block is auto-generated. Edit metadata in `docs/doc_headers.json`.
-> Refresh with `uv run python scripts/check_docs.py --refresh` and validate with `uv run python scripts/check_docs.py --check`.
+<!-- DOC_HEADER:START
+Scope: Upstream GeoPandas test vendoring and contract-coverage workflow.
+Read If: You are refreshing, debugging, or expanding vendored upstream test coverage.
+STOP IF: Your task does not touch vendored tests or compatibility contracts.
+Source Of Truth: Vendored upstream test workflow for GeoPandas compatibility.
+Body Budget: 75/200 lines
+Document: tests/upstream/README.md
 
-**Scope:** Upstream GeoPandas test vendoring and contract-coverage workflow.
-**Read If:** You are refreshing, debugging, or expanding vendored upstream test coverage.
-**STOP IF:** Your task does not touch vendored tests or compatibility contracts.
-**Source Of Truth:** Vendored upstream test workflow for GeoPandas compatibility.
-**Body Budget:** 75/200 lines
-**Document:** `tests/upstream/README.md`
-
-**Section Map (Body Lines)**
+Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-4 | Preamble |
@@ -24,7 +20,7 @@
 | 41-46 | Purpose |
 | 47-62 | Refresh |
 | 63-75 | Current Bootstrap State |
-<!-- DOC_HEADER:END -->
+DOC_HEADER:END -->
 
 This directory contains vendored copies of the upstream GeoPandas test suite.
 
