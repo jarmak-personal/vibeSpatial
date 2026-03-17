@@ -23,6 +23,7 @@ from vibespatial.owned_geometry import (
 )
 from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.adaptive_runtime import plan_dispatch_selection
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.precision import KernelClass
 from vibespatial.runtime import ExecutionMode
 
@@ -496,6 +497,15 @@ def _polygon_centroid_kernels(compute_type: str = "double"):
     return compile_kernel_group(prefix, source, _POLYGON_CENTROID_KERNEL_NAMES)
 
 
+@register_kernel_variant(
+    "polygon_centroid",
+    "gpu-cuda-python",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("cuda-python", "metric", "centroid", "kahan", "centered"),
+)
 def _polygon_centroids_gpu(
     owned: OwnedGeometryArray,
     precision_plan: "PrecisionPlan | None" = None,
@@ -994,6 +1004,15 @@ def polygon_centroids_owned(
     return _polygon_centroids_cpu(owned)
 
 
+@register_kernel_variant(
+    "polygon_centroid",
+    "cpu",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("numpy", "metric", "centroid"),
+)
 def _polygon_centroids_cpu(
     owned: OwnedGeometryArray,
 ) -> tuple[np.ndarray, np.ndarray]:

@@ -9981,16 +9981,20 @@
       "referenced_by": [],
       "symbols": [
         "point_buffer_kernel",
+        "point_buffer_kernel_gpu",
+        "polygon_buffer_kernel_gpu",
         "offset_curve_kernel"
       ],
       "tokens": [
         "buffer",
         "constructive",
         "curve",
+        "gpu",
         "kernel",
         "kernels",
         "offset",
         "point",
+        "polygon",
         "py",
         "src",
         "stroke",

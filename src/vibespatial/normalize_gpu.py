@@ -16,6 +16,7 @@ from __future__ import annotations
 import numpy as np
 
 from vibespatial.adaptive_runtime import plan_dispatch_selection
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -228,6 +229,15 @@ def normalize_owned(
     return _normalize_cpu(owned)
 
 
+@register_kernel_variant(
+    "normalize",
+    "cpu",
+    kernel_class=KernelClass.COARSE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
+    supports_mixed=True,
+    tags=("shapely",),
+)
 def _normalize_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     """CPU fallback: Shapely normalize."""
     import shapely
@@ -245,6 +255,16 @@ def _normalize_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     return from_shapely_geometries(result.tolist())
 
 
+@register_kernel_variant(
+    "normalize",
+    "gpu-cuda-python",
+    kernel_class=KernelClass.COARSE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
+    supports_mixed=True,
+    min_rows=_NORMALIZE_GPU_THRESHOLD,
+    tags=("cuda-python", "ring-rotation", "linestring-reversal"),
+)
 def _normalize_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray | None:
     """GPU path: NVRTC ring rotation + linestring reversal."""
     from vibespatial.precision import PrecisionMode, select_precision_plan, CoordinateStats

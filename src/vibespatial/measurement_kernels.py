@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from vibespatial.adaptive_runtime import plan_dispatch_selection
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -420,6 +421,15 @@ def _compile_kernel(name_prefix: str, fp64_source: str, fp32_source: str,
 # GPU implementation: Area
 # ---------------------------------------------------------------------------
 
+@register_kernel_variant(
+    "geometry_area",
+    "gpu-cuda-python",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("cuda-python", "metric", "area", "kahan", "centered"),
+)
 def _area_gpu(
     owned: OwnedGeometryArray,
     precision_plan: "PrecisionPlan | None" = None,
@@ -551,6 +561,15 @@ def _area_gpu(
 # GPU implementation: Length
 # ---------------------------------------------------------------------------
 
+@register_kernel_variant(
+    "geometry_length",
+    "gpu-cuda-python",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("linestring", "multilinestring", "polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("cuda-python", "metric", "length", "kahan", "centered"),
+)
 def _length_gpu(
     owned: OwnedGeometryArray,
     precision_plan: "PrecisionPlan | None" = None,
@@ -742,6 +761,15 @@ def _length_gpu(
 # CPU fallback: Area (NumPy, NO Shapely)
 # ---------------------------------------------------------------------------
 
+@register_kernel_variant(
+    "geometry_area",
+    "cpu",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("numpy", "metric", "area"),
+)
 def _area_cpu(owned: OwnedGeometryArray) -> np.ndarray:
     """CPU area computation using NumPy — no Shapely dependency."""
     row_count = owned.row_count
@@ -819,6 +847,15 @@ def _rings_area(x, y, ring_offsets, first_ring, last_ring):
 # CPU fallback: Length (NumPy, NO Shapely)
 # ---------------------------------------------------------------------------
 
+@register_kernel_variant(
+    "geometry_length",
+    "cpu",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("linestring", "multilinestring", "polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("numpy", "metric", "length"),
+)
 def _length_cpu(owned: OwnedGeometryArray) -> np.ndarray:
     """CPU length computation using NumPy — no Shapely dependency."""
     row_count = owned.row_count

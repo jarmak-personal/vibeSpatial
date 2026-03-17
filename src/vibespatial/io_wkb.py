@@ -28,6 +28,8 @@ from vibespatial.cccl_precompile import request_warmup
 
 request_warmup(["exclusive_scan_i32", "exclusive_scan_i64"])
 
+from vibespatial.nvrtc_precompile import request_nvrtc_warmup as _request_nvrtc_warmup  # noqa: E402
+
 WKB_TYPE_IDS: dict[GeometryFamily, int] = {
     GeometryFamily.POINT: 1,
     GeometryFamily.LINESTRING: 2,
@@ -261,6 +263,20 @@ __global__ void write_multipolygon_wkb(
 }
 """
 
+_WKB_ENCODE_KERNEL_NAMES = (
+    "write_point_wkb",
+    "write_linestring_wkb",
+    "write_polygon_wkb",
+    "write_multipoint_wkb",
+    "write_multilinestring_wkb",
+    "write_multipolygon_wkb",
+)
+
+_request_nvrtc_warmup([
+    ("wkb-encode", _WKB_ENCODE_KERNEL_SOURCE, _WKB_ENCODE_KERNEL_NAMES),
+])
+
+
 def has_pyarrow_support() -> bool:
     return find_spec("pyarrow") is not None
 
@@ -273,14 +289,7 @@ def _wkb_encode_kernels():
     return runtime.compile_kernels(
         cache_key=make_kernel_cache_key("wkb-encode", _WKB_ENCODE_KERNEL_SOURCE),
         source=_WKB_ENCODE_KERNEL_SOURCE,
-        kernel_names=(
-            "write_point_wkb",
-            "write_linestring_wkb",
-            "write_polygon_wkb",
-            "write_multipoint_wkb",
-            "write_multilinestring_wkb",
-            "write_multipolygon_wkb",
-        ),
+        kernel_names=_WKB_ENCODE_KERNEL_NAMES,
     )
 
 

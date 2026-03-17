@@ -733,6 +733,18 @@ class GeometryArray(ExtensionArray):
     @property
     def centroid(self) -> GeometryArray:
         self.check_geographic_crs(stacklevel=5)
+        if self._owned is not None:
+            from vibespatial.geometry_buffers import GeometryFamily
+
+            families = set(self._owned.families.keys())
+            polygon_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+            if families and families <= polygon_families:
+                from vibespatial.polygon_constructive import polygon_centroids_owned
+
+                cx, cy = polygon_centroids_owned(self._owned)
+                points = shapely.points(cx, cy)
+                # NaN coords produce None in shapely.points
+                return GeometryArray(points, crs=self.crs)
         return GeometryArray(shapely.centroid(self._data), crs=self.crs)
 
     def concave_hull(self, ratio, allow_holes):
@@ -854,6 +866,14 @@ class GeometryArray(ExtensionArray):
         return GeometryArray(shapely.minimum_clearance_line(self._data), crs=self.crs)
 
     def normalize(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.normalize_gpu import normalize_owned
+
+            result_owned = normalize_owned(self._owned)
+            return GeometryArray(
+                np.asarray(result_owned.to_shapely(), dtype=object),
+                crs=self.crs,
+            )
         return GeometryArray(shapely.normalize(self._data), crs=self.crs)
 
     def orient_polygons(self, exterior_cw: bool = False) -> GeometryArray:
@@ -1057,6 +1077,19 @@ class GeometryArray(ExtensionArray):
 
     def distance(self, other):
         self.check_geographic_crs(stacklevel=6)
+        if self._owned is not None and isinstance(other, GeometryArray):
+            if len(self) != len(other):
+                msg = (
+                    "Lengths of inputs do not match. "
+                    f"Left: {len(self)}, Right: {len(other)}"
+                )
+                raise ValueError(msg)
+            if not _check_crs(self, other):
+                _crs_mismatch_warn(self, other, stacklevel=7)
+            from vibespatial.distance_owned import distance_owned
+
+            other_owned = other.to_owned()
+            return distance_owned(self._owned, other_owned)
         return self._binary_method("distance", self, other)
 
     def hausdorff_distance(self, other, **kwargs):

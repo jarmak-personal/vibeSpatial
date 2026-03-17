@@ -18,6 +18,7 @@ import shapely
 from vibespatial.adaptive_runtime import plan_dispatch_selection
 from vibespatial.cuda_runtime import get_cuda_runtime
 from vibespatial.dispatch import record_dispatch_event
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.owned_geometry import (
     OwnedGeometryArray,
@@ -128,6 +129,15 @@ def dwithin_owned(
 # GPU path
 # ---------------------------------------------------------------------------
 
+@register_kernel_variant(
+    "geometry_distance",
+    "gpu-cuda-python",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon"),
+    supports_mixed=True,
+    tags=("cuda-python", "metric", "distance"),
+)
 def _distance_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -304,6 +314,15 @@ def _distance_gpu(
 # CPU fallback
 # ---------------------------------------------------------------------------
 
+@register_kernel_variant(
+    "geometry_distance",
+    "cpu",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("point", "linestring", "polygon", "multipoint", "multilinestring", "multipolygon"),
+    supports_mixed=True,
+    tags=("shapely", "metric", "distance"),
+)
 def _distance_cpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,

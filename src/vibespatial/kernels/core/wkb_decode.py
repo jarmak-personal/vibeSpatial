@@ -543,6 +543,13 @@ _WKB_DECODE_KERNEL_NAMES = (
 # Kernel compilation (matches io_wkb._wkb_encode_kernels pattern)
 # ---------------------------------------------------------------------------
 
+from vibespatial.nvrtc_precompile import request_nvrtc_warmup as _request_nvrtc_warmup  # noqa: E402
+
+_request_nvrtc_warmup([
+    ("wkb-decode", _WKB_DECODE_KERNEL_SOURCE, _WKB_DECODE_KERNEL_NAMES),
+])
+
+
 def _wkb_decode_kernels() -> dict[str, Any]:
     runtime = get_cuda_runtime()
     return runtime.compile_kernels(
