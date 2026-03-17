@@ -63,6 +63,14 @@ result = vibespatial.sjoin(gdf, other_gdf, predicate="intersects")
 dissolved = gdf.dissolve(by="name")
 ```
 
+```{raw} html
+<div class="cp-links" style="text-align: center; margin: 2rem 0;">
+  <a href="https://github.com/jarmak-personal/vibeSpatial" style="margin: 0 1rem;">GitHub</a> &middot;
+  <a href="https://pypi.org/project/vibespatial/" style="margin: 0 1rem;">PyPI</a> &middot;
+  <a href="https://github.com/jarmak-personal/vibeSpatial/issues" style="margin: 0 1rem;">Issues</a>
+</div>
+```
+
 ```{toctree}
 :hidden:
 :maxdepth: 2
