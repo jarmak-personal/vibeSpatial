@@ -1,0 +1,91 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute next version
+        id: version
+        run: |
+          CURRENT=$(python3 -c "
+          import tomllib
+          with open('pyproject.toml', 'rb') as f:
+              print(tomllib.load(f)['project']['version'])
+          ")
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          NEXT=$(python3 -c "
+          parts = '$CURRENT'.split('.')
+          major, minor, patch = int(parts[0]), int(parts[1]), int(parts[2])
+          bump = '${{ inputs.bump }}'
+          if bump == 'major':
+              major += 1; minor = 0; patch = 0
+          elif bump == 'minor':
+              minor += 1; patch = 0
+          else:
+              patch += 1
+          print(f'{major}.{minor}.{patch}')
+          ")
+          echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "### Version bump: $CURRENT → $NEXT (${{ inputs.bump }})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update version files
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+          CURRENT: ${{ steps.version.outputs.current }}
+        run: |
+          # pyproject.toml
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" pyproject.toml
+
+          # src/vibespatial/api/_version.py
+          TUPLE=$(echo "$NEXT" | sed 's/\./, /g')
+          sed -i "s/__version__ = version = \"$CURRENT\"/__version__ = version = \"$NEXT\"/" src/vibespatial/api/_version.py
+          sed -i "s/__version_tuple__ = version_tuple = .*/__version_tuple__ = version_tuple = ($TUPLE)/" src/vibespatial/api/_version.py
+
+          # docs/conf.py
+          sed -i "s/^release = \"$CURRENT\"/release = \"$NEXT\"/" docs/conf.py
+
+          echo "Updated files:"
+          grep -n "version" pyproject.toml | head -3
+          cat src/vibespatial/api/_version.py
+          grep "release" docs/conf.py
+
+      - name: Commit and tag
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Bump version to $NEXT"
+          git tag "v$NEXT"
+          git push origin main --tags
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          gh release create "v$NEXT" \
+            --title "v$NEXT" \
+            --generate-notes \
+            --latest

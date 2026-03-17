@@ -3841,6 +3841,18 @@
     },
     {
       "kind": "repo",
+      "path": ".github/workflows/release.yml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "github",
+        "release",
+        "workflows",
+        "yml"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".github/workflows/test-harness.yml",
       "referenced_by": [],
       "symbols": [],
