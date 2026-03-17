@@ -48,7 +48,7 @@ license = "Apache-2.0"
 [project.urls]
 Homepage = "https://github.com/jarmak-personal/vibeSpatial"
 Repository = "https://github.com/jarmak-personal/vibeSpatial"
-Documentation = "https://vibespatial.github.io/vibeSpatial/"
+Documentation = "https://jarmak-personal.github.io/vibeSpatial/"
 Issues = "https://github.com/jarmak-personal/vibeSpatial/issues"
 
 [dependency-groups]
