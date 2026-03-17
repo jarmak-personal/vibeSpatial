@@ -6012,6 +6012,20 @@
     },
     {
       "kind": "repo",
+      "path": "examples/data/release-notes-v0.1.0.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "data",
+        "examples",
+        "md",
+        "notes",
+        "release",
+        "v0"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "examples/nearby_buildings.py",
       "referenced_by": [],
       "symbols": [
