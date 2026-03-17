@@ -5,21 +5,27 @@ Runs the same pipeline (read, reproject, spatial query, write parquet)
 with upstream GeoPandas, vibeSpatial CPU-fallback, and vibeSpatial GPU,
 then prints a comparison table.
 
+The script auto-creates a temporary venv with upstream GeoPandas for
+the baseline comparison. No manual setup required.
+
 Requires:
 - examples/data/Florida.geojson (run nearby_buildings.py first to download)
-- upstream geopandas installed at /tmp/gpd_bench/bin/python
-- vibeSpatial with GPU deps (uv sync --group gpu-optional)
+- vibeSpatial installed with GPU extras (pip install vibespatial[cu12])
 
 Usage
 -----
-    uv run python examples/benchmark_nearby.py
+    python examples/benchmark_nearby.py
+    python examples/benchmark_nearby.py --skip-geopandas   # skip baseline
 """
 
 from __future__ import annotations
 
+import argparse
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -28,9 +34,6 @@ GEOJSON = "examples/data/Florida.geojson"
 OUTPUT_DIR = Path("examples/data")
 SEED_IDX = 3_000_000  # fixed index for reproducibility
 RADIUS_M = 1_000
-
-# Upstream GeoPandas python
-GPD_PYTHON = "/tmp/gpd_bench/bin/python"
 
 
 def _bench_script(label: str, python: str, script: str) -> dict:
@@ -55,7 +58,39 @@ def _bench_script(label: str, python: str, script: str) -> dict:
     return {}
 
 
+def _setup_geopandas_venv() -> str | None:
+    """Create a temporary venv with upstream GeoPandas. Returns python path."""
+    venv_dir = Path(tempfile.mkdtemp(prefix="vibespatial-bench-"))
+    print(f"Creating GeoPandas baseline venv at {venv_dir} ...")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "venv", str(venv_dir)],
+            check=True, capture_output=True,
+        )
+        pip = str(venv_dir / "bin" / "pip")
+        subprocess.run(
+            [pip, "install", "-q", "geopandas", "pyogrio", "pyarrow", "pyproj"],
+            check=True, capture_output=True, timeout=120,
+        )
+        python = str(venv_dir / "bin" / "python")
+        # Verify it works
+        subprocess.run(
+            [python, "-c", "import geopandas; print(geopandas.__version__)"],
+            check=True, capture_output=True,
+        )
+        return python
+    except Exception as e:
+        print(f"  Failed to create GeoPandas venv: {e}")
+        shutil.rmtree(venv_dir, ignore_errors=True)
+        return None
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Benchmark vibeSpatial vs GeoPandas")
+    parser.add_argument("--skip-geopandas", action="store_true",
+                        help="Skip the upstream GeoPandas baseline")
+    args = parser.parse_args()
+
     if not Path(GEOJSON).exists():
         print(f"Missing {GEOJSON} -- run nearby_buildings.py first to download.")
         sys.exit(1)
@@ -94,9 +129,21 @@ def main() -> None:
                           "buildings": n, "nearby": len(nearby)}}))
     """)
 
+    gpd_python = None
+    t_gpd: dict = {}
+
     # 1. Upstream GeoPandas
-    gpd_script = f"import geopandas as gpd\n{bench_body}"
-    t_gpd = _bench_script("Upstream GeoPandas", GPD_PYTHON, gpd_script)
+    if not args.skip_geopandas:
+        gpd_python = _setup_geopandas_venv()
+        if gpd_python:
+            gpd_script = f"import geopandas as gpd\n{bench_body}"
+            t_gpd = _bench_script("Upstream GeoPandas", gpd_python, gpd_script)
+            # Clean up venv
+            shutil.rmtree(Path(gpd_python).parent.parent, ignore_errors=True)
+        else:
+            print("Skipping GeoPandas baseline (venv setup failed)")
+    else:
+        print("Skipping GeoPandas baseline (--skip-geopandas)")
 
     # 2. vibeSpatial CPU fallback
     cpu_script = (

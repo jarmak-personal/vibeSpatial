@@ -6047,16 +6047,20 @@
       "referenced_by": [],
       "symbols": [
         "_bench_script",
+        "_setup_geopandas_venv",
         "main"
       ],
       "tokens": [
         "bench",
         "benchmark",
         "examples",
+        "geopandas",
         "main",
         "nearby",
         "py",
-        "script"
+        "script",
+        "setup",
+        "venv"
       ]
     },
     {
