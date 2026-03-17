@@ -15378,7 +15378,7 @@
         "test_owned_refine_eliminates_shapely_roundtrip",
         "test_gpu_bbox_candidate_generation_multi_query",
         "test_dwithin_routes_through_owned_path",
-        "test_small_input_gpu_dispatch",
+        "test_small_input_dispatches_correctly",
         "TestSjoinDispatchVisibility",
         "TestDeviceJoinResult"
       ],
@@ -15395,7 +15395,8 @@
         "contains",
         "conversion",
         "coordinate",
-        "dispatch",
+        "correctly",
+        "dispatches",
         "distance",
         "distances",
         "dwithin",

@@ -7,6 +7,7 @@ import vibespatial.api as geopandas
 import numpy as np
 import pandas as pd
 import vibespatial.io_arrow as io_arrow
+import vibespatial.io_geoparquet as io_geoparquet
 from shapely.geometry import (
     LineString,
     MultiLineString,
@@ -341,10 +342,10 @@ def test_read_geoparquet_uses_planned_row_groups_when_metadata_summary_exists(mo
         ymax=[5.0, 15.0, 25.0, 35.0],
     )
 
-    monkeypatch.setattr(io_arrow, "has_pyarrow_support", lambda: True)
-    monkeypatch.setattr(io_arrow, "has_pylibcudf_support", lambda: False)
+    monkeypatch.setattr(io_geoparquet, "has_pyarrow_support", lambda: True)
+    monkeypatch.setattr(io_geoparquet, "has_pylibcudf_support", lambda: False)
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_build_geoparquet_metadata_summary_from_pyarrow",
         lambda path, filesystem, geo_metadata: summary,
     )
@@ -353,9 +354,9 @@ def test_read_geoparquet_uses_planned_row_groups_when_metadata_summary_exists(mo
         captured["row_groups"] = kwargs["row_groups"]
         return "ok"
 
-    monkeypatch.setattr(io_arrow, "_read_geoparquet_with_pyarrow", fake_read_geoparquet_with_pyarrow)
+    monkeypatch.setattr(io_geoparquet, "_read_geoparquet_with_pyarrow", fake_read_geoparquet_with_pyarrow)
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_load_geoparquet_metadata",
         lambda path, filesystem=None, storage_options=None: (
             filesystem,
@@ -417,10 +418,10 @@ def test_read_geoparquet_owned_uses_chunked_backend_and_concatenates(monkeypatch
         arr = pa.FixedSizeListArray.from_arrays(pa.array(np.column_stack([np.arange(start, stop, dtype=float), np.arange(start, stop, dtype=float)]).ravel()), 2)
         return pa.table([arr], schema=pa.schema([field]))
 
-    monkeypatch.setattr(io_arrow, "has_pyarrow_support", lambda: True)
-    monkeypatch.setattr(io_arrow, "has_pylibcudf_support", lambda: True)
+    monkeypatch.setattr(io_geoparquet, "has_pyarrow_support", lambda: True)
+    monkeypatch.setattr(io_geoparquet, "has_pylibcudf_support", lambda: True)
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_load_geoparquet_metadata",
         lambda path, filesystem=None, storage_options=None: (
             filesystem,
@@ -430,7 +431,7 @@ def test_read_geoparquet_owned_uses_chunked_backend_and_concatenates(monkeypatch
         ),
     )
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_build_geoparquet_metadata_summary_from_pyarrow",
         lambda path, filesystem, geo_metadata: build_geoparquet_metadata_summary(
             source="point_encoding",
@@ -442,7 +443,7 @@ def test_read_geoparquet_owned_uses_chunked_backend_and_concatenates(monkeypatch
         ),
     )
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_read_geoparquet_table_with_pylibcudf",
         lambda path, columns=None, row_groups=None, filesystem=None: build_table(
             row_groups[0] * 2, row_groups[-1] * 2 + 2
@@ -479,11 +480,11 @@ def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypa
     fake_table = FakeGpuTable()
     owned = from_shapely_geometries([Point(0, 0), Point(1, 1), Point(2, 2)])
 
-    monkeypatch.setattr(io_arrow, "has_pyarrow_support", lambda: True)
-    monkeypatch.setattr(io_arrow, "has_pylibcudf_support", lambda: True)
-    monkeypatch.setattr(io_arrow, "_supports_pylibcudf_geoparquet_read", lambda *args, **kwargs: (True, "test"))
+    monkeypatch.setattr(io_geoparquet, "has_pyarrow_support", lambda: True)
+    monkeypatch.setattr(io_geoparquet, "has_pylibcudf_support", lambda: True)
+    monkeypatch.setattr(io_geoparquet, "_supports_pylibcudf_geoparquet_read", lambda *args, **kwargs: (True, "test"))
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_load_geoparquet_metadata",
         lambda path, filesystem=None, storage_options=None: (
             filesystem,
@@ -497,15 +498,15 @@ def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypa
             },
         ),
     )
-    monkeypatch.setattr(io_arrow, "_read_geoparquet_table_with_pylibcudf", lambda *args, **kwargs: fake_table)
+    monkeypatch.setattr(io_geoparquet, "_read_geoparquet_table_with_pylibcudf", lambda *args, **kwargs: fake_table)
     monkeypatch.setattr(
-        io_arrow,
-        "_read_non_geometry_geoparquet_columns_with_pyarrow",
-        lambda *args, **kwargs: pd.DataFrame({"value": [10, 20, 30], "name": ["a", "b", "c"]}),
+        io_geoparquet,
+        "_read_non_geometry_geoparquet_columns_as_arrow",
+        lambda *args, **kwargs: pa.table({"value": [10, 20, 30], "name": ["a", "b", "c"]}),
     )
-    monkeypatch.setattr(io_arrow, "_decode_pylibcudf_geoparquet_column_to_owned", lambda column, encoding: owned)
+    monkeypatch.setattr(io_geoparquet, "_decode_pylibcudf_geoparquet_column_to_owned", lambda column, encoding: owned)
     monkeypatch.setattr(
-        io_arrow,
+        io_geoparquet,
         "_build_geoparquet_metadata_summary_from_pyarrow",
         lambda path, filesystem, geo_metadata: None,
     )

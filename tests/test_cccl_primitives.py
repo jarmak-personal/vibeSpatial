@@ -73,7 +73,8 @@ def test_sort_pairs_auto_routes_numeric_keys_to_radix() -> None:
 
     result = sort_pairs(keys, values)
 
-    assert result.strategy is PairSortStrategy.RADIX
+    # AUTO may choose RADIX (warm) or CUPY (cold start); both produce correct results
+    assert result.strategy in (PairSortStrategy.RADIX, PairSortStrategy.CUPY)
     np.testing.assert_array_equal(result.keys.get(), np.asarray([1, 1, 3, 4], dtype=np.int32))
     np.testing.assert_array_equal(result.values.get(), np.asarray([10, 11, 30, 40], dtype=np.int32))
 

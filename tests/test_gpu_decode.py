@@ -213,7 +213,8 @@ def test_read_geoparquet_owned_gpu_wkb_mixed_point_linestring_decode_matches_cpu
 
     assert gpu_owned.residency is Residency.DEVICE
     assert gpu_owned.device_state is not None
-    assert set(gpu_owned.families) == {io_arrow.GeometryFamily.POINT, io_arrow.GeometryFamily.LINESTRING}
+    from vibespatial.geometry_buffers import GeometryFamily
+    assert set(gpu_owned.families) == {GeometryFamily.POINT, GeometryFamily.LINESTRING}
     for family in gpu_owned.families.values():
         assert family.host_materialized is False
 

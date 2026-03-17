@@ -57,8 +57,8 @@ class TestPrecompileEnabled:
 # ---------------------------------------------------------------------------
 
 class TestSpecRegistry:
-    def test_registry_has_20_specs(self):
-        assert len(SPEC_REGISTRY) == 20
+    def test_registry_has_21_specs(self):
+        assert len(SPEC_REGISTRY) == 21
 
     def test_all_expected_specs_present(self):
         expected = {
@@ -70,7 +70,7 @@ class TestSpecRegistry:
             "segmented_reduce_max_f64",
             "lower_bound_i32", "lower_bound_u64",
             "upper_bound_i32", "upper_bound_u64",
-            "radix_sort_i32_i32", "radix_sort_u64_i32",
+            "radix_sort_i32_i32", "radix_sort_i64_i32", "radix_sort_u64_i32",
             "merge_sort_u64_i32",
             "unique_by_key_i32_i32", "unique_by_key_u64_i32",
             "segmented_sort_asc_f64", "segmented_sort_asc_i32",

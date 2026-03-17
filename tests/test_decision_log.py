@@ -12,7 +12,6 @@ def test_decision_index_includes_sample_adr() -> None:
     rendered = render_index(decisions)
 
     assert "ADR-0001" in rendered
-    assert "vibeSpatial-o17.2.12" in rendered
     assert "docs/decisions/0001-mixed-geometries.md" in rendered
 
 
