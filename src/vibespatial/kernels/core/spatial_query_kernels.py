@@ -1137,11 +1137,336 @@ _MORTON_RANGE_KERNEL_NAMES = (
     "morton_range_scatter",
 )
 
+_GRID_NEAREST_KERNEL_SOURCE = """
+#if !defined(INFINITY)
+#define INFINITY __longlong_as_double(0x7FF0000000000000LL)
+#endif
+
+// ---------------------------------------------------------------------------
+// Uniform-grid spatial hash for GPU nearest-neighbour search.
+// Tier 1 NVRTC kernels per ADR-0033: geometry-specific grid operations.
+// ---------------------------------------------------------------------------
+
+// Assign each tree point to a grid cell: cell_id = row * n_cols + col.
+extern "C" __global__ void grid_assign_cells(
+    const double* tree_x,
+    const double* tree_y,
+    double origin_x,
+    double origin_y,
+    double cell_size,
+    int n_cols,
+    int n_rows,
+    int* out_cell_ids,
+    int n_tree
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tree) return;
+    const double tx = tree_x[i];
+    const double ty = tree_y[i];
+    int col = (int) floor((tx - origin_x) / cell_size);
+    int row = (int) floor((ty - origin_y) / cell_size);
+    if (col < 0) col = 0;
+    if (col >= n_cols) col = n_cols - 1;
+    if (row < 0) row = 0;
+    if (row >= n_rows) row = n_rows - 1;
+    out_cell_ids[i] = row * n_cols + col;
+}
+
+// Build cell_start / cell_end boundary arrays from sorted cell_ids.
+// One thread per tree point.  Detects transitions in the sorted array.
+extern "C" __global__ void grid_build_cell_ranges(
+    const int* sorted_cell_ids,
+    int* cell_start,
+    int* cell_end,
+    int n_cells,
+    int n_tree
+) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_tree) return;
+    const int cid = sorted_cell_ids[i];
+    if (i == 0 || cid != sorted_cell_ids[i - 1]) {
+        cell_start[cid] = i;
+    }
+    if (i == n_tree - 1 || cid != sorted_cell_ids[i + 1]) {
+        cell_end[cid] = i + 1;
+    }
+}
+
+// Ring-expansion nearest-neighbour search per query point.
+// Each thread handles one query, expanding rings until early termination.
+extern "C" __global__ void grid_nearest_search(
+    const double* query_x,
+    const double* query_y,
+    const double* sorted_tree_x,
+    const double* sorted_tree_y,
+    const int* sorted_tree_global_idx,
+    const int* cell_start,
+    const int* cell_end,
+    int n_cols,
+    int n_rows,
+    double origin_x,
+    double origin_y,
+    double cell_size,
+    int n_tree,
+    int exclusive,
+    double* out_min_sq,
+    int* out_min_idx,
+    int n_queries
+) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= n_queries) return;
+
+    const double qx = query_x[q];
+    const double qy = query_y[q];
+    double best_sq = INFINITY;
+    int best_idx = -1;
+
+    const int qcol = (int) floor((qx - origin_x) / cell_size);
+    const int qrow = (int) floor((qy - origin_y) / cell_size);
+    const int max_ring = (n_cols > n_rows) ? n_cols : n_rows;
+
+    for (int ring = 0; ring <= max_ring; ++ring) {
+        // Early termination: if best distance < distance to nearest
+        // unexplored cell boundary, no closer point can exist.
+        if (ring >= 2 && best_sq < INFINITY) {
+            double border_dist = (double)(ring - 1) * cell_size;
+            if (best_sq < border_dist * border_dist) break;
+        }
+
+        // Iterate cells on the border of ring R.
+        // Ring 0: just the center cell.
+        // Ring R>0: top/bottom rows and left/right columns of the
+        //           (2R+1) x (2R+1) square (excluding corners counted twice).
+        const int rmin = qrow - ring;
+        const int rmax = qrow + ring;
+        const int cmin = qcol - ring;
+        const int cmax = qcol + ring;
+
+        if (ring == 0) {
+            // Single center cell.
+            if (qcol >= 0 && qcol < n_cols && qrow >= 0 && qrow < n_rows) {
+                int cid = qrow * n_cols + qcol;
+                int s = cell_start[cid];
+                int e = cell_end[cid];
+                for (int j = s; j < e; ++j) {
+                    const double dx = qx - sorted_tree_x[j];
+                    const double dy = qy - sorted_tree_y[j];
+                    const double sq = dx * dx + dy * dy;
+                    if (exclusive && sq == 0.0 && qx == sorted_tree_x[j] && qy == sorted_tree_y[j]) continue;
+                    const int gidx = sorted_tree_global_idx[j];
+                    if (sq < best_sq || (sq == best_sq && gidx < best_idx)) {
+                        best_sq = sq;
+                        best_idx = gidx;
+                    }
+                }
+            }
+        } else {
+            // Top row: row = rmin, col in [cmin, cmax]
+            if (rmin >= 0 && rmin < n_rows) {
+                for (int c = (cmin < 0 ? 0 : cmin); c <= (cmax >= n_cols ? n_cols - 1 : cmax); ++c) {
+                    int cid = rmin * n_cols + c;
+                    int s = cell_start[cid];
+                    int e = cell_end[cid];
+                    for (int j = s; j < e; ++j) {
+                        const double dx = qx - sorted_tree_x[j];
+                        const double dy = qy - sorted_tree_y[j];
+                        const double sq = dx * dx + dy * dy;
+                        if (exclusive && sq == 0.0 && qx == sorted_tree_x[j] && qy == sorted_tree_y[j]) continue;
+                        { const int gidx = sorted_tree_global_idx[j]; if (sq < best_sq || (sq == best_sq && gidx < best_idx)) { best_sq = sq; best_idx = gidx; } }
+                    }
+                }
+            }
+            // Bottom row: row = rmax, col in [cmin, cmax]
+            if (rmax >= 0 && rmax < n_rows && rmax != rmin) {
+                for (int c = (cmin < 0 ? 0 : cmin); c <= (cmax >= n_cols ? n_cols - 1 : cmax); ++c) {
+                    int cid = rmax * n_cols + c;
+                    int s = cell_start[cid];
+                    int e = cell_end[cid];
+                    for (int j = s; j < e; ++j) {
+                        const double dx = qx - sorted_tree_x[j];
+                        const double dy = qy - sorted_tree_y[j];
+                        const double sq = dx * dx + dy * dy;
+                        if (exclusive && sq == 0.0 && qx == sorted_tree_x[j] && qy == sorted_tree_y[j]) continue;
+                        { const int gidx = sorted_tree_global_idx[j]; if (sq < best_sq || (sq == best_sq && gidx < best_idx)) { best_sq = sq; best_idx = gidx; } }
+                    }
+                }
+            }
+            // Left column: col = cmin, row in (rmin, rmax) exclusive of corners
+            if (cmin >= 0 && cmin < n_cols) {
+                for (int r = (rmin + 1 < 0 ? 0 : rmin + 1); r <= (rmax - 1 >= n_rows ? n_rows - 1 : rmax - 1); ++r) {
+                    if (r < 0 || r >= n_rows) continue;
+                    int cid = r * n_cols + cmin;
+                    int s = cell_start[cid];
+                    int e = cell_end[cid];
+                    for (int j = s; j < e; ++j) {
+                        const double dx = qx - sorted_tree_x[j];
+                        const double dy = qy - sorted_tree_y[j];
+                        const double sq = dx * dx + dy * dy;
+                        if (exclusive && sq == 0.0 && qx == sorted_tree_x[j] && qy == sorted_tree_y[j]) continue;
+                        { const int gidx = sorted_tree_global_idx[j]; if (sq < best_sq || (sq == best_sq && gidx < best_idx)) { best_sq = sq; best_idx = gidx; } }
+                    }
+                }
+            }
+            // Right column: col = cmax, row in (rmin, rmax) exclusive of corners
+            if (cmax >= 0 && cmax < n_cols && cmax != cmin) {
+                for (int r = (rmin + 1 < 0 ? 0 : rmin + 1); r <= (rmax - 1 >= n_rows ? n_rows - 1 : rmax - 1); ++r) {
+                    if (r < 0 || r >= n_rows) continue;
+                    int cid = r * n_cols + cmax;
+                    int s = cell_start[cid];
+                    int e = cell_end[cid];
+                    for (int j = s; j < e; ++j) {
+                        const double dx = qx - sorted_tree_x[j];
+                        const double dy = qy - sorted_tree_y[j];
+                        const double sq = dx * dx + dy * dy;
+                        if (exclusive && sq == 0.0 && qx == sorted_tree_x[j] && qy == sorted_tree_y[j]) continue;
+                        { const int gidx = sorted_tree_global_idx[j]; if (sq < best_sq || (sq == best_sq && gidx < best_idx)) { best_sq = sq; best_idx = gidx; } }
+                    }
+                }
+            }
+        }
+    }
+
+    out_min_sq[q] = best_sq;
+    out_min_idx[q] = best_idx;
+}
+
+// Count tied nearest neighbours per query (distance within isclose tolerance).
+extern "C" __global__ void grid_nearest_tie_count(
+    const double* query_x,
+    const double* query_y,
+    const double* sorted_tree_x,
+    const double* sorted_tree_y,
+    const int* cell_start,
+    const int* cell_end,
+    int n_cols,
+    int n_rows,
+    double origin_x,
+    double origin_y,
+    double cell_size,
+    const double* min_sq,
+    int exclusive,
+    int* out_counts,
+    int n_queries
+) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= n_queries) return;
+
+    const double best_sq = min_sq[q];
+    if (!isfinite(best_sq)) {
+        out_counts[q] = 0;
+        return;
+    }
+
+    const double qx = query_x[q];
+    const double qy = query_y[q];
+    const double best = sqrt(best_sq);
+    const double tol = 1e-8 + 1e-5 * fabs(best);
+    // Search radius: best_distance + tolerance, in cell units
+    const double search_r = best + tol;
+    const int qcol = (int) floor((qx - origin_x) / cell_size);
+    const int qrow = (int) floor((qy - origin_y) / cell_size);
+    const int cell_r = (int) ceil(search_r / cell_size) + 1;
+
+    const int rmin = (qrow - cell_r < 0) ? 0 : qrow - cell_r;
+    const int rmax = (qrow + cell_r >= n_rows) ? n_rows - 1 : qrow + cell_r;
+    const int cmin_base = (qcol - cell_r < 0) ? 0 : qcol - cell_r;
+    const int cmax_base = (qcol + cell_r >= n_cols) ? n_cols - 1 : qcol + cell_r;
+
+    int count = 0;
+    for (int r = rmin; r <= rmax; ++r) {
+        for (int c = cmin_base; c <= cmax_base; ++c) {
+            int cid = r * n_cols + c;
+            int s = cell_start[cid];
+            int e = cell_end[cid];
+            for (int j = s; j < e; ++j) {
+                const double dx = qx - sorted_tree_x[j];
+                const double dy = qy - sorted_tree_y[j];
+                const double dist = sqrt(dx * dx + dy * dy);
+                if (exclusive && dx == 0.0 && dy == 0.0) continue;
+                if (fabs(dist - best) <= tol) ++count;
+            }
+        }
+    }
+    out_counts[q] = count;
+}
+
+// Scatter tied nearest-neighbour pairs using precomputed offsets.
+extern "C" __global__ void grid_nearest_tie_scatter(
+    const double* query_x,
+    const double* query_y,
+    const double* sorted_tree_x,
+    const double* sorted_tree_y,
+    const int* sorted_tree_global_idx,
+    const int* cell_start,
+    const int* cell_end,
+    int n_cols,
+    int n_rows,
+    double origin_x,
+    double origin_y,
+    double cell_size,
+    const double* min_sq,
+    int exclusive,
+    const int* offsets,
+    int* out_left,
+    int* out_right,
+    int n_queries
+) {
+    const int q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= n_queries) return;
+
+    const double best_sq = min_sq[q];
+    if (!isfinite(best_sq)) return;
+
+    const double qx = query_x[q];
+    const double qy = query_y[q];
+    const double best = sqrt(best_sq);
+    const double tol = 1e-8 + 1e-5 * fabs(best);
+    const double search_r = best + tol;
+    const int qcol = (int) floor((qx - origin_x) / cell_size);
+    const int qrow = (int) floor((qy - origin_y) / cell_size);
+    const int cell_r = (int) ceil(search_r / cell_size) + 1;
+
+    const int rmin = (qrow - cell_r < 0) ? 0 : qrow - cell_r;
+    const int rmax = (qrow + cell_r >= n_rows) ? n_rows - 1 : qrow + cell_r;
+    const int cmin_base = (qcol - cell_r < 0) ? 0 : qcol - cell_r;
+    const int cmax_base = (qcol + cell_r >= n_cols) ? n_cols - 1 : qcol + cell_r;
+
+    int write_pos = offsets[q];
+    for (int r = rmin; r <= rmax; ++r) {
+        for (int c = cmin_base; c <= cmax_base; ++c) {
+            int cid = r * n_cols + c;
+            int s = cell_start[cid];
+            int e = cell_end[cid];
+            for (int j = s; j < e; ++j) {
+                const double dx = qx - sorted_tree_x[j];
+                const double dy = qy - sorted_tree_y[j];
+                const double dist = sqrt(dx * dx + dy * dy);
+                if (exclusive && dx == 0.0 && dy == 0.0) continue;
+                if (fabs(dist - best) <= tol) {
+                    out_left[write_pos] = q;
+                    out_right[write_pos] = sorted_tree_global_idx[j];
+                    ++write_pos;
+                }
+            }
+        }
+    }
+}
+"""
+
+_GRID_NEAREST_KERNEL_NAMES = (
+    "grid_assign_cells",
+    "grid_build_cell_ranges",
+    "grid_nearest_search",
+    "grid_nearest_tie_count",
+    "grid_nearest_tie_scatter",
+)
+
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SPATIAL_QUERY_KERNEL_NAMES),
     ("morton-range", _MORTON_RANGE_KERNEL_SOURCE, _MORTON_RANGE_KERNEL_NAMES),
+    ("grid-nearest", _GRID_NEAREST_KERNEL_SOURCE, _GRID_NEAREST_KERNEL_NAMES),
 ])
 
 
@@ -1152,4 +1477,14 @@ def _morton_range_kernels():
         cache_key=cache_key,
         source=_MORTON_RANGE_KERNEL_SOURCE,
         kernel_names=_MORTON_RANGE_KERNEL_NAMES,
+    )
+
+
+def _grid_nearest_kernels():
+    runtime = get_cuda_runtime()
+    cache_key = make_kernel_cache_key("grid-nearest", _GRID_NEAREST_KERNEL_SOURCE)
+    return runtime.compile_kernels(
+        cache_key=cache_key,
+        source=_GRID_NEAREST_KERNEL_SOURCE,
+        kernel_names=_GRID_NEAREST_KERNEL_NAMES,
     )

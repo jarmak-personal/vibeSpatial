@@ -35,7 +35,10 @@ from vibespatial.cuda_runtime import (  # noqa: E402
 )
 from vibespatial.geometry_buffers import GeometryFamily  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds  # noqa: E402
-from vibespatial.kernels.core.spatial_query_kernels import _spatial_query_kernels  # noqa: E402
+from vibespatial.kernels.core.spatial_query_kernels import (  # noqa: E402
+    _grid_nearest_kernels,
+    _spatial_query_kernels,
+)
 from vibespatial.owned_geometry import (  # noqa: E402
     FAMILY_TAGS,
     TAG_FAMILIES,
@@ -792,6 +795,358 @@ def _generate_point_nearest_candidates_regular_grid_gpu(
         runtime.free(offsets)
         runtime.free(out_left)
         runtime.free(out_right)
+
+
+# ---------------------------------------------------------------------------
+# Zero-copy GPU grid-based nearest neighbour (bypasses _to_owned entirely)
+# ---------------------------------------------------------------------------
+
+
+def _extract_point_coords_for_nearest(
+    geom_array: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int] | None:
+    """Extract dense point coordinates from a Shapely geometry array.
+
+    Returns ``(dense_x, dense_y, global_idx, n_total)`` where the dense
+    arrays contain only valid non-empty points and *global_idx* maps back
+    to original row indices.  Returns ``None`` if any non-Point geometry
+    is present.
+    """
+    type_ids = shapely.get_type_id(geom_array)
+    missing = shapely.is_missing(geom_array)
+    empty = shapely.is_empty(geom_array)
+    valid = ~missing & ~empty
+    # Check all non-missing geometries are Points (type_id == 0).
+    non_missing = ~missing
+    if non_missing.any() and not np.all(type_ids[non_missing] == 0):
+        return None
+    if not valid.any():
+        return None
+
+    coords = shapely.get_coordinates(geom_array[valid])
+    dense_x = np.ascontiguousarray(coords[:, 0])
+    dense_y = np.ascontiguousarray(coords[:, 1])
+    global_idx = np.flatnonzero(valid).astype(np.intp)
+    return dense_x, dense_y, global_idx, len(geom_array)
+
+
+def _nearest_grid_gpu(
+    tree_geometries: np.ndarray,
+    query_values: np.ndarray,
+    *,
+    return_all: bool,
+    return_distance: bool,
+    exclusive: bool,
+    max_distance: float | None,
+) -> tuple[Any, str] | None:
+    """Zero-copy GPU grid nearest-neighbour for point-point data.
+
+    Extracts coordinates directly from Shapely arrays, builds a uniform
+    grid spatial hash on device, and runs ring-expansion search entirely
+    on the GPU.  Returns ``None`` to fall through to existing paths for
+    non-point or empty inputs.
+    """
+    if not has_gpu_runtime():
+        return None
+
+    tree_data = _extract_point_coords_for_nearest(tree_geometries)
+    if tree_data is None:
+        return None
+    query_data = _extract_point_coords_for_nearest(query_values)
+    if query_data is None:
+        return None
+
+    tree_x_h, tree_y_h, tree_global_idx, _n_tree_total = tree_data
+    query_x_h, query_y_h, query_global_idx, n_query_total = query_data
+
+    n_tree = len(tree_x_h)
+    n_query = len(query_x_h)
+    if n_tree == 0 or n_query == 0:
+        result = _empty_nearest_result(return_distance)
+        return result, "owned_gpu_nearest"
+
+    import math
+
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+
+    # --- Upload tree coords to device ---
+    d_tree_x = runtime.from_host(tree_x_h)
+    d_tree_y = runtime.from_host(tree_y_h)
+    d_tree_global_idx = runtime.from_host(tree_global_idx.astype(np.int32))
+
+    # --- Grid build (all on device) ---
+    min_x = float(cp.min(d_tree_x))
+    max_x = float(cp.max(d_tree_x))
+    min_y = float(cp.min(d_tree_y))
+    max_y = float(cp.max(d_tree_y))
+    extent_x = max_x - min_x
+    extent_y = max_y - min_y
+    extent = max(extent_x, extent_y, 1e-12)
+
+    cell_size = extent / max(1.0, math.ceil(math.sqrt(n_tree)))
+    # Floor: cap grid at 4096 x 4096 = ~16M cells
+    cell_size = max(cell_size, extent / 4096.0)
+    # Ensure cell_size is positive
+    cell_size = max(cell_size, 1e-12)
+
+    origin_x = min_x - cell_size * 0.5
+    origin_y = min_y - cell_size * 0.5
+    n_cols = max(1, int(math.ceil((max_x - origin_x) / cell_size)) + 1)
+    n_rows = max(1, int(math.ceil((max_y - origin_y) / cell_size)) + 1)
+    n_cells = n_cols * n_rows
+
+    # Cap: if n_cells is enormous due to degenerate data, fall through
+    if n_cells > 16_777_216:  # 16M cells max
+        runtime.free(d_tree_x)
+        runtime.free(d_tree_y)
+        runtime.free(d_tree_global_idx)
+        return None
+
+    d_cell_ids = None
+    d_sorted_tree_x = None
+    d_sorted_tree_y = None
+    d_sorted_global_idx = None
+    d_cell_start = None
+    d_cell_end = None
+    d_query_x = None
+    d_query_y = None
+    d_min_sq = None
+    d_min_idx = None
+    d_counts = None
+    d_offsets = None
+    d_out_left = None
+    d_out_right = None
+
+    try:
+        kernels = _grid_nearest_kernels()
+
+        # Assign cells
+        d_cell_ids = runtime.allocate((n_tree,), np.int32)
+        grid_a, block_a = runtime.launch_config(kernels["grid_assign_cells"], n_tree)
+        runtime.launch(
+            kernels["grid_assign_cells"],
+            grid=grid_a, block=block_a,
+            params=(
+                (ptr(d_tree_x), ptr(d_tree_y),
+                 origin_x, origin_y, cell_size,
+                 n_cols, n_rows, ptr(d_cell_ids), n_tree),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            ),
+        )
+
+        # Sort tree points by cell_id
+        d_order = cp.arange(n_tree, dtype=cp.int32)
+        sorted_result = sort_pairs(d_cell_ids, d_order, synchronize=False)
+        d_sorted_cell_ids = sorted_result.keys
+        d_sort_order = sorted_result.values
+
+        # Reorder tree coords by sort order
+        d_sorted_tree_x = d_tree_x[d_sort_order]
+        d_sorted_tree_y = d_tree_y[d_sort_order]
+        d_sorted_global_idx = d_tree_global_idx[d_sort_order]
+
+        # Build cell ranges
+        d_cell_start = runtime.allocate((n_cells,), np.int32, zero=True)
+        d_cell_end = runtime.allocate((n_cells,), np.int32, zero=True)
+        grid_r, block_r = runtime.launch_config(kernels["grid_build_cell_ranges"], n_tree)
+        runtime.launch(
+            kernels["grid_build_cell_ranges"],
+            grid=grid_r, block=block_r,
+            params=(
+                (ptr(d_sorted_cell_ids), ptr(d_cell_start), ptr(d_cell_end),
+                 n_cells, n_tree),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+            ),
+        )
+
+        # Free intermediates no longer needed
+        runtime.free(d_cell_ids)
+        d_cell_ids = None
+        runtime.free(d_tree_x)
+        d_tree_x = None
+        runtime.free(d_tree_y)
+        d_tree_y = None
+        runtime.free(d_tree_global_idx)
+        d_tree_global_idx = None
+        del d_order, d_sorted_cell_ids, d_sort_order
+
+        # --- Upload query coords ---
+        d_query_x = runtime.from_host(query_x_h)
+        d_query_y = runtime.from_host(query_y_h)
+
+        # --- Grid nearest search ---
+        d_min_sq = runtime.allocate((n_query,), np.float64)
+        d_min_idx = runtime.allocate((n_query,), np.int32)
+        grid_s, block_s = runtime.launch_config(kernels["grid_nearest_search"], n_query)
+        runtime.launch(
+            kernels["grid_nearest_search"],
+            grid=grid_s, block=block_s,
+            params=(
+                (ptr(d_query_x), ptr(d_query_y),
+                 ptr(d_sorted_tree_x), ptr(d_sorted_tree_y),
+                 ptr(d_sorted_global_idx),
+                 ptr(d_cell_start), ptr(d_cell_end),
+                 n_cols, n_rows,
+                 origin_x, origin_y, cell_size,
+                 n_tree, 1 if exclusive else 0,
+                 ptr(d_min_sq), ptr(d_min_idx),
+                 n_query),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
+                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32),
+            ),
+        )
+
+        # --- Post-processing ---
+        if not return_all:
+            # return_all=False: just use min_idx directly (one per query).
+            runtime.synchronize()
+            h_min_sq = runtime.copy_device_to_host(d_min_sq)
+            h_min_idx = runtime.copy_device_to_host(d_min_idx)
+
+            # Filter: finite distances only, and max_distance
+            valid_mask = np.isfinite(h_min_sq)
+            if max_distance is not None:
+                valid_mask &= np.sqrt(h_min_sq) <= max_distance
+            valid_q = np.flatnonzero(valid_mask)
+            if valid_q.size == 0:
+                result = _empty_nearest_result(return_distance)
+                return result, "owned_gpu_nearest"
+
+            left = query_global_idx[valid_q].astype(np.intp)
+            right = h_min_idx[valid_q].astype(np.intp)
+            indices = np.vstack((left, right))
+            if return_distance:
+                dists = np.sqrt(h_min_sq[valid_q])
+                return (indices, dists), "owned_gpu_nearest"
+            return indices, "owned_gpu_nearest"
+
+        # return_all=True: need tie-count + tie-scatter
+        # Fast path: check if all counts would be 1 (common case)
+        d_counts = runtime.allocate((n_query,), np.int32)
+        grid_tc, block_tc = runtime.launch_config(kernels["grid_nearest_tie_count"], n_query)
+        runtime.launch(
+            kernels["grid_nearest_tie_count"],
+            grid=grid_tc, block=block_tc,
+            params=(
+                (ptr(d_query_x), ptr(d_query_y),
+                 ptr(d_sorted_tree_x), ptr(d_sorted_tree_y),
+                 ptr(d_cell_start), ptr(d_cell_end),
+                 n_cols, n_rows,
+                 origin_x, origin_y, cell_size,
+                 ptr(d_min_sq),
+                 1 if exclusive else 0,
+                 ptr(d_counts),
+                 n_query),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
+                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32),
+            ),
+        )
+
+        d_offsets = exclusive_sum(d_counts)
+        total_pairs = count_scatter_total(runtime, d_counts, d_offsets) if n_query > 0 else 0
+        if total_pairs == 0:
+            result = _empty_nearest_result(return_distance)
+            return result, "owned_gpu_nearest"
+
+        d_out_left = runtime.allocate((total_pairs,), np.int32)
+        d_out_right = runtime.allocate((total_pairs,), np.int32)
+        grid_ts, block_ts = runtime.launch_config(kernels["grid_nearest_tie_scatter"], n_query)
+        runtime.launch(
+            kernels["grid_nearest_tie_scatter"],
+            grid=grid_ts, block=block_ts,
+            params=(
+                (ptr(d_query_x), ptr(d_query_y),
+                 ptr(d_sorted_tree_x), ptr(d_sorted_tree_y),
+                 ptr(d_sorted_global_idx),
+                 ptr(d_cell_start), ptr(d_cell_end),
+                 n_cols, n_rows,
+                 origin_x, origin_y, cell_size,
+                 ptr(d_min_sq),
+                 1 if exclusive else 0,
+                 ptr(d_offsets),
+                 ptr(d_out_left), ptr(d_out_right),
+                 n_query),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32,
+                 KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32),
+            ),
+        )
+        runtime.synchronize()
+
+        # D2H transfer of final indices
+        h_left_dense = runtime.copy_device_to_host(d_out_left).astype(np.intp)
+        h_right = runtime.copy_device_to_host(d_out_right).astype(np.intp)
+
+        # Compute per-pair distances from min_sq (one D2H for distance data)
+        h_min_sq_all = runtime.copy_device_to_host(d_min_sq)
+        pair_dists = np.sqrt(h_min_sq_all[h_left_dense])
+
+        # Map dense query indices back to global indices
+        left = query_global_idx[h_left_dense]
+        right = h_right  # already global tree indices from sorted_tree_global_idx
+
+        # Apply max_distance filter
+        if max_distance is not None and left.size > 0:
+            within = pair_dists <= max_distance
+            left = left[within]
+            right = right[within]
+            pair_dists = pair_dists[within]
+
+        if left.size == 0:
+            result = _empty_nearest_result(return_distance)
+            return result, "owned_gpu_nearest"
+
+        indices = np.vstack((left, right))
+        if return_distance:
+            return (indices, pair_dists), "owned_gpu_nearest"
+        return indices, "owned_gpu_nearest"
+
+    finally:
+        runtime.free(d_tree_x)
+        runtime.free(d_tree_y)
+        runtime.free(d_tree_global_idx)
+        runtime.free(d_cell_ids)
+        runtime.free(d_sorted_tree_x)
+        runtime.free(d_sorted_tree_y)
+        runtime.free(d_sorted_global_idx)
+        runtime.free(d_cell_start)
+        runtime.free(d_cell_end)
+        runtime.free(d_query_x)
+        runtime.free(d_query_y)
+        runtime.free(d_min_sq)
+        runtime.free(d_min_idx)
+        runtime.free(d_counts)
+        runtime.free(d_offsets)
+        runtime.free(d_out_left)
+        runtime.free(d_out_right)
 
 
 def _nearest_indexed_point_gpu(
@@ -2017,6 +2372,16 @@ def nearest_spatial_index(
     if query_values is None:
         result = _empty_nearest_result(return_distance)
         return result, "owned_cpu_nearest"
+
+    # --- NEW: Try zero-copy GPU grid nearest (bypasses _to_owned entirely) ---
+    if has_gpu_runtime():
+        grid_result = _nearest_grid_gpu(
+            tree_geometries, query_values,
+            return_all=return_all, return_distance=return_distance,
+            exclusive=exclusive, max_distance=max_distance,
+        )
+        if grid_result is not None:
+            return grid_result
 
     # --- Convert owned arrays and compute bounds (shared by both paths) ---
     query_owned = _to_owned(query_values)
