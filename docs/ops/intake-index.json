@@ -3953,18 +3953,6 @@
     },
     {
       "kind": "repo",
-      "path": ".github/workflows/publish.yml",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "github",
-        "publish",
-        "workflows",
-        "yml"
-      ]
-    },
-    {
-      "kind": "repo",
       "path": ".github/workflows/release.yml",
       "referenced_by": [],
       "symbols": [],
