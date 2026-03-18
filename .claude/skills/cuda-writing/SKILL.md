@@ -52,8 +52,13 @@ Why: zero JIT path; simpler than CCCL for no algorithmic advantage.
 ### Tier 3a — CCCL Algorithmic Primitives
 
 **Promoted to CCCL default** (benchmarked 2026-03-12):
-- `select` (compaction by bool mask) — 1.4-3.1x faster than CuPy
-- `exclusive_scan` — 1.8-3.7x faster than CuPy
+- `exclusive_scan` — 1.8-3.7x faster than CuPy via `make_*`
+
+**Reverted to CuPy default** (2026-03-17):
+- `select` (compaction by bool mask) — CCCL `make_select` bakes predicate
+  closure device pointers, preventing reuse across calls. One-shot `select()`
+  re-JITs per array size class (~5-6s each). CuPy `flatnonzero` is 0.2ms
+  with no JIT. CCCL available via explicit `CompactionStrategy.CCCL_SELECT`.
 
 **Already CCCL-only** (no CuPy equivalent):
 - `radix_sort`, `merge_sort` with custom comparators
@@ -323,7 +328,7 @@ with runtime.stream_context() as s_mpoly:
 from vibespatial.cccl_primitives import (
     # Tier 3a — CCCL default (beats CuPy)
     exclusive_sum,            # Prefix sum (1.8-3.7x faster)
-    compact_indices,          # Bool mask -> indices (1.4-3.1x faster)
+    compact_indices,          # Bool mask -> indices (CuPy default; CCCL via explicit strategy)
     sort_pairs,               # Radix or merge sort with values
     unique_sorted_pairs,      # Unique-by-key on sorted input
     segmented_reduce_sum,     # Per-segment sum

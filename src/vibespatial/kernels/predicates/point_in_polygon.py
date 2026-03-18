@@ -1917,6 +1917,7 @@ def _evaluate_point_in_polygon_gpu(
     right: NormalizedBoundsInput,
     *,
     strategy: str = "auto",
+    return_device: bool = False,
 ) -> np.ndarray:
     global _last_gpu_substage_timings
     timings: dict[str, float] = {}
@@ -2156,6 +2157,10 @@ def _evaluate_point_in_polygon_gpu(
         timings["candidate_mask_s"] = 0.0
         timings["family_split_s"] = 0.0
         timings["total_rows"] = int(points.row_count)
+        if return_device:
+            # Keep result on GPU — caller is responsible for freeing.
+            _last_gpu_substage_timings = timings
+            return device_out
         try:
             dense_out = runtime.copy_device_to_host(device_out)
         finally:
@@ -2216,6 +2221,7 @@ def point_in_polygon(
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _return_device: bool = False,
 ) -> list[bool | None]:
     global _last_gpu_substage_timings
 
@@ -2273,13 +2279,21 @@ def point_in_polygon(
         )
         move_to_device_s = perf_counter() - t0
 
-        gpu_out = _point_in_polygon_gpu_variant(left, right)
+        gpu_out = _evaluate_point_in_polygon_gpu(
+            left, right, return_device=_return_device,
+        )
 
         # Merge outer timing into substage report
         if _last_gpu_substage_timings is not None:
             _last_gpu_substage_timings["coerce_left_s"] = coerce_left_s
             _last_gpu_substage_timings["coerce_right_s"] = coerce_right_s
             _last_gpu_substage_timings["move_to_device_s"] = move_to_device_s
+
+        # _return_device: keep result on GPU as CuPy bool array for
+        # zero-copy pipelines (feeds into device_take).
+        if _return_device:
+            import cupy as _cp
+            return _cp.asarray(gpu_out, dtype=_cp.bool_)
 
         # Fused path returns (hits_uint8, null_mask) tuple to avoid
         # the expensive object-dtype array; other strategies return
@@ -2298,4 +2312,10 @@ def point_in_polygon(
     normalize_right_s = perf_counter() - t0
     if _last_gpu_substage_timings is not None:
         _last_gpu_substage_timings["normalize_right_s"] = normalize_right_s
-    return _to_python_result(_point_in_polygon_cpu_variant(left, right))
+    cpu_out = _point_in_polygon_cpu_variant(left, right)
+    if _return_device:
+        # CPU fallback for _return_device: return numpy bool array
+        return np.array([bool(v) if v is not None else False for v in cpu_out], dtype=bool)
+    return _to_python_result(cpu_out)
+
+

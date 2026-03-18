@@ -358,6 +358,12 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
     if coord_counts.size != n or not np.all(coord_counts == 5):
         return None
 
+    # Structural checks above use only offsets (available on host even for
+    # device-resident OGAs).  Coordinate verification needs x/y buffers;
+    # lazily materialise them -- _ensure_host_state skips already-populated
+    # offsets and only transfers coordinates.
+    query_owned._ensure_host_state()
+    polygon_buffer = query_owned.families[GeometryFamily.POLYGON]
     # Reshape coords to (N, 5) for vectorized box validation.
     all_x = polygon_buffer.x.reshape(n, 5)
     all_y = polygon_buffer.y.reshape(n, 5)

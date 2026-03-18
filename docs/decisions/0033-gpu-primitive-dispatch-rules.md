@@ -132,7 +132,7 @@ simplest option.
 
 | Operation | CCCL call | Why switched |
 |---|---|---|
-| Compaction (bool mask → indices) | `cccl_algorithms.select` | CCCL warm beats CuPy at all scales; `make_*` is 1.4–3.1× faster |
+| Compaction (bool mask → indices) | `cp.flatnonzero` (CuPy) | CCCL `make_select` bakes predicate closure device pointers, preventing reuse; one-shot `select()` re-JITs per array size class (~5-6s each). CuPy is 0.2ms with no JIT. CCCL available via explicit `CompactionStrategy.CCCL_SELECT`. |
 | Exclusive prefix sum | `cccl_algorithms.exclusive_scan` | `make_*` is 1.8–3.7× faster than CuPy at all scales |
 
 CuPy paths remain available via strategy overrides for any pipeline

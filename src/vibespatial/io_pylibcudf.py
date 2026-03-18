@@ -249,16 +249,36 @@ def _build_device_single_family_owned(
     validity = runtime.copy_device_to_host(validity_device).astype(np.bool_, copy=False)
     tags = runtime.copy_device_to_host(tags_device).astype(np.int8, copy=False)
     family_row_offsets = runtime.copy_device_to_host(family_row_offsets_device).astype(np.int32, copy=False)
+    # Populate structural metadata on host (offsets, masks -- small, KB-scale)
+    # while keeping coordinate arrays (x, y) device-only.  This lets host-side
+    # code (regular grid detection, morton key computation) inspect geometry
+    # structure without a full D->H transfer of coordinate data.
+    # _ensure_host_state() checks .size / is-not-None before re-transferring,
+    # so these populated fields are reused and only x/y get deferred-transferred.
+    host_geometry_offsets = np.ascontiguousarray(
+        runtime.copy_device_to_host(geometry_offsets_device), dtype=np.int32,
+    )
+    host_empty_mask = np.ascontiguousarray(
+        runtime.copy_device_to_host(empty_mask_device), dtype=np.bool_,
+    )
+    host_part_offsets = (
+        None if part_offsets_device is None
+        else np.ascontiguousarray(runtime.copy_device_to_host(part_offsets_device), dtype=np.int32)
+    )
+    host_ring_offsets = (
+        None if ring_offsets_device is None
+        else np.ascontiguousarray(runtime.copy_device_to_host(ring_offsets_device), dtype=np.int32)
+    )
     buffer = FamilyGeometryBuffer(
         family=family,
         schema=get_geometry_buffer_schema(family),
         row_count=valid_count,
         x=np.empty(0, dtype=np.float64),
         y=np.empty(0, dtype=np.float64),
-        geometry_offsets=np.empty(0, dtype=np.int32),
-        empty_mask=np.empty(0, dtype=np.bool_),
-        part_offsets=None if part_offsets_device is None else None,
-        ring_offsets=None if ring_offsets_device is None else None,
+        geometry_offsets=host_geometry_offsets,
+        empty_mask=host_empty_mask,
+        part_offsets=host_part_offsets,
+        ring_offsets=host_ring_offsets,
         bounds=None,
         host_materialized=False,
     )
@@ -314,10 +334,20 @@ def _build_device_mixed_owned(
             row_count=row_count,
             x=np.empty(0, dtype=np.float64),
             y=np.empty(0, dtype=np.float64),
-            geometry_offsets=np.empty(0, dtype=np.int32),
-            empty_mask=np.empty(0, dtype=np.bool_),
-            part_offsets=None if device_buffer.part_offsets is None else None,
-            ring_offsets=None if device_buffer.ring_offsets is None else None,
+            geometry_offsets=np.ascontiguousarray(
+                runtime.copy_device_to_host(device_buffer.geometry_offsets), dtype=np.int32,
+            ),
+            empty_mask=np.ascontiguousarray(
+                runtime.copy_device_to_host(device_buffer.empty_mask), dtype=np.bool_,
+            ),
+            part_offsets=(
+                None if device_buffer.part_offsets is None
+                else np.ascontiguousarray(runtime.copy_device_to_host(device_buffer.part_offsets), dtype=np.int32)
+            ),
+            ring_offsets=(
+                None if device_buffer.ring_offsets is None
+                else np.ascontiguousarray(runtime.copy_device_to_host(device_buffer.ring_offsets), dtype=np.int32)
+            ),
             bounds=None,
             host_materialized=False,
         )

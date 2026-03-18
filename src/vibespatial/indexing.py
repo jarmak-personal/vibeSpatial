@@ -597,6 +597,13 @@ def _detect_regular_grid_rect_index(
     if not np.array_equal(expected_index, actual_index):
         return None
 
+    # Structural checks above use only offsets/bounds (available on host
+    # even for device-resident OGAs).  The rectangle vertex verification
+    # below needs coordinate data.  Lazily materialise host state here --
+    # _ensure_host_state only transfers x/y since offsets are already
+    # populated.  At 10K polygons this is ~800KB.
+    geometry_array._ensure_host_state()
+    polygon_buffer = geometry_array.families[GeometryFamily.POLYGON]
     ring_x = polygon_buffer.x.reshape(geometry_array.row_count, 5)
     ring_y = polygon_buffer.y.reshape(geometry_array.row_count, 5)
     x_is_min = np.isclose(ring_x, bounds[:, 0][:, None], atol=tol, rtol=0.0)
@@ -730,9 +737,17 @@ def build_flat_spatial_index(
 ) -> FlatSpatialIndex:
     selection = runtime_selection or _default_index_runtime_selection()
     geometry_array.record_runtime_selection(selection)
+    # Use GPU for bounds when geometry is device-resident to avoid pulling
+    # the full coordinate arrays to host just for min/max.  Structural
+    # metadata (offsets, masks) is host-available even on device-resident
+    # OGAs (populated at GPU read time), so regular grid detection and
+    # morton key computation still work.
     bounds_dispatch = (
         ExecutionMode.GPU
-        if selection.selected is ExecutionMode.GPU
+        if (
+            selection.selected is ExecutionMode.GPU
+            or (geometry_array.residency is Residency.DEVICE and has_gpu_runtime())
+        )
         else ExecutionMode.CPU
     )
     bounds = compute_geometry_bounds(geometry_array, dispatch_mode=bounds_dispatch)

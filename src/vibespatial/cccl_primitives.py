@@ -215,10 +215,14 @@ def compact_indices(
     _validate_vector("mask", mask)
     resolved = strategy if isinstance(strategy, CompactionStrategy) else CompactionStrategy(strategy)
     if resolved is CompactionStrategy.AUTO:
-        # CCCL select beats CuPy flatnonzero at all scales once JIT is warm
-        # (ADR-0033, benchmarked 2026-03-12).  Cold-call JIT penalty is ~950ms
-        # but amortised across all subsequent calls in the process.
-        resolved = CompactionStrategy.CCCL_SELECT
+        # Unlike exclusive_sum (where make_* works because _sum_op is a
+        # stateless module-level function), make_select bakes the
+        # predicate closure's device pointers into the compiled kernel,
+        # so the precompiled callable cannot be reused with different
+        # mask arrays.  The one-shot select() API re-JITs per array
+        # size class (~5-6s each).  CuPy flatnonzero is 0.2ms with no
+        # JIT and comparable warm throughput.
+        resolved = CompactionStrategy.CUPY
     if resolved is CompactionStrategy.CUPY:
         out = cp_module.flatnonzero(mask).astype(cp_module.int32, copy=False)
         cp_module.cuda.Stream.null.synchronize()

@@ -103,7 +103,7 @@ class _NvmlGpuSampler:
 @dataclass
 class _StageGpuTelemetryCollector:
     sampler: Any
-    interval_seconds: float = 0.02
+    interval_seconds: float = 0.001
     retain_trace: bool = False
     include_sparklines: bool = False
     _stop: Event = field(default_factory=Event)
@@ -145,7 +145,7 @@ class _StageGpuTelemetryCollector:
         used_values = [sample.used_bytes for _, sample in self._samples]
         summary = {
             "gpu_device_name": first.device_name,
-            "gpu_sampling_interval_ms": int(self.interval_seconds * 1000),
+            "gpu_sampling_interval_ms": round(self.interval_seconds * 1000, 3),
             "gpu_sample_count": len(self._samples),
             "gpu_utilization_pct_start": first.sm_utilization_pct,
             "gpu_utilization_pct_end": last.sm_utilization_pct,
@@ -261,7 +261,7 @@ class StageProfiler:
         selected_runtime: ExecutionMode | str,
         enable_nvtx: bool = False,
         gpu_sampler: Any | None = None,
-        gpu_sample_interval_seconds: float = 0.02,
+        gpu_sample_interval_seconds: float = 0.001,
         retain_gpu_trace: bool = False,
         include_gpu_sparklines: bool = False,
     ) -> None:

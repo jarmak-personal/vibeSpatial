@@ -808,8 +808,7 @@ def _profile_predicate_pipeline(
             detail="evaluate point-in-polygon with pre-constructed polygon buffers",
         ) as stage:
             history_before = len(batch.geometry.runtime_history)
-            hits = np.asarray(point_in_polygon(batch.geometry, polygon_owned), dtype=object)
-            mask = hits == True  # noqa: E712  # object-dtype array
+            mask = point_in_polygon(batch.geometry, polygon_owned, _return_device=True)
             stage.rows_out = int(mask.sum())
             runtime_selection = batch.geometry.runtime_history[history_before:] or batch.geometry.runtime_history[-1:]
             if runtime_selection:
@@ -820,10 +819,11 @@ def _profile_predicate_pipeline(
                 stage.metadata["gpu_substage_timings"] = gpu_timings
             _record_stage_overheads(stage, audit, memory, batch)
 
+        filter_device = ExecutionMode.GPU if hasattr(mask, 'device') else ExecutionMode.CPU
         with profiler.stage(
             "filter_points",
             category="filter",
-            device=ExecutionMode.CPU,
+            device=filter_device,
             rows_in=batch.geometry.row_count,
             detail="filter GeoJSON point rows by predicate hit mask (buffer-level take)",
         ) as stage:
