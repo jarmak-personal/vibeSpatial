@@ -32,7 +32,11 @@ from vibespatial.owned_geometry import (  # noqa: E402
     OwnedGeometryArray,
     from_shapely_geometries,
 )
-from vibespatial.point_constructive import _clip_points_rect_gpu_arrays  # noqa: E402
+from vibespatial.point_constructive import (  # noqa: E402
+    _build_device_backed_point_output,
+    _clip_points_rect_gpu_arrays,
+    _empty_point_output,
+)
 from vibespatial.precision import (  # noqa: E402
     KernelClass,
     PrecisionMode,
@@ -336,17 +340,60 @@ def _compile_lb_kernels():
     return compile_kernel_group("lb-clip", _LIANG_BARSKY_KERNEL_SOURCE, _LB_KERNEL_NAMES)
 
 
-@dataclass(frozen=True)
 class RectClipResult:
-    geometries: np.ndarray
-    row_count: int
-    candidate_rows: np.ndarray
-    fast_rows: np.ndarray
-    fallback_rows: np.ndarray
-    runtime_selection: RuntimeSelection
-    precision_plan: PrecisionPlan
-    robustness_plan: RobustnessPlan
-    owned_result: OwnedGeometryArray | None = None
+    """Result of a rectangle clip operation.
+
+    ``geometries`` is lazily materialized from ``owned_result`` when accessed
+    for the first time on the GPU point path, avoiding D->H->Shapely overhead
+    unless a caller actually needs Shapely objects.
+    """
+
+    __slots__ = (
+        "_geometries",
+        "_geometries_factory",
+        "candidate_rows",
+        "fallback_rows",
+        "fast_rows",
+        "owned_result",
+        "precision_plan",
+        "robustness_plan",
+        "row_count",
+        "runtime_selection",
+    )
+
+    def __init__(
+        self,
+        *,
+        geometries: np.ndarray | None = None,
+        geometries_factory: object | None = None,
+        row_count: int,
+        candidate_rows: np.ndarray,
+        fast_rows: np.ndarray,
+        fallback_rows: np.ndarray,
+        runtime_selection: RuntimeSelection,
+        precision_plan: PrecisionPlan,
+        robustness_plan: RobustnessPlan,
+        owned_result: OwnedGeometryArray | None = None,
+    ):
+        self._geometries = geometries
+        self._geometries_factory = geometries_factory
+        self.row_count = row_count
+        self.candidate_rows = candidate_rows
+        self.fast_rows = fast_rows
+        self.fallback_rows = fallback_rows
+        self.runtime_selection = runtime_selection
+        self.precision_plan = precision_plan
+        self.robustness_plan = robustness_plan
+        self.owned_result = owned_result
+
+    @property
+    def geometries(self) -> np.ndarray:
+        if self._geometries is None and self._geometries_factory is not None:
+            self._geometries = self._geometries_factory()
+            self._geometries_factory = None
+        if self._geometries is None:
+            return np.empty(0, dtype=object)
+        return self._geometries
 
 
 @dataclass(frozen=True)
@@ -1368,25 +1415,49 @@ def clip_by_rect_owned(
                     boundary_inclusive=False,
                 )
                 keep_rows_host = runtime.copy_device_to_host(keep_rows)
-                result = (
-                    _point_clip_result_template(owned)
-                    if shapely_values is None
-                    else np.asarray([None if value is None else EMPTY for value in shapely_values], dtype=object)
-                )
-                if keep_rows_host.size:
-                    if shapely_values is not None:
-                        result[keep_rows_host] = shapely_values[keep_rows_host]
-                    else:
-                        clipped_points = shapely.points(
-                            runtime.copy_device_to_host(clipped_x),
-                            runtime.copy_device_to_host(clipped_y),
+                kept_count = int(keep_rows_host.size)
+
+                # Build owned_result directly from device arrays -- no Shapely
+                # round-trip.  Ownership of clipped_x/clipped_y transfers to the
+                # OwnedGeometryArray so they must NOT be freed in the finally block.
+                if kept_count > 0:
+                    gpu_owned_result = _build_device_backed_point_output(
+                        clipped_x, clipped_y, row_count=kept_count,
+                    )
+                    # Ownership transferred -- prevent finally-block free.
+                    clipped_x = None
+                    clipped_y = None
+                else:
+                    gpu_owned_result = _empty_point_output()
+
+                # Lazily build the Shapely geometries array only when a caller
+                # actually reads .geometries (e.g. tests, GeoPandas adapter).
+                # The hot path (pipeline_benchmarks) uses .owned_result instead.
+                _owned_ref = owned
+                _keep_rows_host_ref = keep_rows_host
+                _owned_result_ref = gpu_owned_result
+                _shapely_values_ref = shapely_values
+
+                def _materialize_geometries():
+                    result = (
+                        _point_clip_result_template(_owned_ref)
+                        if _shapely_values_ref is None
+                        else np.asarray(
+                            [None if value is None else EMPTY for value in _shapely_values_ref],
+                            dtype=object,
                         )
-                        result[keep_rows_host] = np.asarray(clipped_points, dtype=object)
-                # Build owned_result from kept points (ADR-0005: stay device-resident)
-                kept_geoms = [g for g in result if g is not None and not (hasattr(g, "is_empty") and g.is_empty)]
-                gpu_owned_result = from_shapely_geometries(kept_geoms) if kept_geoms else from_shapely_geometries([shapely.Point(0, 0)])
+                    )
+                    if _keep_rows_host_ref.size:
+                        if _shapely_values_ref is not None:
+                            result[_keep_rows_host_ref] = _shapely_values_ref[_keep_rows_host_ref]
+                        else:
+                            # Materialize from owned_result (device -> host -> Shapely)
+                            shapely_geoms = _owned_result_ref.to_shapely()
+                            result[_keep_rows_host_ref] = np.asarray(shapely_geoms, dtype=object)
+                    return result
+
                 return RectClipResult(
-                    geometries=result,
+                    geometries_factory=_materialize_geometries,
                     row_count=int(owned.row_count),
                     candidate_rows=keep_rows_host,
                     fast_rows=keep_rows_host,

@@ -87,9 +87,12 @@ def test_benchmark_dissolve_pipeline_reports_group_count() -> None:
         }
     )
 
-    benchmark = benchmark_dissolve_pipeline(frame, by="group", dataset="points")
+    benchmark = benchmark_dissolve_pipeline(
+        frame, by="group", dataset="points", iterations=1, warmup=0,
+    )
 
     assert benchmark.rows == 4
     assert benchmark.groups == 2
+    assert benchmark.iterations == 1
     assert benchmark.pipeline_elapsed_seconds >= 0.0
     assert benchmark.baseline_elapsed_seconds >= 0.0

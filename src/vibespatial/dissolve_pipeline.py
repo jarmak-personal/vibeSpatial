@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import statistics
 from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
@@ -87,6 +89,7 @@ class DissolveBenchmark:
     groups: int
     pipeline_elapsed_seconds: float
     baseline_elapsed_seconds: float
+    iterations: int = 1
 
     @property
     def speedup_vs_baseline(self) -> float:
@@ -459,13 +462,8 @@ def evaluate_geopandas_dissolve(
         return aggregated
 
 
-def benchmark_dissolve_pipeline(
-    frame,
-    *,
-    by,
-    method: DissolveUnionMethod | str = DissolveUnionMethod.UNARY,
-    dataset: str = "dissolve",
-):
+def _run_pipeline_once(frame, *, by, method):
+    """Execute the pipeline path once and return (result, elapsed)."""
     start = perf_counter()
     result = evaluate_geopandas_dissolve(
         frame,
@@ -480,8 +478,12 @@ def benchmark_dissolve_pipeline(
         grid_size=None,
         agg_kwargs={},
     )
-    pipeline_elapsed = perf_counter() - start
+    elapsed = perf_counter() - start
+    return result, elapsed
 
+
+def _run_baseline_once(frame, *, by, method):
+    """Execute the baseline path once and return elapsed time."""
     start = perf_counter()
     baseline = frame.copy()
     data = baseline.drop(labels=baseline.geometry.name, axis=1)
@@ -494,14 +496,76 @@ def benchmark_dissolve_pipeline(
         crs=baseline.crs,
     )
     aggregated_geometry = aggregated_geometry.join(aggregated_data)
-    baseline_elapsed = perf_counter() - start
+    return perf_counter() - start
+
+
+def benchmark_dissolve_pipeline(
+    frame,
+    *,
+    by,
+    method: DissolveUnionMethod | str = DissolveUnionMethod.UNARY,
+    dataset: str = "dissolve",
+    iterations: int = 5,
+    warmup: int = 1,
+):
+    """Benchmark the dissolve pipeline against the baseline groupby path.
+
+    Uses *warmup* discarded runs followed by *iterations* timed runs per
+    path.  Reports the **median** elapsed time to resist outlier noise.
+    GC is disabled during timed sections to avoid non-deterministic pauses.
+
+    Set *iterations=1* and *warmup=0* for a quick smoke-test (the old
+    behaviour).
+    """
+    from vibespatial.cccl_precompile import ensure_pipelines_warm
+
+    # Drain any CCCL background compilation so it does not interfere
+    # with timing.
+    ensure_pipelines_warm()
+
+    # -- Warmup (results discarded) ------------------------------------
+    for _ in range(warmup):
+        _run_pipeline_once(frame, by=by, method=method)
+        _run_baseline_once(frame, by=by, method=method)
+
+    # Collect garbage once before timed section so both paths start from
+    # a similar heap state.
+    gc.collect()
+
+    # -- Timed iterations: pipeline ------------------------------------
+    pipeline_times: list[float] = []
+    result = None
+    gc.disable()
+    try:
+        for _ in range(iterations):
+            r, elapsed = _run_pipeline_once(frame, by=by, method=method)
+            pipeline_times.append(elapsed)
+            if result is None:
+                result = r
+    finally:
+        gc.enable()
+
+    gc.collect()
+
+    # -- Timed iterations: baseline ------------------------------------
+    baseline_times: list[float] = []
+    gc.disable()
+    try:
+        for _ in range(iterations):
+            baseline_times.append(_run_baseline_once(frame, by=by, method=method))
+    finally:
+        gc.enable()
+
+    pipeline_median = statistics.median(pipeline_times)
+    baseline_median = statistics.median(baseline_times)
 
     return DissolveBenchmark(
         dataset=dataset,
         rows=len(frame),
-        groups=int(result.shape[0]),
-        pipeline_elapsed_seconds=pipeline_elapsed,
-        baseline_elapsed_seconds=baseline_elapsed,
+        groups=int(result.shape[0]) if result is not None else 0,
+        pipeline_elapsed_seconds=pipeline_median,
+        baseline_elapsed_seconds=baseline_median,
+        iterations=iterations,
     )
 
 

@@ -801,6 +801,7 @@ def _nearest_indexed_point_gpu(
     return_all: bool,
     return_distance: bool,
     exclusive: bool,
+    max_distance: float | None = None,
 ) -> tuple[tuple[np.ndarray, np.ndarray] | np.ndarray, str] | None:
     if not has_gpu_runtime():
         return None
@@ -981,12 +982,24 @@ def _nearest_indexed_point_gpu(
         left = runtime.copy_device_to_host(out_left).astype(np.intp, copy=False)
         right = runtime.copy_device_to_host(out_right).astype(np.intp, copy=False)
         best_host = runtime.copy_device_to_host(best)
+
+        # Apply max_distance filter when bounded nearest is requested.
+        if max_distance is not None and left.size:
+            pair_distances = np.asarray(best_host[left], dtype=np.float64)
+            within = pair_distances <= max_distance
+            left = left[within]
+            right = right[within]
+
         if not return_all and left.size:
             keep = np.zeros(left.size, dtype=bool)
             _, first_idx = np.unique(left, return_index=True)
             keep[np.asarray(first_idx, dtype=np.intp)] = True
             left = left[keep]
             right = right[keep]
+
+        if left.size == 0:
+            result = _empty_nearest_result(return_distance)
+            return result, "owned_gpu_nearest"
 
         indices = np.vstack((left, right))
         if return_distance:
@@ -2009,16 +2022,18 @@ def nearest_spatial_index(
     query_owned = _to_owned(query_values)
     tree_owned = _to_owned(tree_geometries)
 
-    if max_distance is None:
-        indexed_result = _nearest_indexed_point_gpu(
-            query_owned,
-            tree_owned,
-            return_all=return_all,
-            return_distance=return_distance,
-            exclusive=exclusive,
-        )
-        if indexed_result is not None:
-            return indexed_result
+    # Try the efficient indexed GPU nearest path for all-Point arrays.
+    # Works for both bounded (max_distance != None) and unbounded nearest.
+    indexed_result = _nearest_indexed_point_gpu(
+        query_owned,
+        tree_owned,
+        return_all=return_all,
+        return_distance=return_distance,
+        exclusive=exclusive,
+        max_distance=max_distance,
+    )
+    if indexed_result is not None:
+        return indexed_result
 
     query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
     tree_bounds = compute_geometry_bounds(tree_owned, dispatch_mode=_gpu_bounds_dispatch_mode())

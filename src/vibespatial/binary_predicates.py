@@ -197,23 +197,6 @@ def _materialize_shapely(values: np.ndarray | None, owned: OwnedGeometryArray | 
     return np.asarray(owned.to_shapely(), dtype=object)
 
 
-def _bounds_for(
-    values: np.ndarray | object | None,
-    *,
-    owned: OwnedGeometryArray | None,
-    dispatch_mode: ExecutionMode,
-    size: int | None = None,
-) -> np.ndarray:
-    if owned is not None:
-        bounds = compute_geometry_bounds(owned, dispatch_mode=dispatch_mode)
-        if size is not None and bounds.shape[0] != size:
-            raise ValueError(f"expected {size} bounds rows, got {bounds.shape[0]}")
-        return bounds
-    if size is None:
-        return np.asarray(shapely.bounds(values), dtype=np.float64)
-    scalar_bounds = np.asarray(shapely.bounds(values), dtype=np.float64)
-    return np.broadcast_to(scalar_bounds, (size, 4)).copy()
-
 
 def _bbox_intersects(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return (
@@ -639,15 +622,22 @@ def evaluate_binary_predicate(
         right_missing = shapely.is_missing(right_values)
     null_mask = left_missing | right_missing
 
-    left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
-    right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=scalar_right)
+    # --- GPU point-region fast path (needs owned arrays) ---
+    # Defer OwnedGeometryArray conversion: only create when GPU refine
+    # will actually use them.  For the common CPU-fallback case (polygon
+    # vs polygon), we skip the expensive from_shapely_geometries entirely
+    # and use shapely.bounds() for coarse filtering instead.
+    left_gpu_owned: OwnedGeometryArray | None = left_owned
+    right_gpu_owned: OwnedGeometryArray | None = right_owned if not scalar_right else None
 
     if (
         runtime_selection.selected is ExecutionMode.GPU
         and not scalar_right
-        and left_gpu_owned is not None
-        and right_gpu_owned is not None
     ):
+        # Point-region fast path requires owned arrays -- build them now
+        # only for this check.
+        left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
+        right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=scalar_right)
         fast_path_result = _evaluate_gpu_point_region_fast_path(
             predicate,
             left=left_gpu_owned,
@@ -661,18 +651,31 @@ def evaluate_binary_predicate(
             _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
             return fast_path_result
 
-    gpu_dispatch_mode = ExecutionMode.GPU if runtime_selection.selected is ExecutionMode.GPU else ExecutionMode.CPU
-    left_bounds = _bounds_for(
-        left_values,
-        owned=left_gpu_owned if gpu_dispatch_mode is ExecutionMode.GPU else left_owned,
-        dispatch_mode=gpu_dispatch_mode,
-    )
-    right_bounds = _bounds_for(
-        right_values,
-        owned=right_gpu_owned if gpu_dispatch_mode is ExecutionMode.GPU else right_owned,
-        dispatch_mode=gpu_dispatch_mode,
-        size=row_count if scalar_right else None,
-    )
+    # --- Bounds computation ---
+    # Prefer shapely.bounds() (~1ms vectorized C) over compute_geometry_bounds(owned)
+    # when raw numpy values are available.  This avoids creating OwnedGeometryArray
+    # just to compute bounds.
+    if left_values is not None:
+        left_bounds = np.asarray(shapely.bounds(left_values), dtype=np.float64)
+    elif left_gpu_owned is not None:
+        gpu_dispatch_mode = ExecutionMode.GPU if runtime_selection.selected is ExecutionMode.GPU else ExecutionMode.CPU
+        left_bounds = compute_geometry_bounds(left_gpu_owned, dispatch_mode=gpu_dispatch_mode)
+    else:
+        assert left_owned is not None
+        left_bounds = compute_geometry_bounds(left_owned, dispatch_mode=ExecutionMode.CPU)
+
+    if scalar_right:
+        scalar_bounds = np.asarray(shapely.bounds(right_values), dtype=np.float64)
+        right_bounds = np.broadcast_to(scalar_bounds, (row_count, 4)).copy()
+    elif right_values is not None:
+        right_bounds = np.asarray(shapely.bounds(right_values), dtype=np.float64)
+    elif right_gpu_owned is not None:
+        gpu_dispatch_mode = ExecutionMode.GPU if runtime_selection.selected is ExecutionMode.GPU else ExecutionMode.CPU
+        right_bounds = compute_geometry_bounds(right_gpu_owned, dispatch_mode=gpu_dispatch_mode)
+    else:
+        assert right_owned is not None
+        right_bounds = compute_geometry_bounds(right_owned, dispatch_mode=ExecutionMode.CPU)
+
     candidate_mask, coarse_true_mask, coarse_false_mask = _coarse_candidate_mask(
         spec.coarse_relation,
         left_bounds,
@@ -686,13 +689,15 @@ def evaluate_binary_predicate(
         else:
             coarse_false_mask = coarse_false_mask | empty_mask
 
+    # --- GPU refine viability check ---
+    # Only build owned arrays and check candidate-pair support if GPU is
+    # selected.  If we already built them for the fast-path above, reuse.
+    # Skip owned creation entirely when scalar_right is True since GPU
+    # refine does not support scalar right-hand geometries.
     if runtime_selection.selected is ExecutionMode.GPU:
         gpu_reason = _unsupported_gpu_reason(predicate, scalar_right=scalar_right)
-        if scalar_right or left_gpu_owned is None or right_gpu_owned is None or not _candidate_pairs_supported(
-            left_gpu_owned,
-            right_gpu_owned,
-            np.flatnonzero(candidate_mask & ~null_mask).astype(np.int32, copy=False),
-        ):
+        if scalar_right:
+            # GPU refine never supports scalar right -- skip owned conversion
             if requested_mode is ExecutionMode.GPU:
                 raise NotImplementedError(gpu_reason)
             runtime_selection = RuntimeSelection(
@@ -700,6 +705,25 @@ def evaluate_binary_predicate(
                 selected=ExecutionMode.CPU,
                 reason=f"{gpu_reason}; using explicit CPU fallback",
             )
+        else:
+            # Ensure owned arrays exist for candidate-pair check
+            if left_gpu_owned is None or left_gpu_owned is left_owned:
+                left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
+            if right_gpu_owned is None or right_gpu_owned is right_owned:
+                right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=scalar_right)
+
+            if left_gpu_owned is None or right_gpu_owned is None or not _candidate_pairs_supported(
+                left_gpu_owned,
+                right_gpu_owned,
+                np.flatnonzero(candidate_mask & ~null_mask).astype(np.int32, copy=False),
+            ):
+                if requested_mode is ExecutionMode.GPU:
+                    raise NotImplementedError(gpu_reason)
+                runtime_selection = RuntimeSelection(
+                    requested=requested_mode,
+                    selected=ExecutionMode.CPU,
+                    reason=f"{gpu_reason}; using explicit CPU fallback",
+                )
 
     _record_runtime_selection(runtime_selection, (left_gpu_owned or left_owned, right_gpu_owned or right_owned))
     precision_plan = select_precision_plan(

@@ -7,13 +7,16 @@ import shapely
 from shapely.geometry.base import BaseGeometry
 
 from vibespatial.binary_predicates import evaluate_binary_predicate
-from vibespatial.geometry_buffers import GeometryFamily
+from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema
 from vibespatial.owned_geometry import (
     FAMILY_TAGS,
     TAG_FAMILIES,
+    DiagnosticKind,
+    FamilyGeometryBuffer,
     OwnedGeometryArray,
     from_shapely_geometries,
 )
+from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.spatial_query_types import (
     _POLYGON_DE9IM_PREDICATES,
@@ -61,9 +64,109 @@ def supports_owned_spatial_input(geometry: Any) -> bool:
     return True
 
 
+def _to_owned_points_fast(values: np.ndarray) -> OwnedGeometryArray | None:
+    """Vectorized fast-path for all-Point arrays using shapely.get_coordinates().
+
+    Returns None if any geometry is not a simple Point (i.e. MultiPoint,
+    LineString, etc.) so the caller falls back to the generic Python loop.
+    Uses shapely.get_type_id() (vectorized C) to detect all-Point arrays,
+    then shapely.get_coordinates() (~1ms for 100k points) instead of the
+    per-object Python loop in from_shapely_geometries() (~500ms-2s).
+    """
+    n = len(values)
+    if n == 0:
+        return None
+
+    # Check for None/missing values.
+    none_mask = shapely.is_missing(values)
+    has_none = bool(none_mask.any())
+
+    # Check that all non-None geometries are simple Points (type_id == 0).
+    if has_none:
+        non_none_mask = ~none_mask
+        if not non_none_mask.any():
+            # All None -- fall back to generic path.
+            return None
+        type_ids = shapely.get_type_id(values)
+        valid_type_ids = type_ids[non_none_mask]
+        if not np.all(valid_type_ids == 0):
+            return None
+        # Check for empty points.
+        empty_flags = shapely.is_empty(values)
+        valid_empty = empty_flags[non_none_mask]
+    else:
+        type_ids = shapely.get_type_id(values)
+        if not np.all(type_ids == 0):
+            return None
+        empty_flags = shapely.is_empty(values)
+        valid_empty = empty_flags
+
+    # Extract coordinates vectorized -- ~1ms for 100k points.
+    # For non-empty points this returns an (M, 2) array of coords.
+    # We need to handle None and empty points specially.
+    validity = ~none_mask
+    point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+    tags = np.full(n, -1, dtype=np.int8)
+    family_row_offsets = np.full(n, -1, dtype=np.int32)
+
+    valid_indices = np.flatnonzero(validity)
+    n_valid = valid_indices.size
+    tags[valid_indices] = point_tag
+    family_row_offsets[valid_indices] = np.arange(n_valid, dtype=np.int32)
+
+    # Build empty_mask for the point family buffer.
+    # valid_empty is already indexed to only the valid (non-None) geometries,
+    # so it has length n_valid and maps 1:1 to the family rows.
+    empty_mask = np.asarray(valid_empty, dtype=bool)
+
+    # Extract coordinates for valid, non-empty points.
+    non_empty_valid_mask = validity & ~empty_flags
+    non_empty_geoms = values[non_empty_valid_mask]
+    if non_empty_geoms.size > 0:
+        coords = shapely.get_coordinates(non_empty_geoms)
+        x_coords = np.ascontiguousarray(coords[:, 0])
+        y_coords = np.ascontiguousarray(coords[:, 1])
+    else:
+        x_coords = np.asarray([], dtype=np.float64)
+        y_coords = np.asarray([], dtype=np.float64)
+
+    # Build geometry_offsets: [0, 1, 2, ..., n_valid] for simple points,
+    # but empty points contribute 0 coords.
+    # For each valid point: non-empty contributes 1 coord, empty contributes 0.
+    coord_counts = np.ones(n_valid, dtype=np.int32)
+    coord_counts[empty_mask] = 0
+    geometry_offsets = np.empty(n_valid + 1, dtype=np.int32)
+    geometry_offsets[0] = 0
+    np.cumsum(coord_counts, out=geometry_offsets[1:])
+
+    point_buffer = FamilyGeometryBuffer(
+        family=GeometryFamily.POINT,
+        schema=get_geometry_buffer_schema(GeometryFamily.POINT),
+        row_count=n_valid,
+        x=x_coords,
+        y=y_coords,
+        geometry_offsets=geometry_offsets,
+        empty_mask=empty_mask,
+    )
+
+    array = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families={GeometryFamily.POINT: point_buffer},
+        residency=Residency.HOST,
+    )
+    array._record(DiagnosticKind.CREATED, "created owned geometry array from shapely points (vectorized fast-path)", visible=True)
+    return array
+
+
 def _to_owned(values: np.ndarray | None) -> OwnedGeometryArray:
     if values is None:
         return from_shapely_geometries([])
+    # Fast-path: all-Point arrays avoid the Python per-object loop.
+    fast = _to_owned_points_fast(values)
+    if fast is not None:
+        return fast
     sanitized = []
     for value in values.tolist():
         if value is None:

@@ -166,15 +166,22 @@ def query_spatial_index(
         and len(tree_owned.families) == 1
     )
 
-    # For predicate=None, build query_owned eagerly so we can use owned
-    # bounds instead of shapely.bounds().  Other predicates defer _to_owned
-    # to preserve the scalar box fast path (no owned conversion needed).
+    # For predicate=None with Shapely input, use shapely.bounds() directly
+    # (~2ms) instead of _to_owned() (~200-500ms) for bounds extraction.
+    # The owned conversion is deferred until predicate refinement needs it.
     if query_values is not None and query_owned is None and predicate is None:
-        query_owned = _to_owned(query_values)
+        import shapely as _shapely_bounds
+        _shapely_query_bounds = np.asarray(
+            _shapely_bounds.bounds(query_values), dtype=np.float64,
+        )
+    else:
+        _shapely_query_bounds = None
 
     point_box_bounds = None
     if query_values is not None and _tree_is_point_only:
-        if predicate is None and query_owned is not None:
+        if predicate is None and _shapely_query_bounds is not None:
+            point_box_bounds = _shapely_query_bounds
+        elif predicate is None and query_owned is not None:
             point_box_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
         else:
             point_box_bounds = _extract_box_query_bounds(predicate, query_values)
@@ -212,12 +219,32 @@ def query_spatial_index(
             return (formatted, execution) if return_metadata else formatted
 
     # --- Phase C: OwnedGeometryArray paths (conversion if needed) ---
+    # Defer _to_owned() as long as possible.  For regular-grid and point-index
+    # fast paths that only need bounds, we use shapely.bounds() (vectorized,
+    # ~2ms) or the previously extracted _shapely_query_bounds.  _to_owned()
+    # is only called when we need the full owned geometry for predicate
+    # refinement or when the fast paths all miss.
     if query_values is not None and query_owned is None:
-        query_owned = _to_owned(query_values)
+        # Try regular-grid and point-index paths with Shapely bounds first,
+        # deferring _to_owned() until after those paths have been tried.
+        _deferred_to_owned = True
+    else:
+        _deferred_to_owned = False
 
-    regular_grid_box_bounds = None
-    if query_owned is not None:
-        regular_grid_box_bounds = _extract_box_query_bounds_from_owned("intersects", query_owned)
+    if _deferred_to_owned:
+        # Use Shapely bounds for regular-grid box path.
+        if _shapely_query_bounds is not None:
+            regular_grid_box_bounds = _shapely_query_bounds
+        else:
+            import shapely as _shapely_bounds_c
+            regular_grid_box_bounds = np.asarray(
+                _shapely_bounds_c.bounds(query_values), dtype=np.float64,
+            )
+    else:
+        regular_grid_box_bounds = None
+        if query_owned is not None:
+            regular_grid_box_bounds = _extract_box_query_bounds_from_owned("intersects", query_owned)
+
     regular_grid_box_pairs = _query_regular_grid_rect_box_index(
         flat_index,
         regular_grid_box_bounds,
@@ -243,7 +270,7 @@ def query_spatial_index(
                     right_idx.astype(np.intp, copy=False),
                 )
             )
-        query_size = 1 if scalar else query_owned.row_count
+        query_size = 1 if scalar else (len(query_values) if query_values is not None else query_owned.row_count)
         formatted = _format_query_indices(
             indices,
             tree_size=tree_size,
@@ -253,6 +280,10 @@ def query_spatial_index(
             output_format=output_format,
         )
         return (formatted, execution) if return_metadata else formatted
+
+    # Now convert to owned if still deferred — needed for remaining paths.
+    if _deferred_to_owned and query_owned is None:
+        query_owned = _to_owned(query_values)
 
     fast_pairs = _query_regular_grid_point_index(flat_index, query_owned, predicate=predicate)
     if fast_pairs is not None:
@@ -320,9 +351,13 @@ def query_spatial_index(
         )
         return (formatted, execution) if return_metadata else formatted
 
-    # Compute bounds for candidate generation — available from owned geometry
-    # without Shapely round-trip.
-    query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
+    # Compute bounds for candidate generation.  If we already extracted
+    # Shapely bounds earlier (no _to_owned needed), reuse them.
+    # Otherwise compute from the owned geometry array.
+    if _shapely_query_bounds is not None:
+        query_bounds = _shapely_query_bounds
+    else:
+        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
     tree_bounds = flat_index.bounds
     query_size = len(query_values) if query_values is not None else query_owned.row_count
 
@@ -543,4 +578,16 @@ def build_owned_spatial_index(geometry: np.ndarray) -> tuple[OwnedGeometryArray,
         ),
     )
     index = build_flat_spatial_index(owned, runtime_selection=selection)
+
+    # ADR-0034 Level 3: eagerly import the spatial query kernel module so
+    # its module-scope request_nvrtc_warmup() fires, then block until all
+    # NVRTC and CCCL background compilations finish.  This front-loads JIT
+    # cost (~1-2s) into the index build rather than the first query call,
+    # eliminating the 400-500x cold-query penalty at small scales (20k).
+    if use_gpu:
+        import vibespatial.spatial_query_candidates  # noqa: F401 — triggers warmup
+        from vibespatial.cccl_precompile import ensure_pipelines_warm
+
+        ensure_pipelines_warm(timeout=30.0)
+
     return owned, index

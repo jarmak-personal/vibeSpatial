@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 import numpy as np
 import pandas as pd
@@ -24,22 +25,42 @@ def _build_frame(rows: int, groups: int) -> geopandas.GeoDataFrame:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark the grouped dissolve pipeline against the baseline path.")
-    parser.add_argument("--rows", type=int, default=10000)
+    parser = argparse.ArgumentParser(
+        description="Benchmark the grouped dissolve pipeline against the baseline path.",
+    )
+    parser.add_argument("--rows", type=int, default=10_000)
     parser.add_argument("--groups", type=int, default=128)
+    parser.add_argument(
+        "--iterations", type=int, default=5,
+        help="Number of timed iterations (reports median). Default: 5.",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=1,
+        help="Number of warmup runs discarded before timing. Default: 1.",
+    )
     args = parser.parse_args()
 
     frame = _build_frame(args.rows, args.groups)
-    benchmark = benchmark_dissolve_pipeline(frame, by="group", dataset="points")
+    benchmark = benchmark_dissolve_pipeline(
+        frame,
+        by="group",
+        dataset="points",
+        iterations=args.iterations,
+        warmup=args.warmup,
+    )
     print(
-        {
-            "dataset": benchmark.dataset,
-            "rows": benchmark.rows,
-            "groups": benchmark.groups,
-            "pipeline_elapsed_seconds": benchmark.pipeline_elapsed_seconds,
-            "baseline_elapsed_seconds": benchmark.baseline_elapsed_seconds,
-            "speedup_vs_baseline": benchmark.speedup_vs_baseline,
-        }
+        json.dumps(
+            {
+                "dataset": benchmark.dataset,
+                "rows": benchmark.rows,
+                "groups": benchmark.groups,
+                "iterations": benchmark.iterations,
+                "pipeline_elapsed_seconds": round(benchmark.pipeline_elapsed_seconds, 6),
+                "baseline_elapsed_seconds": round(benchmark.baseline_elapsed_seconds, 6),
+                "speedup_vs_baseline": round(benchmark.speedup_vs_baseline, 2),
+            },
+            indent=2,
+        )
     )
 
 

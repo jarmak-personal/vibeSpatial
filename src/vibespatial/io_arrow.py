@@ -12,6 +12,11 @@ and ``from vibespatial.io_arrow import X`` continue to work.
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
+# Re-exports from core geometry modules (backwards compat)
+# ---------------------------------------------------------------------------
+from vibespatial.geometry_buffers import GeometryFamily  # noqa: F401
+
+# ---------------------------------------------------------------------------
 # io_geoarrow  – GeoArrow bridge, conversion, benchmarks
 # ---------------------------------------------------------------------------
 from vibespatial.io_geoarrow import (  # noqa: F401
@@ -194,3 +199,4 @@ from vibespatial.io_wkb import (  # noqa: F401
     plan_wkb_bridge,
     plan_wkb_partition,
 )
+from vibespatial.owned_geometry import FAMILY_TAGS  # noqa: F401
