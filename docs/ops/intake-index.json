@@ -9041,7 +9041,9 @@
         "count_scatter_total",
         "count_scatter_total_with_transfer",
         "compile_kernel_group",
-        "make_kernel_cache_key"
+        "make_kernel_cache_key",
+        "clear_nvrtc_cache",
+        "nvrtc_cache_stats"
       ],
       "tokens": [
         "arrays",
@@ -9049,6 +9051,7 @@
         "cache",
         "cached",
         "check",
+        "clear",
         "compile",
         "compiledkernel",
         "count",
@@ -9076,6 +9079,7 @@
         "runtime",
         "scatter",
         "src",
+        "stats",
         "support",
         "total",
         "transfer",
@@ -14755,7 +14759,10 @@
         "test_custom_cache_dir_via_env_var",
         "test_xdg_cache_home_respected",
         "test_default_cache_dir",
-        "test_compile_kernels_populates_disk_cache"
+        "test_compile_kernels_populates_disk_cache",
+        "test_clear_nvrtc_cache",
+        "test_clear_empty_cache",
+        "test_nvrtc_cache_stats"
       ],
       "tokens": [
         "all",
@@ -14764,6 +14771,7 @@
         "cached",
         "capability",
         "changes",
+        "clear",
         "compile",
         "components",
         "compute",
@@ -14776,6 +14784,7 @@
         "disabled",
         "disk",
         "does",
+        "empty",
         "enabled",
         "env",
         "failure",
@@ -14801,6 +14810,7 @@
         "returns",
         "roundtrip",
         "stable",
+        "stats",
         "test",
         "tests",
         "var",

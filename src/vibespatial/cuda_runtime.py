@@ -694,6 +694,35 @@ def make_kernel_cache_key(prefix: str, source: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def clear_nvrtc_cache() -> int:
+    """Delete all cached NVRTC PTX files from disk.
+
+    Returns the number of files removed.
+    """
+    cache_dir = _get_cache_dir()
+    removed = 0
+    try:
+        for path in cache_dir.glob("*.ptx"):
+            path.unlink()
+            removed += 1
+    except OSError:
+        pass
+    return removed
+
+
+def nvrtc_cache_stats() -> dict[str, int | str]:
+    """Return disk cache location and size statistics."""
+    cache_dir = _get_cache_dir()
+    files = list(cache_dir.glob("*.ptx")) if cache_dir.exists() else []
+    total_bytes = sum(f.stat().st_size for f in files)
+    return {
+        "directory": str(cache_dir),
+        "file_count": len(files),
+        "total_bytes": total_bytes,
+        "enabled": _disk_cache_enabled(),
+    }
+
+
 KERNEL_PARAM_PTR = ctypes.c_void_p
 KERNEL_PARAM_I32 = ctypes.c_int
 KERNEL_PARAM_F64 = ctypes.c_double

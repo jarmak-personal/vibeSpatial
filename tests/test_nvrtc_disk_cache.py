@@ -10,6 +10,8 @@ from vibespatial.cuda_runtime import (
     _get_cache_dir,
     _read_cached_ptx,
     _write_cached_ptx,
+    clear_nvrtc_cache,
+    nvrtc_cache_stats,
 )
 
 # ---------------------------------------------------------------------------
@@ -264,3 +266,48 @@ def test_compile_kernels_populates_disk_cache(tmp_path, monkeypatch):
     finally:
         _get_cache_dir.cache_clear()
         _disk_cache_enabled.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Public API: clear and stats
+# ---------------------------------------------------------------------------
+
+
+def test_clear_nvrtc_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    try:
+        # Write some files
+        for name in ("a", "b", "c"):
+            (tmp_path / f"{name}.ptx").write_bytes(b"x" * 100)
+        assert len(list(tmp_path.glob("*.ptx"))) == 3
+        removed = clear_nvrtc_cache()
+        assert removed == 3
+        assert len(list(tmp_path.glob("*.ptx"))) == 0
+    finally:
+        _get_cache_dir.cache_clear()
+
+
+def test_clear_empty_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    try:
+        removed = clear_nvrtc_cache()
+        assert removed == 0
+    finally:
+        _get_cache_dir.cache_clear()
+
+
+def test_nvrtc_cache_stats(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    try:
+        (tmp_path / "a.ptx").write_bytes(b"x" * 200)
+        (tmp_path / "b.ptx").write_bytes(b"y" * 300)
+        stats = nvrtc_cache_stats()
+        assert stats["directory"] == str(tmp_path)
+        assert stats["file_count"] == 2
+        assert stats["total_bytes"] == 500
+        assert stats["enabled"] is True
+    finally:
+        _get_cache_dir.cache_clear()
