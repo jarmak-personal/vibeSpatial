@@ -3866,6 +3866,20 @@
     },
     {
       "kind": "repo",
+      "path": ".claude/skills/intake-router/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "intake",
+        "md",
+        "router",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/skills/pre-land-review/SKILL.md",
       "referenced_by": [],
       "symbols": [],
