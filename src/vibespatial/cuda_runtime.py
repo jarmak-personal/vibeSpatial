@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import os
+import pathlib
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,6 +12,8 @@ from functools import lru_cache
 from typing import Any, TypeAlias
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 try:
     import cupy as cp
@@ -69,6 +73,105 @@ def has_nvrtc_support() -> bool:
 
 
 DeviceArray: TypeAlias = Any
+
+
+# ---------------------------------------------------------------------------
+# NVRTC disk cache — persists compiled PTX across process restarts
+# ---------------------------------------------------------------------------
+
+_NVRTC_CACHE_FORMAT_VERSION = "v1"
+_disk_cache_writes_disabled = False
+
+
+@lru_cache(maxsize=1)
+def _nvrtc_version() -> tuple[int, int]:
+    """Get NVRTC compiler version (cached)."""
+    if nvrtc is None:
+        return (0, 0)
+    major, minor = _check_nvrtc(nvrtc.nvrtcVersion())
+    return (int(major), int(minor))
+
+
+@lru_cache(maxsize=1)
+def _disk_cache_enabled() -> bool:
+    """Check if NVRTC disk cache is enabled via environment."""
+    value = os.environ.get("VIBESPATIAL_NVRTC_CACHE", "")
+    if not value:
+        return True
+    return value.lower() not in {"0", "false", "off", "no"}
+
+
+@lru_cache(maxsize=1)
+def _get_cache_dir() -> pathlib.Path:
+    """Return the disk cache directory for NVRTC PTX files."""
+    env_dir = os.environ.get("VIBESPATIAL_NVRTC_CACHE_DIR")
+    if env_dir:
+        return pathlib.Path(env_dir)
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return pathlib.Path(xdg) / "vibespatial" / "nvrtc"
+    return pathlib.Path.home() / ".cache" / "vibespatial" / "nvrtc"
+
+
+def _disk_cache_key(
+    cache_key: str,
+    compute_cap: tuple[int, int],
+    options: tuple[str, ...],
+    nvrtc_ver: tuple[int, int],
+) -> str:
+    """Build a filesystem-safe cache key for disk PTX storage."""
+    parts = [
+        _NVRTC_CACHE_FORMAT_VERSION,
+        f"sm{compute_cap[0]}{compute_cap[1]}",
+        f"nvrtc{nvrtc_ver[0]}.{nvrtc_ver[1]}",
+        cache_key,
+    ]
+    if options:
+        opts_hash = hashlib.sha1("|".join(sorted(options)).encode()).hexdigest()[:8]
+        parts.append(f"opts-{opts_hash}")
+    return "-".join(parts)
+
+
+def _read_cached_ptx(disk_key: str) -> bytes | None:
+    """Read cached PTX from disk. Returns None on miss or error."""
+    path = _get_cache_dir() / f"{disk_key}.ptx"
+    try:
+        data = path.read_bytes()
+        if len(data) < 16:  # too small to be valid PTX
+            path.unlink(missing_ok=True)
+            return None
+        return data
+    except OSError:
+        return None
+
+
+def _write_cached_ptx(disk_key: str, ptx: bytes) -> None:
+    """Atomically write PTX to disk cache. Errors silently disable writes."""
+    global _disk_cache_writes_disabled
+    if _disk_cache_writes_disabled:
+        return
+    path = _get_cache_dir() / f"{disk_key}.ptx"
+    tmp = path.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_bytes(ptx)
+        os.replace(str(tmp), str(path))
+    except OSError:
+        _disk_cache_writes_disabled = True
+        logger.debug("NVRTC disk cache: write failed, disabling writes for this process")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _delete_cached_ptx(disk_key: str) -> None:
+    """Delete a corrupt cache file."""
+    path = _get_cache_dir() / f"{disk_key}.ptx"
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -430,23 +533,54 @@ class CudaDriverRuntime:
             if cache_key in self._module_cache:
                 return self._module_cache[cache_key]
             with self.activate():
-                program_name = f"{cache_key}.cu".encode()
-                program, = _check_nvrtc(
-                    nvrtc.nvrtcCreateProgram(source.encode(), program_name, 0, [], [])
-                )
-                arch = f"--gpu-architecture=compute_{self.compute_capability[0]}{self.compute_capability[1]}"
+                cc = self.compute_capability
+                arch = f"--gpu-architecture=compute_{cc[0]}{cc[1]}"
                 compile_options = tuple(options) + (arch,)
-                encoded_options = [option.encode() for option in compile_options]
-                result = nvrtc.nvrtcCompileProgram(program, len(encoded_options), encoded_options)
-                if result[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
-                    log_size, = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
-                    log = bytearray(log_size)
-                    _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
-                    raise RuntimeError(bytes(log).decode(errors="replace"))
-                ptx_size, = _check_nvrtc(nvrtc.nvrtcGetPTXSize(program))
-                ptx = bytearray(ptx_size)
-                _check_nvrtc(nvrtc.nvrtcGetPTX(program, ptx))
-                module, = _check_driver(cu.cuModuleLoadData(bytes(ptx)))
+
+                # --- Disk cache probe ---
+                ptx = None
+                disk_key = None
+                disk_cache_hit = False
+                if _disk_cache_enabled():
+                    disk_key = _disk_cache_key(cache_key, cc, options, _nvrtc_version())
+                    ptx = _read_cached_ptx(disk_key)
+                    disk_cache_hit = ptx is not None
+
+                if ptx is None:
+                    # NVRTC compilation (expensive path: 20-400ms)
+                    program_name = f"{cache_key}.cu".encode()
+                    program, = _check_nvrtc(
+                        nvrtc.nvrtcCreateProgram(source.encode(), program_name, 0, [], [])
+                    )
+                    encoded_options = [option.encode() for option in compile_options]
+                    result = nvrtc.nvrtcCompileProgram(program, len(encoded_options), encoded_options)
+                    if result[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+                        log_size, = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
+                        log = bytearray(log_size)
+                        _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
+                        raise RuntimeError(bytes(log).decode(errors="replace"))
+                    ptx_size, = _check_nvrtc(nvrtc.nvrtcGetPTXSize(program))
+                    ptx = bytearray(ptx_size)
+                    _check_nvrtc(nvrtc.nvrtcGetPTX(program, ptx))
+                    ptx = bytes(ptx)
+
+                    # Write to disk cache
+                    if disk_key is not None:
+                        _write_cached_ptx(disk_key, ptx)
+
+                # Load PTX into driver module
+                try:
+                    module, = _check_driver(cu.cuModuleLoadData(ptx))
+                except RuntimeError:
+                    if disk_cache_hit:
+                        # Corrupt cache file — delete and recompile
+                        _delete_cached_ptx(disk_key)
+                        return self._compile_kernels_no_disk_cache(
+                            cache_key=cache_key, source=source,
+                            kernel_names=kernel_names, options=options,
+                        )
+                    raise
+
                 kernels = {
                     name: CompiledKernel(
                         name=name,
@@ -456,6 +590,44 @@ class CudaDriverRuntime:
                 }
             self._module_cache[cache_key] = kernels
             return kernels
+
+    def _compile_kernels_no_disk_cache(
+        self,
+        *,
+        cache_key: str,
+        source: str,
+        kernel_names: tuple[str, ...],
+        options: tuple[str, ...] = (),
+    ) -> dict[str, CompiledKernel]:
+        """Fallback compilation without disk cache (used on corrupt cache recovery)."""
+        cc = self.compute_capability
+        arch = f"--gpu-architecture=compute_{cc[0]}{cc[1]}"
+        compile_options = tuple(options) + (arch,)
+        program_name = f"{cache_key}.cu".encode()
+        program, = _check_nvrtc(
+            nvrtc.nvrtcCreateProgram(source.encode(), program_name, 0, [], [])
+        )
+        encoded_options = [option.encode() for option in compile_options]
+        result = nvrtc.nvrtcCompileProgram(program, len(encoded_options), encoded_options)
+        if result[0] != nvrtc.nvrtcResult.NVRTC_SUCCESS:
+            log_size, = _check_nvrtc(nvrtc.nvrtcGetProgramLogSize(program))
+            log = bytearray(log_size)
+            _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
+            raise RuntimeError(bytes(log).decode(errors="replace"))
+        ptx_size, = _check_nvrtc(nvrtc.nvrtcGetPTXSize(program))
+        ptx = bytearray(ptx_size)
+        _check_nvrtc(nvrtc.nvrtcGetPTX(program, ptx))
+        ptx = bytes(ptx)
+        module, = _check_driver(cu.cuModuleLoadData(ptx))
+        kernels = {
+            name: CompiledKernel(
+                name=name,
+                function=_check_driver(cu.cuModuleGetFunction(module, name.encode()))[0],
+            )
+            for name in kernel_names
+        }
+        self._module_cache[cache_key] = kernels
+        return kernels
 
 _CUDA_RUNTIME = CudaDriverRuntime()
 
