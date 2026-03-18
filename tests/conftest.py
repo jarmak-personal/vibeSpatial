@@ -41,7 +41,7 @@ def _requested_dispatch_modes(config: pytest.Config) -> tuple[ExecutionMode, ...
 
 def _gpu_tests_requested(config: pytest.Config) -> bool:
     requested_modes = _requested_dispatch_modes(config)
-    return config.getoption("run_gpu") or ExecutionMode.GPU in requested_modes
+    return config.getoption("run_gpu") or ExecutionMode.GPU in requested_modes or cuda_runtime_available()
 
 
 def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:

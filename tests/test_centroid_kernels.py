@@ -1,0 +1,357 @@
+"""Tests for GPU-accelerated centroid computation across all geometry types."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+import shapely
+from shapely.geometry import (
+    LineString,
+    MultiLineString,
+    MultiPoint,
+    Point,
+    Polygon,
+)
+
+from vibespatial.centroid_kernels import (
+    _centroid_cpu,
+    _centroid_gpu,
+    centroid_owned,
+)
+from vibespatial.owned_geometry import from_shapely_geometries
+from vibespatial.runtime import has_gpu_runtime
+
+# ARCH005 coverage tokens: null_case, empty_geometry, mixed_type
+_ARCH005_COVERAGE = "null_empty_mixed"
+
+
+def _shapely_centroids(geoms):
+    """Shapely oracle for centroid computation."""
+    return (
+        np.array([g.centroid.x if g and not g.is_empty else np.nan for g in geoms]),
+        np.array([g.centroid.y if g and not g.is_empty else np.nan for g in geoms]),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Point centroid
+# ---------------------------------------------------------------------------
+
+
+def test_point_centroid():
+    """Point centroid is identity — returns the point itself."""
+    geoms = [Point(1, 2), Point(3.5, -7.2), Point(0, 0)]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_point_centroid_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    geoms = [Point(1, 2), Point(3.5, -7.2), Point(0, 0)]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# MultiPoint centroid
+# ---------------------------------------------------------------------------
+
+
+def test_multipoint_centroid():
+    """MultiPoint centroid is mean of component points."""
+    geoms = [
+        MultiPoint([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        MultiPoint([(1, 1), (3, 1), (3, 3)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_multipoint_centroid_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    geoms = [
+        MultiPoint([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        MultiPoint([(1, 1), (3, 1), (3, 3)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# LineString centroid
+# ---------------------------------------------------------------------------
+
+
+def test_linestring_centroid():
+    """LineString centroid uses length-weighted segment midpoints.
+
+    Asymmetric segments ensure we catch unweighted-mean bugs.
+    """
+    geoms = [
+        LineString([(0, 0), (10, 0)]),
+        LineString([(0, 0), (1, 0), (1, 100)]),  # asymmetric: long vertical segment
+        LineString([(0, 0), (3, 4)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_linestring_centroid_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    geoms = [
+        LineString([(0, 0), (10, 0)]),
+        LineString([(0, 0), (1, 0), (1, 100)]),
+        LineString([(0, 0), (3, 4)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# MultiLineString centroid
+# ---------------------------------------------------------------------------
+
+
+def test_multilinestring_centroid():
+    """MultiLineString centroid weights across all parts."""
+    geoms = [
+        MultiLineString([[(0, 0), (10, 0)], [(0, 5), (10, 5)]]),
+        MultiLineString([[(0, 0), (1, 0)], [(100, 100), (200, 100)]]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_multilinestring_centroid_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    geoms = [
+        MultiLineString([[(0, 0), (10, 0)], [(0, 5), (10, 5)]]),
+        MultiLineString([[(0, 0), (1, 0)], [(100, 100), (200, 100)]]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Polygon centroid (delegation through new path)
+# ---------------------------------------------------------------------------
+
+
+def test_polygon_centroid_delegation():
+    """Polygons still work correctly through the new centroid_owned path."""
+    geoms = [
+        Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        Polygon([(0, 0), (6, 0), (3, 6)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_polygon_centroid_delegation_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    geoms = [
+        Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        Polygon([(0, 0), (6, 0), (3, 6)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Mixed geometry centroid
+# ---------------------------------------------------------------------------
+
+
+def test_mixed_geometry_centroid():
+    """Array with Points + LineStrings + Polygons computes all centroids."""
+    geoms = [
+        Point(5, 5),
+        LineString([(0, 0), (10, 0)]),
+        Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        Point(100, 200),
+        LineString([(0, 0), (0, 10)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_mixed_geometry_centroid_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    geoms = [
+        Point(5, 5),
+        LineString([(0, 0), (10, 0)]),
+        Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+        Point(100, 200),
+        LineString([(0, 0), (0, 10)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Null / empty geometry handling
+# ---------------------------------------------------------------------------
+
+
+def test_null_centroid():
+    """Null geometries produce NaN centroids."""
+    geoms = [Point(1, 2), None, Point(3, 4)]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = centroid_owned(owned)
+    assert np.isfinite(cx[0])
+    assert np.isnan(cx[1])
+    assert np.isfinite(cx[2])
+    assert np.isfinite(cy[0])
+    assert np.isnan(cy[1])
+    assert np.isfinite(cy[2])
+
+
+def test_empty_centroid():
+    """Empty geometries produce NaN centroids."""
+    geoms = [
+        Point(1, 2),
+        shapely.from_wkt("LINESTRING EMPTY"),
+        Point(3, 4),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = centroid_owned(owned)
+    assert np.isfinite(cx[0])
+    assert np.isfinite(cx[2])
+
+
+# ---------------------------------------------------------------------------
+# Large-coordinate centering test
+# ---------------------------------------------------------------------------
+
+
+def test_large_coordinates():
+    """UTM-scale coordinates (~500,000) exercise coordinate centering."""
+    base_x, base_y = 500_000.0, 4_500_000.0
+    geoms = [
+        Point(base_x + 1, base_y + 2),
+        LineString([
+            (base_x, base_y),
+            (base_x + 100, base_y),
+            (base_x + 100, base_y + 50),
+        ]),
+        Polygon([
+            (base_x, base_y),
+            (base_x + 10, base_y),
+            (base_x + 10, base_y + 10),
+            (base_x, base_y + 10),
+        ]),
+        MultiPoint([
+            (base_x + 1, base_y + 1),
+            (base_x + 9, base_y + 9),
+        ]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_large_coordinates_gpu():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    base_x, base_y = 500_000.0, 4_500_000.0
+    geoms = [
+        Point(base_x + 1, base_y + 2),
+        LineString([
+            (base_x, base_y),
+            (base_x + 100, base_y),
+            (base_x + 100, base_y + 50),
+        ]),
+        Polygon([
+            (base_x, base_y),
+            (base_x + 10, base_y),
+            (base_x + 10, base_y + 10),
+            (base_x, base_y + 10),
+        ]),
+        MultiPoint([
+            (base_x + 1, base_y + 1),
+            (base_x + 9, base_y + 9),
+        ]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_gpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Public API auto dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_centroid_owned_auto_dispatch():
+    """centroid_owned() auto dispatch works for all types."""
+    geoms = [
+        Point(5, 5),
+        LineString([(0, 0), (10, 0)]),
+        Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = centroid_owned(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+def test_centroid_owned_empty_array():
+    """centroid_owned() handles zero-length arrays."""
+    owned = from_shapely_geometries([])
+    cx, cy = centroid_owned(owned)
+    assert len(cx) == 0
+    assert len(cy) == 0

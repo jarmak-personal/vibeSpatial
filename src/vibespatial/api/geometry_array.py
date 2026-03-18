@@ -734,17 +734,12 @@ class GeometryArray(ExtensionArray):
     def centroid(self) -> GeometryArray:
         self.check_geographic_crs(stacklevel=5)
         if self._owned is not None:
-            from vibespatial.geometry_buffers import GeometryFamily
+            from vibespatial.centroid_kernels import centroid_owned
 
-            families = set(self._owned.families.keys())
-            polygon_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
-            if families and families <= polygon_families:
-                from vibespatial.polygon_constructive import polygon_centroids_owned
-
-                cx, cy = polygon_centroids_owned(self._owned)
-                points = shapely.points(cx, cy)
-                # NaN coords produce None in shapely.points
-                return GeometryArray(points, crs=self.crs)
+            cx, cy = centroid_owned(self._owned)
+            points = shapely.points(cx, cy)
+            # NaN coords produce None in shapely.points
+            return GeometryArray(points, crs=self.crs)
         return GeometryArray(shapely.centroid(self._data), crs=self.crs)
 
     def concave_hull(self, ratio, allow_holes):
