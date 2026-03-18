@@ -1,0 +1,49 @@
+#!/bin/sh
+# commit-msg hook: if Claude co-authored this commit, verify the pre-land
+# review was completed by checking for a review marker file.
+#
+# - Human-only commits: no gate, passes unconditionally.
+# - Claude co-authored commits: must have .claude/.review-completed marker
+#   from the current session (written by /pre-land-review skill).
+#
+# The marker file is created by the pre-land-review skill after all checks
+# pass.  It contains a timestamp so stale markers from old sessions are
+# rejected.
+
+_msg_file="$1"
+_marker=".claude/.review-completed"
+_max_age=3600  # marker must be less than 1 hour old
+
+# Only gate on Claude co-authored commits.
+if ! grep -qi "Co-Authored-By:.*Claude" "$_msg_file" 2>/dev/null; then
+    exit 0
+fi
+
+# Claude is co-authoring — verify the review ran.
+if [ ! -f "$_marker" ]; then
+    printf "\n"
+    printf "%s\n" "commit-msg: BLOCKED — Claude is co-authoring but /pre-land-review was not run."
+    printf "Run /pre-land-review in your Claude Code session first.\n"
+    printf "The skill writes %s when all checks pass.\n" "$_marker"
+    exit 1
+fi
+
+# Check marker age (reject stale markers from previous sessions).
+if command -v stat >/dev/null 2>&1; then
+    _now=$(date +%s)
+    # Linux stat
+    _mtime=$(stat -c %Y "$_marker" 2>/dev/null) || \
+    # macOS stat
+    _mtime=$(stat -f %m "$_marker" 2>/dev/null) || \
+    _mtime=0
+
+    _age=$(( _now - _mtime ))
+    if [ "$_age" -gt "$_max_age" ]; then
+        printf "\n"
+        printf "commit-msg: BLOCKED — review marker is %s seconds old (max %s).\n" "$_age" "$_max_age"
+        printf "Run /pre-land-review again to refresh it.\n"
+        exit 1
+    fi
+fi
+
+printf "commit-msg: pre-land review verified (marker age: %ss).\n" "$_age"

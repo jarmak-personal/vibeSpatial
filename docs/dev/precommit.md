@@ -99,8 +99,9 @@ context, regardless of how long the conversation has been running.
 1. Make your changes in a Claude Code session
 2. When you're ready to land, say "commit" or "let's land this"
 3. The skill fires automatically and runs the full checklist
-4. `git commit` -- deterministic checks run, reminder prints
-5. Commit completes
+4. If verdict is LAND, the skill writes `.claude/.review-completed` marker
+5. `git commit` -- deterministic checks run, `commit-msg` hook verifies marker
+6. Commit completes
 
 ### Available commands
 
@@ -147,17 +148,34 @@ This is configured in `.claude/settings.json`:
 The hook only matches `git commit` commands -- all other Bash calls pass
 through without overhead.
 
+## Layer 4: commit-msg Gate (Co-Author Check)
+
+The `commit-msg` hook (`.githooks/commit-msg`) is the **hard gate** for
+Claude-assisted commits. It checks the commit message for a
+`Co-Authored-By: ... Claude` line:
+
+- **Present**: the review marker `.claude/.review-completed` must exist and
+  be less than 1 hour old. If missing or stale, the commit is blocked.
+- **Absent**: human-only commit, passes unconditionally.
+
+The marker is written by the `/pre-land-review` skill after a LAND verdict.
+This creates a mechanical link: the skill must actually run and pass before
+a Claude co-authored commit can land.
+
 ## How The Layers Interact
 
-The three layers form a defense-in-depth chain:
+The four layers form a defense-in-depth chain:
 
 ```
 Layer 2: Skill fires on "commit" / "land" / "done" intent
   --> Loads full checklist, Claude runs AI analysis
+  --> Writes .claude/.review-completed marker on LAND verdict
     --> Layer 3: Hook fires on Bash(git commit ...)
       --> Injects system message if checklist wasn't completed
         --> Layer 1: Pre-commit hook runs deterministic checks
-          --> Prints reminder, commit completes
+          --> Prints reminder
+            --> Layer 4: commit-msg hook checks Co-Author + marker
+              --> Blocks if Claude co-authored without review
 ```
 
 Each layer catches what the previous one might miss:
@@ -166,8 +184,9 @@ Each layer catches what the previous one might miss:
 |--------------|-----------|
 | Agent forgets to review before committing | Layer 2 (skill) |
 | Long context compresses skill trigger away | Layer 3 (hook) |
-| Claude Code not available (human contributor) | Layer 1 (pre-commit) |
-| Non-interactive environment (CI, VS Code) | Layer 1 (pre-commit) |
+| Agent ignores skill and hook, commits anyway | Layer 4 (commit-msg gate) |
+| Claude Code not available (human contributor) | Layer 1 (pre-commit, no gate) |
+| Non-interactive environment (CI, VS Code) | Layer 1 (pre-commit, no gate) |
 
 ## Ratchet Baseline System
 

@@ -102,7 +102,17 @@ After analysis, output a concise report:
 
 ## After Review
 
-Once the review passes, proceed with the commit. Include in the commit message:
+If the verdict is LAND, you MUST write the review marker before committing:
+
+```bash
+date -u +%Y-%m-%dT%H:%M:%SZ > .claude/.review-completed
+```
+
+This marker is checked by the `commit-msg` hook. If Claude is listed as
+co-author and the marker is missing or stale (>1 hour), the commit is
+blocked. Human-only commits are not gated.
+
+Then proceed with the commit. Include in the commit message:
 - Current strict-native GeoPandas coverage from
   `uv run python scripts/upstream_native_coverage.py --json`
 - Profile summary if runtime/kernel/pipeline code was changed
