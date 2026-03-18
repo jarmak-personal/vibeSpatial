@@ -292,6 +292,8 @@ class DeviceGeometryArray(ExtensionArray):
         """Reproject via vibeProj transform_buffers -- stays on device."""
         from pyproj import CRS as PyprojCRS
 
+        from vibespatial.runtime import ExecutionMode, get_requested_mode
+
         if self._crs is None:
             raise ValueError(
                 "Cannot transform naive geometries.  "
@@ -306,6 +308,17 @@ class DeviceGeometryArray(ExtensionArray):
 
         if self._crs.is_exact_same(crs):
             return self
+
+        if get_requested_mode() is ExecutionMode.CPU:
+            # CPU fallback: materialize Shapely, transform on host, rebuild.
+            from vibespatial.api.geometry_array import _make_transform_func
+            from vibespatial.api.geometry_array import transform as _ga_transform
+
+            shapely_geoms = self._ensure_shapely_cache()
+            transform_func = _make_transform_func(self._crs, crs)
+            new_data = _ga_transform(shapely_geoms, transform_func)
+            new_owned = from_shapely_geometries(new_data)
+            return DeviceGeometryArray._from_owned(new_owned, crs=crs)
 
         return _to_crs_owned(self._owned, self._crs, crs)
 
@@ -703,10 +716,10 @@ class DeviceGeometryArray(ExtensionArray):
             supports_binary_predicate,
         )
         from vibespatial.dispatch import record_dispatch_event
-        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.spatial_query import _extract_box_query_bounds, _query_point_tree_box_index
 
-        if predicate == "intersects" and isinstance(other, BaseGeometry):
+        if predicate == "intersects" and isinstance(other, BaseGeometry) and get_requested_mode() is not ExecutionMode.CPU:
             box_bounds = _extract_box_query_bounds(predicate, np.asarray([other], dtype=object))
             if box_bounds is not None:
                 point_box_pairs = _query_point_tree_box_index(
@@ -744,7 +757,7 @@ class DeviceGeometryArray(ExtensionArray):
                 predicate,
                 left_owned,
                 right_input,
-                dispatch_mode=ExecutionMode.AUTO,
+                dispatch_mode=get_requested_mode(),
                 null_behavior=NullBehavior.FALSE,
                 **kwargs,
             )
@@ -896,13 +909,13 @@ class DeviceGeometryArray(ExtensionArray):
     def clip_by_rect(self, xmin, ymin, xmax, ymax):
         from vibespatial.clip_rect import clip_by_rect_owned
         from vibespatial.dispatch import record_dispatch_event
-        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime import get_requested_mode
 
         try:
             result = clip_by_rect_owned(
                 self._owned,
                 xmin, ymin, xmax, ymax,
-                dispatch_mode=ExecutionMode.AUTO,
+                dispatch_mode=get_requested_mode(),
             )
             selected = result.runtime_selection.selected
             record_dispatch_event(
@@ -1838,13 +1851,15 @@ def _dwithin_scalar(
       4. CuPy threshold filter + scatter into device boolean result (Tier 2)
       5. Single cp.asnumpy D→H for the final boolean array
     """
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
     try:
         import cupy as cp
     except ImportError:
         cp = None
 
     runtime = get_cuda_runtime()
-    if cp is None or not runtime.available():
+    if cp is None or not runtime.available() or get_requested_mode() is ExecutionMode.CPU:
         return _dwithin_scalar_cpu(dga, geom, dist)
 
     n = len(dga)

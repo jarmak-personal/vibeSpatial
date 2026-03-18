@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 100/200 lines
+Body Budget: 114/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -19,8 +19,9 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-65 | Core Rules |
 | 66-75 | Fallback |
-| 76-94 | Index-Array Boundary Model (ADR-0036) |
-| 95-100 | Compatibility |
+| 76-89 | Session Execution Mode Override |
+| 90-108 | Index-Array Boundary Model (ADR-0036) |
+| 109-114 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -95,6 +96,20 @@ files to inspect when execution behavior changes.
 - Non-user host-to-device and device-to-host transfers must remain visible.
 - Device-to-host transfers belong only in explicit materialization surfaces such
   as `to_pandas`, `to_numpy`, `values`, and `__repr__`.
+
+## Session Execution Mode Override
+
+The session-wide execution mode follows the `determinism.py` pattern:
+
+- `VIBESPATIAL_EXECUTION_MODE` env var (`auto`, `cpu`, `gpu`).
+- `set_execution_mode()` programmatic override (takes priority over env var).
+- `get_requested_mode()` reads: explicit override > env var > `auto` default.
+- CPU mode causes early returns in IO (`_try_gpu_read_file`, WKB decode/encode),
+  `DeviceGeometryArray` operations (`to_crs`, `dwithin`, `_binary_predicate`,
+  `clip_by_rect`), binary predicates, and `geoseries_from_owned`.
+- Setting the mode invalidates the adaptive runtime snapshot cache.
+- All entry points call `get_requested_mode()` to determine dispatch; internal
+  GPU-only helpers are safe because their callers gate on mode first.
 
 ## Index-Array Boundary Model (ADR-0036)
 

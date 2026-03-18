@@ -302,7 +302,15 @@ from .robustness import (
     TopologyPolicy,
     select_robustness_plan,
 )
-from .runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime, select_runtime
+from .runtime import (
+    EXECUTION_MODE_ENV_VAR,
+    ExecutionMode,
+    RuntimeSelection,
+    get_requested_mode,
+    has_gpu_runtime,
+    select_runtime,
+    set_execution_mode,
+)
 from .segment_primitives import (
     SegmentIntersectionBenchmark,
     SegmentIntersectionCandidates,
@@ -391,6 +399,7 @@ __all__ = [
     "DeviceSnapshot",
     "DevicePrecisionProfile",
     "DispatchDecision",
+    "EXECUTION_MODE_ENV_VAR",
     "ExecutionMode",
     "ExecutionTraceContext",
     "TRACE_WARNINGS_ENV_VAR",
@@ -524,6 +533,7 @@ __all__ = [
     "generate_segment_candidates",
     "generate_segment_mbr_pairs",
     "get_geometry_buffer_schema",
+    "get_requested_mode",
     "has_gpu_runtime",
     "has_pyarrow_support",
     "has_pylibcudf_support",
@@ -582,6 +592,7 @@ __all__ = [
     "select_residency_plan",
     "select_robustness_plan",
     "select_runtime",
+    "set_execution_mode",
     "StepKind",
     "supports_binary_predicate",
     "strict_native_mode_enabled",

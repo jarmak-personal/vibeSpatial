@@ -207,6 +207,10 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
 
     from vibespatial.cuda_runtime import get_cuda_runtime
     from vibespatial.io_arrow import decode_wkb_arrow_array_owned, geoseries_from_owned
+    from vibespatial.runtime import get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
 
     runtime = get_cuda_runtime()
     if not runtime.available():

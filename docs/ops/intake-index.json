@@ -2276,6 +2276,7 @@
         "Open First",
         "Request Signals",
         "Risks",
+        "Session Execution Mode Override",
         "Verify"
       ],
       "title": "Runtime Model",
@@ -2308,12 +2309,14 @@
         "model",
         "only",
         "open",
+        "override",
         "policy",
         "request",
         "risks",
         "rules",
         "runtime",
         "selection",
+        "session",
         "signals",
         "task",
         "test",
@@ -11698,17 +11701,24 @@
         "RuntimeSelection",
         "_has_module",
         "has_gpu_runtime",
-        "select_runtime"
+        "select_runtime",
+        "set_execution_mode",
+        "get_requested_mode"
       ],
       "tokens": [
+        "execution",
         "executionmode",
+        "get",
         "gpu",
         "has",
+        "mode",
         "module",
         "py",
+        "requested",
         "runtime",
         "runtimeselection",
         "select",
+        "set",
         "src",
         "vibespatial"
       ]
@@ -13396,6 +13406,29 @@
         "testpointpoint",
         "tests",
         "testsegmentsegment"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_execution_mode_override.py",
+      "referenced_by": [],
+      "symbols": [
+        "_clean_mode",
+        "TestGetRequestedMode",
+        "TestSetExecutionMode",
+        "TestCpuModeBypassPrevention"
+      ],
+      "tokens": [
+        "clean",
+        "execution",
+        "mode",
+        "override",
+        "py",
+        "test",
+        "testcpumodebypassprevention",
+        "testgetrequestedmode",
+        "tests",
+        "testsetexecutionmode"
       ]
     },
     {

@@ -29,7 +29,13 @@ from vibespatial.api._version import __version__
 # Re-export vibespatial runtime/dispatch APIs so that code using
 # ``import vibespatial.api as geopandas`` can call
 # ``geopandas.clear_dispatch_events()`` etc.
-from vibespatial.runtime import ExecutionMode, RuntimeSelection, select_runtime
+from vibespatial.runtime import (
+    ExecutionMode,
+    RuntimeSelection,
+    get_requested_mode,
+    select_runtime,
+    set_execution_mode,
+)
 from vibespatial.dispatch import (
     DispatchEvent,
     clear_dispatch_events,

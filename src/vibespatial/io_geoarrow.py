@@ -945,6 +945,13 @@ def geoseries_from_owned(
 
         crs = CRS.from_user_input(crs)
 
+    # Respect session-wide execution mode: when CPU is requested, skip the
+    # DeviceGeometryArray fast path so downstream operations stay on host.
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        use_device_array = False
+
     # Fast path: wrap in DeviceGeometryArray to avoid D->H->Shapely roundtrip.
     # The OwnedGeometryArray stays as source of truth; Shapely objects are
     # only materialized lazily when downstream code actually needs them.

@@ -768,6 +768,7 @@ def evaluate_geopandas_binary_predicate(
     **kwargs: Any,
 ) -> np.ndarray | None:
     from vibespatial.execution_trace import execution_trace
+    from vibespatial.runtime import get_requested_mode
 
     with execution_trace(f"predicate/{predicate}"):
         if not supports_binary_predicate(predicate):
@@ -782,7 +783,7 @@ def evaluate_geopandas_binary_predicate(
             predicate,
             np.asarray(left, dtype=object),
             right if np.isscalar(right) or right is None else np.asarray(right, dtype=object),
-            dispatch_mode=ExecutionMode.AUTO,
+            dispatch_mode=get_requested_mode(),
             null_behavior=NullBehavior.FALSE,
             **kwargs,
         )

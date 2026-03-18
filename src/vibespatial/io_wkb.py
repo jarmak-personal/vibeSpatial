@@ -1926,6 +1926,10 @@ def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGe
 
 def _try_gpu_wkb_arrow_decode(array) -> OwnedGeometryArray | None:
     """Attempt GPU WKB decode of a PyArrow binary/large_binary array via pylibcudf."""
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
     runtime = get_cuda_runtime()
     if not runtime.available():
         return None
@@ -1958,6 +1962,10 @@ def _try_gpu_wkb_encode(
     hex_output: bool = False,
 ) -> list[bytes | str | None] | None:
     """Attempt GPU-accelerated WKB encode. Returns list[bytes|str|None] or None on failure."""
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
     # 1. Check runtime available
     try:
         runtime = get_cuda_runtime()

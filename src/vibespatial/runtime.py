@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.util import find_spec
 
 from vibespatial.cuda_runtime import has_cuda_device
+
+EXECUTION_MODE_ENV_VAR = "VIBESPATIAL_EXECUTION_MODE"
 
 
 class ExecutionMode(StrEnum):
@@ -60,3 +63,44 @@ def select_runtime(requested: ExecutionMode | str = ExecutionMode.AUTO) -> Runti
             else "CUDA Python runtime not available; using explicit CPU fallback"
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Session-scoped execution mode override (mirrors determinism.py pattern)
+# ---------------------------------------------------------------------------
+
+_override_mode: ExecutionMode | None = None
+
+
+def set_execution_mode(mode: ExecutionMode | str | None) -> None:
+    """Override the session execution mode. Pass None to clear.
+
+    Also invalidates the adaptive runtime snapshot cache so the planner
+    re-evaluates on the next dispatch.
+    """
+    global _override_mode
+    if mode is None:
+        _override_mode = None
+    else:
+        _override_mode = mode if isinstance(mode, ExecutionMode) else ExecutionMode(mode)
+    # Avoid circular import: adaptive_runtime imports from runtime, so
+    # we import lazily here.
+    try:
+        from vibespatial.adaptive_runtime import invalidate_snapshot_cache
+
+        invalidate_snapshot_cache()
+    except ImportError:
+        pass
+
+
+def get_requested_mode() -> ExecutionMode:
+    """Return the session-wide requested execution mode.
+
+    Priority: explicit set_execution_mode() > env var > AUTO.
+    """
+    if _override_mode is not None:
+        return _override_mode
+    raw = os.environ.get(EXECUTION_MODE_ENV_VAR)
+    if raw is not None:
+        return ExecutionMode(raw.lower())
+    return ExecutionMode.AUTO
