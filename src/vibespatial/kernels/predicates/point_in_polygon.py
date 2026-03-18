@@ -1351,7 +1351,7 @@ def _to_python_result(values: np.ndarray) -> list[bool | None]:
     result = np.empty(len(values), dtype=object)
     result[:] = np.where(null_mask, False, values).astype(bool)
     result[null_mask] = None
-    return list(result)  # noqa: ARCH004 — public API materialization boundary
+    return list(result)  # public API materialization boundary
 
 
 def _candidate_rows_by_family(

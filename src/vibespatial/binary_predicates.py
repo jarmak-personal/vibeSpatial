@@ -647,6 +647,11 @@ def _evaluate_gpu_de9im_candidates(
     right_tags = right.tags[candidate_rows]
     de9im_masks = np.zeros(candidate_rows.size, dtype=np.uint16)
 
+    # Upload candidate indices to device once — avoids per-group H2D in
+    # compute_polygon_de9im_gpu (passes through d_left/d_right).
+    import cupy as cp
+    d_candidate_rows = cp.asarray(candidate_rows)
+
     # Group by (left_family, right_family) and dispatch the correct kernel.
     unique_tag_pairs = set(zip(left_tags.tolist(), right_tags.tolist()))
     for lt, rt in unique_tag_pairs:
@@ -654,14 +659,16 @@ def _evaluate_gpu_de9im_candidates(
         sub_idx = np.flatnonzero(sub_mask)
         if sub_idx.size == 0:
             continue
-        lf = TAG_FAMILIES.get(lt)
-        rf = TAG_FAMILIES.get(rt)
+        lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
+        rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
         if lf is None or rf is None:
             continue
+        d_sub = d_candidate_rows[sub_idx]
         sub_result = compute_polygon_de9im_gpu(
             left, right,
             candidate_rows[sub_idx], candidate_rows[sub_idx],
             query_family=lf, tree_family=rf,
+            d_left=d_sub, d_right=d_sub,
         )
         if sub_result is not None:
             de9im_masks[sub_idx] = sub_result
@@ -770,8 +777,8 @@ def _fused_gpu_binary_predicate(
         sub_idx = np.flatnonzero(sub_mask)
         if sub_idx.size == 0:
             continue
-        lf = TAG_FAMILIES.get(lt)
-        rf = TAG_FAMILIES.get(rt)
+        lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
+        rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
         if lf is None or rf is None:
             continue
         sub_result = compute_polygon_de9im_gpu(
