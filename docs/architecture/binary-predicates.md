@@ -5,23 +5,23 @@ Scope: Exact binary-predicate refine strategy, coarse-filter staging, and GeoPan
 Read If: You are changing exact predicate kernels, binary predicate dispatch, or GeoPandas predicate integration.
 STOP IF: You already have the binary-predicate engine open and only need local implementation detail.
 Source Of Truth: Phase-4 exact binary-predicate architecture policy before join assembly.
-Body Budget: 137/220 lines
+Body Budget: 142/220 lines
 Document: docs/architecture/binary-predicates.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-13 | Request Signals |
-| 14-21 | Open First |
-| 22-32 | Verify |
-| 33-38 | Risks |
-| 39-43 | Intent |
-| 44-73 | Decision |
-| 74-91 | Current Surface |
-| 92-104 | CCCL Mapping |
-| 105-118 | Host Crossover |
-| 119-137 | Consequences |
+| 3-18 | Request Signals |
+| 19-26 | Open First |
+| 27-37 | Verify |
+| 38-43 | Risks |
+| 44-48 | Intent |
+| 49-78 | Decision |
+| 79-96 | Current Surface |
+| 97-109 | CCCL Mapping |
+| 110-123 | Host Crossover |
+| 124-142 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -32,8 +32,13 @@ DOC_HEADER:END -->
 - within
 - contains
 - covers
+- crosses
+- touches
+- overlaps
+- disjoint
 - cccl
 - geopandas predicate
+- DE-9IM
 
 ## Open First
 
@@ -41,7 +46,7 @@ DOC_HEADER:END -->
 - docs/architecture/robustness.md
 - src/vibespatial/binary_predicates.py
 - src/vibespatial/kernels/predicates/binary_refine.py
-- src/vibespatial/_vendor/geopandas/array.py
+- src/vibespatial/api/geometry_array.py
 
 ## Verify
 

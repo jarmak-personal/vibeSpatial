@@ -5,7 +5,7 @@ Scope: Observable CPU fallback policy for unsupported predicates, geometry mixes
 Read If: You are changing fallback visibility, host-only geospatial paths, or runtime observability.
 STOP IF: You already have the fallback event API open and only need local implementation detail.
 Source Of Truth: Phase-4 explicit fallback policy for predicate and spatial-query surfaces.
-Body Budget: 76/220 lines
+Body Budget: 75/220 lines
 Document: docs/architecture/fallbacks.md
 
 Section Map (Body Lines)
@@ -18,9 +18,9 @@ Section Map (Body Lines)
 | 27-32 | Risks |
 | 33-37 | Intent |
 | 38-49 | Decision |
-| 50-60 | Current Surfaces |
-| 61-70 | Observability Contract |
-| 71-76 | Consequences |
+| 50-59 | Current Surfaces |
+| 60-69 | Observability Contract |
+| 70-75 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -77,9 +77,8 @@ Fallback events are currently recorded for:
 - GeoPandas-facing binary predicates routed through `array.GeometryArray._binary_method`
 - `sindex.query`
 - `sindex.nearest`
-
-This covers the host-only predicate and spatial-query entry points landed in
-Phase 4.
+- `distance_owned` -- element-wise distance GPU-to-CPU fallback
+- `geometry_array_dwithin` -- dwithin GPU-to-CPU fallback
 
 ## Observability Contract
 

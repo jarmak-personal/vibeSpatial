@@ -42,6 +42,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Sync dependencies
-        run: uv sync --group dev
+        run: uv sync --group dev --extra cu12
       - name: Run GPU harness smoke
         run: uv run pytest --run-gpu tests/test_runtime_harness.py -m gpu

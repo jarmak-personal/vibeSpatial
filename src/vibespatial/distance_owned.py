@@ -18,6 +18,7 @@ import shapely
 from vibespatial.adaptive_runtime import plan_dispatch_selection
 from vibespatial.cuda_runtime import get_cuda_runtime
 from vibespatial.dispatch import record_dispatch_event
+from vibespatial.fallbacks import record_fallback_event
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.owned_geometry import (
@@ -99,8 +100,13 @@ def distance_owned(
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
-            pass  # fall through to CPU
+        except Exception as exc:
+            record_fallback_event(
+                surface="distance_owned",
+                reason=f"GPU distance kernel failed: {exc}",
+                detail=f"rows={n}, falling back to CPU Shapely path",
+                pipeline="distance",
+            )
 
     return _distance_cpu(left, right)
 
@@ -175,7 +181,13 @@ def evaluate_geopandas_dwithin(
             selected=ExecutionMode.GPU,
         )
         return result
-    except Exception:
+    except Exception as exc:
+        record_fallback_event(
+            surface="geometry_array_dwithin",
+            reason=f"GPU dwithin failed: {exc}",
+            detail=f"rows={n}, returning None to let caller fall back to Shapely",
+            pipeline="dwithin",
+        )
         return None
 
 

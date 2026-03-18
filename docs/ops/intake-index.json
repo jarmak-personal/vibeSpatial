@@ -302,7 +302,8 @@
         "docs/architecture/binary-predicates.md",
         "docs/architecture/robustness.md",
         "src/vibespatial/binary_predicates.py",
-        "src/vibespatial/kernels/predicates/binary_refine.py"
+        "src/vibespatial/kernels/predicates/binary_refine.py",
+        "src/vibespatial/api/geometry_array.py"
       ],
       "path": "docs/architecture/binary-predicates.md",
       "request_signals": [
@@ -312,8 +313,13 @@
         "within",
         "contains",
         "covers",
+        "crosses",
+        "touches",
+        "overlaps",
+        "disjoint",
         "cccl",
-        "geopandas predicate"
+        "geopandas predicate",
+        "DE-9IM"
       ],
       "risks": [
         "A monolithic exact kernel would hide the compaction boundaries needed for CCCL and later GPU fallback staging.",
@@ -334,6 +340,7 @@
       ],
       "title": "Binary Predicate Refine Pipeline",
       "tokens": [
+        "9im",
         "adapter",
         "already",
         "architecture",
@@ -347,10 +354,13 @@
         "consequences",
         "contains",
         "covers",
+        "crosses",
         "crossover",
         "current",
+        "de",
         "decision",
         "detail",
+        "disjoint",
         "dispatch",
         "engine",
         "exact",
@@ -370,6 +380,7 @@
         "need",
         "only",
         "open",
+        "overlaps",
         "phase",
         "pipeline",
         "policy",
@@ -381,6 +392,7 @@
         "staging",
         "strategy",
         "surface",
+        "touches",
         "verify",
         "within",
         "you"
@@ -2443,6 +2455,8 @@
       "open_first": [
         "docs/architecture/spatial-joins.md",
         "src/vibespatial/spatial_query.py",
+        "src/vibespatial/api/sindex.py",
+        "src/vibespatial/api/tools/sjoin.py",
         "docs/architecture/binary-predicates.md"
       ],
       "path": "docs/architecture/spatial-joins.md",
@@ -10253,7 +10267,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/api/geometry_array.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/architecture/binary-predicates.md"
+      ],
       "symbols": [
         "_make_transform_func",
         "GeometryDtype",
@@ -10637,7 +10653,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/api/sindex.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/architecture/spatial-joins.md"
+      ],
       "symbols": [
         "SpatialIndex"
       ],
@@ -10867,7 +10885,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/api/tools/sjoin.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/architecture/spatial-joins.md"
+      ],
       "symbols": [
         "sjoin",
         "_maybe_make_list",

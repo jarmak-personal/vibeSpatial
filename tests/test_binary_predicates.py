@@ -16,7 +16,6 @@ from vibespatial import (
     has_gpu_runtime,
 )
 from vibespatial.kernel_registry import get_kernel_variants
-from vibespatial.kernels.predicates.binary_refine import intersects_exact
 
 
 @pytest.mark.parametrize(
@@ -73,10 +72,13 @@ def test_binary_predicate_auto_fallback_is_visible(monkeypatch) -> None:
 
     monkeypatch.setattr(adaptive_runtime, "capture_device_snapshot", fake_snapshot)
     adaptive_runtime.invalidate_snapshot_cache()
+    # Use `crosses` predicate — it is not in _DE9IM_PREDICATES, so
+    # line-line pairs still trigger CPU fallback even after the DE-9IM
+    # kernel landed for other predicates.
     left = from_shapely_geometries([LineString([(0, 0), (4, 4)])] * 10_001)
     right = from_shapely_geometries([LineString([(0, 4), (4, 0)])] * 10_001)
 
-    result = evaluate_binary_predicate("intersects", left, right, null_behavior=NullBehavior.FALSE)
+    result = evaluate_binary_predicate("crosses", left, right, null_behavior=NullBehavior.FALSE)
 
     assert bool(result.values[0]) is True
     report = left.diagnostics_report()
@@ -99,6 +101,7 @@ def test_binary_predicate_explicit_gpu_matches_cpu_for_supported_point_region_ca
 
 def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_pairs(monkeypatch) -> None:
     import vibespatial.adaptive_runtime as adaptive_runtime
+    from vibespatial.kernels.predicates.binary_refine import crosses_exact
 
     def fake_snapshot(**_kwargs):
         return DeviceSnapshot(
@@ -111,8 +114,9 @@ def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_p
     monkeypatch.setattr(adaptive_runtime, "capture_device_snapshot", fake_snapshot)
     adaptive_runtime.invalidate_snapshot_cache()
 
+    # Use `crosses` — not in _DE9IM_PREDICATES, so line-line GPU is still unsupported.
     with pytest.raises(NotImplementedError, match="point-centric candidate rows"):
-        intersects_exact(
+        crosses_exact(
             [LineString([(0, 0), (4, 4)])],
             [LineString([(0, 4), (4, 0)])],
             dispatch_mode=ExecutionMode.GPU,

@@ -119,7 +119,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Sync dependencies
-        run: uv sync --group dev --group upstream-optional --group gpu-optional
+        run: uv sync --group dev --group upstream-optional --extra cu12
       - name: Resolve baseline SHA
         id: baseline
         shell: bash
@@ -154,7 +154,7 @@ jobs:
 
           (
             cd "$worktree_dir"
-            uv sync --group dev --group upstream-optional --group gpu-optional
+            uv sync --group dev --group upstream-optional --extra cu12
             uv run python scripts/benchmark_pipelines.py --suite full --repeat 3 --nvtx --output "$GITHUB_WORKSPACE/pipeline-gpu-baseline.json"
           )
           echo "available=true" >> "$GITHUB_OUTPUT"

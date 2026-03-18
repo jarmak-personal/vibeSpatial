@@ -39,8 +39,8 @@ DOC_HEADER:END -->
 
 - docs/architecture/spatial-joins.md
 - src/vibespatial/spatial_query.py
-- src/vibespatial/_vendor/geopandas/sindex.py
-- src/vibespatial/_vendor/geopandas/tools/sjoin.py
+- src/vibespatial/api/sindex.py
+- src/vibespatial/api/tools/sjoin.py
 - docs/architecture/binary-predicates.md
 
 ## Verify
