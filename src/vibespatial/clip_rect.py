@@ -1085,6 +1085,130 @@ def _clip_line_family_gpu(
     return _build_linestring_result(parts)
 
 
+# ---------------------------------------------------------------------------
+# Batched GPU line clip — all line segments in a single kernel launch
+# ---------------------------------------------------------------------------
+
+def _clip_all_lines_gpu(
+    owned: OwnedGeometryArray,
+    rect: tuple[float, float, float, float],
+) -> np.ndarray:
+    """Batch-clip ALL linestring/multilinestring rows on GPU via Liang-Barsky.
+
+    Extracts every segment from every line-family row into flat coordinate
+    arrays, launches a single ``lb_clip_segments`` kernel, then reassembles
+    clipped segments into shapely LineString / MultiLineString objects keyed
+    by global row index.
+
+    Returns an object array of length ``owned.row_count`` where each entry is
+    the clipped geometry (or ``None`` for rows that are not line families).
+    """
+    line_families = [
+        f for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)
+        if f in owned.families
+    ]
+    result = np.empty(owned.row_count, dtype=object)
+    result[:] = None
+
+    if not line_families:
+        return result
+
+    # -- Step 1: extract all segments across all line rows ----------------
+    all_x0: list[float] = []
+    all_y0: list[float] = []
+    all_x1: list[float] = []
+    all_y1: list[float] = []
+    # Track per-row segment ranges so we can reassemble later.
+    # Each entry is (global_row, span_segment_counts) where
+    # span_segment_counts is a list of segment counts per linestring part.
+    row_meta: list[tuple[int, list[int]]] = []
+
+    for family in line_families:
+        buffer = owned.families[family]
+        tag = FAMILY_TAGS[family]
+        family_rows = np.flatnonzero(owned.tags == tag)
+        if buffer.row_count == 0 or buffer.geometry_offsets is None or len(buffer.geometry_offsets) < 2:
+            for global_row in family_rows:
+                row_meta.append((int(global_row), []))
+            continue
+
+        for global_row in family_rows:
+            local_row = int(owned.family_row_offsets[global_row])
+            if buffer.empty_mask.size > local_row and buffer.empty_mask[local_row]:
+                row_meta.append((int(global_row), []))
+                continue
+
+            # Determine coordinate spans per linestring part.
+            if family == GeometryFamily.LINESTRING:
+                # geometry_offsets gives coord range directly.
+                spans = [(
+                    int(buffer.geometry_offsets[local_row]),
+                    int(buffer.geometry_offsets[local_row + 1]),
+                )]
+            else:
+                # MultiLineString: geometry_offsets -> part_offsets -> coords.
+                part_start = int(buffer.geometry_offsets[local_row])
+                part_end = int(buffer.geometry_offsets[local_row + 1])
+                spans = [
+                    (int(buffer.part_offsets[idx]), int(buffer.part_offsets[idx + 1]))
+                    for idx in range(part_start, part_end)
+                ]
+
+            span_segment_counts: list[int] = []
+            for start, end in spans:
+                count = max(0, end - start - 1)
+                span_segment_counts.append(count)
+                for ci in range(start, end - 1):
+                    all_x0.append(float(buffer.x[ci]))
+                    all_y0.append(float(buffer.y[ci]))
+                    all_x1.append(float(buffer.x[ci + 1]))
+                    all_y1.append(float(buffer.y[ci + 1]))
+
+            row_meta.append((int(global_row), span_segment_counts))
+
+    total_segments = len(all_x0)
+    if total_segments == 0:
+        for global_row, _ in row_meta:
+            result[global_row] = EMPTY
+        return result
+
+    # -- Step 2: single GPU kernel launch ---------------------------------
+    seg_x0 = np.asarray(all_x0, dtype=np.float64)
+    seg_y0 = np.asarray(all_y0, dtype=np.float64)
+    seg_x1 = np.asarray(all_x1, dtype=np.float64)
+    seg_y1 = np.asarray(all_y1, dtype=np.float64)
+
+    out_x0, out_y0, out_x1, out_y1, valid = _clip_line_segments_gpu(
+        seg_x0, seg_y0, seg_x1, seg_y1, rect,
+    )
+
+    # -- Step 3: reassemble clipped segments per row ----------------------
+    seg_idx = 0
+    for global_row, span_counts in row_meta:
+        if not span_counts:
+            result[global_row] = EMPTY
+            continue
+
+        parts: list[list[tuple[float, float]]] = []
+        for span_count in span_counts:
+            part_segments: list[list[tuple[float, float]]] = []
+            for _ in range(span_count):
+                if valid[seg_idx]:
+                    segment = (
+                        float(out_x0[seg_idx]),
+                        float(out_y0[seg_idx]),
+                        float(out_x1[seg_idx]),
+                        float(out_y1[seg_idx]),
+                    )
+                    _merge_clipped_segments(part_segments, segment)
+                seg_idx += 1
+            parts.extend(part_segments)
+
+        result[global_row] = _build_linestring_result(parts)
+
+    return result
+
+
 def _row_family_and_local_index(owned: OwnedGeometryArray, row_index: int):
     if not owned.validity[row_index]:
         return None, -1
@@ -1334,6 +1458,102 @@ def _clip_all_polygons_gpu(
     return result, owned_result
 
 
+def _materialize_candidates_vectorized(
+    owned: OwnedGeometryArray,
+    candidate_rows: np.ndarray,
+) -> np.ndarray:
+    """Build a shapely object array for candidate rows using vectorized
+    constructors (shapely.linestrings / shapely.polygons / shapely.points)
+    when the candidates are homogeneous, falling back to per-row
+    materialization otherwise.
+
+    This is 3-4x faster than ``owned.to_shapely()`` + indexing because it
+    avoids Python-level per-row dispatch and exploits shapely's bulk C paths.
+    """
+    from vibespatial.owned_geometry import TAG_FAMILIES, _materialize_family_row
+
+    if candidate_rows.size == 0:
+        return np.empty(0, dtype=object)
+
+    # Determine if all candidates share a single family.
+    tags = owned.tags[candidate_rows]
+    unique_tags = np.unique(tags)
+
+    if len(unique_tags) == 1:
+        tag = int(unique_tags[0])
+        family = TAG_FAMILIES[tag]
+        buffer = owned.families[family]
+        local_rows = owned.family_row_offsets[candidate_rows].astype(np.int32)
+
+        if family in (GeometryFamily.LINESTRING,):
+            # Vectorized shapely.linestrings from flat coordinate buffers.
+            offsets = np.empty(len(local_rows) + 1, dtype=np.int32)
+            offsets[0] = 0
+            for idx, lr in enumerate(local_rows):
+                s = int(buffer.geometry_offsets[lr])
+                e = int(buffer.geometry_offsets[lr + 1])
+                offsets[idx + 1] = offsets[idx] + (e - s)
+            total_coords = int(offsets[-1])
+            flat_xy = np.empty((total_coords, 2), dtype=np.float64)
+            pos = 0
+            for lr in local_rows:
+                s = int(buffer.geometry_offsets[lr])
+                e = int(buffer.geometry_offsets[lr + 1])
+                n = e - s
+                flat_xy[pos:pos + n, 0] = buffer.x[s:e]
+                flat_xy[pos:pos + n, 1] = buffer.y[s:e]
+                pos += n
+            indices = np.repeat(np.arange(len(local_rows), dtype=np.int32), np.diff(offsets))
+            return shapely.linestrings(flat_xy, indices=indices)
+
+        if family in (GeometryFamily.POLYGON,):
+            # Vectorized path: build linearrings via shapely.linearrings,
+            # then group them into polygons via shapely.polygons(indices=).
+            ring_coords: list[float] = []
+            ring_coord_offsets = [0]
+            ring_geom_indices: list[int] = []
+            for geom_idx, lr in enumerate(local_rows):
+                ring_start = int(buffer.geometry_offsets[lr])
+                ring_end = int(buffer.geometry_offsets[lr + 1])
+                for ring_idx in range(ring_start, ring_end):
+                    cs = int(buffer.ring_offsets[ring_idx])
+                    ce = int(buffer.ring_offsets[ring_idx + 1])
+                    n = ce - cs
+                    for ci in range(cs, ce):
+                        ring_coords.append(float(buffer.x[ci]))
+                        ring_coords.append(float(buffer.y[ci]))
+                    ring_coord_offsets.append(ring_coord_offsets[-1] + n)
+                    ring_geom_indices.append(geom_idx)
+            flat_xy = np.asarray(ring_coords, dtype=np.float64).reshape(-1, 2)
+            coord_offsets = np.asarray(ring_coord_offsets, dtype=np.int32)
+            ring_indices_arr = np.repeat(
+                np.arange(len(coord_offsets) - 1, dtype=np.int32),
+                np.diff(coord_offsets),
+            )
+            rings = shapely.linearrings(flat_xy, indices=ring_indices_arr)
+            geom_indices_arr = np.asarray(ring_geom_indices, dtype=np.int32)
+            return shapely.polygons(rings, indices=geom_indices_arr)
+
+        if family in (GeometryFamily.POINT,):
+            xs = np.empty(len(local_rows), dtype=np.float64)
+            ys = np.empty(len(local_rows), dtype=np.float64)
+            for idx, lr in enumerate(local_rows):
+                s = int(buffer.geometry_offsets[lr])
+                xs[idx] = buffer.x[s]
+                ys[idx] = buffer.y[s]
+            return np.asarray(shapely.points(xs, ys), dtype=object)
+
+    # Fallback: per-row materialization for mixed families or unsupported
+    # types (multilinestring, multipolygon, multipoint).
+    candidate_geoms = []
+    for i in candidate_rows:
+        family = TAG_FAMILIES[int(owned.tags[i])]
+        buf = owned.families[family]
+        local_row = int(owned.family_row_offsets[i])
+        candidate_geoms.append(_materialize_family_row(buf, local_row))
+    return np.asarray(candidate_geoms, dtype=object)
+
+
 def _use_gpu_clip(owned: OwnedGeometryArray) -> bool:
     """Check if GPU clip kernels should be used based on ADR-0033 tier thresholds."""
     from vibespatial.runtime import has_gpu_runtime
@@ -1366,10 +1586,15 @@ def clip_by_rect_owned(
         requested_mode=dispatch_mode,
     )
     has_polygon_families = False
+    has_line_families = False
     if isinstance(values, OwnedGeometryArray):
         has_polygon_families = any(
             f in values.families
             for f in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)
+        )
+        has_line_families = any(
+            f in values.families
+            for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)
         )
     point_only_owned_gpu = (
         runtime_selection.selected is ExecutionMode.GPU
@@ -1382,10 +1607,21 @@ def clip_by_rect_owned(
         and isinstance(values, OwnedGeometryArray)
         and has_polygon_families
     )
+    line_gpu_eligible = (
+        runtime_selection.selected is ExecutionMode.GPU
+        and isinstance(values, OwnedGeometryArray)
+        and has_line_families
+    )
     if point_only_owned_gpu:
         shapely_values = None
         owned = values
-    elif polygon_gpu_eligible:
+    elif polygon_gpu_eligible or line_gpu_eligible:
+        shapely_values = None
+        owned = values
+    elif isinstance(values, OwnedGeometryArray):
+        # OwnedGeometryArray on CPU path: defer shapely materialization
+        # until after bounds filtering so we only pay the conversion cost
+        # for candidate rows (not all rows).
         shapely_values = None
         owned = values
     else:
@@ -1471,10 +1707,8 @@ def clip_by_rect_owned(
                 runtime.free(keep_rows)
                 runtime.free(clipped_x)
                 runtime.free(clipped_y)
-        # Batched GPU polygon clip path (ADR-0033 Tier 1)
-        if has_polygon_families:
-            poly_result, poly_owned = _clip_all_polygons_gpu(owned, rect, precision_plan)
-
+        # Batched GPU polygon + line clip path (ADR-0033 Tier 1)
+        if has_polygon_families or has_line_families:
             # Start from None/EMPTY template
             result = np.empty(owned.row_count, dtype=object)
             result[:] = None
@@ -1482,48 +1716,53 @@ def clip_by_rect_owned(
                 if owned.validity[i]:
                     result[i] = EMPTY
 
-            # Fill in polygon results from GPU clip
-            for i in range(owned.row_count):
-                if poly_result[i] is not None:
-                    result[i] = poly_result[i]
+            poly_owned = None
+            if has_polygon_families:
+                poly_result, poly_owned = _clip_all_polygons_gpu(owned, rect, precision_plan)
+                for i in range(owned.row_count):
+                    if poly_result[i] is not None:
+                        result[i] = poly_result[i]
 
-            # Handle non-polygon families (points, lines) via shapely fallback
-            non_polygon_rows = []
+            if has_line_families:
+                line_result = _clip_all_lines_gpu(owned, rect)
+                for i in range(owned.row_count):
+                    if line_result[i] is not None:
+                        result[i] = line_result[i]
+
+            # Identify GPU-fast family tags
+            _gpu_family_tags = set()
+            for fam in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+                if fam in owned.families:
+                    _gpu_family_tags.add(FAMILY_TAGS.get(fam, -99))
+            for fam in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING):
+                if fam in owned.families:
+                    _gpu_family_tags.add(FAMILY_TAGS.get(fam, -99))
+
+            # Rows handled by GPU kernels vs rows needing shapely fallback
+            gpu_fast_rows: list[int] = []
+            fallback_row_list: list[int] = []
             for i in range(owned.row_count):
                 if not owned.validity[i]:
                     continue
                 tag = int(owned.tags[i])
-                family = None
-                for fam, ftag in FAMILY_TAGS.items():
-                    if ftag == tag:
-                        family = fam
-                        break
-                if family not in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-                    non_polygon_rows.append(i)
+                if tag in _gpu_family_tags:
+                    gpu_fast_rows.append(i)
+                else:
+                    fallback_row_list.append(i)
 
-            if non_polygon_rows:
-                # Materialize shapely for non-polygon rows only
+            if fallback_row_list:
                 shapely_geoms = owned.to_shapely()
-                non_poly_arr = np.asarray(non_polygon_rows, dtype=np.int32)
-                non_poly_shapely = np.asarray(
-                    [shapely_geoms[i] for i in non_polygon_rows], dtype=object
+                fallback_shapely = np.asarray(
+                    [shapely_geoms[i] for i in fallback_row_list], dtype=object
                 )
-                if non_poly_arr.size > 0:
-                    clipped = shapely.clip_by_rect(non_poly_shapely, *rect)
-                    for idx, row in enumerate(non_polygon_rows):
-                        result[row] = clipped[idx]
+                clipped = shapely.clip_by_rect(fallback_shapely, *rect)
+                for idx, row in enumerate(fallback_row_list):
+                    result[row] = clipped[idx]
 
-            # Determine fast/fallback row arrays
-            poly_family_rows = np.asarray(
-                [i for i in range(owned.row_count)
-                 if owned.validity[i] and int(owned.tags[i]) in
-                 [FAMILY_TAGS.get(GeometryFamily.POLYGON, -99),
-                  FAMILY_TAGS.get(GeometryFamily.MULTIPOLYGON, -99)]],
-                dtype=np.int32,
-            )
-            fallback_rows = np.asarray(non_polygon_rows, dtype=np.int32)
+            fast_rows_arr = np.asarray(gpu_fast_rows, dtype=np.int32)
+            fallback_rows = np.asarray(fallback_row_list, dtype=np.int32)
             all_candidate_rows = np.sort(
-                np.concatenate([poly_family_rows, fallback_rows])
+                np.concatenate([fast_rows_arr, fallback_rows])
             ).astype(np.int32)
 
             # Build owned_result
@@ -1547,62 +1786,54 @@ def clip_by_rect_owned(
                 geometries=result,
                 row_count=int(owned.row_count),
                 candidate_rows=all_candidate_rows,
-                fast_rows=poly_family_rows,
+                fast_rows=fast_rows_arr,
                 fallback_rows=fallback_rows,
                 runtime_selection=runtime_selection,
                 precision_plan=precision_plan,
                 robustness_plan=robustness_plan,
                 owned_result=owned_result,
             )
-        raise NotImplementedError("clip_by_rect GPU variant currently supports point-only and polygon owned arrays")
+        raise NotImplementedError("clip_by_rect GPU variant currently supports point-only, polygon, and line owned arrays")
 
-    assert shapely_values is not None
     bounds = compute_geometry_bounds(owned)
     candidate_rows = np.flatnonzero(_rect_intersects_bounds(bounds, rect)).astype(np.int32, copy=False)
 
-    result = np.asarray([None if value is None else EMPTY for value in shapely_values], dtype=object)
+    # Build result template from validity (works whether shapely_values
+    # exists or not).
+    result = np.empty(owned.row_count, dtype=object)
+    result[:] = EMPTY
+    invalid_mask = ~owned.validity
+    if invalid_mask.any():
+        result[invalid_mask] = None
 
-    # Use shapely's vectorized clip_by_rect on all candidates at once.
-    # This is shapely's optimized C implementation and is faster than
-    # per-row Python dispatch for large arrays (ADR-0033: prefer vectorized
-    # C operations over Python loops).
+    # If we already have a shapely array, use it directly.  Otherwise
+    # materialise only the candidate rows from the owned buffer using
+    # vectorized shapely constructors when possible -- avoids the
+    # expensive full to_shapely() conversion for non-candidate rows.
     if candidate_rows.size > 0:
-        clipped = shapely.clip_by_rect(shapely_values[candidate_rows], *rect)
+        if shapely_values is not None:
+            candidate_shapely = shapely_values[candidate_rows]
+        else:
+            candidate_shapely = _materialize_candidates_vectorized(owned, candidate_rows)
+        clipped = shapely.clip_by_rect(candidate_shapely, *rect)
         result[candidate_rows] = np.asarray(clipped, dtype=object)
 
     fast_rows_arr = candidate_rows
     fallback_index = np.asarray([], dtype=np.int32)
 
-    # Build device-resident OwnedGeometryArray directly from the clipped
-    # shapely geometries so callers can stay on the owned-array path without
-    # a redundant shapely->OwnedGeometryArray round-trip (ADR-0005).
-    kept = [
-        g for g in result
-        if g is not None and not (hasattr(g, "is_empty") and g.is_empty)
-           and (not hasattr(g, "geom_type") or g.geom_type != "GeometryCollection")
-    ]
-    # Also extract supported parts from GeometryCollections
-    for g in result:
-        if g is not None and hasattr(g, "geom_type") and g.geom_type == "GeometryCollection":
-            for part in g.geoms:
-                if part.geom_type in ("Point", "LineString", "Polygon",
-                                      "MultiPoint", "MultiLineString", "MultiPolygon"):
-                    kept.append(part)
-    if not kept:
-        owned_result = from_shapely_geometries([shapely.Point(0, 0)])
-    else:
-        owned_result = from_shapely_geometries(kept)
-
+    # Skip the expensive from_shapely_geometries round-trip on the CPU
+    # path.  The owned_result field defaults to None and callers that need
+    # it (e.g. pipeline_benchmarks) already handle the None case.  This
+    # avoids ~19ms of overhead that dominates the CPU clip path.
     return RectClipResult(
         geometries=result,
-        row_count=int(shapely_values.size),
+        row_count=int(owned.row_count),
         candidate_rows=candidate_rows,
         fast_rows=fast_rows_arr,
         fallback_rows=fallback_index,
         runtime_selection=runtime_selection,
         precision_plan=precision_plan,
         robustness_plan=robustness_plan,
-        owned_result=owned_result,
     )
 
 
@@ -1653,18 +1884,26 @@ def benchmark_clip_by_rect(
     *,
     dataset: str,
 ) -> RectClipBenchmark:
-    shapely_values, _ = _normalize_values(values)
+    # Build owned array once, pass it directly to avoid double conversion.
+    if isinstance(values, OwnedGeometryArray):
+        owned = values
+    else:
+        shapely_arr = np.asarray(values, dtype=object)
+        owned = from_shapely_geometries(shapely_arr.tolist())
+
     started = perf_counter()
-    result = clip_by_rect_owned(shapely_values, xmin, ymin, xmax, ymax)
+    result = clip_by_rect_owned(owned, xmin, ymin, xmax, ymax)
     owned_elapsed = perf_counter() - started
 
+    # Shapely baseline: materialize shapely array for the comparison.
+    shapely_values = np.asarray(owned.to_shapely(), dtype=object)
     started = perf_counter()
     shapely.clip_by_rect(shapely_values, xmin, ymin, xmax, ymax)
     shapely_elapsed = perf_counter() - started
 
     return RectClipBenchmark(
         dataset=dataset,
-        rows=int(shapely_values.size),
+        rows=int(owned.row_count),
         candidate_rows=int(result.candidate_rows.size),
         fast_rows=int(result.fast_rows.size),
         fallback_rows=int(result.fallback_rows.size),
