@@ -15,7 +15,8 @@ argument-hint: "[git-ref range, default HEAD~1]"
 
 This skill is the landing gate for vibeSpatial. Every commit must pass through
 it. The checklist has two tiers: deterministic checks (enforced by the
-pre-commit hook) and AI-powered analysis (enforced by YOU running it here).
+pre-commit hook) and AI-powered analysis (run as isolated sub-agents for
+fresh-eyes review).
 
 ## Tier 1: Deterministic Checks (verify these pass)
 
@@ -33,63 +34,237 @@ uv run python scripts/check_maintainability.py --all
 If any fail, fix the issues before proceeding. The pre-commit hook will also
 enforce these, but catching them here avoids a failed commit attempt.
 
-## Tier 2: AI-Powered Analysis (you must do this)
+## Tier 2: AI-Powered Analysis (sub-agent based)
 
-The pre-commit hook CANNOT do this — it requires your judgment. Gather
-context once, then analyze all three domains.
+The pre-commit hook CANNOT do this — it requires AI judgment. These reviews
+run as **isolated sub-agents** so they analyze the code with fresh eyes,
+without being biased by the context of having written the code.
 
-### Gather
+### Step 1: Gather shared context
 
-1. `git diff --cached --name-only` (or `git diff HEAD~1 --name-only`)
-2. `git diff --cached` (or `git diff HEAD~1`)
-3. Identify which categories the changes touch:
-   - **kernel/GPU code**: needs GPU code review + performance + zero-copy analysis
-   - **pipeline/dispatch**: needs performance + zero-copy analysis
-   - **api**: needs zero-copy + maintainability analysis
-   - **docs/scripts**: needs maintainability analysis only
+Collect this once — you will inject it into sub-agent prompts:
+
+1. Run `git diff --cached --name-only` (or `git diff HEAD~1 --name-only`)
+   and save the file list.
+2. Run `git diff --cached` (or `git diff HEAD~1`) and save the full diff.
+3. Categorize the changed files:
+   - **kernel/GPU code** (`*_kernels.py`, `*_gpu.py`, CUDA source strings,
+     `cuda_runtime.py`, `cccl_*.py`): needs GPU code review + performance +
+     zero-copy analysis
+   - **pipeline/dispatch** (`*_pipeline.py`, dispatch logic, runtime):
+     needs performance + zero-copy analysis
+   - **api** (`api/`, public functions): needs zero-copy + maintainability
+   - **docs/scripts**: needs maintainability only
    - **tests only**: skip AI analysis (deterministic checks suffice)
 
-### Analyze: GPU Code Review (if kernel, CUDA, NVRTC, or device code changed)
+### Step 2: Launch sub-agent reviews
 
-**MANDATORY**: If any changed file touches GPU kernels, CUDA source, CCCL
-primitives, device memory management, or stream logic, invoke the
-`/gpu-code-review` skill and run its full 6-pass review procedure:
+Based on the categories identified, launch the applicable sub-agents **in
+parallel** using the Agent tool. Each sub-agent gets the diff and its domain-
+specific review instructions. Use `model: "sonnet"` for sub-agents to keep
+them fast.
 
-1. Pass 1: Host-Device Boundary (CRITICAL)
-2. Pass 2: Synchronization (HIGH)
-3. Pass 3: Kernel Efficiency (HIGH)
-4. Pass 4: Precision Compliance (MEDIUM-HIGH)
-5. Pass 5: Memory Management (MEDIUM)
-6. Pass 6: NVRTC/Compilation (LOW-MEDIUM)
+**IMPORTANT**: Always launch all applicable sub-agents in a SINGLE message
+with multiple Agent tool calls so they run in parallel.
 
-Include the GPU review findings in the report under a dedicated section.
+#### Sub-agent: GPU Code Review (if kernel/GPU/NVRTC/device code changed)
 
-### Analyze: Performance (if kernel/pipeline/dispatch code changed)
+Launch with `subagent_type: "general-purpose"` and this prompt template:
 
-- Algorithmic complexity: O(n^2) where O(n log n) is achievable?
-- GPU utilization: enough parallelism at 1M geometries? branch divergence?
-- Host-device boundary: unnecessary syncs? deferrable transfers?
-- Tier compliance (ADR-0033): correct GPU primitive tier?
-- Regression risk: could this slow an existing benchmark?
+```
+You are a GPU code reviewer for vibeSpatial. You have NOT seen this code
+before — review it with fresh eyes. Perform the full 6-pass review procedure.
 
-### Analyze: Zero-Copy (if runtime code changed)
+## Changed Files
+{file_list}
 
-- Transfer paths: every D/H crossing classified as Necessary/Structural/Avoidable?
-- Ping-pongs: any D->H->D round-trips?
-- Boundary leaks: functions accepting device data but returning host data?
-- Pipeline continuity: data stays on device between stages?
-- OwnedGeometryArray contract: lazy host materialization maintained?
+## Full Diff
+{diff}
 
-### Analyze: Maintainability (if any non-test code changed)
+## 6-Pass Review Procedure
 
-- Intake routing: can an agent discover the changed code via intake.md?
-- Doc coherence: do changed behaviors have matching doc updates?
-- Cross-references: any dangling references to moved/deleted code?
-- AGENTS.md: new scripts/modules listed in project shape?
+Pass 1: Host-Device Boundary (CRITICAL)
+- No D->H->D ping-pong patterns
+- No .get() / cp.asnumpy() in middle of GPU pipeline
+- No Python loops over device array elements
+- All D2H transfers deferred to pipeline end
+- count_scatter_total() used instead of sequential .get() calls
+
+Pass 2: Synchronization (HIGH)
+- No runtime.synchronize() between same-stream operations
+- No implicit sync from debug prints, scalar conversions
+- Stream sync only before host reads of device data
+- No cudaMalloc/cudaFree in hot paths (use pool)
+
+Pass 3: Kernel Efficiency (HIGH)
+- Block size via occupancy API, not hardcoded
+- Grid size sufficient to saturate GPU
+- No branch divergence in inner loops
+- SoA layout for coordinate data
+
+Pass 4: Precision Compliance (MEDIUM-HIGH)
+- compute_t typedef, not hardcoded double
+- PrecisionPlan wired through dispatch
+- Cache key includes precision variant
+- Kahan compensation for METRIC fp32 accumulations
+
+Pass 5: Memory Management (MEDIUM)
+- Pool allocation, not raw cudaMalloc
+- LIFO deallocation order where possible
+- Pre-sized output buffers via count-scatter
+
+Pass 6: NVRTC/Compilation (LOW-MEDIUM)
+- SHA1 cache key covers all parameterizations
+- Module-scope warmup declared (request_nvrtc_warmup)
+- No compilation in hot paths
+
+## Output Format
+For each pass, report: CLEAN or list findings with severity and location.
+End with overall verdict: CLEAN / ISSUES FOUND (list critical items).
+```
+
+#### Sub-agent: Zero-Copy Enforcer (if runtime/kernel/pipeline code changed)
+
+Launch with `subagent_type: "general-purpose"` and this prompt template:
+
+```
+You are the zero-copy enforcer for vibeSpatial. Data must stay on device
+until the user explicitly materializes it. Every unnecessary D/H transfer
+is a performance bug. You have NOT seen this code before — review with
+fresh eyes.
+
+## Changed Files
+{file_list}
+
+## Full Diff
+{diff}
+
+## Analysis Checklist
+
+Transfer Path Analysis:
+- Map where device arrays are created, transformed, and consumed
+- Identify every point where data crosses the device/host boundary
+- Classify each transfer as: Necessary / Structural / Avoidable / Ping-pong
+
+Boundary Leak Detection:
+- Do new public functions accept CuPy arrays but return NumPy?
+- Do new methods call .get()/.asnumpy() when they could return device arrays?
+- Are intermediate results being materialized to host then sent back?
+
+Pipeline Continuity:
+- In multi-stage pipelines, does data stay on device between stages?
+- Are there stages that force sync when async would work?
+
+OwnedGeometryArray Contract:
+- Do changes maintain lazy host materialization?
+- Does _ensure_host_state() get called only when truly needed?
+
+## Rules
+- Avoidable transfer = FAIL
+- Ping-pong transfer = CRITICAL
+- Test code is exempt (Shapely oracle pattern is expected)
+
+## Output Format
+Verdict: CLEAN / LEAKY / BROKEN
+For each transfer found: location, direction, classification, recommendation.
+```
+
+#### Sub-agent: Performance Analysis (if kernel/pipeline/dispatch code changed)
+
+Launch with `subagent_type: "general-purpose"` and this prompt template:
+
+```
+You are the performance analysis enforcer for vibeSpatial, a GPU-first
+spatial analytics library. You have NOT seen this code before — review
+with fresh eyes.
+
+## Changed Files
+{file_list}
+
+## Full Diff
+{diff}
+
+## Analysis Checklist
+
+Algorithmic Complexity:
+- O(n^2) where O(n log n) is achievable?
+- Python loops that should be vectorized or GPU-dispatched?
+- Data copied when a view/slice would suffice?
+
+GPU Utilization:
+- GPU threads sitting idle (branch divergence, uncoalesced access)?
+- Enough parallelism to saturate GPU at 1M geometries?
+- Kernel launch overhead amortized?
+
+Host-Device Boundary:
+- Unnecessary sync points in hot loops?
+- D/H transfers that could be deferred or eliminated?
+
+Regression Risk:
+- Could this slow existing benchmarks?
+- Allocation patterns that fragment GPU memory pool at scale?
+- Shapely/Python round-trip in a previously device-native path?
+
+## Rules
+- CRITICAL = do not land
+- WARNING = fix if practical
+- Focus on src/vibespatial/, especially kernels and pipeline code
+- Always consider 1M geometry scale
+
+## Output Format
+Verdict: PASS / WARN / FAIL
+For each finding: severity, location, pattern, impact, recommendation.
+```
+
+#### Sub-agent: Maintainability Enforcer (if any non-test source code changed)
+
+Launch with `subagent_type: "general-purpose"` and this prompt template:
+
+```
+You are the maintainability enforcer for vibeSpatial, an agent-maintained
+spatial analytics project. Code must be discoverable through the intake
+routing system. You have NOT seen this code before — review with fresh eyes.
+
+## Changed Files
+{file_list}
+
+## Full Diff
+{diff}
+
+## Analysis Checklist
+
+Intake Routing:
+- Can an agent discover the changed code via the intake routing system?
+- Are there new request signals that should route to these files?
+
+Documentation Coherence:
+- Do changed behaviors have matching doc updates?
+- Are new invariants documented in the right architecture doc?
+
+Cross-Reference Integrity:
+- Are there dangling references to moved/deleted code?
+- Do ADR references still point to the right places?
+
+Agent Workflow:
+- Should AGENTS.md verification commands be updated?
+- Are there new verification steps needed?
+
+## Rules
+- ORPHANED file (undiscoverable via intake) = FAIL
+- Routing gap = WARNING
+- Test files, __init__.py, conftest.py are exempt
+- Files under kernels/ and api/ are covered by directory-level routing
+
+## Output Format
+Verdict: DISCOVERABLE / GAPS / ORPHANED
+For each gap: file, what's missing, specific fix needed.
+```
+
+### Step 3: Collect and report
+
+Wait for all sub-agents to complete, then compile results into the report.
 
 ## Report Format
-
-After analysis, output a concise report:
 
 ```
 ## Pre-Land Review
@@ -100,11 +275,21 @@ After analysis, output a concise report:
 ### Deterministic Checks
 [PASS/FAIL for each]
 
-### GPU Code Review (if GPU code changed)
-[6-pass findings from /gpu-code-review, or "N/A — no GPU code touched"]
+### Sub-Agent Reviews
+[For each sub-agent that ran, include its verdict and any findings.
+ Note: these ran in isolated sub-agents with fresh eyes on the diff.]
 
-### AI Analysis
-[Findings by domain, only for applicable domains]
+#### GPU Code Review: [CLEAN / ISSUES FOUND]
+[findings or "N/A — no GPU code touched"]
+
+#### Zero-Copy Analysis: [CLEAN / LEAKY / BROKEN]
+[findings or "N/A"]
+
+#### Performance Analysis: [PASS / WARN / FAIL]
+[findings or "N/A"]
+
+#### Maintainability: [DISCOVERABLE / GAPS / ORPHANED]
+[findings or "N/A"]
 
 ### Overall Verdict
 [LAND / FIX REQUIRED / NEEDS PROFILING]
@@ -113,10 +298,10 @@ After analysis, output a concise report:
 ## Rules
 
 - ALL deterministic checks must pass.
-- ANY critical AI finding means FIX REQUIRED.
+- ANY critical sub-agent finding means FIX REQUIRED.
 - If runtime/kernel/pipeline code changed and no GPU is available for
   benchmarks, verdict is NEEDS PROFILING.
-- Test-only changes need only deterministic checks.
+- Test-only changes need only deterministic checks (skip sub-agents).
 - Be concise — this is a gate, not a code review.
 
 ## After Review
