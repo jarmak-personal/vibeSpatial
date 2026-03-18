@@ -109,7 +109,8 @@ You can also invoke the review commands explicitly:
 
 | Command | Purpose |
 |---------|---------|
-| `/pre-land-review` | Skill: full checklist with all three enforcers |
+| `/pre-land-review` | Skill: full checklist, orchestrates all enforcers |
+| `/gpu-code-review` | Skill: 6-pass GPU kernel review (auto-invoked by pre-land-review when GPU code touched) |
 | `/performance-analysis` | Command: GPU utilization, tier compliance, regression risk |
 | `/zero-copy-enforcer` | Command: device residency, transfer path tracing |
 | `/maintainability-enforcer` | Command: intake routing, doc coherence |

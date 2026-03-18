@@ -3851,6 +3851,21 @@
     },
     {
       "kind": "repo",
+      "path": ".claude/skills/gpu-code-review/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "code",
+        "gpu",
+        "md",
+        "review",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/skills/pre-land-review/SKILL.md",
       "referenced_by": [],
       "symbols": [],

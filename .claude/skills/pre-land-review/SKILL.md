@@ -43,10 +43,26 @@ context once, then analyze all three domains.
 1. `git diff --cached --name-only` (or `git diff HEAD~1 --name-only`)
 2. `git diff --cached` (or `git diff HEAD~1`)
 3. Identify which categories the changes touch:
-   - **kernel/pipeline**: needs performance + zero-copy analysis
-   - **dispatch/api**: needs zero-copy + maintainability analysis
+   - **kernel/GPU code**: needs GPU code review + performance + zero-copy analysis
+   - **pipeline/dispatch**: needs performance + zero-copy analysis
+   - **api**: needs zero-copy + maintainability analysis
    - **docs/scripts**: needs maintainability analysis only
    - **tests only**: skip AI analysis (deterministic checks suffice)
+
+### Analyze: GPU Code Review (if kernel, CUDA, NVRTC, or device code changed)
+
+**MANDATORY**: If any changed file touches GPU kernels, CUDA source, CCCL
+primitives, device memory management, or stream logic, invoke the
+`/gpu-code-review` skill and run its full 6-pass review procedure:
+
+1. Pass 1: Host-Device Boundary (CRITICAL)
+2. Pass 2: Synchronization (HIGH)
+3. Pass 3: Kernel Efficiency (HIGH)
+4. Pass 4: Precision Compliance (MEDIUM-HIGH)
+5. Pass 5: Memory Management (MEDIUM)
+6. Pass 6: NVRTC/Compilation (LOW-MEDIUM)
+
+Include the GPU review findings in the report under a dedicated section.
 
 ### Analyze: Performance (if kernel/pipeline/dispatch code changed)
 
@@ -83,6 +99,9 @@ After analysis, output a concise report:
 
 ### Deterministic Checks
 [PASS/FAIL for each]
+
+### GPU Code Review (if GPU code changed)
+[6-pass findings from /gpu-code-review, or "N/A — no GPU code touched"]
 
 ### AI Analysis
 [Findings by domain, only for applicable domains]
