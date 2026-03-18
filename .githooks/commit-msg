@@ -47,3 +47,6 @@ if command -v stat >/dev/null 2>&1; then
 fi
 
 printf "commit-msg: pre-land review verified (marker age: %ss).\n" "$_age"
+
+# Consume the marker so it cannot be reused for a subsequent commit.
+rm -f "$_marker"

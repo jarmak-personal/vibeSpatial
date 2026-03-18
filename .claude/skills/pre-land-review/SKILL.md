@@ -129,7 +129,9 @@ date -u +%Y-%m-%dT%H:%M:%SZ > .claude/.review-completed
 
 This marker is checked by the `commit-msg` hook. If Claude is listed as
 co-author and the marker is missing or stale (>1 hour), the commit is
-blocked. Human-only commits are not gated.
+blocked. The marker is single-use — the hook deletes it after a successful
+commit, so each commit requires its own review. Human-only commits are
+not gated.
 
 Then proceed with the commit. Include in the commit message:
 - Current strict-native GeoPandas coverage from
