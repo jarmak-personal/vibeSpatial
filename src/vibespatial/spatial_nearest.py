@@ -1544,9 +1544,14 @@ def _dwithin_refine_gpu(
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """GPU dwithin refinement: distance <= threshold filter.
 
-    Computes GPU distances for all candidate pairs (including mixed-family
-    arrays) and returns pairs where the computed distance <= the per-query-row
-    threshold.  Returns ``(left_idx, right_idx)`` on success, or ``None``
+    Device-side pipeline (ADR-0033 Tier 2 CuPy for threshold + compact):
+      1. Compute distances on device via mixed-distance kernels (Tier 1)
+      2. Build per-pair thresholds on device (Tier 2 CuPy)
+      3. Apply distance <= threshold filter on device (Tier 2 CuPy)
+      4. Compact surviving indices on device (Tier 2 CuPy flatnonzero)
+      5. Single D→H transfer of filtered index arrays
+
+    Returns ``(left_idx, right_idx)`` on success, or ``None``
     when the GPU runtime is unavailable.
     """
     if not has_gpu_runtime():
@@ -1556,19 +1561,214 @@ def _dwithin_refine_gpu(
     if pair_count == 0:
         return left_idx, right_idx
 
-    # Use mixed-distance pipeline which handles all family combinations,
-    # falling back to Shapely per-group only for unsupported families.
-    distances = _compute_mixed_distances_gpu(
-        query_owned, tree_owned, left_idx, right_idx, exclusive=False,
-        device_candidates=device_candidates,
-    )
-    if distances is None:
+    try:
+        import cupy as cp
+    except ImportError:
         return None
 
-    # Build per-pair thresholds and filter.
-    thresholds = per_row_distance[left_idx]
-    keep = distances <= thresholds
-    return left_idx[keep], right_idx[keep]
+    # --- Device-side distance computation ---
+    # Accumulate distances in a device CuPy array instead of host numpy.
+    d_distances = _compute_mixed_distances_gpu_device(
+        query_owned, tree_owned, left_idx, right_idx,
+        device_candidates=device_candidates,
+    )
+    if d_distances is None:
+        # Fall back to host-side path.
+        distances = _compute_mixed_distances_gpu(
+            query_owned, tree_owned, left_idx, right_idx, exclusive=False,
+            device_candidates=device_candidates,
+        )
+        if distances is None:
+            return None
+        thresholds = per_row_distance[left_idx]
+        keep = distances <= thresholds
+        return left_idx[keep], right_idx[keep]
+
+    # --- Device-side threshold filter (Tier 2 CuPy) ---
+    d_thresholds = cp.asarray(per_row_distance[left_idx])
+    d_keep = d_distances <= d_thresholds
+
+    # --- Device-side compaction (Tier 2 CuPy flatnonzero) ---
+    d_keep_idx = cp.flatnonzero(d_keep)
+
+    if d_keep_idx.size == 0:
+        return np.empty(0, dtype=left_idx.dtype), np.empty(0, dtype=right_idx.dtype)
+
+    # Gather surviving indices on device.
+    if device_candidates is not None and hasattr(device_candidates, "d_left"):
+        # Indices are already on device — gather directly.
+        d_left_result = device_candidates.d_left[d_keep_idx]
+        d_right_result = device_candidates.d_right[d_keep_idx]
+    else:
+        d_left_all = cp.asarray(left_idx)
+        d_right_all = cp.asarray(right_idx)
+        d_left_result = d_left_all[d_keep_idx]
+        d_right_result = d_right_all[d_keep_idx]
+
+    # --- Single D→H transfer of filtered results ---
+    return cp.asnumpy(d_left_result), cp.asnumpy(d_right_result)
+
+
+def _compute_mixed_distances_gpu_device(
+    query_owned: OwnedGeometryArray,
+    tree_owned: OwnedGeometryArray,
+    left_idx: np.ndarray,
+    right_idx: np.ndarray,
+    device_candidates: object | None = None,
+):
+    """Compute distances on device, accumulating into a CuPy device array.
+
+    Same dispatch logic as _compute_mixed_distances_gpu but keeps all
+    distance results device-resident.  Returns a CuPy float64 array of
+    distances, or None if the device pipeline cannot handle all groups.
+    """
+    try:
+        import cupy as cp
+    except ImportError:
+        return None
+
+    pair_count = left_idx.size
+    if pair_count == 0:
+        return cp.empty(0, dtype=cp.float64)
+
+    left_tags = query_owned.tags[left_idx]
+    right_tags = tree_owned.tags[right_idx]
+
+    runtime = get_cuda_runtime()
+    d_distances = cp.full(pair_count, cp.inf, dtype=cp.float64)
+
+    _dc = device_candidates
+    _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
+
+    point_family = GeometryFamily.POINT
+
+    unique_tag_pairs = set(zip(left_tags.tolist(), right_tags.tolist()))
+    for lt, rt in unique_tag_pairs:
+        lf = TAG_FAMILIES.get(lt)
+        rf = TAG_FAMILIES.get(rt)
+
+        sub_mask = (left_tags == lt) & (right_tags == rt)
+        sub_idx = np.flatnonzero(sub_mask)
+        sub_left = left_idx[sub_idx]
+        sub_right = right_idx[sub_idx]
+        sub_count = sub_idx.size
+
+        # Device sub-index for scatter into d_distances.
+        d_sub_idx = cp.asarray(sub_idx.astype(np.int32))
+
+        # Build device sub-arrays for kernel dispatch.
+        _own_sub_device = True
+        if _use_device_idx:
+            d_sub_left = _dc.d_left[d_sub_idx]
+            d_sub_right = _dc.d_right[d_sub_idx]
+            _own_sub_device = False
+        else:
+            d_sub_left = runtime.from_host(np.ascontiguousarray(sub_left, dtype=np.int32))
+            d_sub_right = runtime.from_host(np.ascontiguousarray(sub_right, dtype=np.int32))
+
+        ok = False
+        if lf is None or rf is None:
+            pass
+        elif lf == point_family and rf == point_family:
+            d_sub_dist = runtime.allocate((sub_count,), np.float64)
+            try:
+                query_owned.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="dwithin device: point-point distance",
+                )
+                tree_owned.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="dwithin device: point-point distance",
+                )
+                _launch_point_point_distance_kernel(
+                    query_owned, tree_owned,
+                    d_sub_left, d_sub_right, d_sub_dist, sub_count,
+                )
+                # Scatter into device result array (Tier 2 CuPy).
+                d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
+                ok = True
+            finally:
+                if _own_sub_device:
+                    runtime.free(d_sub_left)
+                    runtime.free(d_sub_right)
+                runtime.free(d_sub_dist)
+        elif lf == point_family or rf == point_family:
+            d_sub_dist = runtime.allocate((sub_count,), np.float64)
+            try:
+                from vibespatial.point_distance import compute_point_distance_gpu
+                if lf == point_family:
+                    ok = compute_point_distance_gpu(
+                        query_owned, tree_owned,
+                        d_sub_left, d_sub_right, d_sub_dist, sub_count,
+                        tree_family=rf,
+                    )
+                else:
+                    ok = compute_point_distance_gpu(
+                        tree_owned, query_owned,
+                        d_sub_right, d_sub_left, d_sub_dist, sub_count,
+                        tree_family=lf,
+                    )
+                if ok:
+                    d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
+            finally:
+                if _own_sub_device:
+                    runtime.free(d_sub_left)
+                    runtime.free(d_sub_right)
+                runtime.free(d_sub_dist)
+        elif (lf == GeometryFamily.MULTIPOINT) != (rf == GeometryFamily.MULTIPOINT):
+            if _own_sub_device:
+                runtime.free(d_sub_left)
+                runtime.free(d_sub_right)
+            _own_sub_device = False
+            if lf == GeometryFamily.MULTIPOINT:
+                mp_result = _compute_multipoint_distances_gpu(
+                    query_owned, tree_owned, sub_left, sub_right,
+                    target_family=rf,
+                )
+            else:
+                mp_result = _compute_multipoint_distances_gpu(
+                    tree_owned, query_owned, sub_right, sub_left,
+                    target_family=lf,
+                )
+            if mp_result is not None:
+                d_distances[d_sub_idx] = cp.asarray(mp_result)
+                ok = True
+        else:
+            d_sub_dist = runtime.allocate((sub_count,), np.float64)
+            try:
+                from vibespatial.segment_distance import compute_segment_distance_gpu
+                ok = compute_segment_distance_gpu(
+                    query_owned, tree_owned,
+                    d_sub_left, d_sub_right, d_sub_dist, sub_count,
+                    query_family=lf, tree_family=rf,
+                )
+                if ok:
+                    d_distances[d_sub_idx] = cp.asarray(d_sub_dist)
+            finally:
+                if _own_sub_device:
+                    runtime.free(d_sub_left)
+                    runtime.free(d_sub_right)
+                runtime.free(d_sub_dist)
+
+        if not ok:
+            # Unsupported family pair — fall back to Shapely for this group,
+            # then upload the sub-group result to device.
+            # to_shapely() is cached on OwnedGeometryArray, so repeated
+            # calls for multiple unsupported groups are cheap.
+            if _own_sub_device:
+                runtime.free(d_sub_left)
+                runtime.free(d_sub_right)
+                _own_sub_device = False
+            query_shapely = np.asarray(query_owned.to_shapely(), dtype=object)
+            tree_shapely = np.asarray(tree_owned.to_shapely(), dtype=object)
+            sub_dists = shapely.distance(query_shapely[sub_left], tree_shapely[sub_right])
+            d_distances[d_sub_idx] = cp.asarray(
+                np.asarray(sub_dists, dtype=np.float64),
+            )
+
+    return d_distances
 
 
 # ---------------------------------------------------------------------------

@@ -349,6 +349,9 @@ def query_spatial_index(
         )
         if device_dist_cands is not None:
             gpu_candidate_gen = True
+            # Host indices needed for tag-based family grouping in the
+            # distance dispatch loop; device candidates passed separately
+            # for device-side gather of surviving indices after filtering.
             left_idx, right_idx = device_dist_cands.to_host()
         else:
             left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)

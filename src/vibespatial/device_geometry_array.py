@@ -903,6 +903,11 @@ class DeviceGeometryArray(ExtensionArray):
         self.check_geographic_crs(stacklevel=6)
         if isinstance(other, BaseGeometry):
             return _dwithin_scalar(self, other, distance)
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None:
+            from vibespatial.distance_owned import dwithin_owned
+            return dwithin_owned(self._owned, other_owned, distance)
+        # Shapely fallback for unsupported 'other' types.
         d = self.distance(other)
         return np.where(np.isnan(d), False, d <= distance)
 
