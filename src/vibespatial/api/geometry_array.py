@@ -10,26 +10,17 @@ from typing import Any, ClassVar, Literal
 
 import numpy as np
 import pandas as pd
-from pandas.api.extensions import (
-    ExtensionArray,
-    ExtensionDtype,
-    register_extension_dtype,
-)
-
 import shapely
 import shapely.affinity
 import shapely.geometry
 import shapely.ops
 import shapely.wkt
+from pandas.api.extensions import (
+    ExtensionArray,
+    ExtensionDtype,
+    register_extension_dtype,
+)
 from shapely.geometry.base import BaseGeometry
-
-from vibespatial.binary_predicates import evaluate_geopandas_binary_predicate, supports_binary_predicate
-from vibespatial.clip_rect import evaluate_geopandas_clip_by_rect
-from vibespatial.dispatch import record_dispatch_event
-from vibespatial.make_valid_pipeline import evaluate_geopandas_make_valid
-from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries
-from vibespatial.runtime import ExecutionMode
-from vibespatial.stroke_kernels import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
 
 from vibespatial.api._compat import (
     GEOS_GE_312,
@@ -37,6 +28,17 @@ from vibespatial.api._compat import (
     requires_pyproj,
 )
 from vibespatial.api.sindex import SpatialIndex
+from vibespatial.binary_predicates import (
+    evaluate_geopandas_binary_predicate,
+    supports_binary_predicate,
+)
+from vibespatial.clip_rect import evaluate_geopandas_clip_by_rect
+from vibespatial.dispatch import record_dispatch_event
+from vibespatial.distance_owned import evaluate_geopandas_dwithin
+from vibespatial.make_valid_pipeline import evaluate_geopandas_make_valid
+from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries
+from vibespatial.runtime import ExecutionMode
+from vibespatial.stroke_kernels import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
 
 if typing.TYPE_CHECKING:
     import numpy.typing as npt
@@ -989,7 +991,22 @@ class GeometryArray(ExtensionArray):
 
     def dwithin(self, other, distance):
         self.check_geographic_crs(stacklevel=6)
-        return self._binary_method("dwithin", self, other, distance=distance)
+        if isinstance(other, GeometryArray):
+            if len(self) != len(other):
+                msg = (
+                    "Lengths of inputs do not match. "
+                    f"Left: {len(self)}, Right: {len(other)}"
+                )
+                raise ValueError(msg)
+            if not _check_crs(self, other):
+                _crs_mismatch_warn(self, other, stacklevel=7)
+            other_data = other._data
+        else:
+            other_data = other
+        result = evaluate_geopandas_dwithin(self._data, other_data, distance)
+        if result is not None:
+            return result
+        return shapely.dwithin(self._data, other_data, distance=distance)
 
     def geom_equals_exact(self, other, tolerance):
         return self._binary_method("equals_exact", self, other, tolerance=tolerance)

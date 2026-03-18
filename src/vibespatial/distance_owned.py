@@ -24,6 +24,7 @@ from vibespatial.owned_geometry import (
     TAG_FAMILIES,
     DiagnosticKind,
     OwnedGeometryArray,
+    from_shapely_geometries,
 )
 from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.residency import Residency, TransferTrigger
@@ -122,6 +123,60 @@ def dwithin_owned(
     )
     # NaN rows (null geometry) -> False for dwithin
     return np.where(np.isnan(distances), False, distances <= threshold)
+
+
+def evaluate_geopandas_dwithin(
+    left: np.ndarray,
+    right: object | np.ndarray,
+    distance: float | np.ndarray,
+) -> np.ndarray | None:
+    """Try GPU-dispatched dwithin for GeometryArray inputs.
+
+    Converts Shapely arrays to OwnedGeometryArray and routes through
+    dwithin_owned().  Returns None when GPU dispatch is not selected
+    (below crossover threshold or GPU unavailable), letting the caller
+    fall back to Shapely.
+    """
+    from shapely.geometry.base import BaseGeometry
+
+    n = len(left)
+    if n == 0:
+        return np.empty(0, dtype=bool)
+
+    selection = plan_dispatch_selection(
+        kernel_name="geometry_distance",
+        kernel_class=KernelClass.METRIC,
+        row_count=n,
+        requested_mode=ExecutionMode.AUTO,
+    )
+    if selection.selected is not ExecutionMode.GPU:
+        return None
+
+    try:
+        left_owned = from_shapely_geometries(left.tolist())
+
+        if isinstance(right, BaseGeometry):
+            # Broadcast scalar geometry to N rows.  The DGA path has an
+            # optimized _dwithin_scalar that avoids this; this path is
+            # only reached from GeometryArray above the crossover threshold.
+            right_owned = from_shapely_geometries([right] * n)
+        elif isinstance(right, np.ndarray):
+            right_owned = from_shapely_geometries(right.tolist())
+        else:
+            return None
+
+        result = dwithin_owned(left_owned, right_owned, distance)
+        record_dispatch_event(
+            surface="geometry_array_dwithin",
+            operation="dwithin",
+            implementation="dwithin_owned_gpu",
+            reason="element-wise dwithin via owned GPU kernels",
+            detail=f"rows={n}",
+            selected=ExecutionMode.GPU,
+        )
+        return result
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
