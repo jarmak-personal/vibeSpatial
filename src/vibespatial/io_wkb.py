@@ -7,24 +7,29 @@ from typing import Any
 
 import numpy as np
 
+from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import exclusive_sum
+from vibespatial.cuda_runtime import (
+    KERNEL_PARAM_I32,
+    KERNEL_PARAM_PTR,
+    get_cuda_runtime,
+    make_kernel_cache_key,
+)
+from vibespatial.device_geometry_array import DeviceGeometryArray
 from vibespatial.dispatch import record_dispatch_event
 from vibespatial.fallbacks import record_fallback_event
 from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema
 from vibespatial.io_support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from vibespatial.owned_geometry import (
-    DiagnosticKind,
     FAMILY_TAGS,
     TAG_FAMILIES,
+    DiagnosticKind,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     from_wkb,
 )
-from vibespatial.device_geometry_array import DeviceGeometryArray
 from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode
-from vibespatial.cuda_runtime import KERNEL_PARAM_I32, KERNEL_PARAM_PTR, get_cuda_runtime, make_kernel_cache_key
-from vibespatial.cccl_primitives import exclusive_sum
-from vibespatial.cccl_precompile import request_warmup
 
 request_warmup(["exclusive_scan_i32", "exclusive_scan_i64"])
 
@@ -1927,6 +1932,7 @@ def _try_gpu_wkb_arrow_decode(array) -> OwnedGeometryArray | None:
     try:
         import pyarrow as pa
         import pylibcudf as plc
+
         from vibespatial.io_pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
 
         # pylibcudf does not support Arrow binary/large_binary types, but the

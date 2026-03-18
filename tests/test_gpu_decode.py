@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import numpy as np
 import pytest
 from shapely.geometry import (
@@ -12,6 +11,7 @@ from shapely.geometry import (
     Polygon,
 )
 
+import vibespatial.api as geopandas
 import vibespatial.io_arrow as io_arrow
 from vibespatial import has_gpu_runtime, has_pylibcudf_support, read_geoparquet_owned
 from vibespatial.residency import Residency

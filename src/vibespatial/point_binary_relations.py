@@ -668,6 +668,7 @@ _POINT_BINARY_RELATIONS_KERNEL_NAMES = (
 )
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("point-binary-relations", _POINT_BINARY_RELATIONS_KERNEL_SOURCE, _POINT_BINARY_RELATIONS_KERNEL_NAMES),
     ("multipoint-binary-relations", _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE, _MULTIPOINT_KERNEL_NAMES),
@@ -1028,9 +1029,9 @@ def classify_point_predicates_indexed(
     Returns a boolean array of length ``left_indices.size``.
     """
     from vibespatial.binary_predicates import (
+        _apply_relation_rows,
         _point_equals_to_predicate,
         _point_relation_to_predicate,
-        _apply_relation_rows,
     )
 
     n = left_indices.size

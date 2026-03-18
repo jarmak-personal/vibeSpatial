@@ -4,10 +4,10 @@ import argparse
 import json
 from time import perf_counter
 
-import geopandas
 import numpy as np
 from shapely.geometry import box
 
+import geopandas
 from vibespatial.dissolve_pipeline import execute_grouped_box_union_gpu
 
 

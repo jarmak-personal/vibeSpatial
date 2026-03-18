@@ -5,13 +5,13 @@ from collections import defaultdict
 import numpy as np
 import shapely
 
+from vibespatial.cccl_precompile import request_warmup
 from vibespatial.cccl_primitives import (
     exclusive_sum,
     segmented_reduce_sum,
     sort_pairs,
     unique_sorted_pairs,
 )
-from vibespatial.cccl_precompile import request_warmup
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
@@ -22,28 +22,13 @@ request_warmup([
     "select_i32",
 ])
 from vibespatial.cuda_runtime import (  # noqa: E402
-    DeviceArray,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    DeviceArray,
     compile_kernel_group,
     get_cuda_runtime,
 )
-from vibespatial.segment_primitives import (  # noqa: E402
-    SegmentIntersectionDeviceState,
-    SegmentIntersectionResult,
-    SegmentTable,
-    classify_segment_intersections,
-    extract_segments,
-)
 from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema  # noqa: E402
-from vibespatial.owned_geometry import (  # noqa: E402
-    FAMILY_TAGS,
-    DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
-    OwnedGeometryArray,
-    OwnedGeometryDeviceState,
-    from_shapely_geometries,
-)
 from vibespatial.overlay_types import (  # noqa: E402  # Re-exported for backward compatibility
     AtomicEdgeDeviceState,
     AtomicEdgeTable,
@@ -54,8 +39,23 @@ from vibespatial.overlay_types import (  # noqa: E402  # Re-exported for backwar
     SplitEventDeviceState,
     SplitEventTable,
 )
+from vibespatial.owned_geometry import (  # noqa: E402
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    FamilyGeometryBuffer,
+    OwnedGeometryArray,
+    OwnedGeometryDeviceState,
+    from_shapely_geometries,
+)
 from vibespatial.residency import Residency  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
+from vibespatial.segment_primitives import (  # noqa: E402
+    SegmentIntersectionDeviceState,
+    SegmentIntersectionResult,
+    SegmentTable,
+    classify_segment_intersections,
+    extract_segments,
+)
 
 try:
     import cupy as cp
@@ -834,6 +834,7 @@ _BATCH_PIP_GPU_THRESHOLD = 100
 
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES),
     ("overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES),
@@ -2220,10 +2221,10 @@ def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
 def _gpu_label_face_coverage(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    label_x: "cp.ndarray",
-    label_y: "cp.ndarray",
+    label_x: cp.ndarray,
+    label_y: cp.ndarray,
     face_count: int,
-) -> tuple["cp.ndarray", "cp.ndarray"]:
+) -> tuple[cp.ndarray, cp.ndarray]:
     """GPU face labeling: test face sample points against input geometries.
 
     Returns (left_covered, right_covered) as CuPy int8 arrays.
@@ -2340,8 +2341,8 @@ def _gpu_label_face_coverage(
 
 
 def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
-    "cp.ndarray", "cp.ndarray", "cp.ndarray", "cp.ndarray", "cp.ndarray",
-    "cp.ndarray", "cp.ndarray", "cp.ndarray", int,
+    cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray,
+    cp.ndarray, cp.ndarray, cp.ndarray, int,
 ]:
     """GPU face walk via pointer jumping + shoelace aggregation.
 
@@ -3381,8 +3382,8 @@ def spatial_overlay_owned(
             and _has_polygonal_families(left)):
         right_geom = right_shapely_orig[0]
         if right_geom is not None and not right_geom.is_empty:
-            from vibespatial.polygon_constructive import polygon_centroids_owned
             from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+            from vibespatial.polygon_constructive import polygon_centroids_owned
             try:
                 # GPU centroid computation (Tier 1 NVRTC kernel, <1ms warm)
                 cx, cy = polygon_centroids_owned(left_subset)

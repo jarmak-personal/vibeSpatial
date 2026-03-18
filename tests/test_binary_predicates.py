@@ -12,8 +12,8 @@ from vibespatial import (
     MonitoringBackend,
     NullBehavior,
     evaluate_binary_predicate,
-    has_gpu_runtime,
     from_shapely_geometries,
+    has_gpu_runtime,
 )
 from vibespatial.kernel_registry import get_kernel_variants
 from vibespatial.kernels.predicates.binary_refine import intersects_exact

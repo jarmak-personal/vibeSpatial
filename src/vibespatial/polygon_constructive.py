@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vibespatial.adaptive_runtime import plan_dispatch_selection
 from vibespatial.cccl_primitives import exclusive_sum
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_F64,
@@ -14,6 +15,7 @@ from vibespatial.cuda_runtime import (
     get_cuda_runtime,
 )
 from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.owned_geometry import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
@@ -21,10 +23,8 @@ from vibespatial.owned_geometry import (
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
 )
-from vibespatial.residency import Residency, TransferTrigger
-from vibespatial.adaptive_runtime import plan_dispatch_selection
-from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.precision import KernelClass
+from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.runtime import ExecutionMode
 
 if TYPE_CHECKING:
@@ -473,6 +473,7 @@ _POLYGON_CENTROID_FP64_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_t
 _POLYGON_CENTROID_FP32_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="float")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("polygon-buffer", _POLYGON_BUFFER_KERNEL_SOURCE, _POLYGON_BUFFER_KERNEL_NAMES),
     ("ring-winding", _RING_WINDING_KERNEL_SOURCE, _RING_WINDING_KERNEL_NAMES),
@@ -481,6 +482,7 @@ request_nvrtc_warmup([
 ])
 
 from vibespatial.cccl_precompile import request_warmup  # noqa: E402
+
 request_warmup(["exclusive_scan_i32"])
 
 _CAP_STYLE_MAP = {"round": 0, "flat": 1, "square": 2}
@@ -508,7 +510,7 @@ def _polygon_centroid_kernels(compute_type: str = "double"):
 )
 def _polygon_centroids_gpu(
     owned: OwnedGeometryArray,
-    precision_plan: "PrecisionPlan | None" = None,
+    precision_plan: PrecisionPlan | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """GPU-accelerated polygon centroid computation via NVRTC shoelace kernel.
 
@@ -945,7 +947,7 @@ def polygon_centroids_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
-    precision: "PrecisionMode | str" = "auto",
+    precision: PrecisionMode | str = "auto",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute polygon centroids directly from OwnedGeometryArray coordinate buffers.
 

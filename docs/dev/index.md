@@ -6,5 +6,6 @@
 architecture
 kernels
 testing
+precommit
 contributing
 ```

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import numpy as np
 import shapely
 from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 
+import vibespatial.api as geopandas
 from vibespatial import benchmark_clip_by_rect, clip_by_rect_owned, from_shapely_geometries
 
 

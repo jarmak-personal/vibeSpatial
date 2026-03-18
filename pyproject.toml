@@ -123,6 +123,37 @@ line-length = 100
 target-version = "py312"
 extend-exclude = ["src/vibespatial/api", "tests/upstream"]
 
+[tool.ruff.lint]
+select = [
+  "E",     # pycodestyle errors
+  "F",     # pyflakes
+  "W",     # pycodestyle warnings
+  "I",     # isort
+  "UP",    # pyupgrade (Python 3.12+)
+  "B",     # flake8-bugbear
+  "PERF",  # perflint — performance anti-patterns
+  "RUF",   # ruff-specific rules
+]
+ignore = [
+  "E501",    # line length managed separately
+  "B007",    # unused-loop-control-variable (rename to _ when convenient)
+  "B905",    # zip-without-explicit-strict (pervasive, low-risk)
+  "PERF401", # manual-list-comprehension (loop+append often clearer than extend)
+  "RUF001",  # ambiguous unicode in strings (degree symbols, spatial notation)
+  "RUF002",  # ambiguous unicode in docstrings
+  "RUF003",  # ambiguous unicode in comments
+  "RUF005",  # collection-literal-concatenation (style preference)
+  "RUF007",  # zip-instead-of-pairwise (niche)
+  "RUF012",  # mutable-class-default (false positives on descriptor patterns)
+  "RUF022",  # unsorted-dunder-all (large __all__ lists, sort when convenient)
+  "RUF046",  # unnecessary-cast-to-int (noisy in coordinate math)
+  "RUF059",  # unused-unpacked-variable (rename to _ when convenient)
+  "UP040",   # non-pep695-type-alias (TypeAlias still fine on 3.12)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["vibespatial", "geopandas"]
+
 # For local development with a sibling vibeProj checkout, uncomment:
 # [tool.uv.sources]
 # vibeproj = { path = "../vibeProj", editable = true }

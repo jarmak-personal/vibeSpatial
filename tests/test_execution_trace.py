@@ -5,7 +5,6 @@ import warnings
 import pytest
 
 from vibespatial.execution_trace import (
-    ExecutionTraceContext,
     TRACE_WARNINGS_ENV_VAR,
     TraceStep,
     TraceTransfer,

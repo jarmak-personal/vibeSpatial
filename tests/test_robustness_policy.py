@@ -8,8 +8,8 @@ from vibespatial import (
     PrecisionMode,
     PredicateFallback,
     RobustnessGuarantee,
-    TopologyPolicy,
     RuntimeSelection,
+    TopologyPolicy,
     select_precision_plan,
 )
 from vibespatial.robustness import select_robustness_plan

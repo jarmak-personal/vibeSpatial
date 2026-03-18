@@ -9,10 +9,10 @@ import numpy as np
 
 from vibespatial import (
     benchmark_geoarrow_bridge,
+    benchmark_geoparquet_planner,
+    benchmark_geoparquet_scan_engine,
     benchmark_native_geometry_codec,
     benchmark_wkb_bridge,
-    benchmark_geoparquet_scan_engine,
-    benchmark_geoparquet_planner,
     build_geoparquet_metadata_summary,
 )
 from vibespatial.io_benchmark_rails import benchmark_io_arrow_suite, io_suite_to_json

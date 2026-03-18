@@ -4,7 +4,13 @@ import numpy as np
 import pytest
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 
-from vibespatial import ExecutionMode, Residency, compute_geometry_bounds, from_shapely_geometries, has_gpu_runtime
+from vibespatial import (
+    ExecutionMode,
+    Residency,
+    compute_geometry_bounds,
+    from_shapely_geometries,
+    has_gpu_runtime,
+)
 
 
 def _sample_geometries():

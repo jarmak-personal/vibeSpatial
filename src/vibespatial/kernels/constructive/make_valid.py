@@ -9,7 +9,6 @@ from vibespatial.make_valid_pipeline import MakeValidResult, make_valid_owned
 from vibespatial.precision import KernelClass
 from vibespatial.runtime import ExecutionMode
 
-
 MakeValidInput = Sequence[object | None] | np.ndarray | object
 
 

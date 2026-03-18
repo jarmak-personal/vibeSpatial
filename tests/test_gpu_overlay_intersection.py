@@ -5,7 +5,12 @@ import pytest
 import shapely
 from shapely.geometry import Polygon, box
 
-from vibespatial import ExecutionMode, from_shapely_geometries, has_gpu_runtime, overlay_intersection_owned
+from vibespatial import (
+    ExecutionMode,
+    from_shapely_geometries,
+    has_gpu_runtime,
+    overlay_intersection_owned,
+)
 
 
 def _normalize(values):

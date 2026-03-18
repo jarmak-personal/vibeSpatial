@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from benchmark_report import render_html
+
 from vibespatial.pipeline_benchmarks import (
     PIPELINE_DEFINITIONS,
     benchmark_pipeline_suite,

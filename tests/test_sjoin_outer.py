@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import shapely
 from shapely.geometry import Point, box
+
+import vibespatial.api as geopandas
 
 
 def test_outer_sjoin_uses_owned_query_dispatch_for_supported_inputs() -> None:

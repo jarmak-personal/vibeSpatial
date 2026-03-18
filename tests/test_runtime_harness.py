@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from tests._runtime_harness import cuda_runtime_available, normalize_dispatch_modes, resolve_dispatch_modes
+from tests._runtime_harness import (
+    cuda_runtime_available,
+    normalize_dispatch_modes,
+    resolve_dispatch_modes,
+)
 from vibespatial import ExecutionMode
 from vibespatial import runtime as runtime_module
 

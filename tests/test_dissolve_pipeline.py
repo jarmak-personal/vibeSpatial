@@ -4,14 +4,13 @@ import pandas as pd
 from shapely.geometry import Point
 
 import vibespatial.api as geopandas
-from vibespatial.api.testing import assert_geodataframe_equal
-
 from vibespatial import (
     DissolveUnionMethod,
     benchmark_dissolve_pipeline,
     fusion_plan_for_dissolve,
     plan_dissolve_pipeline,
 )
+from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.dissolve_pipeline import evaluate_geopandas_dissolve, execute_grouped_union
 from vibespatial.fusion import IntermediateDisposition
 

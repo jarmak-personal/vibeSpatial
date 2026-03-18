@@ -9,7 +9,6 @@ from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.runtime import ExecutionMode
 
-
 ClipInput = Sequence[object | None] | np.ndarray | object
 
 

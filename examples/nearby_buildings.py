@@ -24,7 +24,6 @@ from urllib.request import urlopen
 
 import vibespatial.api as gpd
 
-
 DATA_DIR = Path("examples/data")
 ZIP_PATH = DATA_DIR / "Florida.geojson.zip"
 GEOJSON_PATH = DATA_DIR / "Florida.geojson"

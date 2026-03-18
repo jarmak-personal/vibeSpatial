@@ -11,10 +11,8 @@ from shapely.geometry import Point, box
 
 import vibespatial.api as geopandas
 from vibespatial.api import GeoDataFrame, GeoSeries
-
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.spatial_query import build_owned_spatial_index, query_spatial_index
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

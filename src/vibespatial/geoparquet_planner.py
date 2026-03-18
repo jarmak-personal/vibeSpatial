@@ -5,7 +5,6 @@ from time import perf_counter
 
 import numpy as np
 
-
 BBox = tuple[float, float, float, float]
 
 

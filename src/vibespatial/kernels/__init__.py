@@ -1,5 +1,5 @@
 __all__ = [
-    "core",
     "constructive",
+    "core",
     "predicates",
 ]

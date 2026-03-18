@@ -7,12 +7,17 @@ from dataclasses import asdict, dataclass
 from statistics import median
 from time import perf_counter
 
-import geopandas
 import numpy as np
 import pandas as pd
 import shapely
 
-from vibespatial import DeterminismMode, KernelClass, evaluate_geopandas_dissolve, select_determinism_plan
+import geopandas
+from vibespatial import (
+    DeterminismMode,
+    KernelClass,
+    evaluate_geopandas_dissolve,
+    select_determinism_plan,
+)
 from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
 
 

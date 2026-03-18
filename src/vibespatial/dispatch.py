@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from vibespatial.event_log import append_event_record
 from vibespatial.runtime import ExecutionMode
-
 
 DispatchCallable = Callable[..., Any]
 DISPATCH_REGISTRY: dict[str, list[str]] = defaultdict(list)

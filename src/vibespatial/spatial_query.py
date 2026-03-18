@@ -8,6 +8,32 @@ from vibespatial.indexing import build_flat_spatial_index, generate_bounds_pairs
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.owned_geometry import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.spatial_nearest import (  # noqa: F401
+    _dwithin_refine_gpu,
+    nearest_spatial_index,
+)
+from vibespatial.spatial_query_box import (  # noqa: F401
+    _coords_form_axis_aligned_box,
+    _extract_box_query_bounds,
+    _extract_box_query_bounds_from_owned,
+    _extract_owned_polygon_box_bounds,
+    _is_axis_aligned_box,
+    _point_box_predicate_mode,
+    _query_point_tree_box_index,
+    _query_regular_grid_point_index,
+    _query_regular_grid_rect_box_index,
+)
+from vibespatial.spatial_query_candidates import (  # noqa: F401
+    _generate_candidates_gpu,
+    _generate_candidates_gpu_device,
+    _generate_candidates_gpu_multi,
+    _generate_candidates_gpu_multi_device,
+    _generate_candidates_gpu_scalar,
+    _generate_candidates_morton_range_gpu,
+    _generate_distance_pairs,
+    _generate_distance_pairs_gpu,
+    _generate_distance_pairs_gpu_device,
+)
 
 # ---------------------------------------------------------------------------
 # Re-exports from decomposed modules for backward compatibility.
@@ -16,15 +42,14 @@ from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 # existing ``from vibespatial.spatial_query import ...`` statements continue
 # to work without changes.
 # ---------------------------------------------------------------------------
-
 from vibespatial.spatial_query_types import (  # noqa: F401
+    _POLYGON_DE9IM_PREDICATES,
     SUPPORTED_GEOM_TYPES,
-    SpatialQueryExecution,
-    SpatialJoinIndices,
     RegularGridPointIndex,
+    SpatialJoinIndices,
+    SpatialQueryExecution,
     _DeviceCandidates,
     _DeviceJoinResult,
-    _POLYGON_DE9IM_PREDICATES,
 )
 from vibespatial.spatial_query_utils import (  # noqa: F401
     _as_geometry_array,
@@ -38,32 +63,6 @@ from vibespatial.spatial_query_utils import (  # noqa: F401
     _sort_indices,
     _to_owned,
     supports_owned_spatial_input,
-)
-from vibespatial.spatial_query_candidates import (  # noqa: F401
-    _generate_candidates_gpu,
-    _generate_candidates_gpu_device,
-    _generate_candidates_gpu_multi,
-    _generate_candidates_gpu_multi_device,
-    _generate_candidates_gpu_scalar,
-    _generate_candidates_morton_range_gpu,
-    _generate_distance_pairs,
-    _generate_distance_pairs_gpu,
-    _generate_distance_pairs_gpu_device,
-)
-from vibespatial.spatial_query_box import (  # noqa: F401
-    _coords_form_axis_aligned_box,
-    _extract_box_query_bounds,
-    _extract_box_query_bounds_from_owned,
-    _extract_owned_polygon_box_bounds,
-    _is_axis_aligned_box,
-    _point_box_predicate_mode,
-    _query_point_tree_box_index,
-    _query_regular_grid_point_index,
-    _query_regular_grid_rect_box_index,
-)
-from vibespatial.spatial_nearest import (  # noqa: F401
-    _dwithin_refine_gpu,
-    nearest_spatial_index,
 )
 
 

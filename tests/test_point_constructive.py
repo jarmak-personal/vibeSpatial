@@ -7,8 +7,8 @@ from shapely.geometry import Point, Polygon
 
 from vibespatial.io_arrow import geoseries_from_owned
 from vibespatial.owned_geometry import from_shapely_geometries
-from vibespatial.residency import Residency
 from vibespatial.point_constructive import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
 

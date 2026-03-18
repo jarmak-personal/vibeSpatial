@@ -2,18 +2,16 @@
 from __future__ import annotations
 
 import json
-import textwrap
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.io_geojson import (
-    GeoJSONOwnedBatch,
     plan_geojson_ingest,
     read_geojson_owned,
 )
-from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.residency import Residency
 
 try:

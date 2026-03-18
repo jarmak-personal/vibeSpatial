@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import pytest
 from shapely.geometry import GeometryCollection, LineString, Point, box
 
+import vibespatial.api as geopandas
 import vibespatial.spatial_query as spatial_query_module
 from vibespatial.runtime import has_gpu_runtime
 

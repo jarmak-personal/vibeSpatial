@@ -14,16 +14,15 @@ from vibespatial.cuda_runtime import (
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.owned_geometry import (
-    DeviceFamilyGeometryBuffer,
     FAMILY_TAGS,
+    TAG_FAMILIES,
+    DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
-    TAG_FAMILIES,
 )
 from vibespatial.precision import KernelClass, PrecisionMode, normalize_precision_mode
 from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
-
 
 _BOUNDS_KERNEL_SOURCE_TEMPLATE = """
 typedef {compute_type} compute_t;
@@ -456,6 +455,7 @@ _BOUNDS_KERNEL_NAMES = (
 )
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("geometry-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
 ])

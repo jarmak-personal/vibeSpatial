@@ -6,7 +6,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DOC = "docs/architecture/runtime.md"
 SYNTHETIC_DOC = "docs/testing/synthetic-data.md"

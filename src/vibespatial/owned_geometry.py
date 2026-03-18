@@ -22,16 +22,15 @@ from shapely.geometry import (
     Polygon,
 )
 
+from vibespatial.cuda_runtime import DeviceArray, get_cuda_runtime
 from vibespatial.geometry_buffers import (
     GEOMETRY_BUFFER_SCHEMAS,
     GeometryBufferSchema,
     GeometryFamily,
     get_geometry_buffer_schema,
 )
-from vibespatial.cuda_runtime import DeviceArray, get_cuda_runtime
 from vibespatial.residency import Residency, TransferTrigger, select_residency_plan
 from vibespatial.runtime import RuntimeSelection
-
 
 NULL_TAG = -1
 FAMILY_TAGS: dict[GeometryFamily, int] = {
@@ -167,7 +166,7 @@ class OwnedGeometryArray:
         *,
         trigger: TransferTrigger | str,
         reason: str | None = None,
-    ) -> "OwnedGeometryArray":
+    ) -> OwnedGeometryArray:
         target_residency = target if isinstance(target, Residency) else Residency(target)
         self._last_transfer_seconds = 0.0
         self._last_transfer_bytes = 0
@@ -374,7 +373,7 @@ class OwnedGeometryArray:
             ],
         }
 
-    def take(self, indices: np.ndarray) -> "OwnedGeometryArray":
+    def take(self, indices: np.ndarray) -> OwnedGeometryArray:
         """Return a new OwnedGeometryArray containing only the rows at *indices*.
 
         Operates entirely at the buffer level -- no Shapely round-trip.
@@ -416,7 +415,7 @@ class OwnedGeometryArray:
         result._record(DiagnosticKind.CREATED, f"subset {indices.size} rows via take", visible=False)
         return result
 
-    def device_take(self, indices) -> "OwnedGeometryArray":
+    def device_take(self, indices) -> OwnedGeometryArray:
         """Device-side take — all gathering stays on GPU.
 
         Accepts numpy or CuPy indices/mask.  Returns a DEVICE-resident

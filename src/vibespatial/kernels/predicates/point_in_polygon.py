@@ -5,8 +5,8 @@ from time import perf_counter
 
 import numpy as np
 
-from vibespatial.cccl_primitives import compact_indices
 from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import compact_indices
 
 request_warmup(["select_i32", "select_i64"])
 from vibespatial.cuda_runtime import (  # noqa: E402
@@ -18,10 +18,14 @@ from vibespatial.cuda_runtime import (  # noqa: E402
 )
 from vibespatial.geometry_buffers import GeometryFamily  # noqa: E402
 from vibespatial.kernel_registry import register_kernel_variant  # noqa: E402
-from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import _launch_family_bounds_kernel  # noqa: E402
-from vibespatial.predicate_support import PointSequence, coerce_geometry_array, resolve_predicate_context  # noqa: E402
+from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.precision import KernelClass, PrecisionMode  # noqa: E402
+from vibespatial.predicate_support import (  # noqa: E402
+    PointSequence,
+    coerce_geometry_array,
+    resolve_predicate_context,
+)
 from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
 from vibespatial.runtime import ExecutionMode  # noqa: E402
 
@@ -30,7 +34,6 @@ from .point_within_bounds import (  # noqa: E402
     _evaluate_point_within_bounds,
     _normalize_right_input,
 )
-
 
 _POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE = """
 typedef {compute_type} compute_t;
@@ -1321,6 +1324,7 @@ def _format_pip_kernel_source(compute_type: str = "double") -> str:
 _POINT_IN_POLYGON_KERNEL_SOURCE = _format_pip_kernel_source("double")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("point-in-polygon", _POINT_IN_POLYGON_KERNEL_SOURCE, _POINT_IN_POLYGON_KERNEL_NAMES),
 ])

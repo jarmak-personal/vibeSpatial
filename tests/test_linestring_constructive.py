@@ -5,8 +5,8 @@ import pytest
 import shapely
 from shapely.geometry import LineString
 
-from vibespatial.owned_geometry import from_shapely_geometries
 from vibespatial.linestring_constructive import linestring_buffer_owned_array
+from vibespatial.owned_geometry import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
 

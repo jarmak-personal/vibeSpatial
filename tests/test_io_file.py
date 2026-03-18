@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 from shapely.geometry import LineString, Point, Polygon
 
+import vibespatial.api as geopandas
+import vibespatial.io_geojson as io_geojson
 from vibespatial import (
     benchmark_geojson_ingest,
     benchmark_shapefile_ingest,
@@ -11,7 +12,6 @@ from vibespatial import (
     read_geojson_owned,
     read_shapefile_owned,
 )
-import vibespatial.io_geojson as io_geojson
 
 
 def _sample_frame() -> geopandas.GeoDataFrame:

@@ -6,11 +6,11 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-import vibespatial.api as geopandas
-from vibespatial import clear_dispatch_events, get_dispatch_events
 import numpy as np
 from shapely.affinity import translate
 
+import vibespatial.api as geopandas
+from vibespatial import clear_dispatch_events, get_dispatch_events
 from vibespatial.benchmark_fixtures import ensure_fixture, fixture_path, get_fixture_spec
 
 

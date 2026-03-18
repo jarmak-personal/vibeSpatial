@@ -6,8 +6,8 @@ import shapely
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
 
 from vibespatial import has_gpu_runtime
-from vibespatial.owned_geometry import from_shapely_geometries
 from vibespatial.geometry_buffers import GeometryFamily
+from vibespatial.owned_geometry import from_shapely_geometries
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 

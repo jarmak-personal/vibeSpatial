@@ -4,7 +4,6 @@ import argparse
 import shutil
 from pathlib import Path
 
-
 COPY_TARGETS = (
     ("geopandas/conftest.py", "tests/upstream/geopandas/conftest.py"),
     ("geopandas/tests", "tests/upstream/geopandas/tests"),

@@ -1138,6 +1138,7 @@ _MORTON_RANGE_KERNEL_NAMES = (
 )
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SPATIAL_QUERY_KERNEL_NAMES),
     ("morton-range", _MORTON_RANGE_KERNEL_SOURCE, _MORTON_RANGE_KERNEL_NAMES),

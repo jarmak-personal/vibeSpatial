@@ -4,13 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
 
-
 from vibespatial.dispatch import record_dispatch_event
-from vibespatial.io_support import IOFormat, IOOperation, IOPathKind, plan_io_support
-from vibespatial.owned_geometry import (
-    OwnedGeometryArray,
-)
-from vibespatial.runtime import ExecutionMode
 
 # Re-exported from io_geojson for backward compatibility
 from vibespatial.io_geojson import (  # noqa: F401
@@ -21,6 +15,11 @@ from vibespatial.io_geojson import (  # noqa: F401
     plan_geojson_ingest,
     read_geojson_owned,
 )
+from vibespatial.io_support import IOFormat, IOOperation, IOPathKind, plan_io_support
+from vibespatial.owned_geometry import (
+    OwnedGeometryArray,
+)
+from vibespatial.runtime import ExecutionMode
 
 
 @dataclass(frozen=True)
@@ -206,8 +205,8 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
     """
     import pyogrio
 
-    from vibespatial.io_arrow import decode_wkb_arrow_array_owned, geoseries_from_owned
     from vibespatial.cuda_runtime import get_cuda_runtime
+    from vibespatial.io_arrow import decode_wkb_arrow_array_owned, geoseries_from_owned
 
     runtime = get_cuda_runtime()
     if not runtime.available():
@@ -301,7 +300,7 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
             s = attrs_df[col]
             if hasattr(s, "dt") and s.dt.tz is not None:
                 try:
-                    attrs_df[col] = s.dt.tz_convert(datetime.timezone.utc)
+                    attrs_df[col] = s.dt.tz_convert(datetime.UTC)
                 except Exception:
                     pass
 

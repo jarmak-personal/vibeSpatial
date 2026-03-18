@@ -1,0 +1,265 @@
+# Pre-commit System
+
+<!-- DOC_HEADER:START
+Scope: Pre-commit hook architecture, enforcement layers, and AI review workflow.
+Read If: You are setting up the repo, debugging a pre-commit failure, or extending the enforcement system.
+STOP IF: You only need to run a single lint check (see Verification in AGENTS.md).
+Source Of Truth: Pre-commit enforcement policy and AI review workflow.
+Body Budget: 200/220 lines
+Document: docs/dev/precommit.md
+
+Section Map (Body Lines)
+| Body Lines | Section |
+|---|---|
+| 1-6 | Overview |
+| 7-12 | Quick Start |
+| 13-41 | Layer 1 Deterministic Checks |
+| 42-78 | Layer 2 AI Review Skill |
+| 79-93 | Layer 3 PreToolUse Hook |
+| 94-105 | How The Layers Interact |
+| 106-137 | Ratchet Baseline System |
+| 138-163 | Adding New Checks |
+| 164-200 | Troubleshooting |
+DOC_HEADER:END -->
+
+The pre-commit system enforces three core principles through three defense
+layers, each operating at a different level of the stack:
+
+1. **Performance is king** -- no regressions in GPU-first execution
+2. **Zero-copy by default** -- data stays on device until explicit materialization
+3. **Agent-first discoverability** -- all code is routable through the intake system
+
+## Quick Start
+
+```bash
+uv run python scripts/install_githooks.py
+```
+
+That's it. The git hook runs deterministic checks on every commit and prints
+a reminder about the AI review commands. The skill and hook layers are
+configured automatically via `.claude/settings.json` and `.claude/skills/`.
+
+## Layer 1: Deterministic Checks (git pre-commit hook)
+
+Runs on every commit for all contributors. No network, no AI, no GPU
+required. Total runtime: ~3-5 seconds. Enforced by `.githooks/pre-commit`.
+
+| Order | Check | Script | Rules |
+|-------|-------|--------|-------|
+| 1 | Ruff lint | `ruff check` | E, F, W, I, UP, B, PERF, RUF |
+| 2 | Doc refresh | `check_docs.py --refresh` | Auto-refresh generated headers |
+| 3 | Doc validate | `check_docs.py --check` | Header budgets, routing sections |
+| 4 | Architecture | `check_architecture_lints.py --all` | ARCH001-006 |
+| 5 | Zero-copy | `check_zero_copy.py --all` | ZCOPY001-003 |
+| 6 | Performance | `check_perf_patterns.py --all` | VPAT001-004 |
+| 7 | Maintainability | `check_maintainability.py --all` | MAINT001-003 |
+
+After checks pass, a non-blocking reminder prints the AI review commands.
+This works in terminals, VS Code git output, and CI alike.
+
+### Zero-Copy Rules (ZCOPY)
+
+| Code | Rule | Example |
+|------|------|---------|
+| ZCOPY001 | No ping-pong D/H transfers in same function | `.get()` followed by `cp.asarray()` |
+| ZCOPY002 | No per-element D/H transfers in loops | `.get()` inside a `for` body |
+| ZCOPY003 | Functions using device APIs must not return host data | Public function calls `.get()` in return |
+
+### Performance Rules (VPAT)
+
+| Code | Rule | Example |
+|------|------|---------|
+| VPAT001 | No Python for-loops over geometry objects | `for g in series.geoms` |
+| VPAT002 | No Shapely imports in kernel modules | `import shapely` in `kernels/` |
+| VPAT003 | No `np.fromiter` in runtime code | `np.fromiter(gen, dtype=float)` |
+| VPAT004 | No `.astype(object)` on arrays | `coords.astype(object)` |
+
+### Maintainability Rules (MAINT)
+
+| Code | Rule | Example |
+|------|------|---------|
+| MAINT001 | New modules in `src/vibespatial/` must be in intake | Missing from `intake-index.json` |
+| MAINT002 | New ADRs must be indexed | Missing from `docs/decisions/index.md` |
+| MAINT003 | New scripts must be in AGENTS.md | Missing from project shape section |
+
+## Layer 2: Pre-Land Review Skill (Claude Code, proactive)
+
+The `pre-land-review` skill (`.claude/skills/pre-land-review/SKILL.md`) fires
+**proactively** when Claude detects intent to commit or land work. Unlike
+AGENTS.md instructions which can be compressed away in long conversations,
+skills are matched against current context on every turn by their description
+field. The skill fires on keywords like "commit", "land", "done", "ship it",
+"wrap up", and "let's finish".
+
+When triggered, the skill loads the full pre-land checklist fresh into
+context, regardless of how long the conversation has been running.
+
+### Workflow
+
+1. Make your changes in a Claude Code session
+2. When you're ready to land, say "commit" or "let's land this"
+3. The skill fires automatically and runs the full checklist
+4. `git commit` -- deterministic checks run, reminder prints
+5. Commit completes
+
+### Available commands
+
+You can also invoke the review commands explicitly:
+
+| Command | Purpose |
+|---------|---------|
+| `/pre-land-review` | Skill: full checklist with all three enforcers |
+| `/performance-analysis` | Command: GPU utilization, tier compliance, regression risk |
+| `/zero-copy-enforcer` | Command: device residency, transfer path tracing |
+| `/maintainability-enforcer` | Command: intake routing, doc coherence |
+
+### Suppressing the pre-commit reminder
+
+The reminder is non-blocking. To suppress it:
+
+```bash
+VIBESPATIAL_SKIP_AI_REMINDER=1 git commit -m "message"
+```
+
+## Layer 3: PreToolUse Hook (Claude Code, mechanical)
+
+A `PreToolUse` hook (`.claude/hooks/pre-land-gate.sh`) fires whenever Claude
+calls `Bash` with a command containing `git commit`. The hook runs as a shell
+process **outside the LLM context window** -- it cannot be compressed away,
+forgotten, or skipped by the model.
+
+When triggered, it injects a system message into the conversation reminding
+Claude to complete the pre-land review before proceeding with the commit.
+
+This is configured in `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "Bash",
+      "hooks": [{"type": "command", "command": ".claude/hooks/pre-land-gate.sh"}]
+    }]
+  }
+}
+```
+
+The hook only matches `git commit` commands -- all other Bash calls pass
+through without overhead.
+
+## How The Layers Interact
+
+The three layers form a defense-in-depth chain:
+
+```
+Layer 2: Skill fires on "commit" / "land" / "done" intent
+  --> Loads full checklist, Claude runs AI analysis
+    --> Layer 3: Hook fires on Bash(git commit ...)
+      --> Injects system message if checklist wasn't completed
+        --> Layer 1: Pre-commit hook runs deterministic checks
+          --> Prints reminder, commit completes
+```
+
+Each layer catches what the previous one might miss:
+
+| Failure mode | Caught by |
+|--------------|-----------|
+| Agent forgets to review before committing | Layer 2 (skill) |
+| Long context compresses skill trigger away | Layer 3 (hook) |
+| Claude Code not available (human contributor) | Layer 1 (pre-commit) |
+| Non-interactive environment (CI, VS Code) | Layer 1 (pre-commit) |
+
+## Ratchet Baseline System
+
+The ZCOPY, VPAT, and MAINT checks use a **ratchet** to handle pre-existing
+violations without blocking new work:
+
+- Each script has a `_VIOLATION_BASELINE` constant (the known debt count).
+- The check **passes** if `current_count <= baseline`.
+- The check **fails** if `current_count > baseline` (new violations introduced).
+- When debt is paid down, the script prints a reminder to tighten the baseline.
+
+This means:
+
+- **New code** must comply from day one.
+- **Existing debt** doesn't block commits but can only shrink, never grow.
+- **Paying down debt** is encouraged with a visible nudge.
+
+### Updating baselines
+
+When a script says "Debt reduced! Update `_VIOLATION_BASELINE` to N":
+
+```bash
+# Find and update the constant in the script
+grep -n _VIOLATION_BASELINE scripts/check_zero_copy.py
+# Edit the number, commit the change
+```
+
+Do not increase baselines without documenting why (new code should comply,
+not get an exemption).
+
+## Adding New Checks
+
+To add a new lint rule to an existing enforcer:
+
+1. Add a `check_*` function in the appropriate `scripts/check_*.py`
+2. Add it to the `run_checks()` function
+3. Run the script -- if new violations appear, decide:
+   - Fix them (preferred)
+   - Increase the baseline with a comment explaining why
+4. Update the rule table in this doc
+5. Run `uv run python scripts/check_docs.py --refresh` to update headers
+
+To add an entirely new enforcer:
+
+1. Create `scripts/check_<name>.py` following the existing pattern
+2. Add it to `.githooks/pre-commit` in the Layer 1 block
+3. Add it to AGENTS.md project shape and verification sections
+4. Add a corresponding command in `.claude/commands/` for AI-powered analysis
+5. Document it in this file
+
+## Troubleshooting
+
+### Pre-commit hook not running
+
+```bash
+# Check that hooks are installed
+git config --local core.hooksPath
+# Should print: .githooks
+
+# Reinstall if needed
+uv run python scripts/install_githooks.py
+```
+
+### Deterministic check fails on pre-existing code
+
+The ratchet baseline should prevent this. If it happens:
+
+1. Run the failing script standalone to see all violations
+2. Check if `_VIOLATION_BASELINE` was accidentally lowered
+3. If a dependency update introduced new violations, raise the baseline
+   with a comment explaining the cause
+
+### Skill not firing in Claude Code
+
+The skill triggers on keywords in the conversation. If it doesn't fire:
+
+1. Say `/pre-land-review` explicitly to invoke it
+2. Check that `.claude/skills/pre-land-review/SKILL.md` exists
+3. Verify the skill appears in Claude Code's skill list
+
+### Hook not injecting reminder
+
+1. Check that `.claude/settings.json` has the `PreToolUse` hook configured
+2. Verify `.claude/hooks/pre-land-gate.sh` is executable (`chmod +x`)
+3. Test manually: `echo '{"command":"git commit -m test"}' | .claude/hooks/pre-land-gate.sh`
+
+### Skipping hooks entirely
+
+For emergency commits (not recommended):
+
+```bash
+git commit --no-verify -m "emergency fix"
+```
+
+This bypasses ALL checks including deterministic ones. Use sparingly.

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 from shapely.geometry import Point, Polygon
+
+import vibespatial.api as geopandas
 
 
 def test_public_dispatch_events_are_observable() -> None:

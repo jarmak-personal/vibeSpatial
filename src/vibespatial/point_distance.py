@@ -13,7 +13,6 @@ from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray
 from vibespatial.precision import PrecisionMode
 
-
 _POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = """
 typedef {compute_type} compute_t;
 
@@ -437,6 +436,7 @@ def _format_distance_kernel_source(compute_type: str = "double") -> str:
 _POINT_DISTANCE_KERNEL_SOURCE = _format_distance_kernel_source("double")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("point-distance", _POINT_DISTANCE_KERNEL_SOURCE, _POINT_DISTANCE_KERNEL_NAMES),
 ])

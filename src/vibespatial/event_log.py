@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-
 EVENT_LOG_ENV_VAR = "VIBESPATIAL_EVENT_LOG"
 
 

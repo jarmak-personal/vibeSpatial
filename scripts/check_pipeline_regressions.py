@@ -5,7 +5,6 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-
 WALL_CLOCK_THRESHOLD = 0.05
 DEVICE_MEMORY_THRESHOLD = 0.10
 

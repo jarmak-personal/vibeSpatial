@@ -3,12 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
-import vibespatial.api as geopandas
 from shapely.geometry import LineString, Polygon, box
 
-from vibespatial.segment_primitives import classify_segment_intersections
+import vibespatial.api as geopandas
 from vibespatial.owned_geometry import from_shapely_geometries
-
+from vibespatial.segment_primitives import classify_segment_intersections
 
 ClipOutcome = Literal["nonempty", "empty", "error"]
 

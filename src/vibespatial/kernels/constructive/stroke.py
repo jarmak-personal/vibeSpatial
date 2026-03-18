@@ -8,8 +8,12 @@ from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.precision import KernelClass
 from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode
-from vibespatial.stroke_kernels import BufferKernelResult, OffsetCurveKernelResult, offset_curve_owned, point_buffer_owned
-
+from vibespatial.stroke_kernels import (
+    BufferKernelResult,
+    OffsetCurveKernelResult,
+    offset_curve_owned,
+    point_buffer_owned,
+)
 
 StrokeInput = Sequence[object | None] | np.ndarray | object
 

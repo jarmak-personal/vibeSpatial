@@ -12,8 +12,8 @@ from vibespatial.crossover import (
 )
 from vibespatial.kernel_registry import KernelVariantSpec, get_kernel_variants
 from vibespatial.precision import (
-    CoordinateStats,
     DEFAULT_CONSUMER_PROFILE,
+    CoordinateStats,
     DevicePrecisionProfile,
     KernelClass,
     PrecisionMode,

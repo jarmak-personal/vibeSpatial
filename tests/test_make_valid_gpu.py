@@ -23,7 +23,6 @@ from vibespatial.make_valid_pipeline import (
     make_valid_owned,
 )
 
-
 # ---------------------------------------------------------------------------
 # Helper: compare geometry with Shapely oracle
 # ---------------------------------------------------------------------------

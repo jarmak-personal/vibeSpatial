@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import numpy as np
 import shapely
-from vibespatial.api import GeoSeries
-from vibespatial.api.testing import assert_geoseries_equal
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
+import vibespatial.api as geopandas
 from vibespatial import (
     StrokeOperation,
     benchmark_offset_curve,
@@ -16,6 +14,8 @@ from vibespatial import (
     plan_stroke_kernel,
     point_buffer_owned,
 )
+from vibespatial.api import GeoSeries
+from vibespatial.api.testing import assert_geoseries_equal
 from vibespatial.fusion import IntermediateDisposition
 
 

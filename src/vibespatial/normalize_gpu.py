@@ -16,7 +16,6 @@ from __future__ import annotations
 import numpy as np
 
 from vibespatial.adaptive_runtime import plan_dispatch_selection
-from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -26,6 +25,7 @@ from vibespatial.cuda_runtime import (
 )
 from vibespatial.dispatch import record_dispatch_event
 from vibespatial.geometry_buffers import GeometryFamily
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.owned_geometry import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
@@ -267,7 +267,7 @@ def _normalize_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 )
 def _normalize_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray | None:
     """GPU path: NVRTC ring rotation + linestring reversal."""
-    from vibespatial.precision import PrecisionMode, select_precision_plan, CoordinateStats
+    from vibespatial.precision import CoordinateStats, PrecisionMode, select_precision_plan
     from vibespatial.runtime import RuntimeSelection, has_gpu_runtime
 
     if not has_gpu_runtime():

@@ -77,7 +77,7 @@ class SpatialJoinIndices:
         object.__setattr__(self, "right", np.asarray(self.right, dtype=np.intp))
 
     @classmethod
-    def from_raw(cls, left, right) -> "SpatialJoinIndices":
+    def from_raw(cls, left, right) -> SpatialJoinIndices:
         """Validate and coerce raw arrays into the canonical index form."""
         return cls(
             left=np.asarray(left, dtype=np.intp),
@@ -93,8 +93,12 @@ class _DeviceJoinResult:
     """
 
     __slots__ = (
-        "_d_left", "_d_right", "_d_distances",
-        "_h_left", "_h_right", "_h_distances",
+        "_d_distances",
+        "_d_left",
+        "_d_right",
+        "_h_distances",
+        "_h_left",
+        "_h_right",
     )
 
     def __init__(self, d_left, d_right, d_distances=None):

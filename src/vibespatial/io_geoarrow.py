@@ -6,30 +6,31 @@ from typing import Any
 
 import numpy as np
 
+from vibespatial.device_geometry_array import DeviceGeometryArray
 from vibespatial.dispatch import record_dispatch_event
 from vibespatial.fallbacks import record_fallback_event
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.io_support import IOFormat, IOOperation, IOPathKind, plan_io_support
+from vibespatial.io_wkb import (
+    _decode_native_wkb,
+    _encode_native_wkb,
+    _homogeneous_family,
+    decode_wkb_arrow_array_owned,
+)
 from vibespatial.owned_geometry import (
+    FAMILY_TAGS,
     BufferSharingMode,
     DiagnosticKind,
-    FAMILY_TAGS,
     FamilyGeometryBuffer,
     MixedGeoArrowView,
     OwnedGeometryArray,
-    from_shapely_geometries,
     from_geoarrow,
+    from_shapely_geometries,
     from_wkb,
 )
-from vibespatial.device_geometry_array import DeviceGeometryArray
 from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.runtime import ExecutionMode
-from vibespatial.io_wkb import (
-    _homogeneous_family,
-    decode_wkb_arrow_array_owned,
-    _decode_native_wkb,
-    _encode_native_wkb,
-)
+
 
 @dataclass(frozen=True)
 class GeoArrowCodecPlan:
@@ -191,7 +192,13 @@ def _encode_list_family(
 ):
     import pyarrow as pa
 
-    from vibespatial.api.io._geoarrow import _linestring_type, _multipoint_type, _multilinestring_type, _multipolygon_type, _polygon_type
+    from vibespatial.api.io._geoarrow import (
+        _linestring_type,
+        _multilinestring_type,
+        _multipoint_type,
+        _multipolygon_type,
+        _polygon_type,
+    )
 
     mask = None if bool(array.validity.all()) else pa.array(~array.validity, type=pa.bool_())
     if interleaved:
@@ -817,9 +824,10 @@ def geodataframe_to_arrow(
     interleaved: bool = True,
     include_z: bool | None = None,
 ):
-    from vibespatial.api.io._geoarrow import ArrowTable
     import pandas as pd
     import pyarrow as pa
+
+    from vibespatial.api.io._geoarrow import ArrowTable
 
     record_dispatch_event(
         surface="geopandas.geodataframe.to_arrow",

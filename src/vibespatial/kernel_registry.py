@@ -9,9 +9,8 @@ from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode
 
-
 KernelCallable = Callable[..., Any]
-KERNEL_VARIANTS: dict[str, list["KernelVariantSpec"]] = defaultdict(list)
+KERNEL_VARIANTS: dict[str, list[KernelVariantSpec]] = defaultdict(list)
 
 
 @dataclass(frozen=True)

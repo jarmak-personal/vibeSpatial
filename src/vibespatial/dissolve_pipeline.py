@@ -10,8 +10,8 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection
 
-from vibespatial.cccl_primitives import sort_pairs
 from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import sort_pairs
 from vibespatial.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 
 request_warmup(["radix_sort_i32_i32", "radix_sort_u64_i32"])
@@ -309,8 +309,8 @@ def _gpu_union_group(group_geoms: np.ndarray) -> object:
     Uses overlay_union_owned in log₂(n) rounds, processing all pairs per round.
     Falls back to shapely for non-polygon or degenerate inputs.
     """
-    from vibespatial.owned_geometry import from_shapely_geometries
     from vibespatial.overlay_gpu import overlay_union_owned
+    from vibespatial.owned_geometry import from_shapely_geometries
     from vibespatial.runtime import ExecutionMode
 
     if group_geoms.size == 0:
@@ -505,7 +505,7 @@ def benchmark_dissolve_pipeline(
     )
 
 
-def union_all_owned(owned: "OwnedGeometryArray") -> "OwnedGeometryArray":
+def union_all_owned(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     """Union all geometries in *owned* into a single geometry.
 
     Bypasses the GeoDataFrame/groupby machinery used by
@@ -539,10 +539,10 @@ _UNION_ALL_GPU_THRESHOLD = 50
 
 
 def union_all_gpu(
-    owned: "OwnedGeometryArray",
+    owned: OwnedGeometryArray,
     *,
     grid_size: float | None = None,
-    dispatch_mode: "ExecutionMode | str" = "auto",
+    dispatch_mode: ExecutionMode | str = "auto",
 ) -> object:
     """Union all geometries in *owned* into a single Shapely geometry.
 
@@ -623,7 +623,7 @@ def union_all_gpu(
     )
 
 
-def _union_all_tree_reduce_gpu(owned: "OwnedGeometryArray") -> object | None:
+def _union_all_tree_reduce_gpu(owned: OwnedGeometryArray) -> object | None:
     """GPU tree-reduce: union N geometries in log₂(N) rounds.
 
     Key optimization vs _gpu_union_group: keeps all intermediate results
@@ -638,7 +638,7 @@ def _union_all_tree_reduce_gpu(owned: "OwnedGeometryArray") -> object | None:
     from vibespatial.runtime import ExecutionMode
 
     # Build initial list of single-row owned arrays
-    current: list["OwnedGeometryArray"] = []
+    current: list[OwnedGeometryArray] = []
     for i in range(owned.row_count):
         row_owned = owned.take(np.array([i], dtype=np.intp))
         # Skip null/empty rows
@@ -657,7 +657,7 @@ def _union_all_tree_reduce_gpu(owned: "OwnedGeometryArray") -> object | None:
 
     # Tree-reduce: each round halves the geometry count
     while len(current) > 1:
-        next_round: list["OwnedGeometryArray"] = []
+        next_round: list[OwnedGeometryArray] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
                 try:

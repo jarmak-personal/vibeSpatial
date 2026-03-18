@@ -40,7 +40,7 @@ def _require_gpu():
     try:
         import cupy as cp
 
-        cp.cuda.Device(0).compute_capability
+        _ = cp.cuda.Device(0).compute_capability
     except Exception:
         print("ERROR: No GPU available. This benchmark requires CUDA.", file=sys.stderr)
         sys.exit(1)

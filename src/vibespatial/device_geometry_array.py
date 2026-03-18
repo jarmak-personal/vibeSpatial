@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import inspect
 import warnings
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -22,9 +23,9 @@ from shapely.geometry.base import BaseGeometry
 from vibespatial.cuda_runtime import get_cuda_runtime
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.owned_geometry import (
-    DeviceFamilyGeometryBuffer,
     FAMILY_TAGS,
     NULL_TAG,
+    DeviceFamilyGeometryBuffer,
     DiagnosticEvent,
     DiagnosticKind,
     FamilyGeometryBuffer,
@@ -285,7 +286,7 @@ class DeviceGeometryArray(ExtensionArray):
         try:
             return CRS.from_epsg(utm_crs_list[0].code)
         except IndexError:
-            raise RuntimeError("Unable to determine UTM CRS")
+            raise RuntimeError("Unable to determine UTM CRS") from None
 
     def to_crs(self, crs=None, epsg=None):
         """Reproject via vibeProj transform_buffers -- stays on device."""
@@ -451,6 +452,7 @@ class DeviceGeometryArray(ExtensionArray):
     @property
     def envelope(self):
         import shapely
+
         from vibespatial.api.geometry_array import GeometryArray
 
         self._owned._record(
@@ -463,6 +465,7 @@ class DeviceGeometryArray(ExtensionArray):
     @property
     def exterior(self):
         import shapely
+
         from vibespatial.api.geometry_array import GeometryArray
 
         self._owned._record(
@@ -514,6 +517,7 @@ class DeviceGeometryArray(ExtensionArray):
 
     def simplify(self, tolerance, preserve_topology=True):
         import shapely
+
         from vibespatial.api.geometry_array import GeometryArray
 
         self._owned._record(
@@ -555,6 +559,7 @@ class DeviceGeometryArray(ExtensionArray):
 
     def affine_transform(self, matrix):
         import shapely
+
         from vibespatial.api.geometry_array import GeometryArray
 
         self._owned._record(
@@ -569,6 +574,7 @@ class DeviceGeometryArray(ExtensionArray):
 
     def translate(self, xoff=0.0, yoff=0.0, zoff=0.0):
         import shapely
+
         from vibespatial.api.geometry_array import GeometryArray
 
         self._owned._record(
@@ -692,9 +698,9 @@ class DeviceGeometryArray(ExtensionArray):
         supported by the repo-owned engine.
         """
         from vibespatial.binary_predicates import (
+            NullBehavior,
             evaluate_binary_predicate,
             supports_binary_predicate,
-            NullBehavior,
         )
         from vibespatial.dispatch import record_dispatch_event
         from vibespatial.runtime import ExecutionMode
@@ -921,6 +927,7 @@ class DeviceGeometryArray(ExtensionArray):
             return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
         except NotImplementedError:
             import shapely
+
             from vibespatial.api.geometry_array import GeometryArray
 
             self._owned._record(
@@ -1895,6 +1902,7 @@ def _dwithin_scalar(
 def _ensure_device_row_bounds(owned: OwnedGeometryArray):
     """Return cached device per-row bounds (N, 4) CuPy array, computing if needed."""
     import cupy as cp
+
     from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
     from vibespatial.runtime import ExecutionMode
 

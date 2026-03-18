@@ -4,8 +4,8 @@ import numpy as np
 from shapely.geometry.base import BaseGeometry
 
 from vibespatial.adaptive_runtime import plan_kernel_dispatch
-from vibespatial.cccl_primitives import compact_indices, exclusive_sum
 from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import compact_indices, exclusive_sum
 from vibespatial.crossover import DispatchDecision
 
 request_warmup(["select_i32", "select_i64", "exclusive_scan_i32", "exclusive_scan_i64"])

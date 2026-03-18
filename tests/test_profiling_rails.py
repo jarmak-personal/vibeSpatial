@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from vibespatial.profile_rails import profile_join_kernel, profile_overlay_kernel, profile_spatial_query_stack
+from vibespatial.profile_rails import (
+    profile_join_kernel,
+    profile_overlay_kernel,
+    profile_spatial_query_stack,
+)
 from vibespatial.profiling import StageProfiler
 from vibespatial.runtime import ExecutionMode
 

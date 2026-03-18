@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from vibespatial.cccl_precompile import request_warmup
 from vibespatial.cccl_primitives import (
     compact_indices,
     exclusive_sum,
@@ -29,7 +30,6 @@ from vibespatial.cccl_primitives import (
     sort_pairs,
     unique_sorted_pairs,
 )
-from vibespatial.cccl_precompile import request_warmup
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
@@ -47,9 +47,9 @@ from vibespatial.cuda_runtime import (  # noqa: E402
 )
 from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema  # noqa: E402
 from vibespatial.overlay_gpu import (  # noqa: E402
-    build_gpu_half_edge_graph,
     _build_polygon_output_from_faces_gpu,
     _gpu_face_walk,
+    build_gpu_half_edge_graph,
 )
 from vibespatial.overlay_types import (  # noqa: E402
     AtomicEdgeDeviceState,
@@ -418,6 +418,7 @@ _REPAIR_KERNEL_NAMES = (
 )
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("make-valid-repair", _REPAIR_KERNEL_SOURCE, _REPAIR_KERNEL_NAMES),
 ])
@@ -432,12 +433,12 @@ def _compile_repair_kernels():
 # ---------------------------------------------------------------------------
 
 def _gpu_close_rings(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
     ring_count: int,
     kernels: dict,
-) -> tuple["cp.ndarray", "cp.ndarray", "cp.ndarray"]:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Close unclosed rings by appending first vertex. Returns new x, y, ring_offsets.
 
     Phase 7 GPU-resident: closure check via CuPy vectorised gather (no host copy).
@@ -490,12 +491,12 @@ def _gpu_close_rings(
 
 
 def _gpu_remove_duplicate_vertices(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
     ring_count: int,
     kernels: dict,
-) -> tuple["cp.ndarray", "cp.ndarray", "cp.ndarray"]:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Remove consecutive duplicate vertices within each ring.
 
     Phase 7 GPU-resident: vertex-to-ring mapping via cp.searchsorted,
@@ -558,14 +559,14 @@ def _gpu_remove_duplicate_vertices(
 
 
 def _gpu_fix_ring_orientation(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
-    d_geom_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
+    d_geom_offsets: cp.ndarray,
     ring_count: int,
     polygon_count: int,
     kernels: dict,
-) -> tuple["cp.ndarray", "cp.ndarray"]:
+) -> tuple[cp.ndarray, cp.ndarray]:
     """Fix ring orientation: exterior rings CCW (positive area), holes CW (negative area).
 
     Phase 7 GPU-resident: activates the compute_ring_shoelace NVRTC kernel,
@@ -653,12 +654,12 @@ def _gpu_fix_ring_orientation(
 # ---------------------------------------------------------------------------
 
 def _extract_ring_segments_gpu(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
     ring_count: int,
     kernels: dict | None = None,
-) -> tuple["cp.ndarray", "cp.ndarray", "cp.ndarray", "cp.ndarray", "cp.ndarray"]:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Extract consecutive vertex pairs as flat segment table from ring coords.
 
     Phase 8 GPU-resident: seg_counts via CuPy, seg_offsets via exclusive_sum
@@ -719,16 +720,16 @@ def _extract_ring_segments_gpu(
 
 
 def _detect_intra_ring_intersections(
-    d_seg_x0: "cp.ndarray",
-    d_seg_y0: "cp.ndarray",
-    d_seg_x1: "cp.ndarray",
-    d_seg_y1: "cp.ndarray",
-    d_seg_ring_ids: "cp.ndarray",
+    d_seg_x0: cp.ndarray,
+    d_seg_y0: cp.ndarray,
+    d_seg_x1: cp.ndarray,
+    d_seg_y1: cp.ndarray,
+    d_seg_ring_ids: cp.ndarray,
     total_segments: int,
     ring_count: int,
-    d_ring_offsets: "cp.ndarray",
+    d_ring_offsets: cp.ndarray,
     kernels: dict | None = None,
-) -> tuple["cp.ndarray", "cp.ndarray", "cp.ndarray", "cp.ndarray", "cp.ndarray"]:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Detect self-intersections within each ring using segment pair classification.
 
     Phase 8 GPU-resident: pair generation via NVRTC kernel (or CuPy fallback).
@@ -875,12 +876,12 @@ def _detect_intra_ring_intersections(
 
 
 def _split_self_intersections_gpu(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
     ring_count: int,
     kernels: dict,
-) -> tuple["cp.ndarray", "cp.ndarray", "cp.ndarray", bool]:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, bool]:
     """Detect and split self-intersections. Returns new x, y, ring_offsets, had_splits.
 
     Phases 8-9 GPU-resident: segment extraction via NVRTC, pair generation via
@@ -1038,10 +1039,10 @@ def _split_self_intersections_gpu(
 # ---------------------------------------------------------------------------
 
 def _atomic_edges_from_rings(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
-    d_geom_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
+    d_geom_offsets: cp.ndarray,
     ring_count: int,
     polygon_count: int,
     runtime_selection: RuntimeSelection,
@@ -1170,10 +1171,10 @@ def _atomic_edges_from_rings(
 
 
 def _repolygonize_from_split_rings(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
-    d_geom_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
+    d_geom_offsets: cp.ndarray,
     ring_count: int,
     polygon_count: int,
     runtime_selection: RuntimeSelection | None = None,
@@ -1392,9 +1393,9 @@ def _build_repaired_owned(
 
 
 def _build_single_polygon_owned(
-    d_x: "cp.ndarray",
-    d_y: "cp.ndarray",
-    d_ring_offsets: "cp.ndarray",
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
     ring_count: int,
     runtime_selection: RuntimeSelection,
 ) -> OwnedGeometryArray | None:
@@ -1478,7 +1479,7 @@ class GPURepairResult:
     gpu_phases_used: tuple[str, ...]
 
 
-def _owned_to_shapely_geom(owned_result: OwnedGeometryArray) -> "object | None":
+def _owned_to_shapely_geom(owned_result: OwnedGeometryArray) -> object | None:
     """Convert an OwnedGeometryArray (from overlay pipeline) to a shapely geometry.
 
     Returns a single Polygon or MultiPolygon, or None if the result is empty.

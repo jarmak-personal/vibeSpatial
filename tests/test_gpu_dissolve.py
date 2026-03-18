@@ -4,11 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from vibespatial.api.testing import assert_geodataframe_equal
 from shapely.geometry import box
 
 import vibespatial.api as geopandas
 from vibespatial import DissolveUnionMethod, has_gpu_runtime
+from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.dissolve_pipeline import (
     evaluate_geopandas_dissolve,
     execute_grouped_box_union_gpu,

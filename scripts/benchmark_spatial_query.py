@@ -4,11 +4,15 @@ import argparse
 import json
 from time import perf_counter
 
-import geopandas
 import numpy as np
 from shapely.affinity import translate
 
-from vibespatial.spatial_query import build_owned_spatial_index, nearest_spatial_index, query_spatial_index
+import geopandas
+from vibespatial.spatial_query import (
+    build_owned_spatial_index,
+    nearest_spatial_index,
+    query_spatial_index,
+)
 from vibespatial.testing import SyntheticSpec, generate_points, generate_polygons
 
 
@@ -121,7 +125,7 @@ def main() -> int:
     left_outer, right_outer = build_outer_join_frames(args.rows, overlap_ratio=args.overlap_ratio)
     geopandas.clear_dispatch_events()
     started = perf_counter()
-    _outer_join_cold = geopandas.sjoin(left_outer, right_outer, how="outer", predicate="intersects")  # noqa: F841
+    _outer_join_cold = geopandas.sjoin(left_outer, right_outer, how="outer", predicate="intersects")
     outer_join_cold_elapsed = perf_counter() - started
     cold_dispatch_events = geopandas.get_dispatch_events(clear=True)
     outer_impl = cold_dispatch_events[-1].implementation if cold_dispatch_events else "unknown"

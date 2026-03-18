@@ -6,6 +6,7 @@ from importlib.util import find_spec
 
 from vibespatial.cuda_runtime import has_cuda_device
 
+
 class ExecutionMode(StrEnum):
     AUTO = "auto"
     GPU = "gpu"

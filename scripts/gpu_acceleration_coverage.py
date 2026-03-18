@@ -10,9 +10,19 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .upstream_native_coverage import DEFAULT_TARGETS, NativeCoverageReport, parse_pytest_summary, run_native_coverage
+    from .upstream_native_coverage import (
+        DEFAULT_TARGETS,
+        NativeCoverageReport,
+        parse_pytest_summary,
+        run_native_coverage,
+    )
 except ImportError:
-    from upstream_native_coverage import DEFAULT_TARGETS, NativeCoverageReport, parse_pytest_summary, run_native_coverage
+    from upstream_native_coverage import (
+        DEFAULT_TARGETS,
+        NativeCoverageReport,
+        parse_pytest_summary,
+        run_native_coverage,
+    )
 from vibespatial import STRICT_NATIVE_ENV_VAR
 from vibespatial.event_log import EVENT_LOG_ENV_VAR, read_event_records
 from vibespatial.runtime import has_gpu_runtime

@@ -10,7 +10,6 @@ from pathlib import Path
 
 from vibespatial import STRICT_NATIVE_ENV_VAR
 
-
 DEFAULT_TARGETS = ("tests/upstream/geopandas",)
 
 

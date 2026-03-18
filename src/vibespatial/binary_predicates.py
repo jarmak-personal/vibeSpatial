@@ -14,6 +14,12 @@ from vibespatial.dispatch import record_dispatch_event
 from vibespatial.fallbacks import record_fallback_event
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+from vibespatial.owned_geometry import (
+    FAMILY_TAGS,
+    TAG_FAMILIES,
+    OwnedGeometryArray,
+    from_shapely_geometries,
+)
 from vibespatial.point_binary_relations import (
     POINT_LOCATION_BOUNDARY,
     POINT_LOCATION_INTERIOR,
@@ -22,12 +28,10 @@ from vibespatial.point_binary_relations import (
     classify_point_line_gpu,
     classify_point_region_gpu,
 )
-from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray, TAG_FAMILIES, from_shapely_geometries
 from vibespatial.precision import KernelClass, PrecisionMode, PrecisionPlan, select_precision_plan
 from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.robustness import RobustnessPlan, select_robustness_plan
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
-
 
 PredicateInput = OwnedGeometryArray | Sequence[object | None] | np.ndarray
 

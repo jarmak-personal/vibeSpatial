@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import StrEnum
-import os
 
 from vibespatial.precision import KernelClass
-
 
 DETERMINISM_ENV_VAR = "VIBESPATIAL_DETERMINISM"
 

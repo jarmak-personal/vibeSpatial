@@ -33,7 +33,7 @@
         "End-to-End Profile Gate (MANDATORY)",
         "Execution Model",
         "Intent",
-        "Landing",
+        "Landing (MANDATORY)",
         "Mission",
         "Open First",
         "Project Shape",
@@ -3762,6 +3762,69 @@
   "files": [
     {
       "kind": "repo",
+      "path": ".claude/commands/maintainability-enforcer.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "commands",
+        "enforcer",
+        "maintainability",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/commands/performance-analysis.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "analysis",
+        "claude",
+        "commands",
+        "md",
+        "performance"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/commands/zero-copy-enforcer.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "commands",
+        "copy",
+        "enforcer",
+        "md",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/last-review.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "last",
+        "md",
+        "review"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/settings.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "json",
+        "settings"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/settings.local.json",
       "referenced_by": [],
       "symbols": [],
@@ -3784,6 +3847,21 @@
         "skill",
         "skills",
         "writing"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/skills/pre-land-review/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "land",
+        "md",
+        "pre",
+        "review",
+        "skill",
+        "skills"
       ]
     },
     {
@@ -5754,6 +5832,18 @@
     },
     {
       "kind": "doc",
+      "path": "docs/dev/precommit.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "md",
+        "precommit"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/dev/testing.md",
       "referenced_by": [],
       "symbols": [],
@@ -6837,6 +6927,84 @@
     },
     {
       "kind": "script",
+      "path": "scripts/check_maintainability.py",
+      "referenced_by": [],
+      "symbols": [
+        "LintError",
+        "_load_intake_paths",
+        "_load_agents_referenced_paths",
+        "check_module_intake_coverage",
+        "check_adr_index_coverage",
+        "check_script_agents_coverage",
+        "run_checks",
+        "main"
+      ],
+      "tokens": [
+        "adr",
+        "agents",
+        "check",
+        "checks",
+        "coverage",
+        "index",
+        "intake",
+        "linterror",
+        "load",
+        "main",
+        "maintainability",
+        "module",
+        "py",
+        "referenced",
+        "run",
+        "script",
+        "scripts"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/check_perf_patterns.py",
+      "referenced_by": [],
+      "symbols": [
+        "LintError",
+        "_is_excluded",
+        "iter_python_files",
+        "parse_module",
+        "_is_test_file",
+        "check_geometry_loops",
+        "check_shapely_in_kernels",
+        "check_slow_host_patterns",
+        "check_object_dtype_cast",
+        "run_checks",
+        "main"
+      ],
+      "tokens": [
+        "cast",
+        "check",
+        "checks",
+        "dtype",
+        "excluded",
+        "geometry",
+        "host",
+        "iter",
+        "kernels",
+        "linterror",
+        "loops",
+        "main",
+        "module",
+        "object",
+        "parse",
+        "patterns",
+        "perf",
+        "py",
+        "python",
+        "run",
+        "scripts",
+        "shapely",
+        "slow",
+        "test"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/check_pipeline_regressions.py",
       "referenced_by": [
         "docs/testing/pipeline-benchmarks.md"
@@ -6860,6 +7028,59 @@
         "regressions",
         "results",
         "scripts"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/check_zero_copy.py",
+      "referenced_by": [],
+      "symbols": [
+        "LintError",
+        "_is_excluded",
+        "iter_python_files",
+        "parse_module",
+        "_call_name",
+        "_is_d2h_call",
+        "_is_h2d_call",
+        "check_pingpong_transfers",
+        "check_loop_transfers",
+        "_returns_host_conversion",
+        "_uses_device_apis",
+        "check_boundary_type_leak",
+        "run_checks",
+        "main"
+      ],
+      "tokens": [
+        "apis",
+        "boundary",
+        "call",
+        "check",
+        "checks",
+        "conversion",
+        "copy",
+        "d2h",
+        "device",
+        "excluded",
+        "h2d",
+        "host",
+        "iter",
+        "leak",
+        "linterror",
+        "loop",
+        "main",
+        "module",
+        "name",
+        "parse",
+        "pingpong",
+        "py",
+        "python",
+        "returns",
+        "run",
+        "scripts",
+        "transfers",
+        "type",
+        "uses",
+        "zero"
       ]
     },
     {

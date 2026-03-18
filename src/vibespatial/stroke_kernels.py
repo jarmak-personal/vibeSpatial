@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
-from typing import Sequence
 
 import numpy as np
 import shapely
 from shapely.geometry import LineString, Polygon
 
-from vibespatial.adaptive_runtime import plan_kernel_dispatch, plan_dispatch_selection
+from vibespatial.adaptive_runtime import plan_dispatch_selection, plan_kernel_dispatch
 from vibespatial.crossover import DispatchDecision
 from vibespatial.fallbacks import record_fallback_event
 from vibespatial.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
@@ -17,7 +17,6 @@ from vibespatial.owned_geometry import from_shapely_geometries
 from vibespatial.point_constructive import point_buffer_owned_array
 from vibespatial.precision import KernelClass
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
-
 
 _EPSILON = 1e-12
 _POINT_TYPE_ID = 0

@@ -3,9 +3,8 @@ from __future__ import annotations
 import time
 
 from vibespatial import ExecutionMode
-from vibespatial.testing import SyntheticSpec, generate_points, generate_polygons
 from vibespatial.kernels.predicates.point_bounds import point_bounds
-
+from vibespatial.testing import SyntheticSpec, generate_points, generate_polygons
 
 TIER = 4
 REFERENCE_SCALE = "100K"

@@ -1,27 +1,46 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Sequence
 
 import numpy as np
 import shapely
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPoint, Point, Polygon
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPoint,
+    Point,
+    Polygon,
+)
 
 from vibespatial.adaptive_runtime import plan_dispatch_selection, plan_kernel_dispatch
 from vibespatial.cccl_precompile import request_warmup
 from vibespatial.crossover import DispatchDecision
 
 request_warmup(["exclusive_scan_i32"])
+from vibespatial.cuda_runtime import (  # noqa: E402
+    compile_kernel_group,
+    count_scatter_total,
+    get_cuda_runtime,
+)
 from vibespatial.geometry_buffers import GeometryFamily  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds  # noqa: E402
-from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray, from_shapely_geometries  # noqa: E402
+from vibespatial.owned_geometry import (  # noqa: E402
+    FAMILY_TAGS,
+    OwnedGeometryArray,
+    from_shapely_geometries,
+)
 from vibespatial.point_constructive import _clip_points_rect_gpu_arrays  # noqa: E402
-from vibespatial.precision import KernelClass, PrecisionMode, PrecisionPlan, select_precision_plan  # noqa: E402
+from vibespatial.precision import (  # noqa: E402
+    KernelClass,
+    PrecisionMode,
+    PrecisionPlan,
+    select_precision_plan,
+)
 from vibespatial.robustness import RobustnessPlan, select_robustness_plan  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
-from vibespatial.cuda_runtime import compile_kernel_group, count_scatter_total, get_cuda_runtime  # noqa: E402
-
 
 EMPTY = GeometryCollection()
 _POINT_EPSILON = 1e-12
@@ -302,6 +321,7 @@ _LB_KERNEL_NAMES = ("lb_clip_segments",)
 # ---------------------------------------------------------------------------
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("sh-clip", _SUTHERLAND_HODGMAN_KERNEL_SOURCE, _SH_KERNEL_NAMES),
     ("lb-clip", _LIANG_BARSKY_KERNEL_SOURCE, _LB_KERNEL_NAMES),
@@ -1274,7 +1294,7 @@ def _use_gpu_clip(owned: OwnedGeometryArray) -> bool:
     if not has_gpu_runtime():
         return False
     total_coords = 0
-    for _name, buffer in owned.families.items():
+    for buffer in owned.families.values():
         if hasattr(buffer, 'x') and buffer.x is not None:
             total_coords += len(buffer.x)
     return total_coords >= _POLYGON_CLIP_GPU_THRESHOLD

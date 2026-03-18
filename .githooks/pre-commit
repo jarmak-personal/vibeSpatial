@@ -1,6 +1,13 @@
 #!/bin/sh
 set -e
 
+# ===========================================================================
+# Tier 1: Deterministic checks (fast, all contributors)
+# ===========================================================================
+
+printf "pre-commit: linting with ruff...\n"
+uv run ruff check
+
 printf "pre-commit: refreshing generated docs and intake index...\n"
 uv run python scripts/check_docs.py --refresh --stage-generated
 
@@ -9,3 +16,32 @@ uv run python scripts/check_docs.py --check
 
 printf "pre-commit: checking architecture constraints...\n"
 uv run python scripts/check_architecture_lints.py --all
+
+printf "pre-commit: checking zero-copy compliance...\n"
+uv run python scripts/check_zero_copy.py --all
+
+printf "pre-commit: checking performance patterns...\n"
+uv run python scripts/check_perf_patterns.py --all
+
+printf "pre-commit: checking maintainability...\n"
+uv run python scripts/check_maintainability.py --all
+
+# ===========================================================================
+# Tier 2: AI review reminder
+#
+# The AI commands (/performance-analysis, /zero-copy-enforcer,
+# /maintainability-enforcer, /pre-land-review) are designed for
+# interactive Claude Code sessions, not automated pre-commit runs.
+#
+# This prints a non-blocking reminder visible in terminals and VS Code
+# git output alike.  Suppress with VIBESPATIAL_SKIP_AI_REMINDER=1.
+# ===========================================================================
+
+if [ "${VIBESPATIAL_SKIP_AI_REMINDER:-0}" = "0" ]; then
+    printf "\n"
+    printf "%s\n" "Reminder: run /pre-land-review in Claude Code before landing."
+    printf "  /pre-land-review           all three enforcers\n"
+    printf "  /performance-analysis      GPU utilization, tier compliance\n"
+    printf "  /zero-copy-enforcer        device residency, transfer paths\n"
+    printf "  /maintainability-enforcer  intake routing, doc coherence\n"
+fi

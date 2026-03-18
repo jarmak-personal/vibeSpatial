@@ -3,13 +3,13 @@ from __future__ import annotations
 import numpy as np
 
 from vibespatial.adaptive_runtime import plan_kernel_dispatch
+from vibespatial.cccl_precompile import request_warmup
 from vibespatial.cccl_primitives import (
     compact_indices,
     exclusive_sum,
     lower_bound,
     upper_bound,
 )
-from vibespatial.cccl_precompile import request_warmup
 from vibespatial.crossover import DispatchDecision
 
 request_warmup([

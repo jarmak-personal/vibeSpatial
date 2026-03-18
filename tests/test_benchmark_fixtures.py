@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vibespatial.benchmark_fixtures import BenchmarkFixtureSpec, build_fixture_frame, ensure_fixture, fixture_path
+from vibespatial.benchmark_fixtures import (
+    BenchmarkFixtureSpec,
+    build_fixture_frame,
+    ensure_fixture,
+    fixture_path,
+)
 from vibespatial.fixture_profiles import profile_fixture_query
 
 

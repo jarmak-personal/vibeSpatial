@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from shapely.affinity import translate
 import numpy as np
+from shapely.affinity import translate
 
 from vibespatial.binary_predicates import evaluate_binary_predicate
 from vibespatial.indexing import build_flat_spatial_index, generate_bounds_pairs
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds, compute_morton_keys
-from vibespatial.owned_geometry import from_shapely_geometries
 from vibespatial.overlay_reconstruction import OverlayOperation, plan_overlay_reconstruction
+from vibespatial.owned_geometry import from_shapely_geometries
 from vibespatial.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.profiling import ProfileTrace, StageProfiler
 from vibespatial.robustness import select_robustness_plan

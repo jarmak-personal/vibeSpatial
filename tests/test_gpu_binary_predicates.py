@@ -5,7 +5,13 @@ import pytest
 import shapely
 from shapely.geometry import LineString, MultiLineString, MultiPoint, MultiPolygon, Point, box
 
-from vibespatial import ExecutionMode, NullBehavior, evaluate_binary_predicate, from_shapely_geometries, has_gpu_runtime
+from vibespatial import (
+    ExecutionMode,
+    NullBehavior,
+    evaluate_binary_predicate,
+    from_shapely_geometries,
+    has_gpu_runtime,
+)
 
 
 def _expected(predicate: str, left: list[object | None], right: list[object | None]) -> list[bool | None]:

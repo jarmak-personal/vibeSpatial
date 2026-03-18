@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from vibespatial.cuda_runtime import get_cuda_runtime
+from vibespatial.device_geometry_array import DeviceGeometryArray
 from vibespatial.dispatch import record_dispatch_event
 from vibespatial.fallbacks import record_fallback_event
 from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema
@@ -16,28 +18,9 @@ from vibespatial.geoparquet_planner import (
     build_geoparquet_metadata_summary,
     select_row_groups,
 )
-from vibespatial.io_support import IOFormat, IOOperation, IOPathKind, plan_io_support
-from vibespatial.owned_geometry import (
-    DeviceFamilyGeometryBuffer,
-    DiagnosticKind,
-    FAMILY_TAGS,
-    OwnedGeometryDeviceState,
-    FamilyGeometryBuffer,
-    OwnedGeometryArray,
-)
-from vibespatial.device_geometry_array import DeviceGeometryArray
-from vibespatial.residency import Residency
-from vibespatial.runtime import ExecutionMode
-from vibespatial.cuda_runtime import get_cuda_runtime
-from vibespatial.io_wkb import (
-    _encode_owned_wkb_array,
-    _write_geoparquet_native_device,
-    has_pyarrow_support,
-    has_pylibcudf_support,
-)
 from vibespatial.io_geoarrow import (
-    _owned_geoarrow_fast_path_reason,
     _decode_geoarrow_array_to_owned,
+    _owned_geoarrow_fast_path_reason,
     encode_owned_geoarrow_array,
 )
 from vibespatial.io_pylibcudf import (
@@ -45,6 +28,24 @@ from vibespatial.io_pylibcudf import (
     _decode_pylibcudf_geoparquet_table_to_owned,
     _is_pylibcudf_table,
 )
+from vibespatial.io_support import IOFormat, IOOperation, IOPathKind, plan_io_support
+from vibespatial.io_wkb import (
+    _encode_owned_wkb_array,
+    _write_geoparquet_native_device,
+    has_pyarrow_support,
+    has_pylibcudf_support,
+)
+from vibespatial.owned_geometry import (
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    DiagnosticKind,
+    FamilyGeometryBuffer,
+    OwnedGeometryArray,
+    OwnedGeometryDeviceState,
+)
+from vibespatial.residency import Residency
+from vibespatial.runtime import ExecutionMode
+
 
 @dataclass(frozen=True)
 class GeoParquetScanPlan:
@@ -456,6 +457,7 @@ def _pylibcudf_table_to_geopandas(
     import warnings
 
     import pandas as pd
+
     from vibespatial.api.geodataframe import GeoDataFrame
 
     if geo_metadata is None:
@@ -644,8 +646,9 @@ def _geoparquet_geometry_column_crs(column_metadata: dict[str, Any]) -> Any:
     if "crs" in column_metadata:
         crs = column_metadata["crs"]
         if isinstance(crs, dict):
-            from vibespatial.api.io.arrow import _remove_id_from_member_of_ensembles
             from pyproj import CRS
+
+            from vibespatial.api.io.arrow import _remove_id_from_member_of_ensembles
 
             _remove_id_from_member_of_ensembles(crs)
             return CRS.from_user_input(crs)
@@ -715,8 +718,8 @@ def _build_geoparquet_metadata_summary_from_pyarrow(
     filesystem,
     geo_metadata: dict[str, Any],
 ) -> GeoParquetMetadataSummary | None:
-    import pyarrow.parquet as parquet
     import pyarrow.fs as pafs
+    import pyarrow.parquet as parquet
 
     if filesystem is not None:
         if hasattr(filesystem, "get_file_info"):
@@ -814,6 +817,8 @@ def _read_geoparquet_table_with_pyarrow(
     row_groups: tuple[int, ...] | list[int] | None = None,
     **kwargs,
 ):
+    import pyarrow.parquet as parquet
+
     from vibespatial.api.io.arrow import (
         _check_if_covering_in_geo_metadata,
         _get_bbox_encoding_column_name,
@@ -825,7 +830,6 @@ def _read_geoparquet_table_with_pyarrow(
         _validate_and_decode_metadata,
     )
     from vibespatial.api.io.file import _expand_user
-    import pyarrow.parquet as parquet
 
     filesystem = kwargs.pop("filesystem", None)
     filesystem, normalized_path = _get_filesystem_path(
@@ -1124,7 +1128,7 @@ def _write_geoparquet_native(
     for col_idx, col_name in zip(geometry_indices, geometry_columns):
         series = df[col_name]
         arr = series.array
-        owned = arr.to_owned() if isinstance(arr, DeviceGeometryArray) else arr.to_owned()
+        owned = arr.to_owned()
 
         # Ensure host state for encoding
         owned._ensure_host_state()

@@ -5,8 +5,8 @@ from time import perf_counter
 
 import numpy as np
 
-from vibespatial.cccl_primitives import sort_pairs
 from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import sort_pairs
 
 request_warmup(["radix_sort_i32_i32", "radix_sort_u64_i32"])
 
@@ -14,6 +14,7 @@ try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
+from vibespatial.adaptive_runtime import plan_dispatch_selection  # noqa: E402
 from vibespatial.cuda_runtime import (  # noqa: E402
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -22,13 +23,14 @@ from vibespatial.cuda_runtime import (  # noqa: E402
     get_cuda_runtime,
 )
 from vibespatial.geometry_buffers import GeometryFamily  # noqa: E402
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds, compute_morton_keys  # noqa: E402
+from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
+    compute_geometry_bounds,
+    compute_morton_keys,
+)
 from vibespatial.owned_geometry import OwnedGeometryArray  # noqa: E402
-from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
-from vibespatial.adaptive_runtime import plan_dispatch_selection  # noqa: E402
 from vibespatial.precision import KernelClass  # noqa: E402
+from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime  # noqa: E402
-
 
 _GPU_BOUNDS_PAIRS_THRESHOLD = 2_048
 
@@ -454,7 +456,7 @@ class FlatSpatialIndex:
     _host_morton_keys: object  # np.ndarray or None (lazy from device_morton_keys)
     bounds: np.ndarray
     total_bounds: tuple[float, float, float, float]
-    regular_grid: "RegularGridRectIndex | None" = None
+    regular_grid: RegularGridRectIndex | None = None
     device_morton_keys: object = None  # CuPy device array or None
     device_order: object = None  # CuPy device array or None
 
@@ -537,6 +539,7 @@ class RegularGridRectIndex:
 _INDEXING_KERNEL_NAMES = ("morton_keys_from_bounds", "sweep_mbr_overlap")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("indexing", _INDEXING_KERNEL_SOURCE, _INDEXING_KERNEL_NAMES),
 ])

@@ -5,14 +5,13 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any
 
-import vibespatial.api as geopandas
 import numpy as np
 from shapely.geometry import Point, Polygon
 
+import vibespatial.api as geopandas
 from vibespatial import ExecutionMode
 from vibespatial.runtime import RuntimeSelection, select_runtime
 from vibespatial.testing.synthetic import SyntheticSpec, generate_points, generate_polygons
-
 
 ReferenceCallable = Any
 OperationCallable = Any
@@ -82,7 +81,7 @@ def compare_with_shapely(
     )
 
     def decorator(func):
-        setattr(func, "__oracle_config__", config)
+        func.__oracle_config__ = config
         return func
 
     return decorator

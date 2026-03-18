@@ -17,7 +17,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from vibespatial.adaptive_runtime import plan_dispatch_selection
-from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -26,6 +25,7 @@ from vibespatial.cuda_runtime import (
     get_cuda_runtime,
 )
 from vibespatial.geometry_buffers import GeometryFamily
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.owned_geometry import (
     FAMILY_TAGS,
     OwnedGeometryArray,
@@ -432,7 +432,7 @@ def _compile_kernel(name_prefix: str, fp64_source: str, fp32_source: str,
 )
 def _area_gpu(
     owned: OwnedGeometryArray,
-    precision_plan: "PrecisionPlan | None" = None,
+    precision_plan: PrecisionPlan | None = None,
 ) -> np.ndarray:
     """GPU-accelerated area computation.  Returns float64 array of shape (row_count,)."""
     from vibespatial.precision import PrecisionMode
@@ -572,7 +572,7 @@ def _area_gpu(
 )
 def _length_gpu(
     owned: OwnedGeometryArray,
-    precision_plan: "PrecisionPlan | None" = None,
+    precision_plan: PrecisionPlan | None = None,
 ) -> np.ndarray:
     """GPU-accelerated length computation.  Returns float64 array of shape (row_count,)."""
     from vibespatial.precision import PrecisionMode
@@ -968,7 +968,7 @@ def area_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
-    precision: "PrecisionMode | str" = "auto",
+    precision: PrecisionMode | str = "auto",
 ) -> np.ndarray:
     """Compute area directly from OwnedGeometryArray coordinate buffers.
 
@@ -1029,7 +1029,7 @@ def length_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
-    precision: "PrecisionMode | str" = "auto",
+    precision: PrecisionMode | str = "auto",
 ) -> np.ndarray:
     """Compute length directly from OwnedGeometryArray coordinate buffers.
 

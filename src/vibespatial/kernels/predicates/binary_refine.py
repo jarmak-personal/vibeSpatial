@@ -6,10 +6,9 @@ import numpy as np
 
 from vibespatial.binary_predicates import BinaryPredicateResult, evaluate_binary_predicate
 from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.residency import Residency
 from vibespatial.precision import KernelClass, PrecisionMode
+from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode
-
 
 PredicateInput = Sequence[object | None] | np.ndarray | object
 

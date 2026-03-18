@@ -6,9 +6,9 @@ import tempfile
 from pathlib import Path
 from time import perf_counter
 
-import geopandas
 import numpy as np
 
+import geopandas
 import vibespatial.io_arrow as io_arrow
 from vibespatial import has_gpu_runtime, has_pylibcudf_support
 from vibespatial.cccl_primitives import (

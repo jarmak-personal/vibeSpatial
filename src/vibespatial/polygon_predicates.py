@@ -11,7 +11,6 @@ from vibespatial.cuda_runtime import (
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray
 
-
 # ---------------------------------------------------------------------------
 # DE-9IM bitmask layout
 # ---------------------------------------------------------------------------
@@ -803,6 +802,7 @@ _POLYGON_PREDICATES_KERNEL_NAMES = (
 )
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("polygon-predicates", _POLYGON_PREDICATES_KERNEL_SOURCE, _POLYGON_PREDICATES_KERNEL_NAMES),
 ])

@@ -1,9 +1,23 @@
 # Allow sub-packages (like vibespatial.raster) to be installed separately
 # and discovered via pkgutil namespace extension.
 from pkgutil import extend_path
+
 __path__ = extend_path(__path__, __name__)
 
 __version__ = "0.1.0"
+
+# --- Public GeoPandas-compatible API surface ---
+from vibespatial.api import (
+    GeoDataFrame,
+    GeoSeries,
+    list_layers,
+    points_from_xy,
+    read_feather,
+    read_file,
+    read_parquet,
+)
+from vibespatial.api._config import options
+from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 
 from .adaptive_runtime import (
     AdaptivePlan,
@@ -27,33 +41,17 @@ from .binary_predicates import (
     evaluate_geopandas_binary_predicate,
     supports_binary_predicate,
 )
+from .cccl_precompile import (
+    PRECOMPILE_ENV_VAR,
+    precompile_enabled,
+    precompile_status,
+)
 from .clip_rect import (
     RectClipBenchmark,
     RectClipResult,
     benchmark_clip_by_rect,
     clip_by_rect_owned,
     evaluate_geopandas_clip_by_rect,
-)
-from .cccl_precompile import (
-    PRECOMPILE_ENV_VAR,
-    precompile_enabled,
-    precompile_status,
-)
-from .execution_trace import (
-    ExecutionTraceContext,
-    TRACE_WARNINGS_ENV_VAR,
-    VibeTraceWarning,
-    execution_trace,
-    get_active_trace,
-)
-from .fallbacks import (
-    FallbackEvent,
-    STRICT_NATIVE_ENV_VAR,
-    StrictNativeFallbackError,
-    clear_fallback_events,
-    get_fallback_events,
-    record_fallback_event,
-    strict_native_mode_enabled,
 )
 from .crossover import (
     DEFAULT_CROSSOVER_POLICIES,
@@ -62,7 +60,6 @@ from .crossover import (
     default_crossover_policy,
     select_dispatch_for_rows,
 )
-from .dispatch import DispatchEvent, clear_dispatch_events, get_dispatch_events, record_dispatch_event
 from .determinism import (
     DETERMINISM_ENV_VAR,
     DeterminismMode,
@@ -72,6 +69,12 @@ from .determinism import (
     deterministic_mode_enabled,
     normalize_determinism_mode,
     select_determinism_plan,
+)
+from .dispatch import (
+    DispatchEvent,
+    clear_dispatch_events,
+    get_dispatch_events,
+    record_dispatch_event,
 )
 from .dissolve_pipeline import (
     DissolveBenchmark,
@@ -85,6 +88,22 @@ from .dissolve_pipeline import (
     fusion_plan_for_dissolve,
     plan_dissolve_pipeline,
     union_all_owned,
+)
+from .execution_trace import (
+    TRACE_WARNINGS_ENV_VAR,
+    ExecutionTraceContext,
+    VibeTraceWarning,
+    execution_trace,
+    get_active_trace,
+)
+from .fallbacks import (
+    STRICT_NATIVE_ENV_VAR,
+    FallbackEvent,
+    StrictNativeFallbackError,
+    clear_fallback_events,
+    get_fallback_events,
+    record_fallback_event,
+    strict_native_mode_enabled,
 )
 from .fusion import (
     FusionPlan,
@@ -125,20 +144,19 @@ from .indexing import (
     generate_bounds_pairs,
     generate_segment_mbr_pairs,
 )
-from .io_support import IOFormat, IOOperation, IOPathKind, IOPlan, IOSupportEntry, IO_SUPPORT_MATRIX, plan_io_support
 from .io_arrow import (
     GeoArrowBridgeBenchmark,
     GeoArrowCodecPlan,
-    NativeGeometryBenchmark,
     GeoParquetChunkPlan,
     GeoParquetEngineBenchmark,
     GeoParquetEnginePlan,
     GeoParquetScanPlan,
+    NativeGeometryBenchmark,
     WKBBridgeBenchmark,
     WKBBridgePlan,
     benchmark_geoarrow_bridge,
-    benchmark_native_geometry_codec,
     benchmark_geoparquet_scan_engine,
+    benchmark_native_geometry_codec,
     benchmark_wkb_bridge,
     decode_owned_geoarrow,
     decode_wkb_owned,
@@ -155,19 +173,11 @@ from .io_arrow import (
     plan_geoarrow_codec,
     plan_geoparquet_engine,
     plan_geoparquet_scan,
-    plan_wkb_partition,
     plan_wkb_bridge,
+    plan_wkb_partition,
     read_geoparquet,
     read_geoparquet_owned,
     write_geoparquet,
-)
-from .io_geojson import (
-    GeoJSONIngestBenchmark,
-    GeoJSONIngestPlan,
-    GeoJSONOwnedBatch,
-    benchmark_geojson_ingest,
-    plan_geojson_ingest,
-    read_geojson_owned,
 )
 from .io_file import (
     ShapefileIngestBenchmark,
@@ -181,6 +191,34 @@ from .io_file import (
     read_vector_file,
     write_vector_file,
 )
+from .io_geojson import (
+    GeoJSONIngestBenchmark,
+    GeoJSONIngestPlan,
+    GeoJSONOwnedBatch,
+    benchmark_geojson_ingest,
+    plan_geojson_ingest,
+    read_geojson_owned,
+)
+from .io_support import (
+    IO_SUPPORT_MATRIX,
+    IOFormat,
+    IOOperation,
+    IOPathKind,
+    IOPlan,
+    IOSupportEntry,
+    plan_io_support,
+)
+from .kernels.core import (
+    compute_geometry_bounds,
+    compute_morton_keys,
+    compute_offset_spans,
+    compute_total_bounds,
+)
+from .kernels.predicates import point_in_polygon, point_within_bounds
+from .make_valid_gpu import (
+    GPURepairResult,
+    gpu_repair_invalid_polygons,
+)
 from .make_valid_pipeline import (
     MakeValidBenchmark,
     MakeValidPlan,
@@ -193,26 +231,43 @@ from .make_valid_pipeline import (
     make_valid_owned,
     plan_make_valid_pipeline,
 )
-from .make_valid_gpu import (
-    GPURepairResult,
-    gpu_repair_invalid_polygons,
-)
-from .kernels.core import (
-    compute_geometry_bounds,
-    compute_morton_keys,
-    compute_offset_spans,
-    compute_total_bounds,
-)
-from .kernels.predicates import point_in_polygon, point_within_bounds
 from .nulls import (
+    NULL_BOUNDS,
     GeometryPresence,
     GeometrySemantics,
-    NULL_BOUNDS,
     classify_geometry,
     is_null_like,
     measurement_result_for_geometry,
     predicate_result_for_pair,
     unary_result_for_missing_input,
+)
+from .overlay_gpu import (
+    AtomicEdgeDeviceState,
+    AtomicEdgeTable,
+    HalfEdgeGraph,
+    HalfEdgeGraphDeviceState,
+    OverlayFaceDeviceState,
+    OverlayFaceTable,
+    SplitEventDeviceState,
+    SplitEventTable,
+    build_gpu_atomic_edges,
+    build_gpu_half_edge_graph,
+    build_gpu_overlay_faces,
+    build_gpu_split_events,
+    overlay_difference_owned,
+    overlay_identity_owned,
+    overlay_intersection_owned,
+    overlay_symmetric_difference_owned,
+    overlay_union_owned,
+    spatial_overlay_owned,
+)
+from .overlay_reconstruction import (
+    OverlayOperation,
+    OverlayReconstructionPlan,
+    ReconstructionPrimitive,
+    ReconstructionStage,
+    fusion_plan_for_overlay,
+    plan_overlay_reconstruction,
 )
 from .owned_geometry import (
     BufferSharingMode,
@@ -226,34 +281,20 @@ from .owned_geometry import (
     from_shapely_geometries,
     from_wkb,
 )
-from .overlay_reconstruction import (
-    OverlayOperation,
-    OverlayReconstructionPlan,
-    ReconstructionPrimitive,
-    ReconstructionStage,
-    fusion_plan_for_overlay,
-    plan_overlay_reconstruction,
+from .precision import (
+    DEFAULT_CONSUMER_PROFILE,
+    DEFAULT_DATACENTER_PROFILE,
+    CompensationMode,
+    CoordinateStats,
+    DevicePrecisionProfile,
+    KernelClass,
+    PrecisionMode,
+    PrecisionPlan,
+    RefinementMode,
+    normalize_precision_mode,
+    select_precision_plan,
 )
-from .overlay_gpu import (
-    AtomicEdgeDeviceState,
-    AtomicEdgeTable,
-    HalfEdgeGraph,
-    HalfEdgeGraphDeviceState,
-    OverlayFaceDeviceState,
-    OverlayFaceTable,
-    SplitEventDeviceState,
-    SplitEventTable,
-    overlay_difference_owned,
-    overlay_identity_owned,
-    build_gpu_atomic_edges,
-    build_gpu_half_edge_graph,
-    build_gpu_overlay_faces,
-    build_gpu_split_events,
-    overlay_intersection_owned,
-    overlay_symmetric_difference_owned,
-    overlay_union_owned,
-    spatial_overlay_owned,
-)
+from .residency import Residency, ResidencyPlan, TransferTrigger, select_residency_plan
 from .robustness import (
     PredicateFallback,
     RobustnessGuarantee,
@@ -261,20 +302,6 @@ from .robustness import (
     TopologyPolicy,
     select_robustness_plan,
 )
-from .precision import (
-    CompensationMode,
-    CoordinateStats,
-    DEFAULT_CONSUMER_PROFILE,
-    DEFAULT_DATACENTER_PROFILE,
-    DevicePrecisionProfile,
-    KernelClass,
-    normalize_precision_mode,
-    PrecisionMode,
-    PrecisionPlan,
-    RefinementMode,
-    select_precision_plan,
-)
-from .residency import Residency, ResidencyPlan, TransferTrigger, select_residency_plan
 from .runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime, select_runtime
 from .segment_primitives import (
     SegmentIntersectionBenchmark,
@@ -305,12 +332,6 @@ from .stroke_kernels import (
     point_buffer_owned,
 )
 from .testing import SCALE_PRESETS, SyntheticDataset, SyntheticSpec
-
-# --- Public GeoPandas-compatible API surface ---
-from vibespatial.api import GeoDataFrame, GeoSeries, points_from_xy
-from vibespatial.api import read_file, read_parquet, read_feather, list_layers
-from vibespatial.api.tools import sjoin, sjoin_nearest, overlay, clip
-from vibespatial.api._config import options
 
 __all__ = [
     "AdaptivePlan",

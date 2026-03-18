@@ -9,7 +9,6 @@ from typing import Any
 from vibespatial.event_log import append_event_record
 from vibespatial.runtime import ExecutionMode
 
-
 STRICT_NATIVE_ENV_VAR = "VIBESPATIAL_STRICT_NATIVE"
 
 

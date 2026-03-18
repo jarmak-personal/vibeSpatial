@@ -9,6 +9,7 @@ from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.owned_geometry import OwnedGeometryArray
+from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.predicate_support import (
     PointSequence,
     coerce_geometry_array,
@@ -16,9 +17,7 @@ from vibespatial.predicate_support import (
     extract_point_coordinates,
     resolve_predicate_context,
 )
-from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.runtime import ExecutionMode
-
 
 BoundsValue = tuple[float, float, float, float] | list[float] | np.ndarray
 BoundsSequence = Sequence[BoundsValue | None]

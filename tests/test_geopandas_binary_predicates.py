@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import pandas as pd
 import pytest
 from shapely.geometry import Point, box
 
+import vibespatial.api as geopandas
 from vibespatial import (
     clear_fallback_events,
     get_dispatch_events,

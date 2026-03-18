@@ -4,10 +4,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import vibespatial.api as geopandas
-
 from vibespatial.io_arrow import write_geoparquet
-from vibespatial.testing.synthetic import SyntheticSpec, generate_lines, generate_mixed_geometries, generate_points, generate_polygons
-
+from vibespatial.testing.synthetic import (
+    SyntheticSpec,
+    generate_lines,
+    generate_mixed_geometries,
+    generate_points,
+    generate_polygons,
+)
 
 _DEFAULT_FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".benchmark_fixtures"
 

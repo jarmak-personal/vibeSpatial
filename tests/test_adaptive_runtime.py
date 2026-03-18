@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from vibespatial import (
+    DEFAULT_CONSUMER_PROFILE,
     AdaptiveRuntime,
     CoordinateStats,
-    DEFAULT_CONSUMER_PROFILE,
     DeviceSnapshot,
     DispatchDecision,
     ExecutionMode,
@@ -16,9 +16,18 @@ from vibespatial import (
     capture_device_snapshot,
     plan_adaptive_execution,
 )
-from vibespatial.adaptive_runtime import ChunkedPlanIterator, _detect_device_profile, get_cached_snapshot, invalidate_snapshot_cache
+from vibespatial.adaptive_runtime import (
+    ChunkedPlanIterator,
+    _detect_device_profile,
+    get_cached_snapshot,
+    invalidate_snapshot_cache,
+)
 from vibespatial.crossover import default_crossover_policy
-from vibespatial.kernel_registry import KernelVariantSpec, get_kernel_variants, register_kernel_variant
+from vibespatial.kernel_registry import (
+    KernelVariantSpec,
+    get_kernel_variants,
+    register_kernel_variant,
+)
 
 
 def test_capture_device_snapshot_without_probe_uses_static_heuristics() -> None:

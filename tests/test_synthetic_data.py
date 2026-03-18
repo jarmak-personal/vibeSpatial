@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 
-import vibespatial.api as geopandas
 import pytest
 
+import vibespatial.api as geopandas
 from vibespatial.testing import (
     SCALE_PRESETS,
     SyntheticSpec,

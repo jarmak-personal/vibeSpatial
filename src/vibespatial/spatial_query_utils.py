@@ -8,11 +8,16 @@ from shapely.geometry.base import BaseGeometry
 
 from vibespatial.binary_predicates import evaluate_binary_predicate
 from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries, FAMILY_TAGS, TAG_FAMILIES
+from vibespatial.owned_geometry import (
+    FAMILY_TAGS,
+    TAG_FAMILIES,
+    OwnedGeometryArray,
+    from_shapely_geometries,
+)
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.spatial_query_types import (
-    SUPPORTED_GEOM_TYPES,
     _POLYGON_DE9IM_PREDICATES,
+    SUPPORTED_GEOM_TYPES,
 )
 
 
@@ -405,7 +410,10 @@ def _filter_predicate_pairs_owned(
                     d_sub_left = _dc.d_left[d_full_idx]
                     d_sub_right = _dc.d_right[d_full_idx]
 
-                from vibespatial.polygon_predicates import compute_polygon_de9im_gpu, evaluate_predicate_from_de9im
+                from vibespatial.polygon_predicates import (
+                    compute_polygon_de9im_gpu,
+                    evaluate_predicate_from_de9im,
+                )
                 sub_result = compute_polygon_de9im_gpu(
                     query_owned, tree_owned,
                     de9im_left[sub_idx], de9im_right[sub_idx],

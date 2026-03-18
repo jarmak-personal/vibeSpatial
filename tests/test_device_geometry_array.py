@@ -27,7 +27,6 @@ from vibespatial.owned_geometry import (
 from vibespatial.residency import Residency
 from vibespatial.runtime import has_gpu_runtime
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -240,7 +239,7 @@ class TestTakeCopyConcatNoRoundtrip:
         # Clear any construction diagnostics
         dga._owned.diagnostics.clear()
 
-        _result = dga.take(np.array([0, 2]))  # noqa: F841 — verify no side-effect
+        _result = dga.take(np.array([0, 2]))
 
         # No MATERIALIZATION event should have been recorded on the source
         mat_events = [
@@ -272,7 +271,7 @@ class TestTakeCopyConcatNoRoundtrip:
         dga = DeviceGeometryArray._from_owned(owned)
         dga._owned.diagnostics.clear()
 
-        _copied = dga.copy()  # noqa: F841 — verify no side-effect
+        _copied = dga.copy()
 
         mat_events = [
             e for e in dga._owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION
@@ -338,7 +337,7 @@ class TestTakeCopyConcatNoRoundtrip:
         dga1._owned.diagnostics.clear()
         dga2._owned.diagnostics.clear()
 
-        _result = DeviceGeometryArray._concat_same_type([dga1, dga2])  # noqa: F841
+        _result = DeviceGeometryArray._concat_same_type([dga1, dga2])
 
         for dga in [dga1, dga2]:
             mat_events = [
@@ -817,7 +816,7 @@ class TestBinaryPredicatesOwned:
             assert len(result) == len(left_dga), f"{pred} length mismatch"
 
     def test_predicate_dispatch_event_recorded(self, left_dga, right_dga):
-        from vibespatial.dispatch import get_dispatch_events, clear_dispatch_events
+        from vibespatial.dispatch import clear_dispatch_events, get_dispatch_events
         clear_dispatch_events()
         _ = left_dga.intersects(right_dga)
         events = get_dispatch_events(clear=True)
@@ -868,7 +867,7 @@ class TestClipByRectOwned:
                 assert shp.equals(r, e)
 
     def test_clip_dispatch_event_recorded(self):
-        from vibespatial.dispatch import get_dispatch_events, clear_dispatch_events
+        from vibespatial.dispatch import clear_dispatch_events, get_dispatch_events
         clear_dispatch_events()
         dga = DeviceGeometryArray._from_sequence([Point(1, 1), Point(5, 5)])
         _ = dga.clip_by_rect(0, 0, 3, 3)

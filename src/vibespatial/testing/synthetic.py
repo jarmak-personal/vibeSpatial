@@ -6,7 +6,6 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-import vibespatial.api as geopandas
 import numpy as np
 from shapely import affinity
 from shapely.geometry import (
@@ -18,6 +17,8 @@ from shapely.geometry import (
     Polygon,
     mapping,
 )
+
+import vibespatial.api as geopandas
 
 SCALE_PRESETS = {
     "1K": 1_000,

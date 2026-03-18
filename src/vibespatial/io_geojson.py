@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.util import find_spec
 from pathlib import Path
 from time import perf_counter
-from typing import Callable
 
 import numpy as np
 

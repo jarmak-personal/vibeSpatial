@@ -156,6 +156,7 @@ _VALIDITY_KERNEL_SOURCE_FP64 = _format_validity_kernel_source("double")
 _VALIDITY_KERNEL_SOURCE_FP32 = _format_validity_kernel_source("float")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("make-valid-detect-fp64", _VALIDITY_KERNEL_SOURCE_FP64, _VALIDITY_KERNEL_NAMES),
     ("make-valid-detect-fp32", _VALIDITY_KERNEL_SOURCE_FP32, _VALIDITY_KERNEL_NAMES),
@@ -205,7 +206,8 @@ def _gpu_polygon_validity_mask(owned) -> np.ndarray | None:
 
     # ADR-0002: select compute precision based on device profile
     from vibespatial.precision import KernelClass, PrecisionMode, select_precision_plan
-    from vibespatial.runtime import ExecutionMode as _EM, RuntimeSelection
+    from vibespatial.runtime import ExecutionMode as _EM
+    from vibespatial.runtime import RuntimeSelection
     runtime_sel = RuntimeSelection(
         requested=_EM.GPU, selected=_EM.GPU,
         reason="make_valid GPU ring-structure validity check",

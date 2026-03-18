@@ -487,7 +487,7 @@ def count_scatter_total_with_transfer(
     runtime: CudaDriverRuntime,
     device_counts: DeviceArray,
     device_offsets: DeviceArray,
-) -> tuple[int, "CudaStream", np.ndarray]:
+) -> tuple[int, CudaStream, np.ndarray]:
     """Get total and start async full-counts transfer on a background stream.
 
     Returns ``(total_verts, xfer_stream, pinned_host_counts)``.  The

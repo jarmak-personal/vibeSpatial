@@ -12,8 +12,8 @@ from .binary_refine import (
     touches_exact,
     within_exact,
 )
-from .point_in_polygon import point_in_polygon
 from .point_bounds import point_bounds
+from .point_in_polygon import point_in_polygon
 from .point_within_bounds import point_within_bounds
 
 __all__ = [

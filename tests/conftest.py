@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
 import pytest
 
+import vibespatial.api as geopandas
 from tests._runtime_harness import cuda_runtime_available, resolve_dispatch_modes
 from vibespatial import ExecutionMode
 from vibespatial.testing import (

@@ -18,17 +18,16 @@ import shapely
 from vibespatial.adaptive_runtime import plan_dispatch_selection
 from vibespatial.cuda_runtime import get_cuda_runtime
 from vibespatial.dispatch import record_dispatch_event
-from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.geometry_buffers import GeometryFamily
+from vibespatial.kernel_registry import register_kernel_variant
 from vibespatial.owned_geometry import (
-    OwnedGeometryArray,
     TAG_FAMILIES,
     DiagnosticKind,
+    OwnedGeometryArray,
 )
 from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.runtime import ExecutionMode
-
 
 # ---------------------------------------------------------------------------
 # Point-distance family support (mirrors point_distance._FAMILY_KERNEL_MAP)

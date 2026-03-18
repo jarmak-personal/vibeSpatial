@@ -19,13 +19,20 @@ if not os.environ.get("_VIBESPATIAL_GEOPANDAS_COMPAT"):
 from vibespatial import (
     ExecutionMode,
     RuntimeSelection,
-    clear_dispatch_events as _clear_dispatch_events,
-    clear_fallback_events as _clear_fallback_events,
-    get_dispatch_events as _get_dispatch_events,
-    get_fallback_events as _get_fallback_events,
     select_runtime,
 )
-
+from vibespatial import (
+    clear_dispatch_events as _clear_dispatch_events,
+)
+from vibespatial import (
+    clear_fallback_events as _clear_fallback_events,
+)
+from vibespatial import (
+    get_dispatch_events as _get_dispatch_events,
+)
+from vibespatial import (
+    get_fallback_events as _get_fallback_events,
+)
 
 _API_ROOT = "vibespatial.api"
 _API_PACKAGE = importlib.import_module(_API_ROOT)

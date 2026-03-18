@@ -6,13 +6,13 @@ import shapely
 from shapely.geometry import Polygon
 
 from vibespatial.owned_geometry import from_shapely_geometries
-from vibespatial.residency import Residency
 from vibespatial.polygon_constructive import (
-    polygon_buffer_owned_array,
-    polygon_centroids_owned,
     _polygon_centroids_cpu,
     _polygon_centroids_gpu,
+    polygon_buffer_owned_array,
+    polygon_centroids_owned,
 )
+from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
 

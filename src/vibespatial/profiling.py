@@ -3,12 +3,11 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from importlib import import_module
-from time import perf_counter
 from threading import Event, Thread
+from time import perf_counter
 from typing import Any
 
 from vibespatial.runtime import ExecutionMode
-
 
 _NVTX_COLORS = {
     "setup": "blue",
@@ -188,7 +187,7 @@ class _StageGpuTelemetryCollector:
 class StageMeasurement:
     rows_out: int | None = None
     detail: str = ""
-    device: "ExecutionMode | str | None" = None
+    device: ExecutionMode | str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

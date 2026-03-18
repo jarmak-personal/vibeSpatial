@@ -4,23 +4,23 @@ from typing import Any
 
 import numpy as np
 
-from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema
-from vibespatial.owned_geometry import (
-    DeviceFamilyGeometryBuffer,
-    DiagnosticKind,
-    FAMILY_TAGS,
-    OwnedGeometryDeviceState,
-    FamilyGeometryBuffer,
-    OwnedGeometryArray,
-)
-from vibespatial.residency import Residency
-from vibespatial.cuda_runtime import get_cuda_runtime
 from vibespatial.cccl_precompile import request_warmup
 from vibespatial.cccl_primitives import exclusive_sum
+from vibespatial.cuda_runtime import get_cuda_runtime
+from vibespatial.geometry_buffers import GeometryFamily, get_geometry_buffer_schema
 from vibespatial.io_wkb import (
     WKB_TYPE_IDS,
     DeviceWKBHeaderScan,
 )
+from vibespatial.owned_geometry import (
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    DiagnosticKind,
+    FamilyGeometryBuffer,
+    OwnedGeometryArray,
+    OwnedGeometryDeviceState,
+)
+from vibespatial.residency import Residency
 
 # CCCL warmup (ADR-0034)
 request_warmup(["exclusive_scan_i32"])
@@ -439,7 +439,7 @@ def _build_device_wkb_polygon_family(column, row_indexes):
     # We need to scan cumulatively within each polygon record.
     ring_indexes = cp.arange(total_rings, dtype=cp.int32)
     ring_row_ids = cp.searchsorted(geometry_offsets_device[1:], ring_indexes, side="right")
-    _local_ring_idx = ring_indexes - geometry_offsets_device[ring_row_ids]  # noqa: F841
+    _local_ring_idx = ring_indexes - geometry_offsets_device[ring_row_ids]
 
     # First ring of each polygon starts at byte offset starts[row] + 9
     # (5 header + 4 ring_count). Subsequent rings start after the

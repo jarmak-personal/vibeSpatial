@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from vibespatial.adaptive_runtime import plan_dispatch_selection
 from vibespatial.cccl_primitives import exclusive_sum
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_F64,
@@ -19,11 +20,9 @@ from vibespatial.owned_geometry import (
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
 )
-from vibespatial.residency import Residency, TransferTrigger
-from vibespatial.adaptive_runtime import plan_dispatch_selection
 from vibespatial.precision import KernelClass
+from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.runtime import ExecutionMode
-
 
 _LINESTRING_BUFFER_KERNEL_SOURCE = r"""
 #define PI 3.14159265358979323846
@@ -591,11 +590,13 @@ LINESTRING_BUFFER_GPU_THRESHOLD = 5_000
 _LINESTRING_BUFFER_KERNEL_NAMES = ("linestring_buffer_count", "linestring_buffer_scatter")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES),
 ])
 
 from vibespatial.cccl_precompile import request_warmup  # noqa: E402
+
 request_warmup(["exclusive_scan_i32"])
 
 

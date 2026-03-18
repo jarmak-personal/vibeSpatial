@@ -10,17 +10,20 @@ uv sync
 
 ## Code style
 
-- Python 3.12+, enforced by `ruff`
+- Python 3.12+, enforced by `ruff` (E, F, W, I, UP, B, PERF, RUF rules)
 - Line length: 100 characters
-- Run `uv run ruff check src/` before committing
+- Import sorting: `isort` via ruff, first-party = `vibespatial`, `geopandas`
 
 ## Pre-commit hooks
 
-Install the git hooks for auto-refreshed doc headers:
+Install the git hooks to enforce code quality on every commit:
 
 ```bash
 uv run python scripts/install_githooks.py
 ```
+
+See [Pre-commit System](precommit.md) for the full enforcement architecture,
+rule reference, and troubleshooting.
 
 ## Verification
 
@@ -35,6 +38,13 @@ uv run pytest tests/test_pipeline_benchmarks.py -q
 
 # Doc changes
 uv run python scripts/check_docs.py --check
+
+# Full pre-commit suite (what the hook runs)
+uv run ruff check
+uv run python scripts/check_architecture_lints.py --all
+uv run python scripts/check_zero_copy.py --all
+uv run python scripts/check_perf_patterns.py --all
+uv run python scripts/check_maintainability.py --all
 ```
 
 ## Release process

@@ -7,7 +7,6 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-
 DECISIONS_DIR = Path("docs/decisions")
 INDEX_PATH = DECISIONS_DIR / "index.md"
 INDEX_MARKER = "<!-- DECISION_ROWS -->"

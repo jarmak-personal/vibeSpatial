@@ -4,12 +4,16 @@ import numpy as np
 import pytest
 from shapely.geometry import Point, box
 
-import vibespatial.spatial_query as spatial_query_module
 import vibespatial.spatial_nearest as spatial_nearest_module
+import vibespatial.spatial_query as spatial_query_module
 import vibespatial.spatial_query_utils as spatial_query_utils_module
 from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
-from vibespatial.spatial_query import build_owned_spatial_index, nearest_spatial_index, query_spatial_index
+from vibespatial.spatial_query import (
+    build_owned_spatial_index,
+    nearest_spatial_index,
+    query_spatial_index,
+)
 
 
 def test_query_spatial_index_matches_expected_pairs_for_intersects() -> None:
@@ -118,8 +122,8 @@ class TestDwithinGPU:
         assert result.shape[1] == 0
 
     def test_dwithin_multipoint_point(self):
-        from shapely.geometry import MultiPoint
         import shapely as shp
+        from shapely.geometry import MultiPoint
 
         tree = np.asarray([Point(0, 0), Point(5, 0), Point(20, 0)], dtype=object)
         query = np.asarray([MultiPoint([(1, 0), (10, 0)])], dtype=object)
@@ -730,9 +734,10 @@ class TestSjoinDispatchVisibility:
     def test_sjoin_dispatch_event_reports_owned_query_execution(self) -> None:
         """sjoin dispatch event should report the implementation from the
         owned spatial query engine, not hardcoded CPU."""
+        from shapely.geometry import Point
+
         from vibespatial.api.geodataframe import GeoDataFrame
         from vibespatial.dispatch import get_dispatch_events
-        from shapely.geometry import Point
 
         left = GeoDataFrame(
             {"a": [1, 2, 3]},
@@ -760,9 +765,10 @@ class TestSjoinDispatchVisibility:
     def test_sjoin_nearest_dispatch_event_threads_execution_mode(self) -> None:
         """sjoin_nearest dispatch event should thread the execution mode from
         sindex.nearest instead of hardcoding CPU."""
+        from shapely.geometry import Point
+
         from vibespatial.api.geodataframe import GeoDataFrame
         from vibespatial.dispatch import get_dispatch_events
-        from shapely.geometry import Point
 
         left = GeoDataFrame(
             {"a": [1, 2]},
@@ -790,10 +796,11 @@ class TestSjoinDispatchVisibility:
     def test_geom_predicate_query_returns_execution_metadata(self) -> None:
         """_geom_predicate_query should return execution metadata as the third
         element of its return tuple."""
+        from shapely.geometry import Point
+
         from vibespatial.api.geodataframe import GeoDataFrame
         from vibespatial.api.tools.sjoin import _geom_predicate_query
         from vibespatial.spatial_query_types import SpatialQueryExecution
-        from shapely.geometry import Point
 
         left = GeoDataFrame(
             {"a": [1]},

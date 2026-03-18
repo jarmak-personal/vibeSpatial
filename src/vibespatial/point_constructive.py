@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from vibespatial.cccl_primitives import compact_indices
 from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import compact_indices
 
 request_warmup(["select_i32", "select_i64"])
+from vibespatial.adaptive_runtime import plan_dispatch_selection  # noqa: E402
 from vibespatial.cuda_runtime import (  # noqa: E402
-    DeviceArray,
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    DeviceArray,
     compile_kernel_group,
     get_cuda_runtime,
 )
@@ -22,11 +23,9 @@ from vibespatial.owned_geometry import (  # noqa: E402
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
 )
-from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
-from vibespatial.adaptive_runtime import plan_dispatch_selection  # noqa: E402
 from vibespatial.precision import KernelClass  # noqa: E402
+from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime  # noqa: E402
-
 
 _POINT_CONSTRUCTIVE_KERNEL_SOURCE = """
 extern "C" __global__ void point_rect_mask(
@@ -157,6 +156,7 @@ POINT_BUFFER_GPU_THRESHOLD = 10_000
 _POINT_CONSTRUCTIVE_KERNEL_NAMES = ("point_rect_mask", "point_buffer_quad1", "point_buffer_round", "point_subset_gather")
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES),
 ])

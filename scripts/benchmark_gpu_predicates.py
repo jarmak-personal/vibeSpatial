@@ -8,7 +8,12 @@ import numpy as np
 import shapely
 from shapely.affinity import translate
 
-from vibespatial import ExecutionMode, NullBehavior, evaluate_binary_predicate, from_shapely_geometries
+from vibespatial import (
+    ExecutionMode,
+    NullBehavior,
+    evaluate_binary_predicate,
+    from_shapely_geometries,
+)
 from vibespatial.testing import SyntheticSpec, generate_points, generate_polygons
 
 

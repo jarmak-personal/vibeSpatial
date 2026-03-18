@@ -1,22 +1,25 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from importlib.util import find_spec
-from statistics import median
 from pathlib import Path
+from statistics import median
 from tempfile import TemporaryDirectory
-import json
 
-import vibespatial.api as geopandas
 import numpy as np
 import pandas as pd
 import shapely
 from shapely.geometry import box
 
+import vibespatial.api as geopandas
+from vibespatial.clip_rect import clip_by_rect_owned
 from vibespatial.device_geometry_array import DeviceGeometryArray
 from vibespatial.dispatch import clear_dispatch_events, get_dispatch_events
 from vibespatial.dissolve_pipeline import evaluate_geopandas_dissolve, union_all_owned
 from vibespatial.fallbacks import clear_fallback_events, get_fallback_events
+from vibespatial.geometry_buffers import GeometryFamily
+from vibespatial.indexing import build_flat_spatial_index
 from vibespatial.io_arrow import (
     geoseries_from_owned,
     has_pylibcudf_support,
@@ -25,29 +28,37 @@ from vibespatial.io_arrow import (
     write_geoparquet,
 )
 from vibespatial.io_geojson import read_geojson_owned
-from vibespatial.kernels.predicates.point_in_polygon import get_last_gpu_substage_timings, point_in_polygon
+from vibespatial.kernels.predicates.point_in_polygon import (
+    get_last_gpu_substage_timings,
+    point_in_polygon,
+)
+from vibespatial.linestring_constructive import linestring_buffer_owned_array
+from vibespatial.make_valid_pipeline import make_valid_owned
+from vibespatial.overlay_gpu import (
+    overlay_difference_owned,
+    overlay_intersection_owned,
+    spatial_overlay_owned,
+)
 from vibespatial.owned_geometry import DiagnosticKind, OwnedGeometryArray, from_shapely_geometries
 from vibespatial.point_constructive import (
     POINT_BUFFER_GPU_THRESHOLD,
     POINT_CLIP_GPU_THRESHOLD,
     clip_points_rect_owned,
     point_buffer_owned_array,
+)
+from vibespatial.point_constructive import (
     point_owned_from_xy as _point_owned_from_xy,
 )
-from vibespatial.profiling import ProfileTrace, StageProfiler
-from vibespatial.runtime import ExecutionMode, has_gpu_runtime
-from vibespatial.indexing import build_flat_spatial_index
-from vibespatial.runtime import RuntimeSelection
-from vibespatial.spatial_query import query_spatial_index
-from vibespatial.testing.synthetic import SyntheticSpec, generate_lines, generate_points, generate_polygons
-
-from vibespatial.clip_rect import clip_by_rect_owned
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.linestring_constructive import linestring_buffer_owned_array
-from vibespatial.make_valid_pipeline import make_valid_owned
-from vibespatial.overlay_gpu import overlay_difference_owned, overlay_intersection_owned, spatial_overlay_owned
 from vibespatial.polygon_constructive import polygon_centroids_owned
-
+from vibespatial.profiling import ProfileTrace, StageProfiler
+from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.spatial_query import query_spatial_index
+from vibespatial.testing.synthetic import (
+    SyntheticSpec,
+    generate_lines,
+    generate_points,
+    generate_polygons,
+)
 
 PIPELINE_DEFINITIONS = (
     "join-heavy",
@@ -591,7 +602,7 @@ def _profile_join_pipeline(
             else "cpu"
         ),
         planner_selected_runtime=planner_runtime.value,
-        output_rows=trace.metadata["dispatch_events"] and int(len(dissolved)) or int(len(dissolved)),
+        output_rows=(trace.metadata["dispatch_events"] and int(len(dissolved))) or int(len(dissolved)),
         transfer_count=audit.transfer_count,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),

@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 
-from vibespatial.fixture_profiles import ensure_named_fixture, profile_fixture_nearest, profile_fixture_query
+from vibespatial.fixture_profiles import (
+    ensure_named_fixture,
+    profile_fixture_nearest,
+    profile_fixture_query,
+)
 
 
 def main(argv: list[str] | None = None) -> int:

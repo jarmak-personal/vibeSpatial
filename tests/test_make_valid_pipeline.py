@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-import vibespatial.api as geopandas
-from vibespatial.api import GeoSeries
-from vibespatial.api.testing import assert_geoseries_equal
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon
 
-from vibespatial import benchmark_make_valid, fusion_plan_for_make_valid, make_valid_owned, plan_make_valid_pipeline
+import vibespatial.api as geopandas
+from vibespatial import (
+    benchmark_make_valid,
+    fusion_plan_for_make_valid,
+    make_valid_owned,
+    plan_make_valid_pipeline,
+)
+from vibespatial.api import GeoSeries
+from vibespatial.api.testing import assert_geoseries_equal
 from vibespatial.fusion import IntermediateDisposition
 
 

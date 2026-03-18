@@ -7,6 +7,7 @@ import numpy as np
 import shapely
 
 from vibespatial.adaptive_runtime import plan_kernel_dispatch
+from vibespatial.cccl_precompile import request_warmup
 from vibespatial.cccl_primitives import (
     compact_indices,
     exclusive_sum,
@@ -15,7 +16,6 @@ from vibespatial.cccl_primitives import (
     sort_pairs,
     upper_bound,
 )
-from vibespatial.cccl_precompile import request_warmup
 from vibespatial.crossover import DispatchDecision
 
 request_warmup([
@@ -37,10 +37,10 @@ from vibespatial.geometry_buffers import GeometryFamily  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds  # noqa: E402
 from vibespatial.kernels.core.spatial_query_kernels import _spatial_query_kernels  # noqa: E402
 from vibespatial.owned_geometry import (  # noqa: E402
-    FamilyGeometryBuffer,
-    OwnedGeometryArray,
     FAMILY_TAGS,
     TAG_FAMILIES,
+    FamilyGeometryBuffer,
+    OwnedGeometryArray,
 )
 from vibespatial.precision import KernelClass  # noqa: E402
 from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
@@ -59,7 +59,6 @@ from vibespatial.spatial_query_utils import (  # noqa: E402
     _gpu_bounds_dispatch_mode,
     _to_owned,
 )
-
 
 # ---------------------------------------------------------------------------
 # GPU nearest-neighbour refinement (Tier 1 NVRTC + Tier 3a CCCL)

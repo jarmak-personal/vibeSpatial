@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from vibespatial import (
-    CompensationMode,
-    CoordinateStats,
     DEFAULT_CONSUMER_PROFILE,
     DEFAULT_DATACENTER_PROFILE,
+    CompensationMode,
+    CoordinateStats,
     ExecutionMode,
     KernelClass,
     PrecisionMode,

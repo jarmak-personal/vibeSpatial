@@ -6,7 +6,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-
 HEADER_START = "<!-- DOC_HEADER:START"
 HEADER_END = "DOC_HEADER:END -->"
 REQUIRED_METADATA_FIELDS = ("scope", "readIf", "stopIf", "sourceOfTruth", "maxBodyLines")

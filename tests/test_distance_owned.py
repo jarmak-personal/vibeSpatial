@@ -336,6 +336,7 @@ class TestDGAIntegration:
 class TestGeoSeriesIntegration:
     def test_geoseries_distance(self):
         import pandas as pd
+
         from vibespatial.api.geoseries import GeoSeries
         left = GeoSeries([Point(0, 0), Point(3, 4)])
         right = GeoSeries([Point(1, 0), Point(0, 0)])
@@ -345,6 +346,7 @@ class TestGeoSeriesIntegration:
 
     def test_geoseries_dwithin(self):
         import pandas as pd
+
         from vibespatial.api.geoseries import GeoSeries
         left = GeoSeries([Point(0, 0), Point(0, 0)])
         right = GeoSeries([Point(1, 0), Point(5, 0)])
@@ -354,6 +356,7 @@ class TestGeoSeriesIntegration:
 
     def test_geoseries_distance_single_geom(self):
         import pandas as pd
+
         from vibespatial.api.geoseries import GeoSeries
         gs = GeoSeries([Point(0, 0), Point(3, 4)])
         result = gs.distance(Point(0, 0), align=False)

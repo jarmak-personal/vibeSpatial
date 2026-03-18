@@ -4,8 +4,8 @@ import pytest
 from shapely.geometry import Point, Polygon, box
 
 from vibespatial import ExecutionMode
-from vibespatial.testing import compare_with_shapely
 from vibespatial.kernels.predicates.point_bounds import point_bounds
+from vibespatial.testing import compare_with_shapely
 
 
 def point_bounds_reference(points, polygons):

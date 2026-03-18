@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from vibespatial.cuda_runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -9,7 +8,6 @@ from vibespatial.cuda_runtime import (
 )
 from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray
-
 
 # ---------------------------------------------------------------------------
 # Family ordering for canonical-pair normalisation (lower value = "left").
@@ -531,6 +529,7 @@ _SEGMENT_DISTANCE_KERNEL_NAMES = (
 )
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("segment-distance", _SEGMENT_DISTANCE_KERNEL_SOURCE, _SEGMENT_DISTANCE_KERNEL_NAMES),
 ])

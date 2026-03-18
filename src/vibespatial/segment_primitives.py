@@ -7,23 +7,27 @@ from time import perf_counter
 
 import numpy as np
 
-from vibespatial.cccl_primitives import compact_indices
 from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cccl_primitives import compact_indices
 
 request_warmup(["select_i32", "select_i64"])
+from vibespatial.adaptive_runtime import plan_dispatch_selection  # noqa: E402
 from vibespatial.cuda_runtime import (  # noqa: E402
-    DeviceArray,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    DeviceArray,
     compile_kernel_group,
     get_cuda_runtime,
 )
 from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
-from vibespatial.adaptive_runtime import plan_dispatch_selection  # noqa: E402
-from vibespatial.precision import KernelClass, PrecisionMode, PrecisionPlan, select_precision_plan  # noqa: E402
+from vibespatial.precision import (  # noqa: E402
+    KernelClass,
+    PrecisionMode,
+    PrecisionPlan,
+    select_precision_plan,
+)
 from vibespatial.robustness import RobustnessPlan, select_robustness_plan  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
-
 
 _FLOAT_EPSILON = np.finfo(np.float64).eps
 _ORIENTATION_ERRBOUND = (3.0 + 16.0 * _FLOAT_EPSILON) * _FLOAT_EPSILON
@@ -253,6 +257,7 @@ class SegmentIntersectionCandidates:
 _SEGMENT_INTERSECTION_KERNEL_NAMES = ("classify_segment_pairs",)
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
 request_nvrtc_warmup([
     ("segment-intersections", _SEGMENT_INTERSECTION_KERNEL_SOURCE, _SEGMENT_INTERSECTION_KERNEL_NAMES),
 ])

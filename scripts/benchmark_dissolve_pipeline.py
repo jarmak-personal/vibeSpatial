@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import argparse
 
-import geopandas
 import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 
+import geopandas
 from vibespatial import benchmark_dissolve_pipeline
 
 

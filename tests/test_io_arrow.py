@@ -3,11 +3,8 @@ from __future__ import annotations
 import sys
 import types
 
-import vibespatial.api as geopandas
 import numpy as np
 import pandas as pd
-import vibespatial.io_arrow as io_arrow
-import vibespatial.io_geoparquet as io_geoparquet
 from shapely.geometry import (
     LineString,
     MultiLineString,
@@ -17,31 +14,34 @@ from shapely.geometry import (
     box,
 )
 
+import vibespatial.api as geopandas
+import vibespatial.io_arrow as io_arrow
+import vibespatial.io_geoparquet as io_geoparquet
 from vibespatial import (
     BufferSharingMode,
     ExecutionMode,
     benchmark_geoarrow_bridge,
+    benchmark_geoparquet_planner,
+    benchmark_geoparquet_scan_engine,
     benchmark_native_geometry_codec,
     benchmark_wkb_bridge,
-    benchmark_geoparquet_scan_engine,
-    benchmark_geoparquet_planner,
     build_geoparquet_metadata_summary,
     decode_owned_geoarrow,
     decode_wkb_owned,
-    encode_owned_geoarrow_array,
     encode_owned_geoarrow,
+    encode_owned_geoarrow_array,
     encode_wkb_owned,
     has_gpu_runtime,
     has_pylibcudf_support,
+    plan_geoparquet_scan,
     plan_wkb_partition,
     read_geoparquet,
     read_geoparquet_owned,
-    plan_geoparquet_scan,
     select_row_groups,
     write_geoparquet,
 )
 from vibespatial.device_geometry_array import DeviceGeometryArray
-from vibespatial.owned_geometry import from_shapely_geometries, DiagnosticKind
+from vibespatial.owned_geometry import DiagnosticKind, from_shapely_geometries
 from vibespatial.point_constructive import clip_points_rect_owned
 from vibespatial.residency import Residency, TransferTrigger
 
@@ -459,7 +459,6 @@ def test_read_geoparquet_owned_uses_chunked_backend_and_concatenates(monkeypatch
 
 
 def test_read_geoparquet_gpu_path_returns_dga_without_geometry_to_arrow(monkeypatch) -> None:
-    import pandas as pd
     import pyarrow as pa
     import pyarrow.parquet as pq
 

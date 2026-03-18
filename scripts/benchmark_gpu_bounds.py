@@ -7,7 +7,13 @@ from time import perf_counter
 import numpy as np
 from shapely.geometry import Point
 
-from vibespatial import ExecutionMode, Residency, compute_geometry_bounds, from_shapely_geometries, has_gpu_runtime
+from vibespatial import (
+    ExecutionMode,
+    Residency,
+    compute_geometry_bounds,
+    from_shapely_geometries,
+    has_gpu_runtime,
+)
 
 
 def _sample_points(rows: int) -> list[Point]:

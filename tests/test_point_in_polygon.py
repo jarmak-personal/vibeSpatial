@@ -8,8 +8,8 @@ from vibespatial import (
     DeviceSnapshot,
     ExecutionMode,
     MonitoringBackend,
-    has_gpu_runtime,
     from_shapely_geometries,
+    has_gpu_runtime,
 )
 from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
 from vibespatial.testing import compare_with_shapely, point_in_polygon_reference

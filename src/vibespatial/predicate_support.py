@@ -12,7 +12,6 @@ from vibespatial.precision import KernelClass, PrecisionMode, PrecisionPlan, sel
 from vibespatial.robustness import RobustnessPlan, select_robustness_plan
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 
-
 PointSequence = Sequence[object | None] | OwnedGeometryArray
 
 
