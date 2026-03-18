@@ -22,6 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Compute next version
         id: version
@@ -80,6 +81,21 @@ jobs:
           git tag "v$NEXT"
           git push origin main --tags
 
+      - name: Build patch notes from commit subjects
+        id: notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+          # First line of each commit, as a markdown bullet list
+          NOTES=$(git log --pretty=format:'- %s' "$RANGE" | grep -v '^- Bump version to')
+          echo "notes<<NOTES_EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "NOTES_EOF" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -87,5 +103,5 @@ jobs:
         run: |
           gh release create "v$NEXT" \
             --title "v$NEXT" \
-            --generate-notes \
+            --notes "${{ steps.notes.outputs.notes }}" \
             --latest
