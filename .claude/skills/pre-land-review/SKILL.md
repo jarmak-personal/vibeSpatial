@@ -61,8 +61,8 @@ Collect this once — you will inject it into sub-agent prompts:
 
 Based on the categories identified, launch the applicable sub-agents **in
 parallel** using the Agent tool. Each sub-agent gets the diff and its domain-
-specific review instructions. Use `model: "sonnet"` for sub-agents to keep
-them fast.
+specific review instructions. Use `model: "opus"` for sub-agents — GPU code
+is complex and requires deep reasoning.
 
 **IMPORTANT**: Always launch all applicable sub-agents in a SINGLE message
 with multiple Agent tool calls so they run in parallel.
