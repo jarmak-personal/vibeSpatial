@@ -4,6 +4,7 @@ from typing import Any
 
 import numpy as np
 
+from vibespatial.geometry_buffers import GeometryFamily
 from vibespatial.indexing import build_flat_spatial_index, generate_bounds_pairs
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.owned_geometry import OwnedGeometryArray
@@ -16,6 +17,7 @@ from vibespatial.spatial_query_box import (  # noqa: F401
     _coords_form_axis_aligned_box,
     _extract_box_query_bounds,
     _extract_box_query_bounds_from_owned,
+    _extract_box_query_bounds_shapely,
     _extract_owned_polygon_box_bounds,
     _is_axis_aligned_box,
     _point_box_predicate_mode,
@@ -105,6 +107,65 @@ def query_spatial_index(
             return (formatted, execution) if return_metadata else formatted
         query_owned = None
 
+    # --- Phase A: Regular grid rect box path (Shapely input, no _to_owned) ---
+    # When the tree has a regular grid and queries are Shapely arrays, extract
+    # bounds directly from Shapely (vectorized, ~2ms) instead of converting to
+    # OwnedGeometryArray (~300ms).  This avoids the dominant bottleneck for
+    # Shapely-input spatial queries.
+    if (
+        query_values is not None
+        and query_owned is None
+        and getattr(flat_index, "regular_grid", None) is not None
+        and predicate in (None, "intersects")
+    ):
+        import shapely as _shapely
+
+        if predicate is None:
+            _rg_bounds = np.asarray(_shapely.bounds(query_values), dtype=np.float64)
+        else:
+            _rg_bounds = _extract_box_query_bounds_shapely(query_values)
+        regular_grid_box_pairs = _query_regular_grid_rect_box_index(
+            flat_index, _rg_bounds, predicate=predicate,
+        )
+        if regular_grid_box_pairs is not None:
+            if isinstance(regular_grid_box_pairs, _DeviceCandidates):
+                left_idx, right_idx = regular_grid_box_pairs.to_host()
+            else:
+                left_idx, right_idx = regular_grid_box_pairs
+            execution = SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.GPU,
+                implementation="owned_gpu_spatial_query",
+                reason="repo-owned regular-grid rectangle box query executed on GPU with exact range expansion",
+            )
+            if scalar:
+                indices = right_idx.astype(np.intp, copy=False)
+            else:
+                indices = np.vstack(
+                    (
+                        left_idx.astype(np.intp, copy=False),
+                        right_idx.astype(np.intp, copy=False),
+                    )
+                )
+            query_size = 1 if scalar else len(query_values)
+            formatted = _format_query_indices(
+                indices,
+                tree_size=tree_size,
+                query_size=query_size,
+                scalar=scalar,
+                sort=sort,
+                output_format=output_format,
+            )
+            return (formatted, execution) if return_metadata else formatted
+
+    # --- Phase B: Point-tree box fast path ---
+    # Only attempt the expensive per-element box detection when the tree
+    # contains points (the only case where this path can succeed).
+    _tree_is_point_only = (
+        GeometryFamily.POINT in tree_owned.families
+        and len(tree_owned.families) == 1
+    )
+
     # For predicate=None, build query_owned eagerly so we can use owned
     # bounds instead of shapely.bounds().  Other predicates defer _to_owned
     # to preserve the scalar box fast path (no owned conversion needed).
@@ -112,7 +173,7 @@ def query_spatial_index(
         query_owned = _to_owned(query_values)
 
     point_box_bounds = None
-    if query_values is not None:
+    if query_values is not None and _tree_is_point_only:
         if predicate is None and query_owned is not None:
             point_box_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
         else:
@@ -150,6 +211,7 @@ def query_spatial_index(
             )
             return (formatted, execution) if return_metadata else formatted
 
+    # --- Phase C: OwnedGeometryArray paths (conversion if needed) ---
     if query_values is not None and query_owned is None:
         query_owned = _to_owned(query_values)
 

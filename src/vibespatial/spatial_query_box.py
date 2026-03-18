@@ -335,6 +335,90 @@ def _extract_box_query_bounds(
     return bounds
 
 
+def _extract_box_query_bounds_shapely(query_values: np.ndarray) -> np.ndarray | None:
+    """Vectorized box detection from Shapely arrays — no OwnedGeometryArray needed.
+
+    Mirrors ``_extract_owned_polygon_box_bounds`` logic but operates directly
+    on Shapely geometry arrays using vectorized shapely functions.  Returns
+    (N, 4) bounds array if all non-empty geometries are axis-aligned boxes,
+    or None otherwise.
+    """
+    import shapely as _shapely
+
+    n = len(query_values)
+    if n == 0:
+        return np.full((0, 4), np.nan, dtype=np.float64)
+
+    missing = _shapely.is_missing(query_values)
+    empty = np.zeros(n, dtype=bool)
+    non_missing = ~missing
+    empty[non_missing] = _shapely.is_empty(query_values[non_missing])
+    valid = non_missing & ~empty
+
+    if not np.any(valid):
+        return np.full((n, 4), np.nan, dtype=np.float64)
+
+    valid_geoms = query_values[valid]
+
+    # All valid geometries must be Polygons (type_id == 3).
+    type_ids = _shapely.get_type_id(valid_geoms)
+    if not np.all(type_ids == 3):
+        return None
+
+    # No interior rings.
+    interior_counts = _shapely.get_num_interior_rings(valid_geoms)
+    if not np.all(interior_counts == 0):
+        return None
+
+    # Exactly 5 coordinates per polygon (closed box).
+    coord_counts = _shapely.get_num_coordinates(valid_geoms)
+    if not np.all(coord_counts == 5):
+        return None
+
+    n_valid = int(valid.sum())
+    coords = _shapely.get_coordinates(valid_geoms)
+    if coords.shape[0] != n_valid * 5:
+        return None
+    all_xy = coords.reshape(n_valid, 5, 2)
+    all_x = all_xy[:, :, 0]
+    all_y = all_xy[:, :, 1]
+
+    minx = all_x.min(axis=1)
+    maxx = all_x.max(axis=1)
+    miny = all_y.min(axis=1)
+    maxy = all_y.max(axis=1)
+
+    tol = 1e-9 * np.maximum(np.maximum(np.abs(maxx - minx), np.abs(maxy - miny)), 1.0)
+
+    # Closed ring check.
+    if not np.all(np.abs(all_x[:, 0] - all_x[:, -1]) <= tol):
+        return None
+    if not np.all(np.abs(all_y[:, 0] - all_y[:, -1]) <= tol):
+        return None
+
+    # All coords must be at min or max x/y.
+    tol_2d = tol[:, None]
+    x_at_min_or_max = (np.abs(all_x - minx[:, None]) <= tol_2d) | (np.abs(all_x - maxx[:, None]) <= tol_2d)
+    y_at_min_or_max = (np.abs(all_y - miny[:, None]) <= tol_2d) | (np.abs(all_y - maxy[:, None]) <= tol_2d)
+    if not np.all(x_at_min_or_max):
+        return None
+    if not np.all(y_at_min_or_max):
+        return None
+
+    # Each edge must be axis-aligned.
+    edge_same_x = np.abs(all_x[:, 1:] - all_x[:, :-1]) <= tol_2d
+    edge_same_y = np.abs(all_y[:, 1:] - all_y[:, :-1]) <= tol_2d
+    if not np.all(np.logical_xor(edge_same_x, edge_same_y)):
+        return None
+
+    bounds = np.full((n, 4), np.nan, dtype=np.float64)
+    bounds[valid, 0] = minx
+    bounds[valid, 1] = miny
+    bounds[valid, 2] = maxx
+    bounds[valid, 3] = maxy
+    return bounds
+
+
 def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.ndarray | None:
     if GeometryFamily.POLYGON not in query_owned.families or len(query_owned.families) != 1:
         return None
