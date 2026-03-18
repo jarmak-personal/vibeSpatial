@@ -92,6 +92,14 @@ _MP_TAG = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
 _LINE_TAGS = tuple(FAMILY_TAGS[family] for family in _LINE_FAMILIES)
 _REGION_TAGS = tuple(FAMILY_TAGS[family] for family in _REGION_FAMILIES)
 _ALL_SUPPORTED_TAGS = (_POINT_TAG, _MP_TAG) + _LINE_TAGS + _REGION_TAGS
+# Tags eligible for GPU DE-9IM refinement (all non-point geometry families).
+_DE9IM_TAGS = _LINE_TAGS + _REGION_TAGS
+# Predicates that can be evaluated from DE-9IM bitmasks.
+_DE9IM_PREDICATES = frozenset({
+    "intersects", "contains", "within", "touches",
+    "covers", "covered_by", "overlaps", "disjoint",
+    "contains_properly",
+})
 
 
 def supports_binary_predicate(name: str) -> bool:
@@ -333,6 +341,25 @@ def _candidate_pairs_supported(
             (left_is_point & np.isin(right_tags, _ALL_SUPPORTED_TAGS))
             | (right_is_point & np.isin(left_tags, _ALL_SUPPORTED_TAGS))
         )
+    )
+
+
+def _de9im_candidate_pairs_supported(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    candidate_rows: np.ndarray,
+    predicate: str,
+) -> bool:
+    """Check if non-point candidate pairs can use the GPU DE-9IM kernel."""
+    if candidate_rows.size == 0:
+        return True
+    if predicate not in _DE9IM_PREDICATES:
+        return False
+    left_tags = left.tags[candidate_rows]
+    right_tags = right.tags[candidate_rows]
+    return bool(
+        np.all(np.isin(left_tags, _DE9IM_TAGS))
+        and np.all(np.isin(right_tags, _DE9IM_TAGS))
     )
 
 
@@ -584,6 +611,189 @@ def _evaluate_gpu_point_candidates(
     return out
 
 
+def _evaluate_gpu_de9im_candidates(
+    predicate: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    candidate_rows: np.ndarray,
+) -> np.ndarray:
+    """Evaluate non-point candidate pairs via the GPU DE-9IM kernel.
+
+    Supports all combinations of {LINESTRING, MULTILINESTRING, POLYGON,
+    MULTIPOLYGON}.  Groups candidates by (left_family, right_family) tag
+    pair, dispatches compute_polygon_de9im_gpu per group, then evaluates
+    the predicate from the resulting DE-9IM bitmasks.
+    """
+    if candidate_rows.size == 0:
+        return np.empty(0, dtype=bool)
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} DE-9IM GPU execution for left geometry input",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"{predicate} DE-9IM GPU execution for right geometry input",
+    )
+
+    from vibespatial.polygon_predicates import (
+        compute_polygon_de9im_gpu,
+        evaluate_predicate_from_de9im,
+    )
+
+    left_tags = left.tags[candidate_rows]
+    right_tags = right.tags[candidate_rows]
+    de9im_masks = np.zeros(candidate_rows.size, dtype=np.uint16)
+
+    # Group by (left_family, right_family) and dispatch the correct kernel.
+    unique_tag_pairs = set(zip(left_tags.tolist(), right_tags.tolist()))
+    for lt, rt in unique_tag_pairs:
+        sub_mask = (left_tags == lt) & (right_tags == rt)
+        sub_idx = np.flatnonzero(sub_mask)
+        if sub_idx.size == 0:
+            continue
+        lf = TAG_FAMILIES.get(lt)
+        rf = TAG_FAMILIES.get(rt)
+        if lf is None or rf is None:
+            continue
+        sub_result = compute_polygon_de9im_gpu(
+            left, right,
+            candidate_rows[sub_idx], candidate_rows[sub_idx],
+            query_family=lf, tree_family=rf,
+        )
+        if sub_result is not None:
+            de9im_masks[sub_idx] = sub_result
+
+    return evaluate_predicate_from_de9im(de9im_masks, predicate)
+
+
+def _fused_gpu_binary_predicate(
+    predicate: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> np.ndarray | None:
+    """Fused device-resident pipeline: bounds + coarse filter + DE-9IM.
+
+    Keeps all N-sized intermediaries on device (bounds, validity, bbox
+    mask, candidate indices).  Only downloads the small candidate-sized
+    result at the end.  Returns None if the fused path is not applicable
+    (non-GPU, mixed point/non-point, unsupported predicate).
+    """
+    if predicate not in _DE9IM_PREDICATES:
+        return None
+    from vibespatial.runtime import has_gpu_runtime
+    if not has_gpu_runtime():
+        return None
+
+    # Ensure both arrays are on device with bounds computed.
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"fused GPU {predicate}: left geometry",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"fused GPU {predicate}: right geometry",
+    )
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+
+    # Compute bounds on device if not cached.
+    if left_state.row_bounds is None:
+        compute_geometry_bounds(left, dispatch_mode=ExecutionMode.GPU)
+        left_state = left._ensure_device_state()
+    if right_state.row_bounds is None:
+        compute_geometry_bounds(right, dispatch_mode=ExecutionMode.GPU)
+        right_state = right._ensure_device_state()
+
+    if left_state.row_bounds is None or right_state.row_bounds is None:
+        return None
+
+    import cupy as cp
+
+    n = left.row_count
+    # All N-sized work stays on device (Tier 2 — CuPy element-wise).
+    d_lb = cp.asarray(left_state.row_bounds).reshape(n, 4)
+    d_rb = cp.asarray(right_state.row_bounds).reshape(n, 4)
+    d_val_l = cp.asarray(left_state.validity)
+    d_val_r = cp.asarray(right_state.validity)
+
+    # Coarse bbox filter on device.
+    d_bbox_hit = (
+        (d_lb[:, 0] <= d_rb[:, 2])
+        & (d_lb[:, 2] >= d_rb[:, 0])
+        & (d_lb[:, 1] <= d_rb[:, 3])
+        & (d_lb[:, 3] >= d_rb[:, 1])
+    )
+    d_valid = d_val_l & d_val_r
+    d_cand_mask = d_bbox_hit & d_valid
+
+    # Extract candidate indices on device.
+    d_cand_rows = cp.flatnonzero(d_cand_mask).astype(cp.int32)
+    if d_cand_rows.size == 0:
+        return np.zeros(n, dtype=bool)
+
+    # Check all candidates are DE-9IM eligible (no points).
+    d_tags_l = cp.asarray(left_state.tags)
+    d_tags_r = cp.asarray(right_state.tags)
+    d_cand_ltags = d_tags_l[d_cand_rows]
+    d_cand_rtags = d_tags_r[d_cand_rows]
+    pt = np.int8(FAMILY_TAGS[GeometryFamily.POINT])
+    mpt = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOINT])
+    has_points = bool(
+        cp.any((d_cand_ltags == pt) | (d_cand_ltags == mpt))
+        or cp.any((d_cand_rtags == pt) | (d_cand_rtags == mpt))
+    )
+    if has_points:
+        return None  # Fall back to the partitioned dispatch.
+
+    # DE-9IM kernel — pass device indices to avoid H2D re-upload.
+    from vibespatial.polygon_predicates import (
+        compute_polygon_de9im_gpu,
+        evaluate_predicate_from_de9im,
+    )
+
+    host_cand = cp.asnumpy(d_cand_rows)
+    cand_count = host_cand.size
+
+    # Group by (left_family, right_family) tag pair.
+    host_ltags = cp.asnumpy(d_cand_ltags)
+    host_rtags = cp.asnumpy(d_cand_rtags)
+    de9im_masks = np.zeros(cand_count, dtype=np.uint16)
+
+    unique_tag_pairs = set(zip(host_ltags.tolist(), host_rtags.tolist()))
+    for lt, rt in unique_tag_pairs:
+        sub_mask = (host_ltags == lt) & (host_rtags == rt)
+        sub_idx = np.flatnonzero(sub_mask)
+        if sub_idx.size == 0:
+            continue
+        lf = TAG_FAMILIES.get(lt)
+        rf = TAG_FAMILIES.get(rt)
+        if lf is None or rf is None:
+            continue
+        sub_result = compute_polygon_de9im_gpu(
+            left, right,
+            host_cand[sub_idx], host_cand[sub_idx],
+            query_family=lf, tree_family=rf,
+            d_left=d_cand_rows[sub_idx], d_right=d_cand_rows[sub_idx],
+        )
+        if sub_result is not None:
+            de9im_masks[sub_idx] = sub_result
+
+    cand_result = evaluate_predicate_from_de9im(de9im_masks, predicate)
+
+    # Scatter candidate results into full-size output.
+    # For DISJOINT: non-candidates (no bbox overlap) are True (definitely
+    # disjoint).  Candidates get their exact DE-9IM result.
+    is_disjoint = predicate == "disjoint"
+    out = np.ones(n, dtype=bool) if is_disjoint else np.zeros(n, dtype=bool)
+    out[host_cand] = cand_result
+    return out
+
+
 def evaluate_binary_predicate(
     predicate: str,
     left: PredicateInput,
@@ -651,6 +861,41 @@ def evaluate_binary_predicate(
             _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
             return fast_path_result
 
+        # --- Fused device-resident pipeline for non-point pairs ---
+        # Keeps bounds, coarse filter, and candidate extraction on device.
+        # Only downloads the small candidate-count result at the end.
+        if (
+            not scalar_right
+            and left_gpu_owned is not None
+            and right_gpu_owned is not None
+            and not null_mask.any()
+        ):
+            fused = _fused_gpu_binary_predicate(predicate, left_gpu_owned, right_gpu_owned)
+            if fused is not None:
+                precision_plan = select_precision_plan(
+                    runtime_selection=runtime_selection,
+                    kernel_class=KernelClass.PREDICATE,
+                    requested=precision,
+                )
+                robustness_plan = select_robustness_plan(
+                    kernel_class=KernelClass.PREDICATE,
+                    precision_plan=precision_plan,
+                )
+                _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
+                result_values = np.empty(row_count, dtype=object)
+                result_values[:] = fused
+                return BinaryPredicateResult(
+                    predicate=predicate,
+                    values=result_values,
+                    row_count=row_count,
+                    candidate_rows=np.flatnonzero(fused).astype(np.int32, copy=False),
+                    coarse_true_rows=np.empty(0, dtype=np.int32),
+                    coarse_false_rows=np.empty(0, dtype=np.int32),
+                    runtime_selection=runtime_selection,
+                    precision_plan=precision_plan,
+                    robustness_plan=robustness_plan,
+                )
+
     # --- Bounds computation ---
     # Prefer shapely.bounds() (~1ms vectorized C) over compute_geometry_bounds(owned)
     # when raw numpy values are available.  This avoids creating OwnedGeometryArray
@@ -681,7 +926,19 @@ def evaluate_binary_predicate(
         left_bounds,
         right_bounds,
     )
-    empty_mask = (~null_mask) & (np.isnan(left_bounds).any(axis=1) | np.isnan(right_bounds).any(axis=1))
+    # Fast pre-check: skip the expensive np.isnan scan when owned arrays
+    # report no empty geometries (the common case for generated/clean data).
+    _may_have_empties = True
+    if left_owned is not None and right_owned is not None:
+        _may_have_empties = any(
+            getattr(buf, "empty_mask", None) is not None and buf.empty_mask.any()
+            for owned in (left_owned, right_owned)
+            for buf in owned.families.values()
+        )
+    if _may_have_empties:
+        empty_mask = (~null_mask) & (np.isnan(left_bounds).any(axis=1) | np.isnan(right_bounds).any(axis=1))
+    else:
+        empty_mask = np.zeros(row_count, dtype=bool)
     if empty_mask.any():
         candidate_mask = candidate_mask & ~empty_mask
         if spec.coarse_relation is CoarseRelation.DISJOINT:
@@ -712,11 +969,19 @@ def evaluate_binary_predicate(
             if right_gpu_owned is None or right_gpu_owned is right_owned:
                 right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=scalar_right)
 
-            if left_gpu_owned is None or right_gpu_owned is None or not _candidate_pairs_supported(
-                left_gpu_owned,
-                right_gpu_owned,
-                np.flatnonzero(candidate_mask & ~null_mask).astype(np.int32, copy=False),
-            ):
+            _cand = np.flatnonzero(candidate_mask & ~null_mask).astype(np.int32, copy=False)
+            _point_ok = (
+                left_gpu_owned is not None
+                and right_gpu_owned is not None
+                and _candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand)
+            )
+            _de9im_ok = (
+                not _point_ok
+                and left_gpu_owned is not None
+                and right_gpu_owned is not None
+                and _de9im_candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand, predicate)
+            )
+            if not _point_ok and not _de9im_ok:
                 if requested_mode is ExecutionMode.GPU:
                     raise NotImplementedError(gpu_reason)
                 runtime_selection = RuntimeSelection(
@@ -751,13 +1016,32 @@ def evaluate_binary_predicate(
         if runtime_selection.selected is ExecutionMode.GPU:
             assert left_gpu_owned is not None
             assert right_gpu_owned is not None
-            exact_values = _evaluate_gpu_point_candidates(
-                predicate,
-                left_gpu_owned,
-                right_gpu_owned,
-                candidate_rows,
-            )
-            result[candidate_rows] = exact_values
+            # Route point-centric pairs through the point kernel, non-point
+            # pairs through the DE-9IM kernel.  For element-wise binary
+            # predicates the pairs are typically homogeneous, but we handle
+            # mixed cases by partitioning.
+            left_cand_tags = left_gpu_owned.tags[candidate_rows]
+            right_cand_tags = right_gpu_owned.tags[candidate_rows]
+            left_is_point = (left_cand_tags == _POINT_TAG) | (left_cand_tags == _MP_TAG)
+            right_is_point = (right_cand_tags == _POINT_TAG) | (right_cand_tags == _MP_TAG)
+            point_mask = left_is_point | right_is_point
+            de9im_mask = ~point_mask
+
+            if point_mask.any():
+                point_idx = np.flatnonzero(point_mask)
+                point_rows = candidate_rows[point_idx]
+                point_values = _evaluate_gpu_point_candidates(
+                    predicate, left_gpu_owned, right_gpu_owned, point_rows,
+                )
+                result[point_rows] = point_values
+
+            if de9im_mask.any():
+                de9im_idx = np.flatnonzero(de9im_mask)
+                de9im_rows = candidate_rows[de9im_idx]
+                de9im_values = _evaluate_gpu_de9im_candidates(
+                    predicate, left_gpu_owned, right_gpu_owned, de9im_rows,
+                )
+                result[de9im_rows] = de9im_values
         elif scalar_right:
             left_shapely = _materialize_shapely(left_values, left_owned)
             exact_values = getattr(shapely, spec.shapely_op)(left_shapely[candidate_rows], right_values, **kwargs)

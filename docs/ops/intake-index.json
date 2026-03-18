@@ -4789,6 +4789,40 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/REPORT.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "18",
+        "2026",
+        "benchmark",
+        "fixes",
+        "md",
+        "post",
+        "report",
+        "results"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/all_results.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "18",
+        "2026",
+        "all",
+        "benchmark",
+        "fixes",
+        "json",
+        "post",
+        "results"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-03-18-post-fixes/benchmark_binary_predicates__predicate_intersects_rows_10000.json",
       "referenced_by": [],
       "symbols": [],
@@ -4829,6 +4863,45 @@
         "predicates",
         "results",
         "rows"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_bounds_pairs__rows_10000.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10000",
+        "18",
+        "2026",
+        "benchmark",
+        "bounds",
+        "fixes",
+        "json",
+        "pairs",
+        "post",
+        "results",
+        "rows"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_cccl_vs_cupy__json.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "18",
+        "2026",
+        "benchmark",
+        "cccl",
+        "cupy",
+        "fixes",
+        "json",
+        "post",
+        "results",
+        "vs"
       ]
     },
     {
@@ -4899,6 +4972,48 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_gpu_bounds__scale_1000000_repeat_5.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "1000000",
+        "18",
+        "2026",
+        "benchmark",
+        "bounds",
+        "fixes",
+        "gpu",
+        "json",
+        "post",
+        "repeat",
+        "results",
+        "scale"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_gpu_bounds__scale_100000_repeat_5.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "100000",
+        "18",
+        "2026",
+        "benchmark",
+        "bounds",
+        "fixes",
+        "gpu",
+        "json",
+        "post",
+        "repeat",
+        "results",
+        "scale"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-03-18-post-fixes/benchmark_gpu_constructive__scale_100000.json",
       "referenced_by": [],
       "symbols": [],
@@ -4929,6 +5044,26 @@
         "2026",
         "benchmark",
         "constructive",
+        "fixes",
+        "gpu",
+        "json",
+        "post",
+        "results",
+        "scale"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_gpu_decode__scale_100000.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "100000",
+        "18",
+        "2026",
+        "benchmark",
+        "decode",
         "fixes",
         "gpu",
         "json",
@@ -5081,6 +5216,71 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_io_arrow__scale_1000000_operation_decode.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "1000000",
+        "18",
+        "2026",
+        "arrow",
+        "benchmark",
+        "decode",
+        "fixes",
+        "io",
+        "json",
+        "operation",
+        "post",
+        "results",
+        "scale"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_io_arrow__scale_100000_operation_decode.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "100000",
+        "18",
+        "2026",
+        "arrow",
+        "benchmark",
+        "decode",
+        "fixes",
+        "io",
+        "json",
+        "operation",
+        "post",
+        "results",
+        "scale"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_io_file__format_geojson_scale_100000.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "100000",
+        "18",
+        "2026",
+        "benchmark",
+        "fixes",
+        "format",
+        "geojson",
+        "io",
+        "json",
+        "post",
+        "results",
+        "scale"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-03-18-post-fixes/benchmark_make_valid__rows_10000.json",
       "referenced_by": [],
       "symbols": [],
@@ -5097,6 +5297,49 @@
         "results",
         "rows",
         "valid"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_mixed_layouts__scales_100000_1000000.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "100000",
+        "1000000",
+        "18",
+        "2026",
+        "benchmark",
+        "fixes",
+        "json",
+        "layouts",
+        "mixed",
+        "post",
+        "results",
+        "scales"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_pipelines__suite_full_repeat_2_gpu-sparkline.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "18",
+        "2026",
+        "benchmark",
+        "fixes",
+        "full",
+        "gpu",
+        "json",
+        "pipelines",
+        "post",
+        "repeat",
+        "results",
+        "sparkline",
+        "suite"
       ]
     },
     {
@@ -5154,6 +5397,26 @@
         "intersections",
         "json",
         "post",
+        "results",
+        "rows",
+        "segment"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-18-post-fixes/benchmark_segment_primitives__rows_200.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "18",
+        "200",
+        "2026",
+        "benchmark",
+        "fixes",
+        "json",
+        "post",
+        "primitives",
         "results",
         "rows",
         "segment"
@@ -9975,9 +10238,9 @@
         "_point_equals_to_predicate",
         "_unsupported_gpu_reason",
         "_candidate_pairs_supported",
+        "_de9im_candidate_pairs_supported",
         "_apply_relation_rows",
-        "_owned_empty_mask",
-        "_uniform_point_region_orientation"
+        "_owned_empty_mask"
       ],
       "tokens": [
         "apply",
@@ -9992,6 +10255,7 @@
         "coarserelation",
         "coerce",
         "contains",
+        "de9im",
         "empty",
         "ensure",
         "equals",
@@ -10002,7 +10266,6 @@
         "mask",
         "materialize",
         "nullbehavior",
-        "orientation",
         "output",
         "owned",
         "pairs",
@@ -10012,7 +10275,6 @@
         "py",
         "reason",
         "record",
-        "region",
         "registered",
         "relation",
         "result",
@@ -10024,7 +10286,6 @@
         "src",
         "supported",
         "supports",
-        "uniform",
         "unsupported",
         "values",
         "vibespatial",

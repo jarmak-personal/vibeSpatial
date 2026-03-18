@@ -46,6 +46,17 @@ def main() -> int:
     refined = evaluate_binary_predicate(args.predicate, left, right, null_behavior="false")
     refined_elapsed = perf_counter() - started
 
+    # Owned-input path: measures GPU DE-9IM without Shapely conversion overhead.
+    from vibespatial.owned_geometry import from_shapely_geometries
+
+    left_owned = from_shapely_geometries(left.tolist())
+    right_owned = from_shapely_geometries(right.tolist())
+    # Warm up GPU kernels
+    _ = evaluate_binary_predicate(args.predicate, left_owned, right_owned, null_behavior="false")
+    started = perf_counter()
+    owned_result = evaluate_binary_predicate(args.predicate, left_owned, right_owned, null_behavior="false")
+    owned_elapsed = perf_counter() - started
+
     stats = benchmark_binary_predicate(args.predicate, left, right)
     print(
         json.dumps(
@@ -60,6 +71,8 @@ def main() -> int:
                 "coarse_false_rows": stats["coarse_false_rows"],
                 "naive_elapsed_seconds": naive_elapsed,
                 "refined_elapsed_seconds": refined_elapsed,
+                "owned_gpu_elapsed_seconds": owned_elapsed,
+                "runtime_selected": str(owned_result.runtime_selection.selected),
             },
             indent=2,
         )
