@@ -27,6 +27,7 @@ result_images/
 # Benchmark fixture cache and results
 .benchmark_fixtures/
 benchmarks/results/
+benchmark_results/
 
 # Example data (large downloads)
 examples/data/
