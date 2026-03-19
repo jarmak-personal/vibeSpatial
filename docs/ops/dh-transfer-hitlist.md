@@ -52,7 +52,7 @@ vibeSpatial a pure GPU library.
       arrays uploaded per dense kernel launch.
       *Fix: Allocate on device directly.*
 
-- [ ] **9. point_in_polygon.py:1471, 2077, 2176, 2196** -- D->H dense result
+- [x] **9. point_in_polygon.py:1471, 2077, 2176, 2196** -- D->H dense result
       array copied to host (unless `_return_device=True`).
       *Fix: Make device-return the default internal path.*
 

@@ -1415,11 +1415,12 @@ def _launch_polygon_dense(
     candidate_indices: np.ndarray,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    out: np.ndarray,
+    device_out,
     compute_type: str = "double",
     center_x: float = 0.0,
     center_y: float = 0.0,
 ) -> None:
+    """Launch dense polygon PIP kernel writing into caller-owned *device_out*."""
     runtime = get_cuda_runtime()
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
@@ -1429,7 +1430,6 @@ def _launch_polygon_dense(
     device_mask = runtime.allocate((n,), np.uint8, zero=True)
     device_indices = runtime.from_host(candidate_indices.astype(np.int32, copy=False))
     device_mask[device_indices] = np.uint8(1)
-    device_out = runtime.allocate((n,), np.uint8, zero=True)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_polygon_dense"]
         params = (
@@ -1471,11 +1471,9 @@ def _launch_polygon_dense(
         grid, block = runtime.launch_config(kernel, left.row_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
         runtime.synchronize()
-        runtime.copy_device_to_host(device_out, out)
     finally:
         runtime.free(device_indices)
         runtime.free(device_mask)
-        runtime.free(device_out)
 
 
 def _launch_polygon_compacted(
@@ -1544,11 +1542,12 @@ def _launch_multipolygon_dense(
     candidate_indices: np.ndarray,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    out: np.ndarray,
+    device_out,
     compute_type: str = "double",
     center_x: float = 0.0,
     center_y: float = 0.0,
 ) -> None:
+    """Launch dense multipolygon PIP kernel writing into caller-owned *device_out*."""
     runtime = get_cuda_runtime()
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
@@ -1558,7 +1557,6 @@ def _launch_multipolygon_dense(
     device_mask = runtime.allocate((n,), np.uint8, zero=True)
     device_indices = runtime.from_host(candidate_indices.astype(np.int32, copy=False))
     device_mask[device_indices] = np.uint8(1)
-    device_out = runtime.allocate((n,), np.uint8, zero=True)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_dense"]
         params = (
@@ -1602,11 +1600,9 @@ def _launch_multipolygon_dense(
         grid, block = runtime.launch_config(kernel, left.row_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
         runtime.synchronize()
-        runtime.copy_device_to_host(device_out, out)
     finally:
         runtime.free(device_indices)
         runtime.free(device_mask)
-        runtime.free(device_out)
 
 
 def _launch_multipolygon_compacted(
@@ -1994,13 +1990,22 @@ def _evaluate_point_in_polygon_gpu(
             return coarse
 
         t0 = perf_counter()
-        dense_out = np.zeros(points.row_count, dtype=np.uint8)
-        if GeometryFamily.POLYGON in rows_by_family:
-            _launch_polygon_dense(rows_by_family[GeometryFamily.POLYGON], points, right_array, dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
-        if GeometryFamily.MULTIPOLYGON in rows_by_family:
-            _launch_multipolygon_dense(rows_by_family[GeometryFamily.MULTIPOLYGON], points, right_array, dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+        runtime = get_cuda_runtime()
+        device_dense_out = runtime.allocate((points.row_count,), np.uint8, zero=True)
+        try:
+            if GeometryFamily.POLYGON in rows_by_family:
+                _launch_polygon_dense(rows_by_family[GeometryFamily.POLYGON], points, right_array, device_dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+            if GeometryFamily.MULTIPOLYGON in rows_by_family:
+                _launch_multipolygon_dense(rows_by_family[GeometryFamily.MULTIPOLYGON], points, right_array, device_dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+            timings["kernel_launch_and_sync_s"] = perf_counter() - t0
+            if return_device:
+                _last_gpu_substage_timings = timings
+                return device_dense_out
+            dense_out = runtime.copy_device_to_host(device_dense_out)
+        finally:
+            if not return_device:
+                runtime.free(device_dense_out)
         coarse[candidate_rows] = dense_out[candidate_rows].astype(bool, copy=False)
-        timings["kernel_launch_and_sync_s"] = perf_counter() - t0
     elif selected_strategy == "compacted":
         # Ensure per-family bounds exist on device (same as fused/binned paths).
         runtime = get_cuda_runtime()
@@ -2078,10 +2083,16 @@ def _evaluate_point_in_polygon_gpu(
                 finally:
                     runtime.free(multipolygon_hits)
             timings["kernel_launch_and_sync_s"] = perf_counter() - t0
+            if return_device:
+                # Caller owns device_dense_out; free only candidate indices.
+                runtime.free(candidate_rows.values)
+                _last_gpu_substage_timings = timings
+                return device_dense_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
         finally:
-            runtime.free(device_dense_out)
-            runtime.free(candidate_rows.values)
+            if not return_device:
+                runtime.free(device_dense_out)
+                runtime.free(candidate_rows.values)
         coarse[np.asarray(dense_out, dtype=bool)] = True
     elif selected_strategy == "binned":
         # Binned: bounds filter first, then dispatch PIP in work-balanced bins
@@ -2177,10 +2188,16 @@ def _evaluate_point_in_polygon_gpu(
                 finally:
                     runtime.free(multipolygon_hits)
             timings["kernel_launch_and_sync_s"] = perf_counter() - t0
+            if return_device:
+                # Caller owns device_dense_out; free only candidate indices.
+                runtime.free(candidate_rows.values)
+                _last_gpu_substage_timings = timings
+                return device_dense_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
         finally:
-            runtime.free(device_dense_out)
-            runtime.free(candidate_rows.values)
+            if not return_device:
+                runtime.free(device_dense_out)
+                runtime.free(candidate_rows.values)
         coarse[np.asarray(dense_out, dtype=bool)] = True
     else:
         # Fused: single kernel does bounds check + PIP in one launch.
