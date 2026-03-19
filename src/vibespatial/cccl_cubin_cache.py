@@ -949,47 +949,46 @@ class _CachedScanReduce(_CachedAlgorithm):
             from cuda.compute._utils.protocols import get_data_pointer, validate_and_get_stream
             from cuda.compute.op import make_op_adapter
 
-            with self._call_lock:
-                set_cccl_iterator_state(self._d_in_cccl, d_in)
-                set_cccl_iterator_state(self._d_out_cccl, d_out)
+            set_cccl_iterator_state(self._d_in_cccl, d_in)
+            set_cccl_iterator_state(self._d_out_cccl, d_out)
 
-                op_adapter = make_op_adapter(op)
-                op_adapter.update_op_state(self._op_cccl)
+            op_adapter = make_op_adapter(op)
+            op_adapter.update_op_state(self._op_cccl)
 
-                if hasattr(self._init_cccl, 'state') and init_value is not None:
-                    import numpy as np
-                    if isinstance(init_value, np.ndarray):
-                        self._init_cccl.state = to_cccl_value_state(init_value)
+            if hasattr(self._init_cccl, 'state') and init_value is not None:
+                import numpy as np
+                if isinstance(init_value, np.ndarray):
+                    self._init_cccl.state = to_cccl_value_state(init_value)
 
-                stream_handle = validate_and_get_stream(stream)
+            stream_handle = validate_and_get_stream(stream)
 
-                if temp_storage is None:
-                    temp_bytes = ctypes.c_size_t(0)
-                    d_temp = 0
-                else:
-                    temp_bytes = ctypes.c_size_t(temp_storage.nbytes)
-                    d_temp = get_data_pointer(temp_storage)
+            if temp_storage is None:
+                temp_bytes = ctypes.c_size_t(0)
+                d_temp = 0
+            else:
+                temp_bytes = ctypes.c_size_t(temp_storage.nbytes)
+                d_temp = get_data_pointer(temp_storage)
 
-                IterT = _get_opaque_type("Iter", self._iter_size)
-                OpT = _get_opaque_type("Op", self._op_size)
-                ValT = _get_opaque_type("Value", self._value_size)
+            IterT = _get_opaque_type("Iter", self._iter_size)
+            OpT = _get_opaque_type("Op", self._op_size)
+            ValT = _get_opaque_type("Value", self._value_size)
 
-                err = self._cfunc(
-                    self._build.struct,
-                    ctypes.c_void_p(d_temp),
-                    ctypes.byref(temp_bytes),
-                    IterT.from_buffer_copy(self._d_in_cccl.as_bytes()),
-                    IterT.from_buffer_copy(self._d_out_cccl.as_bytes()),
-                    ctypes.c_uint64(num_items),
-                    OpT.from_buffer_copy(self._op_cccl.as_bytes()),
-                    ValT.from_buffer_copy(self._init_cccl.as_bytes()),
-                    ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
+            err = self._cfunc(
+                self._build.struct,
+                ctypes.c_void_p(d_temp),
+                ctypes.byref(temp_bytes),
+                IterT.from_buffer_copy(self._d_in_cccl.as_bytes()),
+                IterT.from_buffer_copy(self._d_out_cccl.as_bytes()),
+                ctypes.c_uint64(num_items),
+                OpT.from_buffer_copy(self._op_cccl.as_bytes()),
+                ValT.from_buffer_copy(self._init_cccl.as_bytes()),
+                ctypes.c_void_p(stream_handle) if stream_handle else ctypes.c_void_p(0),
+            )
+            if err != 0:
+                raise RuntimeError(
+                    f"CCCL cached {self._spec_name} compute failed with error {err}"
                 )
-                if err != 0:
-                    raise RuntimeError(
-                        f"CCCL cached {self._spec_name} compute failed with error {err}"
-                    )
-                return temp_bytes.value
+            return temp_bytes.value
 
 
 class _CachedSegmentedReduce(_CachedAlgorithm):
