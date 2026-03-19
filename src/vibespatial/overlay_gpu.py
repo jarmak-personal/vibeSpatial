@@ -1567,7 +1567,14 @@ def _build_polygon_output_from_faces_gpu(
     # Each ring needs edge_count + 1 coordinates (for closure)
     ring_coord_counts = d_ring_edge_counts + 1
     d_ring_coord_offsets = exclusive_sum(ring_coord_counts.astype(cp.int32, copy=False))
-    total_coords = int(cp.asnumpy(d_ring_coord_offsets[-1:] + ring_coord_counts[-1:])[0])
+    # Batch two scalar reads into one D->H transfer: total_coords (offset[-1]+count[-1])
+    # and boundary_total (offset[-1]) — the latter is reused in Step 8 merge.
+    _scalar_pair = cp.asnumpy(cp.stack([
+        d_ring_coord_offsets[-1] + ring_coord_counts[-1],
+        d_ring_coord_offsets[-1],
+    ]))
+    total_coords = int(_scalar_pair[0])
+    boundary_total = int(_scalar_pair[1])
 
     # --- Step 7: Scatter ring coordinates via GPU kernel ---
     d_out_x = cp.empty(total_coords, dtype=cp.float64)
@@ -1731,7 +1738,7 @@ def _build_polygon_output_from_faces_gpu(
         d_all_x = cp.concatenate((d_out_x, d_hole_compact_x))
         d_all_y = cp.concatenate((d_out_y, d_hole_compact_y))
         # Merged coordinate offsets: boundary offsets + compact hole offsets shifted
-        boundary_total = int(cp.asnumpy(d_ring_coord_offsets[-1:])[0])
+        # boundary_total was already extracted in the batched scalar read at Step 6
         d_hole_offsets_shifted = d_hole_offsets_compact + boundary_total
         d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted[1:]))
         d_all_edge_counts = cp.concatenate((d_ring_edge_counts, d_hole_edge_counts))

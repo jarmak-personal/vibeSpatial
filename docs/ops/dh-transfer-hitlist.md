@@ -110,7 +110,7 @@ vibeSpatial a pure GPU library.
       `int(geometry_offsets[-1])` offset terminators for allocation.
       *Fix: Fused allocation kernel.*
 
-- [ ] **22. overlay_gpu.py:1570, 1628, 1711, 1734** -- D->H scalar
+- [x] **22. overlay_gpu.py:1570, 1628, 1711, 1734** -- D->H scalar
       `int(cp.asnumpy(...)[0])` extractions for offset counts.
       *Fix: Batch scalar reads.*
 
