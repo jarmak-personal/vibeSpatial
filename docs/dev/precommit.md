@@ -123,31 +123,57 @@ The reminder is non-blocking. To suppress it:
 VIBESPATIAL_SKIP_AI_REMINDER=1 git commit -m "message"
 ```
 
-## Layer 3: PreToolUse Hook (Claude Code, mechanical)
+## Layer 3: PreToolUse Hooks (Claude Code, mechanical)
 
-A `PreToolUse` hook (`.claude/hooks/pre-land-gate.sh`) fires whenever Claude
-calls `Bash` with a command containing `git commit`. The hook runs as a shell
-process **outside the LLM context window** -- it cannot be compressed away,
-forgotten, or skipped by the model.
+Two `PreToolUse` hooks run **outside the LLM context window** -- they cannot
+be compressed away, forgotten, or skipped by the model.
 
-When triggered, it injects a system message into the conversation reminding
-Claude to complete the pre-land review before proceeding with the commit.
+### Bash guard (`.claude/hooks/pre-land-gate.sh`)
 
-This is configured in `.claude/settings.json`:
+Fires on every `Bash` tool call. Returns a **hard block** (`{"decision":"block"}`)
+for commands that would bypass or tamper with enforcement infrastructure:
+
+| Pattern | What it blocks |
+|---------|---------------|
+| `git commit --no-verify` / `-n` | Skipping all git hooks |
+| `git config core.hooksPath` | Redirecting hooks away from `.githooks/` |
+| `git -c core.hooksPath=...` | Inline hook path override |
+| `rm`/`mv`/`chmod`/`sed`/... on `.githooks/` | Tampering with git hooks |
+| `rm`/`mv`/`chmod`/`sed`/... on `.claude/hooks/` | Tampering with Claude hooks |
+| `rm`/`mv`/`>` on `.claude/settings*.json` | Removing hook registrations |
+
+For `git commit` commands that pass the above checks, the hook injects a
+system message reminding Claude to complete `/pre-land-review` first.
+
+### File guard (`.claude/hooks/file-guard.sh`)
+
+Fires on every `Edit` and `Write` tool call. Returns a **hard block** for
+writes to enforcement-critical paths:
+
+| Protected path | Reason |
+|----------------|--------|
+| `.githooks/*` | Git hook scripts |
+| `.claude/hooks/*` | Claude hook scripts |
+| `.claude/settings.json` | Hook registrations |
+| `.claude/settings.local.json` | Local hook overrides |
+| `.claude/skills/pre-land-review/SKILL.md` | Review skill definition |
+
+To modify any of these files, edit them manually outside Claude Code.
+
+### Configuration
+
+Both hooks are registered in `.claude/settings.json`:
 
 ```json
 {
   "hooks": {
-    "PreToolUse": [{
-      "matcher": "Bash",
-      "hooks": [{"type": "command", "command": ".claude/hooks/pre-land-gate.sh"}]
-    }]
+    "PreToolUse": [
+      {"matcher": "Bash",  "hooks": [{"type": "command", "command": ".claude/hooks/pre-land-gate.sh"}]},
+      {"matcher": "Edit",  "hooks": [{"type": "command", "command": ".claude/hooks/file-guard.sh"}]},
+      {"matcher": "Write", "hooks": [{"type": "command", "command": ".claude/hooks/file-guard.sh"}]}
+    ]
   }
 }
-```
-
-The hook only matches `git commit` commands -- all other Bash calls pass
-through without overhead.
 
 ## Layer 4: commit-msg Gate (Content-Addressable Marker)
 
@@ -175,12 +201,12 @@ The four layers form a defense-in-depth chain:
 Layer 2: Skill fires on "commit" / "land" / "done" intent
   --> Loads full checklist, Claude runs AI analysis
   --> Writes .claude/.review-completed marker on LAND verdict
-    --> Layer 3: Hook fires on Bash(git commit ...)
-      --> Injects system message if checklist wasn't completed
-        --> Layer 1: Pre-commit hook runs deterministic checks
-          --> Prints reminder
-            --> Layer 4: commit-msg hook checks Co-Author + marker
-              --> Blocks if Claude co-authored without review
+    --> Layer 3: Bash guard hard-blocks --no-verify, hook tampering
+    --> Layer 3: File guard hard-blocks Edit/Write to enforcement files
+    --> Layer 3: Bash guard injects commit reminder if checks above pass
+      --> Layer 1: Pre-commit hook runs deterministic checks
+        --> Layer 4: commit-msg hook checks Co-Author + marker
+          --> Blocks if Claude co-authored without review
 ```
 
 Each layer catches what the previous one might miss:
@@ -188,7 +214,11 @@ Each layer catches what the previous one might miss:
 | Failure mode | Caught by |
 |--------------|-----------|
 | Agent forgets to review before committing | Layer 2 (skill) |
-| Long context compresses skill trigger away | Layer 3 (hook) |
+| Long context compresses skill trigger away | Layer 3 (bash guard reminder) |
+| Agent uses `--no-verify` to skip git hooks | Layer 3 (bash guard hard block) |
+| Agent redirects `core.hooksPath` | Layer 3 (bash guard hard block) |
+| Agent `rm`/`sed`/`chmod` on hook files via Bash | Layer 3 (bash guard hard block) |
+| Agent edits hook files via Edit/Write tools | Layer 3 (file guard hard block) |
 | Agent ignores skill and hook, commits anyway | Layer 4 (commit-msg gate) |
 | Agent creates stub marker file (`touch ...`) | Layer 4 (missing JSON / hash) |
 | Agent stages new changes after review | Layer 4 (hash mismatch) |
@@ -282,10 +312,9 @@ The skill triggers on keywords in the conversation. If it doesn't fire:
 
 ### Skipping hooks entirely
 
-For emergency commits (not recommended):
+The `--no-verify` flag is **hard-blocked** for AI agents by the Bash guard
+hook. It cannot be used from within Claude Code sessions.
 
-```bash
-git commit --no-verify -m "emergency fix"
-```
-
-This bypasses ALL checks including deterministic ones. Use sparingly.
+For human contributors working outside Claude Code, `--no-verify` still works
+in a plain terminal. Use sparingly -- it bypasses ALL checks including
+deterministic ones.
