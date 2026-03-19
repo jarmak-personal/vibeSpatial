@@ -1001,9 +1001,15 @@ class GeometryArray(ExtensionArray):
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
             other_data = other._data
+            # Pass OwnedGeometryArrays directly when cached, avoiding
+            # a Shapely -> list -> OwnedGeometryArray H->D round-trip.
+            left_arg = self._owned if self._owned is not None else self._data
+            other_arg = other._owned if other._owned is not None else other_data
         else:
             other_data = other
-        result = evaluate_geopandas_dwithin(self._data, other_data, distance)
+            left_arg = self._owned if self._owned is not None else self._data
+            other_arg = other
+        result = evaluate_geopandas_dwithin(left_arg, other_arg, distance)
         if result is not None:
             return result
         return shapely.dwithin(self._data, other_data, distance=distance)

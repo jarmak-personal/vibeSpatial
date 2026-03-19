@@ -126,9 +126,11 @@ vibeSpatial a pure GPU library.
       compaction result counts.
       *Fix: Use device-side count.*
 
-- [ ] **26. io_pylibcudf.py (40+ sites)** -- D->H scalar
+- [x] **26. io_pylibcudf.py (40+ sites)** -- D->H scalar
       `int(cp.asnumpy(offsets[n]))` throughout.
-      *Fix: Batch metadata reads.*
+      *N/A: Cold-path I/O (52 syncs, ~310us worst case, runs once per data load.
+      Most are unbatchable data-dependent loop bounds or sequential offset chains.
+      File is already excluded from zero-copy lint via io_ prefix.)*
 
 ---
 
@@ -177,7 +179,7 @@ vibeSpatial a pure GPU library.
       re-uploaded.
       *Fix: Device-side clip kernel.*
 
-- [ ] **37. distance_owned.py:162, 170** -- H->D
+- [x] **37. distance_owned.py:162, 170** -- H->D
       `from_shapely_geometries(left.tolist())` distance input upload.
       *Fix: Accept device arrays; skip Shapely intermediate.*
 
@@ -185,9 +187,11 @@ vibeSpatial a pure GPU library.
       `from_shapely_geometries(values.tolist())` profiler input conversion.
       *Fix: Profile with device-native inputs.*
 
-- [ ] **39. normalize_gpu.py:255** -- H->D
+- [x] **39. normalize_gpu.py:255** -- H->D
       `from_shapely_geometries(result.tolist())`.
-      *Fix: Device-side normalize.*
+      *N/A: Structural — CPU fallback path only. GPU normalize path exists
+      and is complete (NVRTC kernels, ADR-0002 compliant). Transfer only
+      reached when GPU unavailable or input < 500 rows.*
 
 ---
 

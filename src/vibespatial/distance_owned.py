@@ -133,20 +133,25 @@ def dwithin_owned(
 
 
 def evaluate_geopandas_dwithin(
-    left: np.ndarray,
-    right: object | np.ndarray,
+    left: np.ndarray | OwnedGeometryArray,
+    right: object | np.ndarray | OwnedGeometryArray,
     distance: float | np.ndarray,
 ) -> np.ndarray | None:
     """Try GPU-dispatched dwithin for GeometryArray inputs.
 
-    Converts Shapely arrays to OwnedGeometryArray and routes through
-    dwithin_owned().  Returns None when GPU dispatch is not selected
-    (below crossover threshold or GPU unavailable), letting the caller
-    fall back to Shapely.
+    Accepts either numpy arrays of Shapely objects or pre-built
+    OwnedGeometryArrays.  When OwnedGeometryArrays are provided the
+    Shapely serialisation round-trip (and its H->D transfer) is skipped
+    entirely.
+
+    Returns None when GPU dispatch is not selected (below crossover
+    threshold or GPU unavailable), letting the caller fall back to
+    Shapely.
     """
     from shapely.geometry.base import BaseGeometry
 
-    n = len(left)
+    left_is_owned = isinstance(left, OwnedGeometryArray)
+    n = left.row_count if left_is_owned else len(left)
     if n == 0:
         return np.empty(0, dtype=bool)
 
@@ -160,9 +165,11 @@ def evaluate_geopandas_dwithin(
         return None
 
     try:
-        left_owned = from_shapely_geometries(left.tolist())
+        left_owned = left if left_is_owned else from_shapely_geometries(left.tolist())
 
-        if isinstance(right, BaseGeometry):
+        if isinstance(right, OwnedGeometryArray):
+            right_owned = right
+        elif isinstance(right, BaseGeometry):
             # Broadcast scalar geometry to N rows.  The DGA path has an
             # optimized _dwithin_scalar that avoids this; this path is
             # only reached from GeometryArray above the crossover threshold.
