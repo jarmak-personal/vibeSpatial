@@ -117,7 +117,7 @@ vibeSpatial a pure GPU library.
       `cp.asnumpy(d_rc)` coverage matrices.
       *Fix: Keep coverage on device.*
 
-- [ ] **24. dissolve_pipeline.py:279-284** -- H->D->D->H upload codes/bounds,
+- [x] **24. dissolve_pipeline.py:279-284** -- H->D->D->H upload codes/bounds,
       sort on device, pull back sorted results.
       *Fix: Keep sorted results on device.*
 

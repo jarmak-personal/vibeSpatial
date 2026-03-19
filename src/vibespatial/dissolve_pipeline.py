@@ -12,11 +12,7 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection
 
-from vibespatial.cccl_precompile import request_warmup
-from vibespatial.cccl_primitives import sort_pairs
 from vibespatial.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
-
-request_warmup(["radix_sort_i32_i32", "radix_sort_u64_i32"])
 
 try:
     import cupy as cp
@@ -276,12 +272,13 @@ def execute_grouped_box_union_gpu(
             method=DissolveUnionMethod.COVERAGE,
         )
 
-    codes_device = cp.asarray(group_codes[observed_mask])
-    bounds_device = cp.asarray(bounds[observed_mask])
-    row_ids = cp.arange(int(codes_device.size), dtype=cp.int32)
-    sorted_rows = sort_pairs(codes_device, row_ids).values
-    sorted_codes = cp.asnumpy(codes_device[sorted_rows]).astype(np.int32, copy=False)
-    sorted_bounds = cp.asnumpy(bounds_device[sorted_rows]).astype(np.float64, copy=False)
+    # Sort on host — downstream reduceat ops are numpy-only, so a
+    # H->D->sort->D->H round-trip through CuPy would waste bandwidth.
+    observed_codes = group_codes[observed_mask].astype(np.int32, copy=False)
+    observed_bounds = bounds[observed_mask].astype(np.float64, copy=False)
+    sorted_rows = np.argsort(observed_codes, kind="stable")
+    sorted_codes = observed_codes[sorted_rows]
+    sorted_bounds = observed_bounds[sorted_rows]
 
     start_mask = np.empty((int(sorted_codes.size),), dtype=bool)
     start_mask[0] = True
