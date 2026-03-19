@@ -1771,15 +1771,9 @@ def _compute_total_bounds_from_owned_device(owned: OwnedGeometryArray) -> np.nda
 
     min_xy = cp.amin(cp.stack(mins), axis=0)
     max_xy = cp.amax(cp.stack(maxs), axis=0)
-    return np.asarray(
-        [
-            float(min_xy[0].item()),
-            float(min_xy[1].item()),
-            float(max_xy[0].item()),
-            float(max_xy[1].item()),
-        ],
-        dtype=np.float64,
-    )
+    # Single D->H transfer for all 4 bounds (avoid 4 separate .item() syncs)
+    bounds_device = cp.concatenate([min_xy, max_xy]).astype(cp.float64)
+    return cp.asnumpy(bounds_device)
 
 
 def _compute_total_bounds_from_owned_host(owned: OwnedGeometryArray) -> np.ndarray:

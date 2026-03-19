@@ -85,7 +85,7 @@ vibeSpatial a pure GPU library.
 
 ## TIER 2 -- WARM PATH (per-operation, amortized but avoidable)
 
-- [ ] **16. device_geometry_array.py:1776-1779** -- D->H
+- [x] **16. device_geometry_array.py:1776-1779** -- D->H
       `float(min_xy[0].item())` x4 for total_bounds.
       *Fix: Single kernel returning 4 scalars.*
 
@@ -121,7 +121,7 @@ vibeSpatial a pure GPU library.
       sort on device, pull back sorted results.
       *Fix: Keep sorted results on device.*
 
-- [ ] **25. cccl_primitives.py:205, 627** -- D->H `int(count.get()[0])`
+- [x] **25. cccl_primitives.py:205, 627** -- D->H `int(count.get()[0])`
       compaction result counts.
       *Fix: Use device-side count.*
 
