@@ -1026,16 +1026,22 @@ def _binned_polygon_dispatch(
     For simple/medium bins uses the thread-per-pair kernel.  For the complex
     bin (>1024 vertices) uses the block-per-pair kernel where one thread block
     cooperatively processes a single candidate pair.
+
+    All binning is performed on-device using CuPy to avoid D->H/H->D
+    round-trips for candidate rows and bin indices.
     """
+    import cupy as _cp
+
     runtime = get_cuda_runtime()
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
 
-    candidate_rows_host = runtime.copy_device_to_host(candidate_rows_device)
     device_out = runtime.allocate((candidate_count,), np.uint8)
 
+    # Move work estimates to device once for all bins.
+    d_work = _cp.asarray(work_estimates)
     bin_edges = [0] + _PIP_WORK_BINS + [int(work_estimates.max()) + 1]
     _log.debug(
         "binned_polygon_dispatch: %d candidates, bin_edges=%s, "
@@ -1046,14 +1052,14 @@ def _binned_polygon_dispatch(
     )
 
     for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (work_estimates >= lo) & (work_estimates < hi)
+        mask = (d_work >= lo) & (d_work < hi)
         bin_count = int(mask.sum())
         if bin_count == 0:
             continue
 
-        bin_indices = np.flatnonzero(mask).astype(np.int32)
-        bin_candidate_rows = candidate_rows_host[bin_indices].astype(np.int32)
-        device_bin_candidates = runtime.from_host(bin_candidate_rows)
+        # Device-side binning: no D->H or H->D transfers.
+        device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
+        device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
         device_bin_out = runtime.allocate((bin_count,), np.uint8)
 
         try:
@@ -1122,17 +1128,14 @@ def _binned_polygon_dispatch(
                 grid, block = runtime.launch_config(kernel, bin_count)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
 
-            device_bin_indices = runtime.from_host(bin_indices)
-            try:
-                _scatter_bin_results(
-                    device_bin_indices, device_bin_out, device_out, bin_count,
-                    compute_type=compute_type, center_x=center_x, center_y=center_y,
-                )
-            finally:
-                runtime.free(device_bin_indices)
+            _scatter_bin_results(
+                device_bin_indices, device_bin_out, device_out, bin_count,
+                compute_type=compute_type, center_x=center_x, center_y=center_y,
+            )
 
         finally:
             runtime.free(device_bin_candidates)
+            runtime.free(device_bin_indices)
             runtime.free(device_bin_out)
 
     return device_out
@@ -1148,16 +1151,23 @@ def _binned_multipolygon_dispatch(
     center_x: float = 0.0,
     center_y: float = 0.0,
 ):
-    """Dispatch multipolygon PIP kernel in work-balanced bins."""
+    """Dispatch multipolygon PIP kernel in work-balanced bins.
+
+    All binning is performed on-device using CuPy to avoid D->H/H->D
+    round-trips for candidate rows and bin indices.
+    """
+    import cupy as _cp
+
     runtime = get_cuda_runtime()
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
 
-    candidate_rows_host = runtime.copy_device_to_host(candidate_rows_device)
     device_out = runtime.allocate((candidate_count,), np.uint8)
 
+    # Move work estimates to device once for all bins.
+    d_work = _cp.asarray(work_estimates)
     bin_edges = [0] + _PIP_WORK_BINS + [int(work_estimates.max()) + 1]
     _log.debug(
         "binned_multipolygon_dispatch: %d candidates, work min=%d max=%d",
@@ -1165,14 +1175,14 @@ def _binned_multipolygon_dispatch(
     )
 
     for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (work_estimates >= lo) & (work_estimates < hi)
+        mask = (d_work >= lo) & (d_work < hi)
         bin_count = int(mask.sum())
         if bin_count == 0:
             continue
 
-        bin_indices = np.flatnonzero(mask).astype(np.int32)
-        bin_candidate_rows = candidate_rows_host[bin_indices].astype(np.int32)
-        device_bin_candidates = runtime.from_host(bin_candidate_rows)
+        # Device-side binning: no D->H or H->D transfers.
+        device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
+        device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
         device_bin_out = runtime.allocate((bin_count,), np.uint8)
 
         try:
@@ -1243,17 +1253,14 @@ def _binned_multipolygon_dispatch(
                 grid, block = runtime.launch_config(kernel, bin_count)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
 
-            device_bin_indices = runtime.from_host(bin_indices)
-            try:
-                _scatter_bin_results(
-                    device_bin_indices, device_bin_out, device_out, bin_count,
-                    compute_type=compute_type, center_x=center_x, center_y=center_y,
-                )
-            finally:
-                runtime.free(device_bin_indices)
+            _scatter_bin_results(
+                device_bin_indices, device_bin_out, device_out, bin_count,
+                compute_type=compute_type, center_x=center_x, center_y=center_y,
+            )
 
         finally:
             runtime.free(device_bin_candidates)
+            runtime.free(device_bin_indices)
             runtime.free(device_bin_out)
 
     return device_out

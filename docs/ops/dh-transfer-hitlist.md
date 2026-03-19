@@ -40,11 +40,11 @@ vibeSpatial a pure GPU library.
       `set(zip(valid_left_tags.tolist(), ...))`.
       *Fix: GPU unique tag-pair extraction.*
 
-- [ ] **6. point_in_polygon.py:1036, 1158, 2116** -- D->H candidate rows
+- [x] **6. point_in_polygon.py:1036, 1158, 2116** -- D->H candidate rows
       pulled to host for Python binning logic.
       *Fix: Device-side binning kernel.*
 
-- [ ] **7. point_in_polygon.py:1056, 1125, 1175, 1246** -- H->D per-bin
+- [x] **7. point_in_polygon.py:1056, 1125, 1175, 1246** -- H->D per-bin
       candidate subsets re-uploaded **in a loop**.
       *Fix: Keep bins on device.*
 
