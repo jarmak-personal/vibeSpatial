@@ -202,7 +202,7 @@ def _compact_indices_cccl(mask: DeviceArray) -> CompactionResult:
 
     cccl_algorithms.select(indices, out, count, _selected, item_count)
     cp_module.cuda.Stream.null.synchronize()
-    selected_count = int(count.get()[0])
+    selected_count = int(count.item())
     return CompactionResult(values=out[:selected_count], count=selected_count)
 
 
@@ -624,7 +624,7 @@ def unique_sorted_pairs(keys: DeviceArray, values: DeviceArray) -> UniqueByKeyRe
         item_count,
     )
     cp_module.cuda.Stream.null.synchronize()
-    selected_count = int(out_count.get()[0])
+    selected_count = int(out_count.item())
     return UniqueByKeyResult(
         keys=out_keys[:selected_count],
         values=out_values[:selected_count],
