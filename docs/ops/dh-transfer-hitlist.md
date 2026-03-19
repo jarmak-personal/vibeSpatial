@@ -114,7 +114,7 @@ vibeSpatial a pure GPU library.
       `int(cp.asnumpy(...)[0])` extractions for offset counts.
       *Fix: Batch scalar reads.*
 
-- [ ] **23. overlay_gpu.py:2674-2675** -- D->H `cp.asnumpy(d_lc)`,
+- [x] **23. overlay_gpu.py:2674-2675** -- D->H `cp.asnumpy(d_lc)`,
       `cp.asnumpy(d_rc)` coverage matrices.
       *Fix: Keep coverage on device.*
 

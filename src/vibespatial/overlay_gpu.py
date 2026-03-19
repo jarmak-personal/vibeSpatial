@@ -2643,6 +2643,8 @@ def build_gpu_overlay_faces(
         label_y_values.append(sample_y)
         bounded_mask_values.append(1 if signed_area > 1e-12 else 0)
 
+    # Track whether coverage was computed on device (avoids D->H->D roundtrip).
+    _gpu_coverage = False
     if not face_edge_groups:
         face_offsets = np.asarray([0], dtype=np.int32)
         face_edge_ids = np.asarray([], dtype=np.int32)
@@ -2678,14 +2680,31 @@ def build_gpu_overlay_faces(
                 left, right, d_label_x, d_label_y, cpu_face_count_for_label,
             )
             runtime.synchronize()
-            left_covered = cp.asnumpy(d_lc)
-            right_covered = cp.asnumpy(d_rc)
+            # Apply bounded_mask on device to avoid D->H->D roundtrip.
+            d_bounded_mask = runtime.from_host(bounded_mask)
+            d_mask = d_bounded_mask != 0
+            d_lc = cp.where(d_mask, d_lc, cp.int8(0)).astype(cp.int8, copy=False)
+            d_rc = cp.where(d_mask, d_rc, cp.int8(0)).astype(cp.int8, copy=False)
+            # Host copies deferred -- lazily materialised by property accessor.
+            left_covered = None
+            right_covered = None
+            _gpu_coverage = True
         else:
             left_covered, right_covered = _label_face_coverage(left, right, label_x, label_y)
-        left_covered = np.where(bounded_mask != 0, left_covered, 0).astype(np.int8, copy=False)
-        right_covered = np.where(bounded_mask != 0, right_covered, 0).astype(np.int8, copy=False)
+            left_covered = np.where(bounded_mask != 0, left_covered, 0).astype(np.int8, copy=False)
+            right_covered = np.where(bounded_mask != 0, right_covered, 0).astype(np.int8, copy=False)
 
     cpu_face_count = max(0, int(face_offsets.size) - 1)
+    # Build device state; reuse arrays already on device when GPU coverage ran.
+    d_face_offsets = runtime.from_host(face_offsets)
+    d_face_edge_ids = runtime.from_host(face_edge_ids)
+    if not _gpu_coverage:
+        d_bounded_mask = runtime.from_host(bounded_mask)
+    d_signed_area = runtime.from_host(signed_area)
+    d_centroid_x = runtime.from_host(centroid_x)
+    d_centroid_y = runtime.from_host(centroid_y)
+    d_left_covered = d_lc if _gpu_coverage else runtime.from_host(left_covered)
+    d_right_covered = d_rc if _gpu_coverage else runtime.from_host(right_covered)
     return OverlayFaceTable(
         runtime_selection=half_edge_graph.runtime_selection,
         _face_count=cpu_face_count,
@@ -2698,14 +2717,14 @@ def build_gpu_overlay_faces(
         _left_covered=left_covered,
         _right_covered=right_covered,
         device_state=OverlayFaceDeviceState(
-            face_offsets=runtime.from_host(face_offsets),
-            face_edge_ids=runtime.from_host(face_edge_ids),
-            bounded_mask=runtime.from_host(bounded_mask),
-            signed_area=runtime.from_host(signed_area),
-            centroid_x=runtime.from_host(centroid_x),
-            centroid_y=runtime.from_host(centroid_y),
-            left_covered=runtime.from_host(left_covered),
-            right_covered=runtime.from_host(right_covered),
+            face_offsets=d_face_offsets,
+            face_edge_ids=d_face_edge_ids,
+            bounded_mask=d_bounded_mask,
+            signed_area=d_signed_area,
+            centroid_x=d_centroid_x,
+            centroid_y=d_centroid_y,
+            left_covered=d_left_covered,
+            right_covered=d_right_covered,
         ),
     )
 

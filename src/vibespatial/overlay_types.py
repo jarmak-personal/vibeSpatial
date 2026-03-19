@@ -382,12 +382,20 @@ class OverlayFaceTable:
 
     @property
     def left_covered(self) -> np.ndarray:
-        self._ensure_host()
+        if self._left_covered is None:
+            self._ensure_host()
+        if self._left_covered is None and self.device_state is not None and self.device_state.left_covered is not None:
+            runtime = get_cuda_runtime()
+            self._left_covered = np.asarray(runtime.copy_device_to_host(self.device_state.left_covered), dtype=np.int8)
         return self._left_covered  # type: ignore[return-value]
 
     @property
     def right_covered(self) -> np.ndarray:
-        self._ensure_host()
+        if self._right_covered is None:
+            self._ensure_host()
+        if self._right_covered is None and self.device_state is not None and self.device_state.right_covered is not None:
+            runtime = get_cuda_runtime()
+            self._right_covered = np.asarray(runtime.copy_device_to_host(self.device_state.right_covered), dtype=np.int8)
         return self._right_covered  # type: ignore[return-value]
 
     @property
