@@ -75,7 +75,7 @@ NVRTC operates on independent `nvrtcProgram` handles with no shared
 mutable state between programs. Different threads can concurrently
 compile different programs. NVRTC does not require a CUDA context
 for compilation --- context is only needed for `cuModuleLoadData` to
-load the resulting PTX.
+load the resulting CUBIN (compiled to native SASS via `-arch=sm_XX`).
 
 #### Serialization bottlenecks
 
@@ -775,11 +775,13 @@ triggers all 18 CCCL specs + 14 NVRTC units. Background CPU time:
 ### What About On-Disk Caching?
 
 CCCL does not currently expose an API to serialize compiled GPU code
-to disk. NVRTC's PTX output can be cached, but our NVRTC path already
-uses in-memory caching that is fast enough. On-disk caching would
-help across process restarts but adds complexity (cache invalidation
-on driver/GPU/code changes). Defer until CCCL ships its own persistent
-cache or benchmarks show process-restart latency is a real bottleneck.
+to disk. NVRTC CUBIN output is already disk-cached by
+`CudaDriverRuntime` (see `_read_cached_cubin` / `_write_cached_cubin`
+in `cuda_runtime.py`), keyed by compute capability, NVRTC version,
+source hash, and compile options. This eliminates NVRTC recompilation
+across process restarts. Defer CCCL on-disk caching until CCCL ships
+its own persistent cache or benchmarks show restart latency is
+critical.
 
 ### What About cuda.coop?
 
