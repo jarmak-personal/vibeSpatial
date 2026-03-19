@@ -1,25 +1,28 @@
+# Contract Promotion
+
 <!-- DOC_HEADER:START
 Scope: Upstream GeoPandas contract promotion gates, test-group ordering, and promotion workflow.
 Read If: You are promoting, inspecting, or verifying upstream contract test groups.
 STOP IF: Your task already has the specific test group open and only needs local pass criteria.
 Source Of Truth: Contract promotion workflow for upstream GeoPandas test groups.
-Body Budget: 142/260 lines
+Body Budget: 144/260 lines
 Document: docs/testing/contract-promotion.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-5 | Intent |
-| 6-13 | Request Signals |
-| 14-19 | Open First |
-| 20-24 | Verify |
-| 25-30 | Risks |
-| 31-37 | Phase 7 Order |
-| 38-51 | Current Promotion Gate |
-| 52-82 | Query Promotion Gate |
-| 83-113 | Constructive Promotion Gate |
-| 114-137 | IO Promotion Gate |
-| 138-142 | Workflow |
+| 1-2 | Preamble |
+| 3-7 | Intent |
+| 8-15 | Request Signals |
+| 16-21 | Open First |
+| 22-26 | Verify |
+| 27-32 | Risks |
+| 33-39 | Phase 7 Order |
+| 40-53 | Current Promotion Gate |
+| 54-84 | Query Promotion Gate |
+| 85-115 | Constructive Promotion Gate |
+| 116-139 | IO Promotion Gate |
+| 140-144 | Workflow |
 DOC_HEADER:END -->
 
 ## Intent

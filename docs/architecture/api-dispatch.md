@@ -1,22 +1,25 @@
+# API Dispatch
+
 <!-- DOC_HEADER:START
 Scope: GeoPandas method delegation, dispatch events, and object-construction avoidance.
 Read If: You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.
 STOP IF: Your task already has the adapter implementation open and only needs local detail.
 Source Of Truth: API dispatch policy for GeoPandas-facing method boundaries.
-Body Budget: 61/220 lines
+Body Budget: 63/220 lines
 Document: docs/architecture/api-dispatch.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-6 | Intent |
-| 7-14 | Request Signals |
-| 15-21 | Open First |
-| 22-26 | Verify |
-| 27-32 | Risks |
-| 33-44 | Decision |
-| 45-54 | Performance Notes |
-| 55-61 | Current Behavior |
+| 1-2 | Preamble |
+| 3-8 | Intent |
+| 9-16 | Request Signals |
+| 17-23 | Open First |
+| 24-28 | Verify |
+| 29-34 | Risks |
+| 35-46 | Decision |
+| 47-56 | Performance Notes |
+| 57-63 | Current Behavior |
 DOC_HEADER:END -->
 
 ## Intent

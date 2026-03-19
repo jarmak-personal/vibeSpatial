@@ -1,22 +1,25 @@
+# IO Support Matrix
+
 <!-- DOC_HEADER:START
 Scope: IO format classification as GPU-native, hybrid, or fallback-only.
 Read If: You are classifying a format pathway or adding a new IO format target.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: IO format classification matrix for GPU-native versus hybrid versus fallback paths.
-Body Budget: 53/220 lines
+Body Budget: 55/220 lines
 Document: docs/architecture/io-support-matrix.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-5 | Intent |
-| 6-13 | Request Signals |
-| 14-19 | Open First |
-| 20-23 | Verify |
-| 24-28 | Risks |
-| 29-36 | Decision |
-| 37-47 | Matrix |
-| 48-53 | Performance Notes |
+| 1-2 | Preamble |
+| 3-7 | Intent |
+| 8-15 | Request Signals |
+| 16-21 | Open First |
+| 22-25 | Verify |
+| 26-30 | Risks |
+| 31-38 | Decision |
+| 39-49 | Matrix |
+| 50-55 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent

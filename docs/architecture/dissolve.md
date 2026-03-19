@@ -1,22 +1,25 @@
+# Dissolve Pipeline
+
 <!-- DOC_HEADER:START
 Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggregation policy.
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 63/220 lines
+Body Budget: 65/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-6 | Intent |
-| 7-14 | Request Signals |
-| 15-21 | Open First |
-| 22-26 | Verify |
-| 27-32 | Risks |
-| 33-41 | Decision |
-| 42-50 | Pipeline |
-| 51-63 | Performance Notes |
+| 1-2 | Preamble |
+| 3-8 | Intent |
+| 9-16 | Request Signals |
+| 17-23 | Open First |
+| 24-28 | Verify |
+| 29-34 | Risks |
+| 35-43 | Decision |
+| 44-52 | Pipeline |
+| 53-65 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent

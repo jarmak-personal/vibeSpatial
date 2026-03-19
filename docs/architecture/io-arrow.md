@@ -1,23 +1,26 @@
+# Arrow And GeoParquet IO
+
 <!-- DOC_HEADER:START
 Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and GPU-native decode paths.
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 159/260 lines
+Body Budget: 161/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-5 | Intent |
-| 6-16 | Request Signals |
-| 17-23 | Open First |
-| 24-29 | Verify |
-| 30-35 | Risks |
-| 36-51 | Decision |
-| 52-73 | Performance Notes |
-| 74-121 | Current Behavior |
-| 122-159 | Measured Local Baseline |
+| 1-2 | Preamble |
+| 3-7 | Intent |
+| 8-18 | Request Signals |
+| 19-25 | Open First |
+| 26-31 | Verify |
+| 32-37 | Risks |
+| 38-53 | Decision |
+| 54-75 | Performance Notes |
+| 76-123 | Current Behavior |
+| 124-161 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent

@@ -1,26 +1,29 @@
+# IO Acceleration
+
 <!-- DOC_HEADER:START
 Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and format-level speed targets.
 Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
 STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
 Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-Body Budget: 144/260 lines
+Body Budget: 146/260 lines
 Document: docs/architecture/io-acceleration.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-6 | Purpose |
-| 7-11 | Intent |
-| 12-20 | Request Signals |
-| 21-28 | Open First |
-| 29-34 | Verify |
-| 35-41 | Risks |
-| 42-60 | Decision |
-| 61-74 | Execution Model |
-| 75-102 | Format Strategy |
-| 103-115 | CCCL Preference Order |
-| 116-134 | Performance Targets |
-| 135-144 | Non-Negotiable Constraints |
+| 1-2 | Preamble |
+| 3-8 | Purpose |
+| 9-13 | Intent |
+| 14-22 | Request Signals |
+| 23-30 | Open First |
+| 31-36 | Verify |
+| 37-43 | Risks |
+| 44-62 | Decision |
+| 63-76 | Execution Model |
+| 77-104 | Format Strategy |
+| 105-117 | CCCL Preference Order |
+| 118-136 | Performance Targets |
+| 137-146 | Non-Negotiable Constraints |
 DOC_HEADER:END -->
 
 ## Purpose

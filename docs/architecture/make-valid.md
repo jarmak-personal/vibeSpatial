@@ -1,21 +1,24 @@
+# Make Valid Pipeline
+
 <!-- DOC_HEADER:START
 Scope: Compact-invalid-row make_valid pipeline staging and repair-only-invalids policy.
 Read If: You are changing make_valid, validity checking, or topology repair pipelines.
 STOP IF: Your task already has the make_valid pipeline open and only needs local implementation detail.
 Source Of Truth: Make-valid pipeline architecture for compact-and-repair staging.
-Body Budget: 46/220 lines
+Body Budget: 48/220 lines
 Document: docs/architecture/make-valid.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-6 | Intent |
-| 7-14 | Request Signals |
-| 15-20 | Open First |
-| 21-25 | Verify |
-| 26-30 | Risks |
-| 31-38 | Decision |
-| 39-46 | Performance Notes |
+| 1-2 | Preamble |
+| 3-8 | Intent |
+| 9-16 | Request Signals |
+| 17-22 | Open First |
+| 23-27 | Verify |
+| 28-32 | Risks |
+| 33-40 | Decision |
+| 41-48 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent

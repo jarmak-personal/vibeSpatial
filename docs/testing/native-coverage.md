@@ -1,22 +1,25 @@
+# Native Coverage
+
 <!-- DOC_HEADER:START
 Scope: Strict native mode upstream test pass rate as the real GeoPandas compatibility metric.
 Read If: You are measuring, reporting, or verifying strict native GeoPandas compatibility.
 STOP IF: Your task already has the coverage script open and only needs the command.
 Source Of Truth: Native coverage metric definition for upstream GeoPandas compatibility.
-Body Budget: 63/220 lines
+Body Budget: 65/220 lines
 Document: docs/testing/native-coverage.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-5 | Intent |
-| 6-12 | Request Signals |
-| 13-17 | Open First |
-| 18-22 | Verify |
-| 23-27 | Risks |
-| 28-49 | Definition |
-| 50-57 | Command |
-| 58-63 | Notes |
+| 1-2 | Preamble |
+| 3-7 | Intent |
+| 8-14 | Request Signals |
+| 15-19 | Open First |
+| 20-24 | Verify |
+| 25-29 | Risks |
+| 30-51 | Definition |
+| 52-59 | Command |
+| 60-65 | Notes |
 DOC_HEADER:END -->
 
 ## Intent

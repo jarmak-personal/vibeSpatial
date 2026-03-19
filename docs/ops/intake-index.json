@@ -242,7 +242,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Api-Dispatch",
+      "title": "API Dispatch",
       "tokens": [
         "adapter",
         "already",
@@ -734,7 +734,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Dissolve",
+      "title": "Dissolve Pipeline",
       "tokens": [
         "aggregation",
         "already",
@@ -1128,7 +1128,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Io-Acceleration",
+      "title": "IO Acceleration",
       "tokens": [
         "6b",
         "acceleration",
@@ -1238,7 +1238,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Io-Arrow",
+      "title": "Arrow And GeoParquet IO",
       "tokens": [
         "adapter",
         "adapters",
@@ -1334,7 +1334,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Io-Files",
+      "title": "File Format IO",
       "tokens": [
         "adapter",
         "adapters",
@@ -1419,7 +1419,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Io-Support-Matrix",
+      "title": "IO Support Matrix",
       "tokens": [
         "adapter",
         "adding",
@@ -1498,7 +1498,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Make-Valid",
+      "title": "Make Valid Pipeline",
       "tokens": [
         "already",
         "architecture",
@@ -2582,7 +2582,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Stroke-Kernels",
+      "title": "Stroke Kernels",
       "tokens": [
         "already",
         "architecture",
@@ -2831,7 +2831,7 @@
         "Verify",
         "Workflow"
       ],
-      "title": "Contract-Promotion",
+      "title": "Contract Promotion",
       "tokens": [
         "already",
         "are",
@@ -3166,7 +3166,7 @@
         "Risks",
         "Verify"
       ],
-      "title": "Native-Coverage",
+      "title": "Native Coverage",
       "tokens": [
         "already",
         "are",

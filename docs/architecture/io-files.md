@@ -1,23 +1,26 @@
+# File Format IO
+
 <!-- DOC_HEADER:START
 Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL adapters.
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 201/280 lines
+Body Budget: 203/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-5 | Intent |
-| 6-15 | Request Signals |
-| 16-21 | Open First |
-| 22-27 | Verify |
-| 28-33 | Risks |
-| 34-42 | Decision |
-| 43-52 | Performance Notes |
-| 53-111 | Current Behavior |
-| 112-201 | Measured Local Baseline |
+| 1-2 | Preamble |
+| 3-7 | Intent |
+| 8-17 | Request Signals |
+| 18-23 | Open First |
+| 24-29 | Verify |
+| 30-35 | Risks |
+| 36-44 | Decision |
+| 45-54 | Performance Notes |
+| 55-113 | Current Behavior |
+| 114-203 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
