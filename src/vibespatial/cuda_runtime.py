@@ -76,10 +76,10 @@ DeviceArray: TypeAlias = Any
 
 
 # ---------------------------------------------------------------------------
-# NVRTC disk cache — persists compiled PTX across process restarts
+# NVRTC disk cache — persists compiled CUBIN across process restarts
 # ---------------------------------------------------------------------------
 
-_NVRTC_CACHE_FORMAT_VERSION = "v1"
+_NVRTC_CACHE_FORMAT_VERSION = "v2"
 _disk_cache_writes_disabled = False
 
 
@@ -103,7 +103,7 @@ def _disk_cache_enabled() -> bool:
 
 @lru_cache(maxsize=1)
 def _get_cache_dir() -> pathlib.Path:
-    """Return the disk cache directory for NVRTC PTX files."""
+    """Return the disk cache directory for NVRTC CUBIN files."""
     env_dir = os.environ.get("VIBESPATIAL_NVRTC_CACHE_DIR")
     if env_dir:
         return pathlib.Path(env_dir)
@@ -119,7 +119,7 @@ def _disk_cache_key(
     options: tuple[str, ...],
     nvrtc_ver: tuple[int, int],
 ) -> str:
-    """Build a filesystem-safe cache key for disk PTX storage."""
+    """Build a filesystem-safe cache key for disk CUBIN storage."""
     parts = [
         _NVRTC_CACHE_FORMAT_VERSION,
         f"sm{compute_cap[0]}{compute_cap[1]}",
@@ -132,12 +132,12 @@ def _disk_cache_key(
     return "-".join(parts)
 
 
-def _read_cached_ptx(disk_key: str) -> bytes | None:
-    """Read cached PTX from disk. Returns None on miss or error."""
-    path = _get_cache_dir() / f"{disk_key}.ptx"
+def _read_cached_cubin(disk_key: str) -> bytes | None:
+    """Read cached CUBIN from disk. Returns None on miss or error."""
+    path = _get_cache_dir() / f"{disk_key}.cubin"
     try:
         data = path.read_bytes()
-        if len(data) < 16:  # too small to be valid PTX
+        if len(data) < 16:  # too small to be valid CUBIN
             path.unlink(missing_ok=True)
             return None
         return data
@@ -145,16 +145,16 @@ def _read_cached_ptx(disk_key: str) -> bytes | None:
         return None
 
 
-def _write_cached_ptx(disk_key: str, ptx: bytes) -> None:
-    """Atomically write PTX to disk cache. Errors silently disable writes."""
+def _write_cached_cubin(disk_key: str, cubin: bytes) -> None:
+    """Atomically write CUBIN to disk cache. Errors silently disable writes."""
     global _disk_cache_writes_disabled
     if _disk_cache_writes_disabled:
         return
-    path = _get_cache_dir() / f"{disk_key}.ptx"
+    path = _get_cache_dir() / f"{disk_key}.cubin"
     tmp = path.with_suffix(f".tmp.{os.getpid()}")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_bytes(ptx)
+        tmp.write_bytes(cubin)
         os.replace(str(tmp), str(path))
     except OSError:
         _disk_cache_writes_disabled = True
@@ -165,9 +165,9 @@ def _write_cached_ptx(disk_key: str, ptx: bytes) -> None:
             pass
 
 
-def _delete_cached_ptx(disk_key: str) -> None:
+def _delete_cached_cubin(disk_key: str) -> None:
     """Delete a corrupt cache file."""
-    path = _get_cache_dir() / f"{disk_key}.ptx"
+    path = _get_cache_dir() / f"{disk_key}.cubin"
     try:
         path.unlink(missing_ok=True)
     except OSError:
@@ -198,6 +198,7 @@ class CudaDriverRuntime:
         self._device: Any | None = None
         self._compute_capability: tuple[int, int] | None = None
         self._fp64_to_fp32_ratio: float | None = None
+        self._driver_cuda_version: tuple[int, int] = (0, 0)
         self._module_cache: dict[str, dict[str, Any]] = {}
         self._module_cache_lock = threading.Lock()
         self._block_size_cache: dict[int, int] = {}
@@ -266,10 +267,41 @@ class CudaDriverRuntime:
                 fp64_ratio = 1.0 / float(int(fp64_ratio_raw)) if int(fp64_ratio_raw) > 0 else 1.0 / 32.0
             except Exception:
                 fp64_ratio = 1.0 / 32.0  # conservative consumer default
+            # Query driver CUDA version for NVRTC compatibility diagnostics
+            driver_version = 0
+            try:
+                dv, = _check_driver(cu.cuDriverGetVersion())
+                driver_version = int(dv)
+            except Exception:
+                pass
+            self._driver_cuda_version = (
+                (driver_version // 1000, (driver_version % 1000) // 10)
+                if driver_version > 0
+                else (0, 0)
+            )
             self._device = device
             self._context = context
             self._compute_capability = (int(major), int(minor))
             self._fp64_to_fp32_ratio = fp64_ratio
+
+            # Warn if NVRTC major version exceeds driver capability.
+            # CUBIN compilation avoids PTX JIT so this is non-fatal,
+            # but worth flagging for diagnostics.
+            nvrtc_ver = _nvrtc_version()
+            if nvrtc_ver[0] > 0 and self._driver_cuda_version[0] > 0:
+                if nvrtc_ver[0] > self._driver_cuda_version[0]:
+                    logger.warning(
+                        "NVRTC %d.%d is newer than the CUDA driver (%d.%d). "
+                        "vibespatial compiles to CUBIN (native machine code) so "
+                        "this is safe, but PTX-based workflows would fail. "
+                        "Consider upgrading your NVIDIA driver or installing "
+                        "a cuda-python version matching your driver.",
+                        nvrtc_ver[0],
+                        nvrtc_ver[1],
+                        self._driver_cuda_version[0],
+                        self._driver_cuda_version[1],
+                    )
+
             return self._context
 
     @property
@@ -284,6 +316,12 @@ class CudaDriverRuntime:
         self._ensure_context()
         assert self._fp64_to_fp32_ratio is not None
         return self._fp64_to_fp32_ratio
+
+    @property
+    def driver_cuda_version(self) -> tuple[int, int]:
+        """Return the max CUDA version supported by the installed driver, e.g. ``(13, 0)``."""
+        self._ensure_context()
+        return self._driver_cuda_version
 
     @contextmanager
     def activate(self):
@@ -534,19 +572,19 @@ class CudaDriverRuntime:
                 return self._module_cache[cache_key]
             with self.activate():
                 cc = self.compute_capability
-                arch = f"--gpu-architecture=compute_{cc[0]}{cc[1]}"
+                arch = f"--gpu-architecture=sm_{cc[0]}{cc[1]}"
                 compile_options = tuple(options) + (arch,)
 
                 # --- Disk cache probe ---
-                ptx = None
+                cubin = None
                 disk_key = None
                 disk_cache_hit = False
                 if _disk_cache_enabled():
                     disk_key = _disk_cache_key(cache_key, cc, options, _nvrtc_version())
-                    ptx = _read_cached_ptx(disk_key)
-                    disk_cache_hit = ptx is not None
+                    cubin = _read_cached_cubin(disk_key)
+                    disk_cache_hit = cubin is not None
 
-                if ptx is None:
+                if cubin is None:
                     # NVRTC compilation (expensive path: 20-400ms)
                     program_name = f"{cache_key}.cu".encode()
                     program, = _check_nvrtc(
@@ -559,22 +597,22 @@ class CudaDriverRuntime:
                         log = bytearray(log_size)
                         _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
                         raise RuntimeError(bytes(log).decode(errors="replace"))
-                    ptx_size, = _check_nvrtc(nvrtc.nvrtcGetPTXSize(program))
-                    ptx = bytearray(ptx_size)
-                    _check_nvrtc(nvrtc.nvrtcGetPTX(program, ptx))
-                    ptx = bytes(ptx)
+                    cubin_size, = _check_nvrtc(nvrtc.nvrtcGetCUBINSize(program))
+                    cubin = bytearray(cubin_size)
+                    _check_nvrtc(nvrtc.nvrtcGetCUBIN(program, cubin))
+                    cubin = bytes(cubin)
 
                     # Write to disk cache
                     if disk_key is not None:
-                        _write_cached_ptx(disk_key, ptx)
+                        _write_cached_cubin(disk_key, cubin)
 
-                # Load PTX into driver module
+                # Load CUBIN into driver module
                 try:
-                    module, = _check_driver(cu.cuModuleLoadData(ptx))
+                    module, = _check_driver(cu.cuModuleLoadData(cubin))
                 except RuntimeError:
                     if disk_cache_hit:
                         # Corrupt cache file — delete and recompile
-                        _delete_cached_ptx(disk_key)
+                        _delete_cached_cubin(disk_key)
                         return self._compile_kernels_no_disk_cache(
                             cache_key=cache_key, source=source,
                             kernel_names=kernel_names, options=options,
@@ -601,7 +639,7 @@ class CudaDriverRuntime:
     ) -> dict[str, CompiledKernel]:
         """Fallback compilation without disk cache (used on corrupt cache recovery)."""
         cc = self.compute_capability
-        arch = f"--gpu-architecture=compute_{cc[0]}{cc[1]}"
+        arch = f"--gpu-architecture=sm_{cc[0]}{cc[1]}"
         compile_options = tuple(options) + (arch,)
         program_name = f"{cache_key}.cu".encode()
         program, = _check_nvrtc(
@@ -614,11 +652,11 @@ class CudaDriverRuntime:
             log = bytearray(log_size)
             _check_nvrtc(nvrtc.nvrtcGetProgramLog(program, log))
             raise RuntimeError(bytes(log).decode(errors="replace"))
-        ptx_size, = _check_nvrtc(nvrtc.nvrtcGetPTXSize(program))
-        ptx = bytearray(ptx_size)
-        _check_nvrtc(nvrtc.nvrtcGetPTX(program, ptx))
-        ptx = bytes(ptx)
-        module, = _check_driver(cu.cuModuleLoadData(ptx))
+        cubin_size, = _check_nvrtc(nvrtc.nvrtcGetCUBINSize(program))
+        cubin = bytearray(cubin_size)
+        _check_nvrtc(nvrtc.nvrtcGetCUBIN(program, cubin))
+        cubin = bytes(cubin)
+        module, = _check_driver(cu.cuModuleLoadData(cubin))
         kernels = {
             name: CompiledKernel(
                 name=name,
@@ -695,13 +733,18 @@ def make_kernel_cache_key(prefix: str, source: str) -> str:
 
 
 def clear_nvrtc_cache() -> int:
-    """Delete all cached NVRTC PTX files from disk.
+    """Delete all cached NVRTC CUBIN files from disk.
 
-    Returns the number of files removed.
+    Returns the number of files removed.  Also cleans up any legacy
+    ``.ptx`` files left over from the v1 cache format.
     """
     cache_dir = _get_cache_dir()
     removed = 0
     try:
+        for path in cache_dir.glob("*.cubin"):
+            path.unlink()
+            removed += 1
+        # Clean up legacy v1 PTX cache files
         for path in cache_dir.glob("*.ptx"):
             path.unlink()
             removed += 1
@@ -713,7 +756,7 @@ def clear_nvrtc_cache() -> int:
 def nvrtc_cache_stats() -> dict[str, int | str]:
     """Return disk cache location and size statistics."""
     cache_dir = _get_cache_dir()
-    files = list(cache_dir.glob("*.ptx")) if cache_dir.exists() else []
+    files = list(cache_dir.glob("*.cubin")) if cache_dir.exists() else []
     total_bytes = sum(f.stat().st_size for f in files)
     return {
         "directory": str(cache_dir),

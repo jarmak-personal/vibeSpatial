@@ -5,11 +5,11 @@ from __future__ import annotations
 import pytest
 
 from vibespatial.cuda_runtime import (
-    _delete_cached_ptx,
+    _delete_cached_cubin,
     _disk_cache_key,
     _get_cache_dir,
-    _read_cached_ptx,
-    _write_cached_ptx,
+    _read_cached_cubin,
+    _write_cached_cubin,
     clear_nvrtc_cache,
     nvrtc_cache_stats,
 )
@@ -21,7 +21,7 @@ from vibespatial.cuda_runtime import (
 
 def test_disk_cache_key_includes_all_components():
     key = _disk_cache_key("polygon-area-abc123", (8, 9), (), (12, 6))
-    assert key == "v1-sm89-nvrtc12.6-polygon-area-abc123"
+    assert key == "v2-sm89-nvrtc12.6-polygon-area-abc123"
 
 
 def test_disk_cache_key_changes_with_compute_capability():
@@ -69,10 +69,10 @@ def test_write_and_read_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        ptx = b"// PTX stub content for testing\x00" + b"\x00" * 100
-        _write_cached_ptx("test-key", ptx)
-        result = _read_cached_ptx("test-key")
-        assert result == ptx
+        cubin = b"\x7fELF" + b"\x00" * 120  # ELF-like stub
+        _write_cached_cubin("test-key", cubin)
+        result = _read_cached_cubin("test-key")
+        assert result == cubin
     finally:
         _get_cache_dir.cache_clear()
 
@@ -81,7 +81,7 @@ def test_read_nonexistent_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        result = _read_cached_ptx("nonexistent-key")
+        result = _read_cached_cubin("nonexistent-key")
         assert result is None
     finally:
         _get_cache_dir.cache_clear()
@@ -92,23 +92,23 @@ def test_read_corrupt_file_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        path = tmp_path / "test-corrupt.ptx"
+        path = tmp_path / "test-corrupt.cubin"
         path.write_bytes(b"tiny")  # < 16 bytes
-        result = _read_cached_ptx("test-corrupt")
+        result = _read_cached_cubin("test-corrupt")
         assert result is None
         assert not path.exists()  # corrupt file cleaned up
     finally:
         _get_cache_dir.cache_clear()
 
 
-def test_delete_cached_ptx(tmp_path, monkeypatch):
+def test_delete_cached_cubin(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        path = tmp_path / "test-delete.ptx"
+        path = tmp_path / "test-delete.cubin"
         path.write_bytes(b"x" * 100)
         assert path.exists()
-        _delete_cached_ptx("test-delete")
+        _delete_cached_cubin("test-delete")
         assert not path.exists()
     finally:
         _get_cache_dir.cache_clear()
@@ -118,7 +118,7 @@ def test_delete_nonexistent_is_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        _delete_cached_ptx("does-not-exist")  # should not raise
+        _delete_cached_cubin("does-not-exist")  # should not raise
     finally:
         _get_cache_dir.cache_clear()
 
@@ -142,8 +142,8 @@ def test_write_failure_does_not_crash(tmp_path, monkeypatch):
     old_flag = mod._disk_cache_writes_disabled
     mod._disk_cache_writes_disabled = False
     try:
-        ptx = b"// PTX content\x00" + b"\x00" * 100
-        _write_cached_ptx("test-readonly", ptx)  # should not raise
+        cubin = b"\x7fELF" + b"\x00" * 120
+        _write_cached_cubin("test-readonly", cubin)  # should not raise
         assert mod._disk_cache_writes_disabled is True
     finally:
         read_only.chmod(0o755)
@@ -161,11 +161,11 @@ def test_atomic_write_no_partial_files(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        ptx = b"// PTX content for atomicity test\x00" + b"\x00" * 100
-        _write_cached_ptx("atomic-test", ptx)
+        cubin = b"\x7fELF" + b"\x00" * 120
+        _write_cached_cubin("atomic-test", cubin)
         files = list(tmp_path.iterdir())
         assert len(files) == 1
-        assert files[0].name == "atomic-test.ptx"
+        assert files[0].name == "atomic-test.cubin"
         assert ".tmp" not in files[0].name
     finally:
         _get_cache_dir.cache_clear()
@@ -259,8 +259,8 @@ def test_compile_kernels_populates_disk_cache(tmp_path, monkeypatch):
         """
         compile_kernel_group("test-disk-cache", source, ("test_cache_kernel",))
 
-        # Verify our PTX file was written to disk
-        matching = [p for p in tmp_path.glob("*.ptx") if "test-disk-cache" in p.name]
+        # Verify our CUBIN file was written to disk
+        matching = [p for p in tmp_path.glob("*.cubin") if "test-disk-cache" in p.name]
         assert len(matching) == 1
         assert matching[0].stat().st_size > 16
     finally:
@@ -277,12 +277,13 @@ def test_clear_nvrtc_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        # Write some files
-        for name in ("a", "b", "c"):
-            (tmp_path / f"{name}.ptx").write_bytes(b"x" * 100)
-        assert len(list(tmp_path.glob("*.ptx"))) == 3
+        # Write some files (mix of cubin and legacy ptx)
+        for name in ("a", "b"):
+            (tmp_path / f"{name}.cubin").write_bytes(b"x" * 100)
+        (tmp_path / "legacy.ptx").write_bytes(b"x" * 100)
         removed = clear_nvrtc_cache()
         assert removed == 3
+        assert len(list(tmp_path.glob("*.cubin"))) == 0
         assert len(list(tmp_path.glob("*.ptx"))) == 0
     finally:
         _get_cache_dir.cache_clear()
@@ -302,8 +303,8 @@ def test_nvrtc_cache_stats(tmp_path, monkeypatch):
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     try:
-        (tmp_path / "a.ptx").write_bytes(b"x" * 200)
-        (tmp_path / "b.ptx").write_bytes(b"y" * 300)
+        (tmp_path / "a.cubin").write_bytes(b"x" * 200)
+        (tmp_path / "b.cubin").write_bytes(b"y" * 300)
         stats = nvrtc_cache_stats()
         assert stats["directory"] == str(tmp_path)
         assert stats["file_count"] == 2
