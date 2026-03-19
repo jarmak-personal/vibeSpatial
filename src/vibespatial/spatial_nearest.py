@@ -872,16 +872,20 @@ def _nearest_grid_gpu(
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
 
+    # Guard: int32 kernel parameters cannot exceed 2^31-1.
+    if n_tree > np.iinfo(np.int32).max or n_query > np.iinfo(np.int32).max:
+        return None
+
     # --- Upload tree coords to device ---
     d_tree_x = runtime.from_host(tree_x_h)
     d_tree_y = runtime.from_host(tree_y_h)
     d_tree_global_idx = runtime.from_host(tree_global_idx.astype(np.int32))
 
-    # --- Grid build (all on device) ---
-    min_x = float(cp.min(d_tree_x))
-    max_x = float(cp.max(d_tree_x))
-    min_y = float(cp.min(d_tree_y))
-    max_y = float(cp.max(d_tree_y))
+    # --- Grid build: compute bbox from host arrays (avoids 4 D2H syncs) ---
+    min_x = float(tree_x_h.min())
+    max_x = float(tree_x_h.max())
+    min_y = float(tree_y_h.min())
+    max_y = float(tree_y_h.max())
     extent_x = max_x - min_x
     extent_y = max_y - min_y
     extent = max(extent_x, extent_y, 1e-12)
