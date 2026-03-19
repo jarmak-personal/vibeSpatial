@@ -56,11 +56,11 @@ vibeSpatial a pure GPU library.
       array copied to host (unless `_return_device=True`).
       *Fix: Make device-return the default internal path.*
 
-- [ ] **10. overlay_gpu.py:1564** -- D->H
+- [x] **10. overlay_gpu.py:1564** -- D->H
       `list(cp.asnumpy(...).astype(int))` cycle source rows.
       *Fix: Keep on device, use GPU scatter.*
 
-- [ ] **11. overlay_gpu.py:1599** -- D->H
+- [x] **11. overlay_gpu.py:1599** -- D->H
       `list(cp.asnumpy(cp.flatnonzero(d_hole_mask)))`.
       *Fix: Device-side hole indexing.*
 
@@ -102,11 +102,11 @@ vibeSpatial a pure GPU library.
       *N/A: Transfers are structurally required -- only reached in CPU-candidate
       path where indices genuinely start on host. GPU path uses device arrays directly.*
 
-- [ ] **20. wkb_decode.py:637-1246 (9 sites)** -- D->H
+- [x] **20. wkb_decode.py:637-1246 (9 sites)** -- D->H
       `int(row_indexes.size)` scalar sync per geometry family (up to 6x).
       *Fix: Consolidate sizing into single kernel.*
 
-- [ ] **21. wkb_decode.py:724, 1019, 1023-1024** -- D->H
+- [x] **21. wkb_decode.py:724, 1019, 1023-1024** -- D->H
       `int(geometry_offsets[-1])` offset terminators for allocation.
       *Fix: Fused allocation kernel.*
 

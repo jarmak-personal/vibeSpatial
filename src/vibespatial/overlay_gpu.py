@@ -1559,9 +1559,10 @@ def _build_polygon_output_from_faces_gpu(
     d_ring_edge_starts = sorted_full_edge_ids[valid_cycle_starts]
     d_ring_edge_counts = valid_cycle_lengths
 
-    # Source row per cycle: take the row_index of the first edge
+    # Source row per cycle: take the row_index of the first edge (device-resident
+    # until Step 10 materialization boundary per ADR-0005)
     d_row_indices = cp.asarray(half_edge_graph.row_indices)
-    cycle_source_rows = list(cp.asnumpy(d_row_indices[d_ring_edge_starts]).astype(int))
+    d_cycle_source_rows = d_row_indices[d_ring_edge_starts].astype(cp.int32)
 
     # --- Step 6: Compute ring coordinate offsets (Tier 3a: exclusive_scan) ---
     # Each ring needs edge_count + 1 coordinates (for closure)
@@ -1603,7 +1604,7 @@ def _build_polygon_output_from_faces_gpu(
     d_face_selected_bool = cp.zeros(face_count, dtype=cp.bool_)
     d_face_selected_bool[cp.asarray(selected_face_indices)] = True
     d_hole_mask = (d_bounded_mask_dev != 0) & (~d_face_selected_bool)
-    hole_face_indices = list(cp.asnumpy(cp.flatnonzero(d_hole_mask)).astype(int))
+    d_hole_fi = cp.flatnonzero(d_hole_mask).astype(cp.int32)
 
     # Extract hole ring coordinates using scatter_ring_coordinates kernel.
     # Hole faces use next_edge_ids (not boundary_next) for edge traversal.
@@ -1611,8 +1612,7 @@ def _build_polygon_output_from_faces_gpu(
     d_face_edge_ids_dev = cp.asarray(face_device.face_edge_ids)
     d_next_i32 = cp.asarray(device.next_edge_ids).astype(cp.int32)
 
-    if hole_face_indices:
-        d_hole_fi = cp.asarray(np.asarray(hole_face_indices, dtype=np.int32))
+    if d_hole_fi.size > 0:
         d_hole_starts_in_face = d_face_offsets_dev[d_hole_fi]
         d_hole_ends_in_face = d_face_offsets_dev[d_hole_fi + 1]
         d_hole_lengths = d_hole_ends_in_face - d_hole_starts_in_face
@@ -1796,7 +1796,7 @@ def _build_polygon_output_from_faces_gpu(
 
     # Source rows: boundary rings from cycle walk, holes inherit from exterior
     h_source_rows = np.zeros(total_ring_count, dtype=np.int32)
-    h_source_rows[:boundary_ring_count] = np.asarray(cycle_source_rows, dtype=np.int32)
+    h_source_rows[:boundary_ring_count] = cp.asnumpy(d_cycle_source_rows)
 
     # Build exterior → holes mapping from kernel output
     exterior_indices_host = cp.asnumpy(d_exterior_indices)
