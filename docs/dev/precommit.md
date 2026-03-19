@@ -149,19 +149,23 @@ This is configured in `.claude/settings.json`:
 The hook only matches `git commit` commands -- all other Bash calls pass
 through without overhead.
 
-## Layer 4: commit-msg Gate (Co-Author Check)
+## Layer 4: commit-msg Gate (Content-Addressable Marker)
 
 The `commit-msg` hook (`.githooks/commit-msg`) is the **hard gate** for
 Claude-assisted commits. It checks the commit message for a
 `Co-Authored-By: ... Claude` line:
 
-- **Present**: the review marker `.claude/.review-completed` must exist and
-  be less than 1 hour old. If missing or stale, the commit is blocked.
+- **Present**: the review marker `.claude/.review-completed` must exist,
+  be less than 1 hour old, contain a `staged_hash` that matches the current
+  `git diff --cached | sha256sum`, and have a `verdict` of `LAND`.
+  If any check fails, the commit is blocked.
 - **Absent**: human-only commit, passes unconditionally.
 
-The marker is written by the `/pre-land-review` skill after a LAND verdict.
-This creates a mechanical link: the skill must actually run and pass before
-a Claude co-authored commit can land.
+The marker is a JSON file written by the `/pre-land-review` skill after a
+LAND verdict. It binds the review to the exact staged diff via SHA-256 hash,
+so a stub file (`touch .claude/.review-completed`) or a marker from a
+different staging state will not pass. If you stage additional changes after
+the review, the hash breaks and you must re-run `/pre-land-review`.
 
 ## How The Layers Interact
 
@@ -186,6 +190,8 @@ Each layer catches what the previous one might miss:
 | Agent forgets to review before committing | Layer 2 (skill) |
 | Long context compresses skill trigger away | Layer 3 (hook) |
 | Agent ignores skill and hook, commits anyway | Layer 4 (commit-msg gate) |
+| Agent creates stub marker file (`touch ...`) | Layer 4 (missing JSON / hash) |
+| Agent stages new changes after review | Layer 4 (hash mismatch) |
 | Claude Code not available (human contributor) | Layer 1 (pre-commit, no gate) |
 | Non-interactive environment (CI, VS Code) | Layer 1 (pre-commit, no gate) |
 

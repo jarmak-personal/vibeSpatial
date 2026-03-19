@@ -357,17 +357,32 @@ is not sufficient — if an agent can fix it in minutes, it is BLOCKING.
 
 ## After Review
 
-If the verdict is LAND, you MUST write the review marker before committing:
+If the verdict is LAND, you MUST write the content-addressable review marker
+before committing.  The marker binds the review to the exact staged diff so
+that a stub file or a stale marker from a different staging state cannot pass
+the `commit-msg` hook.
+
+Write the marker with this command (all on one line or in a script block):
 
 ```bash
-date -u +%Y-%m-%dT%H:%M:%SZ > .claude/.review-completed
+printf '{\n  "timestamp": "%s",\n  "staged_hash": "%s",\n  "files": [%s],\n  "verdict": "LAND"\n}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$(git diff --cached | sha256sum | cut -d' ' -f1)" \
+  "$(git diff --cached --name-only | sed 's/.*/"&"/' | paste -sd,)" \
+  > .claude/.review-completed
 ```
 
-This marker is checked by the `commit-msg` hook. If Claude is listed as
-co-author and the marker is missing or stale (>1 hour), the commit is
-blocked. The marker is single-use — the hook deletes it after a successful
-commit, so each commit requires its own review. Human-only commits are
-not gated.
+The `commit-msg` hook verifies:
+1. The file exists and is less than 1 hour old.
+2. `staged_hash` matches a fresh `git diff --cached | sha256sum`.
+3. `verdict` is `LAND`.
+
+If you stage additional changes after writing the marker, the hash will no
+longer match and the commit will be blocked -- re-run `/pre-land-review` to
+review the new staged state.
+
+The marker is single-use -- the hook deletes it after a successful commit,
+so each commit requires its own review.  Human-only commits are not gated.
 
 Then proceed with the commit. Include in the commit message:
 - Current strict-native GeoPandas coverage from
