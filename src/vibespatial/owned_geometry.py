@@ -39,6 +39,30 @@ FAMILY_TAGS: dict[GeometryFamily, int] = {
 TAG_FAMILIES = {value: key for key, value in FAMILY_TAGS.items()}
 
 
+def unique_tag_pairs(
+    left_tags: np.ndarray,
+    right_tags: np.ndarray,
+) -> list[tuple[int, int]]:
+    """Extract unique (left_tag, right_tag) pairs without Python-level iteration.
+
+    Works with both numpy and CuPy arrays.  Packs two int8 tags into one
+    int16 and calls the array library's ``unique``, then unpacks the small
+    result (at most 36 pairs for 6 geometry families) on the host.
+
+    This replaces the ``set(zip(left.tolist(), right.tolist()))`` anti-pattern
+    which forces a full-array D->H transfer and O(n) Python iteration.
+
+    Precondition: tag values must be non-negative and fit in int8 (0..127).
+    Callers must filter null rows (NULL_TAG = -1) before calling.
+    """
+    xp = cp if cp is not None and not isinstance(left_tags, np.ndarray) else np
+    packed = left_tags.astype(xp.int16) * np.int16(256) + right_tags.astype(xp.int16)
+    unique_packed = xp.unique(packed)
+    if xp is not np:
+        unique_packed = unique_packed.get()
+    return [(int(p // 256), int(p % 256)) for p in unique_packed]
+
+
 class DiagnosticKind(StrEnum):
     CREATED = "created"
     TRANSFER = "transfer"

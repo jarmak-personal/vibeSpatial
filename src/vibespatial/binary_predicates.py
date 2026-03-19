@@ -19,6 +19,7 @@ from vibespatial.owned_geometry import (
     TAG_FAMILIES,
     OwnedGeometryArray,
     from_shapely_geometries,
+    unique_tag_pairs,
 )
 from vibespatial.point_binary_relations import (
     POINT_LOCATION_BOUNDARY,
@@ -653,8 +654,7 @@ def _evaluate_gpu_de9im_candidates(
     d_candidate_rows = cp.asarray(candidate_rows)
 
     # Group by (left_family, right_family) and dispatch the correct kernel.
-    unique_tag_pairs = set(zip(left_tags.tolist(), right_tags.tolist()))
-    for lt, rt in unique_tag_pairs:
+    for lt, rt in unique_tag_pairs(left_tags, right_tags):
         sub_mask = (left_tags == lt) & (right_tags == rt)
         sub_idx = np.flatnonzero(sub_mask)
         if sub_idx.size == 0:
@@ -763,32 +763,39 @@ def _fused_gpu_binary_predicate(
         evaluate_predicate_from_de9im,
     )
 
-    host_cand = cp.asnumpy(d_cand_rows)
-    cand_count = host_cand.size
-
-    # Group by (left_family, right_family) tag pair.
-    host_ltags = cp.asnumpy(d_cand_ltags)
-    host_rtags = cp.asnumpy(d_cand_rtags)
+    cand_count = int(d_cand_rows.size)
     de9im_masks = np.zeros(cand_count, dtype=np.uint16)
 
-    unique_tag_pairs = set(zip(host_ltags.tolist(), host_rtags.tolist()))
-    for lt, rt in unique_tag_pairs:
-        sub_mask = (host_ltags == lt) & (host_rtags == rt)
-        sub_idx = np.flatnonzero(sub_mask)
-        if sub_idx.size == 0:
-            continue
+    # Group by (left_family, right_family) tag pair — unique extraction
+    # and sub-masking stay on device; per-group index subsets are
+    # transferred to host before the dispatch loop.
+    groups: list[tuple[GeometryFamily, GeometryFamily, np.ndarray, np.ndarray]] = []
+    d_group_refs: list[tuple] = []
+    for lt, rt in unique_tag_pairs(d_cand_ltags, d_cand_rtags):
         lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
         rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
         if lf is None or rf is None:
             continue
+        d_sub_mask = (d_cand_ltags == lt) & (d_cand_rtags == rt)
+        d_sub_idx = cp.flatnonzero(d_sub_mask)
+        if d_sub_idx.size == 0:
+            continue
+        d_sub_cand = d_cand_rows[d_sub_idx]
+        d_group_refs.append((lf, rf, d_sub_idx, d_sub_cand))
+
+    # D->H: pull per-group indices to host for dispatch.
+    for lf, rf, d_sub_idx, d_sub_cand in d_group_refs:
+        groups.append((lf, rf, cp.asnumpy(d_sub_idx), cp.asnumpy(d_sub_cand)))
+
+    for gi, (lf, rf, h_sub_idx, h_sub_cand) in enumerate(groups):
         sub_result = compute_polygon_de9im_gpu(
             left, right,
-            host_cand[sub_idx], host_cand[sub_idx],
+            h_sub_cand, h_sub_cand,
             query_family=lf, tree_family=rf,
-            d_left=d_cand_rows[sub_idx], d_right=d_cand_rows[sub_idx],
+            d_left=d_group_refs[gi][3], d_right=d_group_refs[gi][3],
         )
         if sub_result is not None:
-            de9im_masks[sub_idx] = sub_result
+            de9im_masks[h_sub_idx] = sub_result
 
     cand_result = evaluate_predicate_from_de9im(de9im_masks, predicate)
 
@@ -797,7 +804,7 @@ def _fused_gpu_binary_predicate(
     # disjoint).  Candidates get their exact DE-9IM result.
     is_disjoint = predicate == "disjoint"
     out = np.ones(n, dtype=bool) if is_disjoint else np.zeros(n, dtype=bool)
-    out[host_cand] = cand_result
+    out[cp.asnumpy(d_cand_rows)] = cand_result
     return out
 
 

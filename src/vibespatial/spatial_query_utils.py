@@ -15,6 +15,7 @@ from vibespatial.owned_geometry import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     from_shapely_geometries,
+    unique_tag_pairs,
 )
 from vibespatial.residency import Residency
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
@@ -491,14 +492,13 @@ def _filter_predicate_pairs_owned(
 
             # Group by (left_family, right_family) to dispatch correct kernel.
             de9im_masks = np.zeros(de9im_idx.size, dtype=np.uint16)
-            unique_tag_pairs = set(zip(de9im_left_tags.tolist(), de9im_right_tags.tolist()))
-            for (lt, rt) in unique_tag_pairs:
+            for (lt, rt) in unique_tag_pairs(de9im_left_tags, de9im_right_tags):
                 sub_mask = (de9im_left_tags == lt) & (de9im_right_tags == rt)
                 sub_idx = np.flatnonzero(sub_mask)
                 if sub_idx.size == 0:
                     continue
-                lf = TAG_FAMILIES.get(lt)
-                rf = TAG_FAMILIES.get(rt)
+                lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
+                rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
                 if lf is None or rf is None:
                     continue
 

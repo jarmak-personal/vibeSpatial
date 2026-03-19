@@ -26,6 +26,7 @@ from vibespatial.owned_geometry import (
     DiagnosticKind,
     OwnedGeometryArray,
     from_shapely_geometries,
+    unique_tag_pairs,
 )
 from vibespatial.precision import KernelClass, PrecisionMode
 from vibespatial.residency import Residency, TransferTrigger
@@ -258,9 +259,7 @@ def _distance_gpu(
     MP = GeometryFamily.MULTIPOINT
 
     # Group valid rows by (left_tag, right_tag).
-    unique_pairs = set(zip(valid_left_tags.tolist(), valid_right_tags.tolist()))
-
-    for lt, rt in unique_pairs:
+    for lt, rt in unique_tag_pairs(valid_left_tags, valid_right_tags):
         lf = TAG_FAMILIES.get(lt)
         rf = TAG_FAMILIES.get(rt)
         if lf is None or rf is None:

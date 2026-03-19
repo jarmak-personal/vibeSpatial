@@ -44,6 +44,7 @@ from vibespatial.owned_geometry import (  # noqa: E402
     TAG_FAMILIES,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
+    unique_tag_pairs,
 )
 from vibespatial.precision import KernelClass  # noqa: E402
 from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
@@ -1768,8 +1769,7 @@ def _compute_mixed_distances_gpu(
 
     point_family = GeometryFamily.POINT
 
-    unique_tag_pairs = set(zip(left_tags.tolist(), right_tags.tolist()))
-    for (lt, rt) in unique_tag_pairs:
+    for (lt, rt) in unique_tag_pairs(left_tags, right_tags):
         lf = TAG_FAMILIES.get(lt)
         rf = TAG_FAMILIES.get(rt)
 
@@ -2014,8 +2014,7 @@ def _compute_mixed_distances_gpu_device(
 
     point_family = GeometryFamily.POINT
 
-    unique_tag_pairs = set(zip(left_tags.tolist(), right_tags.tolist()))
-    for lt, rt in unique_tag_pairs:
+    for lt, rt in unique_tag_pairs(left_tags, right_tags):
         lf = TAG_FAMILIES.get(lt)
         rf = TAG_FAMILIES.get(rt)
 

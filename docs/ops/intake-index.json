@@ -8229,6 +8229,20 @@
     },
     {
       "kind": "doc",
+      "path": "docs/ops/dh-transfer-hitlist.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "dh",
+        "docs",
+        "hitlist",
+        "md",
+        "ops",
+        "transfer"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/ops/intake.md",
       "referenced_by": [
         "AGENTS.md",
@@ -13466,6 +13480,7 @@
         "docs/architecture/geometry-buffers.md"
       ],
       "symbols": [
+        "unique_tag_pairs",
         "DiagnosticKind",
         "BufferSharingMode",
         "DiagnosticEvent",
@@ -13488,8 +13503,7 @@
         "_family_for_geometry",
         "_append_family_geometry",
         "_finalize_family_buffer",
-        "from_shapely_geometries",
-        "from_wkb"
+        "from_shapely_geometries"
       ],
       "tokens": [
         "adopt",
@@ -13517,16 +13531,18 @@
         "owned",
         "ownedgeometryarray",
         "ownedgeometrydevicestate",
+        "pairs",
         "py",
         "shapely",
         "shareable",
         "sharing",
         "slices",
         "src",
+        "tag",
         "take",
+        "unique",
         "vector",
-        "vibespatial",
-        "wkb"
+        "vibespatial"
       ]
     },
     {
