@@ -1412,7 +1412,7 @@ def _select_gpu_strategy(
 
 
 def _launch_polygon_dense(
-    candidate_mask: np.ndarray,
+    candidate_indices: np.ndarray,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     out: np.ndarray,
@@ -1425,8 +1425,11 @@ def _launch_polygon_dense(
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
-    device_mask = runtime.from_host(candidate_mask.astype(np.uint8, copy=False))
-    device_out = runtime.from_host(out.astype(np.uint8, copy=False))
+    n = left.row_count
+    device_mask = runtime.allocate((n,), np.uint8, zero=True)
+    device_indices = runtime.from_host(candidate_indices.astype(np.int32, copy=False))
+    device_mask[device_indices] = np.uint8(1)
+    device_out = runtime.allocate((n,), np.uint8, zero=True)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_polygon_dense"]
         params = (
@@ -1470,6 +1473,7 @@ def _launch_polygon_dense(
         runtime.synchronize()
         runtime.copy_device_to_host(device_out, out)
     finally:
+        runtime.free(device_indices)
         runtime.free(device_mask)
         runtime.free(device_out)
 
@@ -1537,7 +1541,7 @@ def _launch_polygon_compacted(
 
 
 def _launch_multipolygon_dense(
-    candidate_mask: np.ndarray,
+    candidate_indices: np.ndarray,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     out: np.ndarray,
@@ -1550,8 +1554,11 @@ def _launch_multipolygon_dense(
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
-    device_mask = runtime.from_host(candidate_mask.astype(np.uint8, copy=False))
-    device_out = runtime.from_host(out.astype(np.uint8, copy=False))
+    n = left.row_count
+    device_mask = runtime.allocate((n,), np.uint8, zero=True)
+    device_indices = runtime.from_host(candidate_indices.astype(np.int32, copy=False))
+    device_mask[device_indices] = np.uint8(1)
+    device_out = runtime.allocate((n,), np.uint8, zero=True)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_dense"]
         params = (
@@ -1597,6 +1604,7 @@ def _launch_multipolygon_dense(
         runtime.synchronize()
         runtime.copy_device_to_host(device_out, out)
     finally:
+        runtime.free(device_indices)
         runtime.free(device_mask)
         runtime.free(device_out)
 
@@ -1988,13 +1996,9 @@ def _evaluate_point_in_polygon_gpu(
         t0 = perf_counter()
         dense_out = np.zeros(points.row_count, dtype=np.uint8)
         if GeometryFamily.POLYGON in rows_by_family:
-            polygon_mask = np.zeros(points.row_count, dtype=np.uint8)
-            polygon_mask[rows_by_family[GeometryFamily.POLYGON]] = 1
-            _launch_polygon_dense(polygon_mask, points, right_array, dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+            _launch_polygon_dense(rows_by_family[GeometryFamily.POLYGON], points, right_array, dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
         if GeometryFamily.MULTIPOLYGON in rows_by_family:
-            multipolygon_mask = np.zeros(points.row_count, dtype=np.uint8)
-            multipolygon_mask[rows_by_family[GeometryFamily.MULTIPOLYGON]] = 1
-            _launch_multipolygon_dense(multipolygon_mask, points, right_array, dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+            _launch_multipolygon_dense(rows_by_family[GeometryFamily.MULTIPOLYGON], points, right_array, dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
         coarse[candidate_rows] = dense_out[candidate_rows].astype(bool, copy=False)
         timings["kernel_launch_and_sync_s"] = perf_counter() - t0
     elif selected_strategy == "compacted":
