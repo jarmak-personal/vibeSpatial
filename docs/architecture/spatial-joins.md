@@ -5,7 +5,7 @@ Scope: Spatial-index query assembly, sjoin result semantics, bounded nearest str
 Read If: You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.
 STOP IF: You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.
 Source Of Truth: Phase-4 spatial query and join assembly policy before broader API dispatch work.
-Body Budget: 129/220 lines
+Body Budget: 136/220 lines
 Document: docs/architecture/spatial-joins.md
 
 Section Map (Body Lines)
@@ -19,9 +19,9 @@ Section Map (Body Lines)
 | 37-41 | Intent |
 | 42-62 | Decision |
 | 63-102 | Query Strategy |
-| 103-113 | Nearest Strategy |
-| 114-123 | Pandas Semantics |
-| 124-129 | Consequences |
+| 103-120 | Nearest Strategy |
+| 121-130 | Pandas Semantics |
+| 131-136 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -126,14 +126,21 @@ workflow is the source of truth for host/device traversal because it exercises
 
 ## Nearest Strategy
 
-Nearest in the owned engine has two modes:
+Nearest uses a three-tier dispatch for point-point data:
 
-- unbounded nearest: keep the existing STRtree nearest path for now
-- bounded nearest (`max_distance` set): use distance-expanded bounds to prune,
-  then exact distance reduction per input geometry
+1. **Zero-copy GPU grid nearest** — extracts coords directly from Shapely
+   arrays (bypassing `_to_owned`), builds a uniform-grid spatial hash on
+   device, and runs ring-expansion search entirely on the GPU.  Handles both
+   bounded and unbounded nearest.  Falls through for non-point inputs or
+   degenerate grids.
+2. **Indexed GPU nearest** — uses `_to_owned` arrays with a sorted-X sweep
+   and CCCL lower/upper bound for tie counting.  Fallback when the grid
+   path declines.
+3. **STRtree host path** — used for non-point or mixed-geometry inputs, or
+   when the GPU is unavailable.
 
-The bounded path is the GPU-friendly design center because it can be expressed
-as candidate generation plus a reduce-by-key minimum over candidate distances.
+The bounded path (`max_distance` set) can also use distance-expanded bounds to
+prune candidates, then exact distance reduction per input geometry.
 
 ## Pandas Semantics
 

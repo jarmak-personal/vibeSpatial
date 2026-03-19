@@ -118,9 +118,17 @@ Pass 6: NVRTC/Compilation (LOW-MEDIUM)
 - Module-scope warmup declared (request_nvrtc_warmup)
 - No compilation in hot paths
 
+## Severity Rules
+Every finding is BLOCKING unless it meets NIT criteria (see below).
+- BLOCKING: Must fix before landing. Includes correctness bugs, avoidable
+  transfers, redundant D2H, leaked memory, missing guards, unnecessary syncs,
+  and any improvement an agent can fix in minutes.
+- NIT: Only for known codebase-wide gaps requiring coordinated migration,
+  pure style preferences, or future design-level optimizations.
+
 ## Output Format
-For each pass, report: CLEAN or list findings with severity and location.
-End with overall verdict: CLEAN / ISSUES FOUND (list critical items).
+For each pass, report: CLEAN or list findings with severity (BLOCKING/NIT)
+and location. End with overall verdict: CLEAN / BLOCKING ISSUES (list all).
 ```
 
 #### Sub-agent: Zero-Copy Enforcer (if runtime/kernel/pipeline code changed)
@@ -159,14 +167,19 @@ OwnedGeometryArray Contract:
 - Do changes maintain lazy host materialization?
 - Does _ensure_host_state() get called only when truly needed?
 
-## Rules
-- Avoidable transfer = FAIL
-- Ping-pong transfer = CRITICAL
-- Test code is exempt (Shapely oracle pattern is expected)
+## Severity Rules
+Every finding is BLOCKING unless it meets NIT criteria (see below).
+- BLOCKING: Must fix before landing. Includes avoidable transfers, redundant
+  D2H, ping-pong patterns, leaked device memory, and any transfer that an
+  agent can eliminate in minutes.
+- NIT: Only for known codebase-wide gaps requiring coordinated migration,
+  or structural transfers that require significant redesign.
+- Test code is exempt (Shapely oracle pattern is expected).
 
 ## Output Format
 Verdict: CLEAN / LEAKY / BROKEN
-For each transfer found: location, direction, classification, recommendation.
+For each transfer found: location, direction, classification (BLOCKING/NIT),
+recommendation.
 ```
 
 #### Sub-agent: Performance Analysis (if kernel/pipeline/dispatch code changed)
@@ -205,15 +218,20 @@ Regression Risk:
 - Allocation patterns that fragment GPU memory pool at scale?
 - Shapely/Python round-trip in a previously device-native path?
 
-## Rules
-- CRITICAL = do not land
-- WARNING = fix if practical
-- Focus on src/vibespatial/, especially kernels and pipeline code
-- Always consider 1M geometry scale
+## Severity Rules
+Every finding is BLOCKING unless it meets NIT criteria (see below).
+- BLOCKING: Must fix before landing. Includes correctness bugs, avoidable
+  transfers, redundant allocations, unnecessary sync points, missing overflow
+  guards, suboptimal patterns an agent can fix in minutes, and stale docs.
+- NIT: Only for known codebase-wide gaps requiring coordinated migration,
+  or future design-level optimizations requiring significant new algorithms.
+- Focus on src/vibespatial/, especially kernels and pipeline code.
+- Always consider 1M geometry scale.
 
 ## Output Format
-Verdict: PASS / WARN / FAIL
-For each finding: severity, location, pattern, impact, recommendation.
+Verdict: PASS / FAIL
+For each finding: severity (BLOCKING/NIT), location, pattern, impact,
+recommendation.
 ```
 
 #### Sub-agent: Maintainability Enforcer (if any non-test source code changed)
@@ -249,15 +267,19 @@ Agent Workflow:
 - Should AGENTS.md verification commands be updated?
 - Are there new verification steps needed?
 
-## Rules
-- ORPHANED file (undiscoverable via intake) = FAIL
-- Routing gap = WARNING
-- Test files, __init__.py, conftest.py are exempt
-- Files under kernels/ and api/ are covered by directory-level routing
+## Severity Rules
+Every finding is BLOCKING unless it meets NIT criteria (see below).
+- BLOCKING: Must fix before landing. Includes orphaned files, stale docs
+  that contradict new behavior, missing routing signals, and any doc or
+  routing fix an agent can make in minutes.
+- NIT: Only for style preferences or observations with no functional impact.
+- Test files, __init__.py, conftest.py are exempt.
+- Files under kernels/ and api/ are covered by directory-level routing.
 
 ## Output Format
 Verdict: DISCOVERABLE / GAPS / ORPHANED
-For each gap: file, what's missing, specific fix needed.
+For each gap: file, severity (BLOCKING/NIT), what's missing, specific fix
+needed.
 ```
 
 ### Step 3: Collect and report
@@ -293,12 +315,41 @@ Wait for all sub-agents to complete, then compile results into the report.
 
 ### Overall Verdict
 [LAND / FIX REQUIRED / NEEDS PROFILING]
+
+Note: LAND requires zero BLOCKING findings across all sub-agents.
 ```
+
+## Severity Classification
+
+Every sub-agent finding must be classified into one of three tiers:
+
+- **BLOCKING** — Must be fixed before landing. This includes:
+  - Correctness bugs
+  - Avoidable D/H transfers or ping-pong patterns
+  - Redundant D2H transfers
+  - Unnecessary sync points
+  - Leaked device memory (including CuPy temporaries not explicitly freed)
+  - Missing overflow guards for int32 kernel parameters
+  - Stale documentation that contradicts new behavior
+  - Any improvement that a powerful agent can fix in minutes
+- **NIT** — Acceptable to land without fixing. Reserved for:
+  - Known codebase-wide gaps (e.g., ADR-0002 fp64 hardcoding) that require
+    a coordinated migration, not a per-commit fix
+  - Style preferences with no functional or performance impact
+  - Observations about future optimization opportunities that require
+    significant design work (e.g., alternative algorithms for pathological
+    distributions)
+- **N/A** — Not applicable to this change
+
+The default classification is BLOCKING. A finding is only a NIT if fixing it
+is genuinely impractical in the scope of this commit. "It works fine for now"
+is not sufficient — if an agent can fix it in minutes, it is BLOCKING.
 
 ## Rules
 
 - ALL deterministic checks must pass.
-- ANY critical sub-agent finding means FIX REQUIRED.
+- ANY BLOCKING sub-agent finding means FIX REQUIRED — fix all blocking items
+  before committing. Do not land with known blocking issues.
 - If runtime/kernel/pipeline code changed and no GPU is available for
   benchmarks, verdict is NEEDS PROFILING.
 - Test-only changes need only deterministic checks (skip sub-agents).
