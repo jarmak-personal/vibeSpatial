@@ -1,15 +1,21 @@
 import numpy as np
-
 import shapely
 from shapely.geometry.base import BaseGeometry
 
+from vibespatial.api import geometry_array as array
+from vibespatial.api import geoseries
 from vibespatial.dispatch import record_dispatch_event
+from vibespatial.owned_geometry import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
-from vibespatial.owned_geometry import from_shapely_geometries
-from vibespatial.spatial_query import build_owned_spatial_index, nearest_spatial_index, query_spatial_index, supports_owned_spatial_input
+from vibespatial.spatial_query import (
+    build_owned_spatial_index,
+    nearest_spatial_index,
+    query_spatial_index,
+    supports_owned_spatial_input,
+)
+from vibespatial.spatial_query_utils import _to_owned
 
 from . import _compat as compat
-from vibespatial.api import geometry_array as array, geoseries
 
 PREDICATES = {p.name for p in shapely.strtree.BinaryPredicate} | {None}
 OWNED_QUERY_PREDICATES = PREDICATES
@@ -439,6 +445,9 @@ class SpatialIndex:
             tree_supported = supports_owned_spatial_input(self.geometries)
         if not tree_supported:
             return False
+        # Already-owned input is always supported — no conversion needed.
+        if isinstance(geometry, OwnedGeometryArray):
+            return True
         if isinstance(geometry, geoseries.GeoSeries):
             return geometry.values.supports_owned_spatial_input()
         if isinstance(geometry, array.GeometryArray):
@@ -447,6 +456,9 @@ class SpatialIndex:
 
     @staticmethod
     def _owned_query_input(geometry):
+        # Already-owned — pass through without any H->D conversion.
+        if isinstance(geometry, OwnedGeometryArray):
+            return geometry
         if isinstance(geometry, geoseries.GeoSeries):
             values = geometry.values
             return values.to_owned() if hasattr(values, "to_owned") else (
@@ -455,7 +467,9 @@ class SpatialIndex:
         if isinstance(geometry, array.GeometryArray):
             return geometry.to_owned()
         if isinstance(geometry, np.ndarray) and geometry.ndim >= 1:
-            return from_shapely_geometries(geometry.tolist())
+            # Use _to_owned which has a vectorized fast-path for all-Point
+            # arrays (~1ms vs ~500ms for 100k points).
+            return _to_owned(geometry)
         # Scalar BaseGeometry or other types — keep as-is so
         # query_spatial_index() can detect scalar input correctly.
         return geometry

@@ -36,7 +36,12 @@ from vibespatial.clip_rect import evaluate_geopandas_clip_by_rect
 from vibespatial.dispatch import record_dispatch_event
 from vibespatial.distance_owned import evaluate_geopandas_dwithin
 from vibespatial.make_valid_pipeline import evaluate_geopandas_make_valid
-from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries
+from vibespatial.owned_geometry import (
+    NULL_TAG,
+    TAG_FAMILIES,
+    OwnedGeometryArray,
+    from_shapely_geometries,
+)
 from vibespatial.runtime import ExecutionMode
 from vibespatial.stroke_kernels import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
 
@@ -105,6 +110,63 @@ POINT_GEOM_TYPES = {"Point", "MultiPoint"}
 type_mapping = {p.value: _names[p.name] for p in shapely.GeometryType}
 geometry_type_ids = list(type_mapping.keys())
 geometry_type_values = np.array(list(type_mapping.values()), dtype=object)
+
+# Map OwnedGeometryArray family tags to geometry type name strings.
+# Used by geom_type to avoid host-side shapely.get_type_id when _owned
+# is already materialised.
+_TAG_TO_GEOM_TYPE_NAME: dict[int, str] = {
+    tag: {
+        "point": "Point",
+        "linestring": "LineString",
+        "polygon": "Polygon",
+        "multipoint": "MultiPoint",
+        "multilinestring": "MultiLineString",
+        "multipolygon": "MultiPolygon",
+    }[family.value]
+    for tag, family in TAG_FAMILIES.items()
+}
+
+
+def _geom_type_from_tags(owned: OwnedGeometryArray) -> np.ndarray:
+    """Vectorised geom_type lookup from owned tags -- no Shapely call."""
+    tags = owned.tags
+    result = np.empty(len(tags), dtype=object)
+    for tag_value, name in _TAG_TO_GEOM_TYPE_NAME.items():
+        result[tags == tag_value] = name
+    result[tags == NULL_TAG] = None
+    return result
+
+
+def _to_owned_via_wkb(data: np.ndarray) -> OwnedGeometryArray:
+    """Build OwnedGeometryArray from a Shapely geometry array via native WKB.
+
+    Uses ``shapely.to_wkb`` (vectorised C) to serialise the entire array,
+    then feeds the WKB bytes through the native staged decoder which parses
+    binary payloads directly into coordinate buffers without per-geometry
+    Python object introspection.
+
+    Falls back to ``from_shapely_geometries`` if the WKB path fails (e.g.
+    GeometryCollection or other unsupported WKB types).
+    """
+    from vibespatial.io_wkb import _decode_native_wkb
+
+    try:
+        # shapely.to_wkb is a vectorised C call -- much faster than
+        # self._data.tolist() which creates a Python list of Shapely objects.
+        missing = shapely.is_missing(data)
+        wkb_values: list[bytes | None] = [None] * len(data)
+        if not missing.all():
+            present_mask = ~missing
+            wkb_array = shapely.to_wkb(data[present_mask])
+            present_indices = np.flatnonzero(present_mask)
+            for i, idx in enumerate(present_indices):
+                wkb_values[idx] = bytes(wkb_array[i])
+        owned, _plan = _decode_native_wkb(wkb_values)
+        return owned
+    except Exception:
+        # GeometryCollection or other edge cases -- fall back to the
+        # original per-geometry path.
+        return from_shapely_geometries(data.tolist())
 
 
 class GeometryDtype(ExtensionDtype):
@@ -595,7 +657,7 @@ class GeometryArray(ExtensionArray):
 
     def to_owned(self) -> OwnedGeometryArray:
         if self._owned is None:
-            self._owned = from_shapely_geometries(self._data.tolist())
+            self._owned = _to_owned_via_wkb(self._data)
         return self._owned
 
     def owned_flat_sindex(self):
@@ -676,6 +738,8 @@ class GeometryArray(ExtensionArray):
 
     @property
     def geom_type(self):
+        if self._owned is not None:
+            return _geom_type_from_tags(self._owned)
         res = shapely.get_type_id(self._data)
         return geometry_type_values[np.searchsorted(geometry_type_ids, res)]
 

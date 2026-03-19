@@ -136,11 +136,11 @@ vibeSpatial a pure GPU library.
 
 ## TIER 3 -- API LAYER (Shapely round-trips breaking device residency)
 
-- [ ] **27. api/geometry_array.py:598** -- H->D
+- [x] **27. api/geometry_array.py:598** -- H->D
       `from_shapely_geometries(self._data.tolist())` the lazy owned init.
       *Fix: Native device construction (WKB/GeoArrow direct to device).*
 
-- [ ] **28. api/geometry_array.py:679** -- CPU
+- [x] **28. api/geometry_array.py:679** -- CPU
       `shapely.get_type_id(self._data)` forces host geom_type check.
       *Fix: Device-side type tags on OwnedGeometryArray.*
 
@@ -162,7 +162,7 @@ vibeSpatial a pure GPU library.
       `shapely.intersection_all()`.
       *Fix: GPU kernels for each.*
 
-- [ ] **33. api/sindex.py:458** -- H->D
+- [x] **33. api/sindex.py:458** -- H->D
       `from_shapely_geometries(geometry.tolist())` query input conversion.
       *Fix: Accept device arrays directly.*
 
@@ -170,11 +170,11 @@ vibeSpatial a pure GPU library.
       `np.asarray(self._geometry_array._data, dtype=object)` STRtree fallback.
       *Fix: GPU spatial index for all predicates.*
 
-- [ ] **35. stroke_kernels.py:533-534, 751, 786, 811** -- H->D
+- [x] **35. stroke_kernels.py:533-534, 751, 786, 811** -- H->D
       `from_shapely_geometries(geometries.tolist())` stroke results re-uploaded.
       *Fix: Keep stroke output as device arrays.*
 
-- [ ] **36. clip_rect.py:421, 1892** -- H->D
+- [x] **36. clip_rect.py:421, 1892** -- H->D
       `from_shapely_geometries(shapely_values.tolist())` clip results
       re-uploaded.
       *Fix: Device-side clip kernel.*
@@ -183,7 +183,7 @@ vibeSpatial a pure GPU library.
       `from_shapely_geometries(left.tolist())` distance input upload.
       *Fix: Accept device arrays; skip Shapely intermediate.*
 
-- [ ] **38. profile_rails.py:97, 107, 228, 238** -- H->D
+- [x] **38. profile_rails.py:97, 107, 228, 238** -- H->D
       `from_shapely_geometries(values.tolist())` profiler input conversion.
       *Fix: Profile with device-native inputs.*
 
