@@ -1999,6 +1999,7 @@ def _evaluate_point_in_polygon_gpu(
         t0 = perf_counter()
         runtime = get_cuda_runtime()
         device_dense_out = runtime.allocate((points.row_count,), np.uint8, zero=True)
+        _returned = False
         try:
             if GeometryFamily.POLYGON in rows_by_family:
                 _launch_polygon_dense(rows_by_family[GeometryFamily.POLYGON], points, right_array, device_dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
@@ -2007,10 +2008,11 @@ def _evaluate_point_in_polygon_gpu(
             timings["kernel_launch_and_sync_s"] = perf_counter() - t0
             if return_device:
                 _last_gpu_substage_timings = timings
+                _returned = True
                 return device_dense_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
         finally:
-            if not return_device:
+            if not _returned:
                 runtime.free(device_dense_out)
         coarse[candidate_rows] = dense_out[candidate_rows].astype(bool, copy=False)
     elif selected_strategy == "compacted":
@@ -2043,6 +2045,7 @@ def _evaluate_point_in_polygon_gpu(
         runtime = get_cuda_runtime()
         device_dense_out = runtime.allocate((points.row_count,), np.uint8)
         device_dense_out[...] = 0
+        _returned = False
         try:
             t0 = perf_counter()
             if GeometryFamily.POLYGON in right_array.families:
@@ -2094,10 +2097,11 @@ def _evaluate_point_in_polygon_gpu(
                 # Caller owns device_dense_out; free only candidate indices.
                 runtime.free(candidate_rows.values)
                 _last_gpu_substage_timings = timings
+                _returned = True
                 return device_dense_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
         finally:
-            if not return_device:
+            if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
         coarse[np.asarray(dense_out, dtype=bool)] = True
@@ -2146,6 +2150,7 @@ def _evaluate_point_in_polygon_gpu(
 
         device_dense_out = runtime.allocate((points.row_count,), np.uint8)
         device_dense_out[...] = 0
+        _returned = False
         try:
             t0 = perf_counter()
             if GeometryFamily.POLYGON in right_array.families:
@@ -2199,10 +2204,11 @@ def _evaluate_point_in_polygon_gpu(
                 # Caller owns device_dense_out; free only candidate indices.
                 runtime.free(candidate_rows.values)
                 _last_gpu_substage_timings = timings
+                _returned = True
                 return device_dense_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
         finally:
-            if not return_device:
+            if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
         coarse[np.asarray(dense_out, dtype=bool)] = True
