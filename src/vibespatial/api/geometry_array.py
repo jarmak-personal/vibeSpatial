@@ -1640,6 +1640,12 @@ class GeometryArray(ExtensionArray):
 
     @property
     def bounds(self):
+        if self._owned is not None:
+            from vibespatial.kernels.core.geometry_analysis import (
+                compute_geometry_bounds,
+            )
+
+            return compute_geometry_bounds(self._owned)
         return shapely.bounds(self._data)
 
     @property

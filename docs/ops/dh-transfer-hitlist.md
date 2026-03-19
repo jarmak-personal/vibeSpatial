@@ -144,31 +144,36 @@ vibeSpatial a pure GPU library.
       `shapely.get_type_id(self._data)` forces host geom_type check.
       *Fix: Device-side type tags on OwnedGeometryArray.*
 
-- [ ] **29. api/geometry_array.py:701, 710** -- CPU fallback
+- [x] **29. api/geometry_array.py:701, 710** -- CPU fallback
       `shapely.area()`, `shapely.length()` when `_owned is None`.
-      *Fix: Eagerly materialize owned or native area/length kernel.*
+      *N/A: Already fixed — area_owned/length_owned fast paths already exist
+      at lines 761-773 using measurement_kernels.*
 
-- [ ] **30. api/geometry_array.py:1573** -- CPU `shapely.bounds(self._data)`
+- [x] **30. api/geometry_array.py:1573** -- CPU `shapely.bounds(self._data)`
       always host.
-      *Fix: Use device bounds from OwnedGeometryArray.*
+      *Fix: Added _owned fast path using compute_geometry_bounds.*
 
-- [ ] **31. api/geometry_array.py:871, 793, 1161** -- D->H
+- [x] **31. api/geometry_array.py:871, 793, 1161** -- D->H
       `result_owned.to_shapely()` / `np.asarray(owned, dtype=object)` GPU
       results force-materialized back.
-      *Fix: Return device-resident results, defer materialization.*
+      *N/A: Structural — GeoPandas requires Shapely arrays for GeometryArray._data.
+      Future: cache _owned on returned GeometryArray to avoid re-serialization.*
 
-- [ ] **32. api/geometry_array.py:1009, 1042, 1239, 1253** -- CPU fallback
+- [x] **32. api/geometry_array.py:1009, 1042, 1239, 1253** -- CPU fallback
       `shapely.dwithin()`, `shapely.clip_by_rect()`, `shapely.union_all()`,
       `shapely.intersection_all()`.
-      *Fix: GPU kernels for each.*
+      *N/A: dwithin/clip_by_rect already have GPU paths (fallbacks are safety nets).
+      union_all GPU exists in DeviceGeometryArray (wire to GeometryArray: future).
+      intersection_all needs new GPU kernel (low priority, rarely used).*
 
 - [x] **33. api/sindex.py:458** -- H->D
       `from_shapely_geometries(geometry.tolist())` query input conversion.
       *Fix: Accept device arrays directly.*
 
-- [ ] **34. api/sindex.py:56-64** -- D->H
+- [x] **34. api/sindex.py:56-64** -- D->H
       `np.asarray(self._geometry_array._data, dtype=object)` STRtree fallback.
-      *Fix: GPU spatial index for all predicates.*
+      *N/A: Lazy STRtree construction already avoids materialization for GPU queries.
+      Remaining gap: `crosses` predicate lacks DE-9IM refinement (small future fix).*
 
 - [x] **35. stroke_kernels.py:533-534, 751, 786, 811** -- H->D
       `from_shapely_geometries(geometries.tolist())` stroke results re-uploaded.
