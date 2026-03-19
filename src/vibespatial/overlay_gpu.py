@@ -1159,13 +1159,22 @@ def _closed_ring_coords(ring: np.ndarray) -> np.ndarray:
 
 
 def _append_polygon_buffer_row(
-    x_payload: list[float],
-    y_payload: list[float],
+    x_chunks: list[np.ndarray],
+    y_chunks: list[np.ndarray],
     geometry_offsets: list[int],
     ring_offsets: list[int],
     bounds_payload: list[tuple[float, float, float, float]],
     rings: list[np.ndarray],
+    coord_cursor: list[int],
 ) -> None:
+    """Append a single-polygon row to GeoArrow buffer lists.
+
+    Coordinates are collected as NumPy array chunks (not per-element floats)
+    and concatenated once in ``_build_overlay_output_rows``.
+    ``coord_cursor`` is a single-element list used as a mutable running
+    coordinate count so that ``ring_offsets`` can be computed without
+    flattening x_chunks on every call.
+    """
     geometry_offsets.append(len(ring_offsets))
     exterior = _closed_ring_coords(rings[0])
     bounds_payload.append(
@@ -1178,20 +1187,26 @@ def _append_polygon_buffer_row(
     )
     for ring in rings:
         coords = _closed_ring_coords(ring)
-        ring_offsets.append(len(x_payload))
-        x_payload.extend(float(value) for value in coords[:, 0].tolist())
-        y_payload.extend(float(value) for value in coords[:, 1].tolist())
+        ring_offsets.append(coord_cursor[0])
+        x_chunks.append(np.ascontiguousarray(coords[:, 0], dtype=np.float64))
+        y_chunks.append(np.ascontiguousarray(coords[:, 1], dtype=np.float64))
+        coord_cursor[0] += coords.shape[0]
 
 
 def _append_multipolygon_buffer_row(
-    x_payload: list[float],
-    y_payload: list[float],
+    x_chunks: list[np.ndarray],
+    y_chunks: list[np.ndarray],
     geometry_offsets: list[int],
     part_offsets: list[int],
     ring_offsets: list[int],
     bounds_payload: list[tuple[float, float, float, float]],
     polygons: list[list[np.ndarray]],
+    coord_cursor: list[int],
 ) -> None:
+    """Append a multi-polygon row to GeoArrow buffer lists.
+
+    Same chunk-based coordinate collection as ``_append_polygon_buffer_row``.
+    """
     geometry_offsets.append(len(part_offsets))
     min_x = np.inf
     min_y = np.inf
@@ -1206,9 +1221,10 @@ def _append_multipolygon_buffer_row(
         max_y = max(max_y, float(np.max(exterior[:, 1])))
         for ring in rings:
             coords = _closed_ring_coords(ring)
-            ring_offsets.append(len(x_payload))
-            x_payload.extend(float(value) for value in coords[:, 0].tolist())
-            y_payload.extend(float(value) for value in coords[:, 1].tolist())
+            ring_offsets.append(coord_cursor[0])
+            x_chunks.append(np.ascontiguousarray(coords[:, 0], dtype=np.float64))
+            y_chunks.append(np.ascontiguousarray(coords[:, 1], dtype=np.float64))
+            coord_cursor[0] += coords.shape[0]
     bounds_payload.append((min_x, min_y, max_x, max_y))
 
 
@@ -1224,19 +1240,24 @@ def _build_overlay_output_rows(
     tags = np.full(len(ordered_rows), -1, dtype=np.int8)
     family_row_offsets = np.full(len(ordered_rows), -1, dtype=np.int32)
 
-    polygon_x: list[float] = []
-    polygon_y: list[float] = []
+    # Coordinate chunks: collect np.ndarray slices, concatenate once at the
+    # end.  This replaces the previous per-element ``float(value)`` generator
+    # that iterated every coordinate through Python (hitlist #13).
+    polygon_x_chunks: list[np.ndarray] = []
+    polygon_y_chunks: list[np.ndarray] = []
     polygon_geometry_offsets: list[int] = []
     polygon_ring_offsets: list[int] = []
     polygon_bounds: list[tuple[float, float, float, float]] = []
+    polygon_coord_cursor: list[int] = [0]
     polygon_count = 0
 
-    multipolygon_x: list[float] = []
-    multipolygon_y: list[float] = []
+    multipolygon_x_chunks: list[np.ndarray] = []
+    multipolygon_y_chunks: list[np.ndarray] = []
     multipolygon_geometry_offsets: list[int] = []
     multipolygon_part_offsets: list[int] = []
     multipolygon_ring_offsets: list[int] = []
     multipolygon_bounds: list[tuple[float, float, float, float]] = []
+    multipolygon_coord_cursor: list[int] = [0]
     multipolygon_count = 0
 
     for output_row, row_index in enumerate(ordered_rows):
@@ -1245,55 +1266,63 @@ def _build_overlay_output_rows(
             tags[output_row] = FAMILY_TAGS[GeometryFamily.POLYGON]
             family_row_offsets[output_row] = polygon_count
             _append_polygon_buffer_row(
-                polygon_x,
-                polygon_y,
+                polygon_x_chunks,
+                polygon_y_chunks,
                 polygon_geometry_offsets,
                 polygon_ring_offsets,
                 polygon_bounds,
                 polygons[0],
+                polygon_coord_cursor,
             )
             polygon_count += 1
             continue
         tags[output_row] = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
         family_row_offsets[output_row] = multipolygon_count
         _append_multipolygon_buffer_row(
-            multipolygon_x,
-            multipolygon_y,
+            multipolygon_x_chunks,
+            multipolygon_y_chunks,
             multipolygon_geometry_offsets,
             multipolygon_part_offsets,
             multipolygon_ring_offsets,
             multipolygon_bounds,
             polygons,
+            multipolygon_coord_cursor,
         )
         multipolygon_count += 1
 
     families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
     if polygon_count:
+        poly_x = np.concatenate(polygon_x_chunks) if polygon_x_chunks else np.empty(0, dtype=np.float64)
+        poly_y = np.concatenate(polygon_y_chunks) if polygon_y_chunks else np.empty(0, dtype=np.float64)
+        total_poly_coords = polygon_coord_cursor[0]
         families[GeometryFamily.POLYGON] = FamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
             schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
             row_count=polygon_count,
-            x=np.asarray(polygon_x, dtype=np.float64),
-            y=np.asarray(polygon_y, dtype=np.float64),
+            x=poly_x,
+            y=poly_y,
             geometry_offsets=np.asarray([*polygon_geometry_offsets, len(polygon_ring_offsets)], dtype=np.int32),
             empty_mask=np.zeros(polygon_count, dtype=bool),
-            ring_offsets=np.asarray([*polygon_ring_offsets, len(polygon_x)], dtype=np.int32),
+            ring_offsets=np.asarray([*polygon_ring_offsets, total_poly_coords], dtype=np.int32),
             bounds=np.asarray(polygon_bounds, dtype=np.float64),
         )
     if multipolygon_count:
+        mpoly_x = np.concatenate(multipolygon_x_chunks) if multipolygon_x_chunks else np.empty(0, dtype=np.float64)
+        mpoly_y = np.concatenate(multipolygon_y_chunks) if multipolygon_y_chunks else np.empty(0, dtype=np.float64)
+        total_mpoly_coords = multipolygon_coord_cursor[0]
         families[GeometryFamily.MULTIPOLYGON] = FamilyGeometryBuffer(
             family=GeometryFamily.MULTIPOLYGON,
             schema=get_geometry_buffer_schema(GeometryFamily.MULTIPOLYGON),
             row_count=multipolygon_count,
-            x=np.asarray(multipolygon_x, dtype=np.float64),
-            y=np.asarray(multipolygon_y, dtype=np.float64),
+            x=mpoly_x,
+            y=mpoly_y,
             geometry_offsets=np.asarray(
                 [*multipolygon_geometry_offsets, len(multipolygon_part_offsets)],
                 dtype=np.int32,
             ),
             empty_mask=np.zeros(multipolygon_count, dtype=bool),
             part_offsets=np.asarray([*multipolygon_part_offsets, len(multipolygon_ring_offsets)], dtype=np.int32),
-            ring_offsets=np.asarray([*multipolygon_ring_offsets, len(multipolygon_x)], dtype=np.int32),
+            ring_offsets=np.asarray([*multipolygon_ring_offsets, total_mpoly_coords], dtype=np.int32),
             bounds=np.asarray(multipolygon_bounds, dtype=np.float64),
         )
     return OwnedGeometryArray(
@@ -1798,13 +1827,33 @@ def _build_polygon_output_from_faces_gpu(
     h_source_rows = np.zeros(total_ring_count, dtype=np.int32)
     h_source_rows[:boundary_ring_count] = cp.asnumpy(d_cycle_source_rows)
 
-    # Build exterior → holes mapping from kernel output
+    # Build exterior -> holes mapping from kernel output using vectorised
+    # NumPy filtering instead of a Python ``for ri in range(N)`` loop
+    # (hitlist #12).
     exterior_indices_host = cp.asnumpy(d_exterior_indices)
-    exterior_to_holes: dict[int, list[int]] = {int(ei): [] for ei in exterior_indices_host}
-    for ri in range(total_ring_count):
-        ext = int(h_exterior_id[ri])
-        if ext >= 0 and ext != ri and ext in exterior_to_holes:
-            exterior_to_holes[ext].append(ri)
+
+    all_ring_ids = np.arange(total_ring_count, dtype=np.int32)
+    hole_mask = (h_exterior_id >= 0) & (h_exterior_id != all_ring_ids)
+    hole_ring_ids = all_ring_ids[hole_mask]
+    hole_ext_ids = h_exterior_id[hole_mask]
+    # Further filter: only keep holes whose assigned exterior is valid
+    valid_ext_mask = np.isin(hole_ext_ids, exterior_indices_host)
+    hole_ring_ids = hole_ring_ids[valid_ext_mask]
+    hole_ext_ids = hole_ext_ids[valid_ext_mask]
+
+    # Sort holes by (exterior_id, hole_ring_id) for deterministic ordering
+    sort_order = np.lexsort((hole_ring_ids, hole_ext_ids))
+    hole_ring_ids = hole_ring_ids[sort_order]
+    hole_ext_ids = hole_ext_ids[sort_order]
+
+    # Group holes by exterior using searchsorted on the sorted exterior ids
+    exterior_to_holes: dict[int, np.ndarray] = {}
+    if hole_ring_ids.size > 0:
+        breaks = np.flatnonzero(np.diff(hole_ext_ids) != 0)
+        groups = np.split(hole_ring_ids, breaks + 1)
+        ext_keys = hole_ext_ids[np.concatenate(([0], breaks + 1))]
+        for k, g in zip(ext_keys, groups):
+            exterior_to_holes[int(k)] = g
 
     def _ring_coords(ri: int) -> np.ndarray:
         cs = int(h_all_coord_offsets[ri])
@@ -1815,9 +1864,11 @@ def _build_polygon_output_from_faces_gpu(
     for ext_idx in exterior_indices_host.tolist():
         ext_idx = int(ext_idx)
         source_row = int(h_source_rows[ext_idx])
-        rings = [_ring_coords(ext_idx)]
-        for hole_idx in sorted(exterior_to_holes.get(ext_idx, [])):
-            rings.append(_ring_coords(hole_idx))
+        rings: list[np.ndarray] = [_ring_coords(ext_idx)]
+        hole_ids = exterior_to_holes.get(ext_idx)
+        if hole_ids is not None:
+            for hole_idx in hole_ids:
+                rings.append(_ring_coords(int(hole_idx)))
         row_polygons.setdefault(source_row, []).append(rings)
 
     return _build_overlay_output_rows(row_polygons, faces.runtime_selection)

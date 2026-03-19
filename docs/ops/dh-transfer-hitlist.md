@@ -12,7 +12,7 @@ vibeSpatial a pure GPU library.
 - Run the narrow verification gate for the edited surface after each fix.
 - Run `uv run python scripts/check_zero_copy.py --all` after each fix to
   confirm the ratchet baseline decreases.
-- Current baseline: **55 known violations** (as of 2026-03-18).
+- Current baseline: **48 known violations** (as of 2026-03-19).
 - Items 1-5 landed in commit df557a7 (unique_tag_pairs utility).
 
 ---
@@ -64,20 +64,20 @@ vibeSpatial a pure GPU library.
       `list(cp.asnumpy(cp.flatnonzero(d_hole_mask)))`.
       *Fix: Device-side hole indexing.*
 
-- [ ] **12. overlay_gpu.py:1808, 1866, 1895** -- D->H->Python loop
+- [x] **12. overlay_gpu.py:1808, 1866, 1895** -- D->H->Python loop
       `for ext_idx in host_array.tolist():`.
       *Fix: GPU gather kernel.*
 
-- [ ] **13. overlay_gpu.py:1182-1183, 1210-1211** -- D->H
+- [x] **13. overlay_gpu.py:1182-1183, 1210-1211** -- D->H
       `coords[:, 0].tolist()` in coordinate assembly (Python list.extend
       per geometry).
       *Fix: GPU coordinate gather.*
 
-- [ ] **14. segment_primitives.py:323-332** -- D->H `xs0.tolist()` etc.
+- [x] **14. segment_primitives.py:323-332** -- D->H `xs0.tolist()` etc.
       segment coords pulled to Python lists.
       *Fix: Keep segments as device arrays.*
 
-- [ ] **15. segment_primitives.py:355, 795, 995, 1171** -- D->H->loop
+- [x] **15. segment_primitives.py:355, 795, 995, 1171** -- D->H->loop
       `for row in rows.tolist():` Python loops over device-computed indices.
       *Fix: GPU scatter/gather.*
 
