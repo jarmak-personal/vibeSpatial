@@ -78,8 +78,14 @@ class TestNVRTCDeferredDiskLoading:
             "vibespatial.cuda_runtime.make_kernel_cache_key",
             side_effect=lambda prefix, source: f"{prefix}-hash",
         ), patch(
-            "vibespatial.cuda_runtime.nvrtc_is_cached",
-            return_value=True,
+            "vibespatial.cuda_runtime._nvrtc_cached_key_set",
+            return_value=frozenset({"v2-sm89-nvrtc0.0-a-hash"}),
+        ), patch(
+            "vibespatial.cuda_runtime._disk_cache_key",
+            side_effect=lambda ck, cc, opts, ver: f"v2-sm89-nvrtc0.0-{ck}",
+        ), patch(
+            "vibespatial.cuda_runtime._nvrtc_version",
+            return_value=(0, 0),
         ), patch(
             "vibespatial.cuda_runtime.get_cuda_runtime",
             return_value=mock_runtime,
@@ -100,8 +106,14 @@ class TestNVRTCDeferredDiskLoading:
             "vibespatial.cuda_runtime.make_kernel_cache_key",
             side_effect=lambda prefix, source: f"{prefix}-hash",
         ), patch(
-            "vibespatial.cuda_runtime.nvrtc_is_cached",
-            return_value=True,
+            "vibespatial.cuda_runtime._nvrtc_cached_key_set",
+            return_value=frozenset({"v2-sm89-nvrtc0.0-a-hash", "v2-sm89-nvrtc0.0-b-hash"}),
+        ), patch(
+            "vibespatial.cuda_runtime._disk_cache_key",
+            side_effect=lambda ck, cc, opts, ver: f"v2-sm89-nvrtc0.0-{ck}",
+        ), patch(
+            "vibespatial.cuda_runtime._nvrtc_version",
+            return_value=(0, 0),
         ), patch(
             "vibespatial.cuda_runtime.get_cuda_runtime",
             return_value=mock_runtime,

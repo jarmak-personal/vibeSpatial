@@ -86,9 +86,11 @@ class NVRTCPrecompiler:
         use instead of eagerly in a background thread.
         """
         from vibespatial.cuda_runtime import (
+            _disk_cache_key,
+            _nvrtc_cached_key_set,
+            _nvrtc_version,
             get_cuda_runtime,
             make_kernel_cache_key,
-            nvrtc_is_cached,
         )
 
         runtime = get_cuda_runtime()
@@ -102,6 +104,14 @@ class NVRTCPrecompiler:
             except RuntimeError:
                 cc = None
 
+            # Batch probe: scan disk cache directory once for all units
+            if cc is not None:
+                cached_keys = _nvrtc_cached_key_set()
+                nvrtc_ver = _nvrtc_version()
+            else:
+                cached_keys = frozenset()
+                nvrtc_ver = (0, 0)
+
             for prefix, source, kernel_names in units:
                 cache_key = make_kernel_cache_key(prefix, source)
                 if cache_key in self._submitted:
@@ -112,12 +122,14 @@ class NVRTCPrecompiler:
                 if cache_key in runtime._module_cache:
                     continue
 
-                # Check disk cache
-                if cc is not None and nvrtc_is_cached(cache_key, cc):
-                    self._deferred_disk.add(cache_key)
-                    self._deferred_units[cache_key] = (prefix, source, kernel_names)
-                    logger.debug("NVRTC warmup: %s deferred (disk cached)", cache_key)
-                    continue
+                # Check disk cache (batch probe — no per-unit directory scan)
+                if cc is not None:
+                    disk_key = _disk_cache_key(cache_key, cc, (), nvrtc_ver)
+                    if disk_key in cached_keys:
+                        self._deferred_disk.add(cache_key)
+                        self._deferred_units[cache_key] = (prefix, source, kernel_names)
+                        logger.debug("NVRTC warmup: %s deferred (disk cached)", cache_key)
+                        continue
 
                 # Cache miss: submit for background compilation
                 self._futures[cache_key] = self._ensure_executor().submit(
@@ -192,6 +204,7 @@ class NVRTCPrecompiler:
                     kernel_names=kernel_names,
                 )
                 self._deferred_disk.discard(cache_key)
+                self._deferred_units.pop(cache_key, None)
                 elapsed = 0.0  # loaded via compile_kernels fast path
                 self._diagnostics.append(
                     NVRTCWarmupDiagnostic(cache_key, elapsed, True),
