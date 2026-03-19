@@ -107,6 +107,7 @@ def main() -> None:
         t0 = time.monotonic()
         utm_crs = gdf.geometry.estimate_utm_crs()
         gdf_utm = gdf.to_crs(utm_crs)
+        del gdf  # free the pre-projection copy to halve peak RAM
         t_proj = time.monotonic() - t0
         print(f"  Reproject to {{utm_crs}}: {{t_proj:.1f}}s")
 
