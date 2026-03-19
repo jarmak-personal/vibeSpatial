@@ -364,8 +364,12 @@ def _filter_predicate_pairs_owned(
     # (ADR-0005: no eager D→H for tag lookup).
     if _has_device and has_gpu_runtime():
         import cupy as _cp
-        d_query_tags = _cp.asarray(query_owned.tags)  # tiny: 1 byte per row
-        d_tree_tags = _cp.asarray(tree_owned.tags)
+        # Reuse device-resident tags from device_state when available
+        # to avoid redundant H→D transfers (hitlist #17).
+        _q_ds = query_owned.device_state
+        _t_ds = tree_owned.device_state
+        d_query_tags = _q_ds.tags if _q_ds is not None else _cp.asarray(query_owned.tags)
+        d_tree_tags = _t_ds.tags if _t_ds is not None else _cp.asarray(tree_owned.tags)
         d_left_tags = d_query_tags[_dc.d_left]
         d_right_tags = d_tree_tags[_dc.d_right]
 
@@ -386,16 +390,22 @@ def _filter_predicate_pairs_owned(
         any_gpu = bool(_cp.any(d_gpu_pair_mask))
 
         # Materialise host arrays only when needed below.
-        # Tag arrays stay on device; host copies are deferred.
+        # Tag arrays stay on device; host copies are deferred (hitlist #18).
         left_tags = None  # will be set from device if needed
         right_tags = None
         gpu_pair_mask = None  # will be set from device if needed
 
-        # Helper to lazily get host-side tags and mask.
-        def _ensure_host_tags():
-            nonlocal left_tags, right_tags, gpu_pair_mask, left_indices, right_indices
+        # Helper to lazily materialise host indices from device candidates.
+        def _ensure_host_indices():
+            nonlocal left_indices, right_indices
             if left_indices is None or right_indices is None:
                 left_indices, right_indices = _dc.to_host()
+
+        # Helper to lazily get host-side tags and mask.
+        # Only pulls D→H when downstream code truly needs host numpy arrays.
+        def _ensure_host_tags():
+            nonlocal left_tags, right_tags, gpu_pair_mask
+            _ensure_host_indices()
             if left_tags is None:
                 left_tags = _cp.asnumpy(d_left_tags)
                 right_tags = _cp.asnumpy(d_right_tags)
@@ -434,12 +444,13 @@ def _filter_predicate_pairs_owned(
         all_gpu = bool(np.all(gpu_pair_mask))
         any_gpu = bool(np.any(gpu_pair_mask)) and has_gpu_runtime()
 
+        _ensure_host_indices = lambda: None  # noqa: E731 — no-op, already on host
         _ensure_host_tags = lambda: None  # noqa: E731 — no-op, already on host
 
     # Fast path: ALL pairs support GPU predicate evaluation.
     # Uses indexed access into original owned arrays — no take() buffer copy.
     if all_gpu and has_gpu_runtime():
-        _ensure_host_tags()
+        _ensure_host_indices()  # only indices needed — no D→H for tags (hitlist #18)
         from vibespatial.point_binary_relations import classify_point_predicates_indexed
         keep = classify_point_predicates_indexed(
             predicate, query_owned, tree_owned, left_indices, right_indices,

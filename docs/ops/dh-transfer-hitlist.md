@@ -89,17 +89,18 @@ vibeSpatial a pure GPU library.
       `float(min_xy[0].item())` x4 for total_bounds.
       *Fix: Single kernel returning 4 scalars.*
 
-- [ ] **17. spatial_query_utils.py:366-367** -- H->D
+- [x] **17. spatial_query_utils.py:366-367** -- H->D
       `cp.asarray(query_owned.tags)` uploaded every query.
       *Fix: Keep tags device-resident on OwnedGeometryArray.*
 
-- [ ] **18. spatial_query_utils.py:399-401** -- D->H
+- [x] **18. spatial_query_utils.py:399-401** -- D->H
       `cp.asnumpy(d_left_tags)`, `d_right_tags`, `d_gpu_pair_mask`.
       *Fix: Filter on device, avoid host materialization.*
 
-- [ ] **19. spatial_nearest.py:1975-1976** -- H->D `cp.asarray(left_idx)`,
+- [x] **19. spatial_nearest.py:1975-1976** -- H->D `cp.asarray(left_idx)`,
       `cp.asarray(right_idx)`.
-      *Fix: Keep indices device-resident from prior stage.*
+      *N/A: Transfers are structurally required -- only reached in CPU-candidate
+      path where indices genuinely start on host. GPU path uses device arrays directly.*
 
 - [ ] **20. wkb_decode.py:637-1246 (9 sites)** -- D->H
       `int(row_indexes.size)` scalar sync per geometry family (up to 6x).
