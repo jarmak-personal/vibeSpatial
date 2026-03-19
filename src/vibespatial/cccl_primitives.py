@@ -158,12 +158,13 @@ def _get_precompiled(name: str):
 
 
 def _cccl_is_warm(spec_name: str) -> bool:
-    """Check if a CCCL spec is already compiled (no blocking wait)."""
+    """Check if a CCCL spec is compiled or deferred on disk (no blocking wait)."""
     from vibespatial.cccl_precompile import CCCLPrecompiler
 
     if CCCLPrecompiler._instance is None:
         return False
-    return spec_name in CCCLPrecompiler._instance._cache
+    inst = CCCLPrecompiler._instance
+    return spec_name in inst._cache or spec_name in inst._deferred_disk
 
 
 def _ensure_temp(precompiled, num_items: int, query_fn):

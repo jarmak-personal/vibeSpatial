@@ -125,8 +125,113 @@ class TestCCCLPrecompilerNoGPU:
         status = precompiler.status()
         assert "submitted" in status
         assert "compiled" in status
+        assert "deferred" in status
         assert "pending" in status
         assert "failed" in status
         assert "wall_ms" in status
         assert "per_primitive" in status
         assert isinstance(status["per_primitive"], list)
+
+
+# ---------------------------------------------------------------------------
+# Deferred disk loading
+# ---------------------------------------------------------------------------
+
+class TestCCCLDeferredDiskLoading:
+    def test_request_defers_cached_specs(self):
+        """Specs with disk cache entries are deferred, not submitted to thread pool."""
+        precompiler = CCCLPrecompiler(max_workers=1)
+        with patch(
+            "vibespatial.cccl_cubin_cache._cached_spec_name_set",
+            return_value=frozenset({"exclusive_scan_i32"}),
+        ):
+            precompiler.request(["exclusive_scan_i32", "select_i32"])
+        assert "exclusive_scan_i32" in precompiler._deferred_disk
+        assert "exclusive_scan_i32" in precompiler._submitted
+        assert "select_i32" not in precompiler._deferred_disk
+        assert "select_i32" in precompiler._submitted
+        assert "select_i32" in precompiler._futures
+        assert "exclusive_scan_i32" not in precompiler._futures
+
+    def test_no_executor_when_all_deferred(self):
+        """Thread pool is not created when all specs are deferred."""
+        precompiler = CCCLPrecompiler(max_workers=1)
+        with patch(
+            "vibespatial.cccl_cubin_cache._cached_spec_name_set",
+            return_value=frozenset({"exclusive_scan_i32", "select_i32"}),
+        ):
+            precompiler.request(["exclusive_scan_i32", "select_i32"])
+        assert precompiler._executor is None
+        assert len(precompiler._deferred_disk) == 2
+
+    def test_executor_created_on_cache_miss(self):
+        """Thread pool IS created when at least one spec is a cache miss."""
+        precompiler = CCCLPrecompiler(max_workers=1)
+        with patch(
+            "vibespatial.cccl_cubin_cache._cached_spec_name_set",
+            return_value=frozenset({"exclusive_scan_i32"}),
+        ), patch.object(precompiler, "_compile_one", return_value=None):
+            precompiler.request(["exclusive_scan_i32", "select_i32"])
+        assert precompiler._executor is not None
+        assert "exclusive_scan_i32" in precompiler._deferred_disk
+        assert "select_i32" in precompiler._futures
+
+    def test_get_compiled_lazy_loads_deferred(self):
+        """get_compiled() lazy-loads a deferred spec via _lazy_load_deferred."""
+        from vibespatial.cccl_precompile import PrecompiledPrimitive
+
+        precompiler = CCCLPrecompiler(max_workers=1)
+        precompiler._deferred_disk.add("exclusive_scan_i32")
+        precompiler._submitted.add("exclusive_scan_i32")
+        mock_result = PrecompiledPrimitive(
+            name="exclusive_scan_i32", make_callable=None,
+            temp_storage=None, temp_storage_bytes=0,
+            high_water_n=128, warmup_ms=1.0,
+        )
+        with patch.object(precompiler, "_lazy_load_deferred", return_value=mock_result):
+            result = precompiler.get_compiled("exclusive_scan_i32")
+        assert result is mock_result
+
+    def test_get_compiled_returns_cache_first(self):
+        """get_compiled() returns from _cache without touching _deferred_disk."""
+        from vibespatial.cccl_precompile import PrecompiledPrimitive
+
+        precompiler = CCCLPrecompiler(max_workers=1)
+        mock_result = PrecompiledPrimitive(
+            name="exclusive_scan_i32", make_callable=None,
+            temp_storage=None, temp_storage_bytes=0,
+            high_water_n=128, warmup_ms=1.0,
+        )
+        precompiler._cache["exclusive_scan_i32"] = mock_result
+        precompiler._deferred_disk.add("exclusive_scan_i32")
+        result = precompiler.get_compiled("exclusive_scan_i32")
+        assert result is mock_result
+
+    def test_status_reports_deferred_count(self):
+        precompiler = CCCLPrecompiler(max_workers=1)
+        precompiler._deferred_disk.add("exclusive_scan_i32")
+        precompiler._deferred_disk.add("select_i32")
+        status = precompiler.status()
+        assert status["deferred"] == 2
+
+    def test_ensure_warm_loads_deferred_specs(self):
+        """ensure_warm() loads all deferred specs."""
+        from vibespatial.cccl_precompile import PrecompiledPrimitive
+
+        precompiler = CCCLPrecompiler(max_workers=1)
+        precompiler._deferred_disk.add("exclusive_scan_i32")
+        precompiler._submitted.add("exclusive_scan_i32")
+        mock_result = PrecompiledPrimitive(
+            name="exclusive_scan_i32", make_callable=None,
+            temp_storage=None, temp_storage_bytes=0,
+            high_water_n=128, warmup_ms=1.0,
+        )
+        with patch.object(precompiler, "_lazy_load_deferred", return_value=mock_result):
+            cold = precompiler.ensure_warm()
+        assert cold == []
+
+    def test_shutdown_noop_when_no_executor(self):
+        """shutdown() doesn't crash when executor was never created."""
+        precompiler = CCCLPrecompiler(max_workers=1)
+        assert precompiler._executor is None
+        precompiler.shutdown()  # should not raise

@@ -5,7 +5,7 @@ Scope: CCCL and NVRTC CUBIN on-disk caching, precompilation, ctypes replay, and 
 Read If: You are changing kernel compilation, caching, precompilation, JIT warmup, or CCCL/NVRTC integration.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Disk caching architecture for CCCL algorithm CUBINs and NVRTC kernel CUBINs.
-Body Budget: 195/200 lines
+Body Budget: 220/260 lines
 Document: docs/architecture/gpu-kernel-caching.md
 
 Section Map (Body Lines)
@@ -83,8 +83,12 @@ Pipeline execution (all kernels warm)
 | Scenario | CCCL (21 specs) | NVRTC (61 units) | Total wall |
 |----------|----------------|-------------------|------------|
 | Cold (no cache) | ~3,400 ms | ~200-400 ms | ~3.5 s |
-| Warm (disk hit) | **~50 ms** | ~200 ms (already fast) | **~250 ms** |
+| Warm (disk hit, lazy) | **~0.1 ms request** | **~0.1 ms request** | **~0.2 ms at import** |
 | In-memory hit | 0.04 ms | <0.01 ms | instant |
+
+With lazy warmup, disk-cached specs are deferred at `request_warmup()` time
+and loaded on first `get_compiled()` call (~2 ms/spec).  No thread pool is
+created when all specs are cached.  See "Lazy warmup" below.
 
 ## CCCL CUBIN disk cache
 
@@ -218,6 +222,31 @@ cache predates the CCCL cache and uses the same patterns:
 - **Corruption recovery:** if `cuModuleLoadData` fails on a cached CUBIN,
   the file is deleted and the kernel is recompiled
 - **Location:** `~/.cache/vibespatial/nvrtc/`
+
+## Lazy warmup for disk-cached specs
+
+When `request_warmup()` or `request_nvrtc_warmup()` is called at module
+scope, each spec/unit is probed against the disk cache before any work
+is submitted:
+
+1. **Batch probe:** `_cached_spec_name_set()` (CCCL) or
+   `_nvrtc_cached_key_set()` (NVRTC) scans the cache directory once and
+   returns the set of cached names.  The underlying helpers
+   (`_compute_capability`, `_cccl_version`, `_get_cache_dir`) are all
+   `@lru_cache`'d, so repeated probes are cheap.
+2. **Defer on hit:** specs with disk cache entries are added to a
+   `_deferred_disk` set.  No thread pool task is created for them.
+3. **Lazy load:** on the first `get_compiled()` call (CCCL) or
+   `compile_kernels()` call (NVRTC), the deferred spec is loaded from
+   disk synchronously (~2 ms), then cached in memory.
+4. **No thread pool if all cached:** the `ThreadPoolExecutor` is created
+   lazily.  If every spec is deferred, no threads are spawned.
+
+`ensure_warm()` / `ensure_pipelines_warm()` handle deferred specs
+correctly -- they trigger lazy loads before waiting on futures.
+
+The `status()` dict includes a `"deferred"` count alongside `"compiled"`
+and `"pending"`.
 
 ## Environment variables
 

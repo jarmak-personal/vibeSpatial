@@ -44,12 +44,12 @@ class NVRTCPrecompiler:
 
     def __init__(self, max_workers: int | None = None) -> None:
         self._submitted: set[str] = set()
+        self._deferred_disk: set[str] = set()
+        self._deferred_units: dict[str, tuple[str, str, tuple[str, ...]]] = {}
         self._futures: dict[str, Future[Any]] = {}
         self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers or min(os.cpu_count() or 4, 16),
-            thread_name_prefix="nvrtc-warmup",
-        )
+        self._max_workers = max_workers or min(os.cpu_count() or 4, 16)
+        self._executor: ThreadPoolExecutor | None = None
         self._start_time: float | None = None
         self._diagnostics: list[NVRTCWarmupDiagnostic] = []
 
@@ -67,25 +67,60 @@ class NVRTCPrecompiler:
             cls._instance.shutdown()
             cls._instance = None
 
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        """Create the thread pool lazily, only when there are actual cache misses."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="nvrtc-warmup",
+            )
+        return self._executor
+
     def request(
         self, units: list[tuple[str, str, tuple[str, ...]]],
     ) -> None:
         """Submit (prefix, source, kernel_names) for background compile.
 
-        Idempotent.  Never blocks.
+        Idempotent.  Never blocks.  Units that are already cached on disk
+        are deferred — they will be loaded by compile_kernels() on first
+        use instead of eagerly in a background thread.
         """
-        from vibespatial.cuda_runtime import get_cuda_runtime, make_kernel_cache_key
+        from vibespatial.cuda_runtime import (
+            get_cuda_runtime,
+            make_kernel_cache_key,
+            nvrtc_is_cached,
+        )
 
         runtime = get_cuda_runtime()
         with self._lock:
             if self._start_time is None:
                 self._start_time = perf_counter()
+
+            # Get compute capability once for all probes
+            try:
+                cc = runtime.compute_capability
+            except RuntimeError:
+                cc = None
+
             for prefix, source, kernel_names in units:
                 cache_key = make_kernel_cache_key(prefix, source)
                 if cache_key in self._submitted:
                     continue
                 self._submitted.add(cache_key)
-                self._futures[cache_key] = self._executor.submit(
+
+                # Check in-memory cache first
+                if cache_key in runtime._module_cache:
+                    continue
+
+                # Check disk cache
+                if cc is not None and nvrtc_is_cached(cache_key, cc):
+                    self._deferred_disk.add(cache_key)
+                    self._deferred_units[cache_key] = (prefix, source, kernel_names)
+                    logger.debug("NVRTC warmup: %s deferred (disk cached)", cache_key)
+                    continue
+
+                # Cache miss: submit for background compilation
+                self._futures[cache_key] = self._ensure_executor().submit(
                     self._compile_one, runtime, cache_key, source, kernel_names,
                 )
 
@@ -123,6 +158,7 @@ class NVRTCPrecompiler:
         return {
             "submitted": len(self._submitted),
             "compiled": sum(1 for d in self._diagnostics if d.success),
+            "deferred": len(self._deferred_disk),
             "pending": sum(1 for f in self._futures.values() if not f.done()),
             "failed": sum(1 for d in self._diagnostics if not d.success),
             "wall_ms": (perf_counter() - self._start_time) * 1000
@@ -141,6 +177,28 @@ class NVRTCPrecompiler:
         Used by Level 3 pipeline-aware warmup (ADR-0034).
         """
         cold: list[str] = []
+        # Load deferred disk-cached units via compile_kernels (which
+        # handles disk cache loading internally)
+        for cache_key in list(self._deferred_disk):
+            unit_info = self._deferred_units.get(cache_key)
+            if unit_info is None:
+                continue
+            prefix, source, kernel_names = unit_info
+            try:
+                from vibespatial.cuda_runtime import get_cuda_runtime
+                runtime = get_cuda_runtime()
+                runtime.compile_kernels(
+                    cache_key=cache_key, source=source,
+                    kernel_names=kernel_names,
+                )
+                self._deferred_disk.discard(cache_key)
+                elapsed = 0.0  # loaded via compile_kernels fast path
+                self._diagnostics.append(
+                    NVRTCWarmupDiagnostic(cache_key, elapsed, True),
+                )
+            except Exception:
+                cold.append(cache_key)
+        # Wait for background-compiled units
         for cache_key, future in list(self._futures.items()):
             try:
                 future.result(timeout=timeout)
@@ -150,7 +208,8 @@ class NVRTCPrecompiler:
 
     def shutdown(self) -> None:
         """Shut down the thread pool.  For testing cleanup."""
-        self._executor.shutdown(wait=False)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------

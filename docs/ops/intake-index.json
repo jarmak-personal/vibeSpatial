@@ -12246,8 +12246,8 @@
         "count_scatter_total_with_transfer",
         "compile_kernel_group",
         "make_kernel_cache_key",
-        "clear_nvrtc_cache",
-        "nvrtc_cache_stats"
+        "_nvrtc_cached_key_set",
+        "nvrtc_is_cached"
       ],
       "tokens": [
         "arrays",
@@ -12255,7 +12255,6 @@
         "cache",
         "cached",
         "check",
-        "clear",
         "compile",
         "compiledkernel",
         "count",
@@ -12282,8 +12281,8 @@
         "require",
         "runtime",
         "scatter",
+        "set",
         "src",
-        "stats",
         "support",
         "total",
         "transfer",
@@ -16022,7 +16021,8 @@
         "TestCacheEntry",
         "TestDiskIO",
         "TestCacheKey",
-        "TestFamilyRegistry"
+        "TestFamilyRegistry",
+        "TestIsCached"
       ],
       "tokens": [
         "cache",
@@ -16037,6 +16037,7 @@
         "testdiskio",
         "testelfparsing",
         "testfamilyregistry",
+        "testiscached",
         "tests",
         "teststructsizes"
       ]
@@ -16049,7 +16050,8 @@
         "_reset_precompilers",
         "TestPrecompileEnabled",
         "TestSpecRegistry",
-        "TestCCCLPrecompilerNoGPU"
+        "TestCCCLPrecompilerNoGPU",
+        "TestCCCLDeferredDiskLoading"
       ],
       "tokens": [
         "cccl",
@@ -16058,6 +16060,7 @@
         "py",
         "reset",
         "test",
+        "testcccldeferreddiskloading",
         "testccclprecompilernogpu",
         "testprecompileenabled",
         "tests",
@@ -18046,7 +18049,9 @@
         "test_compile_kernels_populates_disk_cache",
         "test_clear_nvrtc_cache",
         "test_clear_empty_cache",
-        "test_nvrtc_cache_stats"
+        "test_nvrtc_cache_stats",
+        "test_nvrtc_cached_key_set",
+        "test_nvrtc_is_cached_true"
       ],
       "tokens": [
         "all",
@@ -18093,10 +18098,12 @@
         "respected",
         "returns",
         "roundtrip",
+        "set",
         "stable",
         "stats",
         "test",
         "tests",
+        "true",
         "var",
         "version",
         "via",
@@ -18111,7 +18118,8 @@
       "referenced_by": [],
       "symbols": [
         "_reset_precompiler",
-        "TestNVRTCPrecompilerNoGPU"
+        "TestNVRTCPrecompilerNoGPU",
+        "TestNVRTCDeferredDiskLoading"
       ],
       "tokens": [
         "nvrtc",
@@ -18120,6 +18128,7 @@
         "py",
         "reset",
         "test",
+        "testnvrtcdeferreddiskloading",
         "testnvrtcprecompilernogpu",
         "tests"
       ]

@@ -1497,6 +1497,47 @@ def save_after_build(
         _write_cache_entry(entry)
 
 
+def _cached_spec_name_set() -> frozenset[str]:
+    """Return all spec names with cache files on disk for the current CC/CCCL version.
+
+    Scans the cache directory once and extracts spec names from filenames.
+    The result is NOT lru_cached because callers (CCCLPrecompiler.request)
+    may need to re-probe after a precompile_all() populates the cache.
+    However, the underlying helpers (_compute_capability, _cccl_version,
+    _get_cache_dir) are all @lru_cache'd, so repeated calls are cheap.
+    """
+    if not _cccl_cache_enabled():
+        return frozenset()
+    cache_dir = _get_cache_dir()
+    if not cache_dir.exists():
+        return frozenset()
+    cc = _compute_capability()
+    prefix = f"{_CACHE_FORMAT_VERSION}-sm{cc[0]}{cc[1]}-cccl{_cccl_version()}-"
+    suffix = ".cache"
+    names: set[str] = set()
+    try:
+        for path in cache_dir.iterdir():
+            fname = path.name
+            if fname.startswith(prefix) and fname.endswith(suffix):
+                # Filename: {prefix}{spec_name}-{cubin_hash_12}.cache
+                rest = fname[len(prefix):-len(suffix)]
+                # spec_name is everything before the last '-' (the hash)
+                dash_idx = rest.rfind("-")
+                if dash_idx > 0:
+                    names.add(rest[:dash_idx])
+    except OSError:
+        pass
+    return frozenset(names)
+
+
+def is_cached(spec_name: str) -> bool:
+    """Quick check: does a cache file exist on disk for this spec?
+
+    Uses _cached_spec_name_set() which scans the directory once.
+    """
+    return spec_name in _cached_spec_name_set()
+
+
 def clear_cache() -> int:
     """Delete all CCCL CUBIN cache files.  Returns count of files removed."""
     cache_dir = _get_cache_dir()

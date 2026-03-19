@@ -8,10 +8,12 @@ from vibespatial.cuda_runtime import (
     _delete_cached_cubin,
     _disk_cache_key,
     _get_cache_dir,
+    _nvrtc_cached_key_set,
     _read_cached_cubin,
     _write_cached_cubin,
     clear_nvrtc_cache,
     nvrtc_cache_stats,
+    nvrtc_is_cached,
 )
 
 # ---------------------------------------------------------------------------
@@ -310,5 +312,70 @@ def test_nvrtc_cache_stats(tmp_path, monkeypatch):
         assert stats["file_count"] == 2
         assert stats["total_bytes"] == 500
         assert stats["enabled"] is True
+    finally:
+        _get_cache_dir.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Disk cache probe (nvrtc_is_cached / _nvrtc_cached_key_set)
+# ---------------------------------------------------------------------------
+
+
+def test_nvrtc_cached_key_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    try:
+        (tmp_path / "v2-sm89-nvrtc12.6-test-abc123.cubin").write_bytes(b"x" * 100)
+        (tmp_path / "v2-sm89-nvrtc12.6-other-def456.cubin").write_bytes(b"x" * 100)
+        (tmp_path / "not-a-cubin.txt").write_bytes(b"noise")
+        keys = _nvrtc_cached_key_set()
+        assert "v2-sm89-nvrtc12.6-test-abc123" in keys
+        assert "v2-sm89-nvrtc12.6-other-def456" in keys
+        assert len(keys) == 2
+    finally:
+        _get_cache_dir.cache_clear()
+
+
+def test_nvrtc_is_cached_true(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    from vibespatial.cuda_runtime import _nvrtc_version
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    _nvrtc_version.cache_clear()
+    try:
+        with patch("vibespatial.cuda_runtime._nvrtc_version", return_value=(12, 6)):
+            disk_key = _disk_cache_key("test-abc123", (8, 9), (), (12, 6))
+            (tmp_path / f"{disk_key}.cubin").write_bytes(b"x" * 100)
+            assert nvrtc_is_cached("test-abc123", (8, 9), ()) is True
+    finally:
+        _get_cache_dir.cache_clear()
+        _nvrtc_version.cache_clear()
+
+
+def test_nvrtc_is_cached_false(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    try:
+        assert nvrtc_is_cached("nonexistent-key", (8, 9), ()) is False
+    finally:
+        _get_cache_dir.cache_clear()
+
+
+def test_nvrtc_is_cached_false_when_disabled(monkeypatch):
+    from vibespatial.cuda_runtime import _disk_cache_enabled
+    _disk_cache_enabled.cache_clear()
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE", "0")
+    try:
+        assert nvrtc_is_cached("anything", (8, 9), ()) is False
+    finally:
+        _disk_cache_enabled.cache_clear()
+
+
+def test_nvrtc_cached_key_set_empty_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
+    _get_cache_dir.cache_clear()
+    try:
+        assert _nvrtc_cached_key_set() == frozenset()
     finally:
         _get_cache_dir.cache_clear()

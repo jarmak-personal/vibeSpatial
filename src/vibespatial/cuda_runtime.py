@@ -732,6 +732,46 @@ def make_kernel_cache_key(prefix: str, source: str) -> str:
     return f"{prefix}-{digest}"
 
 
+def _nvrtc_cached_key_set() -> frozenset[str]:
+    """Return all disk cache keys with CUBIN files on disk.
+
+    Scans the NVRTC cache directory once and returns the set of
+    disk_key stems (filename without .cubin suffix).  Not lru_cached
+    because callers may need to re-probe after compilation populates
+    the cache; the underlying _get_cache_dir() is already cached.
+    """
+    if not _disk_cache_enabled():
+        return frozenset()
+    cache_dir = _get_cache_dir()
+    if not cache_dir.exists():
+        return frozenset()
+    keys: set[str] = set()
+    try:
+        for path in cache_dir.iterdir():
+            if path.suffix == ".cubin":
+                keys.add(path.stem)
+    except OSError:
+        pass
+    return frozenset(keys)
+
+
+def nvrtc_is_cached(
+    cache_key: str,
+    compute_cap: tuple[int, int],
+    options: tuple[str, ...] = (),
+) -> bool:
+    """Check if an NVRTC CUBIN exists on disk for the given cache key.
+
+    Cheap: file-existence only, no deserialization.
+    Requires compute_cap to be passed in (avoids requiring CUDA context
+    initialization just for the probe).
+    """
+    if not _disk_cache_enabled():
+        return False
+    disk_key = _disk_cache_key(cache_key, compute_cap, options, _nvrtc_version())
+    return disk_key in _nvrtc_cached_key_set()
+
+
 def clear_nvrtc_cache() -> int:
     """Delete all cached NVRTC CUBIN files from disk.
 

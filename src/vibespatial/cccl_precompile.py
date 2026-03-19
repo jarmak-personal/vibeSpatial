@@ -705,11 +705,11 @@ class CCCLPrecompiler:
         self._cache: dict[str, PrecompiledPrimitive] = {}
         self._futures: dict[str, Future[PrecompiledPrimitive | None]] = {}
         self._submitted: set[str] = set()
+        self._deferred_disk: set[str] = set()
         self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="cccl-warmup",
-        )
+        self._deferred_lock = threading.Lock()
+        self._max_workers = max_workers
+        self._executor: ThreadPoolExecutor | None = None
         self._start_time: float | None = None
         self._diagnostics: list[WarmupDiagnostic] = []
 
@@ -727,22 +727,46 @@ class CCCLPrecompiler:
             cls._instance.shutdown()
             cls._instance = None
 
+    def _ensure_executor(self) -> ThreadPoolExecutor:
+        """Create the thread pool lazily, only when there are actual cache misses."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix="cccl-warmup",
+            )
+        return self._executor
+
     def request(self, spec_names: list[str]) -> None:
-        """Submit specs for background compilation.  Idempotent, never blocks."""
+        """Submit specs for background compilation.  Idempotent, never blocks.
+
+        Specs that are already cached on disk are deferred — they will be
+        loaded lazily on the first get_compiled() call instead of eagerly
+        in a background thread.  If all specs are cached, no thread pool
+        is created.
+        """
         with self._lock:
             new_specs = [n for n in spec_names if n not in self._submitted]
             if not new_specs:
                 return
             if self._start_time is None:
                 self._start_time = perf_counter()
+
+            # Batch probe: which of the new specs are already on disk?
+            from vibespatial.cccl_cubin_cache import _cached_spec_name_set
+            cached_on_disk = _cached_spec_name_set()
+
             for name in new_specs:
                 if name not in SPEC_REGISTRY:
                     logger.warning("Unknown CCCL warmup spec: %s", name)
                     continue
                 self._submitted.add(name)
-                spec = SPEC_REGISTRY[name]
-                future = self._executor.submit(self._compile_one, spec)
-                self._futures[name] = future
+                if name in cached_on_disk:
+                    self._deferred_disk.add(name)
+                    logger.debug("CCCL warmup: %s deferred (disk cached)", name)
+                else:
+                    spec = SPEC_REGISTRY[name]
+                    future = self._ensure_executor().submit(self._compile_one, spec)
+                    self._futures[name] = future
 
     def _compile_one(self, spec: CCCLWarmupSpec) -> PrecompiledPrimitive | None:
         """JIT-compile one make_* callable with dummy arrays.  Runs on a worker thread.
@@ -873,6 +897,8 @@ class CCCLPrecompiler:
         """
         if name in self._cache:
             return self._cache[name]
+        if name in self._deferred_disk:
+            return self._lazy_load_deferred(name)
         if name in self._futures:
             try:
                 return self._futures[name].result(timeout=timeout)
@@ -880,11 +906,67 @@ class CCCLPrecompiler:
                 return None
         return None
 
+    def _lazy_load_deferred(self, name: str) -> PrecompiledPrimitive | None:
+        """Synchronously load a deferred disk-cached spec into memory.
+
+        Thread-safe: concurrent callers for the same spec serialize via
+        _deferred_lock; the second caller gets the cached result.
+        """
+        if name in self._cache:
+            return self._cache[name]
+
+        with self._deferred_lock:
+            if name in self._cache:
+                return self._cache[name]
+
+            spec = SPEC_REGISTRY.get(name)
+            if spec is None:
+                self._deferred_disk.discard(name)
+                return None
+
+            try:
+                import cupy as cp_module
+                from cuda.compute import algorithms
+            except ImportError:
+                self._deferred_disk.discard(name)
+                return None
+
+            t0 = perf_counter()
+            result = self._try_cached_compile(spec, cp_module, algorithms)
+            if result is not None:
+                self._deferred_disk.discard(name)
+                return result
+
+            # Cache file disappeared or is corrupt — fall back to full compile
+            logger.debug(
+                "CCCL lazy load: %s disk cache miss, compiling synchronously",
+                name,
+            )
+            self._deferred_disk.discard(name)
+            compiler = _FAMILY_COMPILERS.get(spec.family)
+            if compiler is None:
+                return None
+            try:
+                result = compiler(spec, cp_module, algorithms)
+                self._cache[name] = result
+                elapsed = (perf_counter() - t0) * 1000.0
+                result.warmup_ms = elapsed
+                self._diagnostics.append(WarmupDiagnostic(name, elapsed, True))
+                self._save_to_disk_cache(spec, result)
+                return result
+            except Exception as exc:
+                elapsed = (perf_counter() - t0) * 1000.0
+                self._diagnostics.append(
+                    WarmupDiagnostic(name, elapsed, False, str(exc)),
+                )
+                return None
+
     def status(self) -> dict[str, Any]:
         """Diagnostic snapshot for observability."""
         return {
             "submitted": len(self._submitted),
             "compiled": len(self._cache),
+            "deferred": len(self._deferred_disk),
             "pending": sum(1 for f in self._futures.values() if not f.done()),
             "failed": sum(
                 1 for f in self._futures.values()
@@ -907,6 +989,12 @@ class CCCLPrecompiler:
         compilation before the first pipeline stage executes.
         """
         cold: list[str] = []
+        # Load all deferred disk-cached specs first
+        for name in list(self._deferred_disk):
+            result = self._lazy_load_deferred(name)
+            if result is None:
+                cold.append(name)
+        # Wait for background-compiled specs
         for name, future in list(self._futures.items()):
             if name in self._cache:
                 continue
@@ -918,7 +1006,8 @@ class CCCLPrecompiler:
 
     def shutdown(self) -> None:
         """Shut down the thread pool.  For testing cleanup."""
-        self._executor.shutdown(wait=False)
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------

@@ -54,8 +54,73 @@ class TestNVRTCPrecompilerNoGPU:
         status = precompiler.status()
         assert "submitted" in status
         assert "compiled" in status
+        assert "deferred" in status
         assert "pending" in status
         assert "failed" in status
         assert "wall_ms" in status
         assert "per_unit" in status
         assert isinstance(status["per_unit"], list)
+
+
+# ---------------------------------------------------------------------------
+# Deferred disk loading
+# ---------------------------------------------------------------------------
+
+class TestNVRTCDeferredDiskLoading:
+    def test_request_defers_cached_units(self):
+        """Units with disk cache entries are deferred, not submitted to thread pool."""
+        precompiler = NVRTCPrecompiler(max_workers=1)
+        mock_runtime = type("MockRuntime", (), {
+            "compute_capability": (8, 9),
+            "_module_cache": {},
+        })()
+        with patch(
+            "vibespatial.cuda_runtime.make_kernel_cache_key",
+            side_effect=lambda prefix, source: f"{prefix}-hash",
+        ), patch(
+            "vibespatial.cuda_runtime.nvrtc_is_cached",
+            return_value=True,
+        ), patch(
+            "vibespatial.cuda_runtime.get_cuda_runtime",
+            return_value=mock_runtime,
+        ):
+            precompiler.request([("a", "source_a", ("k1",))])
+        assert "a-hash" in precompiler._deferred_disk
+        assert "a-hash" in precompiler._submitted
+        assert precompiler._executor is None
+
+    def test_no_executor_when_all_deferred(self):
+        """Thread pool is not created when all units are disk-cached."""
+        precompiler = NVRTCPrecompiler(max_workers=1)
+        mock_runtime = type("MockRuntime", (), {
+            "compute_capability": (8, 9),
+            "_module_cache": {},
+        })()
+        with patch(
+            "vibespatial.cuda_runtime.make_kernel_cache_key",
+            side_effect=lambda prefix, source: f"{prefix}-hash",
+        ), patch(
+            "vibespatial.cuda_runtime.nvrtc_is_cached",
+            return_value=True,
+        ), patch(
+            "vibespatial.cuda_runtime.get_cuda_runtime",
+            return_value=mock_runtime,
+        ):
+            precompiler.request([
+                ("a", "src_a", ("k1",)),
+                ("b", "src_b", ("k2",)),
+            ])
+        assert precompiler._executor is None
+        assert len(precompiler._deferred_disk) == 2
+
+    def test_status_reports_deferred_count(self):
+        precompiler = NVRTCPrecompiler(max_workers=1)
+        precompiler._deferred_disk.add("test-key")
+        status = precompiler.status()
+        assert status["deferred"] == 1
+
+    def test_shutdown_noop_when_no_executor(self):
+        """shutdown() doesn't crash when executor was never created."""
+        precompiler = NVRTCPrecompiler(max_workers=1)
+        assert precompiler._executor is None
+        precompiler.shutdown()  # should not raise
