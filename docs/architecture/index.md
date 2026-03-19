@@ -31,4 +31,5 @@ io-support-matrix
 io-files
 io-arrow
 io-acceleration
+gpu-kernel-caching
 ```

@@ -448,6 +448,246 @@ _FAMILY_MAKE_FN = {
 
 
 # ---------------------------------------------------------------------------
+# Cached-build helpers — construct _Cached* from disk cache entries
+# ---------------------------------------------------------------------------
+
+
+def _build_cached_callable(
+    entry: Any, spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+) -> Any:
+    """Construct a _Cached* callable from a CacheEntry + spec."""
+    from cuda.compute._bindings import Op as CcclOp
+    from cuda.compute._bindings import OpKind
+    from cuda.compute._cccl_interop import (
+        to_cccl_input_iter,
+        to_cccl_output_iter,
+        to_cccl_value,
+    )
+    from cuda.compute.op import make_op_adapter
+
+    from vibespatial.cccl_cubin_cache import (
+        _CachedBinarySearch,
+        _CachedMergeSort,
+        _CachedRadixSort,
+        _CachedScanReduce,
+        _CachedSegmentedReduce,
+        _CachedUniqueByKey,
+        reconstruct_build,
+    )
+
+    build = reconstruct_build(entry)
+
+    family = spec.family
+    if family in (AlgorithmFamily.EXCLUSIVE_SCAN, AlgorithmFamily.REDUCE_INTO):
+        d_in = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out = cp_module.empty(
+            1 if family == AlgorithmFamily.REDUCE_INTO else _N,
+            dtype=spec.key_dtype,
+        )
+        op = _get_op(spec.op_name)
+        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        d_in_cccl = to_cccl_input_iter(d_in)
+        d_out_cccl = to_cccl_output_iter(d_out)
+        op_adapter = make_op_adapter(op)
+        from cuda.compute._cccl_interop import get_value_type
+        vt = get_value_type(h_init)
+        op_cccl = op_adapter.compile((vt, vt), vt)
+        init_cccl = to_cccl_value(h_init)
+
+        c_func = (
+            "cccl_device_exclusive_scan"
+            if family == AlgorithmFamily.EXCLUSIVE_SCAN
+            else "cccl_device_reduce"
+        )
+        return _CachedScanReduce(
+            build, spec.name, c_func,
+            d_in_cccl, d_out_cccl, op_cccl, init_cccl, op_adapter,
+        )
+
+    if family == AlgorithmFamily.SEGMENTED_REDUCE:
+        n_segs = 4
+        seg_size = _N // n_segs
+        d_values = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out = cp_module.empty(n_segs, dtype=spec.key_dtype)
+        d_starts = cp_module.arange(0, _N, seg_size, dtype=cp_module.int32)
+        d_ends = d_starts + seg_size
+        op = _get_op(spec.op_name)
+        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        d_in_cccl = to_cccl_input_iter(d_values)
+        d_out_cccl = to_cccl_output_iter(d_out)
+        d_starts_cccl = to_cccl_input_iter(d_starts)
+        d_ends_cccl = to_cccl_input_iter(d_ends)
+        op_adapter = make_op_adapter(op)
+        from cuda.compute._cccl_interop import get_value_type
+        vt = get_value_type(h_init)
+        op_cccl = op_adapter.compile((vt, vt), vt)
+        init_cccl = to_cccl_value(h_init)
+        return _CachedSegmentedReduce(
+            build, spec.name,
+            d_in_cccl, d_out_cccl, d_starts_cccl, d_ends_cccl,
+            op_cccl, init_cccl, op_adapter,
+        )
+
+    if family in (AlgorithmFamily.LOWER_BOUND, AlgorithmFamily.UPPER_BOUND):
+        d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
+        d_query = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out = cp_module.empty(_N, dtype=np.uintp)
+        d_data_cccl = to_cccl_input_iter(d_sorted)
+        d_values_cccl = to_cccl_input_iter(d_query)
+        d_out_cccl = to_cccl_output_iter(d_out)
+        # Binary search uses a compiled lambda comparator (not OpKind.LESS,
+        # because well-known ops don't carry type info for JIT)
+        import numba
+        def _default_less(a, b):
+            return a < b
+        from cuda.compute._cccl_interop import get_value_type
+        comp_adapter = make_op_adapter(_default_less)
+        vt = get_value_type(d_sorted)
+        op_cccl = comp_adapter.compile((vt, vt), numba.types.uint8)
+        return _CachedBinarySearch(
+            build, spec.name,
+            d_data_cccl, d_values_cccl, d_out_cccl, op_cccl,
+        )
+
+    if family == AlgorithmFamily.RADIX_SORT:
+        d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_keys_in_cccl = to_cccl_input_iter(d_keys)
+        d_keys_out_cccl = to_cccl_output_iter(d_out_keys)
+        d_vals_in_cccl = to_cccl_input_iter(d_values)
+        d_vals_out_cccl = to_cccl_output_iter(d_out_values)
+        # Radix sort uses a dummy (empty) decomposer op
+        from cuda.compute._bindings import Op as CcclOp
+        decomposer_cccl = CcclOp(
+            name="", operator_type=OpKind.STATELESS,
+            ltoir=b"", state_alignment=1, state=None,
+        )
+        return _CachedRadixSort(
+            build, spec.name,
+            d_keys_in_cccl, d_keys_out_cccl,
+            d_vals_in_cccl, d_vals_out_cccl,
+            decomposer_cccl,
+        )
+
+    if family == AlgorithmFamily.MERGE_SORT:
+        d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        op = _get_op(spec.op_name)
+        d_keys_in_cccl = to_cccl_input_iter(d_keys)
+        d_vals_in_cccl = to_cccl_input_iter(d_values)
+        d_keys_out_cccl = to_cccl_output_iter(d_out_keys)
+        d_vals_out_cccl = to_cccl_output_iter(d_out_values)
+        op_adapter = make_op_adapter(op)
+        from cuda.compute._cccl_interop import get_value_type
+        vt = get_value_type(d_keys)
+        op_cccl = op_adapter.compile((vt, vt), vt)
+        return _CachedMergeSort(
+            build, spec.name,
+            d_keys_in_cccl, d_vals_in_cccl,
+            d_keys_out_cccl, d_vals_out_cccl,
+            op_cccl, op_adapter,
+        )
+
+    if family == AlgorithmFamily.UNIQUE_BY_KEY:
+        d_keys = cp_module.arange(_N, dtype=spec.key_dtype)
+        d_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_count = cp_module.empty(1, dtype=cp_module.int32)
+        op = _get_op(spec.op_name)
+        d_keys_in_cccl = to_cccl_input_iter(d_keys)
+        d_vals_in_cccl = to_cccl_input_iter(d_values)
+        d_keys_out_cccl = to_cccl_output_iter(d_out_keys)
+        d_vals_out_cccl = to_cccl_output_iter(d_out_values)
+        d_count_cccl = to_cccl_output_iter(d_count)
+        op_adapter = make_op_adapter(op)
+        from cuda.compute._cccl_interop import get_value_type
+        vt = get_value_type(d_keys)
+        op_cccl = op_adapter.compile((vt, vt), vt)
+        return _CachedUniqueByKey(
+            build, spec.name,
+            d_keys_in_cccl, d_vals_in_cccl,
+            d_keys_out_cccl, d_vals_out_cccl, d_count_cccl,
+            op_cccl, op_adapter,
+        )
+
+    # Unsupported family (select, segmented_sort) — fall through to build
+    return None
+
+
+def _query_cached_temp(
+    cached_callable: Any, spec: CCCLWarmupSpec, cp_module: Any,
+) -> int:
+    """Query temp storage size from a cached callable."""
+    family = spec.family
+
+    if family in (AlgorithmFamily.EXCLUSIVE_SCAN, AlgorithmFamily.REDUCE_INTO):
+        d_in = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out = cp_module.empty(
+            1 if family == AlgorithmFamily.REDUCE_INTO else _N,
+            dtype=spec.key_dtype,
+        )
+        op = _get_op(spec.op_name)
+        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        return cached_callable(None, d_in, d_out, op, _N, h_init)
+
+    if family == AlgorithmFamily.SEGMENTED_REDUCE:
+        n_segs = 4
+        seg_size = _N // n_segs
+        d_values = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out = cp_module.empty(n_segs, dtype=spec.key_dtype)
+        d_starts = cp_module.arange(0, _N, seg_size, dtype=cp_module.int32)
+        d_ends = d_starts + seg_size
+        op = _get_op(spec.op_name)
+        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        return cached_callable(
+            None, d_values, d_out, d_starts, d_ends, op, n_segs, h_init,
+        )
+
+    if family in (AlgorithmFamily.LOWER_BOUND, AlgorithmFamily.UPPER_BOUND):
+        d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
+        d_query = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out = cp_module.empty(_N, dtype=np.uintp)
+        return cached_callable(None, d_sorted, d_query, d_out, _N, _N)
+
+    if family == AlgorithmFamily.RADIX_SORT:
+        d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        return cached_callable(
+            None, d_keys, d_out_keys, d_values, d_out_values, _N,
+        )
+
+    if family == AlgorithmFamily.MERGE_SORT:
+        d_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        op = _get_op(spec.op_name)
+        return cached_callable(
+            None, d_keys, d_values, d_out_keys, d_out_values, op, _N,
+        )
+
+    if family == AlgorithmFamily.UNIQUE_BY_KEY:
+        d_keys = cp_module.arange(_N, dtype=spec.key_dtype)
+        d_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_out_keys = cp_module.empty(_N, dtype=spec.key_dtype)
+        d_out_values = cp_module.empty(_N, dtype=spec.value_dtype)
+        d_count = cp_module.empty(1, dtype=cp_module.int32)
+        op = _get_op(spec.op_name)
+        return cached_callable(
+            None, d_keys, d_values, d_out_keys, d_out_values, d_count, op, _N,
+        )
+
+    return 1  # fallback
+
+
+# ---------------------------------------------------------------------------
 # Precompiler singleton
 # ---------------------------------------------------------------------------
 
@@ -505,7 +745,11 @@ class CCCLPrecompiler:
                 self._futures[name] = future
 
     def _compile_one(self, spec: CCCLWarmupSpec) -> PrecompiledPrimitive | None:
-        """JIT-compile one make_* callable with dummy arrays.  Runs on a worker thread."""
+        """JIT-compile one make_* callable with dummy arrays.  Runs on a worker thread.
+
+        Checks the on-disk CUBIN cache first.  On miss, builds via CCCL
+        make_* and caches the result for next time.
+        """
         try:
             import cupy as cp_module
             from cuda.compute import algorithms
@@ -529,6 +773,12 @@ class CCCLPrecompiler:
             self._diagnostics.append(diag)
             return None
 
+        # --- CCCL CUBIN disk cache: try cache-hit path first ---
+        cached_result = self._try_cached_compile(spec, cp_module, algorithms)
+        if cached_result is not None:
+            return cached_result
+
+        # --- Standard CCCL build (cache miss or cache disabled) ---
         t0 = perf_counter()
         try:
             result = compiler(spec, cp_module, algorithms)
@@ -537,12 +787,81 @@ class CCCLPrecompiler:
             result.warmup_ms = elapsed
             self._diagnostics.append(WarmupDiagnostic(spec.name, elapsed, True))
             logger.debug("CCCL warmup: %s compiled in %.1fms", spec.name, elapsed)
+
+            # Cache for next time
+            self._save_to_disk_cache(spec, result)
+
             return result
         except Exception as exc:
             elapsed = (perf_counter() - t0) * 1000.0
             self._diagnostics.append(WarmupDiagnostic(spec.name, elapsed, False, str(exc)))
             logger.debug("CCCL warmup: %s failed: %s", spec.name, exc)
             return None
+
+    def _try_cached_compile(
+        self,
+        spec: CCCLWarmupSpec,
+        cp_module: Any,
+        algorithms: Any,
+    ) -> PrecompiledPrimitive | None:
+        """Try to load a cached CUBIN and construct a _Cached* callable."""
+        try:
+            from vibespatial import cccl_cubin_cache
+
+            entry = cccl_cubin_cache.try_load_cached(spec.name, spec.family)
+            if entry is None:
+                return None
+
+            t0 = perf_counter()
+            cached_callable = _build_cached_callable(
+                entry, spec, cp_module, algorithms,
+            )
+            if cached_callable is None:
+                return None
+
+            # Query temp storage
+            temp_bytes = _query_cached_temp(cached_callable, spec, cp_module)
+            temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
+            d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
+
+            elapsed = (perf_counter() - t0) * 1000.0
+            result = PrecompiledPrimitive(
+                name=spec.name,
+                make_callable=cached_callable,
+                temp_storage=d_temp,
+                temp_storage_bytes=temp_bytes,
+                high_water_n=_N,
+                warmup_ms=elapsed,
+            )
+            self._cache[spec.name] = result
+            self._diagnostics.append(
+                WarmupDiagnostic(spec.name, elapsed, True),
+            )
+            logger.debug(
+                "CCCL warmup: %s loaded from disk cache in %.1fms",
+                spec.name, elapsed,
+            )
+            return result
+        except Exception:
+            logger.debug(
+                "CCCL cache: hit but load failed for %s, falling back",
+                spec.name, exc_info=True,
+            )
+            return None
+
+    def _save_to_disk_cache(
+        self, spec: CCCLWarmupSpec, result: PrecompiledPrimitive,
+    ) -> None:
+        """Save a freshly built result to disk cache."""
+        try:
+            from vibespatial import cccl_cubin_cache
+            cccl_cubin_cache.save_after_build(
+                spec.name, spec.family, result.make_callable,
+            )
+        except Exception:
+            logger.debug(
+                "CCCL cache: save failed for %s", spec.name, exc_info=True,
+            )
 
     def get_compiled(
         self, name: str, timeout: float = 5.0,
@@ -651,4 +970,72 @@ def ensure_pipelines_warm(timeout: float = 60.0) -> dict[str, Any]:
         result["cccl_cold"] = CCCLPrecompiler.get().ensure_warm(timeout=timeout)
     if NVRTCPrecompiler._instance is not None:
         result["nvrtc_cold"] = NVRTCPrecompiler.get().ensure_warm(timeout=timeout)
+    return result
+
+
+# Modules whose import triggers request_nvrtc_warmup() at module scope.
+_NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
+    "vibespatial.indexing",
+    "vibespatial.io_geojson_gpu",
+    "vibespatial.io_wkb",
+    "vibespatial.kernels.core.geometry_analysis",
+    "vibespatial.kernels.core.spatial_query_kernels",
+    "vibespatial.kernels.core.wkb_decode",
+    "vibespatial.kernels.predicates.point_in_polygon",
+    "vibespatial.overlay_gpu",
+    "vibespatial.make_valid_gpu",
+    "vibespatial.make_valid_pipeline",
+    "vibespatial.point_binary_relations",
+    "vibespatial.point_constructive",
+    "vibespatial.point_distance",
+    "vibespatial.polygon_constructive",
+    "vibespatial.polygon_predicates",
+    "vibespatial.linestring_constructive",
+    "vibespatial.segment_distance",
+    "vibespatial.segment_primitives",
+    "vibespatial.measurement_kernels",
+    "vibespatial.centroid_kernels",
+    "vibespatial.clip_rect",
+)
+
+
+def precompile_all(timeout: float = 120.0) -> dict[str, Any]:
+    """Pre-compile every CCCL algorithm spec and NVRTC kernel in the library.
+
+    This populates both the CCCL CUBIN disk cache and the NVRTC disk cache
+    so that subsequent process starts pay near-zero JIT cost.  Intended for
+    one-time use after installation or in a CI warm-up step::
+
+        uv run python -c "from vibespatial.cccl_precompile import precompile_all; print(precompile_all())"
+
+    Blocks until all compilations finish (or *timeout* seconds elapse).
+
+    Returns a dict with ``cccl`` and ``nvrtc`` status sub-dicts plus
+    ``cccl_cold`` / ``nvrtc_cold`` lists of any specs that failed or
+    timed out.
+    """
+    import importlib
+
+    from vibespatial.runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        return {"error": "no GPU runtime available"}
+
+    # ---- CCCL: request every spec in the registry ----
+    request_warmup(list(SPEC_REGISTRY.keys()))
+
+    # ---- NVRTC: import consumer modules to trigger their warmup requests ----
+    for mod_name in _NVRTC_CONSUMER_MODULES:
+        try:
+            importlib.import_module(mod_name)
+        except Exception:
+            logger.debug("precompile_all: failed to import %s", mod_name)
+
+    # ---- Block until done ----
+    cold = ensure_pipelines_warm(timeout=timeout)
+
+    # ---- Return combined status ----
+    result = precompile_status()
+    result["cccl_cold"] = cold.get("cccl_cold", [])
+    result["nvrtc_cold"] = cold.get("nvrtc_cold", [])
     return result

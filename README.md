@@ -98,8 +98,10 @@ kernels.
 | Packaging | uv, hatchling |
 
 All GPU kernels are **pure Python** — CUDA C source strings compiled at
-runtime via NVRTC with background warmup (ADR-0034).  No compiled extensions,
-no `nvcc` build step.  The entire suite ships as pure-Python wheels:
+runtime via NVRTC with background warmup (ADR-0034).  Compiled CUBINs are
+cached on disk so the JIT cost is paid only once per install.  No compiled
+extensions, no `nvcc` build step.  The entire suite ships as pure-Python
+wheels:
 
 | Package | Wheel size |
 |---|---|
@@ -107,6 +109,27 @@ no `nvcc` build step.  The entire suite ships as pure-Python wheels:
 | vibeproj | 57 KB |
 | vibespatial-raster | 51 KB |
 | **Total** | **720 KB** |
+
+### Pre-compilation
+
+The first time a GPU operation runs, CUDA kernels are JIT-compiled in the
+background (~2-3 s wall time on 8 threads).  Compiled CUBINs are cached on
+disk so subsequent process starts are near-instant.  To pre-populate the
+caches (e.g. in CI or after install):
+
+```python
+from vibespatial.cccl_precompile import precompile_all
+precompile_all()  # compiles all 21 CCCL specs + 61 NVRTC kernels, blocks until done
+```
+
+Or from the command line:
+
+```bash
+uv run python -c "from vibespatial.cccl_precompile import precompile_all; precompile_all()"
+```
+
+See [GPU Kernel Caching](docs/architecture/gpu-kernel-caching.md) for the
+full design and environment variables.
 
 ### Documentation
 
