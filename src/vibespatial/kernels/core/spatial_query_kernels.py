@@ -204,7 +204,19 @@ extern "C" __global__ void regular_grid_box_overlap_count(
         return;
     }
 
-    const int count = (end_col - start_col + 1) * (end_row - start_row + 1);
+    int count = (end_col - start_col + 1) * (end_row - start_row + 1);
+
+    // Subtract cells in the last grid row beyond polygon_count.
+    // Only the final row can be partially populated (polygon_count < rows*cols).
+    const int last_grid_row = rows - 1;
+    if (end_row == last_grid_row && polygon_count < rows * cols) {
+        const int last_row_max_col = polygon_count - last_grid_row * cols - 1;
+        if (last_row_max_col < start_col) {
+            count -= (end_col - start_col + 1);
+        } else if (last_row_max_col < end_col) {
+            count -= (end_col - last_row_max_col);
+        }
+    }
     out_counts[q] = count < 0 ? 0 : count;
 }
 

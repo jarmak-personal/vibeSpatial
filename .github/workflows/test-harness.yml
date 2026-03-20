@@ -26,8 +26,6 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Sync dependencies
         run: uv sync --group dev
-      - name: Validate docs
-        run: uv run python scripts/check_docs.py --check
       - name: Run smoke tests
         run: uv run pytest tests/test_geopandas_shim.py tests/test_runtime_harness.py tests/test_intake_v2.py tests/upstream/geopandas/tests/test_config.py
 

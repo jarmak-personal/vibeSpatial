@@ -165,7 +165,7 @@ Do not borrow cuSpatial architecture by default. Re-justify every design.
 ## Verification
 
 - Packaging or env changes: `uv sync`
-- Intake/doc changes: `uv run python scripts/check_docs.py --check && uv run python scripts/intake.py "<request>"`
+- Intake/doc changes (local only, enforced by pre-commit hook, not CI): `uv run python scripts/check_docs.py --check && uv run python scripts/intake.py "<request>"`
 - Runtime/package changes: `uv run pytest`
 - Pipeline benchmark / profiler changes: `uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q && uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2`
 - Strict-native GeoPandas coverage: `uv run python scripts/upstream_native_coverage.py --json`

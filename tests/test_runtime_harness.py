@@ -9,6 +9,7 @@ from tests._runtime_harness import (
 )
 from vibespatial import ExecutionMode
 from vibespatial import runtime as runtime_module
+from vibespatial.runtime import _runtime as _runtime_impl
 
 
 def test_cuda_runtime_available_returns_bool() -> None:
@@ -48,7 +49,7 @@ def test_dispatch_selection_matches_requested_mode(dispatch_mode, dispatch_selec
 
 @pytest.mark.cpu_fallback
 def test_auto_runtime_selection_reports_explicit_fallback_without_cuda(monkeypatch) -> None:
-    monkeypatch.setattr(runtime_module, "has_gpu_runtime", lambda: False)
+    monkeypatch.setattr(_runtime_impl, "has_gpu_runtime", lambda: False)
     selection = runtime_module.select_runtime(ExecutionMode.AUTO)
     assert selection.selected is ExecutionMode.CPU
     assert "explicit CPU fallback" in selection.reason

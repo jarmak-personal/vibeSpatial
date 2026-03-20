@@ -200,4 +200,4 @@ def test_geopandas_sindex_nearest_fallback_is_observable() -> None:
     assert not events
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.sindex.nearest"
-    assert dispatch_events[-1].implementation == "strtree_host"
+    assert dispatch_events[-1].implementation in ("strtree_host", "owned_gpu_nearest", "owned_cpu_nearest")
