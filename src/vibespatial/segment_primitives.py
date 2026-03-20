@@ -39,24 +39,24 @@ extern "C" __device__ double abs_f64(double value) {{
 }}
 
 extern "C" __global__ void classify_segment_pairs(
-    const int* left_lookup,
-    const int* right_lookup,
-    const double* left_x0,
-    const double* left_y0,
-    const double* left_x1,
-    const double* left_y1,
-    const double* right_x0,
-    const double* right_y0,
-    const double* right_x1,
-    const double* right_y1,
-    signed char* out_kind,
-    double* out_point_x,
-    double* out_point_y,
-    double* out_overlap_x0,
-    double* out_overlap_y0,
-    double* out_overlap_x1,
-    double* out_overlap_y1,
-    unsigned char* out_ambiguous,
+    const int* __restrict__ left_lookup,
+    const int* __restrict__ right_lookup,
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
+    signed char* __restrict__ out_kind,
+    double* __restrict__ out_point_x,
+    double* __restrict__ out_point_y,
+    double* __restrict__ out_overlap_x0,
+    double* __restrict__ out_overlap_y0,
+    double* __restrict__ out_overlap_x1,
+    double* __restrict__ out_overlap_y1,
+    unsigned char* __restrict__ out_ambiguous,
     int row_count
 ) {{
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -83,6 +83,172 @@ extern "C" __global__ void classify_segment_pairs(
   out_overlap_y0[row] = nan_value;
   out_overlap_x1[row] = nan_value;
   out_overlap_y1[row] = nan_value;
+
+  const double abx = bx - ax;
+  const double aby = by - ay;
+  const double acx = cx - ax;
+  const double acy = cy - ay;
+  const double adx = dx - ax;
+  const double ady = dy - ay;
+  const double cdx = dx - cx;
+  const double cdy = dy - cy;
+  const double cax = ax - cx;
+  const double cay = ay - cy;
+  const double cbx = bx - cx;
+  const double cby = by - cy;
+
+  const double o1_term1 = abx * acy;
+  const double o1_term2 = aby * acx;
+  const double o1 = o1_term1 - o1_term2;
+  const double o2_term1 = abx * ady;
+  const double o2_term2 = aby * adx;
+  const double o2 = o2_term1 - o2_term2;
+  const double o3_term1 = cdx * cay;
+  const double o3_term2 = cdy * cax;
+  const double o3 = o3_term1 - o3_term2;
+  const double o4_term1 = cdx * cby;
+  const double o4_term2 = cdy * cbx;
+  const double o4 = o4_term1 - o4_term2;
+
+  const double err1 = {_ORIENTATION_ERRBOUND} * (abs_f64(o1_term1) + abs_f64(o1_term2));
+  const double err2 = {_ORIENTATION_ERRBOUND} * (abs_f64(o2_term1) + abs_f64(o2_term2));
+  const double err3 = {_ORIENTATION_ERRBOUND} * (abs_f64(o3_term1) + abs_f64(o3_term2));
+  const double err4 = {_ORIENTATION_ERRBOUND} * (abs_f64(o4_term1) + abs_f64(o4_term2));
+
+  const int sign1 = (o1 > 0.0) - (o1 < 0.0);
+  const int sign2 = (o2 > 0.0) - (o2 < 0.0);
+  const int sign3 = (o3 > 0.0) - (o3 < 0.0);
+  const int sign4 = (o4 > 0.0) - (o4 < 0.0);
+
+  const int ambiguous =
+      (abs_f64(o1) <= err1) ||
+      (abs_f64(o2) <= err2) ||
+      (abs_f64(o3) <= err3) ||
+      (abs_f64(o4) <= err4) ||
+      ((ax == bx) && (ay == by)) ||
+      ((cx == dx) && (cy == dy)) ||
+      (sign1 == 0) ||
+      (sign2 == 0) ||
+      (sign3 == 0) ||
+      (sign4 == 0);
+
+  out_ambiguous[row] = ambiguous ? 1 : 0;
+  if (ambiguous) {{
+    return;
+  }}
+
+  if ((sign1 * sign2 < 0) && (sign3 * sign4 < 0)) {{
+    const double denominator = (ax - bx) * (cy - dy) - (ay - by) * (cx - dx);
+    if (denominator == 0.0) {{
+      out_ambiguous[row] = 1;
+      return;
+    }}
+    const double left_det = ax * by - ay * bx;
+    const double right_det = cx * dy - cy * dx;
+    out_kind[row] = 1;
+    out_point_x[row] = (left_det * (cx - dx) - (ax - bx) * right_det) / denominator;
+    out_point_y[row] = (left_det * (cy - dy) - (ay - by) * right_det) / denominator;
+  }}
+}}
+"""
+
+_SEGMENT_INTERSECTION_WARP_SKIP_KERNEL_SOURCE = f"""
+extern "C" __device__ double abs_f64(double value) {{
+  return value < 0.0 ? -value : value;
+}}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+classify_segment_pairs_warp_skip(
+    const int* __restrict__ left_lookup,
+    const int* __restrict__ right_lookup,
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
+    signed char* __restrict__ out_kind,
+    double* __restrict__ out_point_x,
+    double* __restrict__ out_point_y,
+    double* __restrict__ out_overlap_x0,
+    double* __restrict__ out_overlap_y0,
+    double* __restrict__ out_overlap_x1,
+    double* __restrict__ out_overlap_y1,
+    unsigned char* __restrict__ out_ambiguous,
+    int row_count
+) {{
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool valid = row < row_count;
+
+  /* --- Phase 1: MBR overlap check with warp-cooperative skip --- */
+  int has_overlap = 0;
+  int left_index = 0;
+  int right_index = 0;
+  double ax, ay, bx, by, cx, cy, dx, dy;
+
+  if (valid) {{
+    left_index = left_lookup[row];
+    right_index = right_lookup[row];
+
+    /* Load endpoints */
+    ax = left_x0[left_index];
+    ay = left_y0[left_index];
+    bx = left_x1[left_index];
+    by = left_y1[left_index];
+    cx = right_x0[right_index];
+    cy = right_y0[right_index];
+    dx = right_x1[right_index];
+    dy = right_y1[right_index];
+
+    /* Compute MBRs */
+    const double left_minx = ax < bx ? ax : bx;
+    const double left_maxx = ax > bx ? ax : bx;
+    const double left_miny = ay < by ? ay : by;
+    const double left_maxy = ay > by ? ay : by;
+    const double right_minx = cx < dx ? cx : dx;
+    const double right_maxx = cx > dx ? cx : dx;
+    const double right_miny = cy < dy ? cy : dy;
+    const double right_maxy = cy > dy ? cy : dy;
+
+    has_overlap = (left_minx <= right_maxx) && (left_maxx >= right_minx) &&
+                  (left_miny <= right_maxy) && (left_maxy >= right_miny);
+  }}
+
+  /* If no thread in this warp has an overlapping pair, skip all work */
+  if (__ballot_sync(0xFFFFFFFF, has_overlap) == 0) {{
+    if (valid) {{
+      out_kind[row] = 0;          /* DISJOINT */
+      const double nan_value = 0.0 / 0.0;
+      out_point_x[row] = nan_value;
+      out_point_y[row] = nan_value;
+      out_overlap_x0[row] = nan_value;
+      out_overlap_y0[row] = nan_value;
+      out_overlap_x1[row] = nan_value;
+      out_overlap_y1[row] = nan_value;
+      out_ambiguous[row] = 0;
+    }}
+    return;
+  }}
+
+  if (!valid) return;
+
+  /* --- Phase 2: Full orientation classification (same as original) --- */
+  const double nan_value = 0.0 / 0.0;
+  out_kind[row] = 0;
+  out_point_x[row] = nan_value;
+  out_point_y[row] = nan_value;
+  out_overlap_x0[row] = nan_value;
+  out_overlap_y0[row] = nan_value;
+  out_overlap_x1[row] = nan_value;
+  out_overlap_y1[row] = nan_value;
+
+  /* Non-overlapping MBR -> disjoint (thread-level early exit) */
+  if (!has_overlap) {{
+    out_ambiguous[row] = 0;
+    return;
+  }}
 
   const double abx = bx - ax;
   const double aby = by - ay;
@@ -255,16 +421,22 @@ class SegmentIntersectionCandidates:
 
 
 _SEGMENT_INTERSECTION_KERNEL_NAMES = ("classify_segment_pairs",)
+_SEGMENT_INTERSECTION_WARP_SKIP_KERNEL_NAMES = ("classify_segment_pairs_warp_skip",)
 
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("segment-intersections", _SEGMENT_INTERSECTION_KERNEL_SOURCE, _SEGMENT_INTERSECTION_KERNEL_NAMES),
+    ("segment-intersections-warp-skip", _SEGMENT_INTERSECTION_WARP_SKIP_KERNEL_SOURCE, _SEGMENT_INTERSECTION_WARP_SKIP_KERNEL_NAMES),
 ])
 
 
 def _segment_intersection_kernels():
     return compile_kernel_group("segment-intersections", _SEGMENT_INTERSECTION_KERNEL_SOURCE, _SEGMENT_INTERSECTION_KERNEL_NAMES)
+
+
+def _segment_intersection_warp_skip_kernels():
+    return compile_kernel_group("segment-intersections-warp-skip", _SEGMENT_INTERSECTION_WARP_SKIP_KERNEL_SOURCE, _SEGMENT_INTERSECTION_WARP_SKIP_KERNEL_NAMES)
 
 
 def _select_segment_runtime(
@@ -932,7 +1104,7 @@ def _classify_segment_intersections_gpu(
         device_overlap_y1 = runtime.allocate((pairs.count,), np.float64)
         device_ambiguous_mask = runtime.allocate((pairs.count,), np.uint8)
 
-        kernel = _segment_intersection_kernels()["classify_segment_pairs"]
+        kernel = _segment_intersection_warp_skip_kernels()["classify_segment_pairs_warp_skip"]
         ptr = runtime.pointer
         params = (
             (

@@ -31,8 +31,8 @@ _SEGMENT_DISTANCE_KERNEL_SOURCE = """
 // Parametric closest-approach between two 2-D line segments.
 // Returns squared Euclidean distance; callers take sqrt() once at the end.
 extern "C" __device__ inline double segment_segment_sq_dist(
-    double p1x, double p1y, double p2x, double p2y,
-    double q1x, double q1y, double q2x, double q2y
+    const double p1x, const double p1y, const double p2x, const double p2y,
+    const double q1x, const double q1y, const double q2x, const double q2y
 ) {
   const double d1x = p2x - p1x, d1y = p2y - p1y;
   const double d2x = q2x - q1x, d2y = q2y - q1y;
@@ -92,8 +92,8 @@ extern "C" __device__ inline double segment_segment_sq_dist(
 // Level 1a: min sq distance between all segment pairs in two coord ranges
 // ===================================================================
 extern "C" __device__ inline double coords_coords_min_sq_dist(
-    const double* x1, const double* y1, int cs1, int ce1,
-    const double* x2, const double* y2, int cs2, int ce2
+    const double* __restrict__ x1, const double* __restrict__ y1, int cs1, int ce1,
+    const double* __restrict__ x2, const double* __restrict__ y2, int cs2, int ce2
 ) {
   double best = INFINITY;
   for (int i = cs1 + 1; i < ce1; ++i) {
@@ -112,9 +112,9 @@ extern "C" __device__ inline double coords_coords_min_sq_dist(
 // Level 1b: even-odd point-in-rings containment check
 // ===================================================================
 extern "C" __device__ inline bool seg_point_in_rings(
-    double px, double py,
-    const double* x, const double* y,
-    const int* ring_offsets,
+    const double px, const double py,
+    const double* __restrict__ x, const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
     int ring_start, int ring_end
 ) {
   bool inside = false;
@@ -154,9 +154,9 @@ extern "C" __device__ inline bool seg_point_in_rings(
 // Linestring (coord range) → single polygon distance.
 // Returns 0 if linestring touches/crosses/is-inside the polygon.
 extern "C" __device__ inline double ls_polygon_sq_dist(
-    const double* lx, const double* ly, int lcs, int lce,
-    const double* px, const double* py,
-    const int* geom_offsets, const int* ring_offsets, int prow
+    const double* __restrict__ lx, const double* __restrict__ ly, int lcs, int lce,
+    const double* __restrict__ px, const double* __restrict__ py,
+    const int* __restrict__ geom_offsets, const int* __restrict__ ring_offsets, int prow
 ) {
   const int ring_start = geom_offsets[prow];
   const int ring_end   = geom_offsets[prow + 1];
@@ -183,10 +183,10 @@ extern "C" __device__ inline double ls_polygon_sq_dist(
 
 // Polygon → polygon distance (single polygon rows on each side).
 extern "C" __device__ inline double pg_pg_sq_dist(
-    const double* x1, const double* y1,
-    const int* go1, const int* ro1, int r1,
-    const double* x2, const double* y2,
-    const int* go2, const int* ro2, int r2
+    const double* __restrict__ x1, const double* __restrict__ y1,
+    const int* __restrict__ go1, const int* __restrict__ ro1, int r1,
+    const double* __restrict__ x2, const double* __restrict__ y2,
+    const int* __restrict__ go2, const int* __restrict__ ro2, int r2
 ) {
   const int rs1 = go1[r1], re1 = go1[r1 + 1];
   const int rs2 = go2[r2], re2 = go2[r2 + 1];
@@ -243,12 +243,12 @@ extern "C" __device__ inline double pg_pg_sq_dist(
 // ===================================================================
 
 // ---- LS × LS ----
-extern "C" __global__ void distance_ls_ls_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_ls_ls_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   out[i] = sqrt(coords_coords_min_sq_dist(
@@ -257,12 +257,12 @@ extern "C" __global__ void distance_ls_ls_from_owned(
 }
 
 // ---- LS × MLS ----
-extern "C" __global__ void distance_ls_mls_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_po, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_ls_mls_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_po, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lcs = left_go[lr], lce = left_go[lr + 1];
@@ -279,12 +279,12 @@ extern "C" __global__ void distance_ls_mls_from_owned(
 }
 
 // ---- LS × PG ----
-extern "C" __global__ void distance_ls_pg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_ls_pg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   out[i] = sqrt(ls_polygon_sq_dist(
@@ -293,12 +293,12 @@ extern "C" __global__ void distance_ls_pg_from_owned(
 }
 
 // ---- LS × MPG ----
-extern "C" __global__ void distance_ls_mpg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_po, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_ls_mpg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_po, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lcs = left_go[lr], lce = left_go[lr + 1];
@@ -324,12 +324,12 @@ extern "C" __global__ void distance_ls_mpg_from_owned(
 }
 
 // ---- MLS × MLS ----
-extern "C" __global__ void distance_mls_mls_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const int* left_po, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_po, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_mls_mls_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const int* __restrict__ left_po, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_po, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];
@@ -348,12 +348,12 @@ extern "C" __global__ void distance_mls_mls_from_owned(
 }
 
 // ---- MLS × PG ----
-extern "C" __global__ void distance_mls_pg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const int* left_po, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_mls_pg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const int* __restrict__ left_po, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];
@@ -369,12 +369,12 @@ extern "C" __global__ void distance_mls_pg_from_owned(
 }
 
 // ---- MLS × MPG ----
-extern "C" __global__ void distance_mls_mpg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const int* left_po, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go2, const int* right_po, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_mls_mpg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const int* __restrict__ left_po, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go2, const int* __restrict__ right_po, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];
@@ -402,12 +402,12 @@ extern "C" __global__ void distance_mls_mpg_from_owned(
 }
 
 // ---- PG × PG ----
-extern "C" __global__ void distance_pg_pg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const int* left_ro, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_pg_pg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const int* __restrict__ left_ro, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   out[i] = sqrt(pg_pg_sq_dist(
@@ -416,12 +416,12 @@ extern "C" __global__ void distance_pg_pg_from_owned(
 }
 
 // ---- PG × MPG ----
-extern "C" __global__ void distance_pg_mpg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const int* left_ro, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go2, const int* right_po, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_pg_mpg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const int* __restrict__ left_ro, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go2, const int* __restrict__ right_po, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lrs = left_go[lr], lre = left_go[lr + 1];
@@ -468,12 +468,12 @@ extern "C" __global__ void distance_pg_mpg_from_owned(
 }
 
 // ---- MPG × MPG ----
-extern "C" __global__ void distance_mpg_mpg_from_owned(
-    const unsigned char* left_validity, const signed char* left_tags, const int* left_fro,
-    const int* left_go, const int* left_po, const int* left_ro, const unsigned char* left_em, const double* left_x, const double* left_y, int left_tag,
-    const unsigned char* right_validity, const signed char* right_tags, const int* right_fro,
-    const int* right_go, const int* right_po, const int* right_ro, const unsigned char* right_em, const double* right_x, const double* right_y, int right_tag,
-    const int* left_idx, const int* right_idx, double* out, int exclusive, int pair_count
+extern "C" __global__ __launch_bounds__(256, 4) void distance_mpg_mpg_from_owned(
+    const unsigned char* __restrict__ left_validity, const signed char* __restrict__ left_tags, const int* __restrict__ left_fro,
+    const int* __restrict__ left_go, const int* __restrict__ left_po, const int* __restrict__ left_ro, const unsigned char* __restrict__ left_em, const double* __restrict__ left_x, const double* __restrict__ left_y, int left_tag,
+    const unsigned char* __restrict__ right_validity, const signed char* __restrict__ right_tags, const int* __restrict__ right_fro,
+    const int* __restrict__ right_go, const int* __restrict__ right_po, const int* __restrict__ right_ro, const unsigned char* __restrict__ right_em, const double* __restrict__ right_x, const double* __restrict__ right_y, int right_tag,
+    const int* __restrict__ left_idx, const int* __restrict__ right_idx, double* __restrict__ out, int exclusive, int pair_count
 ) {
   DIST_PREAMBLE(left_tag, right_tag)
   const int lps = left_go[lr], lpe = left_go[lr + 1];

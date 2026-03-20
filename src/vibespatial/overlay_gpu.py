@@ -109,22 +109,23 @@ extern "C" __device__ double project_t(
   return clamp01((py - y0) / dy);
 }
 
-extern "C" __global__ void emit_endpoint_split_events(
-    const double* left_x0,
-    const double* left_y0,
-    const double* left_x1,
-    const double* left_y1,
-    const double* right_x0,
-    const double* right_y0,
-    const double* right_x1,
-    const double* right_y1,
+extern "C" __global__ void __launch_bounds__(256, 4)
+emit_endpoint_split_events(
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
     int left_count,
     int right_count,
-    int* out_source_segment_ids,
-    double* out_t,
-    double* out_x,
-    double* out_y,
-    unsigned long long* out_key,
+    int* __restrict__ out_source_segment_ids,
+    double* __restrict__ out_t,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    unsigned long long* __restrict__ out_key,
     int event_count
 ) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -132,10 +133,10 @@ extern "C" __global__ void emit_endpoint_split_events(
     return;
   }
 
-  const int segment_row = row / 2;
+  const int segment_row = row >> 1;
   const int endpoint_kind = row & 1;
   const int is_right = segment_row >= left_count;
-  const int source_segment_id = is_right ? segment_row : segment_row;
+  const int source_segment_id = segment_row;
   const int segment_index = is_right ? (segment_row - left_count) : segment_row;
 
   const double* x0_values = is_right ? right_x0 : left_x0;
@@ -154,9 +155,10 @@ extern "C" __global__ void emit_endpoint_split_events(
   out_key[row] = pack_key(source_segment_id, t);
 }
 
-extern "C" __global__ void count_pair_split_events(
-    const signed char* kinds,
-    int* out_counts,
+extern "C" __global__ void __launch_bounds__(256, 4)
+count_pair_split_events(
+    const signed char* __restrict__ kinds,
+    int* __restrict__ out_counts,
     int row_count
 ) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -164,51 +166,51 @@ extern "C" __global__ void count_pair_split_events(
     return;
   }
   const signed char kind = kinds[row];
-  if (kind == 1 || kind == 2) {
-    out_counts[row] = 2;
-    return;
-  }
-  if (kind == 3) {
-    out_counts[row] = 4;
-    return;
-  }
-  out_counts[row] = 0;
+  /* Predicated write: branchless count lookup. */
+  out_counts[row] = (kind == 1 || kind == 2) ? 2 : (kind == 3) ? 4 : 0;
 }
 
-extern "C" __global__ void scatter_pair_split_events(
-    const int* left_lookup,
-    const int* right_lookup,
-    const signed char* kinds,
-    const double* point_x,
-    const double* point_y,
-    const double* overlap_x0,
-    const double* overlap_y0,
-    const double* overlap_x1,
-    const double* overlap_y1,
-    const double* left_x0,
-    const double* left_y0,
-    const double* left_x1,
-    const double* left_y1,
-    const double* right_x0,
-    const double* right_y0,
-    const double* right_x1,
-    const double* right_y1,
-    const int* pair_offsets,
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_pair_split_events(
+    const int* __restrict__ left_lookup,
+    const int* __restrict__ right_lookup,
+    const signed char* __restrict__ kinds,
+    const double* __restrict__ point_x,
+    const double* __restrict__ point_y,
+    const double* __restrict__ overlap_x0,
+    const double* __restrict__ overlap_y0,
+    const double* __restrict__ overlap_x1,
+    const double* __restrict__ overlap_y1,
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
+    const int* __restrict__ pair_offsets,
     int left_count,
-    int* out_source_segment_ids,
-    double* out_t,
-    double* out_x,
-    double* out_y,
-    unsigned long long* out_key,
+    int* __restrict__ out_source_segment_ids,
+    double* __restrict__ out_t,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    unsigned long long* __restrict__ out_key,
     int row_count
 ) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= row_count) {
+  const int valid = row < row_count;
+
+  /* Warp-cooperative skip: if no thread in this warp has a non-disjoint
+     pair, the entire warp can return without reading any lookup/offset
+     arrays.  After coarse filtering, ~85-95% of candidate pairs are
+     disjoint, so most warps skip entirely. */
+  const signed char kind = valid ? kinds[row] : 0;
+  if (__ballot_sync(0xFFFFFFFF, kind != 0) == 0) {
     return;
   }
 
-  const signed char kind = kinds[row];
-  if (kind == 0) {
+  if (!valid || kind == 0) {
     return;
   }
 
@@ -273,25 +275,32 @@ extern "C" __global__ void scatter_pair_split_events(
   }
 }
 
-extern "C" __global__ void emit_atomic_edges(
-    const int* source_segment_ids,
-    const double* x,
-    const double* y,
-    const unsigned char* adjacency_mask,
-    const int* adjacency_offsets,
-    int* out_source_segment_ids,
-    signed char* out_direction,
-    double* out_src_x,
-    double* out_src_y,
-    double* out_dst_x,
-    double* out_dst_y,
+extern "C" __global__ void __launch_bounds__(256, 4)
+emit_atomic_edges(
+    const int* __restrict__ source_segment_ids,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const unsigned char* __restrict__ adjacency_mask,
+    const int* __restrict__ adjacency_offsets,
+    int* __restrict__ out_source_segment_ids,
+    signed char* __restrict__ out_direction,
+    double* __restrict__ out_src_x,
+    double* __restrict__ out_src_y,
+    double* __restrict__ out_dst_x,
+    double* __restrict__ out_dst_y,
     int row_count
 ) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= row_count) {
+  const int valid = row < row_count;
+
+  /* Warp-cooperative skip: if no thread in this warp has an adjacent
+     pair (adjacency_mask set), skip all global memory writes. */
+  const unsigned char mask_val = valid ? adjacency_mask[row] : 0;
+  if (__ballot_sync(0xFFFFFFFF, mask_val) == 0) {
     return;
   }
-  if (adjacency_mask[row] == 0) {
+
+  if (!valid || mask_val == 0) {
     return;
   }
 
@@ -330,13 +339,14 @@ _OVERLAY_FACE_WALK_KERNEL_SOURCE = r"""
 // Compute per-edge shoelace contributions for area and centroid.
 // src_x[i], src_y[i] are the source coordinates of edge i.
 // next_edge_ids[i] gives the next edge in the cycle.
-extern "C" __global__ void compute_shoelace_contributions(
-    const double* src_x,
-    const double* src_y,
-    const long long* next_edge_ids,
-    double* out_cross,
-    double* out_cx_contrib,
-    double* out_cy_contrib,
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_shoelace_contributions(
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const long long* __restrict__ next_edge_ids,
+    double* __restrict__ out_cross,
+    double* __restrict__ out_cx_contrib,
+    double* __restrict__ out_cy_contrib,
     int edge_count
 ) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -356,16 +366,17 @@ extern "C" __global__ void compute_shoelace_contributions(
 // face_starts[f] and face_ends[f] give the range into sorted_edge_ids
 // (edges sorted by face_id). The sample point is the perpendicular-offset
 // midpoint of the first non-degenerate edge.
-extern "C" __global__ void compute_face_sample_points(
-    const double* src_x,
-    const double* src_y,
-    const long long* next_edge_ids,
-    const int* face_starts,
-    const int* face_edge_ids,
-    const double* signed_area,
-    double* out_label_x,
-    double* out_label_y,
-    signed char* out_bounded,
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_face_sample_points(
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const long long* __restrict__ next_edge_ids,
+    const int* __restrict__ face_starts,
+    const int* __restrict__ face_edge_ids,
+    const double* __restrict__ signed_area,
+    double* __restrict__ out_label_x,
+    double* __restrict__ out_label_y,
+    signed char* __restrict__ out_bounded,
     int face_count
 ) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -432,10 +443,11 @@ extern "C" __global__ void compute_face_sample_points(
 // next edge in the cycle.  Each thread walks backward from its edge to the
 // root, counting steps.  For typical overlay faces (3-20 edges) this
 // completes in microseconds per thread.
-extern "C" __global__ void list_rank_within_cycle(
-    const int* face_id,
-    const long long* next_edge_ids,
-    int* out_rank,
+extern "C" __global__ void __launch_bounds__(256, 4)
+list_rank_within_cycle(
+    const int* __restrict__ face_id,
+    const long long* __restrict__ next_edge_ids,
+    int* __restrict__ out_rank,
     int edge_count,
     int max_walk
 ) {
@@ -514,15 +526,16 @@ extern "C" __device__ inline bool ring_contains_even_odd(
 // polygon_ring_offsets: maps ring → coordinate range
 // polygon_x, polygon_y: flat coordinate arrays
 // polygon_count: number of polygons
-extern "C" __global__ void label_face_coverage_polygon(
-    const double* label_x,
-    const double* label_y,
-    const double* polygon_x,
-    const double* polygon_y,
-    const int* polygon_geometry_offsets,
-    const int* polygon_ring_offsets,
+extern "C" __global__ void __launch_bounds__(256, 4)
+label_face_coverage_polygon(
+    const double* __restrict__ label_x,
+    const double* __restrict__ label_y,
+    const double* __restrict__ polygon_x,
+    const double* __restrict__ polygon_y,
+    const int* __restrict__ polygon_geometry_offsets,
+    const int* __restrict__ polygon_ring_offsets,
     int polygon_count,
-    signed char* out_covered,
+    signed char* __restrict__ out_covered,
     int face_count
 ) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -549,16 +562,17 @@ extern "C" __global__ void label_face_coverage_polygon(
 
 // Test face sample points against all multipolygons on one side.
 // One thread per face.
-extern "C" __global__ void label_face_coverage_multipolygon(
-    const double* label_x,
-    const double* label_y,
-    const double* mp_x,
-    const double* mp_y,
-    const int* mp_geometry_offsets,
-    const int* mp_part_offsets,
-    const int* mp_ring_offsets,
+extern "C" __global__ void __launch_bounds__(256, 4)
+label_face_coverage_multipolygon(
+    const double* __restrict__ label_x,
+    const double* __restrict__ label_y,
+    const double* __restrict__ mp_x,
+    const double* __restrict__ mp_y,
+    const int* __restrict__ mp_geometry_offsets,
+    const int* __restrict__ mp_part_offsets,
+    const int* __restrict__ mp_ring_offsets,
     int mp_count,
-    signed char* out_covered,
+    signed char* __restrict__ out_covered,
     int face_count
 ) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -620,11 +634,12 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE = r"""
 // Identify boundary edges: edges where the face on this side is selected
 // but the twin face is not (or has no face).
 // boundary_next[e] = next boundary edge following e along the boundary.
-extern "C" __global__ void compute_boundary_edges(
-    const int* edge_face_ids,       // face_id for each edge (-1 if none)
-    const signed char* face_selected, // 1 if face is selected
-    const long long* next_edge_ids, // half-edge next pointers
-    signed char* out_is_boundary,   // 1 if edge is a boundary edge
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_boundary_edges(
+    const int* __restrict__ edge_face_ids,
+    const signed char* __restrict__ face_selected,
+    const long long* __restrict__ next_edge_ids,
+    signed char* __restrict__ out_is_boundary,
     int edge_count
 ) {
   const int e = blockIdx.x * blockDim.x + threadIdx.x;
@@ -651,12 +666,13 @@ extern "C" __global__ void compute_boundary_edges(
 // Compute next boundary edge for each boundary edge.
 // For boundary edge e: follow next_edge_ids from e, crossing through
 // non-boundary edges via twin traversal, until finding next boundary edge.
-extern "C" __global__ void compute_boundary_next(
-    const int* edge_face_ids,
-    const signed char* face_selected,
-    const long long* next_edge_ids,
-    const signed char* is_boundary,
-    int* out_boundary_next,  // next boundary edge for each boundary edge
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_boundary_next(
+    const int* __restrict__ edge_face_ids,
+    const signed char* __restrict__ face_selected,
+    const long long* __restrict__ next_edge_ids,
+    const signed char* __restrict__ is_boundary,
+    int* __restrict__ out_boundary_next,
     int edge_count,
     int max_steps
 ) {
@@ -682,15 +698,16 @@ extern "C" __global__ void compute_boundary_next(
 // Each ring is a boundary cycle. ring_edge_starts[r] is the starting
 // boundary edge for ring r. We follow boundary_next to walk the cycle
 // and write coordinates.
-extern "C" __global__ void scatter_ring_coordinates(
-    const double* src_x,
-    const double* src_y,
-    const int* ring_edge_starts,    // starting boundary edge per ring
-    const int* ring_coord_offsets,  // output offset per ring
-    const int* ring_edge_counts,    // number of edges per ring
-    const int* boundary_next,       // next boundary edge
-    double* out_x,
-    double* out_y,
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_ring_coordinates(
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const int* __restrict__ ring_edge_starts,
+    const int* __restrict__ ring_coord_offsets,
+    const int* __restrict__ ring_edge_counts,
+    const int* __restrict__ boundary_next,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
     int ring_count
 ) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -713,17 +730,18 @@ extern "C" __global__ void scatter_ring_coordinates(
 
 // Test each ring centroid against each exterior ring to determine
 // hole-to-exterior assignment. One thread per candidate ring.
-extern "C" __global__ void assign_holes_to_exteriors(
-    const double* ring_centroid_x,  // centroid x per ring
-    const double* ring_centroid_y,  // centroid y per ring
-    const double* ring_area,        // signed area per ring (positive = CCW = exterior)
-    const int* ring_coord_offsets,  // coordinate offsets per ring
-    const int* ring_edge_counts,    // edge count per ring
-    const double* all_x,            // all ring coordinates
-    const double* all_y,
-    const int* exterior_indices,    // indices of exterior rings
+extern "C" __global__ void __launch_bounds__(256, 4)
+assign_holes_to_exteriors(
+    const double* __restrict__ ring_centroid_x,
+    const double* __restrict__ ring_centroid_y,
+    const double* __restrict__ ring_area,
+    const int* __restrict__ ring_coord_offsets,
+    const int* __restrict__ ring_edge_counts,
+    const double* __restrict__ all_x,
+    const double* __restrict__ all_y,
+    const int* __restrict__ exterior_indices,
     int exterior_count,
-    int* out_exterior_id,           // assigned exterior index per ring (-1 if none)
+    int* __restrict__ out_exterior_id,
     int ring_count
 ) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -785,14 +803,15 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
 # ---------------------------------------------------------------------------
 
 _BATCH_POINT_IN_RING_KERNEL_SOURCE = r"""
-extern "C" __global__ void batch_point_in_ring(
-    const double* sample_x,
-    const double* sample_y,
-    const double* ring_x,
-    const double* ring_y,
-    const int* ring_offsets,
-    const int* pair_ring_idx,
-    int* results,
+extern "C" __global__ void __launch_bounds__(256, 4)
+batch_point_in_ring(
+    const double* __restrict__ sample_x,
+    const double* __restrict__ sample_y,
+    const double* __restrict__ ring_x,
+    const double* __restrict__ ring_y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ pair_ring_idx,
+    int* __restrict__ results,
     int pair_count
 ) {
     const int pair = blockIdx.x * blockDim.x + threadIdx.x;

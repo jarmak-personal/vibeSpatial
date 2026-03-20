@@ -68,6 +68,7 @@ class WorkloadProfile:
     coordinate_stats: CoordinateStats | None = None
     is_streaming: bool = False
     chunk_index: int = 0
+    avg_vertices_per_geometry: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,18 @@ def _score_variant(
         score += 1
     if workload.mixed_geometry and variant.supports_mixed:
         score += 2
+    # Geometry-adaptive variant selection: boost cooperative variants
+    # for complex geometries (many vertices per row), and boost simple
+    # variants for geometries with few vertices.
+    is_cooperative = "cooperative" in variant.tags
+    avg_verts = workload.avg_vertices_per_geometry
+    if avg_verts > 0:
+        if is_cooperative and avg_verts >= 64:
+            # Strong boost for cooperative variants on complex geometries
+            score += 5
+        elif not is_cooperative and avg_verts < 64:
+            # Mild boost for simple variants on simple geometries
+            score += 2
     return score
 
 
@@ -533,3 +546,30 @@ class ChunkedPlanIterator:
         if plan.replan_after_chunk:
             invalidate_snapshot_cache()
         return plan, row_range
+
+
+# ---------------------------------------------------------------------------
+# Geometry complexity estimation for adaptive variant dispatch
+# ---------------------------------------------------------------------------
+
+
+def estimate_avg_vertices(owned: object) -> float:
+    """Estimate average vertices per geometry from an OwnedGeometryArray.
+
+    Used by kernel dispatch to select between simple (1-thread-per-geometry)
+    and cooperative (1-block-per-geometry) kernel variants.  Returns 0.0 if
+    the geometry array has no families or no coordinates.
+
+    Accepts ``object`` to avoid importing OwnedGeometryArray at module scope
+    (which would create a circular import).
+    """
+    families = getattr(owned, "families", None)
+    row_count = getattr(owned, "row_count", 0)
+    if not families or row_count == 0:
+        return 0.0
+    total_coords = 0
+    for buf in families.values():
+        x = getattr(buf, "x", None)
+        if x is not None:
+            total_coords += len(x)
+    return total_coords / row_count

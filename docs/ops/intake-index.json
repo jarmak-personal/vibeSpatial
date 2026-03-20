@@ -11544,7 +11544,8 @@
         "invalidate_snapshot_cache",
         "plan_kernel_dispatch",
         "plan_dispatch_selection",
-        "ChunkedPlanIterator"
+        "ChunkedPlanIterator",
+        "estimate_avg_vertices"
       ],
       "tokens": [
         "adapt",
@@ -11552,6 +11553,7 @@
         "adaptiveplan",
         "adaptiveruntime",
         "availability",
+        "avg",
         "cache",
         "cached",
         "capture",
@@ -11561,6 +11563,7 @@
         "device",
         "devicesnapshot",
         "dispatch",
+        "estimate",
         "execution",
         "get",
         "invalidate",
@@ -11581,6 +11584,7 @@
         "snapshot",
         "src",
         "variant",
+        "vertices",
         "vibespatial",
         "workloadprofile"
       ]
@@ -14337,6 +14341,7 @@
       ],
       "symbols": [
         "_format_bounds_kernel_source",
+        "_format_cooperative_bounds_kernel_source",
         "_family_bounds_scalar",
         "_assemble_cached_bounds",
         "_slice_bounds_vectorized",
@@ -14344,8 +14349,11 @@
         "_compute_geometry_bounds_cpu_scalar",
         "_compute_geometry_bounds_cpu_vectorized",
         "_bounds_kernels",
+        "_bounds_cooperative_kernels",
         "_family_kernel_name",
         "_launch_family_bounds_kernel",
+        "_avg_coords_per_geometry",
+        "_launch_family_bounds_cooperative",
         "_compute_geometry_bounds_gpu_impl",
         "_compute_geometry_bounds_gpu",
         "_resolve_bounds_plan",
@@ -14359,11 +14367,14 @@
       "tokens": [
         "analysis",
         "assemble",
+        "avg",
         "bits",
         "bounds",
         "cached",
         "code",
         "compute",
+        "cooperative",
+        "coords",
         "core",
         "cpu",
         "family",
@@ -14378,6 +14389,7 @@
         "morton",
         "name",
         "offset",
+        "per",
         "plan",
         "py",
         "resolve",
@@ -15784,6 +15796,7 @@
         "SegmentIntersectionDeviceState",
         "SegmentIntersectionCandidates",
         "_segment_intersection_kernels",
+        "_segment_intersection_warp_skip_kernels",
         "_select_segment_runtime",
         "_valid_global_rows",
         "_append_segments_for_span",
@@ -15799,8 +15812,7 @@
         "_unique_points",
         "_sort_collinear_points",
         "_classify_exact_pair",
-        "_classify_exact_rows",
-        "classify_segment_intersections"
+        "_classify_exact_rows"
       ],
       "tokens": [
         "append",
@@ -15814,7 +15826,6 @@
         "generate",
         "global",
         "intersection",
-        "intersections",
         "kernels",
         "line",
         "orient2d",
@@ -15836,13 +15847,15 @@
         "segmenttable",
         "select",
         "sign",
+        "skip",
         "sort",
         "span",
         "src",
         "tables",
         "unique",
         "valid",
-        "vibespatial"
+        "vibespatial",
+        "warp"
       ]
     },
     {

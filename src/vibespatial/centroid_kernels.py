@@ -47,6 +47,140 @@ if TYPE_CHECKING:
     from vibespatial.precision import PrecisionMode, PrecisionPlan
 
 # ---------------------------------------------------------------------------
+# Cooperative polygon centroid kernel: 1 block per geometry (for complex polygons)
+# ---------------------------------------------------------------------------
+
+_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+extern "C" __global__ __launch_bounds__(256, 4)
+void polygon_centroid_cooperative(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ geometry_offsets,
+    double* __restrict__ cx,
+    double* __restrict__ cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {{
+    const int row = blockIdx.x;
+    if (row >= row_count) return;
+
+    /* Polygon centroid uses only the exterior ring (first ring). */
+    const int first_ring = geometry_offsets[row];
+    const int coord_start = ring_offsets[first_ring];
+    const int coord_end = ring_offsets[first_ring + 1];
+    int n = coord_end - coord_start;
+
+    /* Strip closure vertex if present. */
+    if (n >= 2) {{
+        double dx = x[coord_start] - x[coord_end - 1];
+        double dy = y[coord_start] - y[coord_end - 1];
+        if (dx * dx + dy * dy < 1e-24) n--;
+    }}
+
+    if (n < 3) {{
+        if (threadIdx.x == 0) {{
+            cx[row] = 0.0 / 0.0;  /* NaN */
+            cy[row] = 0.0 / 0.0;
+        }}
+        return;
+    }}
+
+    /* Shared memory for inter-warp Kahan reduction (up to 256/32 = 8 warps) */
+    __shared__ compute_t warp_area[8];
+    __shared__ compute_t warp_area_c[8];
+    __shared__ compute_t warp_cx[8];
+    __shared__ compute_t warp_cx_c[8];
+    __shared__ compute_t warp_cy[8];
+    __shared__ compute_t warp_cy_c[8];
+
+    /* Each thread accumulates partial sums with Kahan */
+    compute_t partial_area = (compute_t)0.0;
+    compute_t partial_area_c = (compute_t)0.0;
+    compute_t partial_cx = (compute_t)0.0;
+    compute_t partial_cx_c = (compute_t)0.0;
+    compute_t partial_cy = (compute_t)0.0;
+    compute_t partial_cy_c = (compute_t)0.0;
+
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {{
+        const int cur = coord_start + i;
+        const int nxt = coord_start + ((i + 1) % n);
+        const compute_t xi  = CX(x[cur]);
+        const compute_t yi  = CY(y[cur]);
+        const compute_t xi1 = CX(x[nxt]);
+        const compute_t yi1 = CY(y[nxt]);
+
+        const compute_t cross = xi * yi1 - xi1 * yi;
+        KAHAN_ADD(partial_area, cross, partial_area_c);
+        KAHAN_ADD(partial_cx, (xi + xi1) * cross, partial_cx_c);
+        KAHAN_ADD(partial_cy, (yi + yi1) * cross, partial_cy_c);
+    }}
+
+    /* Warp-level reduction via __shfl_down_sync */
+    const unsigned int FULL_MASK = 0xFFFFFFFF;
+    for (int offset = 16; offset > 0; offset >>= 1) {{
+        compute_t s_area = __shfl_down_sync(FULL_MASK, partial_area, offset);
+        compute_t s_area_c = __shfl_down_sync(FULL_MASK, partial_area_c, offset);
+        KAHAN_ADD(partial_area, s_area - s_area_c, partial_area_c);
+
+        compute_t s_cx = __shfl_down_sync(FULL_MASK, partial_cx, offset);
+        compute_t s_cx_c = __shfl_down_sync(FULL_MASK, partial_cx_c, offset);
+        KAHAN_ADD(partial_cx, s_cx - s_cx_c, partial_cx_c);
+
+        compute_t s_cy = __shfl_down_sync(FULL_MASK, partial_cy, offset);
+        compute_t s_cy_c = __shfl_down_sync(FULL_MASK, partial_cy_c, offset);
+        KAHAN_ADD(partial_cy, s_cy - s_cy_c, partial_cy_c);
+    }}
+
+    /* Block-level reduction via shared memory */
+    const int warp_id = threadIdx.x >> 5;
+    const int lane_id = threadIdx.x & 31;
+    if (lane_id == 0) {{
+        warp_area[warp_id] = partial_area;
+        warp_area_c[warp_id] = partial_area_c;
+        warp_cx[warp_id] = partial_cx;
+        warp_cx_c[warp_id] = partial_cx_c;
+        warp_cy[warp_id] = partial_cy;
+        warp_cy_c[warp_id] = partial_cy_c;
+    }}
+    __syncthreads();
+
+    /* Thread 0 combines across warps with Kahan */
+    if (threadIdx.x == 0) {{
+        compute_t sum_area = (compute_t)0.0;
+        compute_t c_area = (compute_t)0.0;
+        compute_t sum_cx = (compute_t)0.0;
+        compute_t c_cx = (compute_t)0.0;
+        compute_t sum_cy = (compute_t)0.0;
+        compute_t c_cy = (compute_t)0.0;
+        const int num_warps = ((int)blockDim.x + 31) >> 5;
+        for (int w = 0; w < num_warps; ++w) {{
+            KAHAN_ADD(sum_area, warp_area[w] - warp_area_c[w], c_area);
+            KAHAN_ADD(sum_cx, warp_cx[w] - warp_cx_c[w], c_cx);
+            KAHAN_ADD(sum_cy, warp_cy[w] - warp_cy_c[w], c_cy);
+        }}
+
+        const compute_t signed_area = sum_area * (compute_t)0.5;
+
+        if (fabs(signed_area) < (compute_t)1e-30) {{
+            /* Degenerate polygon -- fall back to coordinate mean. */
+            compute_t mx = (compute_t)0.0, my = (compute_t)0.0;
+            for (int i = 0; i < n; i++) {{
+                mx += CX(x[coord_start + i]);
+                my += CY(y[coord_start + i]);
+            }}
+            cx[row] = (double)(mx / (compute_t)n) + center_x;
+            cy[row] = (double)(my / (compute_t)n) + center_y;
+        }} else {{
+            cx[row] = (double)(sum_cx / ((compute_t)6.0 * signed_area)) + center_x;
+            cy[row] = (double)(sum_cy / ((compute_t)6.0 * signed_area)) + center_y;
+        }}
+    }}
+}}
+"""
+
+# ---------------------------------------------------------------------------
 # Point centroid kernel: identity copy (x, y -> cx, cy)
 # ---------------------------------------------------------------------------
 
@@ -259,6 +393,7 @@ _POINT_CENTROID_NAMES = ("point_centroid",)
 _MULTIPOINT_CENTROID_NAMES = ("multipoint_centroid",)
 _LINESTRING_CENTROID_NAMES = ("linestring_centroid",)
 _MULTILINESTRING_CENTROID_NAMES = ("multilinestring_centroid",)
+_POLYGON_CENTROID_COOPERATIVE_NAMES = ("polygon_centroid_cooperative",)
 
 _POINT_CENTROID_FP64 = _POINT_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POINT_CENTROID_FP32 = _POINT_CENTROID_KERNEL_SOURCE.format(compute_type="float")
@@ -270,6 +405,8 @@ _MULTILINESTRING_CENTROID_FP64 = _MULTILINESTRING_CENTROID_KERNEL_SOURCE.format(
 _MULTILINESTRING_CENTROID_FP32 = _MULTILINESTRING_CENTROID_KERNEL_SOURCE.format(compute_type="float")
 _POLYGON_CENTROID_FP64 = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_CENTROID_FP32 = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="float")
+_POLYGON_CENTROID_COOPERATIVE_FP64 = _POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE.format(compute_type="double")
+_POLYGON_CENTROID_COOPERATIVE_FP32 = _POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE.format(compute_type="float")
 
 # Background precompilation (ADR-0034)
 from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
@@ -283,6 +420,8 @@ request_nvrtc_warmup([
     ("centroid-linestring-fp32", _LINESTRING_CENTROID_FP32, _LINESTRING_CENTROID_NAMES),
     ("centroid-multilinestring-fp64", _MULTILINESTRING_CENTROID_FP64, _MULTILINESTRING_CENTROID_NAMES),
     ("centroid-multilinestring-fp32", _MULTILINESTRING_CENTROID_FP32, _MULTILINESTRING_CENTROID_NAMES),
+    ("centroid-polygon-cooperative-fp64", _POLYGON_CENTROID_COOPERATIVE_FP64, _POLYGON_CENTROID_COOPERATIVE_NAMES),
+    ("centroid-polygon-cooperative-fp32", _POLYGON_CENTROID_COOPERATIVE_FP32, _POLYGON_CENTROID_COOPERATIVE_NAMES),
 ])
 
 
@@ -546,11 +685,27 @@ def _launch_polygon_centroid(
     if buf.row_count == 0 or buf.ring_offsets is None or len(buf.geometry_offsets) < 2:
         return
 
-    kernels = _compile_polygon_centroid_kernel(compute_type)
-    kernel = kernels["polygon_centroid"]
+    n = buf.row_count
+
+    # Choose cooperative vs simple kernel based on avg vertex count.
+    # Cooperative kernel only applies to Polygon family (not MultiPolygon,
+    # which uses the same per-thread polygon_centroid kernel).
+    avg_verts = buf.x.size / max(n, 1) if n > 0 else 0
+    use_cooperative = avg_verts >= 64 and family is GeometryFamily.POLYGON
+
+    if use_cooperative:
+        coop_kernels = _compile_kernel(
+            "centroid-polygon-cooperative",
+            _POLYGON_CENTROID_COOPERATIVE_FP64, _POLYGON_CENTROID_COOPERATIVE_FP32,
+            _POLYGON_CENTROID_COOPERATIVE_NAMES, compute_type,
+        )
+        kernel = coop_kernels["polygon_centroid_cooperative"]
+    else:
+        kernels = _compile_polygon_centroid_kernel(compute_type)
+        kernel = kernels["polygon_centroid"]
+
     global_rows = np.flatnonzero(mask)
     family_rows = family_row_offsets[global_rows]
-    n = buf.row_count
 
     needs_free = device_state is None or family not in (device_state.families if device_state else {})
     allocated = []
@@ -577,7 +732,13 @@ def _launch_polygon_centroid(
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
              KERNEL_PARAM_I32),
         )
-        grid, block = runtime.launch_config(kernel, n)
+        if use_cooperative:
+            # 1 block per geometry; fixed at 256 to match __launch_bounds__(256, 4)
+            # and shared memory sized for 8 warps (256 / 32).
+            grid = (n, 1, 1)
+            block = (256, 1, 1)
+        else:
+            grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
         family_cx = runtime.copy_device_to_host(d_cx)
         family_cy = runtime.copy_device_to_host(d_cy)

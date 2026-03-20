@@ -59,6 +59,107 @@ typedef {compute_type} compute_t;
 """
 
 # ---------------------------------------------------------------------------
+# Cooperative area kernel: 1 block per geometry (for complex polygons)
+# ---------------------------------------------------------------------------
+
+_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+extern "C" __global__ __launch_bounds__(256, 4)
+void polygon_area_cooperative(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ geometry_offsets,
+    double* __restrict__ out_area,
+    double center_x,
+    double center_y,
+    int row_count
+) {{
+    const int row = blockIdx.x;
+    if (row >= row_count) return;
+
+    const int first_ring = geometry_offsets[row];
+    const int last_ring = geometry_offsets[row + 1];
+
+    /* Shared memory for inter-warp Kahan reduction (up to 256/32 = 8 warps) */
+    __shared__ compute_t warp_sums[8];
+    __shared__ compute_t warp_comp[8];
+
+    compute_t total_area = (compute_t)0.0;
+    compute_t c_total = (compute_t)0.0;
+
+    for (int ring = first_ring; ring < last_ring; ring++) {{
+        const int cs = ring_offsets[ring];
+        const int ce = ring_offsets[ring + 1];
+        int n = ce - cs;
+
+        /* Strip closure vertex if present. */
+        if (n >= 2) {{
+            double dx = x[cs] - x[ce - 1];
+            double dy = y[cs] - y[ce - 1];
+            if (dx * dx + dy * dy < 1e-24) n--;
+        }}
+        if (n < 3) {{
+            __syncthreads();  /* keep block synchronized even on skip */
+            continue;
+        }}
+
+        /* Each thread accumulates partial cross product sum with Kahan */
+        compute_t partial_sum = (compute_t)0.0;
+        compute_t partial_c = (compute_t)0.0;
+
+        for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {{
+            const int cur = cs + i;
+            const int nxt = cs + ((i + 1) % n);
+            KAHAN_ADD(partial_sum, CX(x[cur]) * CY(y[nxt]) - CX(x[nxt]) * CY(y[cur]), partial_c);
+        }}
+
+        /* Warp-level reduction via __shfl_down_sync */
+        const unsigned int FULL_MASK = 0xFFFFFFFF;
+        for (int offset = 16; offset > 0; offset >>= 1) {{
+            compute_t shfl_sum = __shfl_down_sync(FULL_MASK, partial_sum, offset);
+            compute_t shfl_c = __shfl_down_sync(FULL_MASK, partial_c, offset);
+            /* Kahan add the shuffled value */
+            KAHAN_ADD(partial_sum, shfl_sum - shfl_c, partial_c);
+        }}
+
+        /* Block-level reduction via shared memory */
+        const int warp_id = threadIdx.x >> 5;
+        const int lane_id = threadIdx.x & 31;
+        if (lane_id == 0) {{
+            warp_sums[warp_id] = partial_sum;
+            warp_comp[warp_id] = partial_c;
+        }}
+        __syncthreads();
+
+        /* Thread 0 combines across warps with Kahan for this ring */
+        if (threadIdx.x == 0) {{
+            compute_t ring_sum = (compute_t)0.0;
+            compute_t ring_c = (compute_t)0.0;
+            const int num_warps = ((int)blockDim.x + 31) >> 5;
+            for (int w = 0; w < num_warps; ++w) {{
+                /* Incorporate warp compensation into value before adding */
+                KAHAN_ADD(ring_sum, warp_sums[w] - warp_comp[w], ring_c);
+            }}
+
+            compute_t ring_area = ring_sum * (compute_t)0.5;
+            if (ring == first_ring) {{
+                /* Exterior ring: positive area. */
+                KAHAN_ADD(total_area, fabs(ring_area), c_total);
+            }} else {{
+                /* Interior ring (hole): subtract. */
+                KAHAN_ADD(total_area, -fabs(ring_area), c_total);
+            }}
+        }}
+        __syncthreads();
+    }}
+
+    if (threadIdx.x == 0) {{
+        out_area[row] = (double)total_area;
+    }}
+}}
+"""
+
+# ---------------------------------------------------------------------------
 # Area kernel: Polygon (also used by MultiPolygon per-polygon-part)
 # ---------------------------------------------------------------------------
 
@@ -368,6 +469,7 @@ extern "C" __global__ void multilinestring_length(
 # ---------------------------------------------------------------------------
 
 _POLYGON_AREA_NAMES = ("polygon_area",)
+_POLYGON_AREA_COOPERATIVE_NAMES = ("polygon_area_cooperative",)
 _MULTIPOLYGON_AREA_NAMES = ("multipolygon_area",)
 _POLYGON_LENGTH_NAMES = ("polygon_length",)
 _MULTIPOLYGON_LENGTH_NAMES = ("multipolygon_length",)
@@ -376,6 +478,8 @@ _MULTILINESTRING_LENGTH_NAMES = ("multilinestring_length",)
 
 _POLYGON_AREA_FP64 = _POLYGON_AREA_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_AREA_FP32 = _POLYGON_AREA_KERNEL_SOURCE.format(compute_type="float")
+_POLYGON_AREA_COOPERATIVE_FP64 = _POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE.format(compute_type="double")
+_POLYGON_AREA_COOPERATIVE_FP32 = _POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE.format(compute_type="float")
 _MULTIPOLYGON_AREA_FP64 = _MULTIPOLYGON_AREA_KERNEL_SOURCE.format(compute_type="double")
 _MULTIPOLYGON_AREA_FP32 = _MULTIPOLYGON_AREA_KERNEL_SOURCE.format(compute_type="float")
 _POLYGON_LENGTH_FP64 = _POLYGON_LENGTH_KERNEL_SOURCE.format(compute_type="double")
@@ -393,6 +497,8 @@ from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 request_nvrtc_warmup([
     ("polygon-area-fp64", _POLYGON_AREA_FP64, _POLYGON_AREA_NAMES),
     ("polygon-area-fp32", _POLYGON_AREA_FP32, _POLYGON_AREA_NAMES),
+    ("polygon-area-cooperative-fp64", _POLYGON_AREA_COOPERATIVE_FP64, _POLYGON_AREA_COOPERATIVE_NAMES),
+    ("polygon-area-cooperative-fp32", _POLYGON_AREA_COOPERATIVE_FP32, _POLYGON_AREA_COOPERATIVE_NAMES),
     ("multipolygon-area-fp64", _MULTIPOLYGON_AREA_FP64, _MULTIPOLYGON_AREA_NAMES),
     ("multipolygon-area-fp32", _MULTIPOLYGON_AREA_FP32, _MULTIPOLYGON_AREA_NAMES),
     ("polygon-length-fp64", _POLYGON_LENGTH_FP64, _POLYGON_LENGTH_NAMES),
@@ -462,12 +568,26 @@ def _area_gpu(
     if np.any(poly_mask) and GeometryFamily.POLYGON in owned.families:
         buf = owned.families[GeometryFamily.POLYGON]
         if buf.row_count > 0 and buf.ring_offsets is not None and len(buf.geometry_offsets) >= 2:
-            kernels = _compile_kernel("polygon-area", _POLYGON_AREA_FP64, _POLYGON_AREA_FP32,
-                                      _POLYGON_AREA_NAMES, compute_type)
-            kernel = kernels["polygon_area"]
+            n = buf.row_count
+
+            # Choose cooperative vs simple kernel based on avg vertex count
+            avg_verts = buf.x.size / max(n, 1) if n > 0 else 0
+            use_cooperative = avg_verts >= 64
+
+            if use_cooperative:
+                coop_kernels = _compile_kernel(
+                    "polygon-area-cooperative",
+                    _POLYGON_AREA_COOPERATIVE_FP64, _POLYGON_AREA_COOPERATIVE_FP32,
+                    _POLYGON_AREA_COOPERATIVE_NAMES, compute_type,
+                )
+                kernel = coop_kernels["polygon_area_cooperative"]
+            else:
+                kernels = _compile_kernel("polygon-area", _POLYGON_AREA_FP64, _POLYGON_AREA_FP32,
+                                          _POLYGON_AREA_NAMES, compute_type)
+                kernel = kernels["polygon_area"]
+
             global_rows = np.flatnonzero(poly_mask)
             family_rows = family_row_offsets[global_rows]
-            n = buf.row_count
 
             # Zero-copy: use device pointers if already resident
             needs_free = device_state is None or GeometryFamily.POLYGON not in (device_state.families if device_state else {})
@@ -491,7 +611,13 @@ def _area_gpu(
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_I32),
                 )
-                grid, block = runtime.launch_config(kernel, n)
+                if use_cooperative:
+                    # 1 block per geometry; fixed at 256 to match __launch_bounds__(256, 4)
+                    # and shared memory sized for 8 warps (256 / 32).
+                    grid = (n, 1, 1)
+                    block = (256, 1, 1)
+                else:
+                    grid, block = runtime.launch_config(kernel, n)
                 runtime.launch(kernel, grid=grid, block=block, params=params)
                 family_result = runtime.copy_device_to_host(d_out)
                 result[global_rows] = family_result[family_rows]

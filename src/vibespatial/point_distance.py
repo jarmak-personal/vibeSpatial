@@ -58,7 +58,7 @@ extern "C" __device__ inline compute_t point_segment_sq_distance(
 // ---------------------------------------------------------------------------
 extern "C" __device__ inline compute_t point_coords_min_sq_distance(
     compute_t px, compute_t py,
-    const double* x, const double* y,
+    const double* __restrict__ x, const double* __restrict__ y,
     double center_x, double center_y,
     int coord_start, int coord_end
 ) {{
@@ -67,6 +67,8 @@ extern "C" __device__ inline compute_t point_coords_min_sq_distance(
     const compute_t d = point_segment_sq_distance(
         px, py, CX(x[c - 1]), CY(y[c - 1]), CX(x[c]), CY(y[c]));
     if (d < best) best = d;
+    // Early exit: point is ON this edge — distance can't improve.
+    if (best <= (compute_t)0.0) return best;
   }}
   return best;
 }}
@@ -78,10 +80,10 @@ extern "C" __device__ inline compute_t point_coords_min_sq_distance(
 // ---------------------------------------------------------------------------
 extern "C" __device__ inline bool point_inside_polygon(
     compute_t px, compute_t py,
-    const double* x, const double* y,
+    const double* __restrict__ x, const double* __restrict__ y,
     double center_x, double center_y,
-    const int* geometry_offsets,
-    const int* ring_offsets,
+    const int* __restrict__ geometry_offsets,
+    const int* __restrict__ ring_offsets,
     int polygon_row
 ) {{
   const int ring_start = geometry_offsets[polygon_row];
@@ -119,26 +121,26 @@ extern "C" __device__ inline bool point_inside_polygon(
 // Tier 1 NVRTC kernels: point distance to linestring / polygon families
 // ---------------------------------------------------------------------------
 
-extern "C" __global__ void point_linestring_distance_from_owned(
-    const unsigned char* query_validity,
-    const signed char*   query_tags,
-    const int*           query_family_row_offsets,
-    const int*           query_geometry_offsets,
-    const unsigned char* query_empty_mask,
-    const double*        query_x,
-    const double*        query_y,
+extern "C" __global__ __launch_bounds__(256, 4) void point_linestring_distance_from_owned(
+    const unsigned char* __restrict__ query_validity,
+    const signed char*   __restrict__ query_tags,
+    const int*           __restrict__ query_family_row_offsets,
+    const int*           __restrict__ query_geometry_offsets,
+    const unsigned char* __restrict__ query_empty_mask,
+    const double*        __restrict__ query_x,
+    const double*        __restrict__ query_y,
     int                  query_point_tag,
-    const unsigned char* tree_validity,
-    const signed char*   tree_tags,
-    const int*           tree_family_row_offsets,
-    const int*           tree_geometry_offsets,
-    const unsigned char* tree_empty_mask,
-    const double*        tree_x,
-    const double*        tree_y,
+    const unsigned char* __restrict__ tree_validity,
+    const signed char*   __restrict__ tree_tags,
+    const int*           __restrict__ tree_family_row_offsets,
+    const int*           __restrict__ tree_geometry_offsets,
+    const unsigned char* __restrict__ tree_empty_mask,
+    const double*        __restrict__ tree_x,
+    const double*        __restrict__ tree_y,
     int                  tree_line_tag,
-    const int*           left_idx,
-    const int*           right_idx,
-    double*              out_distances,
+    const int*           __restrict__ left_idx,
+    const int*           __restrict__ right_idx,
+    double*              __restrict__ out_distances,
     int                  exclusive,
     int                  pair_count,
     double               center_x,
@@ -180,27 +182,27 @@ extern "C" __global__ void point_linestring_distance_from_owned(
   out_distances[i] = (double)sqrt((double)sq);
 }}
 
-extern "C" __global__ void point_multilinestring_distance_from_owned(
-    const unsigned char* query_validity,
-    const signed char*   query_tags,
-    const int*           query_family_row_offsets,
-    const int*           query_geometry_offsets,
-    const unsigned char* query_empty_mask,
-    const double*        query_x,
-    const double*        query_y,
+extern "C" __global__ __launch_bounds__(256, 4) void point_multilinestring_distance_from_owned(
+    const unsigned char* __restrict__ query_validity,
+    const signed char*   __restrict__ query_tags,
+    const int*           __restrict__ query_family_row_offsets,
+    const int*           __restrict__ query_geometry_offsets,
+    const unsigned char* __restrict__ query_empty_mask,
+    const double*        __restrict__ query_x,
+    const double*        __restrict__ query_y,
     int                  query_point_tag,
-    const unsigned char* tree_validity,
-    const signed char*   tree_tags,
-    const int*           tree_family_row_offsets,
-    const int*           tree_geometry_offsets,
-    const int*           tree_part_offsets,
-    const unsigned char* tree_empty_mask,
-    const double*        tree_x,
-    const double*        tree_y,
+    const unsigned char* __restrict__ tree_validity,
+    const signed char*   __restrict__ tree_tags,
+    const int*           __restrict__ tree_family_row_offsets,
+    const int*           __restrict__ tree_geometry_offsets,
+    const int*           __restrict__ tree_part_offsets,
+    const unsigned char* __restrict__ tree_empty_mask,
+    const double*        __restrict__ tree_x,
+    const double*        __restrict__ tree_y,
     int                  tree_multiline_tag,
-    const int*           left_idx,
-    const int*           right_idx,
-    double*              out_distances,
+    const int*           __restrict__ left_idx,
+    const int*           __restrict__ right_idx,
+    double*              __restrict__ out_distances,
     int                  exclusive,
     int                  pair_count,
     double               center_x,
@@ -243,31 +245,32 @@ extern "C" __global__ void point_multilinestring_distance_from_owned(
     const compute_t sq = point_coords_min_sq_distance(px, py, tree_x, tree_y,
                                                        center_x, center_y, cs, ce);
     if (sq < best) best = sq;
+    if (best <= (compute_t)0.0) break;
   }}
   out_distances[i] = (double)sqrt((double)best);
 }}
 
-extern "C" __global__ void point_polygon_distance_from_owned(
-    const unsigned char* query_validity,
-    const signed char*   query_tags,
-    const int*           query_family_row_offsets,
-    const int*           query_geometry_offsets,
-    const unsigned char* query_empty_mask,
-    const double*        query_x,
-    const double*        query_y,
+extern "C" __global__ __launch_bounds__(256, 4) void point_polygon_distance_from_owned(
+    const unsigned char* __restrict__ query_validity,
+    const signed char*   __restrict__ query_tags,
+    const int*           __restrict__ query_family_row_offsets,
+    const int*           __restrict__ query_geometry_offsets,
+    const unsigned char* __restrict__ query_empty_mask,
+    const double*        __restrict__ query_x,
+    const double*        __restrict__ query_y,
     int                  query_point_tag,
-    const unsigned char* tree_validity,
-    const signed char*   tree_tags,
-    const int*           tree_family_row_offsets,
-    const int*           tree_polygon_geometry_offsets,
-    const int*           tree_ring_offsets,
-    const unsigned char* tree_empty_mask,
-    const double*        tree_x,
-    const double*        tree_y,
+    const unsigned char* __restrict__ tree_validity,
+    const signed char*   __restrict__ tree_tags,
+    const int*           __restrict__ tree_family_row_offsets,
+    const int*           __restrict__ tree_polygon_geometry_offsets,
+    const int*           __restrict__ tree_ring_offsets,
+    const unsigned char* __restrict__ tree_empty_mask,
+    const double*        __restrict__ tree_x,
+    const double*        __restrict__ tree_y,
     int                  tree_polygon_tag,
-    const int*           left_idx,
-    const int*           right_idx,
-    double*              out_distances,
+    const int*           __restrict__ left_idx,
+    const int*           __restrict__ right_idx,
+    double*              __restrict__ out_distances,
     int                  exclusive,
     int                  pair_count,
     double               center_x,
@@ -315,32 +318,33 @@ extern "C" __global__ void point_polygon_distance_from_owned(
     const compute_t sq = point_coords_min_sq_distance(px, py, tree_x, tree_y,
                                                        center_x, center_y, cs, ce);
     if (sq < best) best = sq;
+    if (best <= (compute_t)0.0) break;
   }}
   out_distances[i] = (double)sqrt((double)best);
 }}
 
-extern "C" __global__ void point_multipolygon_distance_from_owned(
-    const unsigned char* query_validity,
-    const signed char*   query_tags,
-    const int*           query_family_row_offsets,
-    const int*           query_geometry_offsets,
-    const unsigned char* query_empty_mask,
-    const double*        query_x,
-    const double*        query_y,
+extern "C" __global__ __launch_bounds__(256, 4) void point_multipolygon_distance_from_owned(
+    const unsigned char* __restrict__ query_validity,
+    const signed char*   __restrict__ query_tags,
+    const int*           __restrict__ query_family_row_offsets,
+    const int*           __restrict__ query_geometry_offsets,
+    const unsigned char* __restrict__ query_empty_mask,
+    const double*        __restrict__ query_x,
+    const double*        __restrict__ query_y,
     int                  query_point_tag,
-    const unsigned char* tree_validity,
-    const signed char*   tree_tags,
-    const int*           tree_family_row_offsets,
-    const int*           tree_geometry_offsets,
-    const int*           tree_part_offsets,
-    const int*           tree_ring_offsets,
-    const unsigned char* tree_empty_mask,
-    const double*        tree_x,
-    const double*        tree_y,
+    const unsigned char* __restrict__ tree_validity,
+    const signed char*   __restrict__ tree_tags,
+    const int*           __restrict__ tree_family_row_offsets,
+    const int*           __restrict__ tree_geometry_offsets,
+    const int*           __restrict__ tree_part_offsets,
+    const int*           __restrict__ tree_ring_offsets,
+    const unsigned char* __restrict__ tree_empty_mask,
+    const double*        __restrict__ tree_x,
+    const double*        __restrict__ tree_y,
     int                  tree_multipolygon_tag,
-    const int*           left_idx,
-    const int*           right_idx,
-    double*              out_distances,
+    const int*           __restrict__ left_idx,
+    const int*           __restrict__ right_idx,
+    double*              __restrict__ out_distances,
     int                  exclusive,
     int                  pair_count,
     double               center_x,
