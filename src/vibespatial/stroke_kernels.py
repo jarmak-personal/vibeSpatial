@@ -717,6 +717,7 @@ def evaluate_geopandas_buffer(
     join_style,
     mitre_limit: float,
     single_sided: bool,
+    prebuilt_owned=None,
 ):
     from vibespatial.execution_trace import execution_trace
 
@@ -748,7 +749,7 @@ def evaluate_geopandas_buffer(
             )
             dispatch_decision = plan.dispatch_decision
             if dispatch_decision is DispatchDecision.GPU:
-                owned = from_shapely_geometries(geometries.tolist())
+                owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
                 result = point_buffer_owned_array(
                     owned,
                     distance,
@@ -783,7 +784,7 @@ def evaluate_geopandas_buffer(
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=len(geometries),
             ).selected is ExecutionMode.GPU:
-                owned = from_shapely_geometries(geometries.tolist())
+                owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
                 result = linestring_buffer_owned_array(
                     owned,
                     distance,
@@ -808,7 +809,7 @@ def evaluate_geopandas_buffer(
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=len(geometries),
             ).selected is ExecutionMode.GPU:
-                owned = from_shapely_geometries(geometries.tolist())
+                owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
                 result = polygon_buffer_owned_array(
                     owned,
                     distance,

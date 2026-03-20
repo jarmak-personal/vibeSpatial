@@ -3,16 +3,14 @@ import warnings
 from typing import Literal, get_args
 
 import numpy as np
-from pandas import DataFrame, Series
-
 import shapely
+from pandas import DataFrame, Series
 
 import vibespatial.api as geopandas
 from vibespatial.api import GeoDataFrame
 from vibespatial.api._compat import import_optional_dependency
-from vibespatial.api.geometry_array import from_shapely, from_wkb
 from vibespatial.api.geo_base import _is_geometry_like_dtype
-
+from vibespatial.api.geometry_array import GeometryArray, from_shapely, from_wkb
 from vibespatial.api.io.file import _expand_user
 
 METADATA_VERSION = "1.0.0"
@@ -573,16 +571,36 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attr
             crs = "OGC:CRS84"
 
         if col_metadata["encoding"] == "WKB":
-            geom_arr = from_wkb(np.array(table[col]), crs=crs)
-        else:
-            from vibespatial.api.io._geoarrow import construct_shapely_array
+            from vibespatial.io_wkb import _decode_native_wkb
 
-            geom_arr = from_shapely(
-                construct_shapely_array(
-                    table[col].combine_chunks(), "geoarrow." + col_metadata["encoding"]
-                ),
-                crs=crs,
-            )
+            arrow_col = table[col].combine_chunks()
+            wkb_values = arrow_col.to_pylist()
+            try:
+                owned, _plan = _decode_native_wkb(wkb_values)
+                geom_arr = GeometryArray.from_owned(owned, crs=crs)
+            except (ValueError, NotImplementedError):
+                geom_arr = from_wkb(np.array(table[col]), crs=crs)
+        else:
+            import pyarrow as pa
+
+            from vibespatial.io_geoarrow import _decode_geoarrow_array_to_owned
+
+            arrow_col = table[col].combine_chunks()
+            field = pa.field(col, arrow_col.type)
+            try:
+                owned = _decode_geoarrow_array_to_owned(
+                    field, arrow_col, encoding=col_metadata["encoding"],
+                )
+                geom_arr = GeometryArray.from_owned(owned, crs=crs)
+            except (ValueError, NotImplementedError):
+                from vibespatial.api.io._geoarrow import construct_shapely_array
+
+                geom_arr = from_shapely(
+                    construct_shapely_array(
+                        arrow_col, "geoarrow." + col_metadata["encoding"]
+                    ),
+                    crs=crs,
+                )
 
         df.insert(result_column_names.index(col), col, geom_arr)
 

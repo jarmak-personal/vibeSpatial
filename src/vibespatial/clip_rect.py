@@ -1843,6 +1843,8 @@ def evaluate_geopandas_clip_by_rect(
     ymin: float,
     xmax: float,
     ymax: float,
+    *,
+    prebuilt_owned: OwnedGeometryArray | None = None,
 ) -> tuple[np.ndarray | None, ExecutionMode]:
     from vibespatial.execution_trace import execution_trace
 
@@ -1862,8 +1864,9 @@ def evaluate_geopandas_clip_by_rect(
         )
         dispatch_mode = ExecutionMode.GPU if plan.dispatch_decision is DispatchDecision.GPU else ExecutionMode.CPU
         try:
+            clip_input = prebuilt_owned if prebuilt_owned is not None else geometries
             result = clip_by_rect_owned(
-                geometries,
+                clip_input,
                 xmin,
                 ymin,
                 xmax,

@@ -1085,8 +1085,8 @@ def evaluate_binary_predicate(
 
 def evaluate_geopandas_binary_predicate(
     predicate: str,
-    left: np.ndarray,
-    right: object | np.ndarray,
+    left: np.ndarray | OwnedGeometryArray,
+    right: object | np.ndarray | OwnedGeometryArray,
     **kwargs: Any,
 ) -> np.ndarray | None:
     from vibespatial.execution_trace import execution_trace
@@ -1101,10 +1101,15 @@ def evaluate_geopandas_binary_predicate(
                 pipeline="predicate",
             )
             return None
+        left_coerced = left if isinstance(left, OwnedGeometryArray) else np.asarray(left, dtype=object)
+        if isinstance(right, OwnedGeometryArray) or np.isscalar(right) or right is None:
+            right_coerced = right
+        else:
+            right_coerced = np.asarray(right, dtype=object)
         result = evaluate_binary_predicate(
             predicate,
-            np.asarray(left, dtype=object),
-            right if np.isscalar(right) or right is None else np.asarray(right, dtype=object),
+            left_coerced,
+            right_coerced,
             dispatch_mode=get_requested_mode(),
             null_behavior=NullBehavior.FALSE,
             **kwargs,
