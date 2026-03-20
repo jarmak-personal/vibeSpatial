@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 114/200 lines
+Body Budget: 127/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -20,8 +20,9 @@ Section Map (Body Lines)
 | 38-65 | Core Rules |
 | 66-75 | Fallback |
 | 76-89 | Session Execution Mode Override |
-| 90-108 | Index-Array Boundary Model (ADR-0036) |
-| 109-114 | Compatibility |
+| 90-102 | Provenance Rewrite Override |
+| 103-121 | Index-Array Boundary Model (ADR-0036) |
+| 122-127 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -110,6 +111,19 @@ The session-wide execution mode follows the `determinism.py` pattern:
 - Setting the mode invalidates the adaptive runtime snapshot cache.
 - All entry points call `get_requested_mode()` to determine dispatch; internal
   GPU-only helpers are safe because their callers gate on mode first.
+
+## Provenance Rewrite Override
+
+The provenance rewrite system (ADR-0039) follows the same pattern:
+
+- `VIBESPATIAL_PROVENANCE_REWRITES` env var (default: enabled; `0`/`false`/
+  `no`/`off` to disable).
+- `set_provenance_rewrites(bool | None)` programmatic override (takes priority
+  over env var; `None` clears override back to default).
+- `provenance_rewrites_enabled()` reads: explicit override > env var > `True`.
+- Gated at three sites: `attempt_provenance_rewrite()` in `provenance.py`
+  (covers R1 and all consumption-time rules), and the R5/R6 branches in
+  `geometry_array.py:buffer()`.
 
 ## Index-Array Boundary Model (ADR-0036)
 

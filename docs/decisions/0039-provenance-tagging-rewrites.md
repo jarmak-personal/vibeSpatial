@@ -41,6 +41,13 @@ Key properties:
 - precondition failures fall through silently to the original operation
 - provenance propagates through `GeometryArray.copy()` and `__init__` so it
   survives pandas Series wrapping
+- rewrites are globally toggleable via `VIBESPATIAL_PROVENANCE_REWRITES` env
+  var (`0`/`false`/`no`/`off` to disable; default enabled) or the
+  `set_provenance_rewrites(bool | None)` programmatic override for A/B
+  benchmarking; `provenance_rewrites_enabled()` reads: explicit override >
+  env var > `True` default
+- each `RewriteEvent` carries `elapsed_seconds` wall-clock timing of the
+  rewritten computation for performance analysis
 
 Initial rewrite rules:
 
