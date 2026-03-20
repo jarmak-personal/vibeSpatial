@@ -81,5 +81,4 @@ Rewrite rules:
 ## Acceptance Notes
 
 The landed implementation covers the data model, registry, event logging, and
-three rewrite rules (R5, R1, R6) with full test coverage. R2 (sjoin rewrite)
-and future rules are follow-up work within the same framework.
+five rewrite rules (R1, R2, R5, R6, R7) with full test coverage.
