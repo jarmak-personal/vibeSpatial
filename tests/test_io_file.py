@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from shapely.geometry import LineString, Point, Polygon
 
 import vibespatial.api as geopandas
@@ -25,6 +26,7 @@ def _sample_frame() -> geopandas.GeoDataFrame:
     )
 
 
+@pytest.mark.gpu
 def test_geojson_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
@@ -42,6 +44,7 @@ def test_geojson_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     assert not fallbacks
 
 
+@pytest.mark.gpu
 def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()

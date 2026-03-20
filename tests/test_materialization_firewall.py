@@ -602,6 +602,7 @@ class TestSindexSjoinShortcut:
         assert _has_no_materialization(tree_dga)
         assert _has_no_materialization(query_dga)
 
+    @pytest.mark.gpu
     def test_sjoin_dga_no_materialization(self):
         """sjoin on DGA-backed GeoDataFrames uses owned dispatch without materialization."""
         tree_owned = from_shapely_geometries([Point(0, 0), Point(10, 10)])
@@ -618,6 +619,7 @@ class TestSindexSjoinShortcut:
         assert _has_no_materialization(tree_dga)
         assert _has_no_materialization(query_dga)
 
+    @pytest.mark.gpu
     def test_sjoin_dga_records_owned_dispatch(self):
         """sjoin on DGA-backed GeoDataFrames records owned_spatial_query dispatch."""
         tree_owned = from_shapely_geometries([Point(0, 0), Point(10, 10)])
@@ -637,6 +639,7 @@ class TestSindexSjoinShortcut:
         assert sjoin_events
         assert sjoin_events[-1].implementation == "owned_spatial_query"
 
+    @pytest.mark.gpu
     def test_sjoin_outer_dga_no_materialization(self):
         """Outer sjoin on DGA-backed GeoDataFrames avoids materialization."""
         tree_owned = from_shapely_geometries([Point(0, 0), Point(10, 10)])

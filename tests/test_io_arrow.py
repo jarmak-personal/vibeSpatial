@@ -5,6 +5,7 @@ import types
 
 import numpy as np
 import pandas as pd
+import pytest
 from shapely.geometry import (
     LineString,
     MultiLineString,
@@ -815,6 +816,7 @@ def _make_device_dga_gdf(geoms, crs="EPSG:4326"):
     return gdf, owned
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_point_geoarrow(tmp_path) -> None:
     """Point DGA → GeoArrow write → read yields identical geometry."""
     pts = [Point(i, i * 2) for i in range(5)]
@@ -827,6 +829,7 @@ def test_write_geoparquet_roundtrips_point_geoarrow(tmp_path) -> None:
         assert result.geometry.iloc[i].equals(pt)
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_point_wkb(tmp_path) -> None:
     """Point DGA → WKB write → read yields identical geometry."""
     pts = [Point(i, i * 2) for i in range(5)]
@@ -839,6 +842,7 @@ def test_write_geoparquet_roundtrips_point_wkb(tmp_path) -> None:
         assert result.geometry.iloc[i].equals(pt)
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_polygon_geoarrow(tmp_path) -> None:
     """Polygon DGA → GeoArrow write → read roundtrip."""
     polys = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(4)]
@@ -851,6 +855,7 @@ def test_write_geoparquet_roundtrips_polygon_geoarrow(tmp_path) -> None:
         assert result.geometry.iloc[i].equals(poly)
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_polygon_wkb(tmp_path) -> None:
     """Polygon DGA → WKB write → read roundtrip."""
     polys = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(4)]
@@ -863,6 +868,7 @@ def test_write_geoparquet_roundtrips_polygon_wkb(tmp_path) -> None:
         assert result.geometry.iloc[i].equals(poly)
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_linestring_wkb(tmp_path) -> None:
     """LineString DGA → WKB write → read roundtrip."""
     lines = [LineString([(i, 0), (i + 1, 1), (i + 2, 0)]) for i in range(3)]
@@ -875,6 +881,7 @@ def test_write_geoparquet_roundtrips_linestring_wkb(tmp_path) -> None:
         assert result.geometry.iloc[i].equals(ls)
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_multipolygon_wkb(tmp_path) -> None:
     """MultiPolygon DGA → WKB write → read roundtrip."""
     mpolys = [
@@ -893,6 +900,7 @@ def test_write_geoparquet_roundtrips_multipolygon_wkb(tmp_path) -> None:
         assert result.geometry.iloc[i].equals(mp)
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_no_materialization(tmp_path) -> None:
     """Writing DGA-backed GDF with GeoArrow must NOT trigger Shapely materialization."""
     pts = [Point(i, i) for i in range(10)]
@@ -1019,6 +1027,7 @@ def test_zero_transfer_pipeline(tmp_path) -> None:
     assert materialization_count == 0
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_parquet_roundtrip_preserves_crs(tmp_path) -> None:
     """GeoParquet roundtrip via DGA write path preserves CRS metadata."""
     from pyproj import CRS
@@ -1031,6 +1040,7 @@ def test_parquet_roundtrip_preserves_crs(tmp_path) -> None:
     assert CRS(result.crs) == CRS("EPSG:32632")
 
 
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_parquet_roundtrip_preserves_attributes(tmp_path) -> None:
     """Non-geometry columns survive DGA write path roundtrip."""
     pts = [Point(i, i) for i in range(5)]

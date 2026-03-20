@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from shapely.geometry import Point, Polygon, box
 
 from vibespatial import (
@@ -28,6 +29,7 @@ def test_build_flat_spatial_index_sorts_by_morton_key() -> None:
     assert any("cpu baseline" in reason for reason in owned.diagnostics_report()["runtime_history"])
 
 
+@pytest.mark.gpu
 def test_query_bounds_returns_matching_rows() -> None:
     owned = from_shapely_geometries([Point(0, 0), Point(10, 10), box(5, 5, 7, 7)])
     index = build_flat_spatial_index(owned)
@@ -37,6 +39,7 @@ def test_query_bounds_returns_matching_rows() -> None:
     assert set(matches.tolist()) == {2}
 
 
+@pytest.mark.gpu
 def test_query_returns_candidate_pairs_for_sindex_style_workload() -> None:
     left = from_shapely_geometries([Point(0, 0), Point(8, 8), Point(50, 50)])
     right = from_shapely_geometries(
@@ -82,6 +85,7 @@ def test_build_flat_spatial_index_gpu_matches_cpu_order() -> None:
     assert gpu.order.tolist() == cpu.order.tolist()
 
 
+@pytest.mark.gpu
 def test_build_flat_spatial_index_default_prefers_gpu_when_available() -> None:
     owned = from_shapely_geometries([Point(2, 2), Point(0, 0), Point(1, 1)])
 

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from scripts.check_pipeline_regressions import compare_results
 from vibespatial.bench.pipeline import benchmark_pipeline_suite, suite_to_json
 
 
 def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
+    pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke")
     by_name = {(result.pipeline, result.scale): result for result in results}
 
@@ -47,6 +50,7 @@ def test_pipeline_smoke_suite_can_run_geopandas_predicate_baseline() -> None:
 
 
 def test_vegetation_corridor_smoke() -> None:
+    pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke", pipelines=("vegetation-corridor",))
     assert len(results) == 1
     result = results[0]
@@ -73,6 +77,7 @@ def test_vegetation_corridor_geopandas_smoke() -> None:
 
 
 def test_parcel_zoning_smoke() -> None:
+    pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke", pipelines=("parcel-zoning",))
     assert len(results) == 1
     result = results[0]
@@ -94,6 +99,7 @@ def test_parcel_zoning_geopandas_smoke() -> None:
 
 
 def test_flood_exposure_smoke() -> None:
+    pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke", pipelines=("flood-exposure",))
     assert len(results) == 1
     result = results[0]
@@ -115,6 +121,7 @@ def test_flood_exposure_geopandas_smoke() -> None:
 
 
 def test_network_service_area_smoke() -> None:
+    pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke", pipelines=("network-service-area",))
     assert len(results) == 1
     result = results[0]
@@ -137,6 +144,7 @@ def test_network_service_area_geopandas_smoke() -> None:
 
 
 def test_site_suitability_smoke() -> None:
+    pytest.importorskip("pylibcudf")
     results = benchmark_pipeline_suite(suite="smoke", pipelines=("site-suitability",))
     assert len(results) == 1
     result = results[0]

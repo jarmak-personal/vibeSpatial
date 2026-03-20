@@ -58,6 +58,7 @@ def test_binary_predicate_uses_coarse_filter_before_exact_refine() -> None:
     assert np.count_nonzero(result.values) == 12
 
 
+@pytest.mark.gpu
 @pytest.mark.cpu_fallback
 def test_binary_predicate_auto_fallback_is_visible(monkeypatch) -> None:
     import vibespatial.runtime.adaptive as adaptive_runtime

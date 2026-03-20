@@ -122,6 +122,7 @@ def test_morton_keys_place_null_and_empty_at_end() -> None:
     assert keys[2] == np.iinfo(np.uint64).max
 
 
+@pytest.mark.gpu
 def test_diagnostics_capture_residency_and_runtime_changes() -> None:
     owned = from_shapely_geometries(_sample_geometries())
     owned.move_to(
