@@ -3854,6 +3854,20 @@
     },
     {
       "kind": "repo",
+      "path": ".claude/skills/cuda-optimizer/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "cuda",
+        "md",
+        "optimizer",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/skills/cuda-writing/SKILL.md",
       "referenced_by": [],
       "symbols": [],

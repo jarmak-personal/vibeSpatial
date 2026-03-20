@@ -180,6 +180,27 @@ Uses `cuOccupancyMaxPotentialBlockSize` for optimal threads-per-block
 based on register pressure and shared memory. Falls back to 256 if
 the API is unavailable. Results cached per kernel function.
 
+**Note**: The occupancy API maximizes *occupancy*, not necessarily
+*performance*. For kernels with high register usage, lower occupancy
+with more registers per thread can outperform higher occupancy due to
+increased ILP (instruction-level parallelism). Profile before overriding.
+
+### `__launch_bounds__` Directive
+
+Use `__launch_bounds__` in NVRTC kernel source to guide register
+allocation and ensure minimum blocks per SM:
+
+```c
+extern "C" __global__ void __launch_bounds__(256, 4)
+my_kernel(const double* __restrict__ x, ...) {{
+    // 256 max threads/block, at least 4 blocks per SM
+}}
+```
+
+Without `__launch_bounds__`, the compiler assumes the maximum possible
+threads per block, which can over-estimate shared memory needs and
+reduce occupancy. Always use when the block size is known at compile time.
+
 ---
 
 ## 3. Device Memory Management
@@ -455,6 +476,19 @@ if (!valid || !is_candidate) return;
 
 After bounds filtering at ~5% hit rate, most warps skip entirely.
 
+### `__syncwarp()` — Warp Reconvergence (Volta+)
+
+On Volta+ (CC 7.0+) with independent thread scheduling, warps can
+remain diverged after conditional blocks. Use `__syncwarp()` before
+warp-level primitives to guarantee all lanes are converged:
+
+```c
+if (condition) {{
+    // ... divergent work ...
+}}
+__syncwarp(0xFFFFFFFF);  // reconverge before shuffle/ballot
+```
+
 ### Warp Shuffle — Intra-Warp Reduction
 
 Reduce across 32 lanes without shared memory:
@@ -538,6 +572,27 @@ for (int ring = ring_start; ring < ring_end; ++ring) {{
 }}
 ```
 
+### Bank Conflict Avoidance
+
+Shared memory has 32 banks, each 4 bytes wide. If multiple threads in
+a warp access different addresses in the same bank, accesses serialize.
+
+**The +1 padding trick** eliminates bank conflicts on column access:
+
+```c
+// BAD: 32-way bank conflict when reading columns
+__shared__ float tile[32][32];
+
+// GOOD: +1 padding shifts bank mapping — no conflicts
+__shared__ float tile[32][33];
+```
+
+For `double` (8 bytes = 2 banks), stride-1 access has inherent 2-way
+conflict. Mitigate with `+1` padding per row or swizzled indexing.
+
+NVIDIA benchmark: padding improved matrix transpose bandwidth from
+51.3 GB/s to 99.5 GB/s (~2x).
+
 ### Declaring Shared Memory
 
 ```python
@@ -547,6 +602,25 @@ runtime.launch(kernel, grid=g, block=b, params=p, shared_mem_bytes=1024)
 ```c
 __shared__ int scratch[256];                  // static
 extern __shared__ float dynamic_smem[];       // dynamic (via shared_mem_bytes)
+```
+
+**Max shared memory per block** (default is 48 KB; requesting more
+requires `cudaFuncSetAttribute` with `cudaFuncAttributeMaxDynamicSharedMemorySize`):
+- A100: 163 KB
+- H100: 227 KB
+- RTX 3090/4090: 99 KB
+
+### Async Copy to Shared Memory (CUDA 11.0+)
+
+For data tiling, `__pipeline_memcpy_async()` copies directly from global
+to shared memory, bypassing the register file. This reduces register
+pressure and can increase occupancy. Best with 8 or 16-byte elements:
+
+```c
+__pipeline_memcpy_async(&shared_data[tid], &global_data[idx], sizeof(double));
+__pipeline_commit();
+__pipeline_wait_prior(0);  // wait for all committed copies
+__syncthreads();
 ```
 
 ---
@@ -594,15 +668,71 @@ See `precision-compliance` skill for the full step-by-step procedure.
 
 - **Coalesced reads**: Adjacent threads read adjacent addresses. SoA
   layout (separate x[], y[]) is already coalesced.
-- **Avoid AoS**: Never interleave x,y in a single array.
+- **Avoid AoS**: Never interleave x,y in a single array. NVIDIA GTC 2024
+  benchmark: AoS was **5.9x slower** than SoA due to strided access.
 - **Minimize global writes**: Use shared memory or registers for
   intermediates; write to global once.
+- **`const __restrict__`**: Always annotate read-only pointer parameters.
+  On CC 3.5+, the compiler automatically routes through the read-only
+  data cache (`__ldg` path), increasing effective cache capacity:
+  ```c
+  extern "C" __global__ void my_kernel(
+      const double* __restrict__ x,   // read-only -> __ldg cache
+      const double* __restrict__ y,
+      double* __restrict__ output,    // write-only
+      ...
+  ```
+- **Vectorized loads** for bandwidth-bound bulk I/O. Use 128-bit wide
+  loads to reduce instruction count and increase bandwidth (1.3-1.5x
+  speedup per NVIDIA benchmarks):
+  ```c
+  // Instead of scalar loads:
+  double val = input[idx];
+  // Use 128-bit vectorized loads (requires aligned pointer):
+  double2 vals = reinterpret_cast<const double2*>(input)[idx];
+  // For fp32: float4 vals = reinterpret_cast<const float4*>(input)[idx];
+  ```
+  `cudaMalloc` guarantees 256-byte alignment, so device pointers are valid.
+  Handle remainder elements with a scalar tail.
 
 ### Kernel Launch
 
 - Never launch with <32 threads of real work (wastes a warp).
-- Avoid many tiny kernels — each launch has ~5us overhead.
+- Avoid many tiny kernels — each launch has ~3-5us overhead.
 - Remove unnecessary syncs between same-stream operations.
+- **Wave quantization**: On modern GPUs (128 SMs on RTX 4090, 132 on
+  H100), launching grid_size = SM_count + 1 wastes ~50% of the final
+  wave. Size grids to exactly fill the GPU and use grid-stride loops.
+
+### Grid-Stride Loops with ILP
+
+Prefer grid-stride loops over one-thread-per-element. Process multiple
+elements per thread for instruction-level parallelism:
+
+```c
+// Grid-stride loop with ILP (4 elements/thread)
+const int stride = blockDim.x * gridDim.x;
+for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+     idx < n;
+     idx += stride * 4) {{
+    #pragma unroll
+    for (int j = 0; j < 4; j++) {{
+        int elem = idx + j * stride;
+        if (elem < n) output[elem] = compute(input[elem]);
+    }}
+}}
+```
+
+NVIDIA GTC 2024 data: 4 elements/thread at 50% occupancy outperformed
+1 element/thread at 100% occupancy (82% vs 51% bandwidth utilization).
+
+**Grid sizing for grid-stride loops**:
+```python
+grid_size = min(
+    (n + block_size - 1) // block_size,
+    sm_count * max_blocks_per_sm  # fill GPU exactly — avoid wave waste
+)
+```
 
 ### Divergence and Load Balancing
 
@@ -620,6 +750,38 @@ def _should_bin_dispatch(work_estimates):
 
 For the "complex" bin, use a block-per-item kernel where all threads
 cooperatively process one work item (see cooperative edge iteration).
+
+### Arithmetic Micro-Optimizations
+
+- **Float constant suffix**: In fp32 kernels, use `1.0f` not `1.0`.
+  Without the `f` suffix, constants are double-precision and force a
+  conversion instruction. When using `compute_t`, cast explicitly:
+  `(compute_t)0.0` or `(compute_t)1e-7`.
+- **Integer division/modulo**: Compiles to up to 20 instructions. When
+  the divisor is a power of 2, use bitwise ops:
+  `threadIdx.x / 32` -> `threadIdx.x >> 5`
+  `threadIdx.x % 32` -> `threadIdx.x & 31`
+- **`sinpi`/`cospi`**: If trig functions are needed (e.g., great circle
+  distance), use `sinpi(x)` instead of `sin(x * M_PI)` — faster and
+  more accurate.
+
+### L2 Cache-Aware Patterns
+
+For multi-kernel pipelines (count -> scatter, bounds -> filter -> refine),
+consider these L2-friendly patterns:
+
+- **Reverse block traversal**: Alternate block indexing direction between
+  consecutive kernels so kernel B starts from data kernel A last touched:
+  ```c
+  // Kernel A: forward
+  int blockId = blockIdx.x;
+  // Kernel B: reverse (hits A's still-cached tail data)
+  int blockId = gridDim.x - blockIdx.x - 1;
+  ```
+- **Cache tiling**: If intermediate data fits in L2 (40 MB A100, 72 MB
+  RTX 4090, 50 MB H100), process data in L2-sized chunks end-to-end
+  rather than running each stage over the full dataset. L2 cache hits
+  can yield up to 10x bandwidth improvement over HBM misses.
 
 ---
 

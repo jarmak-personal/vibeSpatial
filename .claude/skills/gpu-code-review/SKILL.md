@@ -34,7 +34,7 @@ Use these numbers to evaluate whether code is appropriately tuned.
 | Registers per SM | 65,536 (32-bit) | 65,536 (32-bit) | 65,536 (32-bit) | 65,536 (32-bit) |
 | Max registers/thread | 255 | 255 | 255 | 255 |
 | Max threads per SM | 2,048 | 2,048 | 1,536 | 1,536 |
-| Max blocks per SM | 32 | 32 | 16 | 16 |
+| Max blocks per SM | 32 | 32 | 16 | 24 |
 | Shared mem per SM | 164 KB | 228 KB | 100 KB | 100 KB |
 | Max shared mem/block | 163 KB | 227 KB | 99 KB | 99 KB |
 | L1/Texture cache | 192 KB | 256 KB | 128 KB | 128 KB |
@@ -54,17 +54,18 @@ full rate (1:1). H100 is 1:2. This is why ADR-0002 precision dispatch exists.
 
 ---
 
-## 1. Memory Management with RMM
+## 1. Memory Management
 
 ### 1.1 Pool Allocation vs Direct CUDA Allocation
 
 **Rule**: Always use a memory pool. Never call raw `cudaMalloc`/`cudaFree` in
 hot paths.
 
-- RMM pool suballocations cost <1 microsecond each (alloc + free)
+- Pool suballocations cost <1 microsecond each (alloc + free)
 - Raw `cudaMalloc` costs ~100-1000 microseconds depending on size
-- RMM pools are ~1,000x faster than `cudaMalloc`/`cudaFree`
-- Real-world impact: 4.6-10x speedup from pool allocation in RAPIDS benchmarks
+- Pools are ~1,000x faster than `cudaMalloc`/`cudaFree`
+- Real-world impact: 2-5x end-to-end speedup in RAPIDS GPU Big Data Benchmarks
+  when switching from `cudaMalloc` to `cudaMallocAsync` (stream-ordered pools)
 
 **vibeSpatial pattern**: CuPy MemoryPool is configured at runtime init.
 `VIBESPATIAL_GPU_POOL_LIMIT` env var caps pool size. Check via
@@ -73,17 +74,8 @@ hot paths.
 ### 1.2 Pool Sizing
 
 **Rule**: Reserve 200-500 MB for the CUDA context. Do not allocate 100% of VRAM.
-
-```python
-# Good: leave headroom
-pool = rmm.mr.PoolMemoryResource(
-    initial_pool_size=int(0.75 * total_vram),  # 75% of VRAM
-    maximum_pool_size=int(0.90 * total_vram),  # 90% ceiling
-)
-
-# Bad: allocate everything
-pool = rmm.mr.PoolMemoryResource(initial_pool_size=total_vram)
-```
+Target 75% initial / 90% max ceiling for pool sizing. vibeSpatial uses CuPy's
+memory pool, configured via `VIBESPATIAL_GPU_POOL_LIMIT`.
 
 ### 1.3 Pool vs Managed Memory
 
@@ -100,27 +92,34 @@ Use stream-ordered allocation when:
 - Memory lifetimes are tied to specific stream operations
 - Library code needs independent memory management without affecting the
   application's default pool
-- Frequent alloc/free cycles within a loop (set release threshold to
-  `UINT64_MAX` to prevent reallocation overhead)
+- Frequent alloc/free cycles within a loop
 
-Configuration:
+**Critical configuration — release threshold**: The default release threshold
+is **0**, meaning ALL unused pool memory is returned to the OS on every
+synchronization operation (`cudaStreamSynchronize`, `cudaDeviceSynchronize`).
+This causes expensive OS allocation calls every iteration. For single-process
+exclusive GPU usage, always set `UINT64_MAX`:
+
 ```c
-// Prevent pool from releasing memory between iterations
+// MANDATORY for iterative workloads: prevent pool from releasing memory
 uint64_t threshold = UINT64_MAX;
 cudaMemPoolSetAttribute(mempool, cudaMemPoolAttrReleaseThreshold, &threshold);
 ```
 
+**Interoperability gotcha**: `cudaFree()` can free `cudaMallocAsync` memory
+but does NOT implicitly synchronize in that case — you MUST sync first.
+`cudaFreeAsync()` can free `cudaMalloc` memory (freed at next sync).
+
 ### 1.5 Sub-Allocator Patterns for Geometry Buffers
 
-**Binning allocator**: Use RMM `binning_memory_resource` for mixed-size
-geometry allocations:
-- Small allocations (< 64 MB): `fixed_size_memory_resource` per size class
+**Binning allocator**: For mixed-size geometry allocations, use separate
+pools by size class:
+- Small allocations (< 64 MB): fixed-size pools per size class
   (eliminates fragmentation)
-- Large allocations (>= 64 MB): `pool_memory_resource` with coalescing
+- Large allocations (>= 64 MB): general pool with coalescing
 
-**Arena allocator**: `arena_memory_resource` carves per-thread pools for small
-allocations, shares a pool for large ones. Good for multithreaded geometry
-processing.
+**Arena pattern**: Carve per-thread sub-pools for small allocations, share
+a pool for large ones. Good for multithreaded geometry processing.
 
 ### 1.6 Fragmentation Avoidance
 
@@ -149,9 +148,10 @@ processing.
 2. Tiny transfers — stream creation costs ~1-2 microseconds; if transfer time
    is less, streams add overhead
 3. Single-kernel operations — nothing to overlap with
-4. More than 8 concurrent streams — most GPUs see no benefit beyond 8, and
-   scheduling overhead increases (20-30% execution time increase from
-   queue mismanagement)
+4. Excessive concurrent streams — diminishing returns and increased
+   scheduling overhead. Keep the number of concurrent streams small
+   (empirically, beyond ~8 concurrent streams benefits are marginal
+   on most workloads)
 
 ### 2.2 Stream-Ordered Memory Allocation
 
@@ -214,7 +214,7 @@ Flag these in code review — they serialize the GPU pipeline:
 |-----------|-----------|
 | `cudaMalloc()` | Device-wide |
 | `cudaFree()` | Device-wide |
-| `cudaMemset()` | Device-wide |
+| `cudaMemset()` (non-async) | Device-wide (use `cudaMemsetAsync` to avoid) |
 | `cudaMemcpy()` (non-async) | Blocking + sync |
 | Page-locked host memory allocation | Device-wide |
 | Any operation on the null/default stream | Serializes all streams |
@@ -349,9 +349,13 @@ constraint.
 | Softmax + matmul | 20-50% | Not applicable |
 
 **Register pressure from fusion**: Monitor with `--maxrregcount` in NVRTC
-or check via `cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)`. If fused
-kernel exceeds ~40 registers/thread on consumer GPUs (CC 8.6/8.9 with 48
-max warps/SM), occupancy drops below 50%.
+or check via `cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS)`. On consumer
+GPUs (CC 8.6/8.9, 65,536 regs/SM, 48 max warps), occupancy begins dropping
+below 100% at ~43 regs/thread (42 warps = 87.5%) and below 50% at ~85
+regs/thread (24 warps). On datacenter GPUs (CC 8.0, 64 max warps),
+occupancy drops below 50% at 64 regs/thread. Register allocations are
+rounded up to the nearest 256 per warp, so small increases can have
+outsized occupancy impact.
 
 ### 3.5 Launch Overhead Amortization
 
@@ -370,9 +374,9 @@ Can reach ~25 microseconds on older systems or WDDM (Windows).
 **Rule**: If kernel execution time < 10x launch overhead (~25-50 us), batch
 the work into fewer, larger launches.
 
-**NVIDIA guidance**: Ideal kernel execution times range from ~1 ms to ~200 ms.
-Below 1 ms, launch overhead becomes significant. Above 200 ms, latency
-hiding diminishes.
+**Empirical guideline**: Kernels shorter than ~1 ms are increasingly
+dominated by launch overhead. Extremely long kernels (>200 ms) may reduce
+opportunity for stream-level overlap and latency hiding.
 
 ---
 
@@ -785,6 +789,8 @@ vibeSpatial uses three-level demand-driven warmup:
 | `--split-compile=0` | Parallel optimization passes | Large kernels, use all CPU threads |
 | `--extra-device-vectorization` | Aggressive vectorization | Memory-bound kernels with regular access |
 | `--ftz=true` | Flush denormals to zero | fp32 kernels where denormals are noise |
+| `--prec-div=false` | Less precise division (faster) | Non-precision-critical fp32 kernels |
+| `--prec-sqrt=false` | Less precise square root (faster) | Non-precision-critical fp32 kernels |
 | `--Ofast-compile=mid` | Trade compile speed for runtime perf | Development iteration |
 
 ### 7.5 JIT Cost Amortization
@@ -919,18 +925,23 @@ ALL threads execute for 10,000 iterations (9,990 wasted per thread).
 - 255 regs/thread -> 256 threads/SM -> 12.5% occupancy
 
 **On CC 8.6/8.9** (RTX 3090/4090 with 1,536 max threads/SM):
-- 32 regs/thread -> 1,536 threads/SM -> 100% occupancy
-- 42 regs/thread -> 1,536 threads/SM -> 100% (register limit is not yet binding)
-- 64 regs/thread -> 1,024 threads/SM -> 66% occupancy
-- 128 regs/thread -> 512 threads/SM -> 33% occupancy
+- 32 regs/thread -> 1,024/warp (aligned) -> 64 warps, capped at 48 -> 100% occupancy
+- 43 regs/thread -> 1,536/warp (aligned) -> 42 warps -> 87.5% occupancy
+- 64 regs/thread -> 2,048/warp (aligned) -> 32 warps -> 66% occupancy
+- 85 regs/thread -> 2,816/warp (aligned) -> 23 warps -> ~48% occupancy
+- 128 regs/thread -> 4,096/warp (aligned) -> 16 warps -> 33% occupancy
+
+Note: register allocations are rounded up to the nearest 256 per warp.
+E.g., 42 regs x 32 threads = 1,344, rounded to 1,536 regs/warp.
 
 **Spilling**: When a kernel exceeds register limits, the compiler spills to
 local memory (actually global memory with L1 caching). Spills in hot loops
 cause dramatic slowdowns.
 
 **Detection**: Check with `cuFuncGetAttribute(CU_FUNC_ATTRIBUTE_NUM_REGS, func)`.
-Flag if > 64 registers per thread for compute-bound kernels, or > 40 for
-memory-bound kernels where occupancy matters more.
+Flag if > 64 registers per thread for compute-bound kernels on datacenter
+GPUs (50% occupancy threshold on CC 8.0), or > 43 for memory-bound kernels
+on consumer GPUs where occupancy starts dropping below 100% (CC 8.6/8.9).
 
 **Reducing register pressure**:
 - Break complex kernels into smaller device functions
@@ -967,6 +978,53 @@ if (lane_id == 0) atomicAdd(&global_count[bin], warp_sum);
 3. Block-level shared memory reduction -> single atomic per block
 4. CCCL `reduce` / `segmented_reduce` for known reduction patterns
 
+### 8.8 Wave Quantization
+
+**Severity: MEDIUM-HIGH** — increasingly significant on modern GPUs with 100+ SMs.
+
+One "wave" = the number of thread blocks that exactly fills the GPU. If a
+kernel launches even slightly more blocks than fit in one wave, the GPU must
+execute a second wave during which most SMs sit idle.
+
+On an RTX 4090 (128 SMs), a kernel launching 129 blocks runs a second wave
+with only 1 active block = ~50% GPU waste on the final wave. On H100 (132
+SMs), the problem is even worse.
+
+**Detection rules**:
+- Grid size is just barely over `SM_count * max_blocks_per_SM` -- results
+  in a nearly-empty final wave
+- Kernel execution time is short (< 1 ms) and launch overhead is a
+  significant fraction
+
+**Mitigation**: Use grid-stride loops and size the grid to exactly fill the
+GPU (`SM_count * blocks_per_SM`). Each block processes multiple data elements
+via the stride loop.
+
+### 8.9 Missing Vectorized Loads
+
+**Severity: MEDIUM** — 1.3-1.5x bandwidth improvement for memory-bound kernels.
+
+```c
+// BAD: scalar 32-bit loads (LDG.E)
+double val = input[idx];  // one 8-byte load per instruction
+
+// GOOD: 128-bit vectorized load (LDG.E.128) for bulk data movement
+double2 vals = reinterpret_cast<const double2*>(input)[idx];
+// or for fp32: float4 vals = reinterpret_cast<const float4*>(input)[idx];
+```
+
+**Requirements**:
+- Pointer must be aligned to the vector type size (cudaMalloc guarantees
+  256-byte alignment, so device pointers are always valid)
+- Data count must be handled: process remainder with scalar tail
+- Kernel must not already be register-limited (vectorized loads increase
+  register pressure)
+
+**Measured impact** (NVIDIA GTC 2024, H100, copy kernel):
+- `float`: 60.6% BW utilization
+- `float2`: 84.3% BW utilization
+- `float4`: 88.8% BW utilization (1.46x speedup over scalar)
+
 ---
 
 ## 9. Review Procedure
@@ -988,10 +1046,13 @@ When reviewing GPU code, check in this order (highest impact first):
 
 ### Pass 3: Kernel Efficiency (HIGH)
 - [ ] Block size via occupancy API, not hardcoded (Section 3.1)
+- [ ] `__launch_bounds__` on kernels with known max block size (Section 3.1)
 - [ ] Grid size sufficient to saturate GPU (Section 8.4)
+- [ ] No wave quantization waste (grid just over one wave) (Section 8.8)
 - [ ] No branch divergence in inner loops (Section 8.5)
 - [ ] Work-size binning for variable-complexity geometry (Section 5.3)
 - [ ] SoA layout for coordinate data (Section 4.1)
+- [ ] Vectorized loads for bandwidth-bound bulk data movement (Section 8.9)
 
 ### Pass 4: Precision Compliance (MEDIUM-HIGH)
 - [ ] `compute_t` typedef, not hardcoded `double` (Section 6.6)
@@ -1011,6 +1072,13 @@ When reviewing GPU code, check in this order (highest impact first):
 - [ ] No compilation in hot paths
 - [ ] `const __restrict__` on read-only pointer params (Section 4.4)
 
+### Pass 7: Handoff to Optimizer
+
+If any findings from Passes 1-6 involve code that needs rewriting (not
+just a flag to remove), invoke `/cuda-optimizer <file>` on each affected
+file. The optimizer produces concrete before/after rewrites for every
+finding. Do this automatically — do not ask the user whether to run it.
+
 ---
 
 ## 10. Quick Reference: Quantitative Thresholds
@@ -1020,10 +1088,10 @@ When reviewing GPU code, check in this order (highest impact first):
 | Kernel launch overhead | 3-5 us (modern PCIe 4/5) | If kernel < 25 us execution, consider batching |
 | Minimum threads per launch | 32 (1 warp) absolute minimum | Prefer 10,000+ for saturation |
 | Occupancy target | >= 50% for memory-bound kernels | Check with occupancy API |
-| Registers per thread (warning) | > 64 (datacenter), > 40 (consumer) | Profile; may need `--maxrregcount` |
+| Registers per thread (warning) | > 64 (datacenter = 50% occ), > 43 (consumer = <100% occ) | Profile; may need `--maxrregcount` or `__launch_bounds__` |
 | Shared memory bank conflict | Any N-way conflict in inner loop | Pad or swizzle |
 | fp64:fp32 penalty (consumer) | 64x slower | Use ADR-0002 precision dispatch |
-| RMM pool vs cudaMalloc | 1,000x faster | Always use pool |
+| Pool vs cudaMalloc | 1,000x faster | Always use pool |
 | L2 set-aside thrashing | > 10% perf drop if oversized | Tune hitRatio = set_aside / data_size |
 | Stream count (diminishing returns) | > 8 concurrent streams | Consolidate work |
 | Kahan summation overhead | 4 extra FLOPs per step | Negligible vs memory access |
@@ -1031,33 +1099,30 @@ When reviewing GPU code, check in this order (highest impact first):
 | CCCL cold-call JIT | 950-1,460 ms | Mandate `request_warmup()` |
 | NVRTC cold compilation | 20-400 ms per unit | Mandate `request_nvrtc_warmup()` |
 | Grid-stride loop grid size | SM_count * max_blocks_per_SM | Maximize SM utilization |
+| Wave quantization overhead | ~50% waste on partial final wave | Size grid to exactly fill GPU |
+| Vectorized loads speedup | 1.3-1.5x for memory-bound kernels | Use float4/double2/int4 for bulk I/O |
+| cudaMallocAsync release threshold | Default 0 = OS roundtrip on every sync | Set UINT64_MAX for exclusive GPU |
+| CCCL gpu_to_gpu determinism | 20-30% slower than run_to_run | Only when cross-GPU reproducibility needed |
 
 ---
 
-## Sources
+## 11. CCCL Reduction Determinism (CCCL 3.1+)
 
-This reference was compiled from the following sources:
+CCCL `DeviceReduce` supports three determinism levels. Relevant for spatial
+operations where reproducible results matter (overlay area, dissolve).
 
-- [CUDA C++ Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html)
-- [NVIDIA Ampere Tuning Guide](https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html)
-- [NVIDIA Hopper Tuning Guide](https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html)
-- [NVIDIA Ada Tuning Guide](https://docs.nvidia.com/cuda/ada-tuning-guide/index.html)
-- [CUDA Programming Guide: Cooperative Groups](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cooperative-groups.html)
-- [CUDA Programming Guide: L2 Cache Control](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/l2-cache-control.html)
-- [CUDA Programming Guide: Stream-Ordered Memory Allocator](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/stream-ordered-memory-allocation.html)
-- [RMM: Fast, Flexible Allocation for CUDA (NVIDIA Blog)](https://developer.nvidia.com/blog/fast-flexible-allocation-for-cuda-with-rapids-memory-manager/)
-- [Using CUDA Warp-Level Primitives (NVIDIA Blog)](https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/)
-- [CUDA Pro Tip: Occupancy API (NVIDIA Blog)](https://developer.nvidia.com/blog/cuda-pro-tip-occupancy-api-simplifies-launch-configuration/)
-- [CUDA Stream-Ordered Memory Allocator (NVIDIA Blog)](https://developer.nvidia.com/blog/using-cuda-stream-ordered-memory-allocator-part-1/)
-- [Using Shared Memory in CUDA (NVIDIA Blog)](https://developer.nvidia.com/blog/using-shared-memory-cuda-cc/)
-- [Faster Parallel Reductions on Kepler (NVIDIA Blog)](https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/)
-- [CUDA Kernel Fusion Strategies (Emergent Mind)](https://www.emergentmind.com/topics/cuda-kernel-fusion)
-- [NVRTC Documentation](https://docs.nvidia.com/cuda/nvrtc/index.html)
-- [CuPy Interoperability Guide](https://docs.cupy.dev/en/stable/user_guide/interoperability.html)
-- [CuPy Implicit Synchronization Detection (GitHub Issue #2808)](https://github.com/cupy/cupy/issues/2808)
-- [CUDA Implicit Synchronization (NVIDIA Forums)](https://forums.developer.nvidia.com/t/cuda-implicit-synchronization-behavior-and-conditions-in-detail/251729)
-- [Kernel Launch Overhead Discussion (NVIDIA Forums)](https://forums.developer.nvidia.com/t/launch-of-many-small-kernels-10x-slower-compared-to-one-kernel/350194)
-- [RMM GitHub Repository](https://github.com/rapidsai/rmm)
-- [NVIDIA Jitify (NVRTC simplification)](https://github.com/NVIDIA/jitify)
-- [Benchmarking Thread Divergence in CUDA (arXiv)](https://arxiv.org/pdf/1504.01650)
-- [Kahan Summation Algorithm (Wikipedia)](https://en.wikipedia.org/wiki/Kahan_summation_algorithm)
+| Level | Behavior | Performance | Guarantee |
+|-------|----------|-------------|-----------|
+| `not_guaranteed` | Atomic-based, single kernel | Fastest | None |
+| `run_to_run` (DEFAULT) | Fixed tree reduction | Good | Same GPU + config = bitwise identical |
+| `gpu_to_gpu` | RFA (Reproducible FP Accumulator) | 20-30% slower | Cross-GPU bitwise identical |
+
+**Review rules**:
+- vibeSpatial CCCL reductions use the default `run_to_run` level, which
+  provides same-GPU determinism automatically.
+- If a pipeline aggregates results across multiple GPUs (future multi-GPU
+  support), flag the need for `gpu_to_gpu` determinism.
+- The `gpu_to_gpu` level uses exponent binning (default 3 bins) and
+  provides tighter numerical error bounds than standard pairwise summation,
+  not just determinism.
+

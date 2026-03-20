@@ -16,8 +16,8 @@ The precision planning layer (`src/vibespatial/precision.py`) correctly
 computes a `PrecisionPlan` that selects fp32 or fp64 compute precision
 based on device profile and kernel class. But many CUDA kernel source
 strings are hardcoded to `double` and ignore the plan entirely. On
-consumer GPUs with 1:32 fp64:fp32 throughput, this means kernels run at
-~3% of potential throughput for no correctness benefit.
+consumer GPUs with 1:64 fp64:fp32 throughput (CC 8.6/8.9), this means
+kernels run at ~1.6% of potential throughput for no correctness benefit.
 
 ## Step 1: Read the Target Kernel and Classify It
 
