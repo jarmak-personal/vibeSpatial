@@ -42,6 +42,12 @@ from vibespatial.owned_geometry import (
     OwnedGeometryArray,
     from_shapely_geometries,
 )
+from vibespatial.provenance import (
+    ProvenanceTag,
+    attempt_provenance_rewrite,
+    make_buffer_tag,
+    record_rewrite_event,
+)
 from vibespatial.runtime import ExecutionMode
 from vibespatial.stroke_kernels import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
 
@@ -452,9 +458,11 @@ class GeometryArray(ExtensionArray):
     _dtype = GeometryDtype()
 
     def __init__(self, data, crs: Any | None = None):
+        _source_provenance: ProvenanceTag | None = None
         if isinstance(data, self.__class__):
             if not crs:
                 crs = data.crs
+            _source_provenance = data._provenance
             data = data._data
         elif hasattr(data, "_data") and hasattr(data, "dtype") and hasattr(data.dtype, "name") and data.dtype.name == "device_geometry":
             # Accept DeviceGeometryArray by extracting its Shapely cache
@@ -470,7 +478,7 @@ class GeometryArray(ExtensionArray):
             raise ValueError(
                 "'data' should be a 1-dimensional array of geometry objects."
             )
-        self._data = data
+        self._shapely_data = data
 
         self._crs = None
         self.crs = crs
@@ -478,6 +486,28 @@ class GeometryArray(ExtensionArray):
         self._owned: OwnedGeometryArray | None = None
         self._owned_flat_sindex = None
         self._owned_spatial_input_supported: bool | None = None
+        self._provenance: ProvenanceTag | None = _source_provenance
+
+    @classmethod
+    def from_owned(cls, owned: OwnedGeometryArray, crs=None) -> GeometryArray:
+        """Create a GeometryArray backed by an OwnedGeometryArray without materializing Shapely."""
+        obj = object.__new__(cls)
+        obj._shapely_data = None
+        obj._crs = None
+        obj.crs = crs
+        obj._sindex = None
+        obj._owned = owned
+        obj._owned_flat_sindex = None
+        obj._owned_spatial_input_supported = None
+        obj._provenance = None
+        return obj
+
+    @property
+    def _data(self) -> np.ndarray:
+        if self._shapely_data is None:
+            assert self._owned is not None
+            self._shapely_data = np.asarray(self._owned.to_shapely(), dtype=object)
+        return self._shapely_data
 
     @property
     def sindex(self) -> SpatialIndex:
@@ -640,19 +670,24 @@ class GeometryArray(ExtensionArray):
             geoms = shapely.from_wkb(state[0])
             self._crs = state[1]
             self._sindex = None  # pygeos.STRtree could not be pickled yet
-            self._data = geoms
+            self._shapely_data = geoms
             self.base = None
             self._owned = None
             self._owned_flat_sindex = None
             self._owned_spatial_input_supported = None
+            self._provenance = None
         else:
             if "data" in state:
-                state["_data"] = state.pop("data")
+                state["_shapely_data"] = state.pop("data")
+            if "_data" in state:
+                state["_shapely_data"] = state.pop("_data")
+            state.setdefault("_shapely_data", None)
             if "_crs" not in state:
                 state["_crs"] = None
             state.setdefault("_owned", None)
             state.setdefault("_owned_flat_sindex", None)
             state.setdefault("_owned_spatial_input_supported", None)
+            state.setdefault("_provenance", None)
             self.__dict__.update(state)
 
     def to_owned(self) -> OwnedGeometryArray:
@@ -957,9 +992,10 @@ class GeometryArray(ExtensionArray):
         )
         return GeometryArray(
             evaluate_geopandas_make_valid(
-                self._data,
+                self._data if self._owned is None else None,
                 method=method,
                 keep_collapsed=keep_collapsed,
+                prebuilt_owned=self._owned,
             ),
             crs=self.crs,
         )
@@ -1002,6 +1038,12 @@ class GeometryArray(ExtensionArray):
 
     @staticmethod
     def _binary_method(op, left, right, **kwargs):
+        # Provenance rewrite check: see if the left operand's provenance
+        # enables a cheaper operation (e.g. buffer(r).intersects -> dwithin(r))
+        rewrite_result = attempt_provenance_rewrite(op, left, right, **kwargs)
+        if rewrite_result is not None:
+            return rewrite_result
+
         if isinstance(right, GeometryArray):
             if len(left) != len(right):
                 msg = (
@@ -1011,14 +1053,19 @@ class GeometryArray(ExtensionArray):
                 raise ValueError(msg)
             if not _check_crs(left, right):
                 _crs_mismatch_warn(left, right, stacklevel=7)
-            right = right._data
+            right_arg = right._owned if right._owned is not None else right._data
+        else:
+            right_arg = right
 
         if supports_binary_predicate(op):
-            result = evaluate_geopandas_binary_predicate(op, left._data, right, **kwargs)
+            left_arg = left._owned if left._owned is not None else left._data
+            result = evaluate_geopandas_binary_predicate(op, left_arg, right_arg, **kwargs)
             if result is not None:
                 return result
 
-        return getattr(shapely, op)(left._data, right, **kwargs)
+        # Shapely fallback needs Shapely arrays
+        right_shapely = right._data if isinstance(right, GeometryArray) else right_arg
+        return getattr(shapely, op)(left._data, right_shapely, **kwargs)
 
     def covers(self, other):
         return self._binary_method("covers", self, other)
@@ -1089,7 +1136,9 @@ class GeometryArray(ExtensionArray):
     #
 
     def clip_by_rect(self, xmin, ymin, xmax, ymax) -> GeometryArray:
-        owned, selected = evaluate_geopandas_clip_by_rect(self._data, xmin, ymin, xmax, ymax)
+        owned, selected = evaluate_geopandas_clip_by_rect(
+            self._data, xmin, ymin, xmax, ymax, prebuilt_owned=self._owned,
+        )
         if owned is None:
             record_dispatch_event(
                 surface="geopandas.array.clip_by_rect",
@@ -1210,6 +1259,44 @@ class GeometryArray(ExtensionArray):
         join_style = kwargs.get("join_style", "round")
         mitre_limit = float(kwargs.get("mitre_limit", 5.0))
         single_sided = bool(kwargs.get("single_sided", False))
+
+        # R5: buffer(0) is the identity operation
+        if isinstance(distance, int | float) and distance == 0:
+            record_rewrite_event(
+                rule_name="R5_buffer_zero_identity",
+                surface="geopandas.array.buffer",
+                original_operation="buffer",
+                rewritten_operation="identity",
+                reason="buffer(0) is the identity operation",
+                detail=f"rows={len(self)}",
+            )
+            result = GeometryArray(self._data.copy(), crs=self.crs)
+            if self._owned is not None:
+                result._owned = self._owned
+            return result
+
+        # R6: buffer(a).buffer(b) -> buffer(a+b) for point geometries
+        from vibespatial.provenance import _r6_preconditions_met
+
+        if (
+            self._provenance is not None
+            and self._provenance.operation == "buffer"
+            and isinstance(distance, int | float)
+            and _r6_preconditions_met(self._provenance, distance, cap_style, join_style)
+        ):
+            prev_distance = self._provenance.get_param("distance")
+            merged_distance = prev_distance + distance
+            source = self._provenance.source_array
+            record_rewrite_event(
+                rule_name="R6_buffer_chain_merge",
+                surface="geopandas.array.buffer",
+                original_operation="buffer",
+                rewritten_operation="buffer",
+                reason="buffer(a).buffer(b) merged to buffer(a+b)",
+                detail=f"a={prev_distance}, b={distance}, merged={merged_distance}",
+            )
+            return source.buffer(merged_distance, quad_segs=quad_segs, **kwargs)
+
         owned, selected = evaluate_geopandas_buffer(
             self._data,
             distance,
@@ -1218,6 +1305,7 @@ class GeometryArray(ExtensionArray):
             join_style=join_style,
             mitre_limit=mitre_limit,
             single_sided=single_sided,
+            prebuilt_owned=self._owned,
         )
         if owned is not None:
             record_dispatch_event(
@@ -1228,7 +1316,9 @@ class GeometryArray(ExtensionArray):
                 detail=f"rows={len(self)}, quad_segs={quad_segs}",
                 selected=selected,
             )
-            return GeometryArray(np.asarray(owned, dtype=object), crs=self.crs)
+            result = GeometryArray(np.asarray(owned, dtype=object), crs=self.crs)
+            result._provenance = make_buffer_tag(self, distance, cap_style, join_style, single_sided, quad_segs)
+            return result
         record_dispatch_event(
             surface="geopandas.array.buffer",
             operation="buffer",
@@ -1238,10 +1328,12 @@ class GeometryArray(ExtensionArray):
             selected=ExecutionMode.CPU,
         )
 
-        return GeometryArray(
+        result = GeometryArray(
             shapely.buffer(self._data, distance, quad_segs=quad_segs, **kwargs),
             crs=self.crs,
         )
+        result._provenance = make_buffer_tag(self, distance, cap_style, join_style, single_sided, quad_segs)
+        return result
 
     def interpolate(self, distance, normalized: bool = False) -> GeometryArray:
         self.check_geographic_crs(stacklevel=5)
@@ -1675,7 +1767,9 @@ class GeometryArray(ExtensionArray):
 
     @property
     def size(self):
-        return self._data.size
+        if self._shapely_data is not None:
+            return self._shapely_data.size
+        return self._owned.row_count
 
     @property
     def shape(self) -> tuple:
@@ -1687,7 +1781,9 @@ class GeometryArray(ExtensionArray):
 
     def copy(self, *args, **kwargs) -> GeometryArray:
         # still taking args/kwargs for compat with pandas 0.24
-        return GeometryArray(self._data.copy(), crs=self._crs)
+        result = GeometryArray(self._data.copy(), crs=self._crs)
+        result._provenance = self._provenance
+        return result
 
     def take(self, indices, allow_fill: bool = False, fill_value=None) -> GeometryArray:
         from pandas.api.extensions import take
