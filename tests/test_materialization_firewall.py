@@ -576,6 +576,7 @@ class TestSindexSjoinShortcut:
         sindex = dga_points.sindex
         assert sindex.is_empty is False
 
+    @pytest.mark.gpu
     def test_sindex_query_no_materialization(self, dga_points):
         """sindex.query() routes through owned dispatch without materializing."""
         from shapely.geometry import box as shapely_box
@@ -585,6 +586,7 @@ class TestSindexSjoinShortcut:
         assert 0 in result
         assert _has_no_materialization(dga_points)
 
+    @pytest.mark.gpu
     def test_sindex_query_with_geoseries_no_materialization(self):
         """sindex.query() with a GeoSeries query avoids materialization on both sides."""
         from shapely.geometry import box as shapely_box
@@ -656,6 +658,7 @@ class TestSindexSjoinShortcut:
         assert len(result) >= 1
         assert _has_no_materialization(query_dga)
 
+    @pytest.mark.gpu
     def test_sindex_query_dga_tree_shapely_query(self, dga_points):
         """Scalar Shapely query against DGA-backed sindex avoids tree materialization."""
         sindex = dga_points.sindex
