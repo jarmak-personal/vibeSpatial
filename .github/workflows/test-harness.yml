@@ -14,7 +14,7 @@ on:
         type: boolean
 
 jobs:
-  cpu-smoke:
+  cpu-tests:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -26,8 +26,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Sync dependencies
         run: uv sync --group dev
-      - name: Run smoke tests
-        run: uv run pytest tests/test_geopandas_shim.py tests/test_runtime_harness.py tests/test_intake_v2.py tests/upstream/geopandas/tests/test_config.py
+      - name: Lint
+        run: uv run ruff check
+      - name: Run tests (non-GPU)
+        run: uv run pytest -m "not gpu" --ignore=tests/upstream -q
 
   gpu-smoke:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu }}
