@@ -43,7 +43,7 @@ before owned geometry buffers and kernels expand.
 ## Open First
 
 - docs/architecture/nulls.md
-- src/vibespatial/nulls.py
+- src/vibespatial/runtime/nulls.py
 - docs/architecture/runtime.md
 - docs/decisions/0003-null-empty-geometry-contract.md
 

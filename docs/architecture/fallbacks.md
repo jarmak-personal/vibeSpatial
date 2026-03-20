@@ -36,9 +36,9 @@ DOC_HEADER:END -->
 
 - docs/architecture/fallbacks.md
 - docs/architecture/runtime.md
-- src/vibespatial/fallbacks.py
-- src/vibespatial/binary_predicates.py
-- src/vibespatial/spatial_query.py
+- src/vibespatial/runtime/fallbacks.py
+- src/vibespatial/predicates/binary.py
+- src/vibespatial/spatial/query.py
 
 ## Verify
 

@@ -42,9 +42,9 @@ geometry buffers while keeping GPU-native formats as the design center.
 ## Open First
 
 - docs/architecture/io-arrow.md
-- src/vibespatial/io_geoarrow.py
-- src/vibespatial/io_geoparquet.py
-- src/vibespatial/io_wkb.py
+- src/vibespatial/io/geoarrow.py
+- src/vibespatial/io/geoparquet.py
+- src/vibespatial/io/wkb.py
 
 ## Verify
 

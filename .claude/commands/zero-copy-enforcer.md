@@ -18,7 +18,7 @@ boundary type leaks that the static ZCOPY checks cannot fully detect.
 2. Run `git diff --cached` (or `git diff HEAD~1`) to get the full diff.
 3. Run `uv run python scripts/check_zero_copy.py --all` to get static analysis baseline.
 4. Run `uv run python scripts/check_architecture_lints.py --all` to check ARCH004 (D/H in non-materialization methods).
-5. Read `src/vibespatial/execution_trace.py` to understand runtime transfer detection.
+5. Read `src/vibespatial/runtime/execution_trace.py` to understand runtime transfer detection.
 6. Read `docs/architecture/runtime.md` for the device residency contract.
 
 ## Step 2: Analyze

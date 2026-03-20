@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.precision import KernelClass, PrecisionMode, normalize_precision_mode
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, normalize_precision_mode
 
 
 @register_kernel_variant(

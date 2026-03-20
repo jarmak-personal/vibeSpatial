@@ -4,11 +4,11 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from vibespatial.binary_predicates import BinaryPredicateResult, evaluate_binary_predicate
-from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.precision import KernelClass, PrecisionMode
-from vibespatial.residency import Residency
+from vibespatial.predicates.binary import BinaryPredicateResult, evaluate_binary_predicate
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.residency import Residency
 
 PredicateInput = Sequence[object | None] | np.ndarray | object
 

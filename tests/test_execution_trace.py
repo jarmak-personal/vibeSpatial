@@ -4,7 +4,8 @@ import warnings
 
 import pytest
 
-from vibespatial.execution_trace import (
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.execution_trace import (
     TRACE_WARNINGS_ENV_VAR,
     TraceStep,
     TraceTransfer,
@@ -14,7 +15,6 @@ from vibespatial.execution_trace import (
     notify_dispatch,
     notify_transfer,
 )
-from vibespatial.runtime import ExecutionMode
 
 
 def test_trace_context_manager_sets_and_clears_active_trace() -> None:

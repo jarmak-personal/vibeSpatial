@@ -31,3 +31,5 @@ benchmark_results/
 
 # Example data (large downloads)
 examples/data/
+
+cuda-learnings/

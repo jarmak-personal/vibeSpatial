@@ -38,7 +38,7 @@ DOC_HEADER:END -->
 ## Open First
 
 - docs/architecture/spatial-joins.md
-- src/vibespatial/spatial_query.py
+- src/vibespatial/spatial/query.py
 - src/vibespatial/api/sindex.py
 - src/vibespatial/api/tools/sjoin.py
 - docs/architecture/binary-predicates.md

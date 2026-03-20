@@ -4,25 +4,25 @@ import math
 
 import numpy as np
 
-from vibespatial.adaptive_runtime import plan_kernel_dispatch
-from vibespatial.cuda_runtime import (
+from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     get_cuda_runtime,
     make_kernel_cache_key,
 )
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.owned_geometry import (
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     TAG_FAMILIES,
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
 )
-from vibespatial.precision import KernelClass, PrecisionMode, normalize_precision_mode
-from vibespatial.residency import Residency, TransferTrigger
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime.adaptive import plan_kernel_dispatch
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, normalize_precision_mode
+from vibespatial.runtime.residency import Residency, TransferTrigger
 
 _BOUNDS_KERNEL_SOURCE_TEMPLATE = """
 typedef {compute_type} compute_t;
@@ -689,7 +689,7 @@ _BOUNDS_COOPERATIVE_KERNEL_NAMES = (
     "bounds_multipolygon_cooperative",
 )
 
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("geometry-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),

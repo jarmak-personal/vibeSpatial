@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from vibespatial.cccl_cubin_cache import (
+from vibespatial.cuda.cccl_cubin_cache import (
     CacheEntry,
     CcclBinarySearchBuild,
     CcclReduceBuild,
@@ -193,10 +193,10 @@ class TestCacheEntry:
 
 class TestDiskIO:
     def test_write_and_read_roundtrip(self, tmp_path: Path):
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
-             patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"), \
-             patch("vibespatial.cccl_cubin_cache._disk_cache_writes_disabled", False):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
+             patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"), \
+             patch("vibespatial.cuda.cccl_cubin_cache._disk_cache_writes_disabled", False):
             entry = CacheEntry(
                 spec_name="exclusive_scan_i32",
                 family="exclusive_scan",
@@ -214,19 +214,19 @@ class TestDiskIO:
             assert loaded.cubin_bytes == entry.cubin_bytes
 
     def test_read_nonexistent_returns_none(self, tmp_path: Path):
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path):
             assert _read_cache_entry("no_such_spec") is None
 
     def test_clear_cache(self, tmp_path: Path):
         (tmp_path / "test.cache").write_bytes(b"data")
         (tmp_path / "test2.cache").write_bytes(b"data2")
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path):
             count = clear_cache()
         assert count == 2
 
     def test_cache_stats(self, tmp_path: Path):
         (tmp_path / "a.cache").write_bytes(b"x" * 100)
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path):
             stats = cache_stats()
         assert stats["file_count"] == 1
         assert stats["total_bytes"] == 100
@@ -239,8 +239,8 @@ class TestDiskIO:
 
 class TestCacheKey:
     def test_includes_all_components(self):
-        with patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+        with patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
             key = _cache_key("reduce_sum_f64", b"\x7fELF" + b"\x00" * 100)
             assert "v1" in key
             assert "sm89" in key
@@ -248,18 +248,18 @@ class TestCacheKey:
             assert "reduce_sum_f64" in key
 
     def test_different_cubin_different_key(self):
-        with patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+        with patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
             k1 = _cache_key("scan", b"cubin_a")
             k2 = _cache_key("scan", b"cubin_b")
             assert k1 != k2
 
     def test_different_cc_different_key(self):
         cubin = b"same_cubin"
-        with patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
-            with patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 0)):
+        with patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+            with patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 0)):
                 k1 = _cache_key("scan", cubin)
-            with patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(9, 0)):
+            with patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(9, 0)):
                 k2 = _cache_key("scan", cubin)
         assert k1 != k2
 
@@ -271,7 +271,7 @@ class TestCacheKey:
 
 class TestFamilyRegistry:
     def test_all_expected_families_present(self):
-        from vibespatial.cccl_cubin_cache import _FAMILY_STRUCTS
+        from vibespatial.cuda.cccl_cubin_cache import _FAMILY_STRUCTS
         expected = {
             "exclusive_scan", "reduce_into", "segmented_reduce",
             "radix_sort", "merge_sort", "unique_by_key",
@@ -280,7 +280,7 @@ class TestFamilyRegistry:
         assert expected.issubset(set(_FAMILY_STRUCTS.keys()))
 
     def test_each_family_has_kernel_fields(self):
-        from vibespatial.cccl_cubin_cache import _FAMILY_STRUCTS
+        from vibespatial.cuda.cccl_cubin_cache import _FAMILY_STRUCTS
         for name, (struct_type, kernel_fields) in _FAMILY_STRUCTS.items():
             assert len(kernel_fields) >= 1, f"{name} has no kernel fields"
 
@@ -292,33 +292,33 @@ class TestFamilyRegistry:
 
 class TestIsCached:
     def test_returns_true_for_cached_spec(self, tmp_path: Path):
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
-             patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
+             patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
             # Create a cache file matching the expected pattern
             fname = "v1-sm89-cccl0.5.1-exclusive_scan_i32-dd7dbbd47276.cache"
             (tmp_path / fname).write_bytes(b"data")
             assert is_cached("exclusive_scan_i32") is True
 
     def test_returns_false_for_missing_spec(self, tmp_path: Path):
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
-             patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
+             patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
             assert is_cached("nonexistent_spec") is False
 
     def test_returns_false_when_cache_disabled(self):
-        with patch("vibespatial.cccl_cubin_cache._cccl_cache_enabled", return_value=False):
+        with patch("vibespatial.cuda.cccl_cubin_cache._cccl_cache_enabled", return_value=False):
             assert is_cached("anything") is False
 
     def test_returns_false_when_cache_dir_missing(self, tmp_path: Path):
         missing = tmp_path / "does_not_exist"
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=missing):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=missing):
             assert is_cached("anything") is False
 
     def test_batch_probe_returns_all_cached_names(self, tmp_path: Path):
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
-             patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
+             patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
             (tmp_path / "v1-sm89-cccl0.5.1-exclusive_scan_i32-abcd12345678.cache").write_bytes(b"data")
             (tmp_path / "v1-sm89-cccl0.5.1-reduce_sum_f64-efgh56789012.cache").write_bytes(b"data")
             # Wrong CC — should not match
@@ -329,9 +329,9 @@ class TestIsCached:
             assert "select_i32" not in names  # wrong CC
 
     def test_ignores_non_cache_files(self, tmp_path: Path):
-        with patch("vibespatial.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
-             patch("vibespatial.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
-             patch("vibespatial.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
+        with patch("vibespatial.cuda.cccl_cubin_cache._get_cache_dir", return_value=tmp_path), \
+             patch("vibespatial.cuda.cccl_cubin_cache._compute_capability", return_value=(8, 9)), \
+             patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.5.1"):
             (tmp_path / "v1-sm89-cccl0.5.1-scan_i32-abcdef123456.cache").write_bytes(b"data")
             (tmp_path / "random_file.txt").write_bytes(b"noise")
             (tmp_path / "v1-sm89-cccl0.5.1-scan_i32-abcdef123456.cache.tmp.12345").write_bytes(b"tmp")

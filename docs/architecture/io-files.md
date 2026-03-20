@@ -41,7 +41,7 @@ keeping GPU-native formats primary and legacy formats explicit.
 ## Open First
 
 - docs/architecture/io-files.md
-- src/vibespatial/io_file.py
+- src/vibespatial/io/file.py
 - tests/test_io_file.py
 
 ## Verify

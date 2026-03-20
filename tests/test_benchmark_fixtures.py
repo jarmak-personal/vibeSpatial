@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from vibespatial.benchmark_fixtures import (
+from vibespatial.bench.fixture_profiles import profile_fixture_query
+from vibespatial.bench.fixtures import (
     BenchmarkFixtureSpec,
     build_fixture_frame,
     ensure_fixture,
     fixture_path,
 )
-from vibespatial.fixture_profiles import profile_fixture_query
 
 
 def test_fixture_path_uses_name_and_parquet_suffix(tmp_path: Path) -> None:

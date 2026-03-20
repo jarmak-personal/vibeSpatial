@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from vibespatial.cccl_precompile import request_warmup
-from vibespatial.cuda_runtime import get_cuda_runtime, make_kernel_cache_key
+from vibespatial.cuda._runtime import get_cuda_runtime, make_kernel_cache_key
+from vibespatial.cuda.cccl_precompile import request_warmup
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
@@ -1461,7 +1461,7 @@ _GRID_NEAREST_KERNEL_NAMES = (
     "grid_nearest_tie_scatter",
 )
 
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SPATIAL_QUERY_KERNEL_NAMES),

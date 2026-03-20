@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from vibespatial.cccl_precompile import (
+from vibespatial.cuda.cccl_precompile import (
     PRECOMPILE_ENV_VAR,
     SPEC_REGISTRY,
     CCCLPrecompiler,
@@ -14,7 +14,7 @@ from vibespatial.cccl_precompile import (
     precompile_status,
     request_warmup,
 )
-from vibespatial.nvrtc_precompile import NVRTCPrecompiler
+from vibespatial.cuda.nvrtc_precompile import NVRTCPrecompiler
 
 
 @pytest.fixture(autouse=True)
@@ -142,7 +142,7 @@ class TestCCCLDeferredDiskLoading:
         """Specs with disk cache entries are deferred, not submitted to thread pool."""
         precompiler = CCCLPrecompiler(max_workers=1)
         with patch(
-            "vibespatial.cccl_cubin_cache._cached_spec_name_set",
+            "vibespatial.cuda.cccl_cubin_cache._cached_spec_name_set",
             return_value=frozenset({"exclusive_scan_i32"}),
         ):
             precompiler.request(["exclusive_scan_i32", "select_i32"])
@@ -157,7 +157,7 @@ class TestCCCLDeferredDiskLoading:
         """Thread pool is not created when all specs are deferred."""
         precompiler = CCCLPrecompiler(max_workers=1)
         with patch(
-            "vibespatial.cccl_cubin_cache._cached_spec_name_set",
+            "vibespatial.cuda.cccl_cubin_cache._cached_spec_name_set",
             return_value=frozenset({"exclusive_scan_i32", "select_i32"}),
         ):
             precompiler.request(["exclusive_scan_i32", "select_i32"])
@@ -168,7 +168,7 @@ class TestCCCLDeferredDiskLoading:
         """Thread pool IS created when at least one spec is a cache miss."""
         precompiler = CCCLPrecompiler(max_workers=1)
         with patch(
-            "vibespatial.cccl_cubin_cache._cached_spec_name_set",
+            "vibespatial.cuda.cccl_cubin_cache._cached_spec_name_set",
             return_value=frozenset({"exclusive_scan_i32"}),
         ), patch.object(precompiler, "_compile_one", return_value=None):
             precompiler.request(["exclusive_scan_i32", "select_i32"])
@@ -178,7 +178,7 @@ class TestCCCLDeferredDiskLoading:
 
     def test_get_compiled_lazy_loads_deferred(self):
         """get_compiled() lazy-loads a deferred spec via _lazy_load_deferred."""
-        from vibespatial.cccl_precompile import PrecompiledPrimitive
+        from vibespatial.cuda.cccl_precompile import PrecompiledPrimitive
 
         precompiler = CCCLPrecompiler(max_workers=1)
         precompiler._deferred_disk.add("exclusive_scan_i32")
@@ -194,7 +194,7 @@ class TestCCCLDeferredDiskLoading:
 
     def test_get_compiled_returns_cache_first(self):
         """get_compiled() returns from _cache without touching _deferred_disk."""
-        from vibespatial.cccl_precompile import PrecompiledPrimitive
+        from vibespatial.cuda.cccl_precompile import PrecompiledPrimitive
 
         precompiler = CCCLPrecompiler(max_workers=1)
         mock_result = PrecompiledPrimitive(
@@ -216,7 +216,7 @@ class TestCCCLDeferredDiskLoading:
 
     def test_ensure_warm_loads_deferred_specs(self):
         """ensure_warm() loads all deferred specs."""
-        from vibespatial.cccl_precompile import PrecompiledPrimitive
+        from vibespatial.cuda.cccl_precompile import PrecompiledPrimitive
 
         precompiler = CCCLPrecompiler(max_workers=1)
         precompiler._deferred_disk.add("exclusive_scan_i32")

@@ -12,9 +12,9 @@ from shapely.geometry import (
 )
 
 import vibespatial.api as geopandas
-import vibespatial.io_arrow as io_arrow
+import vibespatial.io.arrow as io_arrow
 from vibespatial import has_gpu_runtime, has_pylibcudf_support, read_geoparquet_owned
-from vibespatial.residency import Residency
+from vibespatial.runtime.residency import Residency
 
 
 def _require_gpu_decode_runtime() -> None:
@@ -213,7 +213,7 @@ def test_read_geoparquet_owned_gpu_wkb_mixed_point_linestring_decode_matches_cpu
 
     assert gpu_owned.residency is Residency.DEVICE
     assert gpu_owned.device_state is not None
-    from vibespatial.geometry_buffers import GeometryFamily
+    from vibespatial.geometry.buffers import GeometryFamily
     assert set(gpu_owned.families) == {GeometryFamily.POINT, GeometryFamily.LINESTRING}
     for family in gpu_owned.families.values():
         assert family.host_materialized is False

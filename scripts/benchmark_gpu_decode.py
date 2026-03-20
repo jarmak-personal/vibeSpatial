@@ -9,16 +9,16 @@ from time import perf_counter
 import numpy as np
 
 import geopandas
-import vibespatial.io_arrow as io_arrow
+import vibespatial.io.arrow as io_arrow
 from vibespatial import has_gpu_runtime, has_pylibcudf_support
-from vibespatial.cccl_primitives import (
+from vibespatial.cuda._runtime import get_cuda_runtime
+from vibespatial.cuda.cccl_primitives import (
     CompactionStrategy,
     ScanStrategy,
     compact_indices,
     exclusive_sum,
     has_cccl_primitives,
 )
-from vibespatial.cuda_runtime import get_cuda_runtime
 from vibespatial.testing.synthetic import SyntheticSpec, generate_points
 
 

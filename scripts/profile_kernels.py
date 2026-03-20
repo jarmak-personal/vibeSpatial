@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from vibespatial.profile_rails import profile_join_kernel, profile_overlay_kernel
+from vibespatial.bench.profile_rails import profile_join_kernel, profile_overlay_kernel
 
 
 def main(argv: list[str] | None = None) -> int:

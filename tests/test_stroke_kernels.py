@@ -16,7 +16,7 @@ from vibespatial import (
 )
 from vibespatial.api import GeoSeries
 from vibespatial.api.testing import assert_geoseries_equal
-from vibespatial.fusion import IntermediateDisposition
+from vibespatial.runtime.fusion import IntermediateDisposition
 
 
 def test_stroke_plan_uses_prefix_sum_and_persistent_geometry_buffers() -> None:

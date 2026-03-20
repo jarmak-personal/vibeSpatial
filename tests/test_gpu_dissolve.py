@@ -9,7 +9,7 @@ from shapely.geometry import box
 import vibespatial.api as geopandas
 from vibespatial import DissolveUnionMethod, has_gpu_runtime
 from vibespatial.api.testing import assert_geodataframe_equal
-from vibespatial.dissolve_pipeline import (
+from vibespatial.overlay.dissolve import (
     evaluate_geopandas_dissolve,
     execute_grouped_box_union_gpu,
 )

@@ -17,7 +17,7 @@ def _is_geometry_like_dtype(dtype) -> bool:
     if isinstance(dtype, GeometryDtype):
         return True
     try:
-        from vibespatial.device_geometry_array import DeviceGeometryDtype
+        from vibespatial.geometry.device_array import DeviceGeometryDtype
 
         return isinstance(dtype, DeviceGeometryDtype)
     except ImportError:

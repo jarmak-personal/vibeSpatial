@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 import pytest
 
-from vibespatial.cccl_precompile import PRECOMPILE_ENV_VAR
-from vibespatial.nvrtc_precompile import (
+from vibespatial.cuda.cccl_precompile import PRECOMPILE_ENV_VAR
+from vibespatial.cuda.nvrtc_precompile import (
     NVRTCPrecompiler,
     request_nvrtc_warmup,
 )
@@ -36,7 +36,7 @@ class TestNVRTCPrecompilerNoGPU:
         precompiler = NVRTCPrecompiler(max_workers=1)
         with patch.object(precompiler, "_compile_one", return_value=None):
             with patch(
-                "vibespatial.cuda_runtime.make_kernel_cache_key",
+                "vibespatial.cuda._runtime.make_kernel_cache_key",
                 side_effect=lambda prefix, source: f"{prefix}-hash",
             ):
                 precompiler.request([
@@ -75,19 +75,19 @@ class TestNVRTCDeferredDiskLoading:
             "_module_cache": {},
         })()
         with patch(
-            "vibespatial.cuda_runtime.make_kernel_cache_key",
+            "vibespatial.cuda._runtime.make_kernel_cache_key",
             side_effect=lambda prefix, source: f"{prefix}-hash",
         ), patch(
-            "vibespatial.cuda_runtime._nvrtc_cached_key_set",
+            "vibespatial.cuda._runtime._nvrtc_cached_key_set",
             return_value=frozenset({"v2-sm89-nvrtc0.0-a-hash"}),
         ), patch(
-            "vibespatial.cuda_runtime._disk_cache_key",
+            "vibespatial.cuda._runtime._disk_cache_key",
             side_effect=lambda ck, cc, opts, ver: f"v2-sm89-nvrtc0.0-{ck}",
         ), patch(
-            "vibespatial.cuda_runtime._nvrtc_version",
+            "vibespatial.cuda._runtime._nvrtc_version",
             return_value=(0, 0),
         ), patch(
-            "vibespatial.cuda_runtime.get_cuda_runtime",
+            "vibespatial.cuda._runtime.get_cuda_runtime",
             return_value=mock_runtime,
         ):
             precompiler.request([("a", "source_a", ("k1",))])
@@ -103,19 +103,19 @@ class TestNVRTCDeferredDiskLoading:
             "_module_cache": {},
         })()
         with patch(
-            "vibespatial.cuda_runtime.make_kernel_cache_key",
+            "vibespatial.cuda._runtime.make_kernel_cache_key",
             side_effect=lambda prefix, source: f"{prefix}-hash",
         ), patch(
-            "vibespatial.cuda_runtime._nvrtc_cached_key_set",
+            "vibespatial.cuda._runtime._nvrtc_cached_key_set",
             return_value=frozenset({"v2-sm89-nvrtc0.0-a-hash", "v2-sm89-nvrtc0.0-b-hash"}),
         ), patch(
-            "vibespatial.cuda_runtime._disk_cache_key",
+            "vibespatial.cuda._runtime._disk_cache_key",
             side_effect=lambda ck, cc, opts, ver: f"v2-sm89-nvrtc0.0-{ck}",
         ), patch(
-            "vibespatial.cuda_runtime._nvrtc_version",
+            "vibespatial.cuda._runtime._nvrtc_version",
             return_value=(0, 0),
         ), patch(
-            "vibespatial.cuda_runtime.get_cuda_runtime",
+            "vibespatial.cuda._runtime.get_cuda_runtime",
             return_value=mock_runtime,
         ):
             precompiler.request([

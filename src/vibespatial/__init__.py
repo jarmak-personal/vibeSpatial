@@ -19,102 +19,52 @@ from vibespatial.api import (
 from vibespatial.api._config import options
 from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 
-from .adaptive_runtime import (
-    AdaptivePlan,
-    AdaptiveRuntime,
-    DeviceSnapshot,
-    MonitoringBackend,
-    MonitoringSample,
-    WorkloadProfile,
-    capture_device_snapshot,
-    get_cached_snapshot,
-    invalidate_snapshot_cache,
-    plan_adaptive_execution,
-    plan_dispatch_selection,
-    plan_kernel_dispatch,
-)
-from .binary_predicates import (
-    BinaryPredicateResult,
-    NullBehavior,
-    benchmark_binary_predicate,
-    evaluate_binary_predicate,
-    evaluate_geopandas_binary_predicate,
-    supports_binary_predicate,
-)
-from .cccl_precompile import (
-    PRECOMPILE_ENV_VAR,
-    precompile_enabled,
-    precompile_status,
-)
-from .clip_rect import (
+from .constructive.clip_rect import (
     RectClipBenchmark,
     RectClipResult,
     benchmark_clip_by_rect,
     clip_by_rect_owned,
     evaluate_geopandas_clip_by_rect,
 )
-from .crossover import (
-    DEFAULT_CROSSOVER_POLICIES,
-    CrossoverPolicy,
-    DispatchDecision,
-    default_crossover_policy,
-    select_dispatch_for_rows,
+from .constructive.make_valid_gpu import (
+    GPURepairResult,
+    gpu_repair_invalid_polygons,
 )
-from .determinism import (
-    DETERMINISM_ENV_VAR,
-    DeterminismMode,
-    DeterminismPlan,
-    ReproducibilityGuarantee,
-    determinism_mode_from_env,
-    deterministic_mode_enabled,
-    normalize_determinism_mode,
-    select_determinism_plan,
+from .constructive.make_valid_pipeline import (
+    MakeValidBenchmark,
+    MakeValidPlan,
+    MakeValidPrimitive,
+    MakeValidResult,
+    MakeValidStage,
+    benchmark_make_valid,
+    evaluate_geopandas_make_valid,
+    fusion_plan_for_make_valid,
+    make_valid_owned,
+    plan_make_valid_pipeline,
 )
-from .dispatch import (
-    DispatchEvent,
-    clear_dispatch_events,
-    get_dispatch_events,
-    record_dispatch_event,
+from .constructive.stroke import (
+    BufferKernelResult,
+    OffsetCurveKernelResult,
+    StrokeBenchmark,
+    StrokeKernelPlan,
+    StrokeKernelStage,
+    StrokeOperation,
+    StrokePrimitive,
+    benchmark_offset_curve,
+    benchmark_point_buffer,
+    evaluate_geopandas_buffer,
+    evaluate_geopandas_offset_curve,
+    fusion_plan_for_stroke,
+    offset_curve_owned,
+    plan_stroke_kernel,
+    point_buffer_owned,
 )
-from .dissolve_pipeline import (
-    DissolveBenchmark,
-    DissolvePipelinePlan,
-    DissolvePrimitive,
-    DissolveStage,
-    DissolveUnionMethod,
-    GroupedUnionResult,
-    benchmark_dissolve_pipeline,
-    evaluate_geopandas_dissolve,
-    fusion_plan_for_dissolve,
-    plan_dissolve_pipeline,
-    union_all_owned,
+from .cuda.cccl_precompile import (
+    PRECOMPILE_ENV_VAR,
+    precompile_enabled,
+    precompile_status,
 )
-from .execution_trace import (
-    TRACE_WARNINGS_ENV_VAR,
-    ExecutionTraceContext,
-    VibeTraceWarning,
-    execution_trace,
-    get_active_trace,
-)
-from .fallbacks import (
-    STRICT_NATIVE_ENV_VAR,
-    FallbackEvent,
-    StrictNativeFallbackError,
-    clear_fallback_events,
-    get_fallback_events,
-    record_fallback_event,
-    strict_native_mode_enabled,
-)
-from .fusion import (
-    FusionPlan,
-    FusionStage,
-    IntermediateDisposition,
-    PipelineStep,
-    StepKind,
-    default_fusible_sequences,
-    plan_fusion,
-)
-from .geometry_buffers import (
+from .geometry.buffers import (
     GEOMETRY_BUFFER_SCHEMAS,
     BufferKind,
     BufferSpec,
@@ -122,29 +72,19 @@ from .geometry_buffers import (
     GeometryFamily,
     get_geometry_buffer_schema,
 )
-from .geoparquet_planner import (
-    GeoParquetMetadataSummary,
-    GeoParquetPlannerBenchmark,
-    GeoParquetPruneResult,
-    benchmark_geoparquet_planner,
-    build_geoparquet_metadata_summary,
-    select_row_groups,
+from .geometry.owned import (
+    BufferSharingMode,
+    DiagnosticEvent,
+    DiagnosticKind,
+    FamilyGeometryBuffer,
+    GeoArrowBufferView,
+    MixedGeoArrowView,
+    OwnedGeometryArray,
+    from_geoarrow,
+    from_shapely_geometries,
+    from_wkb,
 )
-from .indexing import (
-    BoundsPairBenchmark,
-    CandidatePairs,
-    FlatSpatialIndex,
-    SegmentCandidatePairs,
-    SegmentFilterBenchmark,
-    SegmentMBRTable,
-    benchmark_bounds_pairs,
-    benchmark_segment_filter,
-    build_flat_spatial_index,
-    extract_segment_mbrs,
-    generate_bounds_pairs,
-    generate_segment_mbr_pairs,
-)
-from .io_arrow import (
+from .io.arrow import (
     GeoArrowBridgeBenchmark,
     GeoArrowCodecPlan,
     GeoParquetChunkPlan,
@@ -179,7 +119,7 @@ from .io_arrow import (
     read_geoparquet_owned,
     write_geoparquet,
 )
-from .io_file import (
+from .io.file import (
     ShapefileIngestBenchmark,
     ShapefileIngestPlan,
     ShapefileOwnedBatch,
@@ -191,7 +131,7 @@ from .io_file import (
     read_vector_file,
     write_vector_file,
 )
-from .io_geojson import (
+from .io.geojson import (
     GeoJSONIngestBenchmark,
     GeoJSONIngestPlan,
     GeoJSONOwnedBatch,
@@ -199,7 +139,15 @@ from .io_geojson import (
     plan_geojson_ingest,
     read_geojson_owned,
 )
-from .io_support import (
+from .io.geoparquet_planner import (
+    GeoParquetMetadataSummary,
+    GeoParquetPlannerBenchmark,
+    GeoParquetPruneResult,
+    benchmark_geoparquet_planner,
+    build_geoparquet_metadata_summary,
+    select_row_groups,
+)
+from .io.support import (
     IO_SUPPORT_MATRIX,
     IOFormat,
     IOOperation,
@@ -215,33 +163,20 @@ from .kernels.core import (
     compute_total_bounds,
 )
 from .kernels.predicates import point_in_polygon, point_within_bounds
-from .make_valid_gpu import (
-    GPURepairResult,
-    gpu_repair_invalid_polygons,
+from .overlay.dissolve import (
+    DissolveBenchmark,
+    DissolvePipelinePlan,
+    DissolvePrimitive,
+    DissolveStage,
+    DissolveUnionMethod,
+    GroupedUnionResult,
+    benchmark_dissolve_pipeline,
+    evaluate_geopandas_dissolve,
+    fusion_plan_for_dissolve,
+    plan_dissolve_pipeline,
+    union_all_owned,
 )
-from .make_valid_pipeline import (
-    MakeValidBenchmark,
-    MakeValidPlan,
-    MakeValidPrimitive,
-    MakeValidResult,
-    MakeValidStage,
-    benchmark_make_valid,
-    evaluate_geopandas_make_valid,
-    fusion_plan_for_make_valid,
-    make_valid_owned,
-    plan_make_valid_pipeline,
-)
-from .nulls import (
-    NULL_BOUNDS,
-    GeometryPresence,
-    GeometrySemantics,
-    classify_geometry,
-    is_null_like,
-    measurement_result_for_geometry,
-    predicate_result_for_pair,
-    unary_result_for_missing_input,
-)
-from .overlay_gpu import (
+from .overlay.gpu import (
     AtomicEdgeDeviceState,
     AtomicEdgeTable,
     HalfEdgeGraph,
@@ -261,7 +196,7 @@ from .overlay_gpu import (
     overlay_union_owned,
     spatial_overlay_owned,
 )
-from .overlay_reconstruction import (
+from .overlay.reconstruction import (
     OverlayOperation,
     OverlayReconstructionPlan,
     ReconstructionPrimitive,
@@ -269,19 +204,96 @@ from .overlay_reconstruction import (
     fusion_plan_for_overlay,
     plan_overlay_reconstruction,
 )
-from .owned_geometry import (
-    BufferSharingMode,
-    DiagnosticEvent,
-    DiagnosticKind,
-    FamilyGeometryBuffer,
-    GeoArrowBufferView,
-    MixedGeoArrowView,
-    OwnedGeometryArray,
-    from_geoarrow,
-    from_shapely_geometries,
-    from_wkb,
+from .predicates.binary import (
+    BinaryPredicateResult,
+    NullBehavior,
+    benchmark_binary_predicate,
+    evaluate_binary_predicate,
+    evaluate_geopandas_binary_predicate,
+    supports_binary_predicate,
 )
-from .precision import (
+from .runtime import (
+    EXECUTION_MODE_ENV_VAR,
+    ExecutionMode,
+    RuntimeSelection,
+    get_requested_mode,
+    has_gpu_runtime,
+    select_runtime,
+    set_execution_mode,
+)
+from .runtime.adaptive import (
+    AdaptivePlan,
+    AdaptiveRuntime,
+    DeviceSnapshot,
+    MonitoringBackend,
+    MonitoringSample,
+    WorkloadProfile,
+    capture_device_snapshot,
+    get_cached_snapshot,
+    invalidate_snapshot_cache,
+    plan_adaptive_execution,
+    plan_dispatch_selection,
+    plan_kernel_dispatch,
+)
+from .runtime.crossover import (
+    DEFAULT_CROSSOVER_POLICIES,
+    CrossoverPolicy,
+    DispatchDecision,
+    default_crossover_policy,
+    select_dispatch_for_rows,
+)
+from .runtime.determinism import (
+    DETERMINISM_ENV_VAR,
+    DeterminismMode,
+    DeterminismPlan,
+    ReproducibilityGuarantee,
+    determinism_mode_from_env,
+    deterministic_mode_enabled,
+    normalize_determinism_mode,
+    select_determinism_plan,
+)
+from .runtime.dispatch import (
+    DispatchEvent,
+    clear_dispatch_events,
+    get_dispatch_events,
+    record_dispatch_event,
+)
+from .runtime.execution_trace import (
+    TRACE_WARNINGS_ENV_VAR,
+    ExecutionTraceContext,
+    VibeTraceWarning,
+    execution_trace,
+    get_active_trace,
+)
+from .runtime.fallbacks import (
+    STRICT_NATIVE_ENV_VAR,
+    FallbackEvent,
+    StrictNativeFallbackError,
+    clear_fallback_events,
+    get_fallback_events,
+    record_fallback_event,
+    strict_native_mode_enabled,
+)
+from .runtime.fusion import (
+    FusionPlan,
+    FusionStage,
+    IntermediateDisposition,
+    PipelineStep,
+    StepKind,
+    default_fusible_sequences,
+    plan_fusion,
+)
+from .runtime.nulls import (
+    NULL_BOUNDS,
+    GeometryPresence,
+    GeometrySemantics,
+    classify_geometry,
+    is_null_like,
+    measurement_result_for_geometry,
+    predicate_result_for_pair,
+    unary_result_for_missing_input,
+)
+from .runtime.precision import (
     DEFAULT_CONSUMER_PROFILE,
     DEFAULT_DATACENTER_PROFILE,
     CompensationMode,
@@ -294,24 +306,29 @@ from .precision import (
     normalize_precision_mode,
     select_precision_plan,
 )
-from .residency import Residency, ResidencyPlan, TransferTrigger, select_residency_plan
-from .robustness import (
+from .runtime.residency import Residency, ResidencyPlan, TransferTrigger, select_residency_plan
+from .runtime.robustness import (
     PredicateFallback,
     RobustnessGuarantee,
     RobustnessPlan,
     TopologyPolicy,
     select_robustness_plan,
 )
-from .runtime import (
-    EXECUTION_MODE_ENV_VAR,
-    ExecutionMode,
-    RuntimeSelection,
-    get_requested_mode,
-    has_gpu_runtime,
-    select_runtime,
-    set_execution_mode,
+from .spatial.indexing import (
+    BoundsPairBenchmark,
+    CandidatePairs,
+    FlatSpatialIndex,
+    SegmentCandidatePairs,
+    SegmentFilterBenchmark,
+    SegmentMBRTable,
+    benchmark_bounds_pairs,
+    benchmark_segment_filter,
+    build_flat_spatial_index,
+    extract_segment_mbrs,
+    generate_bounds_pairs,
+    generate_segment_mbr_pairs,
 )
-from .segment_primitives import (
+from .spatial.segment_primitives import (
     SegmentIntersectionBenchmark,
     SegmentIntersectionCandidates,
     SegmentIntersectionKind,
@@ -321,23 +338,6 @@ from .segment_primitives import (
     classify_segment_intersections,
     extract_segments,
     generate_segment_candidates,
-)
-from .stroke_kernels import (
-    BufferKernelResult,
-    OffsetCurveKernelResult,
-    StrokeBenchmark,
-    StrokeKernelPlan,
-    StrokeKernelStage,
-    StrokeOperation,
-    StrokePrimitive,
-    benchmark_offset_curve,
-    benchmark_point_buffer,
-    evaluate_geopandas_buffer,
-    evaluate_geopandas_offset_curve,
-    fusion_plan_for_stroke,
-    offset_curve_owned,
-    plan_stroke_kernel,
-    point_buffer_owned,
 )
 from .testing import SCALE_PRESETS, SyntheticDataset, SyntheticSpec
 

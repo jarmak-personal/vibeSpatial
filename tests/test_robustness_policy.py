@@ -12,7 +12,7 @@ from vibespatial import (
     TopologyPolicy,
     select_precision_plan,
 )
-from vibespatial.robustness import select_robustness_plan
+from vibespatial.runtime.robustness import select_robustness_plan
 
 
 def gpu_selection() -> RuntimeSelection:

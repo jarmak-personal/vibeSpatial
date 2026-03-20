@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from vibespatial.cccl_primitives import (
+from vibespatial.cuda.cccl_primitives import (
     CompactionStrategy,
     PairSortStrategy,
     ScanStrategy,

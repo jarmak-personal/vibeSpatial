@@ -38,7 +38,7 @@ stages.
 ## Open First
 
 - docs/architecture/make-valid.md
-- src/vibespatial/make_valid_pipeline.py
+- src/vibespatial/constructive/make_valid_pipeline.py
 - tests/test_make_valid_pipeline.py
 
 ## Verify

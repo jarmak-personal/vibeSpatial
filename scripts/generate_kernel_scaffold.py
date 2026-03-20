@@ -108,7 +108,7 @@ def render_kernel_source(spec: KernelSpec) -> str:
     return f"""from __future__ import annotations
 
 from vibespatial import ExecutionMode, KernelClass, PrecisionMode, normalize_precision_mode
-from vibespatial.kernel_registry import register_kernel_variant
+from vibespatial.runtime.kernel_registry import register_kernel_variant
 
 
 @register_kernel_variant(

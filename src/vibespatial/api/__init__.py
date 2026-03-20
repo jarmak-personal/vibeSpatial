@@ -4,9 +4,9 @@ from vibespatial.api.geoseries import GeoSeries
 from vibespatial.api.geodataframe import GeoDataFrame
 from vibespatial.api.geometry_array import points_from_xy
 
-from vibespatial.io_file import read_vector_file as read_file
+from vibespatial.io.file import read_vector_file as read_file
 from vibespatial.api.io.file import _list_layers as list_layers
-from vibespatial.io_arrow import read_geoparquet as read_parquet
+from vibespatial.io.arrow import read_geoparquet as read_parquet
 from vibespatial.api.io.arrow import _read_feather as read_feather
 from vibespatial.api.io.sql import _read_postgis as read_postgis
 from vibespatial.api.tools import sjoin, sjoin_nearest
@@ -36,13 +36,13 @@ from vibespatial.runtime import (
     select_runtime,
     set_execution_mode,
 )
-from vibespatial.dispatch import (
+from vibespatial.runtime.dispatch import (
     DispatchEvent,
     clear_dispatch_events,
     get_dispatch_events,
     record_dispatch_event,
 )
-from vibespatial.fallbacks import (
+from vibespatial.runtime.fallbacks import (
     FallbackEvent,
     clear_fallback_events,
     get_fallback_events,

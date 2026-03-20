@@ -5,29 +5,29 @@ from time import perf_counter
 
 import numpy as np
 
-from vibespatial.cccl_precompile import request_warmup
-from vibespatial.cccl_primitives import compact_indices
+from vibespatial.cuda.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_primitives import compact_indices
 
 request_warmup(["select_i32", "select_i64"])
-from vibespatial.cuda_runtime import (  # noqa: E402
+from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     get_cuda_runtime,
     make_kernel_cache_key,
 )
-from vibespatial.geometry_buffers import GeometryFamily  # noqa: E402
-from vibespatial.kernel_registry import register_kernel_variant  # noqa: E402
+from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
+from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import _launch_family_bounds_kernel  # noqa: E402
-from vibespatial.owned_geometry import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
-from vibespatial.precision import KernelClass, PrecisionMode  # noqa: E402
-from vibespatial.predicate_support import (  # noqa: E402
+from vibespatial.predicates.support import (  # noqa: E402
     PointSequence,
     coerce_geometry_array,
     resolve_predicate_context,
 )
-from vibespatial.residency import Residency, TransferTrigger  # noqa: E402
 from vibespatial.runtime import ExecutionMode  # noqa: E402
+from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
+from vibespatial.runtime.precision import KernelClass, PrecisionMode  # noqa: E402
+from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
 from .point_within_bounds import (  # noqa: E402
     NormalizedBoundsInput,
@@ -1330,7 +1330,7 @@ def _format_pip_kernel_source(compute_type: str = "double") -> str:
 
 _POINT_IN_POLYGON_KERNEL_SOURCE = _format_pip_kernel_source("double")
 
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("point-in-polygon", _POINT_IN_POLYGON_KERNEL_SOURCE, _POINT_IN_POLYGON_KERNEL_NAMES),
@@ -1953,7 +1953,7 @@ def _evaluate_point_in_polygon_gpu(
     coarse[~points.validity | right.null_mask] = None
 
     # Determine compute precision from device profile.
-    from vibespatial.adaptive_runtime import get_cached_snapshot
+    from vibespatial.runtime.adaptive import get_cached_snapshot
     snapshot = get_cached_snapshot()
     use_fp32 = not snapshot.device_profile.favors_native_fp64
     compute_type = "float" if use_fp32 else "double"

@@ -18,7 +18,7 @@ import pytest
 import shapely
 from shapely.geometry import Polygon
 
-from vibespatial.make_valid_pipeline import (
+from vibespatial.constructive.make_valid_pipeline import (
     MakeValidResult,
     make_valid_owned,
 )
@@ -315,6 +315,6 @@ def test_result_metadata():
 
 def test_gpu_module_imports():
     """GPU repair module should import without errors."""
-    from vibespatial.make_valid_gpu import GPURepairResult, gpu_repair_invalid_polygons
+    from vibespatial.constructive.make_valid_gpu import GPURepairResult, gpu_repair_invalid_polygons
     assert GPURepairResult is not None
     assert gpu_repair_invalid_polygons is not None

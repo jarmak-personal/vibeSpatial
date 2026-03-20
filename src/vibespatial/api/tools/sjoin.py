@@ -7,9 +7,9 @@ import pandas as pd
 from vibespatial.api import GeoDataFrame
 from vibespatial.api._compat import PANDAS_GE_30
 from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
-from vibespatial.dispatch import record_dispatch_event
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime import ExecutionMode
-from vibespatial.spatial_query import build_owned_spatial_index, query_spatial_index, supports_owned_spatial_input
+from vibespatial.spatial.query import build_owned_spatial_index, query_spatial_index, supports_owned_spatial_input
 
 
 def sjoin(

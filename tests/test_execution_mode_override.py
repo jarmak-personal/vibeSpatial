@@ -83,8 +83,8 @@ class TestCpuModeBypassPrevention:
         """_try_gpu_read_file should return None when CPU mode is active."""
         set_execution_mode(ExecutionMode.CPU)
 
-        from vibespatial.io_file import _try_gpu_read_file, plan_vector_file_io
-        from vibespatial.io_support import IOOperation
+        from vibespatial.io.file import _try_gpu_read_file, plan_vector_file_io
+        from vibespatial.io.support import IOOperation
 
         # Use a dummy filename; the function should bail before touching the file.
         plan = plan_vector_file_io("dummy.geojson", operation=IOOperation.READ)
@@ -100,10 +100,10 @@ class TestCpuModeBypassPrevention:
 
         set_execution_mode(ExecutionMode.CPU)
 
-        from vibespatial.binary_predicates import (
+        from vibespatial.predicates.binary import (
             evaluate_geopandas_binary_predicate,
         )
-        from vibespatial.dispatch import clear_dispatch_events, get_dispatch_events
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 
         left = np.array([Point(0, 0), Point(1, 1)], dtype=object)
         right = np.array([Point(0, 0), Point(2, 2)], dtype=object)
@@ -121,12 +121,12 @@ class TestCpuModeBypassPrevention:
         """geoseries_from_owned should skip DeviceGeometryArray in CPU mode."""
         from shapely.geometry import Point
 
-        from vibespatial.device_geometry_array import DeviceGeometryArray
-        from vibespatial.owned_geometry import from_shapely_geometries
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.geometry.owned import from_shapely_geometries
 
         set_execution_mode(ExecutionMode.CPU)
 
-        from vibespatial.io_geoarrow import geoseries_from_owned
+        from vibespatial.io.geoarrow import geoseries_from_owned
 
         owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
         series = geoseries_from_owned(owned, name="geometry", crs="EPSG:4326")

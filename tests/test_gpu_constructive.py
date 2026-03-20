@@ -6,8 +6,8 @@ import shapely
 from shapely.geometry import Point, Polygon
 
 from vibespatial import ExecutionMode, clip_by_rect_owned, from_shapely_geometries, has_gpu_runtime
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.point_constructive import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.geometry.buffers import GeometryFamily
 
 
 def _assert_geometries_equal(actual: list[object | None], expected: list[object | None]) -> None:

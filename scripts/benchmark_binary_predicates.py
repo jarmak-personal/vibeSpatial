@@ -47,7 +47,7 @@ def main() -> int:
     refined_elapsed = perf_counter() - started
 
     # Owned-input path: measures GPU DE-9IM without Shapely conversion overhead.
-    from vibespatial.owned_geometry import from_shapely_geometries
+    from vibespatial.geometry.owned import from_shapely_geometries
 
     left_owned = from_shapely_geometries(left.tolist())
     right_owned = from_shapely_geometries(right.tolist())

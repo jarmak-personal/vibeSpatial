@@ -195,7 +195,7 @@ per-feature loop for this workload shape (many small features).
 - POC: `examples/poc_gpu_geojson.py`
 - Property extraction POC: `examples/poc_property_extraction.py`
 - Geometry stripping POC: `examples/poc_strip_geometry.py`
-- Implementation: `src/vibespatial/io_geojson_gpu.py`
+- Implementation: `src/vibespatial/io/geojson_gpu.py`
 - Tests: `tests/test_geojson_gpu.py`
 - ADR-0002: Precision policy (fp64 for I/O)
 - ADR-0033: Kernel tier classification

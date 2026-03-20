@@ -46,7 +46,7 @@ before exact-kernel work begins.
 ## Open First
 
 - docs/architecture/robustness.md
-- src/vibespatial/robustness.py
+- src/vibespatial/runtime/robustness.py
 - docs/architecture/precision.md
 - docs/architecture/nulls.md
 - docs/decisions/0004-robustness-strategy.md

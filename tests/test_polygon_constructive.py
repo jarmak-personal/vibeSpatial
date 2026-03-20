@@ -5,15 +5,15 @@ import pytest
 import shapely
 from shapely.geometry import Polygon
 
-from vibespatial.owned_geometry import from_shapely_geometries
-from vibespatial.polygon_constructive import (
+from vibespatial.constructive.polygon import (
     _polygon_centroids_cpu,
     _polygon_centroids_gpu,
     polygon_buffer_owned_array,
     polygon_centroids_owned,
 )
-from vibespatial.residency import Residency
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 
 
 def _buffer_matches_shapely(gpu_geom, shapely_geom, *, tol: float = 5e-4) -> bool:
@@ -164,7 +164,7 @@ def test_polygon_buffer_gpu_device_resident() -> None:
 
     assert gpu.residency is Residency.DEVICE
     assert gpu.device_state is not None
-    from vibespatial.geometry_buffers import GeometryFamily
+    from vibespatial.geometry.buffers import GeometryFamily
     assert gpu.families[GeometryFamily.POLYGON].host_materialized is False
 
     # Materialization on to_shapely

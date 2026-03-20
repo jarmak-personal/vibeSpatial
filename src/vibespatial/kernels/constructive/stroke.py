@@ -4,16 +4,16 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.precision import KernelClass
-from vibespatial.residency import Residency
-from vibespatial.runtime import ExecutionMode
-from vibespatial.stroke_kernels import (
+from vibespatial.constructive.stroke import (
     BufferKernelResult,
     OffsetCurveKernelResult,
     offset_curve_owned,
     point_buffer_owned,
 )
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import Residency
 
 StrokeInput = Sequence[object | None] | np.ndarray | object
 
@@ -52,8 +52,8 @@ def point_buffer_kernel_gpu(
     *,
     quad_segs: int = 16,
 ) -> BufferKernelResult:
-    from vibespatial.owned_geometry import from_shapely_geometries
-    from vibespatial.point_constructive import point_buffer_owned_array
+    from vibespatial.constructive.point import point_buffer_owned_array
+    from vibespatial.geometry.owned import from_shapely_geometries
 
     geometries = np.asarray(values, dtype=object)
     owned = from_shapely_geometries(list(geometries))

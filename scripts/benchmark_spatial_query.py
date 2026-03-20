@@ -8,7 +8,7 @@ import numpy as np
 from shapely.affinity import translate
 
 import geopandas
-from vibespatial.spatial_query import (
+from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
     query_spatial_index,

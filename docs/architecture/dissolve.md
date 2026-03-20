@@ -39,7 +39,7 @@ iteration.
 ## Open First
 
 - docs/architecture/dissolve.md
-- src/vibespatial/dissolve_pipeline.py
+- src/vibespatial/overlay/dissolve.py
 - tests/test_dissolve_pipeline.py
 - tests/test_gpu_dissolve.py
 

@@ -12,11 +12,11 @@ from shapely.geometry import LineString, MultiPoint, Point, Polygon
 
 import vibespatial.api as geopandas
 from vibespatial.api import GeoDataFrame, GeoSeries
-from vibespatial.device_geometry_array import (
+from vibespatial.geometry.device_array import (
     DeviceGeometryArray,
     DeviceGeometryDtype,
 )
-from vibespatial.owned_geometry import (
+from vibespatial.geometry.owned import (
     DiagnosticKind,
     OwnedGeometryArray,
     from_shapely_geometries,

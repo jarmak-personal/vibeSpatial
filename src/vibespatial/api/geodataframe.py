@@ -15,8 +15,8 @@ from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 
 import vibespatial.api as geopandas
-from vibespatial.dispatch import record_dispatch_event
-from vibespatial.dissolve_pipeline import evaluate_geopandas_dissolve
+from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve
 from vibespatial.runtime import ExecutionMode
 from vibespatial.api.geometry_array import GeometryArray, GeometryDtype, from_shapely, to_wkb, to_wkt
 from vibespatial.api.geo_base import GeoPandasBase, _is_geometry_like_dtype, is_geometry_type
@@ -976,7 +976,7 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         1    POLYGON ((0 0, 1 1, 0 1, 0 0))    2      b
         2      LINESTRING (0 0, -1 1, 0 -1)    3      c
         """
-        from vibespatial.io_arrow import geodataframe_from_arrow
+        from vibespatial.io.arrow import geodataframe_from_arrow
 
         return geodataframe_from_arrow(
             table,
@@ -1407,7 +1407,7 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
 01010000000000000000000040000000000000F03F]]
 
         """
-        from vibespatial.io_arrow import geodataframe_to_arrow
+        from vibespatial.io.arrow import geodataframe_to_arrow
 
         return geodataframe_to_arrow(
             self,
@@ -1489,7 +1489,7 @@ default 'snappy'
                 f"to_parquet: {engine!r} passed instead."
             )
 
-        from vibespatial.io_arrow import write_geoparquet
+        from vibespatial.io.arrow import write_geoparquet
 
         write_geoparquet(
             self,
@@ -1657,7 +1657,7 @@ default 'snappy'
         ... )  # doctest: +SKIP
 
         """
-        from vibespatial.io_file import write_vector_file
+        from vibespatial.io.file import write_vector_file
 
         write_vector_file(self, filename, driver, schema, index, **kwargs)
 

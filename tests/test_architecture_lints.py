@@ -57,7 +57,7 @@ def test_kernel_host_transfer_rule_blocks_non_materialization_methods(tmp_path: 
     write_file(
         tmp_path / "src" / "vibespatial" / "kernels" / "distance.py",
         """
-from vibespatial.kernel_registry import register_kernel_variant
+from vibespatial.runtime.kernel_registry import register_kernel_variant
 
 
 @register_kernel_variant("point_distance", "cpu")
@@ -75,7 +75,7 @@ def test_materialization_methods_may_transfer_to_host(tmp_path: Path) -> None:
     write_file(
         tmp_path / "src" / "vibespatial" / "kernels" / "distance.py",
         """
-from vibespatial.kernel_registry import register_kernel_variant
+from vibespatial.runtime.kernel_registry import register_kernel_variant
 
 
 @register_kernel_variant("point_distance", "cpu")

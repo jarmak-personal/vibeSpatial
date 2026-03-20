@@ -6,8 +6,8 @@ import shapely
 from shapely.geometry import MultiPolygon, Polygon, box
 
 from vibespatial import has_gpu_runtime
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.owned_geometry import from_shapely_geometries
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import from_shapely_geometries
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 
@@ -17,7 +17,7 @@ def _make_owned(geoms):
 
 
 def _compute_de9im(query_owned, tree_owned, left_idx, right_idx, query_family, tree_family):
-    from vibespatial.polygon_predicates import compute_polygon_de9im_gpu
+    from vibespatial.predicates.polygon import compute_polygon_de9im_gpu
     return compute_polygon_de9im_gpu(
         query_owned, tree_owned,
         np.asarray(left_idx, dtype=np.int32),
@@ -28,7 +28,7 @@ def _compute_de9im(query_owned, tree_owned, left_idx, right_idx, query_family, t
 
 
 def _eval_predicate(masks, predicate):
-    from vibespatial.polygon_predicates import evaluate_predicate_from_de9im
+    from vibespatial.predicates.polygon import evaluate_predicate_from_de9im
     return evaluate_predicate_from_de9im(masks, predicate)
 
 

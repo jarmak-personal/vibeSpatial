@@ -657,7 +657,7 @@ class GeoSeries(GeoPandasBase, Series):
         2      LINESTRING (0 0, -1 1, 0 -1)
         dtype: geometry
         """
-        from vibespatial.io_arrow import geoseries_from_arrow
+        from vibespatial.io.arrow import geoseries_from_arrow
 
         return geoseries_from_arrow(arr, **kwargs)
 
@@ -1503,7 +1503,7 @@ e": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [3
         <POINT (2 1)>
 
         """
-        from vibespatial.io_arrow import geoseries_to_arrow
+        from vibespatial.io.arrow import geoseries_to_arrow
 
         return geoseries_to_arrow(
             self,

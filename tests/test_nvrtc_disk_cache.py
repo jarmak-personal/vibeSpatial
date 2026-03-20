@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from vibespatial.cuda_runtime import (
+from vibespatial.cuda._runtime import (
     _delete_cached_cubin,
     _disk_cache_key,
     _get_cache_dir,
@@ -132,7 +132,7 @@ def test_delete_nonexistent_is_noop(tmp_path, monkeypatch):
 
 def test_write_failure_does_not_crash(tmp_path, monkeypatch):
     """Write to a read-only dir degrades gracefully."""
-    import vibespatial.cuda_runtime as mod
+    import vibespatial.cuda._runtime as mod
 
     read_only = tmp_path / "readonly"
     read_only.mkdir()
@@ -179,7 +179,7 @@ def test_atomic_write_no_partial_files(tmp_path, monkeypatch):
 
 
 def test_cache_disabled_via_env_var(monkeypatch):
-    from vibespatial.cuda_runtime import _disk_cache_enabled
+    from vibespatial.cuda._runtime import _disk_cache_enabled
     _disk_cache_enabled.cache_clear()
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE", "0")
     try:
@@ -189,7 +189,7 @@ def test_cache_disabled_via_env_var(monkeypatch):
 
 
 def test_cache_enabled_by_default(monkeypatch):
-    from vibespatial.cuda_runtime import _disk_cache_enabled
+    from vibespatial.cuda._runtime import _disk_cache_enabled
     _disk_cache_enabled.cache_clear()
     monkeypatch.delenv("VIBESPATIAL_NVRTC_CACHE", raising=False)
     try:
@@ -238,7 +238,7 @@ def test_default_cache_dir(monkeypatch):
 @pytest.mark.gpu
 def test_compile_kernels_populates_disk_cache(tmp_path, monkeypatch):
     """First compile writes to disk cache; file exists after."""
-    from vibespatial.cuda_runtime import (
+    from vibespatial.cuda._runtime import (
         _disk_cache_enabled,
         compile_kernel_group,
     )
@@ -339,12 +339,12 @@ def test_nvrtc_cached_key_set(tmp_path, monkeypatch):
 def test_nvrtc_is_cached_true(tmp_path, monkeypatch):
     from unittest.mock import patch
 
-    from vibespatial.cuda_runtime import _nvrtc_version
+    from vibespatial.cuda._runtime import _nvrtc_version
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE_DIR", str(tmp_path))
     _get_cache_dir.cache_clear()
     _nvrtc_version.cache_clear()
     try:
-        with patch("vibespatial.cuda_runtime._nvrtc_version", return_value=(12, 6)):
+        with patch("vibespatial.cuda._runtime._nvrtc_version", return_value=(12, 6)):
             disk_key = _disk_cache_key("test-abc123", (8, 9), (), (12, 6))
             (tmp_path / f"{disk_key}.cubin").write_bytes(b"x" * 100)
             assert nvrtc_is_cached("test-abc123", (8, 9), ()) is True
@@ -363,7 +363,7 @@ def test_nvrtc_is_cached_false(tmp_path, monkeypatch):
 
 
 def test_nvrtc_is_cached_false_when_disabled(monkeypatch):
-    from vibespatial.cuda_runtime import _disk_cache_enabled
+    from vibespatial.cuda._runtime import _disk_cache_enabled
     _disk_cache_enabled.cache_clear()
     monkeypatch.setenv("VIBESPATIAL_NVRTC_CACHE", "0")
     try:

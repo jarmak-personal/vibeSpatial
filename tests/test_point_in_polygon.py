@@ -58,7 +58,7 @@ def test_point_in_polygon_supports_multipolygon_inputs(oracle_runner) -> None:
 
 @pytest.mark.cpu_fallback
 def test_point_in_polygon_auto_fallback_is_visible(monkeypatch) -> None:
-    import vibespatial.adaptive_runtime as adaptive_runtime
+    import vibespatial.runtime.adaptive as adaptive_runtime
 
     def fake_snapshot(**_kwargs):
         return DeviceSnapshot(

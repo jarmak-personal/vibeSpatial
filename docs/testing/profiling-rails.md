@@ -45,8 +45,8 @@ current join and overlay hot paths.
 
 - docs/testing/profiling-rails.md
 - scripts/profile_kernels.py
-- src/vibespatial/profiling.py
-- src/vibespatial/profile_rails.py
+- src/vibespatial/bench/profiling.py
+- src/vibespatial/bench/profile_rails.py
 
 ## Verify
 

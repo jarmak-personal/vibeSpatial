@@ -40,7 +40,7 @@ rectangle clipping.
 
 - docs/architecture/clip-fast-paths.md
 - docs/architecture/segment-primitives.md
-- src/vibespatial/clip_rect.py
+- src/vibespatial/constructive/clip_rect.py
 - tests/test_clip_rect.py
 
 ## Verify

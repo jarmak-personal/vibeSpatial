@@ -5,7 +5,7 @@ import math
 from shapely.geometry import LineString, Point, Polygon
 
 from vibespatial import GeometryPresence
-from vibespatial.nulls import (
+from vibespatial.runtime.nulls import (
     NULL_BOUNDS,
     classify_geometry,
     measurement_result_for_geometry,

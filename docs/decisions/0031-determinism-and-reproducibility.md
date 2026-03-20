@@ -77,7 +77,7 @@ Cross-device bitwise reproducibility is explicitly rejected as a contract.
 
 The decision adds:
 
-- `src/vibespatial/determinism.py`
+- `src/vibespatial/runtime/determinism.py`
 - `docs/architecture/determinism.md`
 - `scripts/check_determinism.py`
 

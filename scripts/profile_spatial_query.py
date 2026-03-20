@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from vibespatial.profile_rails import profile_spatial_query_stack
+from vibespatial.bench.profile_rails import profile_spatial_query_stack
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -45,7 +45,7 @@ files to inspect when execution behavior changes.
 ## Open First
 
 - docs/architecture/runtime.md
-- src/vibespatial/runtime.py
+- src/vibespatial/runtime/_runtime.py
 - src/geopandas/__init__.py
 - src/vibespatial/api/__init__.py
 

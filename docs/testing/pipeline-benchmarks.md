@@ -49,7 +49,7 @@ timers.
 - docs/testing/pipeline-benchmarks.md
 - scripts/benchmark_pipelines.py
 - scripts/check_pipeline_regressions.py
-- src/vibespatial/pipeline_benchmarks.py
+- src/vibespatial/bench/pipeline.py
 - .github/workflows/pipeline-benchmarks.yml
 
 ## Verify

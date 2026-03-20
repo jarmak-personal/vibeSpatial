@@ -44,7 +44,7 @@ without pretending cross-device bitwise equality exists.
 ## Open First
 
 - docs/architecture/determinism.md
-- src/vibespatial/determinism.py
+- src/vibespatial/runtime/determinism.py
 - scripts/check_determinism.py
 - docs/architecture/runtime.md
 - docs/architecture/precision.md

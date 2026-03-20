@@ -232,7 +232,7 @@ This is a static declaration, not a runtime probe:
 
 ```python
 # spatial_query.py
-from vibespatial.cccl_primitives import (
+from vibespatial.cuda.cccl_primitives import (
     compact_indices,
     exclusive_sum,
     lower_bound,
@@ -240,7 +240,7 @@ from vibespatial.cccl_primitives import (
     sort_pairs,
     upper_bound,
 )
-from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_precompile import request_warmup
 
 # Declare the 12 specs this module actually uses.
 # request_warmup is a no-op if GPU is unavailable or specs
@@ -258,13 +258,13 @@ request_warmup([
 
 ```python
 # point_in_polygon.py --- only needs select
-from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_precompile import request_warmup
 request_warmup(["select_i32", "select_i64"])
 ```
 
 ```python
 # io_arrow.py --- only needs exclusive_scan
-from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_precompile import request_warmup
 request_warmup(["exclusive_scan_i32", "exclusive_scan_i64"])
 ```
 
@@ -535,7 +535,7 @@ units at module scope:
 
 ```python
 # spatial_query.py
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
 request_nvrtc_warmup([
     ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SQ_KERNEL_NAMES),
@@ -545,7 +545,7 @@ request_nvrtc_warmup([
 
 ```python
 # point_in_polygon.py
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
 request_nvrtc_warmup([
     ("pip", _POINT_IN_POLYGON_KERNEL_SOURCE, _PIP_KERNEL_NAMES),
@@ -703,7 +703,7 @@ dispatch events log whether a pre-compiled callable was used:
 >>> import geopandas as gpd
 >>> # At this point, dissolve_pipeline imported eagerly.
 >>> # Only 3 specs (sort variants) are warming in background.
->>> from vibespatial.cccl_precompile import CCCLPrecompiler
+>>> from vibespatial.cuda.cccl_precompile import CCCLPrecompiler
 >>> CCCLPrecompiler.get().status()
 {"submitted": 3, "compiled": 3, "pending": 0, "wall_ms": 1012.4, ...}
 

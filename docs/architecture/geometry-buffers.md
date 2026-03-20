@@ -47,8 +47,8 @@ adapter and kernel work begins.
 - docs/architecture/geometry-buffers.md
 - docs/architecture/mixed-geometries.md
 - docs/architecture/precision.md
-- src/vibespatial/geometry_buffers.py
-- src/vibespatial/owned_geometry.py
+- src/vibespatial/geometry/buffers.py
+- src/vibespatial/geometry/owned.py
 - src/vibespatial/kernels/core/geometry_analysis.py
 - docs/decisions/0008-owned-geometry-buffer-schema.md
 

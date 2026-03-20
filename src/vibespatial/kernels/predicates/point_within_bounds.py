@@ -5,12 +5,10 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.kernel_registry import register_kernel_variant
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-from vibespatial.owned_geometry import OwnedGeometryArray
-from vibespatial.precision import KernelClass, PrecisionMode
-from vibespatial.predicate_support import (
+from vibespatial.predicates.support import (
     PointSequence,
     coerce_geometry_array,
     extract_empty_rows,
@@ -18,6 +16,8 @@ from vibespatial.predicate_support import (
     resolve_predicate_context,
 )
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 BoundsValue = tuple[float, float, float, float] | list[float] | np.ndarray
 BoundsSequence = Sequence[BoundsValue | None]

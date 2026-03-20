@@ -11,8 +11,8 @@ from vibespatial import (
     plan_dissolve_pipeline,
 )
 from vibespatial.api.testing import assert_geodataframe_equal
-from vibespatial.dissolve_pipeline import evaluate_geopandas_dissolve, execute_grouped_union
-from vibespatial.fusion import IntermediateDisposition
+from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, execute_grouped_union
+from vibespatial.runtime.fusion import IntermediateDisposition
 
 
 def test_dissolve_pipeline_plan_uses_group_encoding_and_grouped_union() -> None:

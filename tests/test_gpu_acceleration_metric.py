@@ -8,10 +8,10 @@ from scripts.gpu_acceleration_coverage import (
     summarize_event_records,
 )
 from scripts.upstream_native_coverage import NativeCoverageReport
-from vibespatial.dispatch import record_dispatch_event
-from vibespatial.event_log import EVENT_LOG_ENV_VAR, read_event_records
-from vibespatial.fallbacks import record_fallback_event
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.event_log import EVENT_LOG_ENV_VAR, read_event_records
+from vibespatial.runtime.fallbacks import record_fallback_event
 
 
 def test_event_log_captures_dispatch_and_fallback_records(tmp_path: Path, monkeypatch) -> None:

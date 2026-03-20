@@ -15,8 +15,8 @@ from shapely.geometry import (
 )
 
 import vibespatial.api as geopandas
-import vibespatial.io_arrow as io_arrow
-import vibespatial.io_geoparquet as io_geoparquet
+import vibespatial.io.arrow as io_arrow
+import vibespatial.io.geoparquet as io_geoparquet
 from vibespatial import (
     BufferSharingMode,
     ExecutionMode,
@@ -40,10 +40,10 @@ from vibespatial import (
     select_row_groups,
     write_geoparquet,
 )
-from vibespatial.device_geometry_array import DeviceGeometryArray
-from vibespatial.owned_geometry import DiagnosticKind, from_shapely_geometries
-from vibespatial.point_constructive import clip_points_rect_owned
-from vibespatial.residency import Residency, TransferTrigger
+from vibespatial.constructive.point import clip_points_rect_owned
+from vibespatial.geometry.device_array import DeviceGeometryArray
+from vibespatial.geometry.owned import DiagnosticKind, from_shapely_geometries
+from vibespatial.runtime.residency import Residency, TransferTrigger
 
 
 def _diagnostic_totals(*values) -> tuple[int, int]:

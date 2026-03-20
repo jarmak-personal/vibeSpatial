@@ -9,7 +9,7 @@ import shapely
 from shapely.affinity import translate
 
 from vibespatial import ExecutionMode, clip_by_rect_owned, from_shapely_geometries
-from vibespatial.point_constructive import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
 from vibespatial.testing import SyntheticSpec, generate_points
 
 

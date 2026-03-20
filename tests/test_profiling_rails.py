@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from vibespatial.profile_rails import (
+from vibespatial.bench.profile_rails import (
     profile_join_kernel,
     profile_overlay_kernel,
     profile_spatial_query_stack,
 )
-from vibespatial.profiling import StageProfiler
+from vibespatial.bench.profiling import StageProfiler
 from vibespatial.runtime import ExecutionMode
 
 
@@ -38,7 +38,7 @@ class _FakeGpuSampler:
         )
 
     def sample(self):
-        from vibespatial.profiling import GpuTelemetrySample
+        from vibespatial.bench.profiling import GpuTelemetrySample
 
         sample = self._samples[min(self._index, len(self._samples) - 1)]
         self._index += 1

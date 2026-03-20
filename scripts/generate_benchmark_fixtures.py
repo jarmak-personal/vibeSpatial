@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from vibespatial.benchmark_fixtures import ensure_fixture, list_fixture_specs
+from vibespatial.bench.fixtures import ensure_fixture, list_fixture_specs
 
 
 def main(argv: list[str] | None = None) -> int:

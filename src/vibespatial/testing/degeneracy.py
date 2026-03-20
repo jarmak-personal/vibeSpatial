@@ -6,8 +6,8 @@ from typing import Any, Literal
 from shapely.geometry import LineString, Polygon, box
 
 import vibespatial.api as geopandas
-from vibespatial.owned_geometry import from_shapely_geometries
-from vibespatial.segment_primitives import classify_segment_intersections
+from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.spatial.segment_primitives import classify_segment_intersections
 
 ClipOutcome = Literal["nonempty", "empty", "error"]
 

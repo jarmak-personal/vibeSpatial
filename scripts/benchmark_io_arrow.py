@@ -15,7 +15,7 @@ from vibespatial import (
     benchmark_wkb_bridge,
     build_geoparquet_metadata_summary,
 )
-from vibespatial.io_benchmark_rails import benchmark_io_arrow_suite, io_suite_to_json
+from vibespatial.bench.io_benchmark_rails import benchmark_io_arrow_suite, io_suite_to_json
 
 
 def build_covering_summary(*, scale: int, selectivity: float, seed: int = 0):

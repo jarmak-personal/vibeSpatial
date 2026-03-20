@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from vibespatial.io_benchmark_rails import (
+from vibespatial.bench.io_benchmark_rails import (
     benchmark_io_arrow_suite,
     benchmark_io_file_suite,
     io_suite_to_json,

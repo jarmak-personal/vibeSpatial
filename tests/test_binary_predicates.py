@@ -15,7 +15,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
-from vibespatial.kernel_registry import get_kernel_variants
+from vibespatial.runtime.kernel_registry import get_kernel_variants
 
 
 @pytest.mark.parametrize(
@@ -60,7 +60,7 @@ def test_binary_predicate_uses_coarse_filter_before_exact_refine() -> None:
 
 @pytest.mark.cpu_fallback
 def test_binary_predicate_auto_fallback_is_visible(monkeypatch) -> None:
-    import vibespatial.adaptive_runtime as adaptive_runtime
+    import vibespatial.runtime.adaptive as adaptive_runtime
 
     def fake_snapshot(**_kwargs):
         return DeviceSnapshot(
@@ -100,7 +100,7 @@ def test_binary_predicate_explicit_gpu_matches_cpu_for_supported_point_region_ca
 
 
 def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_pairs(monkeypatch) -> None:
-    import vibespatial.adaptive_runtime as adaptive_runtime
+    import vibespatial.runtime.adaptive as adaptive_runtime
     from vibespatial.kernels.predicates.binary_refine import crosses_exact
 
     def fake_snapshot(**_kwargs):

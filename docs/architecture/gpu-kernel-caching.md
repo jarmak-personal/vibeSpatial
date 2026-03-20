@@ -33,12 +33,12 @@ Request Signals: kernel caching, CUBIN cache, precompile, warmup, JIT, CCCL cach
 
 Open First:
 - docs/architecture/gpu-kernel-caching.md
-- src/vibespatial/cccl_cubin_cache.py
-- src/vibespatial/cccl_precompile.py
+- src/vibespatial/cuda/cccl_cubin_cache.py
+- src/vibespatial/cuda/cccl_precompile.py
 
 Verify:
 - uv run pytest tests/test_cccl_cubin_cache.py tests/test_cccl_precompile.py -q
-- uv run python -c "from vibespatial.cccl_cubin_cache import cache_stats; print(cache_stats())"
+- uv run python -c "from vibespatial.cuda.cccl_cubin_cache import cache_stats; print(cache_stats())"
 
 Risks:
 - ctypes struct layout mismatch if CCCL changes C ABI without version bump
@@ -263,7 +263,7 @@ All variables respect `XDG_CACHE_HOME` when the `_DIR` override is not set.
 ## Pre-compilation API
 
 ```python
-from vibespatial.cccl_precompile import precompile_all
+from vibespatial.cuda.cccl_precompile import precompile_all
 
 # Compile everything and block until done (CI warm-up, post-install)
 result = precompile_all(timeout=120.0)
@@ -275,7 +275,7 @@ result = precompile_all(timeout=120.0)
 For demand-driven warmup (the default):
 
 ```python
-from vibespatial.cccl_precompile import request_warmup, ensure_pipelines_warm
+from vibespatial.cuda.cccl_precompile import request_warmup, ensure_pipelines_warm
 
 # Non-blocking: request specific specs (typically called at module scope)
 request_warmup(["exclusive_scan_i32", "radix_sort_i32_i32"])
@@ -287,8 +287,8 @@ cold = ensure_pipelines_warm(timeout=60.0)
 ## Cache management
 
 ```python
-from vibespatial.cccl_cubin_cache import clear_cache, cache_stats
-from vibespatial.cuda_runtime import clear_nvrtc_cache, nvrtc_cache_stats
+from vibespatial.cuda.cccl_cubin_cache import clear_cache, cache_stats
+from vibespatial.cuda._runtime import clear_nvrtc_cache, nvrtc_cache_stats
 
 # Inspect
 print(cache_stats())       # CCCL: file count, total bytes, directory
@@ -321,10 +321,10 @@ process-specific. On cache hit we call `cuLibraryLoadData` and
 
 | File | Role |
 |------|------|
-| `src/vibespatial/cccl_cubin_cache.py` | CCCL CUBIN cache: ctypes structs, extraction, reconstruction, disk I/O, cached algorithm wrappers |
-| `src/vibespatial/cccl_precompile.py` | CCCL precompiler singleton, cache integration, `precompile_all()` |
-| `src/vibespatial/cuda_runtime.py` | NVRTC disk cache, CUDA driver runtime |
-| `src/vibespatial/nvrtc_precompile.py` | NVRTC precompiler singleton |
+| `src/vibespatial/cuda/cccl_cubin_cache.py` | CCCL CUBIN cache: ctypes structs, extraction, reconstruction, disk I/O, cached algorithm wrappers |
+| `src/vibespatial/cuda/cccl_precompile.py` | CCCL precompiler singleton, cache integration, `precompile_all()` |
+| `src/vibespatial/cuda/_runtime.py` | NVRTC disk cache, CUDA driver runtime |
+| `src/vibespatial/cuda/nvrtc_precompile.py` | NVRTC precompiler singleton |
 | `tests/test_cccl_cubin_cache.py` | Cache unit tests (no GPU required) |
 | `tests/test_cccl_precompile.py` | Precompiler unit tests |
 | `tests/test_nvrtc_disk_cache.py` | NVRTC cache unit tests |

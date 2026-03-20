@@ -28,28 +28,28 @@ from vibespatial.api._compat import (
     requires_pyproj,
 )
 from vibespatial.api.sindex import SpatialIndex
-from vibespatial.binary_predicates import (
+from vibespatial.predicates.binary import (
     evaluate_geopandas_binary_predicate,
     supports_binary_predicate,
 )
-from vibespatial.clip_rect import evaluate_geopandas_clip_by_rect
-from vibespatial.dispatch import record_dispatch_event
-from vibespatial.distance_owned import evaluate_geopandas_dwithin
-from vibespatial.make_valid_pipeline import evaluate_geopandas_make_valid
-from vibespatial.owned_geometry import (
+from vibespatial.constructive.clip_rect import evaluate_geopandas_clip_by_rect
+from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.spatial.distance_owned import evaluate_geopandas_dwithin
+from vibespatial.constructive.make_valid_pipeline import evaluate_geopandas_make_valid
+from vibespatial.geometry.owned import (
     NULL_TAG,
     TAG_FAMILIES,
     OwnedGeometryArray,
     from_shapely_geometries,
 )
-from vibespatial.provenance import (
+from vibespatial.runtime.provenance import (
     ProvenanceTag,
     attempt_provenance_rewrite,
     make_buffer_tag,
     record_rewrite_event,
 )
 from vibespatial.runtime import ExecutionMode
-from vibespatial.stroke_kernels import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
+from vibespatial.constructive.stroke import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
 
 if typing.TYPE_CHECKING:
     import numpy.typing as npt
@@ -154,7 +154,7 @@ def _to_owned_via_wkb(data: np.ndarray) -> OwnedGeometryArray:
     Falls back to ``from_shapely_geometries`` if the WKB path fails (e.g.
     GeometryCollection or other unsupported WKB types).
     """
-    from vibespatial.io_wkb import _decode_native_wkb
+    from vibespatial.io.wkb import _decode_native_wkb
 
     try:
         # shapely.to_wkb is a vectorised C call -- much faster than
@@ -700,7 +700,7 @@ class GeometryArray(ExtensionArray):
         if owned is None:
             owned = self.to_owned()
         if self._owned_flat_sindex is None:
-            from vibespatial.indexing import build_flat_spatial_index
+            from vibespatial.spatial.indexing import build_flat_spatial_index
             from vibespatial.runtime import ExecutionMode, RuntimeSelection
 
             self._owned_flat_sindex = build_flat_spatial_index(
@@ -715,7 +715,7 @@ class GeometryArray(ExtensionArray):
 
     def supports_owned_spatial_input(self) -> bool:
         if self._owned_spatial_input_supported is None:
-            from vibespatial.spatial_query import supports_owned_spatial_input
+            from vibespatial.spatial.query import supports_owned_spatial_input
 
             self._owned_spatial_input_supported = bool(supports_owned_spatial_input(self._data))
         return self._owned_spatial_input_supported
@@ -794,7 +794,7 @@ class GeometryArray(ExtensionArray):
         """
         self.check_geographic_crs(stacklevel=5)
         if self._owned is not None:
-            from vibespatial.measurement_kernels import area_owned
+            from vibespatial.constructive.measurement import area_owned
 
             return area_owned(self._owned)
         return shapely.area(self._data)
@@ -803,7 +803,7 @@ class GeometryArray(ExtensionArray):
     def length(self):
         self.check_geographic_crs(stacklevel=5)
         if self._owned is not None:
-            from vibespatial.measurement_kernels import length_owned
+            from vibespatial.constructive.measurement import length_owned
 
             return length_owned(self._owned)
         return shapely.length(self._data)
@@ -835,7 +835,7 @@ class GeometryArray(ExtensionArray):
     def centroid(self) -> GeometryArray:
         self.check_geographic_crs(stacklevel=5)
         if self._owned is not None:
-            from vibespatial.centroid_kernels import centroid_owned
+            from vibespatial.constructive.centroid import centroid_owned
 
             cx, cy = centroid_owned(self._owned)
             points = shapely.points(cx, cy)
@@ -963,7 +963,7 @@ class GeometryArray(ExtensionArray):
 
     def normalize(self) -> GeometryArray:
         if self._owned is not None:
-            from vibespatial.normalize_gpu import normalize_owned
+            from vibespatial.constructive.normalize import normalize_owned
 
             result_owned = normalize_owned(self._owned)
             return GeometryArray(
@@ -1217,7 +1217,7 @@ class GeometryArray(ExtensionArray):
                 raise ValueError(msg)
             if not _check_crs(self, other):
                 _crs_mismatch_warn(self, other, stacklevel=7)
-            from vibespatial.distance_owned import distance_owned
+            from vibespatial.spatial.distance_owned import distance_owned
 
             other_owned = other.to_owned()
             return distance_owned(self._owned, other_owned)
@@ -1276,7 +1276,7 @@ class GeometryArray(ExtensionArray):
             return result
 
         # R6: buffer(a).buffer(b) -> buffer(a+b) for point geometries
-        from vibespatial.provenance import _r6_preconditions_met
+        from vibespatial.runtime.provenance import _r6_preconditions_met
 
         if (
             self._provenance is not None

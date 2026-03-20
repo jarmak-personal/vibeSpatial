@@ -4,12 +4,12 @@ import numpy as np
 import pytest
 from shapely.geometry import Point, box
 
-import vibespatial.spatial_nearest as spatial_nearest_module
-import vibespatial.spatial_query as spatial_query_module
-import vibespatial.spatial_query_utils as spatial_query_utils_module
-from vibespatial.owned_geometry import OwnedGeometryArray, from_shapely_geometries
+import vibespatial.spatial.nearest as spatial_nearest_module
+import vibespatial.spatial.query as spatial_query_module
+import vibespatial.spatial.query_utils as spatial_query_utils_module
+from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
-from vibespatial.spatial_query import (
+from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
     query_spatial_index,
@@ -623,8 +623,8 @@ def test_owned_refine_eliminates_shapely_roundtrip(predicate: str) -> None:
     )
 
     # CPU reference via owned engine (not STRtree) for consistency
-    from vibespatial.binary_predicates import evaluate_binary_predicate
-    from vibespatial.indexing import generate_bounds_pairs
+    from vibespatial.predicates.binary import evaluate_binary_predicate
+    from vibespatial.spatial.indexing import generate_bounds_pairs
 
     query_owned_ref = from_shapely_geometries(query.tolist())
     pairs = generate_bounds_pairs(query_owned_ref, flat.geometry_array)
@@ -737,7 +737,7 @@ class TestSjoinDispatchVisibility:
         from shapely.geometry import Point
 
         from vibespatial.api.geodataframe import GeoDataFrame
-        from vibespatial.dispatch import get_dispatch_events
+        from vibespatial.runtime.dispatch import get_dispatch_events
 
         left = GeoDataFrame(
             {"a": [1, 2, 3]},
@@ -768,7 +768,7 @@ class TestSjoinDispatchVisibility:
         from shapely.geometry import Point
 
         from vibespatial.api.geodataframe import GeoDataFrame
-        from vibespatial.dispatch import get_dispatch_events
+        from vibespatial.runtime.dispatch import get_dispatch_events
 
         left = GeoDataFrame(
             {"a": [1, 2]},
@@ -800,7 +800,7 @@ class TestSjoinDispatchVisibility:
 
         from vibespatial.api.geodataframe import GeoDataFrame
         from vibespatial.api.tools.sjoin import _geom_predicate_query
-        from vibespatial.spatial_query_types import SpatialQueryExecution
+        from vibespatial.spatial.query_types import SpatialQueryExecution
 
         left = GeoDataFrame(
             {"a": [1]},
@@ -823,7 +823,7 @@ class TestDeviceJoinResult:
     def test_device_join_result_lazy_materialize(self) -> None:
         """_DeviceJoinResult should defer host copy until properties are
         accessed."""
-        from vibespatial.spatial_query_types import _DeviceJoinResult
+        from vibespatial.spatial.query_types import _DeviceJoinResult
 
         # Use pre-populated host arrays as a mock for the lazy path.
         djr = _DeviceJoinResult.__new__(_DeviceJoinResult)

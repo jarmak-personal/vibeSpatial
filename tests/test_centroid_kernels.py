@@ -13,12 +13,12 @@ from shapely.geometry import (
     Polygon,
 )
 
-from vibespatial.centroid_kernels import (
+from vibespatial.constructive.centroid import (
     _centroid_cpu,
     _centroid_gpu,
     centroid_owned,
 )
-from vibespatial.owned_geometry import from_shapely_geometries
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import has_gpu_runtime
 
 # ARCH005 coverage tokens: null_case, empty_geometry, mixed_type

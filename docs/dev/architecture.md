@@ -9,7 +9,7 @@ vibespatial.api.*                       (extracted GeoPandas-compatible surface)
         |
 evaluate_geopandas_*()                  (GPU dispatch hooks)
         |
-vibespatial.dispatch / runtime          (adaptive GPU/CPU routing)
+vibespatial.runtime.dispatch / runtime          (adaptive GPU/CPU routing)
         |
 vibespatial.kernels.*                   (NVRTC CUDA kernels)
         |

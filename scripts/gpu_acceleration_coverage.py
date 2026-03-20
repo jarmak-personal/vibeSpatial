@@ -24,8 +24,8 @@ except ImportError:
         run_native_coverage,
     )
 from vibespatial import STRICT_NATIVE_ENV_VAR
-from vibespatial.event_log import EVENT_LOG_ENV_VAR, read_event_records
 from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime.event_log import EVENT_LOG_ENV_VAR, read_event_records
 
 
 @dataclass(frozen=True)

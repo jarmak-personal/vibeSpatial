@@ -43,8 +43,8 @@ expand, without overcommitting to a live feedback controller too early.
 
 - docs/architecture/adaptive-runtime.md
 - docs/architecture/runtime.md
-- src/vibespatial/adaptive_runtime.py
-- src/vibespatial/kernel_registry.py
+- src/vibespatial/runtime/adaptive.py
+- src/vibespatial/runtime/kernel_registry.py
 - docs/decisions/0007-probe-first-adaptive-runtime.md
 
 ## Verify

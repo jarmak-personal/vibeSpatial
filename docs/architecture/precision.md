@@ -45,7 +45,7 @@ execution before owned geometry buffers and kernels expand.
 ## Open First
 
 - docs/architecture/precision.md
-- src/vibespatial/precision.py
+- src/vibespatial/runtime/precision.py
 - docs/architecture/runtime.md
 - docs/decisions/0002-dual-precision-dispatch.md
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 
 from scripts.check_pipeline_regressions import compare_results
-from vibespatial.pipeline_benchmarks import benchmark_pipeline_suite, suite_to_json
+from vibespatial.bench.pipeline import benchmark_pipeline_suite, suite_to_json
 
 
 def test_pipeline_smoke_suite_runs_active_pipelines() -> None:

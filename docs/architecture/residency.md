@@ -44,7 +44,7 @@ allowed, and how zero-copy interop should behave before owned buffers land.
 
 - docs/architecture/residency.md
 - docs/architecture/runtime.md
-- src/vibespatial/residency.py
+- src/vibespatial/runtime/residency.py
 - docs/decisions/0005-device-residency-policy.md
 
 ## Verify

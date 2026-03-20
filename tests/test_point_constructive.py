@@ -5,11 +5,11 @@ import pytest
 import shapely
 from shapely.geometry import Point, Polygon
 
-from vibespatial.io_arrow import geoseries_from_owned
-from vibespatial.owned_geometry import from_shapely_geometries
-from vibespatial.point_constructive import clip_points_rect_owned, point_buffer_owned_array
-from vibespatial.residency import Residency
+from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.io.arrow import geoseries_from_owned
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 
 
 def _assert_geometries_equal(actual: list[object | None], expected: list[object | None]) -> None:

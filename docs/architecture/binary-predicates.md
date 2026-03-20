@@ -44,7 +44,7 @@ DOC_HEADER:END -->
 
 - docs/architecture/binary-predicates.md
 - docs/architecture/robustness.md
-- src/vibespatial/binary_predicates.py
+- src/vibespatial/predicates/binary.py
 - src/vibespatial/kernels/predicates/binary_refine.py
 - src/vibespatial/api/geometry_array.py
 

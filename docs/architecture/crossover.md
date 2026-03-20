@@ -42,7 +42,7 @@ each kernel class before adaptive runtime work lands.
 
 - docs/architecture/crossover.md
 - docs/architecture/runtime.md
-- src/vibespatial/crossover.py
+- src/vibespatial/runtime/crossover.py
 - docs/decisions/0006-dispatch-crossover-policy.md
 
 ## Verify

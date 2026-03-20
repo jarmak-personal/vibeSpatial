@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from vibespatial import benchmark_geojson_ingest, benchmark_shapefile_ingest
-from vibespatial.io_benchmark_rails import benchmark_io_file_suite, io_suite_to_json
+from vibespatial.bench.io_benchmark_rails import benchmark_io_file_suite, io_suite_to_json
 
 
 def main(argv: list[str] | None = None) -> int:

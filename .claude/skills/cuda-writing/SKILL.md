@@ -99,7 +99,7 @@ before changing the AUTO default from CuPy.
 Impact: reduces peak device memory for large intermediates.
 
 ```python
-from vibespatial.cccl_primitives import counting_iterator, transform_iterator
+from vibespatial.cuda.cccl_primitives import counting_iterator, transform_iterator
 
 # Instead of: indices = cp.arange(n, dtype=cp.int32)
 indices = counting_iterator(0, dtype=np.int32)
@@ -129,7 +129,7 @@ offsets = exclusive_sum(counts, strategy=ScanStrategy.AUTO)
 Every NVRTC kernel follows this exact sequence:
 
 ```python
-from vibespatial.cuda_runtime import (
+from vibespatial.cuda._runtime import (
     get_cuda_runtime, make_kernel_cache_key,
     KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_F64,
 )
@@ -165,7 +165,7 @@ KERNEL_PARAM_I32 = ctypes.c_int       # 32-bit integers
 KERNEL_PARAM_F64 = ctypes.c_double    # 64-bit floats
 ```
 
-**CRITICAL:** Always use the named constants from `vibespatial.cuda_runtime`.
+**CRITICAL:** Always use the named constants from `vibespatial.cuda._runtime`.
 
 ### Occupancy-Based Block Sizing
 
@@ -288,7 +288,7 @@ runtime.copy_host_to_device_async(h_array, d_array, stream)
 ### Pattern: Count-Scatter Total
 
 ```python
-from vibespatial.cuda_runtime import count_scatter_total, count_scatter_total_with_transfer
+from vibespatial.cuda._runtime import count_scatter_total, count_scatter_total_with_transfer
 
 # Simple: single-sync async pinned transfer (replaces 2x .get())
 total = count_scatter_total(runtime, device_counts, device_offsets)
@@ -346,7 +346,7 @@ with runtime.stream_context() as s_mpoly:
 ### Available in cccl_primitives.py
 
 ```python
-from vibespatial.cccl_primitives import (
+from vibespatial.cuda.cccl_primitives import (
     # Tier 3a — CCCL default (beats CuPy)
     exclusive_sum,            # Prefix sum (1.8-3.7x faster)
     compact_indices,          # Bool mask -> indices (CuPy default; CCCL via explicit strategy)
@@ -402,7 +402,7 @@ Never blocks import; first real call may block up to 5s waiting for its
 needed spec.
 
 ```python
-from vibespatial.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_precompile import request_warmup
 request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "select_i32"])
 ```
 
@@ -411,7 +411,7 @@ request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "select_i32"])
 Thread-safe via `_module_cache_lock` on `CudaDriverRuntime`.
 
 ```python
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 request_nvrtc_warmup([
     ("my-kernel", _KERNEL_SOURCE, _KERNEL_NAMES),
 ])
@@ -788,9 +788,9 @@ consider these L2-friendly patterns:
 ## 12. Dispatcher Pattern
 
 ```python
-from vibespatial.adaptive_runtime import plan_dispatch_selection
-from vibespatial.precision import KernelClass
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime._runtime._runtime import ExecutionMode
 
 selection = plan_dispatch_selection(
     kernel_name="my_kernel",

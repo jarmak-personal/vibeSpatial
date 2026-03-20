@@ -39,7 +39,7 @@ clip, and later GPU constructive kernels.
 - docs/testing/degeneracy-corpus.md
 - src/vibespatial/testing/degeneracy.py
 - tests/test_degeneracy_corpus.py
-- src/vibespatial/segment_primitives.py
+- src/vibespatial/spatial/segment_primitives.py
 
 ## Verify
 

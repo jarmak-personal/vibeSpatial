@@ -16,7 +16,7 @@ from vibespatial.api.geometry_array import (
     _check_crs,
     _crs_mismatch_warn,
 )
-from vibespatial.fallbacks import strict_native_mode_enabled
+from vibespatial.runtime.fallbacks import strict_native_mode_enabled
 
 
 def _mask_is_list_like_rectangle(mask):

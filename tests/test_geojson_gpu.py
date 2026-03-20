@@ -7,12 +7,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.io_geojson import (
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.io.geojson import (
     plan_geojson_ingest,
     read_geojson_owned,
 )
-from vibespatial.residency import Residency
+from vibespatial.runtime.residency import Residency
 
 try:
     import cupy as cp

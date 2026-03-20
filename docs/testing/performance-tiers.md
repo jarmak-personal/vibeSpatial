@@ -49,7 +49,7 @@ rules so each kernel can declare success against the same denominator.
 - docs/testing/performance-tiers.md
 - docs/implementation-order.md
 - docs/testing/upstream-inventory.md
-- src/vibespatial/runtime.py
+- src/vibespatial/runtime/_runtime.py
 
 ## Verify
 

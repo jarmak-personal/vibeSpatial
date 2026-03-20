@@ -4,16 +4,16 @@ from shapely.geometry.base import BaseGeometry
 
 from vibespatial.api import geometry_array as array
 from vibespatial.api import geoseries
-from vibespatial.dispatch import record_dispatch_event
-from vibespatial.owned_geometry import OwnedGeometryArray
+from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
-from vibespatial.spatial_query import (
+from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
     query_spatial_index,
     supports_owned_spatial_input,
 )
-from vibespatial.spatial_query_utils import _to_owned
+from vibespatial.spatial.query_utils import _to_owned
 
 from . import _compat as compat
 

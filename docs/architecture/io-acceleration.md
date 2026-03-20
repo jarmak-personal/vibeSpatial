@@ -51,8 +51,8 @@ shared decode architecture and explicit format-level floor targets.
 - docs/architecture/io-acceleration.md
 - docs/architecture/io-arrow.md
 - docs/architecture/io-files.md
-- src/vibespatial/io_arrow.py
-- src/vibespatial/io_file.py
+- src/vibespatial/io/arrow.py
+- src/vibespatial/io/file.py
 
 ## Verify
 

@@ -46,7 +46,7 @@ committing the repo to an overbuilt execution engine too early.
 - docs/architecture/fusion.md
 - docs/architecture/residency.md
 - docs/architecture/adaptive-runtime.md
-- src/vibespatial/fusion.py
+- src/vibespatial/runtime/fusion.py
 - docs/decisions/0009-fusion-strategy.md
 
 ## Verify

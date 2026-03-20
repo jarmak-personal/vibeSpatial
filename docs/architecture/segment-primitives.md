@@ -41,7 +41,7 @@ intersection classification.
 
 - docs/architecture/segment-primitives.md
 - docs/architecture/robustness.md
-- src/vibespatial/segment_primitives.py
+- src/vibespatial/spatial/segment_primitives.py
 - tests/test_segment_primitives.py
 
 ## Verify

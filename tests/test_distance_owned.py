@@ -19,8 +19,8 @@ from shapely.geometry import (
     Polygon,
 )
 
-from vibespatial.distance_owned import distance_owned, dwithin_owned
-from vibespatial.owned_geometry import from_shapely_geometries
+from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.spatial.distance_owned import distance_owned, dwithin_owned
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -279,7 +279,7 @@ class TestDwithin:
 
 class TestDGAIntegration:
     def test_dga_distance(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
         left_geoms = [Point(0, 0), Point(1, 1), Point(3, 4)]
         right_geoms = [Point(1, 0), Point(1, 1), Point(0, 0)]
         dga_left = DeviceGeometryArray._from_sequence(left_geoms)
@@ -289,7 +289,7 @@ class TestDGAIntegration:
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
     def test_dga_distance_single_geometry(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
         geoms = [Point(0, 0), Point(3, 4)]
         dga = DeviceGeometryArray._from_sequence(geoms)
         target = Point(0, 0)
@@ -298,7 +298,7 @@ class TestDGAIntegration:
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
     def test_dga_dwithin(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
         geoms = [Point(0, 0), Point(0, 0)]
         others = [Point(1, 0), Point(5, 0)]
         dga_left = DeviceGeometryArray._from_sequence(geoms)
@@ -307,7 +307,7 @@ class TestDGAIntegration:
         np.testing.assert_array_equal(result, [True, False])
 
     def test_dga_distance_numpy_array(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
         left_geoms = [Point(0, 0), Point(1, 1)]
         right_geoms = np.array([Point(1, 0), Point(4, 5)], dtype=object)
         dga = DeviceGeometryArray._from_sequence(left_geoms)
@@ -316,7 +316,7 @@ class TestDGAIntegration:
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
     def test_dga_distance_mixed_families(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
         left_geoms = [Point(0, 0), LineString([(0, 0), (1, 0)])]
         right_geoms = [
             Polygon([(3, 3), (4, 3), (4, 4), (3, 4)]),

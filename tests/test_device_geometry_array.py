@@ -17,15 +17,15 @@ from shapely.geometry import (
     box,
 )
 
-from vibespatial.device_geometry_array import DeviceGeometryArray, DeviceGeometryDtype
-from vibespatial.owned_geometry import (
+from vibespatial.geometry.device_array import DeviceGeometryArray, DeviceGeometryDtype
+from vibespatial.geometry.owned import (
     DiagnosticKind,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     from_shapely_geometries,
 )
-from vibespatial.residency import Residency
 from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -816,7 +816,7 @@ class TestBinaryPredicatesOwned:
             assert len(result) == len(left_dga), f"{pred} length mismatch"
 
     def test_predicate_dispatch_event_recorded(self, left_dga, right_dga):
-        from vibespatial.dispatch import clear_dispatch_events, get_dispatch_events
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
         clear_dispatch_events()
         _ = left_dga.intersects(right_dga)
         events = get_dispatch_events(clear=True)
@@ -867,7 +867,7 @@ class TestClipByRectOwned:
                 assert shp.equals(r, e)
 
     def test_clip_dispatch_event_recorded(self):
-        from vibespatial.dispatch import clear_dispatch_events, get_dispatch_events
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
         clear_dispatch_events()
         dga = DeviceGeometryArray._from_sequence([Point(1, 1), Point(5, 5)])
         _ = dga.clip_by_rect(0, 0, 3, 3)

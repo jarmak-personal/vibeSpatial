@@ -8,7 +8,7 @@ import shapely
 from shapely.geometry import Point
 
 from vibespatial.api.geometry_array import GeometryArray
-from vibespatial.provenance import (
+from vibespatial.runtime.provenance import (
     ProvenanceTag,
     RewriteRule,
     _is_point_only,

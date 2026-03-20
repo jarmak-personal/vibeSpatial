@@ -8,7 +8,7 @@ import numpy as np
 from shapely.geometry import box
 
 import geopandas
-from vibespatial.dissolve_pipeline import execute_grouped_box_union_gpu
+from vibespatial.overlay.dissolve import execute_grouped_box_union_gpu
 
 
 def _build_frame(rows: int, groups: int) -> geopandas.GeoDataFrame:

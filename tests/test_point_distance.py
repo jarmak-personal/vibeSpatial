@@ -6,8 +6,8 @@ import shapely
 from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, box
 
 from vibespatial import has_gpu_runtime
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.owned_geometry import from_shapely_geometries
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import from_shapely_geometries
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 
@@ -17,8 +17,8 @@ def _make_owned(geoms):
 
 
 def _compute_distances(query_owned, tree_owned, left_idx, right_idx, tree_family, exclusive=False):
-    from vibespatial.cuda_runtime import get_cuda_runtime
-    from vibespatial.point_distance import compute_point_distance_gpu
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.spatial.point_distance import compute_point_distance_gpu
 
     runtime = get_cuda_runtime()
     pair_count = len(left_idx)

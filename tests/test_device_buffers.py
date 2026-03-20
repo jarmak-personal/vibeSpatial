@@ -5,7 +5,7 @@ import pytest
 from shapely.geometry import LineString, Point, Polygon
 
 from vibespatial import Residency, TransferTrigger, from_shapely_geometries, has_gpu_runtime
-from vibespatial.cuda_runtime import get_cuda_runtime
+from vibespatial.cuda._runtime import get_cuda_runtime
 
 
 def _sample_geometries():

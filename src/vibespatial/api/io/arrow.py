@@ -93,14 +93,14 @@ _geometry_type_names += [geom_type + " Z" for geom_type in _geometry_type_names]
 
 def _get_geometry_types(series):
     """Get unique geometry types from a GeoSeries."""
-    from vibespatial.device_geometry_array import DeviceGeometryArray
+    from vibespatial.geometry.device_array import DeviceGeometryArray
 
     arr = series.array
     if isinstance(arr, DeviceGeometryArray):
         # Satisfy from owned tags without Shapely materialization.
         # Map family tags → shapely type IDs.
-        from vibespatial.geometry_buffers import GeometryFamily
-        from vibespatial.owned_geometry import FAMILY_TAGS, NULL_TAG
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.geometry.owned import FAMILY_TAGS, NULL_TAG
 
         _family_to_shapely_type_id = {
             FAMILY_TAGS[GeometryFamily.POINT]: 0,
@@ -571,7 +571,7 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attr
             crs = "OGC:CRS84"
 
         if col_metadata["encoding"] == "WKB":
-            from vibespatial.io_wkb import _decode_native_wkb
+            from vibespatial.io.wkb import _decode_native_wkb
 
             arrow_col = table[col].combine_chunks()
             wkb_values = arrow_col.to_pylist()
@@ -583,7 +583,7 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attr
         else:
             import pyarrow as pa
 
-            from vibespatial.io_geoarrow import _decode_geoarrow_array_to_owned
+            from vibespatial.io.geoarrow import _decode_geoarrow_array_to_owned
 
             arrow_col = table[col].combine_chunks()
             field = pa.field(col, arrow_col.type)

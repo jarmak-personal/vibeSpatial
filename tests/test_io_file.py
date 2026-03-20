@@ -3,7 +3,7 @@ from __future__ import annotations
 from shapely.geometry import LineString, Point, Polygon
 
 import vibespatial.api as geopandas
-import vibespatial.io_geojson as io_geojson
+import vibespatial.io.geojson as io_geojson
 from vibespatial import (
     benchmark_geojson_ingest,
     benchmark_shapefile_ingest,
@@ -96,7 +96,7 @@ def test_read_shapefile_owned_points_use_raw_arrow_fast_path(monkeypatch, tmp_pa
     )
     frame.to_file(path, driver="ESRI Shapefile")
 
-    import vibespatial.io_arrow as io_arrow
+    import vibespatial.io.arrow as io_arrow
 
     def fail_decode(*_args, **_kwargs):
         raise AssertionError("generic WKB decode should not be used for raw Arrow point fast path")
@@ -141,7 +141,7 @@ def test_read_shapefile_owned_lines_use_raw_arrow_fast_path(monkeypatch, tmp_pat
     )
     frame.to_file(path, driver="ESRI Shapefile")
 
-    import vibespatial.io_arrow as io_arrow
+    import vibespatial.io.arrow as io_arrow
 
     def fail_decode(*_args, **_kwargs):
         raise AssertionError("generic WKB decode should not be used for raw Arrow linestring fast path")
@@ -166,7 +166,7 @@ def test_read_shapefile_owned_polygons_use_raw_arrow_fast_path(monkeypatch, tmp_
     )
     frame.to_file(path, driver="ESRI Shapefile")
 
-    import vibespatial.io_arrow as io_arrow
+    import vibespatial.io.arrow as io_arrow
 
     def fail_decode(*_args, **_kwargs):
         raise AssertionError("generic WKB decode should not be used for raw Arrow polygon fast path")

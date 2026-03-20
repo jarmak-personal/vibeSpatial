@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from vibespatial.fallbacks import (
+from vibespatial.runtime.fallbacks import (
     StrictNativeFallbackError,
     record_fallback_event,
     strict_native_mode_enabled,

@@ -59,7 +59,7 @@ of recompiling (~1,300 ms per CCCL spec, ~100 ms per NVRTC unit).
 **Pre-populate all caches** after install or in CI warm-up:
 
 ```python
-from vibespatial.cccl_precompile import precompile_all
+from vibespatial.cuda.cccl_precompile import precompile_all
 result = precompile_all()   # blocks until all specs/units are compiled
 print(result)               # shows compiled/failed counts and timings
 ```

@@ -66,7 +66,7 @@ def test_point_within_bounds_accepts_explicit_bounds(oracle_runner) -> None:
 
 @pytest.mark.cpu_fallback
 def test_point_within_bounds_auto_fallback_is_visible(monkeypatch) -> None:
-    import vibespatial.adaptive_runtime as adaptive_runtime
+    import vibespatial.runtime.adaptive as adaptive_runtime
 
     def fake_snapshot(**_kwargs):
         return DeviceSnapshot(
@@ -89,7 +89,7 @@ def test_point_within_bounds_auto_fallback_is_visible(monkeypatch) -> None:
 
 
 def test_point_within_bounds_explicit_gpu_request_fails_without_variant(monkeypatch) -> None:
-    import vibespatial.adaptive_runtime as adaptive_runtime
+    import vibespatial.runtime.adaptive as adaptive_runtime
 
     def fake_snapshot(**_kwargs):
         return DeviceSnapshot(

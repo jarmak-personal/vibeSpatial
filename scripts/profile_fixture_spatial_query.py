@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
-from vibespatial.fixture_profiles import (
+from vibespatial.bench.fixture_profiles import (
     ensure_named_fixture,
     profile_fixture_nearest,
     profile_fixture_query,

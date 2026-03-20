@@ -16,14 +16,14 @@ from vibespatial import (
     capture_device_snapshot,
     plan_adaptive_execution,
 )
-from vibespatial.adaptive_runtime import (
+from vibespatial.runtime.adaptive import (
     ChunkedPlanIterator,
     _detect_device_profile,
     get_cached_snapshot,
     invalidate_snapshot_cache,
 )
-from vibespatial.crossover import default_crossover_policy
-from vibespatial.kernel_registry import (
+from vibespatial.runtime.crossover import default_crossover_policy
+from vibespatial.runtime.kernel_registry import (
     KernelVariantSpec,
     get_kernel_variants,
     register_kernel_variant,

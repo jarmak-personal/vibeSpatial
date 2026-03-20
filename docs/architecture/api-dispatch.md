@@ -39,7 +39,7 @@ or hiding which implementation actually ran.
 ## Open First
 
 - docs/architecture/api-dispatch.md
-- src/vibespatial/device_geometry_array.py
+- src/vibespatial/geometry/device_array.py
 - src/geopandas/__init__.py
 - tests/test_geopandas_dispatch.py
 

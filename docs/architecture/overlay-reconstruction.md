@@ -38,7 +38,7 @@ DOC_HEADER:END -->
 
 - docs/architecture/overlay-reconstruction.md
 - docs/architecture/segment-primitives.md
-- src/vibespatial/overlay_reconstruction.py
+- src/vibespatial/overlay/reconstruction.py
 - tests/test_overlay_reconstruction.py
 
 ## Verify

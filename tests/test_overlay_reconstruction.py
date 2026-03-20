@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from vibespatial import OverlayOperation, fusion_plan_for_overlay, plan_overlay_reconstruction
-from vibespatial.fusion import IntermediateDisposition
+from vibespatial.runtime.fusion import IntermediateDisposition
 
 
 def test_overlay_reconstruction_plan_has_shared_topology_prefix() -> None:

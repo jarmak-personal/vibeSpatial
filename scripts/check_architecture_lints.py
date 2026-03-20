@@ -264,6 +264,86 @@ def check_gpu_kernel_tests(repo_root: Path) -> list[LintError]:
     return errors
 
 
+REORG_SHIM_MARKER = "# REORG_SHIM"
+
+
+def _collect_shim_modules(repo_root: Path) -> set[str]:
+    """Return dotted module names for files that carry the REORG_SHIM marker."""
+    shim_modules: set[str] = set()
+    src = repo_root / "src" / "vibespatial"
+    for path in iter_python_files(src):
+        try:
+            first_line = path.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+        except OSError:
+            continue
+        if REORG_SHIM_MARKER not in first_line:
+            continue
+        relative = path.relative_to(repo_root / "src")
+        parts = list(relative.with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        shim_modules.add(".".join(parts))
+    return shim_modules
+
+
+def check_shim_imports(repo_root: Path) -> list[LintError]:
+    """ARCH007: Flag imports from deprecated reorg-shim modules."""
+    errors: list[LintError] = []
+    shim_modules = _collect_shim_modules(repo_root)
+    if not shim_modules:
+        return errors
+    scan_dirs = [
+        repo_root / "src" / "vibespatial",
+        repo_root / "tests",
+        repo_root / "scripts",
+    ]
+    for scan_dir in scan_dirs:
+        for path in iter_python_files(scan_dir):
+            # Shim files themselves are allowed to import from the new location
+            try:
+                first_line = path.read_text(encoding="utf-8", errors="replace").split("\n", 1)[0]
+            except OSError:
+                continue
+            if REORG_SHIM_MARKER in first_line:
+                continue
+            tree = parse_module(path)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    module = node.module
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        if alias.name in shim_modules:
+                            errors.append(
+                                LintError(
+                                    code="ARCH007",
+                                    path=path,
+                                    line=node.lineno,
+                                    message=(
+                                        f"Import from deprecated shim module '{alias.name}'; "
+                                        "use the canonical path instead."
+                                    ),
+                                    doc_path=RUNTIME_DOC,
+                                )
+                            )
+                    continue
+                else:
+                    continue
+                if module in shim_modules:
+                    errors.append(
+                        LintError(
+                            code="ARCH007",
+                            path=path,
+                            line=node.lineno,
+                            message=(
+                                f"Import from deprecated shim module '{module}'; "
+                                "use the canonical path instead."
+                            ),
+                            doc_path=RUNTIME_DOC,
+                        )
+                    )
+    return errors
+
+
 def check_test_data_files(repo_root: Path) -> list[LintError]:
     errors: list[LintError] = []
     root = repo_root / "tests"
@@ -302,6 +382,13 @@ def run_checks(repo_root: Path) -> list[LintError]:
     return sorted(errors, key=lambda error: (str(error.path), error.line, error.code))
 
 
+def run_advisory_checks(repo_root: Path) -> list[LintError]:
+    """Advisory checks that report migration progress but do not block landing."""
+    errors: list[LintError] = []
+    errors.extend(check_shim_imports(repo_root))
+    return sorted(errors, key=lambda error: (str(error.path), error.line, error.code))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check repo-specific architecture constraints that must hold before commit."
@@ -317,6 +404,13 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("pass --all")
 
     errors = run_checks(REPO_ROOT)
+    advisory = run_advisory_checks(REPO_ROOT)
+
+    for error in advisory:
+        print(f"[advisory] {error.render(REPO_ROOT)}")
+    if advisory:
+        print(f"\n{len(advisory)} advisory issue(s) (shim imports to migrate).")
+
     if not errors:
         print("Architecture lint checks passed.")
         return 0

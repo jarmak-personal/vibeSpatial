@@ -394,7 +394,7 @@ uv run pytest tests/test_gpu_constructive.py tests/test_gpu_overlay_intersection
 To benchmark CuPy vs CCCL on a specific primitive at a specific scale:
 
 ```python
-from vibespatial.cccl_primitives import compact_indices, CompactionStrategy
+from vibespatial.cuda.cccl_primitives import compact_indices, CompactionStrategy
 # Force CCCL path:
 result = compact_indices(mask, strategy=CompactionStrategy.CCCL_SELECT)
 # Force CuPy path:

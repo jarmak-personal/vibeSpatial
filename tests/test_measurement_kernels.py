@@ -21,17 +21,17 @@ from shapely.geometry import (
     Polygon,
 )
 
-from vibespatial.measurement_kernels import (
+from vibespatial.constructive.measurement import (
     area_owned,
     length_owned,
 )
-from vibespatial.owned_geometry import OwnedGeometryArray
+from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
 
 
 def _has_gpu():
     try:
-        from vibespatial.cuda_runtime import get_cuda_runtime
+        from vibespatial.cuda._runtime import get_cuda_runtime
 
         return get_cuda_runtime().available()
     except Exception:
@@ -43,7 +43,7 @@ requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
 
 def _make_owned(geometries: list) -> OwnedGeometryArray:
     """Build an OwnedGeometryArray from a list of Shapely geometries."""
-    from vibespatial.owned_geometry import from_shapely_geometries
+    from vibespatial.geometry.owned import from_shapely_geometries
 
     return from_shapely_geometries(geometries)
 
@@ -379,8 +379,8 @@ class TestDispatch:
 class TestDGAIntegration:
     def test_dga_area_no_shapely_materialization(self):
         """DGA.area should NOT produce materialization diagnostic events."""
-        from vibespatial.device_geometry_array import DeviceGeometryArray
-        from vibespatial.owned_geometry import DiagnosticKind
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.geometry.owned import DiagnosticKind
 
         geoms = [Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])] * 5
         owned = _make_owned(geoms)
@@ -391,8 +391,8 @@ class TestDGAIntegration:
 
     def test_dga_length_no_shapely_materialization(self):
         """DGA.length should NOT produce materialization diagnostic events."""
-        from vibespatial.device_geometry_array import DeviceGeometryArray
-        from vibespatial.owned_geometry import DiagnosticKind
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.geometry.owned import DiagnosticKind
 
         geoms = [LineString([(0, 0), (1, 0), (1, 1)])] * 5
         owned = _make_owned(geoms)
@@ -402,7 +402,7 @@ class TestDGAIntegration:
         assert len(mat_events) == 0, f"Unexpected materialization events: {mat_events}"
 
     def test_dga_area_matches_shapely(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
 
         geoms = [
             Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
@@ -415,7 +415,7 @@ class TestDGAIntegration:
         np.testing.assert_allclose(result, expected, rtol=1e-10)
 
     def test_dga_length_matches_shapely(self):
-        from vibespatial.device_geometry_array import DeviceGeometryArray
+        from vibespatial.geometry.device_array import DeviceGeometryArray
 
         geoms = [
             LineString([(0, 0), (3, 0), (3, 4)]),

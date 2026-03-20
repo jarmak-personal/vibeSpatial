@@ -7,7 +7,7 @@ from pathlib import Path
 
 from benchmark_report import render_html
 
-from vibespatial.pipeline_benchmarks import (
+from vibespatial.bench.pipeline import (
     PIPELINE_DEFINITIONS,
     benchmark_pipeline_suite,
     render_gpu_sparkline_report,

@@ -21,26 +21,26 @@ from typing import Any
 
 import numpy as np
 
-from vibespatial.cccl_precompile import request_warmup
-from vibespatial.cccl_primitives import exclusive_sum
-from vibespatial.cuda_runtime import (
+from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     get_cuda_runtime,
     make_kernel_cache_key,
 )
-from vibespatial.geometry_buffers import GeometryFamily
-from vibespatial.io_pylibcudf import (
-    _build_device_mixed_owned,
-    _build_device_single_family_owned,
-)
-from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.owned_geometry import (
+from vibespatial.cuda.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_primitives import exclusive_sum
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
 )
-from vibespatial.precision import KernelClass
+from vibespatial.io.pylibcudf import (
+    _build_device_mixed_owned,
+    _build_device_single_family_owned,
+)
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass
 
 logger = logging.getLogger(__name__)
 
@@ -543,7 +543,9 @@ _WKB_DECODE_KERNEL_NAMES = (
 # Kernel compilation (matches io_wkb._wkb_encode_kernels pattern)
 # ---------------------------------------------------------------------------
 
-from vibespatial.nvrtc_precompile import request_nvrtc_warmup as _request_nvrtc_warmup  # noqa: E402
+from vibespatial.cuda.nvrtc_precompile import (  # noqa: E402
+    request_nvrtc_warmup as _request_nvrtc_warmup,
+)
 
 _request_nvrtc_warmup([
     ("wkb-decode", _WKB_DECODE_KERNEL_SOURCE, _WKB_DECODE_KERNEL_NAMES),

@@ -12,7 +12,7 @@ You are bringing a GPU kernel into compliance with ADR-0002
 
 ## The Problem
 
-The precision planning layer (`src/vibespatial/precision.py`) correctly
+The precision planning layer (`src/vibespatial/runtime/precision.py`) correctly
 computes a `PrecisionPlan` that selects fp32 or fp64 compute precision
 based on device profile and kernel class. But many CUDA kernel source
 strings are hardcoded to `double` and ignore the plan entirely. On
@@ -23,7 +23,7 @@ kernels run at ~1.6% of potential throughput for no correctness benefit.
 
 Read the target file. Determine:
 
-1. **Kernel class** (from `src/vibespatial/precision.py:KernelClass`):
+1. **Kernel class** (from `src/vibespatial/runtime/precision.py:KernelClass`):
    - `COARSE`: bounds, filters, sort keys, spatial index — cheap geometry-local work
    - `METRIC`: area, length, distance, centroid — accumulation-heavy reductions
    - `PREDICATE`: point-in-polygon, binary predicates, orientation — boolean classification
@@ -42,9 +42,9 @@ Read the target file. Determine:
 
 Read these files to understand the API you must use:
 
-- `src/vibespatial/precision.py` — `PrecisionPlan`, `select_precision_plan()`, `KernelClass`, `PrecisionMode`, `CompensationMode`, `CoordinateStats`
-- `src/vibespatial/kernel_registry.py` — `register_kernel_variant()` decorator and `KernelVariantSpec`
-- `src/vibespatial/robustness.py` — `select_robustness_plan()` (takes a PrecisionPlan)
+- `src/vibespatial/runtime/precision.py` — `PrecisionPlan`, `select_precision_plan()`, `KernelClass`, `PrecisionMode`, `CompensationMode`, `CoordinateStats`
+- `src/vibespatial/runtime/kernel_registry.py` — `register_kernel_variant()` decorator and `KernelVariantSpec`
+- `src/vibespatial/runtime/robustness.py` — `select_robustness_plan()` (takes a PrecisionPlan)
 
 ## Step 3: Implement the Precision-Aware Kernel
 
@@ -140,10 +140,10 @@ robustness work proves a cheaper path. But still:
 Follow the existing pattern from `binary_predicates.py` / `segment_primitives.py`:
 
 ```python
-from vibespatial.precision import (
+from vibespatial.runtime.precision import (
     KernelClass, PrecisionMode, PrecisionPlan, select_precision_plan,
 )
-from vibespatial.robustness import RobustnessPlan, select_robustness_plan
+from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
 
 # At the public API entry point:
 precision_plan = select_precision_plan(
@@ -245,25 +245,25 @@ The compliance ledger file is at:
 ### Fully compliant (plan computed AND kernel respects it)
 
 - `src/vibespatial/kernels/core/geometry_analysis.py` (COARSE) — precision plan wired through dispatch; GPU kernel is templated on compute_t but bounds intentionally stay fp64 because fp32 rounding shrinks bounds and causes false negatives in spatial filtering. The precision infrastructure is in place for future use if conservative rounding is implemented.
-- `src/vibespatial/point_distance.py` (METRIC) — kernel templated on compute_t with coordinate centering via center_x/center_y parameters. Subtraction happens in fp64 before cast to compute_t. On consumer GPUs, uses staged fp32; on datacenter GPUs, native fp64. The point-in-polygon helper embedded in distance also uses centered fp32.
+- `src/vibespatial/spatial/point_distance.py` (METRIC) — kernel templated on compute_t with coordinate centering via center_x/center_y parameters. Subtraction happens in fp64 before cast to compute_t. On consumer GPUs, uses staged fp32; on datacenter GPUs, native fp64. The point-in-polygon helper embedded in distance also uses centered fp32.
 - `src/vibespatial/kernels/predicates/point_in_polygon.py` (PREDICATE) — all 9 kernel entry points templated on compute_t with centering. Device helpers (point_on_segment, ring_contains_even_odd, polygon/multipolygon_contains_point) use centered fp32 arithmetic. Boundary tolerance widened from 1e-12 to 1e-7 for fp32 noise floor. Dispatch selects compute_type from cached device snapshot. All launcher functions accept compute_type/center params.
 
-- `src/vibespatial/make_valid_pipeline.py` (PREDICATE) — check_ring_validity kernel templated on compute_t with precision-dependent closure tolerance (1e-24 fp64, 1e-10 fp32). reduce_ring_to_polygon_validity is integer-only. PrecisionPlan wired through dispatch. Both fp32 and fp64 variants precompiled via NVRTC warmup.
+- `src/vibespatial/constructive/make_valid_pipeline.py` (PREDICATE) — check_ring_validity kernel templated on compute_t with precision-dependent closure tolerance (1e-24 fp64, 1e-10 fp32). reduce_ring_to_polygon_validity is integer-only. PrecisionPlan wired through dispatch. Both fp32 and fp64 variants precompiled via NVRTC warmup.
 
 ### Plan wired at dispatch layer; kernel uses fp64 by design (CONSTRUCTIVE per ADR-0002)
 
-- `src/vibespatial/binary_predicates.py` (PREDICATE) — dispatch uses plan_kernel_dispatch; downstream PIP kernels now use staged fp32
-- `src/vibespatial/segment_primitives.py` (CONSTRUCTIVE) — dispatch uses plan_dispatch_selection; kernel stays fp64
-- `src/vibespatial/clip_rect.py` (CONSTRUCTIVE) — dispatch uses plan_dispatch_selection; kernel stays fp64
-- `src/vibespatial/predicate_support.py` (PREDICATE) — dispatch uses plan_kernel_dispatch; downstream PIP kernels now use staged fp32
-- `src/vibespatial/overlay_gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002
-- `src/vibespatial/point_constructive.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; dispatch via plan_dispatch_selection
-- `src/vibespatial/linestring_constructive.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; dispatch via plan_dispatch_selection
-- `src/vibespatial/polygon_constructive.py` (mixed CONSTRUCTIVE/METRIC) — buffer kernels fp64 by design per ADR-0002; **polygon_centroid kernel (METRIC) fully compliant**: templated on compute_t with Kahan-compensated shoelace accumulation, coordinate centering via center_x/center_y, precision-keyed NVRTC cache (fp32/fp64 variants precompiled). fp32+center+Kahan achieves 8e-4 max error vs Shapely at 1e6-magnitude coords.
-- `src/vibespatial/spatial_query.py` (COARSE) — dispatch via plan_kernel_dispatch; no owned CUDA kernel to template
-- `src/vibespatial/dissolve_pipeline.py` (mixed) — delegates to lower-level GPU ops
-- `src/vibespatial/indexing.py` (COARSE) — dispatch via plan_dispatch_selection; no owned CUDA kernel to template
-- `src/vibespatial/make_valid_gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; GPU repair kernels (close_rings, flag_duplicate_vertices, reverse_ring_coords, split event kernels) all use fp64 storage and compute
+- `src/vibespatial/predicates/binary.py` (PREDICATE) — dispatch uses plan_kernel_dispatch; downstream PIP kernels now use staged fp32
+- `src/vibespatial/spatial/segment_primitives.py` (CONSTRUCTIVE) — dispatch uses plan_dispatch_selection; kernel stays fp64
+- `src/vibespatial/constructive/clip_rect.py` (CONSTRUCTIVE) — dispatch uses plan_dispatch_selection; kernel stays fp64
+- `src/vibespatial/predicates/support.py` (PREDICATE) — dispatch uses plan_kernel_dispatch; downstream PIP kernels now use staged fp32
+- `src/vibespatial/overlay/gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002
+- `src/vibespatial/constructive/point.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; dispatch via plan_dispatch_selection
+- `src/vibespatial/constructive/linestring.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; dispatch via plan_dispatch_selection
+- `src/vibespatial/constructive/polygon.py` (mixed CONSTRUCTIVE/METRIC) — buffer kernels fp64 by design per ADR-0002; **polygon_centroid kernel (METRIC) fully compliant**: templated on compute_t with Kahan-compensated shoelace accumulation, coordinate centering via center_x/center_y, precision-keyed NVRTC cache (fp32/fp64 variants precompiled). fp32+center+Kahan achieves 8e-4 max error vs Shapely at 1e6-magnitude coords.
+- `src/vibespatial/spatial/query.py` (COARSE) — dispatch via plan_kernel_dispatch; no owned CUDA kernel to template
+- `src/vibespatial/overlay/dissolve.py` (mixed) — delegates to lower-level GPU ops
+- `src/vibespatial/spatial/indexing.py` (COARSE) — dispatch via plan_dispatch_selection; no owned CUDA kernel to template
+- `src/vibespatial/constructive/make_valid_gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; GPU repair kernels (close_rings, flag_duplicate_vertices, reverse_ring_coords, split event kernels) all use fp64 storage and compute
 
 ### Priority order (highest performance impact first)
 

@@ -4,10 +4,10 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from vibespatial.clip_rect import RectClipResult, clip_by_rect_owned
-from vibespatial.kernel_registry import register_kernel_variant
-from vibespatial.precision import KernelClass, PrecisionMode
+from vibespatial.constructive.clip_rect import RectClipResult, clip_by_rect_owned
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 ClipInput = Sequence[object | None] | np.ndarray | object
 
