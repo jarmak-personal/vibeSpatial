@@ -46,6 +46,7 @@ from vibespatial.runtime.provenance import (
     ProvenanceTag,
     attempt_provenance_rewrite,
     make_buffer_tag,
+    provenance_rewrites_enabled,
     record_rewrite_event,
 )
 from vibespatial.runtime import ExecutionMode
@@ -1261,7 +1262,14 @@ class GeometryArray(ExtensionArray):
         single_sided = bool(kwargs.get("single_sided", False))
 
         # R5: buffer(0) is the identity operation
-        if isinstance(distance, int | float) and distance == 0:
+        if isinstance(distance, int | float) and distance == 0 and provenance_rewrites_enabled():
+            from time import perf_counter as _pc
+
+            _t0 = _pc()
+            result = GeometryArray(self._data.copy(), crs=self.crs)
+            if self._owned is not None:
+                result._owned = self._owned
+            _elapsed = _pc() - _t0
             record_rewrite_event(
                 rule_name="R5_buffer_zero_identity",
                 surface="geopandas.array.buffer",
@@ -1269,24 +1277,28 @@ class GeometryArray(ExtensionArray):
                 rewritten_operation="identity",
                 reason="buffer(0) is the identity operation",
                 detail=f"rows={len(self)}",
+                elapsed_seconds=_elapsed,
             )
-            result = GeometryArray(self._data.copy(), crs=self.crs)
-            if self._owned is not None:
-                result._owned = self._owned
             return result
 
         # R6: buffer(a).buffer(b) -> buffer(a+b) for point geometries
         from vibespatial.runtime.provenance import _r6_preconditions_met
 
         if (
-            self._provenance is not None
+            provenance_rewrites_enabled()
+            and self._provenance is not None
             and self._provenance.operation == "buffer"
             and isinstance(distance, int | float)
             and _r6_preconditions_met(self._provenance, distance, cap_style, join_style)
         ):
+            from time import perf_counter as _pc
+
             prev_distance = self._provenance.get_param("distance")
             merged_distance = prev_distance + distance
             source = self._provenance.source_array
+            _t0 = _pc()
+            merged_result = source.buffer(merged_distance, quad_segs=quad_segs, **kwargs)
+            _elapsed = _pc() - _t0
             record_rewrite_event(
                 rule_name="R6_buffer_chain_merge",
                 surface="geopandas.array.buffer",
@@ -1294,8 +1306,9 @@ class GeometryArray(ExtensionArray):
                 rewritten_operation="buffer",
                 reason="buffer(a).buffer(b) merged to buffer(a+b)",
                 detail=f"a={prev_distance}, b={distance}, merged={merged_distance}",
+                elapsed_seconds=_elapsed,
             )
-            return source.buffer(merged_distance, quad_segs=quad_segs, **kwargs)
+            return merged_result
 
         owned, selected = evaluate_geopandas_buffer(
             self._data,

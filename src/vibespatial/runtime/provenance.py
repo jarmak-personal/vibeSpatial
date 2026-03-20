@@ -9,8 +9,10 @@ See ADR-0039 for the design rationale.
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict, deque
 from dataclasses import asdict, dataclass, field
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -67,6 +69,7 @@ class RewriteEvent:
     rewritten_operation: str
     reason: str
     detail: str = ""
+    elapsed_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -106,6 +109,7 @@ def record_rewrite_event(
     rewritten_operation: str,
     reason: str,
     detail: str = "",
+    elapsed_seconds: float = 0.0,
 ) -> RewriteEvent:
     event = RewriteEvent(
         rule_name=rule_name,
@@ -114,6 +118,7 @@ def record_rewrite_event(
         rewritten_operation=rewritten_operation,
         reason=reason,
         detail=detail,
+        elapsed_seconds=elapsed_seconds,
     )
     _REWRITE_EVENTS.append(event)
     append_event_record("rewrite", event.to_dict())
@@ -129,6 +134,29 @@ def get_rewrite_events(*, clear: bool = False) -> list[RewriteEvent]:
 
 def clear_rewrite_events() -> None:
     _REWRITE_EVENTS.clear()
+
+
+# ---------------------------------------------------------------------------
+# A/B disable switch
+# ---------------------------------------------------------------------------
+
+PROVENANCE_REWRITES_ENV_VAR = "VIBESPATIAL_PROVENANCE_REWRITES"
+
+_override_rewrites: bool | None = None
+
+
+def set_provenance_rewrites(enabled: bool | None) -> None:
+    """Override provenance rewrites. Pass None to clear (use env var or default)."""
+    global _override_rewrites
+    _override_rewrites = enabled
+
+
+def provenance_rewrites_enabled() -> bool:
+    """Check if provenance rewrites are enabled. Default: True."""
+    if _override_rewrites is not None:
+        return _override_rewrites
+    value = os.environ.get(PROVENANCE_REWRITES_ENV_VAR, "1")
+    return value.lower() not in {"0", "false", "no", "off"}
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +345,10 @@ def attempt_rewrite_buffer_intersects(
     else:
         right_arg = right
 
+    t0 = perf_counter()
     result = evaluate_geopandas_dwithin(left_arg, right_arg, distance)
     if result is not None:
+        elapsed = perf_counter() - t0
         record_rewrite_event(
             rule_name="R1_buffer_intersects_to_dwithin",
             surface="geopandas.array.intersects",
@@ -326,6 +356,7 @@ def attempt_rewrite_buffer_intersects(
             rewritten_operation="dwithin",
             reason=R1_BUFFER_INTERSECTS.reason,
             detail=f"buffer_distance={distance}",
+            elapsed_seconds=elapsed,
         )
         record_dispatch_event(
             surface="geopandas.array.intersects",
@@ -342,6 +373,7 @@ def attempt_rewrite_buffer_intersects(
     right_data = right._data if hasattr(right, "_data") else right
     result = shapely.dwithin(source_data, right_data, distance=distance)
     if result is not None:
+        elapsed = perf_counter() - t0
         record_rewrite_event(
             rule_name="R1_buffer_intersects_to_dwithin",
             surface="geopandas.array.intersects",
@@ -349,6 +381,7 @@ def attempt_rewrite_buffer_intersects(
             rewritten_operation="dwithin",
             reason=R1_BUFFER_INTERSECTS.reason,
             detail=f"buffer_distance={distance}, fallback=shapely",
+            elapsed_seconds=elapsed,
         )
         record_dispatch_event(
             surface="geopandas.array.intersects",
@@ -383,6 +416,8 @@ def attempt_provenance_rewrite(
 
     Returns the rewritten result array, or None if no rewrite applies.
     """
+    if not provenance_rewrites_enabled():
+        return None
     if not hasattr(left, "_provenance") or left._provenance is None:
         return None
 

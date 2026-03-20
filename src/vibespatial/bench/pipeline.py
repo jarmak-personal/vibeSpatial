@@ -78,6 +78,7 @@ PIPELINE_DEFINITIONS = (
     "network-service-area-geopandas",
     "site-suitability",
     "site-suitability-geopandas",
+    "provenance-rewrite",
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".benchmark_fixtures"
@@ -160,6 +161,7 @@ class PipelineBenchmarkResult:
     peak_device_memory_bytes: int | None
     stages: tuple[ProfileTrace | dict, ...] = field(default_factory=tuple)
     notes: str = ""
+    rewrite_event_count: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -179,6 +181,7 @@ class PipelineBenchmarkResult:
                 for stage in self.stages
             ],
             "notes": self.notes,
+            "rewrite_event_count": self.rewrite_event_count,
         }
 
 
@@ -2826,6 +2829,145 @@ def pipeline_scales(suite: str) -> tuple[int, ...]:
     raise ValueError(f"Unsupported suite: {suite}")
 
 
+# ---------------------------------------------------------------------------
+# Provenance rewrite A/B benchmark pipeline
+# ---------------------------------------------------------------------------
+
+
+def _profile_provenance_rewrite_pipeline(
+    scale: int,
+    *,
+    enable_nvtx: bool = False,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> PipelineBenchmarkResult:
+    """A/B benchmark: buffer().intersects() with vs without provenance rewrites."""
+    from time import perf_counter
+
+    from shapely.geometry import Point
+
+    from vibespatial.api.geometry_array import GeometryArray
+    from vibespatial.runtime.provenance import (
+        clear_rewrite_events,
+        get_rewrite_events,
+        set_provenance_rewrites,
+    )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    clear_rewrite_events()
+
+    profiler = StageProfiler(
+        operation="pipeline.provenance-rewrite",
+        dataset=f"scale-{scale}",
+        requested_runtime=ExecutionMode.AUTO,
+        selected_runtime="cpu",
+        enable_nvtx=enable_nvtx,
+        retain_gpu_trace=retain_gpu_trace,
+        include_gpu_sparklines=include_gpu_sparklines,
+    )
+
+    buffer_distance = 5.0
+
+    with profiler.stage(
+        "generate_points",
+        category="setup",
+        device=ExecutionMode.CPU,
+        rows_in=scale,
+        detail="generate random point arrays for A/B comparison",
+    ) as stage:
+        rng = np.random.default_rng(42)
+        coords_left = rng.uniform(0, 1000, (scale, 2))
+        coords_right = rng.uniform(0, 1000, (scale, 2))
+        points = GeometryArray(
+            np.array([Point(x, y) for x, y in coords_left], dtype=object),
+        )
+        targets = GeometryArray(
+            np.array([Point(x, y) for x, y in coords_right], dtype=object),
+        )
+        stage.rows_out = scale
+
+    # A: with rewrites (should fire R1: buffer(r).intersects -> dwithin(r))
+    clear_rewrite_events()
+    with profiler.stage(
+        "buffer_intersects_rewrite",
+        category="refine",
+        device=ExecutionMode.CPU,
+        rows_in=scale,
+        detail="buffer().intersects() with provenance rewrites enabled",
+    ) as stage:
+        t0 = perf_counter()
+        result_a = points.buffer(buffer_distance).intersects(targets)
+        rewrite_elapsed = perf_counter() - t0
+        rewrite_events = get_rewrite_events()
+        stage.rows_out = int(np.sum(result_a)) if hasattr(result_a, "__len__") else 0
+        stage.metadata["rewrite_count"] = len(rewrite_events)
+        stage.metadata["wall_clock_seconds"] = rewrite_elapsed
+
+    # B: without rewrites (naive path)
+    set_provenance_rewrites(False)
+    clear_rewrite_events()
+    try:
+        with profiler.stage(
+            "buffer_intersects_naive",
+            category="refine",
+            device=ExecutionMode.CPU,
+            rows_in=scale,
+            detail="buffer().intersects() with provenance rewrites disabled",
+        ) as stage:
+            t0 = perf_counter()
+            result_b = points.buffer(buffer_distance).intersects(targets)
+            naive_elapsed = perf_counter() - t0
+            naive_events = get_rewrite_events()
+            stage.rows_out = int(np.sum(result_b)) if hasattr(result_b, "__len__") else 0
+            stage.metadata["rewrite_count"] = len(naive_events)
+            stage.metadata["wall_clock_seconds"] = naive_elapsed
+    finally:
+        set_provenance_rewrites(None)
+
+    # Compare
+    results_match = np.array_equal(result_a, result_b)
+    speedup = naive_elapsed / rewrite_elapsed if rewrite_elapsed > 0 else float("inf")
+    with profiler.stage(
+        "compare",
+        category="emit",
+        device=ExecutionMode.CPU,
+        rows_in=scale,
+        detail="verify equivalence and compute speedup",
+    ) as stage:
+        stage.rows_out = scale
+        stage.metadata["results_match"] = results_match
+        stage.metadata["speedup"] = round(speedup, 3)
+        stage.metadata["rewrite_seconds"] = round(rewrite_elapsed, 6)
+        stage.metadata["naive_seconds"] = round(naive_elapsed, 6)
+
+    trace = profiler.finish(
+        metadata={
+            "scale": scale,
+            "buffer_distance": buffer_distance,
+            "speedup": round(speedup, 3),
+            "results_match": results_match,
+            "rewrite_event_count": len(rewrite_events),
+        }
+    )
+    return PipelineBenchmarkResult(
+        pipeline="provenance-rewrite",
+        scale=scale,
+        status="ok",
+        elapsed_seconds=trace.total_elapsed_seconds,
+        selected_runtime="cpu",
+        planner_selected_runtime="cpu",
+        output_rows=int(np.sum(result_a)) if hasattr(result_a, "__len__") else 0,
+        transfer_count=0,
+        materialization_count=0,
+        fallback_event_count=0,
+        peak_device_memory_bytes=None,
+        stages=(_trace_to_stage_dict(trace),),
+        notes=f"A/B provenance rewrite benchmark: speedup={speedup:.3f}x, match={results_match}",
+        rewrite_event_count=len(rewrite_events),
+    )
+
+
 def benchmark_pipeline_suite(
     *,
     suite: str = "ci",
@@ -2986,6 +3128,15 @@ def benchmark_pipeline_suite(
                             include_gpu_sparklines=include_gpu_sparklines,
                         )
                     )
+                elif pipeline == "provenance-rewrite":
+                    samples.append(
+                        _profile_provenance_rewrite_pipeline(
+                            scale,
+                            enable_nvtx=enable_nvtx,
+                            retain_gpu_trace=retain_gpu_trace,
+                            include_gpu_sparklines=include_gpu_sparklines,
+                        )
+                    )
                 else:
                     raise ValueError(f"Unsupported pipeline: {pipeline}")
             if pipeline == "raster-to-vector":
@@ -3011,6 +3162,7 @@ def benchmark_pipeline_suite(
                     ),
                     stages=median_sample.stages,
                     notes=median_sample.notes,
+                    rewrite_event_count=median_sample.rewrite_event_count,
                 )
             )
     if suite == "full":

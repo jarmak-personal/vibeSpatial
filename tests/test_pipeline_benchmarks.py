@@ -201,3 +201,32 @@ def test_pipeline_regression_check_flags_wall_clock_and_transfers() -> None:
     assert "transfer_count" in metrics
     assert "materialization_count" in metrics
     assert "peak_device_memory_bytes" in metrics
+
+
+def test_provenance_rewrite_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(suite="smoke", pipelines=("provenance-rewrite",))
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "provenance-rewrite"
+    assert result.scale == 1000
+    assert result.status == "ok"
+    assert result.rewrite_event_count > 0
+
+    trace = result.stages[0]
+    stage_names = [stage["name"] for stage in trace["stages"]]
+    assert "generate_points" in stage_names
+    assert "buffer_intersects_rewrite" in stage_names
+    assert "buffer_intersects_naive" in stage_names
+    assert "compare" in stage_names
+
+    # Rewrite stage should have rewrite_count > 0
+    rewrite_stage = next(s for s in trace["stages"] if s["name"] == "buffer_intersects_rewrite")
+    assert rewrite_stage["metadata"]["rewrite_count"] > 0
+
+    # Naive stage should have rewrite_count == 0
+    naive_stage = next(s for s in trace["stages"] if s["name"] == "buffer_intersects_naive")
+    assert naive_stage["metadata"]["rewrite_count"] == 0
+
+    # Results should match
+    compare_stage = next(s for s in trace["stages"] if s["name"] == "compare")
+    assert compare_stage["metadata"]["results_match"] is True

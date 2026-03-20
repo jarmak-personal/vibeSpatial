@@ -15778,6 +15778,8 @@
         "record_rewrite_event",
         "get_rewrite_events",
         "clear_rewrite_events",
+        "set_provenance_rewrites",
+        "provenance_rewrites_enabled",
         "infer_geom_types",
         "_is_point_only",
         "make_buffer_tag",
@@ -15791,6 +15793,7 @@
         "buffer",
         "candidates",
         "clear",
+        "enabled",
         "event",
         "events",
         "geom",
@@ -15812,7 +15815,9 @@
         "rewrite",
         "rewriteevent",
         "rewriterule",
+        "rewrites",
         "runtime",
+        "set",
         "src",
         "tag",
         "types",
@@ -19371,7 +19376,8 @@
         "test_network_service_area_geopandas_smoke",
         "test_site_suitability_smoke",
         "test_site_suitability_geopandas_smoke",
-        "test_pipeline_regression_check_flags_wall_clock_and_transfers"
+        "test_pipeline_regression_check_flags_wall_clock_and_transfers",
+        "test_provenance_rewrite_pipeline_smoke"
       ],
       "tokens": [
         "active",
@@ -19391,8 +19397,10 @@
         "pipeline",
         "pipelines",
         "predicate",
+        "provenance",
         "py",
         "regression",
+        "rewrite",
         "run",
         "runs",
         "service",
@@ -19796,7 +19804,9 @@
         "TestR5BufferZero",
         "TestR1BufferIntersects",
         "TestR6BufferChain",
-        "TestRewriteFallthrough"
+        "TestRewriteFallthrough",
+        "TestRewriteTiming",
+        "TestDisableSwitch"
       ],
       "tokens": [
         "array",
@@ -19808,6 +19818,7 @@
         "provenance",
         "py",
         "test",
+        "testdisableswitch",
         "testpreconditions",
         "testprovenancetag",
         "testr1bufferintersects",
@@ -19816,6 +19827,7 @@
         "testregistry",
         "testrewriteevents",
         "testrewritefallthrough",
+        "testrewritetiming",
         "tests",
         "testtagsetting"
       ]

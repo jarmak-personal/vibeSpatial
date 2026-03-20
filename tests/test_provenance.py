@@ -222,10 +222,12 @@ class TestRewriteEvents:
             rewritten_operation="b",
             reason="t",
             detail="d",
+            elapsed_seconds=0.042,
         )
         d = event.to_dict()
         assert d["rule_name"] == "r"
         assert d["detail"] == "d"
+        assert d["elapsed_seconds"] == 0.042
 
 
 # ---------------------------------------------------------------------------
@@ -508,3 +510,133 @@ class TestRewriteFallthrough:
     def test_attempt_provenance_rewrite_returns_none_for_no_tag(self, point_array, other_point_array):
         result = attempt_provenance_rewrite("intersects", point_array, other_point_array)
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: elapsed_seconds on RewriteEvent
+# ---------------------------------------------------------------------------
+
+
+class TestRewriteTiming:
+    def test_rewrite_event_has_elapsed_seconds(self, point_array, other_point_array):
+        """R1 rewrite event should carry positive timing."""
+        buffered = point_array.buffer(30.0)
+        clear_rewrite_events()
+        buffered.intersects(other_point_array)
+
+        events = get_rewrite_events()
+        r1 = [e for e in events if e.rule_name == "R1_buffer_intersects_to_dwithin"]
+        assert len(r1) == 1
+        assert r1[0].elapsed_seconds > 0
+
+    def test_r5_event_has_elapsed_seconds(self, point_array):
+        """R5 rewrite event should carry non-negative timing."""
+        clear_rewrite_events()
+        point_array.buffer(0)
+
+        events = get_rewrite_events()
+        r5 = [e for e in events if e.rule_name == "R5_buffer_zero_identity"]
+        assert len(r5) == 1
+        assert r5[0].elapsed_seconds >= 0
+
+    def test_r6_event_has_elapsed_seconds(self, point_array):
+        """R6 rewrite event should carry positive timing."""
+        clear_rewrite_events()
+        point_array.buffer(5.0).buffer(10.0)
+
+        events = get_rewrite_events()
+        r6 = [e for e in events if e.rule_name == "R6_buffer_chain_merge"]
+        assert len(r6) == 1
+        assert r6[0].elapsed_seconds > 0
+
+    def test_rewrite_event_to_dict_includes_elapsed(self, point_array, other_point_array):
+        buffered = point_array.buffer(30.0)
+        clear_rewrite_events()
+        buffered.intersects(other_point_array)
+
+        events = get_rewrite_events()
+        d = events[0].to_dict()
+        assert "elapsed_seconds" in d
+        assert d["elapsed_seconds"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: A/B disable switch
+# ---------------------------------------------------------------------------
+
+
+class TestDisableSwitch:
+    @pytest.fixture(autouse=True)
+    def _restore_switch(self):
+        """Ensure the switch is restored after each test."""
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        yield
+        set_provenance_rewrites(None)
+
+    def test_default_is_enabled(self):
+        from vibespatial.runtime.provenance import provenance_rewrites_enabled
+
+        assert provenance_rewrites_enabled()
+
+    def test_disable_via_python_api(self, point_array, other_point_array):
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        set_provenance_rewrites(False)
+        buffered = point_array.buffer(30.0)
+        clear_rewrite_events()
+        buffered.intersects(other_point_array)
+
+        events = get_rewrite_events()
+        assert not any(e.rule_name == "R1_buffer_intersects_to_dwithin" for e in events)
+
+    def test_reenable_after_disable(self, point_array, other_point_array):
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        set_provenance_rewrites(False)
+        set_provenance_rewrites(None)  # clear override -> back to default (enabled)
+
+        buffered = point_array.buffer(30.0)
+        clear_rewrite_events()
+        buffered.intersects(other_point_array)
+
+        events = get_rewrite_events()
+        assert any(e.rule_name == "R1_buffer_intersects_to_dwithin" for e in events)
+
+    def test_disable_via_env_var(self, monkeypatch, point_array, other_point_array):
+        monkeypatch.setenv("VIBESPATIAL_PROVENANCE_REWRITES", "off")
+
+        buffered = point_array.buffer(30.0)
+        clear_rewrite_events()
+        buffered.intersects(other_point_array)
+
+        events = get_rewrite_events()
+        assert not any(e.rule_name == "R1_buffer_intersects_to_dwithin" for e in events)
+
+    def test_r5_respects_disable(self, point_array):
+        """When disabled, buffer(0) should run the full buffer (producing valid polygons, not identity)."""
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        set_provenance_rewrites(False)
+        clear_rewrite_events()
+        result = point_array.buffer(0)
+
+        events = get_rewrite_events()
+        assert not any(e.rule_name == "R5_buffer_zero_identity" for e in events)
+        # Result should still be valid geometry (shapely buffer(0) returns empty geoms or points)
+        assert len(result) == len(point_array)
+
+    def test_r1_respects_disable(self, point_array, other_point_array):
+        """When disabled, buffer().intersects() runs the normal predicate path."""
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        set_provenance_rewrites(False)
+        buffered = point_array.buffer(30.0)
+        clear_rewrite_events()
+        result = buffered.intersects(other_point_array)
+
+        events = get_rewrite_events()
+        assert not any(e.rule_name == "R1_buffer_intersects_to_dwithin" for e in events)
+        # Result should still be a valid boolean array
+        assert result.dtype == bool
+        assert len(result) == len(point_array)
