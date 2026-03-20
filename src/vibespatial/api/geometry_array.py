@@ -6,6 +6,7 @@ import operator
 import typing
 import warnings
 from functools import lru_cache
+from time import perf_counter as _perf_counter
 from typing import Any, ClassVar, Literal
 
 import numpy as np
@@ -1261,22 +1262,22 @@ class GeometryArray(ExtensionArray):
         mitre_limit = float(kwargs.get("mitre_limit", 5.0))
         single_sided = bool(kwargs.get("single_sided", False))
 
-        # R5: buffer(0) is the identity operation
-        if isinstance(distance, int | float) and distance == 0 and provenance_rewrites_enabled():
-            from time import perf_counter as _pc
+        _rewrites_on = provenance_rewrites_enabled()
 
-            _t0 = _pc()
+        # R5: buffer(0) is the identity operation
+        if isinstance(distance, int | float) and distance == 0 and _rewrites_on:
+            _t0 = _perf_counter()
             result = GeometryArray(self._data.copy(), crs=self.crs)
             if self._owned is not None:
                 result._owned = self._owned
-            _elapsed = _pc() - _t0
+            _elapsed = _perf_counter() - _t0
             record_rewrite_event(
                 rule_name="R5_buffer_zero_identity",
                 surface="geopandas.array.buffer",
                 original_operation="buffer",
                 rewritten_operation="identity",
                 reason="buffer(0) is the identity operation",
-                detail=f"rows={len(self)}",
+                detail=f"rows={len(self)}, note=identity_copy_time",
                 elapsed_seconds=_elapsed,
             )
             return result
@@ -1285,20 +1286,18 @@ class GeometryArray(ExtensionArray):
         from vibespatial.runtime.provenance import _r6_preconditions_met
 
         if (
-            provenance_rewrites_enabled()
+            _rewrites_on
             and self._provenance is not None
             and self._provenance.operation == "buffer"
             and isinstance(distance, int | float)
             and _r6_preconditions_met(self._provenance, distance, cap_style, join_style)
         ):
-            from time import perf_counter as _pc
-
             prev_distance = self._provenance.get_param("distance")
             merged_distance = prev_distance + distance
             source = self._provenance.source_array
-            _t0 = _pc()
+            _t0 = _perf_counter()
             merged_result = source.buffer(merged_distance, quad_segs=quad_segs, **kwargs)
-            _elapsed = _pc() - _t0
+            _elapsed = _perf_counter() - _t0
             record_rewrite_event(
                 rule_name="R6_buffer_chain_merge",
                 surface="geopandas.array.buffer",

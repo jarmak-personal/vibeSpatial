@@ -2844,8 +2844,6 @@ def _profile_provenance_rewrite_pipeline(
     """A/B benchmark: buffer().intersects() with vs without provenance rewrites."""
     from time import perf_counter
 
-    from shapely.geometry import Point
-
     from vibespatial.api.geometry_array import GeometryArray
     from vibespatial.runtime.provenance import (
         clear_rewrite_events,
@@ -2880,10 +2878,10 @@ def _profile_provenance_rewrite_pipeline(
         coords_left = rng.uniform(0, 1000, (scale, 2))
         coords_right = rng.uniform(0, 1000, (scale, 2))
         points = GeometryArray(
-            np.array([Point(x, y) for x, y in coords_left], dtype=object),
+            shapely.points(coords_left),
         )
         targets = GeometryArray(
-            np.array([Point(x, y) for x, y in coords_right], dtype=object),
+            shapely.points(coords_right),
         )
         stage.rows_out = scale
 
