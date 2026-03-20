@@ -607,6 +607,7 @@ class GeometryArray(ExtensionArray):
             result._owned = self._owned
             result._owned_flat_sindex = self._owned_flat_sindex
             result._owned_spatial_input_supported = self._owned_spatial_input_supported
+            result._provenance = self._provenance
             return result
 
         # array-like, slice
@@ -1355,6 +1356,23 @@ class GeometryArray(ExtensionArray):
         )
 
     def simplify(self, tolerance, preserve_topology: bool = True) -> GeometryArray:
+        # R7: simplify(0) is the identity operation
+        if isinstance(tolerance, int | float) and tolerance == 0 and provenance_rewrites_enabled():
+            _t0 = _perf_counter()
+            result = GeometryArray(self._data.copy(), crs=self.crs)
+            if self._owned is not None:
+                result._owned = self._owned
+            _elapsed = _perf_counter() - _t0
+            record_rewrite_event(
+                rule_name="R7_simplify_zero_identity",
+                surface="geopandas.array.simplify",
+                original_operation="simplify",
+                rewritten_operation="identity",
+                reason="simplify(0) is the identity operation",
+                detail=f"rows={len(self)}, note=identity_copy_time",
+                elapsed_seconds=_elapsed,
+            )
+            return result
         return GeometryArray(
             shapely.simplify(
                 self._data, tolerance, preserve_topology=preserve_topology

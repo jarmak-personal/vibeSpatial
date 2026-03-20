@@ -49,13 +49,15 @@ Key properties:
 - each `RewriteEvent` carries `elapsed_seconds` wall-clock timing of the
   rewritten computation for performance analysis
 
-Initial rewrite rules:
+Rewrite rules:
 
 | Rule | Pattern | Rewrite | Constraint |
 |---|---|---|---|
-| R5 | `buffer(0)` | identity | always valid |
 | R1 | `buffer(r).intersects(Y)` | `dwithin(Y, r)` | point-only, round cap/join |
+| R2 | `sjoin(buffer(r,X), Y, "intersects")` | `sjoin(X, Y, "dwithin", r)` | point-only, round cap/join |
+| R5 | `buffer(0)` | identity | always valid |
 | R6 | `buffer(a).buffer(b)` | `buffer(a+b)` | positive radii, same style, point-only |
+| R7 | `simplify(0)` | identity | always valid |
 
 ## Consequences
 

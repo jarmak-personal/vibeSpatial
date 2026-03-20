@@ -7,9 +7,18 @@ import pandas as pd
 from vibespatial.api import GeoDataFrame
 from vibespatial.api._compat import PANDAS_GE_30
 from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
-from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime import ExecutionMode
-from vibespatial.spatial.query import build_owned_spatial_index, query_spatial_index, supports_owned_spatial_input
+from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.provenance import (
+    _r1_preconditions_met,
+    provenance_rewrites_enabled,
+    record_rewrite_event,
+)
+from vibespatial.spatial.query import (
+    build_owned_spatial_index,
+    query_spatial_index,
+    supports_owned_spatial_input,
+)
 
 
 def sjoin(
@@ -332,11 +341,43 @@ def _geom_predicate_query(
     """
     original_predicate = predicate
 
+    # R2: sjoin(buffer(r, X), Y, "intersects") -> sjoin(X, Y, "dwithin", r)
+    # When the left geometry was produced by buffer() on point data, we can
+    # substitute the original (pre-buffer) geometry and use dwithin instead.
+    if (
+        provenance_rewrites_enabled()
+        and predicate == "intersects"
+        and distance is None
+    ):
+        left_ga = left_df.geometry.values
+        tag = getattr(left_ga, "_provenance", None)
+        if tag is not None and tag.operation == "buffer" and _r1_preconditions_met(tag):
+            buf_distance = tag.get_param("distance")
+            source_ga = tag.source_array
+            if source_ga is not None and len(source_ga) == len(left_ga):
+                from vibespatial.api.geoseries import GeoSeries
+
+                rewritten_left = left_df.copy()
+                rewritten_left[left_df.geometry.name] = GeoSeries(
+                    source_ga, index=left_df.index, crs=left_df.crs
+                )
+                record_rewrite_event(
+                    rule_name="R2_sjoin_buffer_intersects_to_dwithin",
+                    surface="geopandas.tools.sjoin",
+                    original_operation="sjoin(buffer, intersects)",
+                    rewritten_operation="sjoin(dwithin)",
+                    reason="sjoin(buffer(r, X), Y, intersects) == sjoin(X, Y, dwithin, r)",
+                    detail=f"buffer_distance={buf_distance}, rows={len(left_df)}",
+                )
+                left_df = rewritten_left
+                predicate = "dwithin"
+                distance = buf_distance
+
     # Always try owned spatial query first for all join types, not just
     # outer.  The owned engine handles 'within' directly so we pass the
-    # original predicate.
+    # current predicate (which may have been rewritten by R2 above).
     owned_result = _query_with_owned_spatial_index(
-        left_df, right_df, original_predicate, distance
+        left_df, right_df, predicate, distance
     )
     if owned_result is not None:
         (l_idx, r_idx), owned_execution = owned_result

@@ -640,3 +640,169 @@ class TestDisableSwitch:
         # Result should still be a valid boolean array
         assert result.dtype == bool
         assert len(result) == len(point_array)
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: R7 (simplify(0) identity)
+# ---------------------------------------------------------------------------
+
+
+class TestR7SimplifyZero:
+    def test_simplify_zero_returns_same_geometries(self, polygon_array):
+        result = polygon_array.simplify(0)
+        np.testing.assert_array_equal(
+            shapely.get_coordinates(result._data),
+            shapely.get_coordinates(polygon_array._data),
+        )
+
+    def test_simplify_zero_logs_rewrite_event(self, polygon_array):
+        clear_rewrite_events()
+        polygon_array.simplify(0)
+        events = get_rewrite_events()
+        assert len(events) == 1
+        assert events[0].rule_name == "R7_simplify_zero_identity"
+        assert events[0].rewritten_operation == "identity"
+
+    def test_simplify_zero_has_elapsed_seconds(self, polygon_array):
+        clear_rewrite_events()
+        polygon_array.simplify(0)
+        events = get_rewrite_events()
+        assert events[0].elapsed_seconds >= 0
+
+    def test_simplify_nonzero_no_rewrite(self, polygon_array):
+        clear_rewrite_events()
+        polygon_array.simplify(1.0)
+        events = get_rewrite_events()
+        assert not any(e.rule_name == "R7_simplify_zero_identity" for e in events)
+
+    def test_simplify_zero_respects_disable(self, polygon_array):
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        set_provenance_rewrites(False)
+        try:
+            clear_rewrite_events()
+            result = polygon_array.simplify(0)
+            events = get_rewrite_events()
+            assert not any(e.rule_name == "R7_simplify_zero_identity" for e in events)
+            assert len(result) == len(polygon_array)
+        finally:
+            set_provenance_rewrites(None)
+
+    def test_r7_rule_registered(self):
+        candidates = get_rewrite_candidates("simplify", "__self__")
+        assert any(r.name == "R7_simplify_zero_identity" for r in candidates)
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: R2 (sjoin buffer+intersects -> sjoin dwithin)
+# ---------------------------------------------------------------------------
+
+
+class TestR2SjoinBufferIntersects:
+    def test_equivalence(self):
+        """sjoin(buffer(r, X), Y, 'intersects') should match sjoin(X, Y, 'dwithin', r)."""
+        import vibespatial.api as gpd
+
+        rng = np.random.default_rng(42)
+        n = 200
+        left = gpd.GeoDataFrame(
+            {"val": rng.integers(0, 100, n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        right = gpd.GeoDataFrame(
+            {"zone": rng.integers(0, 10, n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+
+        # With rewrite (provenance-based)
+        buffered_left = left.copy()
+        buffered_left["geometry"] = left.geometry.buffer(5.0)
+        clear_rewrite_events()
+        result_rewrite = gpd.sjoin(buffered_left, right, predicate="intersects")
+
+        events = get_rewrite_events()
+        assert any(e.rule_name == "R2_sjoin_buffer_intersects_to_dwithin" for e in events)
+
+        # Direct dwithin (ground truth)
+        result_dwithin = gpd.sjoin(left, right, predicate="dwithin", distance=5.0)
+
+        # Both should find the same pairs (index sets should match)
+        rewrite_pairs = set(zip(result_rewrite.index, result_rewrite["index_right"]))
+        dwithin_pairs = set(zip(result_dwithin.index, result_dwithin["index_right"]))
+        assert rewrite_pairs == dwithin_pairs
+
+    def test_logs_rewrite_event(self):
+        import vibespatial.api as gpd
+
+        rng = np.random.default_rng(42)
+        n = 50
+        left = gpd.GeoDataFrame(
+            {"val": np.arange(n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        right = gpd.GeoDataFrame(
+            {"zone": np.arange(n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        buffered_left = left.copy()
+        buffered_left["geometry"] = left.geometry.buffer(5.0)
+        clear_rewrite_events()
+        gpd.sjoin(buffered_left, right, predicate="intersects")
+
+        events = get_rewrite_events()
+        r2 = [e for e in events if e.rule_name == "R2_sjoin_buffer_intersects_to_dwithin"]
+        assert len(r2) == 1
+        assert "buffer_distance=5.0" in r2[0].detail
+
+    def test_no_rewrite_for_polygon_input(self):
+        """Polygon geometries should NOT trigger R2."""
+        import vibespatial.api as gpd
+
+        rng = np.random.default_rng(42)
+        n = 50
+        polys = shapely.buffer(shapely.points(rng.uniform(0, 100, (n, 2))), 3.0)
+        left = gpd.GeoDataFrame(
+            {"val": np.arange(n)},
+            geometry=gpd.GeoSeries(polys),
+        )
+        right = gpd.GeoDataFrame(
+            {"zone": np.arange(n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        buffered_left = left.copy()
+        buffered_left["geometry"] = left.geometry.buffer(5.0)
+        clear_rewrite_events()
+        gpd.sjoin(buffered_left, right, predicate="intersects")
+
+        events = get_rewrite_events()
+        assert not any(e.rule_name == "R2_sjoin_buffer_intersects_to_dwithin" for e in events)
+
+    def test_no_rewrite_when_disabled(self):
+        import vibespatial.api as gpd
+        from vibespatial.runtime.provenance import set_provenance_rewrites
+
+        rng = np.random.default_rng(42)
+        n = 50
+        left = gpd.GeoDataFrame(
+            {"val": np.arange(n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        right = gpd.GeoDataFrame(
+            {"zone": np.arange(n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        buffered_left = left.copy()
+        buffered_left["geometry"] = left.geometry.buffer(5.0)
+
+        set_provenance_rewrites(False)
+        try:
+            clear_rewrite_events()
+            gpd.sjoin(buffered_left, right, predicate="intersects")
+            events = get_rewrite_events()
+            assert not any(e.rule_name == "R2_sjoin_buffer_intersects_to_dwithin" for e in events)
+        finally:
+            set_provenance_rewrites(None)
+
+    def test_r2_rule_registered(self):
+        candidates = get_rewrite_candidates("buffer", "sjoin")
+        assert any(r.name == "R2_sjoin_buffer_intersects_to_dwithin" for r in candidates)

@@ -268,9 +268,27 @@ R6_BUFFER_CHAIN = RewriteRule(
     reason="buffer(a).buffer(b) == buffer(a+b) for positive radii on point geometries",
 )
 
+R2_SJOIN_BUFFER_INTERSECTS = RewriteRule(
+    name="R2_sjoin_buffer_intersects_to_dwithin",
+    input_pattern="buffer",
+    consumer_operation="sjoin",
+    preconditions=("point_only", "positive_distance", "round_cap", "round_join", "not_single_sided"),
+    reason="sjoin(buffer(r, X), Y, intersects) == sjoin(X, Y, dwithin, r) for point buffers",
+)
+
+R7_SIMPLIFY_ZERO = RewriteRule(
+    name="R7_simplify_zero_identity",
+    input_pattern="simplify",
+    consumer_operation="__self__",
+    preconditions=("tolerance_zero",),
+    reason="simplify(0) is the identity operation",
+)
+
 register_rewrite(R1_BUFFER_INTERSECTS)
+register_rewrite(R2_SJOIN_BUFFER_INTERSECTS)
 register_rewrite(R5_BUFFER_ZERO)
 register_rewrite(R6_BUFFER_CHAIN)
+register_rewrite(R7_SIMPLIFY_ZERO)
 
 
 # ---------------------------------------------------------------------------

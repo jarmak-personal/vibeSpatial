@@ -19809,7 +19809,9 @@
         "TestR6BufferChain",
         "TestRewriteFallthrough",
         "TestRewriteTiming",
-        "TestDisableSwitch"
+        "TestDisableSwitch",
+        "TestR7SimplifyZero",
+        "TestR2SjoinBufferIntersects"
       ],
       "tokens": [
         "array",
@@ -19825,8 +19827,10 @@
         "testpreconditions",
         "testprovenancetag",
         "testr1bufferintersects",
+        "testr2sjoinbufferintersects",
         "testr5bufferzero",
         "testr6bufferchain",
+        "testr7simplifyzero",
         "testregistry",
         "testrewriteevents",
         "testrewritefallthrough",
