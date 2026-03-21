@@ -33,3 +33,6 @@ benchmark_results/
 examples/data/
 
 cuda-learnings/
+
+# Audit reports
+reports/

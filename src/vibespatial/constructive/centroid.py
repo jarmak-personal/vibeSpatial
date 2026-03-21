@@ -20,6 +20,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover
+    cp = None
+
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -31,6 +36,8 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     OwnedGeometryArray,
+    build_device_resident_owned,
+    DeviceFamilyGeometryBuffer,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -459,10 +466,10 @@ def _compile_polygon_centroid_kernel(compute_type: str = "double"):
 def _centroid_gpu(
     owned: OwnedGeometryArray,
     precision_plan: PrecisionPlan | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> OwnedGeometryArray:
     """GPU-accelerated centroid for all geometry families.
 
-    Returns (cx, cy) tuple of float64 arrays of shape (row_count,).
+    Returns device-resident Point OwnedGeometryArray.
     Respects ADR-0002 precision dispatch.
     """
     from vibespatial.runtime.precision import PrecisionMode
@@ -480,8 +487,12 @@ def _centroid_gpu(
 
     runtime = get_cuda_runtime()
     row_count = owned.row_count
-    cx = np.full(row_count, np.nan, dtype=np.float64)
-    cy = np.full(row_count, np.nan, dtype=np.float64)
+
+    # Allocate global device output arrays initialized to NaN
+    d_cx = runtime.allocate((row_count,), np.float64)
+    d_cy = runtime.allocate((row_count,), np.float64)
+    d_cx[:] = cp.nan
+    d_cy[:] = cp.nan
 
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
@@ -490,13 +501,13 @@ def _centroid_gpu(
     # --- Point family ---
     _launch_point_centroid(
         owned, runtime, tags, family_row_offsets, device_state,
-        cx, cy, center_x, center_y, compute_type,
+        d_cx, d_cy, center_x, center_y, compute_type,
     )
 
     # --- MultiPoint family ---
     _launch_simple_centroid(
         owned, runtime, tags, family_row_offsets, device_state,
-        cx, cy, center_x, center_y, compute_type,
+        d_cx, d_cy, center_x, center_y, compute_type,
         GeometryFamily.MULTIPOINT, "multipoint_centroid",
         _MULTIPOINT_CENTROID_FP64, _MULTIPOINT_CENTROID_FP32,
         _MULTIPOINT_CENTROID_NAMES, "centroid-multipoint",
@@ -506,7 +517,7 @@ def _centroid_gpu(
     # --- LineString family ---
     _launch_simple_centroid(
         owned, runtime, tags, family_row_offsets, device_state,
-        cx, cy, center_x, center_y, compute_type,
+        d_cx, d_cy, center_x, center_y, compute_type,
         GeometryFamily.LINESTRING, "linestring_centroid",
         _LINESTRING_CENTROID_FP64, _LINESTRING_CENTROID_FP32,
         _LINESTRING_CENTROID_NAMES, "centroid-linestring",
@@ -516,7 +527,7 @@ def _centroid_gpu(
     # --- MultiLineString family ---
     _launch_simple_centroid(
         owned, runtime, tags, family_row_offsets, device_state,
-        cx, cy, center_x, center_y, compute_type,
+        d_cx, d_cy, center_x, center_y, compute_type,
         GeometryFamily.MULTILINESTRING, "multilinestring_centroid",
         _MULTILINESTRING_CENTROID_FP64, _MULTILINESTRING_CENTROID_FP32,
         _MULTILINESTRING_CENTROID_NAMES, "centroid-multilinestring",
@@ -526,32 +537,41 @@ def _centroid_gpu(
     # --- Polygon family ---
     _launch_polygon_centroid(
         owned, runtime, tags, family_row_offsets, device_state,
-        cx, cy, center_x, center_y, compute_type,
+        d_cx, d_cy, center_x, center_y, compute_type,
         GeometryFamily.POLYGON,
     )
 
     # --- MultiPolygon family ---
     _launch_polygon_centroid(
         owned, runtime, tags, family_row_offsets, device_state,
-        cx, cy, center_x, center_y, compute_type,
+        d_cx, d_cy, center_x, center_y, compute_type,
         GeometryFamily.MULTIPOLYGON,
     )
 
-    return cx, cy
+    # Mask invalid rows as NaN on device
+    d_validity = cp.asarray(owned.validity)
+    d_cx[~d_validity] = cp.nan
+    d_cy[~d_validity] = cp.nan
+
+    # Build device-resident Point OwnedGeometryArray
+    from vibespatial.constructive.point import _build_device_backed_point_output
+
+    return _build_device_backed_point_output(d_cx, d_cy, row_count=row_count)
 
 
 def _launch_point_centroid(
     owned, runtime, tags, family_row_offsets, device_state,
-    cx, cy, center_x, center_y, compute_type,
+    d_out_cx, d_out_cy, center_x, center_y, compute_type,
 ):
-    """Launch point centroid kernel (identity copy)."""
+    """Launch point centroid kernel (identity copy).
+
+    Scatters results directly into device output arrays ``d_out_cx``/``d_out_cy``.
+    """
     tag = FAMILY_TAGS[GeometryFamily.POINT]
     mask = tags == tag
-    if not np.any(mask) or GeometryFamily.POINT not in owned.families:
+    if not np.any(mask) or not owned.family_has_rows(GeometryFamily.POINT):
         return
     buf = owned.families[GeometryFamily.POINT]
-    if buf.row_count == 0 or len(buf.geometry_offsets) < 2:
-        return
 
     kernels = _compile_kernel(
         "centroid-point", _POINT_CENTROID_FP64, _POINT_CENTROID_FP32,
@@ -587,10 +607,11 @@ def _launch_point_centroid(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_cx = runtime.copy_device_to_host(d_cx)
-        family_cy = runtime.copy_device_to_host(d_cy)
-        cx[global_rows] = family_cx[family_rows]
-        cy[global_rows] = family_cy[family_rows]
+        # Device-side scatter into global output arrays
+        d_global = cp.asarray(global_rows)
+        d_family = cp.asarray(family_rows)
+        d_out_cx[d_global] = d_cx[d_family]
+        d_out_cy[d_global] = d_cy[d_family]
     finally:
         runtime.free(d_cx)
         runtime.free(d_cy)
@@ -600,20 +621,27 @@ def _launch_point_centroid(
 
 def _launch_simple_centroid(
     owned, runtime, tags, family_row_offsets, device_state,
-    cx, cy, center_x, center_y, compute_type,
+    d_out_cx, d_out_cy, center_x, center_y, compute_type,
     family, kernel_name, fp64_source, fp32_source, kernel_names, prefix,
     has_part_offsets,
 ):
-    """Launch centroid kernel for MultiPoint, LineString, or MultiLineString."""
+    """Launch centroid kernel for MultiPoint, LineString, or MultiLineString.
+
+    Scatters results directly into device output arrays ``d_out_cx``/``d_out_cy``.
+    """
     tag = FAMILY_TAGS[family]
     mask = tags == tag
-    if not np.any(mask) or family not in owned.families:
+    if not np.any(mask) or not owned.family_has_rows(family):
         return
     buf = owned.families[family]
-    if buf.row_count == 0 or len(buf.geometry_offsets) < 2:
-        return
-    if has_part_offsets and buf.part_offsets is None:
-        return
+    if has_part_offsets:
+        has_parts = (
+            (device_state is not None and family in device_state.families
+             and device_state.families[family].part_offsets is not None)
+            or buf.part_offsets is not None
+        )
+        if not has_parts:
+            return
 
     kernels = _compile_kernel(prefix, fp64_source, fp32_source, kernel_names, compute_type)
     kernel = kernels[kernel_name]
@@ -661,10 +689,11 @@ def _launch_simple_centroid(
             )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_cx = runtime.copy_device_to_host(d_cx)
-        family_cy = runtime.copy_device_to_host(d_cy)
-        cx[global_rows] = family_cx[family_rows]
-        cy[global_rows] = family_cy[family_rows]
+        # Device-side scatter into global output arrays
+        d_global = cp.asarray(global_rows)
+        d_family = cp.asarray(family_rows)
+        d_out_cx[d_global] = d_cx[d_family]
+        d_out_cy[d_global] = d_cy[d_family]
     finally:
         runtime.free(d_cx)
         runtime.free(d_cy)
@@ -674,24 +703,30 @@ def _launch_simple_centroid(
 
 def _launch_polygon_centroid(
     owned, runtime, tags, family_row_offsets, device_state,
-    cx, cy, center_x, center_y, compute_type,
+    d_out_cx, d_out_cy, center_x, center_y, compute_type,
     family,
 ):
-    """Launch polygon centroid kernel (Polygon or MultiPolygon)."""
+    """Launch polygon centroid kernel (Polygon or MultiPolygon).
+
+    Scatters results directly into device output arrays ``d_out_cx``/``d_out_cy``.
+    """
     tag = FAMILY_TAGS[family]
     mask = tags == tag
-    if not np.any(mask) or family not in owned.families:
+    if not np.any(mask) or not owned.family_has_rows(family):
         return
     buf = owned.families[family]
-    if buf.row_count == 0 or buf.ring_offsets is None or len(buf.geometry_offsets) < 2:
-        return
 
     n = buf.row_count
 
     # Choose cooperative vs simple kernel based on avg vertex count.
     # Cooperative kernel only applies to Polygon family (not MultiPolygon,
     # which uses the same per-thread polygon_centroid kernel).
-    avg_verts = buf.x.size / max(n, 1) if n > 0 else 0
+    # Read coordinate count from authoritative side (device stubs have x.size==0).
+    if device_state is not None and family in device_state.families:
+        coord_count = int(device_state.families[family].x.size)
+    else:
+        coord_count = buf.x.size
+    avg_verts = coord_count / max(n, 1) if n > 0 else 0
     use_cooperative = avg_verts >= 64 and family is GeometryFamily.POLYGON
 
     if use_cooperative:
@@ -741,10 +776,11 @@ def _launch_polygon_centroid(
         else:
             grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        family_cx = runtime.copy_device_to_host(d_cx)
-        family_cy = runtime.copy_device_to_host(d_cy)
-        cx[global_rows] = family_cx[family_rows]
-        cy[global_rows] = family_cy[family_rows]
+        # Device-side scatter into global output arrays
+        d_global = cp.asarray(global_rows)
+        d_family = cp.asarray(family_rows)
+        d_out_cx[d_global] = d_cx[d_family]
+        d_out_cy[d_global] = d_cy[d_family]
     finally:
         runtime.free(d_cx)
         runtime.free(d_cy)
@@ -933,25 +969,28 @@ def centroid_owned(
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = "auto",
-) -> tuple[np.ndarray, np.ndarray]:
+) -> OwnedGeometryArray:
     """Compute centroid directly from OwnedGeometryArray coordinate buffers.
 
     Supports all geometry families: Point, MultiPoint, LineString,
     MultiLineString, Polygon, MultiPolygon.
 
     GPU path uses ADR-0002 METRIC-class precision dispatch.
-    Returns (cx, cy) tuple of float64 arrays of shape (row_count,).
+    Returns a device-resident Point OwnedGeometryArray (GPU path) or
+    host-resident Point OwnedGeometryArray (CPU path).
 
     Zero host/device transfers mid-process.  When owned.device_state
     is populated (vibeFrame path), GPU kernels read directly from
     device pointers with no copy.
     """
+    from vibespatial.constructive.point import _build_device_backed_point_output
+    from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime import RuntimeSelection
     from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
 
     row_count = owned.row_count
     if row_count == 0:
-        return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
+        return from_shapely_geometries([])
 
     selection = plan_dispatch_selection(
         kernel_name="geometry_centroid",
@@ -981,14 +1020,15 @@ def centroid_owned(
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
         )
         try:
-            cx, cy = _centroid_gpu(owned, precision_plan=precision_plan)
-            cx[~owned.validity] = np.nan
-            cy[~owned.validity] = np.nan
-            return cx, cy
+            return _centroid_gpu(owned, precision_plan=precision_plan)
         except Exception:
             pass  # fall through to CPU
 
     cx, cy = _centroid_cpu(owned)
     cx[~owned.validity] = np.nan
     cy[~owned.validity] = np.nan
-    return cx, cy
+    # Build host-resident Point OwnedGeometryArray from CPU results
+    import shapely as _shapely
+
+    points = _shapely.points(cx, cy)
+    return from_shapely_geometries(points.tolist())

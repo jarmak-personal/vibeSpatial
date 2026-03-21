@@ -438,17 +438,11 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def centroid(self):
-        import shapely
+        from vibespatial.constructive.centroid import centroid_owned
 
         self.check_geographic_crs(stacklevel=5)
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.centroid: Shapely materialization required",
-            visible=True,
-        )
-        result = shapely.centroid(self._ensure_shapely_cache())
-        new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        result_owned = centroid_owned(self._owned)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def convex_hull(self):
@@ -465,29 +459,17 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def envelope(self):
-        import shapely
+        from vibespatial.constructive.envelope import envelope_owned
 
-        from vibespatial.api.geometry_array import GeometryArray
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.envelope: Shapely materialization required",
-            visible=True,
-        )
-        return GeometryArray(shapely.envelope(self._ensure_shapely_cache()), crs=self._crs)
+        result_owned = envelope_owned(self._owned)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def exterior(self):
-        import shapely
+        from vibespatial.constructive.exterior import exterior_owned
 
-        from vibespatial.api.geometry_array import GeometryArray
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.exterior: Shapely materialization required",
-            visible=True,
-        )
-        return GeometryArray(shapely.get_exterior_ring(self._ensure_shapely_cache()), crs=self._crs)
+        result_owned = exterior_owned(self._owned)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def unary_union(self):
@@ -518,30 +500,23 @@ class DeviceGeometryArray(ExtensionArray):
         import shapely
 
         self.check_geographic_crs(stacklevel=5)
+        if isinstance(distance, pd.Series):
+            distance = np.asarray(distance)
+        # Use Shapely cache for buffer (GPU point buffer available via GeometryArray path)
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.buffer: Shapely materialization required",
             visible=True,
         )
-        if isinstance(distance, pd.Series):
-            distance = np.asarray(distance)
         result = shapely.buffer(self._ensure_shapely_cache(), distance, quad_segs=resolution, **kwargs)
         new_owned = from_shapely_geometries(result.tolist())
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def simplify(self, tolerance, preserve_topology=True):
-        import shapely
+        from vibespatial.constructive.simplify import simplify_owned
 
-        from vibespatial.api.geometry_array import GeometryArray
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.simplify: Shapely materialization required",
-            visible=True,
-        )
-        return GeometryArray(
-            shapely.simplify(self._ensure_shapely_cache(), tolerance, preserve_topology=preserve_topology),
-            crs=self._crs,
+        result_owned = simplify_owned(self._owned, tolerance, preserve_topology=preserve_topology)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs
         )
 
     def normalize(self):
@@ -572,64 +547,31 @@ class DeviceGeometryArray(ExtensionArray):
         return DeviceGeometryArray._from_owned(result, crs=self._crs)
 
     def affine_transform(self, matrix):
-        import shapely
+        from vibespatial.constructive.affine_transform import affine_transform_owned
 
-        from vibespatial.api.geometry_array import GeometryArray
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.affine_transform: Shapely materialization required",
-            visible=True,
-        )
-        return GeometryArray(
-            shapely.transform(self._ensure_shapely_cache(), matrix, include_z=True),
-            crs=self._crs,
-        )
+        result_owned = affine_transform_owned(self._owned, matrix)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def translate(self, xoff=0.0, yoff=0.0, zoff=0.0):
-        import shapely
+        from vibespatial.constructive.affine_transform import translate_owned
 
-        from vibespatial.api.geometry_array import GeometryArray
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.translate: Shapely materialization required",
-            visible=True,
-        )
-        return GeometryArray(
-            shapely.transform(self._ensure_shapely_cache(), lambda coords: coords + [xoff, yoff, zoff], include_z=True),
-            crs=self._crs,
-        )
+        result_owned = translate_owned(self._owned, xoff, yoff, zoff)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def count_coordinates(self):
-        import shapely
+        from vibespatial.constructive.properties import num_coordinates_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.count_coordinates: Shapely materialization required",
-            visible=True,
-        )
-        return shapely.get_num_coordinates(self._ensure_shapely_cache())
+        return num_coordinates_owned(self._owned)
 
     def count_geometries(self):
-        import shapely
+        from vibespatial.constructive.properties import num_geometries_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.count_geometries: Shapely materialization required",
-            visible=True,
-        )
-        return shapely.get_num_geometries(self._ensure_shapely_cache())
+        return num_geometries_owned(self._owned)
 
     def count_interior_rings(self):
-        import shapely
+        from vibespatial.constructive.properties import num_interior_rings_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.count_interior_rings: Shapely materialization required",
-            visible=True,
-        )
-        return shapely.get_num_interior_rings(self._ensure_shapely_cache())
+        return num_interior_rings_owned(self._owned)
 
     def to_wkb(self, **kwargs):
         hex_output = bool(kwargs.pop("hex", False))

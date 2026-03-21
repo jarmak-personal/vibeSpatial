@@ -121,7 +121,7 @@ skip_covered = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py313"
 extend-exclude = ["src/vibespatial/api", "tests/upstream"]
 
 [tool.ruff.lint]

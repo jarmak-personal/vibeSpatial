@@ -3782,6 +3782,19 @@
   "files": [
     {
       "kind": "repo",
+      "path": ".claude/agents/cuda-engineer.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "claude",
+        "cuda",
+        "engineer",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/commands/maintainability-enforcer.md",
       "referenced_by": [],
       "symbols": [],
@@ -7850,6 +7863,984 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/REPORT.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "md",
+        "pipeline",
+        "report",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/all_results.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "all",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_centroid_mixed_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "centroid",
+        "copy",
+        "json",
+        "mixed",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_centroid_points_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "centroid",
+        "copy",
+        "json",
+        "pipeline",
+        "points",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_centroid_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "centroid",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_chain_centroid_translate_3step.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "3step",
+        "benchmark",
+        "centroid",
+        "chain",
+        "copy",
+        "json",
+        "pipeline",
+        "results",
+        "translate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_chain_envelope_centroid_3step.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "3step",
+        "benchmark",
+        "centroid",
+        "chain",
+        "copy",
+        "envelope",
+        "json",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_convex_hull_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "convex",
+        "copy",
+        "hull",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_envelope_lines_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "envelope",
+        "json",
+        "lines",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_envelope_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "envelope",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_exterior_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "exterior",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_is_valid_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "valid",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_num_coords_mixed_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "coords",
+        "copy",
+        "json",
+        "mixed",
+        "num",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_rotate_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "rotate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_scale_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "scale",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_simplify_lines_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "json",
+        "lines",
+        "pipeline",
+        "results",
+        "simplify",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_simplify_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "simplify",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_translate_points_50k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "50k",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "points",
+        "results",
+        "translate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_translate_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "translate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_xy_points_50k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "50k",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "points",
+        "results",
+        "xy",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/benchmark_zero_copy.py",
+      "referenced_by": [],
+      "symbols": [
+        "_make_points",
+        "_make_polygons",
+        "_make_lines",
+        "_make_mixed",
+        "_make_geoms",
+        "bench_centroid",
+        "bench_translate",
+        "bench_rotate",
+        "bench_scale",
+        "bench_envelope",
+        "bench_exterior",
+        "bench_num_coordinates",
+        "bench_get_xy",
+        "bench_simplify",
+        "bench_convex_hull",
+        "bench_is_valid",
+        "bench_chain_centroid_translate",
+        "bench_chain_envelope_centroid",
+        "main"
+      ],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "bench",
+        "benchmark",
+        "centroid",
+        "chain",
+        "convex",
+        "coordinates",
+        "copy",
+        "envelope",
+        "exterior",
+        "geoms",
+        "get",
+        "hull",
+        "lines",
+        "main",
+        "make",
+        "mixed",
+        "num",
+        "pipeline",
+        "points",
+        "polygons",
+        "py",
+        "results",
+        "rotate",
+        "scale",
+        "simplify",
+        "translate",
+        "valid",
+        "xy",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/generate_report.py",
+      "referenced_by": [],
+      "symbols": [
+        "load_results",
+        "format_time",
+        "format_speedup",
+        "generate_report",
+        "main"
+      ],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "benchmark",
+        "copy",
+        "format",
+        "generate",
+        "load",
+        "main",
+        "pipeline",
+        "py",
+        "report",
+        "results",
+        "speedup",
+        "time",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-20-zero-copy-pipeline/run_all.py",
+      "referenced_by": [],
+      "symbols": [
+        "run_benchmark",
+        "main"
+      ],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "all",
+        "benchmark",
+        "copy",
+        "main",
+        "pipeline",
+        "py",
+        "results",
+        "run",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/all_results.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "all",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_centroid_mixed_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "centroid",
+        "copy",
+        "json",
+        "mixed",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_centroid_points_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "centroid",
+        "copy",
+        "json",
+        "pipeline",
+        "points",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_centroid_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "centroid",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_chain_centroid_translate_3step.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "3step",
+        "benchmark",
+        "centroid",
+        "chain",
+        "copy",
+        "json",
+        "pipeline",
+        "results",
+        "translate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_chain_envelope_centroid_3step.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "3step",
+        "benchmark",
+        "centroid",
+        "chain",
+        "copy",
+        "envelope",
+        "json",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_convex_hull_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "convex",
+        "copy",
+        "hull",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_envelope_lines_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "envelope",
+        "json",
+        "lines",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_envelope_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "envelope",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_exterior_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "exterior",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_is_valid_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "valid",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_num_coords_mixed_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "coords",
+        "copy",
+        "json",
+        "mixed",
+        "num",
+        "pipeline",
+        "results",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_rotate_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "rotate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_scale_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "scale",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_simplify_lines_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "json",
+        "lines",
+        "pipeline",
+        "results",
+        "simplify",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_simplify_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "simplify",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_translate_points_50k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "50k",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "points",
+        "results",
+        "translate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_translate_polygons_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10k",
+        "2026",
+        "21",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "polygons",
+        "results",
+        "translate",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_xy_points_50k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "50k",
+        "benchmark",
+        "copy",
+        "json",
+        "pipeline",
+        "points",
+        "results",
+        "xy",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/benchmark_zero_copy.py",
+      "referenced_by": [],
+      "symbols": [
+        "_make_points",
+        "_make_polygons",
+        "_make_lines",
+        "_make_mixed",
+        "_make_geoms",
+        "bench_centroid",
+        "bench_translate",
+        "bench_rotate",
+        "bench_scale",
+        "bench_envelope",
+        "bench_exterior",
+        "bench_num_coordinates",
+        "bench_get_xy",
+        "bench_simplify",
+        "bench_convex_hull",
+        "bench_is_valid",
+        "bench_chain_centroid_translate",
+        "bench_chain_envelope_centroid",
+        "main"
+      ],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "bench",
+        "benchmark",
+        "centroid",
+        "chain",
+        "convex",
+        "coordinates",
+        "copy",
+        "envelope",
+        "exterior",
+        "geoms",
+        "get",
+        "hull",
+        "lines",
+        "main",
+        "make",
+        "mixed",
+        "num",
+        "pipeline",
+        "points",
+        "polygons",
+        "py",
+        "results",
+        "rotate",
+        "scale",
+        "simplify",
+        "translate",
+        "valid",
+        "xy",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-03-21-zero-copy-pipeline/run_all.py",
+      "referenced_by": [],
+      "symbols": [
+        "run_benchmark",
+        "main"
+      ],
+      "tokens": [
+        "03",
+        "2026",
+        "21",
+        "all",
+        "benchmark",
+        "copy",
+        "main",
+        "pipeline",
+        "py",
+        "results",
+        "run",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmarks/bench_point_bounds.py",
       "referenced_by": [],
       "symbols": [
@@ -10100,6 +11091,53 @@
       ]
     },
     {
+      "kind": "repo",
+      "path": "reports/cpu-dependency-audit-2026-03-20.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "audit",
+        "cpu",
+        "dependency",
+        "md",
+        "reports"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "reports/zero-copy-gap-analysis-2026-03-20.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "20",
+        "2026",
+        "analysis",
+        "copy",
+        "gap",
+        "md",
+        "reports",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "reports/zero-copy-implementation-checklist.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "checklist",
+        "copy",
+        "implementation",
+        "md",
+        "reports",
+        "zero"
+      ]
+    },
+    {
       "kind": "script",
       "path": "scripts/__init__.py",
       "referenced_by": [],
@@ -10108,6 +11146,47 @@
         "init",
         "py",
         "scripts"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/bench_compact_gather.py",
+      "referenced_by": [],
+      "symbols": [
+        "_sync",
+        "_gpu_time_us",
+        "_median",
+        "_p10_p90",
+        "cupy_compact_gather",
+        "cccl_compact_cupy_gather",
+        "_get_gather_kernel",
+        "nvrtc_gather",
+        "cupy_compact_nvrtc_gather",
+        "_verify_results",
+        "run_benchmark"
+      ],
+      "tokens": [
+        "bench",
+        "benchmark",
+        "cccl",
+        "compact",
+        "cupy",
+        "gather",
+        "get",
+        "gpu",
+        "kernel",
+        "median",
+        "nvrtc",
+        "p10",
+        "p90",
+        "py",
+        "results",
+        "run",
+        "scripts",
+        "sync",
+        "time",
+        "us",
+        "verify"
       ]
     },
     {
@@ -12769,6 +13848,97 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/affine_transform.py",
+      "referenced_by": [],
+      "symbols": [
+        "_affine_matrix",
+        "_translate_matrix",
+        "_rotate_matrix",
+        "_scale_matrix",
+        "_skew_matrix",
+        "_compose_around_origin",
+        "_launch_affine_family",
+        "_affine_transform_gpu",
+        "_affine_transform_cpu",
+        "affine_transform_owned",
+        "translate_owned",
+        "rotate_owned",
+        "scale_owned",
+        "skew_owned"
+      ],
+      "tokens": [
+        "affine",
+        "around",
+        "compose",
+        "constructive",
+        "cpu",
+        "family",
+        "gpu",
+        "launch",
+        "matrix",
+        "origin",
+        "owned",
+        "py",
+        "rotate",
+        "scale",
+        "skew",
+        "src",
+        "transform",
+        "translate",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/binary_constructive.py",
+      "referenced_by": [],
+      "symbols": [
+        "is_constructive_op",
+        "_is_polygon_only",
+        "_dispatch_overlay_gpu",
+        "binary_constructive_owned"
+      ],
+      "tokens": [
+        "binary",
+        "constructive",
+        "dispatch",
+        "gpu",
+        "only",
+        "op",
+        "overlay",
+        "owned",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/boundary.py",
+      "referenced_by": [],
+      "symbols": [
+        "_boundary_cpu",
+        "_boundary_polygon_gpu",
+        "_boundary_linestring_gpu",
+        "_boundary_gpu",
+        "boundary_owned"
+      ],
+      "tokens": [
+        "boundary",
+        "constructive",
+        "cpu",
+        "gpu",
+        "linestring",
+        "owned",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/centroid.py",
       "referenced_by": [],
       "symbols": [
@@ -12885,6 +14055,104 @@
         "top",
         "values",
         "vertical",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/convex_hull.py",
+      "referenced_by": [],
+      "symbols": [
+        "_cross",
+        "_convex_hull_geometry_cpu",
+        "_convex_hull_family_cpu",
+        "_convex_hull_cpu",
+        "_compute_flat_coord_offsets",
+        "_convex_hull_family_gpu",
+        "_convex_hull_gpu",
+        "convex_hull_owned"
+      ],
+      "tokens": [
+        "compute",
+        "constructive",
+        "convex",
+        "coord",
+        "cpu",
+        "cross",
+        "family",
+        "flat",
+        "geometry",
+        "gpu",
+        "hull",
+        "offsets",
+        "owned",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/envelope.py",
+      "referenced_by": [],
+      "symbols": [
+        "_envelope_gpu",
+        "envelope_owned"
+      ],
+      "tokens": [
+        "constructive",
+        "envelope",
+        "gpu",
+        "owned",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/exterior.py",
+      "referenced_by": [],
+      "symbols": [
+        "_exterior_gpu",
+        "exterior_owned"
+      ],
+      "tokens": [
+        "constructive",
+        "exterior",
+        "gpu",
+        "owned",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/linear_ref.py",
+      "referenced_by": [],
+      "symbols": [
+        "_interpolate_linestring_cpu",
+        "_interpolate_multilinestring_cpu",
+        "_project_linestring_cpu",
+        "_interpolate_gpu",
+        "_project_gpu",
+        "interpolate_owned",
+        "project_owned"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "gpu",
+        "interpolate",
+        "linear",
+        "linestring",
+        "multilinestring",
+        "owned",
+        "project",
+        "py",
+        "ref",
+        "src",
         "vibespatial"
       ]
     },
@@ -13105,6 +14373,36 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/orient.py",
+      "referenced_by": [],
+      "symbols": [
+        "_build_is_exterior",
+        "_orient_family_gpu",
+        "_orient_gpu",
+        "_shoelace_area_2x",
+        "_orient_polygon_cpu",
+        "orient_owned"
+      ],
+      "tokens": [
+        "2x",
+        "area",
+        "build",
+        "constructive",
+        "cpu",
+        "exterior",
+        "family",
+        "gpu",
+        "orient",
+        "owned",
+        "polygon",
+        "py",
+        "shoelace",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/point.py",
       "referenced_by": [],
       "symbols": [
@@ -13192,6 +14490,47 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/properties.py",
+      "referenced_by": [],
+      "symbols": [
+        "_offset_diff_gpu",
+        "num_coordinates_owned",
+        "_num_coords_polygon_gpu",
+        "_num_coords_multilinestring_gpu",
+        "_num_coords_multipolygon_gpu",
+        "num_geometries_owned",
+        "num_interior_rings_owned",
+        "get_x_owned",
+        "get_y_owned",
+        "is_closed_owned",
+        "is_ccw_owned"
+      ],
+      "tokens": [
+        "ccw",
+        "closed",
+        "constructive",
+        "coordinates",
+        "coords",
+        "diff",
+        "geometries",
+        "get",
+        "gpu",
+        "interior",
+        "multilinestring",
+        "multipolygon",
+        "num",
+        "offset",
+        "owned",
+        "polygon",
+        "properties",
+        "py",
+        "rings",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/representative_point.py",
       "referenced_by": [],
       "symbols": [
@@ -13212,6 +14551,75 @@
         "representatives",
         "src",
         "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/reverse.py",
+      "referenced_by": [],
+      "symbols": [
+        "_reverse_family_gpu",
+        "_reverse_gpu",
+        "reverse_owned"
+      ],
+      "tokens": [
+        "constructive",
+        "family",
+        "gpu",
+        "owned",
+        "py",
+        "reverse",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/segmentize.py",
+      "referenced_by": [],
+      "symbols": [
+        "_segmentize_family_gpu",
+        "_segmentize_gpu",
+        "_segmentize_span",
+        "_segmentize_family_cpu",
+        "segmentize_owned"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "family",
+        "gpu",
+        "owned",
+        "py",
+        "segmentize",
+        "span",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/simplify.py",
+      "referenced_by": [],
+      "symbols": [
+        "_simplify_family_gpu",
+        "_simplify_gpu",
+        "_vw_simplify_span",
+        "_simplify_family_cpu",
+        "simplify_owned"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "family",
+        "gpu",
+        "owned",
+        "py",
+        "simplify",
+        "span",
+        "src",
+        "vibespatial",
+        "vw"
       ]
     },
     {
@@ -13281,6 +14689,68 @@
         "supports",
         "surface",
         "uniform",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/validity.py",
+      "referenced_by": [],
+      "symbols": [
+        "_shoelace_area_2x",
+        "_segments_cross",
+        "_is_valid_points",
+        "_is_valid_linestrings",
+        "_is_valid_polygon_ring",
+        "_is_valid_polygons",
+        "_is_valid_multipoints",
+        "_is_valid_multilinestrings",
+        "_is_valid_multipolygons",
+        "_is_simple_points",
+        "_is_simple_multipoints",
+        "_linestring_self_intersects",
+        "_is_simple_linestrings",
+        "_is_simple_polygons",
+        "_is_simple_multilinestrings",
+        "_is_simple_multipolygons",
+        "_build_is_exterior_for_validity",
+        "_reduce_ring_valid_to_geom",
+        "_reduce_span_simple_to_geom",
+        "_is_valid_gpu_points",
+        "_is_valid_gpu_multipoints",
+        "_is_valid_gpu_linestrings",
+        "_is_valid_gpu_multilinestrings",
+        "_is_valid_gpu_polygons"
+      ],
+      "tokens": [
+        "2x",
+        "area",
+        "build",
+        "constructive",
+        "cross",
+        "exterior",
+        "geom",
+        "gpu",
+        "intersects",
+        "linestring",
+        "linestrings",
+        "multilinestrings",
+        "multipoints",
+        "multipolygons",
+        "points",
+        "polygon",
+        "polygons",
+        "py",
+        "reduce",
+        "ring",
+        "segments",
+        "self",
+        "shoelace",
+        "simple",
+        "span",
+        "src",
+        "valid",
+        "validity",
         "vibespatial"
       ]
     },
@@ -15566,15 +17036,19 @@
         "get_active_trace",
         "execution_trace",
         "notify_dispatch",
-        "notify_transfer"
+        "notify_transfer",
+        "TransferViolationError",
+        "assert_no_transfers"
       ],
       "tokens": [
         "active",
+        "assert",
         "dispatch",
         "enabled",
         "execution",
         "executiontracecontext",
         "get",
+        "no",
         "notify",
         "py",
         "runtime",
@@ -15583,6 +17057,8 @@
         "tracestep",
         "tracetransfer",
         "transfer",
+        "transfers",
+        "transferviolationerror",
         "vibespatial",
         "vibetracewarning",
         "warn",
@@ -15890,6 +17366,54 @@
         "py",
         "spatial",
         "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/spatial/distance_metrics.py",
+      "referenced_by": [],
+      "symbols": [
+        "_coords_for_row",
+        "_linestring_coords_for_row",
+        "_euclidean",
+        "_min_distances_vectorized",
+        "_build_flat_coord_offsets",
+        "_compile_distance_kernel",
+        "_hausdorff_gpu",
+        "_frechet_gpu",
+        "_hausdorff_pair",
+        "_hausdorff_cpu",
+        "_frechet_pair",
+        "_frechet_cpu",
+        "hausdorff_distance_owned",
+        "frechet_distance_owned"
+      ],
+      "tokens": [
+        "build",
+        "compile",
+        "coord",
+        "coords",
+        "cpu",
+        "distance",
+        "distances",
+        "euclidean",
+        "flat",
+        "frechet",
+        "gpu",
+        "hausdorff",
+        "kernel",
+        "linestring",
+        "metrics",
+        "min",
+        "offsets",
+        "owned",
+        "pair",
+        "py",
+        "row",
+        "spatial",
+        "src",
+        "vectorized",
         "vibespatial"
       ]
     },
@@ -17161,6 +18685,7 @@
       "referenced_by": [],
       "symbols": [
         "_shapely_centroids",
+        "_extract_cx_cy",
         "test_point_centroid",
         "test_point_centroid_gpu",
         "test_multipoint_centroid",
@@ -17178,17 +18703,22 @@
         "test_large_coordinates",
         "test_large_coordinates_gpu",
         "test_centroid_owned_auto_dispatch",
-        "test_centroid_owned_empty_array"
+        "test_centroid_owned_empty_array",
+        "test_centroid_owned_10k_random_polygons"
       ],
       "tokens": [
+        "10k",
         "array",
         "auto",
         "centroid",
         "centroids",
         "coordinates",
+        "cx",
+        "cy",
         "delegation",
         "dispatch",
         "empty",
+        "extract",
         "geometry",
         "gpu",
         "kernels",
@@ -17201,7 +18731,9 @@
         "owned",
         "point",
         "polygon",
+        "polygons",
         "py",
+        "random",
         "shapely",
         "test",
         "tests"
@@ -19792,6 +21324,56 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_properties_device.py",
+      "referenced_by": [],
+      "symbols": [
+        "_make_owned_with_device_state",
+        "_shapely_num_coordinates",
+        "_shapely_num_geometries",
+        "_shapely_num_interior_rings",
+        "_shapely_is_closed",
+        "_expected_is_ccw",
+        "TestNumCoordinates",
+        "TestNumGeometries",
+        "TestNumInteriorRings",
+        "TestIsClosed",
+        "TestIsCCW",
+        "TestMixedTypes",
+        "TestGetX",
+        "TestGetY",
+        "TestGetXYNoHostMaterialization"
+      ],
+      "tokens": [
+        "ccw",
+        "closed",
+        "coordinates",
+        "device",
+        "expected",
+        "geometries",
+        "interior",
+        "make",
+        "num",
+        "owned",
+        "properties",
+        "py",
+        "rings",
+        "shapely",
+        "state",
+        "test",
+        "testgetx",
+        "testgetxynohostmaterialization",
+        "testgety",
+        "testisccw",
+        "testisclosed",
+        "testmixedtypes",
+        "testnumcoordinates",
+        "testnumgeometries",
+        "testnuminteriorrings",
+        "tests"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_provenance.py",
       "referenced_by": [],
       "symbols": [
@@ -20559,6 +22141,48 @@
         "test",
         "tests",
         "upstream"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_zero_copy_pipeline.py",
+      "referenced_by": [],
+      "symbols": [
+        "TestBuildDeviceResidentOwned",
+        "TestCentroidDeviceResident",
+        "TestAffineTransform",
+        "TestEnvelope",
+        "TestPropertyKernels",
+        "TestSimplify",
+        "TestConvexHull",
+        "TestValidity",
+        "TestTransferAudit",
+        "_has_gpu",
+        "_make_random_polygons",
+        "TestZeroCopyChains"
+      ],
+      "tokens": [
+        "copy",
+        "gpu",
+        "has",
+        "make",
+        "pipeline",
+        "polygons",
+        "py",
+        "random",
+        "test",
+        "testaffinetransform",
+        "testbuilddeviceresidentowned",
+        "testcentroiddeviceresident",
+        "testconvexhull",
+        "testenvelope",
+        "testpropertykernels",
+        "tests",
+        "testsimplify",
+        "testtransferaudit",
+        "testvalidity",
+        "testzerocopychains",
+        "zero"
       ]
     },
     {

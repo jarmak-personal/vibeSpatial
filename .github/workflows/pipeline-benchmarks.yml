@@ -27,7 +27,7 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: Sync dependencies
         run: uv sync --group dev --group upstream-optional
       - name: Run current pipeline suite
@@ -53,7 +53,7 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          python-version: "3.13"
       - name: Sync dependencies
         run: uv sync --group dev --group upstream-optional --extra cu12
       - name: Run GPU pipeline suite

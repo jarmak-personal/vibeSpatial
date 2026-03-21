@@ -166,3 +166,48 @@ def notify_transfer(
         trigger=trigger,
         reason=reason,
     ))
+
+
+class TransferViolationError(AssertionError):
+    """Raised by assert_no_transfers when a D->H transfer occurs mid-pipeline."""
+
+    def __init__(self, transfers: list[TraceTransfer]):
+        self.transfers = transfers
+        details = "; ".join(
+            f"{t.direction} ({t.trigger}: {t.reason})" for t in transfers
+        )
+        super().__init__(
+            f"Expected zero host/device transfers, but {len(transfers)} occurred: {details}"
+        )
+
+
+@contextmanager
+def assert_no_transfers(*, allow_directions: frozenset[str] | None = None):
+    """Context manager that asserts no D->H transfers occur mid-pipeline.
+
+    Usage::
+
+        with assert_no_transfers():
+            result = gdf.centroid.buffer(100).intersects(other)
+        # Raises TransferViolationError if any D->H transfer occurred
+
+    Parameters
+    ----------
+    allow_directions : frozenset of str, optional
+        Directions to allow (e.g. frozenset({"h2d"}) to only block D->H).
+        Default: block all transfers.
+    """
+    blocked = allow_directions or frozenset()
+    ctx = ExecutionTraceContext(pipeline="assert_no_transfers")
+    parent = get_active_trace()
+    _thread_local.trace = ctx
+    try:
+        yield ctx
+    finally:
+        _thread_local.trace = parent
+        violations = [
+            t for t in ctx.transfers
+            if t.direction not in blocked
+        ]
+        if violations:
+            raise TransferViolationError(violations)

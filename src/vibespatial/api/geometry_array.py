@@ -37,7 +37,9 @@ from vibespatial.constructive.clip_rect import evaluate_geopandas_clip_by_rect
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.spatial.distance_owned import evaluate_geopandas_dwithin
 from vibespatial.constructive.make_valid_pipeline import evaluate_geopandas_make_valid
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
     NULL_TAG,
     TAG_FAMILIES,
     OwnedGeometryArray,
@@ -729,6 +731,10 @@ class GeometryArray(ExtensionArray):
 
     @property
     def is_valid(self):
+        if self._owned is not None:
+            from vibespatial.constructive.validity import is_valid_owned
+
+            return is_valid_owned(self._owned)
         return shapely.is_valid(self._data)
 
     def is_valid_reason(self):
@@ -752,6 +758,10 @@ class GeometryArray(ExtensionArray):
 
     @property
     def is_simple(self):
+        if self._owned is not None:
+            from vibespatial.constructive.validity import is_simple_owned
+
+            return is_simple_owned(self._owned)
         return shapely.is_simple(self._data)
 
     @property
@@ -760,10 +770,18 @@ class GeometryArray(ExtensionArray):
 
     @property
     def is_closed(self):
+        if self._owned is not None:
+            from vibespatial.constructive.properties import is_closed_owned
+
+            return is_closed_owned(self._owned)
         return shapely.is_closed(self._data)
 
     @property
     def is_ccw(self):
+        if self._owned is not None:
+            from vibespatial.constructive.properties import is_ccw_owned
+
+            return is_ccw_owned(self._owned)
         return shapely.is_ccw(self._data)
 
     @property
@@ -812,12 +830,24 @@ class GeometryArray(ExtensionArray):
         return shapely.length(self._data)
 
     def count_coordinates(self):
+        if self._owned is not None:
+            from vibespatial.constructive.properties import num_coordinates_owned
+
+            return num_coordinates_owned(self._owned)
         return shapely.get_num_coordinates(self._data)
 
     def count_geometries(self):
+        if self._owned is not None:
+            from vibespatial.constructive.properties import num_geometries_owned
+
+            return num_geometries_owned(self._owned)
         return shapely.get_num_geometries(self._data)
 
     def count_interior_rings(self):
+        if self._owned is not None:
+            from vibespatial.constructive.properties import num_interior_rings_owned
+
+            return num_interior_rings_owned(self._owned)
         return shapely.get_num_interior_rings(self._data)
 
     def get_precision(self):
@@ -832,6 +862,11 @@ class GeometryArray(ExtensionArray):
 
     @property
     def boundary(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.boundary import boundary_owned
+
+            result_owned = boundary_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.boundary(self._data), crs=self.crs)
 
     @property
@@ -840,10 +875,8 @@ class GeometryArray(ExtensionArray):
         if self._owned is not None:
             from vibespatial.constructive.centroid import centroid_owned
 
-            cx, cy = centroid_owned(self._owned)
-            points = shapely.points(cx, cy)
-            # NaN coords produce None in shapely.points
-            return GeometryArray(points, crs=self.crs)
+            result_owned = centroid_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.centroid(self._data), crs=self.crs)
 
     def concave_hull(self, ratio, allow_holes):
@@ -857,11 +890,21 @@ class GeometryArray(ExtensionArray):
     @property
     def convex_hull(self) -> GeometryArray:
         """Return the convex hull of the geometries in this array."""
+        if self._owned is not None:
+            from vibespatial.constructive.convex_hull import convex_hull_owned
+
+            result_owned = convex_hull_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.convex_hull(self._data), crs=self.crs)
 
     @property
     def envelope(self) -> GeometryArray:
         """Return the envelope of the geometries in this array."""
+        if self._owned is not None:
+            from vibespatial.constructive.envelope import envelope_owned
+
+            result_owned = envelope_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.envelope(self._data), crs=self.crs)
 
     def minimum_rotated_rectangle(self):
@@ -870,6 +913,11 @@ class GeometryArray(ExtensionArray):
 
     @property
     def exterior(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.exterior import exterior_owned
+
+            result_owned = exterior_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.get_exterior_ring(self._data), crs=self.crs)
 
     def extract_unique_points(self) -> GeometryArray:
@@ -969,13 +1017,15 @@ class GeometryArray(ExtensionArray):
             from vibespatial.constructive.normalize import normalize_owned
 
             result_owned = normalize_owned(self._owned)
-            return GeometryArray(
-                np.asarray(result_owned.to_shapely(), dtype=object),
-                crs=self.crs,
-            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.normalize(self._data), crs=self.crs)
 
     def orient_polygons(self, exterior_cw: bool = False) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.orient import orient_owned
+
+            result_owned = orient_owned(self._owned, exterior_cw=exterior_cw)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.orient_polygons(self._data, exterior_cw=exterior_cw), crs=self.crs
         )
@@ -1004,9 +1054,19 @@ class GeometryArray(ExtensionArray):
         )
 
     def reverse(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.reverse import reverse_owned
+
+            result_owned = reverse_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.reverse(self._data), crs=self.crs)
 
     def segmentize(self, max_segment_length) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.segmentize import segmentize_owned
+
+            result_owned = segmentize_owned(self._owned, max_segment_length)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.segmentize(self._data, max_segment_length),
             crs=self.crs,
@@ -1166,28 +1226,28 @@ class GeometryArray(ExtensionArray):
         )
 
     def difference(self, other, grid_size=None) -> GeometryArray:
-        return GeometryArray(
-            self._binary_method("difference", self, other, grid_size=grid_size),
-            crs=self.crs,
-        )
+        return self._constructive_or_fallback("difference", other, grid_size=grid_size)
 
     def intersection(self, other, grid_size=None) -> GeometryArray:
-        return GeometryArray(
-            self._binary_method("intersection", self, other, grid_size=grid_size),
-            crs=self.crs,
-        )
+        return self._constructive_or_fallback("intersection", other, grid_size=grid_size)
 
     def symmetric_difference(self, other, grid_size=None) -> GeometryArray:
-        return GeometryArray(
-            self._binary_method(
-                "symmetric_difference", self, other, grid_size=grid_size
-            ),
-            crs=self.crs,
+        return self._constructive_or_fallback(
+            "symmetric_difference", other, grid_size=grid_size,
         )
 
     def union(self, other, grid_size=None) -> GeometryArray:
+        return self._constructive_or_fallback("union", other, grid_size=grid_size)
+
+    def _constructive_or_fallback(self, op, other, **kwargs) -> GeometryArray:
+        """Dispatch binary constructive ops through owned path when available."""
+        if self._owned is not None and isinstance(other, GeometryArray) and other._owned is not None:
+            from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+            result_owned = binary_constructive_owned(op, self._owned, other._owned, **kwargs)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
-            self._binary_method("union", self, other, grid_size=grid_size), crs=self.crs
+            self._binary_method(op, self, other, **kwargs), crs=self.crs,
         )
 
     def shortest_line(self, other) -> GeometryArray:
@@ -1228,10 +1288,30 @@ class GeometryArray(ExtensionArray):
 
     def hausdorff_distance(self, other, **kwargs):
         self.check_geographic_crs(stacklevel=6)
+        if (
+            self._owned is not None
+            and isinstance(other, GeometryArray)
+            and other._owned is not None
+        ):
+            from vibespatial.spatial.distance_metrics import hausdorff_distance_owned
+
+            return hausdorff_distance_owned(
+                self._owned, other._owned, densify=kwargs.get("densify"),
+            )
         return self._binary_method("hausdorff_distance", self, other, **kwargs)
 
     def frechet_distance(self, other, **kwargs):
         self.check_geographic_crs(stacklevel=6)
+        if (
+            self._owned is not None
+            and isinstance(other, GeometryArray)
+            and other._owned is not None
+        ):
+            from vibespatial.spatial.distance_metrics import frechet_distance_owned
+
+            return frechet_distance_owned(
+                self._owned, other._owned, densify=kwargs.get("densify"),
+            )
         return self._binary_method("frechet_distance", self, other, **kwargs)
 
     def buffer(self, distance, quad_segs: int | None = None, **kwargs):
@@ -1350,6 +1430,11 @@ class GeometryArray(ExtensionArray):
 
     def interpolate(self, distance, normalized: bool = False) -> GeometryArray:
         self.check_geographic_crs(stacklevel=5)
+        if self._owned is not None:
+            from vibespatial.constructive.linear_ref import interpolate_owned
+
+            result_owned = interpolate_owned(self._owned, distance, normalized=normalized)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.line_interpolate_point(self._data, distance, normalized=normalized),
             crs=self.crs,
@@ -1373,6 +1458,13 @@ class GeometryArray(ExtensionArray):
                 elapsed_seconds=_elapsed,
             )
             return result
+        if self._owned is not None:
+            from vibespatial.constructive.simplify import simplify_owned
+
+            result_owned = simplify_owned(
+                self._owned, tolerance, preserve_topology=preserve_topology,
+            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.simplify(
                 self._data, tolerance, preserve_topology=preserve_topology
@@ -1395,6 +1487,15 @@ class GeometryArray(ExtensionArray):
         )
 
     def project(self, other, normalized=False):
+        if (
+            not normalized
+            and self._owned is not None
+            and isinstance(other, GeometryArray)
+            and other._owned is not None
+        ):
+            from vibespatial.constructive.linear_ref import project_owned
+
+            return project_owned(self._owned, other._owned)
         if isinstance(other, GeometryArray):
             other = other._data
         return shapely.line_locate_point(self._data, other, normalized=normalized)
@@ -1466,6 +1567,11 @@ class GeometryArray(ExtensionArray):
         return data
 
     def affine_transform(self, matrix) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.affine_transform import affine_transform_owned
+
+            result_owned = affine_transform_owned(self._owned, matrix)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             self._affinity_method("affine_transform", self._data, matrix),
             crs=self.crs,
@@ -1474,6 +1580,11 @@ class GeometryArray(ExtensionArray):
     def translate(
         self, xoff: float = 0.0, yoff: float = 0.0, zoff: float = 0.0
     ) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.affine_transform import translate_owned
+
+            result_owned = translate_owned(self._owned, xoff, yoff, zoff)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             self._affinity_method("translate", self._data, xoff, yoff, zoff),
             crs=self.crs,
@@ -1482,6 +1593,13 @@ class GeometryArray(ExtensionArray):
     def rotate(
         self, angle, origin="center", use_radians: bool = False
     ) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.affine_transform import rotate_owned
+
+            result_owned = rotate_owned(
+                self._owned, angle, origin=origin, use_radians=use_radians,
+            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             self._affinity_method(
                 "rotate", self._data, angle, origin=origin, use_radians=use_radians
@@ -1496,6 +1614,13 @@ class GeometryArray(ExtensionArray):
         zfact: float = 1.0,
         origin="center",
     ) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.affine_transform import scale_owned
+
+            result_owned = scale_owned(
+                self._owned, xfact, yfact, zfact, origin=origin,
+            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             self._affinity_method(
                 "scale", self._data, xfact, yfact, zfact, origin=origin
@@ -1510,6 +1635,13 @@ class GeometryArray(ExtensionArray):
         origin="center",
         use_radians: bool = False,
     ) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.affine_transform import skew_owned
+
+            result_owned = skew_owned(
+                self._owned, xs, ys, origin=origin, use_radians=use_radians,
+            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             self._affinity_method(
                 "skew", self._data, xs, ys, origin=origin, use_radians=use_radians
@@ -1699,6 +1831,13 @@ class GeometryArray(ExtensionArray):
     @property
     def x(self):
         """Return the x location of point geometries in a GeoSeries."""
+        if self._owned is not None:
+            point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+            non_null = ~self.isna()
+            if non_null.any() and (self._owned.tags[non_null] == point_tag).all():
+                from vibespatial.constructive.properties import get_x_owned
+
+                return get_x_owned(self._owned)
         if (self.geom_type[~self.isna()] == "Point").all():
             empty = self.is_empty
             if empty.any():
@@ -1715,6 +1854,13 @@ class GeometryArray(ExtensionArray):
     @property
     def y(self):
         """Return the y location of point geometries in a GeoSeries."""
+        if self._owned is not None:
+            point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+            non_null = ~self.isna()
+            if non_null.any() and (self._owned.tags[non_null] == point_tag).all():
+                from vibespatial.constructive.properties import get_y_owned
+
+                return get_y_owned(self._owned)
         if (self.geom_type[~self.isna()] == "Point").all():
             empty = self.is_empty
             if empty.any():

@@ -33,6 +33,20 @@ def _shapely_centroids(geoms):
     )
 
 
+def _extract_cx_cy(result):
+    """Extract cx/cy arrays from centroid result (OwnedGeometryArray or tuple)."""
+    if isinstance(result, tuple):
+        return result
+    # OwnedGeometryArray of Points — extract x/y from buffers
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    geoms = result.to_shapely()
+    cx = np.array([g.x if g is not None and not g.is_empty else np.nan for g in geoms])
+    cy = np.array([g.y if g is not None and not g.is_empty else np.nan for g in geoms])
+    return cx, cy
+
+
 # ---------------------------------------------------------------------------
 # Point centroid
 # ---------------------------------------------------------------------------
@@ -54,7 +68,7 @@ def test_point_centroid_gpu():
         pytest.skip("CUDA runtime not available")
     geoms = [Point(1, 2), Point(3.5, -7.2), Point(0, 0)]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -87,7 +101,7 @@ def test_multipoint_centroid_gpu():
         MultiPoint([(1, 1), (3, 1), (3, 3)]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -125,7 +139,7 @@ def test_linestring_centroid_gpu():
         LineString([(0, 0), (3, 4)]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -158,7 +172,7 @@ def test_multilinestring_centroid_gpu():
         MultiLineString([[(0, 0), (1, 0)], [(100, 100), (200, 100)]]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -191,7 +205,7 @@ def test_polygon_centroid_delegation_gpu():
         Polygon([(0, 0), (6, 0), (3, 6)]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -230,7 +244,7 @@ def test_mixed_geometry_centroid_gpu():
         LineString([(0, 0), (0, 10)]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -245,7 +259,7 @@ def test_null_centroid():
     """Null geometries produce NaN centroids."""
     geoms = [Point(1, 2), None, Point(3, 4)]
     owned = from_shapely_geometries(geoms)
-    cx, cy = centroid_owned(owned)
+    cx, cy = _extract_cx_cy(centroid_owned(owned))
     assert np.isfinite(cx[0])
     assert np.isnan(cx[1])
     assert np.isfinite(cx[2])
@@ -262,7 +276,7 @@ def test_empty_centroid():
         Point(3, 4),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = centroid_owned(owned)
+    cx, cy = _extract_cx_cy(centroid_owned(owned))
     assert np.isfinite(cx[0])
     assert np.isfinite(cx[2])
 
@@ -324,7 +338,7 @@ def test_large_coordinates_gpu():
         ]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = _centroid_gpu(owned)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -343,7 +357,7 @@ def test_centroid_owned_auto_dispatch():
         Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
     ]
     owned = from_shapely_geometries(geoms)
-    cx, cy = centroid_owned(owned)
+    cx, cy = _extract_cx_cy(centroid_owned(owned))
     ex, ey = _shapely_centroids(geoms)
     np.testing.assert_allclose(cx, ex, atol=1e-10)
     np.testing.assert_allclose(cy, ey, atol=1e-10)
@@ -352,6 +366,30 @@ def test_centroid_owned_auto_dispatch():
 def test_centroid_owned_empty_array():
     """centroid_owned() handles zero-length arrays."""
     owned = from_shapely_geometries([])
-    cx, cy = centroid_owned(owned)
+    cx, cy = _extract_cx_cy(centroid_owned(owned))
     assert len(cx) == 0
     assert len(cy) == 0
+
+
+# ---------------------------------------------------------------------------
+# 10k random polygon verification (Step 1b gate)
+# ---------------------------------------------------------------------------
+
+
+def test_centroid_owned_10k_random_polygons():
+    """centroid_owned on 10k random polygons matches Shapely within 1e-10."""
+    rng = np.random.default_rng(42)
+    polys = []
+    for _ in range(10_000):
+        cx, cy = rng.uniform(-1000, 1000, size=2)
+        r = rng.uniform(1, 100)
+        n_verts = rng.integers(3, 8)
+        angles = np.sort(rng.uniform(0, 2 * np.pi, size=n_verts))
+        coords = [(cx + r * np.cos(a), cy + r * np.sin(a)) for a in angles]
+        polys.append(Polygon(coords))
+
+    owned = from_shapely_geometries(polys)
+    result_cx, result_cy = _extract_cx_cy(centroid_owned(owned, precision="fp64"))
+    expect_cx, expect_cy = _shapely_centroids(polys)
+    np.testing.assert_allclose(result_cx, expect_cx, atol=1e-10)
+    np.testing.assert_allclose(result_cy, expect_cy, atol=1e-10)

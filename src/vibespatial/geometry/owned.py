@@ -165,6 +165,26 @@ class OwnedGeometryArray:
     def row_count(self) -> int:
         return int(self.validity.size)
 
+    def family_has_rows(self, family: GeometryFamily) -> bool:
+        """Check whether *family* has at least one geometry row to process.
+
+        Reads from whichever side is authoritative: ``device_state`` when
+        populated, host ``FamilyGeometryBuffer`` otherwise.  This avoids the
+        bug where host stubs with ``host_materialized=False`` report empty
+        offsets even when device buffers have real data.
+        """
+        if family not in self.families:
+            return False
+
+        # Device side is authoritative when populated
+        if self.device_state is not None and family in self.device_state.families:
+            d_buf = self.device_state.families[family]
+            return int(d_buf.geometry_offsets.size) >= 2
+
+        # Host side is authoritative
+        buf = self.families[family]
+        return buf.row_count > 0 and len(buf.geometry_offsets) >= 2
+
     def _record(
         self,
         kind: DiagnosticKind,
@@ -1286,3 +1306,73 @@ def _materialize_family_row(buffer: FamilyGeometryBuffer, row_index: int) -> obj
         return MultiPolygon(polygons)
 
     raise NotImplementedError(f"unsupported geometry family: {buffer.family.value}")
+
+
+def build_device_resident_owned(
+    *,
+    device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer],
+    row_count: int,
+    tags: np.ndarray,
+    validity: np.ndarray,
+    family_row_offsets: np.ndarray,
+) -> OwnedGeometryArray:
+    """Construct an OwnedGeometryArray from device buffers without touching host.
+
+    This is the canonical factory for producing device-resident results from GPU
+    kernels.  Host-side FamilyGeometryBuffers are created with empty coordinate
+    stubs (``host_materialized=False``); actual data lives only in the
+    ``device_state``.  Lazy ``_ensure_host_state`` will copy on demand if the
+    caller ever needs Shapely objects.
+
+    Parameters
+    ----------
+    device_families
+        Per-family device buffers produced by a GPU kernel.
+    row_count
+        Total number of rows (geometries) in the output.
+    tags
+        int8 array of family tags, length ``row_count``.
+    validity
+        bool array, length ``row_count``.
+    family_row_offsets
+        int32 array mapping global row index to family-local row index.
+    """
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+
+    # Build host-side placeholder families with host_materialized=False
+    host_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+    for family in device_families:
+        schema = get_geometry_buffer_schema(family)
+        host_families[family] = FamilyGeometryBuffer(
+            family=family,
+            schema=schema,
+            row_count=int(np.sum(tags == FAMILY_TAGS[family])),
+            x=np.empty(0, dtype=np.float64),
+            y=np.empty(0, dtype=np.float64),
+            geometry_offsets=np.empty(0, dtype=np.int32),
+            empty_mask=np.empty(0, dtype=np.bool_),
+            host_materialized=False,
+        )
+
+    result = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=host_families,
+        residency=Residency.DEVICE,
+        device_state=OwnedGeometryDeviceState(
+            validity=runtime.from_host(validity),
+            tags=runtime.from_host(tags),
+            family_row_offsets=runtime.from_host(family_row_offsets),
+            families=device_families,
+        ),
+    )
+    result._record(
+        DiagnosticKind.CREATED,
+        f"device-resident owned array, {row_count} rows, "
+        f"{len(device_families)} families",
+        visible=False,
+    )
+    return result
