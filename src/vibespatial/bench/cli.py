@@ -70,6 +70,27 @@ def main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--json", action="store_true", dest="json_output")
     p_list.add_argument("--category", help="Filter operations by category")
 
+    # --- vsbench shootout <script.py> ----------------------------------------
+    p_shootout = sub.add_parser(
+        "shootout",
+        help="Compare a script running with real geopandas vs vibespatial",
+    )
+    p_shootout.add_argument("script", type=Path, help="Python script using geopandas")
+    p_shootout.add_argument("--repeat", type=int, default=3, help="Number of timed runs (default: 3)")
+    p_shootout.add_argument("--no-warmup", action="store_true", help="Skip warmup run")
+    p_shootout.add_argument(
+        "--baseline-python", type=str, default=None,
+        help="Python interpreter with real geopandas (skips uv isolation)",
+    )
+    p_shootout.add_argument(
+        "--with", action="append", dest="extra_deps",
+        help="Extra pip dep for the geopandas env (can repeat)",
+    )
+    p_shootout.add_argument("--timeout", type=int, default=300, help="Per-run timeout in seconds (default: 300)")
+    p_shootout.add_argument("--json", action="store_true", dest="json_output")
+    p_shootout.add_argument("--quiet", action="store_true")
+    p_shootout.add_argument("--output", type=Path, default=None, help="Write results to file")
+
     args = parser.parse_args(argv)
     return _dispatch(args)
 
@@ -126,6 +147,8 @@ def _dispatch(args: argparse.Namespace) -> int:
             return _cmd_report(args)
         case "list":
             return _cmd_list(args)
+        case "shootout":
+            return _cmd_shootout(args)
     return 1
 
 
@@ -406,6 +429,30 @@ def _list_kernels(mode: str) -> int:
     )
     print(text)
     return 0
+
+
+def _cmd_shootout(args: argparse.Namespace) -> int:
+    from .output import render_shootout
+    from .shootout import run_shootout
+
+    script = args.script.resolve()
+    if not script.is_file():
+        print(f"Error: script not found: {script}", file=sys.stderr)
+        return 1
+
+    result = run_shootout(
+        script,
+        repeat=args.repeat,
+        warmup=not args.no_warmup,
+        extra_deps=args.extra_deps,
+        baseline_python=args.baseline_python,
+        timeout=args.timeout,
+        quiet=args.quiet,
+    )
+
+    text = render_shootout(result, mode=_output_mode(args))
+    _write_output(text, args.output)
+    return 0 if result.status == "pass" else 1
 
 
 if __name__ == "__main__":

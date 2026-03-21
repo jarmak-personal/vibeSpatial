@@ -1,6 +1,8 @@
 """Benchmark orchestration: warmup, repeat/median, pipeline wrapping."""
 from __future__ import annotations
 
+import sys
+from time import perf_counter
 from typing import Any
 
 from .catalog import ensure_operations_loaded, get_operation
@@ -215,6 +217,37 @@ def _extract_gpu_util(stages: tuple[Any, ...]) -> GpuUtilSummary | None:
 # Suite runner
 # ---------------------------------------------------------------------------
 
+def _fmt_scale(scale: int) -> str:
+    if scale >= 1_000_000:
+        return f"{scale // 1_000_000}M"
+    if scale >= 1_000:
+        return f"{scale // 1_000}K"
+    return str(scale)
+
+
+def _fmt_time(seconds: float) -> str:
+    if seconds < 0.001:
+        return f"{seconds * 1_000_000:.0f}\u00b5s"
+    if seconds < 1.0:
+        return f"{seconds * 1_000:.1f}ms"
+    return f"{seconds:.2f}s"
+
+
+def _progress(result: BenchmarkResult, *, idx: int, total: int) -> None:
+    """Print a single-line progress update to stderr."""
+    status = {"pass": "\033[32mPASS\033[0m", "fail": "\033[31mFAIL\033[0m",
+              "error": "\033[31mERR\033[0m", "skip": "\033[90mSKIP\033[0m"}.get(
+        result.status, result.status)
+    speedup = f" {result.speedup:.1f}x" if result.speedup is not None else ""
+    time_str = _fmt_time(result.timing.median_seconds) if result.timing.sample_count > 0 else "-"
+    print(
+        f"  [{idx}/{total}] {status} {result.operation:<22} "
+        f"scale={_fmt_scale(result.scale):<4} {time_str:>8}{speedup}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def run_suite(
     level: str,
     *,
@@ -234,14 +267,36 @@ def run_suite(
     suite_def = SUITES[level]
     results: list[BenchmarkResult] = []
 
-    # Run operations
+    # Count total work items for progress
     ensure_operations_loaded()
     from .catalog import _OPERATION_REGISTRY
 
-    for op_name in suite_def.operations:
-        if op_name not in _OPERATION_REGISTRY:
-            continue  # skip unregistered ops (not yet wrapped)
+    active_pipelines = suite_def.pipelines
+    if pipelines_filter:
+        active_pipelines = tuple(p for p in active_pipelines if p in pipelines_filter)
+
+    registered_ops = [op for op in suite_def.operations if op in _OPERATION_REGISTRY]
+    total_items = (
+        len(registered_ops) * len(suite_def.scales)
+        + len(active_pipelines)
+        + len(suite_def.kernels) * len(suite_def.scales)
+    )
+    item_idx = 0
+    suite_start = perf_counter()
+
+    print(
+        f"\033[1mvsbench suite {level}\033[0m — "
+        f"{len(registered_ops)} ops × {len(suite_def.scales)} scales + "
+        f"{len(active_pipelines)} pipelines "
+        f"(repeat={repeat}, compare={compare or 'none'})",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    # Run operations
+    for op_name in registered_ops:
         for scale in suite_def.scales:
+            item_idx += 1
             try:
                 result = run_operation(
                     op_name,
@@ -255,7 +310,7 @@ def run_suite(
                 )
                 results.append(result)
             except Exception as exc:
-                results.append(BenchmarkResult(
+                result = BenchmarkResult(
                     operation=op_name,
                     tier=1,
                     scale=scale,
@@ -264,14 +319,13 @@ def run_suite(
                     status="error",
                     status_reason=str(exc),
                     timing=timing_from_samples([]),
-                ))
+                )
+                results.append(result)
+            _progress(result, idx=item_idx, total=total_items)
 
     # Run pipelines
-    active_pipelines = suite_def.pipelines
-    if pipelines_filter:
-        active_pipelines = tuple(p for p in active_pipelines if p in pipelines_filter)
-
     for pipeline_name in active_pipelines:
+        item_idx += 1
         suite_label = level
         try:
             pipeline_results = run_pipeline(
@@ -283,8 +337,10 @@ def run_suite(
                 trace=trace,
             )
             results.extend(pipeline_results)
+            for pr in pipeline_results:
+                _progress(pr, idx=item_idx, total=total_items)
         except Exception as exc:
-            results.append(BenchmarkResult(
+            result = BenchmarkResult(
                 operation=pipeline_name,
                 tier=1,
                 scale=0,
@@ -293,7 +349,9 @@ def run_suite(
                 status="error",
                 status_reason=str(exc),
                 timing=timing_from_samples([]),
-            ))
+            )
+            results.append(result)
+            _progress(result, idx=item_idx, total=total_items)
 
     # Tier 2 kernel benchmarks (only if available)
     if suite_def.kernels:
@@ -302,11 +360,12 @@ def run_suite(
 
             for kernel_name in suite_def.kernels:
                 for scale in suite_def.scales:
+                    item_idx += 1
                     try:
                         result = run_kernel_bench(kernel_name, scale=scale, precision=precision)
                         results.append(result)
                     except Exception as exc:
-                        results.append(BenchmarkResult(
+                        result = BenchmarkResult(
                             operation=kernel_name,
                             tier=2,
                             scale=scale,
@@ -315,9 +374,19 @@ def run_suite(
                             status="error",
                             status_reason=str(exc),
                             timing=timing_from_samples([]),
-                        ))
+                        )
+                        results.append(result)
+                    _progress(result, idx=item_idx, total=total_items)
         except ImportError:
             pass  # cuda-bench not installed, skip Tier 2
+
+    elapsed = perf_counter() - suite_start
+    passed = sum(1 for r in results if r.status == "pass")
+    print(
+        f"\n\033[1mDone\033[0m — {passed}/{len(results)} passed in {_fmt_time(elapsed)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     return SuiteResult(
         suite_name=level,

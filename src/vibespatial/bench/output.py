@@ -363,3 +363,110 @@ def render_list(
     if _has_rich():
         return _render_list_rich(items, columns=columns, title=title)
     return _render_list_plain(items, columns=columns, title=title)
+
+
+# ---------------------------------------------------------------------------
+# Shootout rendering
+# ---------------------------------------------------------------------------
+
+def _shootout_status(run: Any) -> str:
+    return "ERR" if run.error else "OK"
+
+
+def _render_shootout_quiet(result: Any) -> str:
+    status = "PASS" if result.status == "pass" else "ERR"
+    parts = [
+        f"[{status}]",
+        "shootout",
+        result.script,
+        f"geopandas={_fmt_time(result.geopandas.timing.median_seconds)}",
+        f"vibespatial={_fmt_time(result.vibespatial.timing.median_seconds)}",
+    ]
+    if result.speedup is not None:
+        parts.append(f"speedup={result.speedup:.1f}x")
+    return " ".join(parts)
+
+
+def _render_shootout_plain(result: Any) -> str:
+    from pathlib import Path
+
+    name = Path(result.script).name
+    lines = [f"Shootout: {name}", "=" * 50]
+
+    for run in (result.geopandas, result.vibespatial):
+        t = run.timing
+        status = _shootout_status(run)
+        lines.append(
+            f"  {run.label:<14} median={_fmt_time(t.median_seconds):>8}  "
+            f"min={_fmt_time(t.min_seconds):>8}  max={_fmt_time(t.max_seconds):>8}  "
+            f"[{status}]"
+        )
+        if run.error:
+            lines.append(f"    error: {run.error}")
+
+    lines.append("-" * 50)
+    if result.speedup is not None:
+        label = "faster" if result.speedup >= 1.0 else "slower"
+        lines.append(f"  Speedup: {result.speedup:.2f}x (vibespatial is {label})")
+    else:
+        lines.append("  Speedup: N/A")
+    return "\n".join(lines)
+
+
+def _render_shootout_rich(result: Any) -> str:
+    from pathlib import Path
+
+    from rich.console import Console
+    from rich.table import Table
+
+    name = Path(result.script).name
+    table = Table(
+        title=f"vsbench shootout: {name}",
+        show_edge=False,
+        pad_edge=False,
+    )
+    table.add_column("Runner", style="bold")
+    table.add_column("Median", justify="right")
+    table.add_column("Min", justify="right")
+    table.add_column("Max", justify="right")
+    table.add_column("Samples", justify="right")
+    table.add_column("Status", justify="center")
+
+    for run in (result.geopandas, result.vibespatial):
+        t = run.timing
+        status_style = "green" if not run.error else "bold red"
+        status_str = f"[{status_style}]{_shootout_status(run)}[/]"
+        table.add_row(
+            run.label,
+            _fmt_time(t.median_seconds),
+            _fmt_time(t.min_seconds),
+            _fmt_time(t.max_seconds),
+            str(t.sample_count),
+            status_str,
+        )
+
+    if result.speedup is not None:
+        style = "bold green" if result.speedup >= 1.0 else "bold red"
+        label = "faster" if result.speedup >= 1.0 else "slower"
+        table.add_section()
+        table.add_row(
+            "Speedup",
+            f"[{style}]{result.speedup:.2f}x[/] ({label})",
+            "", "", "", "",
+        )
+
+    console = Console(file=None, force_terminal=False)
+    with console.capture() as capture:
+        console.print(table)
+    return capture.get()
+
+
+def render_shootout(result: Any, *, mode: str = "human") -> str:
+    """Render a shootout comparison result."""
+    if mode == "json":
+        return result.to_json()
+    if mode == "quiet":
+        return _render_shootout_quiet(result)
+    if _has_rich():
+        return _render_shootout_rich(result)
+    return _render_shootout_plain(result)

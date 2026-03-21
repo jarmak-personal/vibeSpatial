@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 153/220 lines
+Body Budget: 156/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -13,16 +13,16 @@ Section Map (Body Lines)
 |---|---|
 | 1-5 | Preamble |
 | 6-12 | Intent |
-| 13-27 | Request Signals |
-| 28-39 | Open First |
-| 40-47 | Verify |
-| 48-56 | Risks |
-| 57-70 | Entry Points |
-| 71-85 | Pipelines |
-| 86-98 | Suites |
-| 99-107 | Regression Rules |
-| 108-134 | Trace Contract |
-| 135-153 | CI Workflow |
+| 13-29 | Request Signals |
+| 30-42 | Open First |
+| 43-50 | Verify |
+| 51-59 | Risks |
+| 60-73 | Entry Points |
+| 74-88 | Pipelines |
+| 89-101 | Suites |
+| 102-110 | Regression Rules |
+| 111-137 | Trace Contract |
+| 138-156 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -49,6 +49,8 @@ timers.
 - benchmark suite
 - benchmark compare
 - nvbench kernel
+- shootout
+- geopandas vs vibespatial
 
 ## Open First
 
@@ -61,6 +63,7 @@ timers.
 - scripts/benchmark_pipelines.py
 - scripts/check_pipeline_regressions.py
 - .github/workflows/pipeline-benchmarks.yml
+- src/vibespatial/bench/shootout.py
 
 ## Verify
 

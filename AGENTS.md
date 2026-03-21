@@ -112,7 +112,7 @@ inspect the local area, then expand.
 - `scripts/extract_vendor_to_api.py`: extract vendored GeoPandas surfaces into the repo-owned API layer.
 - `scripts/upstream_native_coverage.py`: strict-native GeoPandas coverage analysis.
 - `scripts/bench_compact_gather.py`: compact+gather micro-benchmark (CuPy vs CCCL vs NVRTC).
-- `vsbench` (entry point): unified benchmarking CLI for operations, pipelines, kernel microbenchmarks, and regression detection. See `src/vibespatial/bench/cli.py`.
+- `vsbench` (entry point): unified benchmarking CLI for operations, pipelines, kernel microbenchmarks, regression detection, and geopandas-vs-vibespatial shootout comparisons. See `src/vibespatial/bench/cli.py`.
 - `scripts/benchmark_pipelines.py`: end-to-end pipeline benchmarking and GPU sparkline profiling (legacy; prefer `vsbench suite`).
 - `scripts/check_architecture_lints.py`: validate architecture constraints and doc consistency.
 - `scripts/check_zero_copy.py`: zero-copy device transfer enforcement (ZCOPY001-003).

@@ -3326,7 +3326,8 @@
         "src/vibespatial/bench/pipeline.py",
         "scripts/benchmark_pipelines.py",
         "scripts/check_pipeline_regressions.py",
-        ".github/workflows/pipeline-benchmarks.yml"
+        ".github/workflows/pipeline-benchmarks.yml",
+        "src/vibespatial/bench/shootout.py"
       ],
       "path": "docs/testing/pipeline-benchmarks.md",
       "request_signals": [
@@ -3341,7 +3342,9 @@
         "benchmark operation",
         "benchmark suite",
         "benchmark compare",
-        "nvbench kernel"
+        "nvbench kernel",
+        "shootout",
+        "geopandas vs vibespatial"
       ],
       "risks": [
         "Comparing current results to a stale or missing baseline can hide regressions",
@@ -3381,6 +3384,7 @@
         "first",
         "gate",
         "gates",
+        "geopandas",
         "gpu",
         "have",
         "implementation",
@@ -3406,6 +3410,7 @@
         "risks",
         "rules",
         "scripts",
+        "shootout",
         "signals",
         "suite",
         "suites",
@@ -3413,6 +3418,8 @@
         "trace",
         "tracking",
         "verify",
+        "vibespatial",
+        "vs",
         "vsbench",
         "workflow",
         "you"
@@ -12891,7 +12898,8 @@
         "_list_operations",
         "_list_pipelines",
         "_list_fixtures",
-        "_list_kernels"
+        "_list_kernels",
+        "_cmd_shootout"
       ],
       "tokens": [
         "add",
@@ -12915,6 +12923,7 @@
         "py",
         "report",
         "run",
+        "shootout",
         "src",
         "suite",
         "vibespatial",
@@ -13374,7 +13383,12 @@
         "_render_list_plain",
         "render_result",
         "render_suite",
-        "render_list"
+        "render_list",
+        "_shootout_status",
+        "_render_shootout_quiet",
+        "_render_shootout_plain",
+        "_render_shootout_rich",
+        "render_shootout"
       ],
       "tokens": [
         "bench",
@@ -13390,6 +13404,7 @@
         "result",
         "rich",
         "scale",
+        "shootout",
         "speedup",
         "src",
         "status",
@@ -13566,16 +13581,21 @@
         "run_pipeline",
         "_convert_pipeline_result",
         "_extract_gpu_util",
+        "_fmt_scale",
+        "_fmt_time",
+        "_progress",
         "run_suite"
       ],
       "tokens": [
         "bench",
         "convert",
         "extract",
+        "fmt",
         "gpu",
         "median",
         "operation",
         "pipeline",
+        "progress",
         "py",
         "resolve",
         "result",
@@ -13585,6 +13605,7 @@
         "select",
         "src",
         "suite",
+        "time",
         "util",
         "vibespatial"
       ]
@@ -13617,6 +13638,41 @@
         "timing",
         "timingsummary",
         "transfersummary",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/bench/shootout.py",
+      "referenced_by": [
+        "docs/testing/pipeline-benchmarks.md"
+      ],
+      "symbols": [
+        "ShootoutRun",
+        "ShootoutResult",
+        "_find_uv",
+        "_fmt_time",
+        "_build_run_from_result",
+        "_error_run",
+        "_run_harness",
+        "run_shootout"
+      ],
+      "tokens": [
+        "bench",
+        "build",
+        "error",
+        "find",
+        "fmt",
+        "harness",
+        "py",
+        "result",
+        "run",
+        "shootout",
+        "shootoutresult",
+        "shootoutrun",
+        "src",
+        "time",
+        "uv",
         "vibespatial"
       ]
     },
