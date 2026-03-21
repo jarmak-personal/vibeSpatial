@@ -278,6 +278,23 @@ wheels = [
 ]
 
 [[package]]
+name = "cuda-bench"
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/01/35/4263638e255cddf818f557c5f8528dc671d5a492ae56f3f08df18482c854/cuda_bench-0.2.0-cp312-cp312-manylinux_2_27_x86_64.whl", hash = "sha256:5636d12b95df877c6af27a3359528875280c100ca6c266f354f1296486efd671", size = 2417619, upload-time = "2026-02-04T01:05:56.929Z" },
+    { url = "https://files.pythonhosted.org/packages/26/bb/7c1443441700212f9f5b3319c0b9cbe5b4588860bd08110c8441029462c4/cuda_bench-0.2.0-cp313-cp313-manylinux_2_27_x86_64.whl", hash = "sha256:e30329e4420442d57ffb551f7c1c78a602b7e098157f05a1d970bbe02b00e855", size = 2419526, upload-time = "2026-02-04T01:05:58.341Z" },
+]
+
+[package.optional-dependencies]
+cu12 = [
+    { name = "cuda-bindings", version = "12.9.6", source = { registry = "https://pypi.org/simple" } },
+]
+cu13 = [
+    { name = "cuda-bindings", version = "13.2.0", source = { registry = "https://pypi.org/simple" } },
+]
+
+[[package]]
 name = "cuda-bindings"
 version = "12.9.6"
 source = { registry = "https://pypi.org/simple" }
@@ -834,6 +851,40 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/0f/41/c5f71f9f00aabcc71fee8b7475e3f64747282580c2fe748961ba29b18385/kiwisolver-1.5.0-graalpy312-graalpy250_312_native-macosx_11_0_arm64.whl", hash = "sha256:f6764a4ccab3078db14a632420930f6186058750df066b8ea2a7106df91d3203", size = 138036, upload-time = "2026-03-09T13:15:36.894Z" },
     { url = "https://files.pythonhosted.org/packages/fa/06/7399a607f434119c6e1fdc8ec89a8d51ccccadf3341dee4ead6bd14caaf5/kiwisolver-1.5.0-graalpy312-graalpy250_312_native-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:c31c13da98624f957b0fb1b5bae5383b2333c2c3f6793d9825dd5ce79b525cb7", size = 194295, upload-time = "2026-03-09T13:15:38.22Z" },
     { url = "https://files.pythonhosted.org/packages/b5/91/53255615acd2a1eaca307ede3c90eb550bae9c94581f8c00081b6b1c8f44/kiwisolver-1.5.0-graalpy312-graalpy250_312_native-win_amd64.whl", hash = "sha256:1f1489f769582498610e015a8ef2d36f28f505ab3096d0e16b4858a9ec214f57", size = 75987, upload-time = "2026-03-09T13:15:39.65Z" },
+]
+
+[[package]]
+name = "kvikio-cu12"
+version = "26.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cupy-cuda12x" },
+    { name = "libkvikio-cu12" },
+    { name = "numpy" },
+    { name = "packaging" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/97/00/da0094342e1b99808022587e3588ee0fc111c9497550291c8faf2538a14f/kvikio_cu12-26.2.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:ffd1fe053872c54499bd3a394657da59ed9082108fee17ac5b17227d9ddc0650", size = 603879, upload-time = "2026-02-06T23:06:43.36Z" },
+    { url = "https://files.pythonhosted.org/packages/c8/fc/1b7426734eea4ff91371d9472ee7e4bc7df60db5e25c7d4698bfe7f9b14c/kvikio_cu12-26.2.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:21d07c72bbd97b47482df46922667cdb9cade0f9a8169257a5bf34ffeef7aa2d", size = 642880, upload-time = "2026-02-06T23:08:55.037Z" },
+    { url = "https://files.pythonhosted.org/packages/38/cb/e4eec9e1a4827665e80ad9f90fbe22b175e1644659fadbaa8027cc0d0622/kvikio_cu12-26.2.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:04095bfffa727b129cb965ce3b5373ef35af45ca6f57cd7ff079d54e60cd96fe", size = 601824, upload-time = "2026-02-06T23:05:01.817Z" },
+    { url = "https://files.pythonhosted.org/packages/df/ad/9c2dfa40bb2584160ddf32715a9dbe97425276713b37a0640bfc246cbe81/kvikio_cu12-26.2.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0a89ad44eef800663127c1a4b3253a4112d9193c717507a1198c884e9ac60e79", size = 640991, upload-time = "2026-02-06T23:09:39.355Z" },
+]
+
+[[package]]
+name = "kvikio-cu13"
+version = "26.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cupy-cuda13x" },
+    { name = "libkvikio-cu13" },
+    { name = "numpy" },
+    { name = "packaging" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/87/2d/cedaf5fef8f972994669f1f66067c626bd57751cef69661196fbc4d2a50f/kvikio_cu13-26.2.0-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:93efa8e771584c590c52769930d60c29de7f91386f343ae448f962d7a975e536", size = 603879, upload-time = "2026-02-06T23:03:18.132Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/7a/0f87cbeb1a4fd4138e0a5c888fc6254fb73d8303038743dd215789ae75a5/kvikio_cu13-26.2.0-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:75aa7778f8f206c4738dae63d00d7f0b1ea8108f8b1442038d7b4ff13cf0e455", size = 642880, upload-time = "2026-02-06T23:09:17.188Z" },
+    { url = "https://files.pythonhosted.org/packages/ab/83/a92e50514bc94f223cdb6c7cfbdadc2abcb3c2b867fec9184ff7155ddd92/kvikio_cu13-26.2.0-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4609e5d8b5a9a3263d6cbfe469007c2bf6811d468cd51315da714737ee24c6ba", size = 601820, upload-time = "2026-02-06T23:00:47.798Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/c7/eec495b709c57d0ebca4e998e1747dc29d7230932725df19a9bbf2dd3239/kvikio_cu13-26.2.0-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6b668dc006d888e9d8c629cf051ed407076c199222934cef7ff40d84da63b1af", size = 640992, upload-time = "2026-02-06T23:08:09.584Z" },
 ]
 
 [[package]]
@@ -2277,16 +2328,20 @@ bench = [
     { name = "rich" },
 ]
 cu12 = [
+    { name = "cuda-bench", extra = ["cu12"], marker = "extra == 'extra-11-vibespatial-cu12'" },
     { name = "cuda-cccl", extra = ["cu12"], marker = "extra == 'extra-11-vibespatial-cu12'" },
     { name = "cuda-python", version = "12.9.6", source = { registry = "https://pypi.org/simple" } },
     { name = "cupy-cuda12x" },
+    { name = "kvikio-cu12" },
     { name = "nvidia-ml-py" },
     { name = "pylibcudf-cu12" },
 ]
 cu13 = [
+    { name = "cuda-bench", extra = ["cu13"], marker = "extra == 'extra-11-vibespatial-cu13'" },
     { name = "cuda-cccl", extra = ["cu13"], marker = "extra == 'extra-11-vibespatial-cu13'" },
     { name = "cuda-python", version = "13.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "cupy-cuda13x" },
+    { name = "kvikio-cu13" },
     { name = "nvidia-ml-py" },
     { name = "pylibcudf-cu13" },
 ]
@@ -2322,12 +2377,16 @@ upstream-optional = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cuda-bench", extras = ["cu12"], marker = "extra == 'cu12'" },
+    { name = "cuda-bench", extras = ["cu13"], marker = "extra == 'cu13'" },
     { name = "cuda-cccl", extras = ["cu12"], marker = "extra == 'cu12'" },
     { name = "cuda-cccl", extras = ["cu13"], marker = "extra == 'cu13'" },
     { name = "cuda-python", marker = "extra == 'cu12'", specifier = ">=12,<13" },
     { name = "cuda-python", marker = "extra == 'cu13'", specifier = ">=13" },
     { name = "cupy-cuda12x", marker = "extra == 'cu12'", specifier = ">=13" },
     { name = "cupy-cuda13x", marker = "extra == 'cu13'", specifier = ">=14" },
+    { name = "kvikio-cu12", marker = "extra == 'cu12'", specifier = ">=26.2" },
+    { name = "kvikio-cu13", marker = "extra == 'cu13'", specifier = ">=26.2" },
     { name = "numpy", specifier = ">=2" },
     { name = "nvidia-ml-py", marker = "extra == 'cu12'", specifier = ">=13.590.48" },
     { name = "nvidia-ml-py", marker = "extra == 'cu13'", specifier = ">=13.590.48" },

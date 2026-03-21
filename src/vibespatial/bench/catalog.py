@@ -24,6 +24,7 @@ class BenchmarkCallable(Protocol):
         repeat: int,
         compare: str | None,
         precision: str,
+        input_format: str,
         nvtx: bool,
         gpu_sparkline: bool,
         trace: bool,
@@ -48,6 +49,7 @@ class OperationSpec:
     callable: BenchmarkCallable
     legacy_script: str | None = None
     tags: tuple[str, ...] = ()
+    max_scale: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -61,6 +63,8 @@ class OperationSpec:
         }
         if self.legacy_script:
             d["legacy_script"] = self.legacy_script
+        if self.max_scale is not None:
+            d["max_scale"] = self.max_scale
         return d
 
 
@@ -81,6 +85,7 @@ def benchmark_operation(
     tier: int = 3,
     legacy_script: str | None = None,
     tags: tuple[str, ...] = (),
+    max_scale: int | None = None,
 ):
     """Decorator that registers a benchmark operation for CLI discovery."""
 
@@ -95,6 +100,7 @@ def benchmark_operation(
             callable=func,
             legacy_script=legacy_script,
             tags=tags,
+            max_scale=max_scale,
         )
         _OPERATION_REGISTRY[name] = spec
         return func

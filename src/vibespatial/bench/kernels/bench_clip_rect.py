@@ -43,13 +43,13 @@ def main(argv: list[str] | None = None) -> int:
             clip_by_rect_owned(owned, *rect)
 
         state.add_element_count(n)
-        state.exec(launcher)
+        state.exec(launcher, sync=True)
 
     b = bench.register(clip_bench)
     b.add_int64_axis("NumElements", [args.scale])
 
     bench.run_all_benchmarks(
-        ["--json", str(args.output_json)] + (sys.argv[1:] if argv is None else [])
+        ["--json", str(args.output_json)]
     )
     return 0
 

@@ -12,7 +12,7 @@ from vibespatial.bench.schema import (
 
 @benchmark_operation(
     name="io-arrow",
-    description="GeoArrow / WKB / GeoParquet decode benchmark",
+    description="GeoArrow / WKB encode roundtrip benchmark",
     category="io",
     geometry_types=("point", "polygon"),
     default_scale=100_000,
@@ -26,28 +26,24 @@ def bench_io_arrow(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import from_shapely_geometries
-    from vibespatial.io.arrow import owned_to_wkb
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_points
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
+    from vibespatial.io.wkb import encode_wkb_owned
 
-    dataset = generate_points(SyntheticSpec("point", "grid", count=scale, seed=0))
-    owned = from_shapely_geometries(list(dataset.geometries))
+    spec = resolve_fixture_spec("point", "grid", scale)
+    owned, read_seconds = load_owned(spec, InputFormat(input_format))
 
-    # Benchmark WKB encoding roundtrip
-    # Warmup
-    owned_to_wkb(owned)
+    encode_wkb_owned(owned)
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        owned_to_wkb(owned)
+        encode_wkb_owned(owned)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -61,6 +57,8 @@ def bench_io_arrow(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat, "format": "wkb-encode"},
     )
 
@@ -81,19 +79,32 @@ def bench_io_file(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_geojson_ingest
 
-    results = benchmark_geojson_ingest(
-        geometry_type="point",
-        rows=scale,
-        repeat=max(1, repeat),
-    )
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    # Use the first (fastest) implementation's timing
-    best = min(results, key=lambda r: r.elapsed_seconds)
-    timing = timing_from_samples([best.elapsed_seconds])
+    # This benchmark measures the read itself — input_format IS the operation
+    fmt = InputFormat(input_format)
+    spec = resolve_fixture_spec("point", "grid", scale)
+
+    # Time the owned (GPU-native) read
+    owned, read_seconds = load_owned(spec, fmt)
+
+    # Time the GeoDataFrame (CPU) read as baseline
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare is not None or True:  # always compare for IO benchmarks
+        gdf, baseline_read = load_geodataframe(spec, fmt)
+        baseline_timing = timing_from_samples([baseline_read])
+        baseline_name = f"geopandas-{input_format}"
+        if read_seconds > 0:
+            speedup = baseline_read / read_seconds
+
+    timing = timing_from_samples([read_seconds])
 
     return BenchmarkResult(
         operation="io-file",
@@ -104,11 +115,12 @@ def bench_io_file(
         status="pass",
         status_reason="ok",
         timing=timing,
-        metadata={
-            "format": "geojson",
-            "implementation": best.implementation,
-            "rows_per_second": best.rows_per_second,
-        },
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
+        metadata={"format": input_format},
     )
 
 
@@ -128,19 +140,20 @@ def bench_gpu_decode(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import decode_wkb_owned, from_shapely_geometries
-    from vibespatial.io.arrow import owned_to_wkb
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_points
+    from vibespatial import decode_wkb_owned
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
+    from vibespatial.io.wkb import encode_wkb_owned
 
-    dataset = generate_points(SyntheticSpec("point", "grid", count=scale, seed=0))
-    owned = from_shapely_geometries(list(dataset.geometries))
-    wkb_data = owned_to_wkb(owned)
+    spec = resolve_fixture_spec("point", "grid", scale)
+    owned, _ = load_owned(spec, InputFormat(input_format))
+    wkb_data = encode_wkb_owned(owned)
 
-    # Warmup
     decode_wkb_owned(wkb_data)
 
     times: list[float] = []
@@ -160,6 +173,7 @@ def bench_gpu_decode(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
         metadata={"repeat": repeat, "format": "wkb-decode"},
     )
 
@@ -180,6 +194,7 @@ def bench_mixed_layouts(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from vibespatial.testing.mixed_layouts import benchmark_matrix
@@ -195,9 +210,9 @@ def bench_mixed_layouts(
             status="error",
             status_reason="no results from benchmark_matrix",
             timing=timing_from_samples([]),
+            input_format=input_format,
         )
 
-    # Use the first result
     r = results[0]
     timing = timing_from_samples([r.tagged_prep_ms / 1000.0])
 
@@ -210,6 +225,7 @@ def bench_mixed_layouts(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
         metadata={
             "dataset_name": r.dataset_name,
             "warp_purity": r.tagged_warp_purity,

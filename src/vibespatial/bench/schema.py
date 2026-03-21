@@ -146,6 +146,10 @@ class BenchmarkResult:
     tier_gate_threshold: float | None = None
     tier_gate_passed: bool | None = None
 
+    # IO format tracking
+    input_format: str = "parquet"
+    read_seconds: float | None = None
+
     # Stages (pipeline drilldown)
     stages: tuple[dict[str, Any], ...] = ()
 
@@ -162,7 +166,10 @@ class BenchmarkResult:
             "status": self.status,
             "status_reason": self.status_reason,
             "timing": self.timing.to_dict(),
+            "input_format": self.input_format,
         }
+        if self.read_seconds is not None:
+            d["read_seconds"] = self.read_seconds
         if self.baseline_name is not None:
             d["baseline_name"] = self.baseline_name
         if self.baseline_timing is not None:
@@ -186,7 +193,10 @@ class BenchmarkResult:
         return d
 
     def to_json(self) -> str:
-        return orjson.dumps(self.to_dict(), option=orjson.OPT_INDENT_2).decode()
+        return orjson.dumps(
+            self.to_dict(),
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY,
+        ).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +220,10 @@ class SuiteResult:
         }
 
     def to_json(self) -> str:
-        return orjson.dumps(self.to_dict(), option=orjson.OPT_INDENT_2).decode()
+        return orjson.dumps(
+            self.to_dict(),
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY,
+        ).decode()
 
 
 # ---------------------------------------------------------------------------

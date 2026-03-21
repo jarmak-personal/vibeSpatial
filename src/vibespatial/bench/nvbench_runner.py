@@ -185,7 +185,10 @@ def _parse_nvbench_json(
         return _error_result(kernel_name, scale, precision, "no states in benchmark")
 
     state = states[0]
-    summaries = {s.get("tag", ""): s for s in state.get("summaries", [])}
+    if state.get("is_skipped") or state.get("summaries") is None:
+        reason = state.get("skip_reason", "no summaries (kernel may have failed)")
+        return _error_result(kernel_name, scale, precision, reason)
+    summaries = {s.get("tag", ""): s for s in state["summaries"]}
 
     gpu_time = _extract_summary_value(summaries, "nv/cold/time/gpu/mean", 0.0)
     cpu_time = _extract_summary_value(summaries, "nv/cold/time/cpu/mean", 0.0)
@@ -232,14 +235,30 @@ def _extract_summary_value(
     tag: str,
     default: Any,
 ) -> Any:
-    """Extract a numeric value from NVBench summary data."""
+    """Extract a numeric value from NVBench summary data.
+
+    NVBench stores values as ``data[0]["value"]`` (string-encoded).
+    """
     s = summaries.get(tag)
     if s is None:
         return default
+    # NVBench JSON format: {"tag": ..., "data": [{"name": "value", "type": "float64", "value": "0.001"}]}
+    data = s.get("data")
+    if isinstance(data, list) and data:
+        raw = data[0].get("value")
+        if raw is not None:
+            try:
+                return float(raw)
+            except (ValueError, TypeError):
+                pass
+    # Fallback: try top-level "value" key
     value = s.get("value")
-    if value is None:
-        return default
-    return float(value)
+    if value is not None:
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            pass
+    return default
 
 
 # ---------------------------------------------------------------------------

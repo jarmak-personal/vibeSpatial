@@ -26,20 +26,18 @@ def bench_bounds(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from shapely.geometry import Point
-
-    from vibespatial import ExecutionMode, from_shapely_geometries, has_gpu_runtime
+    from vibespatial import ExecutionMode, has_gpu_runtime
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 
-    points = [Point(float(i), float((i * 7) % 1000)) for i in range(scale)]
-    owned = from_shapely_geometries(points)
+    spec = resolve_fixture_spec("point", "grid", scale)
+    owned, read_seconds = load_owned(spec, InputFormat(input_format))
 
     # CPU timing
     cpu_times: list[float] = []
@@ -54,14 +52,12 @@ def bench_bounds(
     baseline_timing = None
 
     if has_gpu_runtime():
-        # Warmup
         compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
         for _ in range(max(1, repeat)):
             start = perf_counter()
             compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
             gpu_times.append(perf_counter() - start)
 
-    # Determine primary timing and baseline
     if gpu_times:
         timing = timing_from_samples(gpu_times)
         baseline_timing = timing_from_samples(cpu_times)
@@ -82,6 +78,8 @@ def bench_bounds(
         baseline_name="cpu" if gpu_times else None,
         baseline_timing=baseline_timing,
         speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat},
     )
 
@@ -102,30 +100,21 @@ def bench_spatial_query(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import from_shapely_geometries
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.spatial.indexing import build_flat_spatial_index
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
 
-    dataset = generate_polygons(
-        SyntheticSpec(
-            geometry_type="polygon",
-            distribution="regular-grid",
-            count=scale,
-            seed=0,
-        )
-    )
-    owned = from_shapely_geometries(list(dataset.geometries))
+    spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    owned, read_seconds = load_owned(spec, InputFormat(input_format))
+
+    build_flat_spatial_index(owned)
 
     times: list[float] = []
-    # Warmup
-    build_flat_spatial_index(owned)
     for _ in range(max(1, repeat)):
         start = perf_counter()
         build_flat_spatial_index(owned)
@@ -142,6 +131,8 @@ def bench_spatial_query(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat},
     )
 
@@ -155,6 +146,7 @@ def bench_spatial_query(
     tier=5,
     legacy_script="benchmark_bounds_pairs.py",
     tags=("gpu",),
+    max_scale=100_000,
 )
 def bench_bounds_pairs(
     *,
@@ -162,15 +154,15 @@ def bench_bounds_pairs(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_bounds_pairs, from_shapely_geometries
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_points
+    from vibespatial import benchmark_bounds_pairs
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    dataset = generate_points(
-        SyntheticSpec("point", "uniform", count=scale, seed=0)
-    )
-    owned = from_shapely_geometries(list(dataset.geometries))
+    spec = resolve_fixture_spec("point", "uniform", scale)
+    owned, read_seconds = load_owned(spec, InputFormat(input_format))
     result = benchmark_bounds_pairs(owned, dataset="uniform", tile_size=256)
 
     timing = timing_from_samples([result.elapsed_seconds])
@@ -184,6 +176,8 @@ def bench_bounds_pairs(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={
             "pairs_examined": result.pairs_examined,
             "candidate_pairs": result.candidate_pairs,

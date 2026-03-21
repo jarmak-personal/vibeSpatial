@@ -46,13 +46,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.bandwidth:
             state.add_global_memory_reads(n * 16)  # xy coords per point
             state.add_global_memory_writes(n * 32)  # 4 doubles per bounds
-        state.exec(launcher)
+        state.exec(launcher, sync=True)
 
     b = bench.register(bounds_bench)
     b.add_int64_axis("NumElements", [args.scale])
 
     bench.run_all_benchmarks(
-        ["--json", str(args.output_json)] + (sys.argv[1:] if argv is None else [])
+        ["--json", str(args.output_json)]
     )
     return 0
 

@@ -3323,11 +3323,13 @@
         "src/vibespatial/bench/catalog.py",
         "src/vibespatial/bench/runner.py",
         "src/vibespatial/bench/schema.py",
+        "src/vibespatial/bench/fixtures.py",
+        "src/vibespatial/bench/fixture_loader.py",
         "src/vibespatial/bench/pipeline.py",
+        "src/vibespatial/bench/shootout.py",
         "scripts/benchmark_pipelines.py",
         "scripts/check_pipeline_regressions.py",
-        ".github/workflows/pipeline-benchmarks.yml",
-        "src/vibespatial/bench/shootout.py"
+        ".github/workflows/pipeline-benchmarks.yml"
       ],
       "path": "docs/testing/pipeline-benchmarks.md",
       "request_signals": [
@@ -3427,6 +3429,7 @@
       "verify": [
         "uv run vsbench list operations",
         "uv run vsbench run bounds --scale 1k --repeat 1 --quiet",
+        "uv run vsbench fixtures generate --scale 1k --format parquet",
         "uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q",
         "uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2",
         "uv run python scripts/check_docs.py --check"
@@ -12979,7 +12982,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/bench/fixture_loader.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/testing/pipeline-benchmarks.md"
+      ],
       "symbols": [
         "_preferred_geoparquet_backend",
         "load_owned",
@@ -13040,7 +13045,9 @@
     {
       "kind": "source",
       "path": "src/vibespatial/bench/fixtures.py",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/testing/pipeline-benchmarks.md"
+      ],
       "symbols": [
         "InputFormat",
         "BenchmarkFixtureSpec",

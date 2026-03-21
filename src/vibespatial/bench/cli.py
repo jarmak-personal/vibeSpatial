@@ -70,6 +70,25 @@ def main(argv: list[str] | None = None) -> int:
     p_list.add_argument("--json", action="store_true", dest="json_output")
     p_list.add_argument("--category", help="Filter operations by category")
 
+    # --- vsbench fixtures generate --------------------------------------------
+    p_fix = sub.add_parser("fixtures", help="Manage benchmark fixture files")
+    fix_sub = p_fix.add_subparsers(dest="fixtures_command", required=True)
+    p_gen = fix_sub.add_parser("generate", help="Generate fixture files in various formats")
+    p_gen.add_argument(
+        "--scale",
+        choices=("1k", "10k", "100k", "1m", "all"),
+        default="all",
+        help="Scale to generate (default: all)",
+    )
+    p_gen.add_argument(
+        "--format",
+        choices=("parquet", "geojson", "shapefile", "gpkg", "all"),
+        default="all",
+        dest="gen_format",
+        help="Output format (default: all)",
+    )
+    p_gen.add_argument("--force", action="store_true", help="Regenerate even if cached")
+
     # --- vsbench shootout <script.py> ----------------------------------------
     p_shootout = sub.add_parser(
         "shootout",
@@ -103,6 +122,12 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--scale", choices=("1k", "10k", "100k", "1m"), default=None)
     parser.add_argument("--compare", choices=("shapely", "geopandas"), default=None)
     parser.add_argument("--precision", choices=("fp32", "fp64", "auto"), default="auto")
+    parser.add_argument(
+        "--input-format",
+        choices=("parquet", "geojson", "shapefile", "gpkg"),
+        default="parquet",
+        help="Input file format for fixtures (default: parquet)",
+    )
     parser.add_argument("--gpu-sparkline", action="store_true")
     parser.add_argument("--nvtx", action="store_true")
     parser.add_argument("--trace", action="store_true")
@@ -147,6 +172,8 @@ def _dispatch(args: argparse.Namespace) -> int:
             return _cmd_report(args)
         case "list":
             return _cmd_list(args)
+        case "fixtures":
+            return _cmd_fixtures(args)
         case "shootout":
             return _cmd_shootout(args)
     return 1
@@ -171,6 +198,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         repeat=args.repeat,
         compare=args.compare,
         precision=args.precision,
+        input_format=args.input_format,
         nvtx=args.nvtx,
         gpu_sparkline=args.gpu_sparkline,
         trace=args.trace,
@@ -215,6 +243,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         repeat=args.repeat,
         compare=args.compare,
         precision=args.precision,
+        input_format=args.input_format,
         nvtx=args.nvtx,
         gpu_sparkline=args.gpu_sparkline,
         trace=args.trace,
@@ -236,10 +265,8 @@ def _cmd_kernel(args: argparse.Namespace) -> int:
         from .nvbench_runner import run_kernel_bench
     except ImportError:
         print(
-            "cuda-bench is not installed. Install it with:\n"
-            "  pip install cuda-bench[cu12]\n"
-            "or add it to your project with:\n"
-            "  uv add --optional bench-nvbench 'cuda-bench[cu12]'",
+            "cuda-bench is not installed. Install GPU deps with:\n"
+            "  uv sync --extra cu12",
             file=sys.stderr,
         )
         return 1
@@ -305,6 +332,52 @@ def _cmd_report(args: argparse.Namespace) -> int:
     out_path = args.output or args.input.with_suffix(".html")
     out_path.write_text(html_content, encoding="utf-8")
     print(f"Report written to {out_path}")
+    return 0
+
+
+def _cmd_fixtures(args: argparse.Namespace) -> int:
+    from .fixtures import (
+        ALL_INPUT_FORMATS,
+        InputFormat,
+        ensure_fixture_format,
+        list_fixture_specs,
+    )
+    from .runner import SCALE_MAP
+
+    specs = list_fixture_specs()
+    if args.scale != "all":
+        target = SCALE_MAP[args.scale]
+        specs = tuple(s for s in specs if s.rows == target)
+
+    if args.gen_format == "all":
+        formats = ALL_INPUT_FORMATS
+    else:
+        formats = (InputFormat(args.gen_format),)
+
+    total = len(specs) * len(formats)
+    count = 0
+    skipped = 0
+    for spec in specs:
+        for fmt in formats:
+            count += 1
+            print(
+                f"  [{count}/{total}] {spec.name} [{fmt}]...",
+                end="",
+                flush=True,
+                file=sys.stderr,
+            )
+            try:
+                path = ensure_fixture_format(spec, fmt, force=args.force)
+                print(f" {path}", file=sys.stderr)
+            except ValueError as exc:
+                skipped += 1
+                print(f" SKIP ({exc})", file=sys.stderr)
+
+    generated = count - skipped
+    msg = f"\nGenerated {generated} fixture files."
+    if skipped:
+        msg += f" Skipped {skipped} (unsupported format combos)."
+    print(msg, file=sys.stderr)
     return 0
 
 

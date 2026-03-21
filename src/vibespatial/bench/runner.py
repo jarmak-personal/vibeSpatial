@@ -41,6 +41,7 @@ def run_operation(
     repeat: int = 3,
     compare: str | None = None,
     precision: str = "auto",
+    input_format: str = "parquet",
     nvtx: bool = False,
     gpu_sparkline: bool = False,
     trace: bool = False,
@@ -49,13 +50,17 @@ def run_operation(
     ensure_operations_loaded()
     spec = get_operation(name)
 
+    # Clip scale to max_scale if the operation declares one
+    effective_scale = min(scale, spec.max_scale) if spec.max_scale else scale
+
     # Warmup run (discarded)
     try:
         spec.callable(
-            scale=min(scale, 1_000),
+            scale=min(effective_scale, 1_000),
             repeat=1,
             compare=None,
             precision=precision,
+            input_format=input_format,
             nvtx=False,
             gpu_sparkline=False,
             trace=False,
@@ -67,10 +72,11 @@ def run_operation(
     samples: list[BenchmarkResult] = []
     for _ in range(max(1, repeat)):
         result = spec.callable(
-            scale=scale,
+            scale=effective_scale,
             repeat=1,
             compare=compare,
             precision=precision,
+            input_format=input_format,
             nvtx=nvtx,
             gpu_sparkline=gpu_sparkline,
             trace=trace,
@@ -150,8 +156,13 @@ def _convert_pipeline_result(pr: Any) -> BenchmarkResult:
     # Extract GPU util from stage metadata if available
     gpu_util = _extract_gpu_util(pr.stages)
 
-    # Determine pass/fail
-    status = "pass" if pr.status == "ok" else "fail"
+    # Determine pass/fail/skip
+    if pr.status == "ok":
+        status = "pass"
+    elif pr.status == "deferred":
+        status = "skip"
+    else:
+        status = "fail"
     status_reason = pr.notes or pr.status
 
     # Flatten stages to dicts
@@ -254,6 +265,7 @@ def run_suite(
     repeat: int = 3,
     compare: str | None = None,
     precision: str = "auto",
+    input_format: str = "parquet",
     nvtx: bool = False,
     gpu_sparkline: bool = False,
     trace: bool = False,
@@ -304,6 +316,7 @@ def run_suite(
                     repeat=repeat,
                     compare=compare,
                     precision=precision,
+                    input_format=input_format,
                     nvtx=nvtx,
                     gpu_sparkline=gpu_sparkline,
                     trace=trace,
@@ -336,8 +349,14 @@ def run_suite(
                 gpu_sparkline=gpu_sparkline,
                 trace=trace,
             )
-            results.extend(pipeline_results)
-            for pr in pipeline_results:
+            # Filter: only keep results for the requested pipeline (pipeline.py
+            # may return raster-to-vector deferred results mixed in)
+            own_results = [pr for pr in pipeline_results if pr.operation == pipeline_name]
+            other_results = [pr for pr in pipeline_results if pr.operation != pipeline_name]
+            results.extend(own_results)
+            # Silently collect deferred/other pipeline results without progress noise
+            results.extend(other_results)
+            for pr in own_results:
                 _progress(pr, idx=item_idx, total=total_items)
         except Exception as exc:
             result = BenchmarkResult(
@@ -394,5 +413,6 @@ def run_suite(
         metadata={
             "repeat": repeat,
             "precision": precision,
+            "input_format": input_format,
         },
     )

@@ -26,18 +26,15 @@ def bench_gpu_pip(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    import numpy as np
-
-    from vibespatial import ExecutionMode, from_shapely_geometries, has_gpu_runtime
+    from vibespatial import ExecutionMode, has_gpu_runtime
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_points, generate_polygons
 
     if not has_gpu_runtime():
         return BenchmarkResult(
@@ -49,25 +46,27 @@ def bench_gpu_pip(
             status="skip",
             status_reason="GPU runtime not available",
             timing=timing_from_samples([]),
+            input_format=input_format,
         )
 
-    polygon_base_count = max(scale // 8, 1)
-    points = np.asarray(
-        list(generate_points(SyntheticSpec("point", "grid", count=scale, seed=0)).geometries),
-        dtype=object,
-    )
-    polygons = np.resize(
-        np.asarray(
-            list(generate_polygons(
-                SyntheticSpec("polygon", "regular-grid", count=polygon_base_count, seed=1, vertices=5)
-            ).geometries),
-            dtype=object,
-        ),
-        scale,
-    ).astype(object, copy=False)
+    fmt = InputFormat(input_format)
+    points_spec = resolve_fixture_spec("point", "grid", scale)
+    polygon_base = max(scale // 8, 1)
+    polygons_spec = resolve_fixture_spec("polygon", "regular-grid", polygon_base, vertices=5)
 
-    points_owned = from_shapely_geometries(points.tolist())
-    polygons_owned = from_shapely_geometries(polygons.tolist())
+    points_owned, read_s1 = load_owned(points_spec, fmt)
+    polygons_owned, read_s2 = load_owned(polygons_spec, fmt)
+    read_seconds = read_s1 + read_s2
+
+    # Resize polygons to match points scale
+    if polygons_owned.row_count < scale:
+        import numpy as np
+
+        from vibespatial.geometry.owned import from_shapely_geometries
+
+        shapely_polys = polygons_owned.to_shapely()
+        tiled = np.resize(np.asarray(shapely_polys, dtype=object), scale).tolist()
+        polygons_owned = from_shapely_geometries(tiled)
 
     # Baseline: Shapely
     baseline_timing = None
@@ -76,18 +75,26 @@ def bench_gpu_pip(
     if compare == "shapely" or compare is None:
         import shapely
 
+        gdf_points, _ = load_geodataframe(points_spec, fmt)
+        gdf_polys, _ = load_geodataframe(polygons_spec, fmt)
+        points_arr = gdf_points.geometry.to_numpy()
+        polys_arr = gdf_polys.geometry.to_numpy()
+        if len(polys_arr) < scale:
+            import numpy as np
+
+            polys_arr = np.resize(polys_arr, scale)
+
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            shapely.covers(polygons, points)
+            shapely.covers(polys_arr, points_arr)
             shapely_times.append(perf_counter() - start)
         baseline_timing = timing_from_samples(shapely_times)
         baseline_name = "shapely"
 
-    # Warmup (cold run)
+    # Warmup
     point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
 
-    # Timed GPU runs
     gpu_times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
@@ -110,7 +117,9 @@ def bench_gpu_pip(
         baseline_name=baseline_name,
         baseline_timing=baseline_timing,
         speedup=speedup,
-        metadata={"repeat": repeat, "polygon_base_count": polygon_base_count},
+        input_format=input_format,
+        read_seconds=read_seconds,
+        metadata={"repeat": repeat, "polygon_base_count": polygon_base},
     )
 
 
@@ -130,51 +139,49 @@ def bench_binary_predicates(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    import numpy as np
-    from shapely.affinity import translate
-
-    from vibespatial import from_shapely_geometries
-    from vibespatial.predicates.binary import evaluate_binary_predicate
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
-
-    dataset = generate_polygons(
-        SyntheticSpec("polygon", "regular-grid", count=scale, seed=0)
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixtures import (
+        InputFormat,
+        ensure_shifted_fixture,
+        resolve_fixture_spec,
     )
-    left_geoms = list(dataset.geometries)
-    right_geoms = [translate(g, xoff=0.3, yoff=0.3) for g in left_geoms]
+    from vibespatial.predicates.binary import evaluate_binary_predicate
 
-    left_owned = from_shapely_geometries(left_geoms)
-    right_owned = from_shapely_geometries(right_geoms)
+    fmt = InputFormat(input_format)
+    left_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.3, yoff=0.3, fmt=fmt)
+
+    left_owned, read_s1 = load_owned(left_spec, fmt)
+    right_owned, read_s2 = load_owned(right_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
     predicate = "intersects"
 
-    # Warmup
-    evaluate_binary_predicate(left_owned, right_owned, predicate)
+    evaluate_binary_predicate(predicate, left_owned, right_owned)
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        evaluate_binary_predicate(left_owned, right_owned, predicate)
+        evaluate_binary_predicate(predicate, left_owned, right_owned)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
 
-    # Shapely baseline
     baseline_timing = None
     speedup = None
     baseline_name = None
     if compare == "shapely" or compare is None:
         import shapely
 
-        left_arr = np.asarray(left_geoms, dtype=object)
-        right_arr = np.asarray(right_geoms, dtype=object)
+        gdf_left, _ = load_geodataframe(left_spec, fmt)
+        gdf_right, _ = load_geodataframe(right_spec, fmt)
+        left_arr = gdf_left.geometry.to_numpy()
+        right_arr = gdf_right.geometry.to_numpy()
 
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
@@ -198,6 +205,8 @@ def bench_binary_predicates(
         baseline_name=baseline_name,
         baseline_timing=baseline_timing,
         speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat, "predicate": predicate},
     )
 
@@ -218,46 +227,29 @@ def bench_gpu_predicates(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    import numpy as np
-    import shapely
-    from shapely.affinity import translate
+    from vibespatial import evaluate_binary_predicate
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    from vibespatial import evaluate_binary_predicate, from_shapely_geometries
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_points, generate_polygons
+    fmt = InputFormat(input_format)
+    polys_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    points_spec = resolve_fixture_spec("point", "grid", scale, seed=1)
 
-    polygons = np.asarray(
-        list(generate_polygons(
-            SyntheticSpec("polygon", "regular-grid", count=scale, seed=0)
-        ).geometries),
-        dtype=object,
-    )
-    points = np.asarray(
-        list(generate_points(
-            SyntheticSpec("point", "grid", count=scale, seed=1)
-        ).geometries),
-        dtype=object,
-    )
-    half = scale // 2
-    if half < scale:
-        points[half:] = np.asarray(
-            [translate(g, xoff=10_000.0, yoff=10_000.0) for g in points[half:]],
-            dtype=object,
-        )
+    left_owned, read_s1 = load_owned(polys_spec, fmt)
+    right_owned, read_s2 = load_owned(points_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
-    left_owned = from_shapely_geometries(polygons.tolist())
-    right_owned = from_shapely_geometries(points.tolist())
-
-    # Warmup
-    evaluate_binary_predicate(left_owned, right_owned, "contains")
+    evaluate_binary_predicate("contains", left_owned, right_owned)
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        evaluate_binary_predicate(left_owned, right_owned, "contains")
+        evaluate_binary_predicate("contains", left_owned, right_owned)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -266,10 +258,17 @@ def bench_gpu_predicates(
     speedup = None
     baseline_name = None
     if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf_left, _ = load_geodataframe(polys_spec, fmt)
+        gdf_right, _ = load_geodataframe(points_spec, fmt)
+        left_arr = gdf_left.geometry.to_numpy()
+        right_arr = gdf_right.geometry.to_numpy()
+
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            shapely.contains(polygons, points)
+            shapely.contains(left_arr, right_arr)
             shapely_times.append(perf_counter() - start)
         baseline_timing = timing_from_samples(shapely_times)
         baseline_name = "shapely"
@@ -288,6 +287,8 @@ def bench_gpu_predicates(
         baseline_name=baseline_name,
         baseline_timing=baseline_timing,
         speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat, "predicate": "contains"},
     )
 
@@ -308,32 +309,45 @@ def bench_point_predicates(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import ExecutionMode, from_shapely_geometries
+    from vibespatial import ExecutionMode
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.kernels.predicates import point_within_bounds
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_points, generate_polygons
 
-    points_data = generate_points(
-        SyntheticSpec("point", "uniform", count=scale, seed=7)
-    ).geometries
-    polygon_data = generate_polygons(
-        SyntheticSpec("polygon", "regular-grid", count=max(1, scale // 10), seed=3)
-    ).geometries
-    tiled = [polygon_data[i % len(polygon_data)] for i in range(scale)]
+    fmt = InputFormat(input_format)
+    points_spec = resolve_fixture_spec("point", "grid", scale)
+    polys_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
 
-    points = from_shapely_geometries(list(points_data))
-    polygons = from_shapely_geometries(tiled)
+    points_owned, read_s1 = load_owned(points_spec, fmt)
+    polys_owned, read_s2 = load_owned(polys_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
-    # Warmup
-    point_within_bounds(points, polygons, dispatch_mode=ExecutionMode.CPU)
+    # Warmup — point_within_bounds has known bugs with some OGA layouts
+    try:
+        point_within_bounds(points_owned, polys_owned, dispatch_mode=ExecutionMode.CPU)
+    except (IndexError, ValueError) as exc:
+        return BenchmarkResult(
+            operation="point-predicates",
+            tier=1,
+            scale=scale,
+            geometry_type="point+polygon",
+            precision=precision,
+            status="error",
+            status_reason=f"point_within_bounds bug: {exc}",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        point_within_bounds(points, polygons, dispatch_mode=ExecutionMode.CPU)
+        point_within_bounds(points_owned, polys_owned, dispatch_mode=ExecutionMode.CPU)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -347,5 +361,7 @@ def bench_point_predicates(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat},
     )

@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 156/220 lines
+Body Budget: 159/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -14,15 +14,15 @@ Section Map (Body Lines)
 | 1-5 | Preamble |
 | 6-12 | Intent |
 | 13-29 | Request Signals |
-| 30-42 | Open First |
-| 43-50 | Verify |
-| 51-59 | Risks |
-| 60-73 | Entry Points |
-| 74-88 | Pipelines |
-| 89-101 | Suites |
-| 102-110 | Regression Rules |
-| 111-137 | Trace Contract |
-| 138-156 | CI Workflow |
+| 30-44 | Open First |
+| 45-53 | Verify |
+| 54-62 | Risks |
+| 63-76 | Entry Points |
+| 77-91 | Pipelines |
+| 92-104 | Suites |
+| 105-113 | Regression Rules |
+| 114-140 | Trace Contract |
+| 141-159 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -59,16 +59,19 @@ timers.
 - src/vibespatial/bench/catalog.py
 - src/vibespatial/bench/runner.py
 - src/vibespatial/bench/schema.py
+- src/vibespatial/bench/fixtures.py
+- src/vibespatial/bench/fixture_loader.py
 - src/vibespatial/bench/pipeline.py
+- src/vibespatial/bench/shootout.py
 - scripts/benchmark_pipelines.py
 - scripts/check_pipeline_regressions.py
 - .github/workflows/pipeline-benchmarks.yml
-- src/vibespatial/bench/shootout.py
 
 ## Verify
 
 - `uv run vsbench list operations`
 - `uv run vsbench run bounds --scale 1k --repeat 1 --quiet`
+- `uv run vsbench fixtures generate --scale 1k --format parquet`
 - `uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q`
 - `uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2`
 - `uv run python scripts/check_docs.py --check`

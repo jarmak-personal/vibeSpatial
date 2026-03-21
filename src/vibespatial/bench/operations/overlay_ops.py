@@ -19,6 +19,7 @@ from vibespatial.bench.schema import (
     tier=2,
     legacy_script="benchmark_gpu_overlay.py",
     tags=("gpu",),
+    max_scale=10_000,
 )
 def bench_gpu_overlay(
     *,
@@ -26,18 +27,19 @@ def bench_gpu_overlay(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from shapely.affinity import translate
-
-    from vibespatial import from_shapely_geometries, has_gpu_runtime
+    from vibespatial import has_gpu_runtime
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import (
+        InputFormat,
+        ensure_shifted_fixture,
+        resolve_fixture_spec,
+    )
     from vibespatial.overlay.gpu import overlay_intersection_owned
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
 
     if not has_gpu_runtime():
         return BenchmarkResult(
@@ -49,18 +51,17 @@ def bench_gpu_overlay(
             status="skip",
             status_reason="GPU runtime not available",
             timing=timing_from_samples([]),
+            input_format=input_format,
         )
 
-    dataset = generate_polygons(
-        SyntheticSpec("polygon", "regular-grid", count=scale, seed=0)
-    )
-    left_geoms = list(dataset.geometries)
-    right_geoms = [translate(g, xoff=0.3, yoff=0.3) for g in left_geoms]
+    fmt = InputFormat(input_format)
+    left_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.3, yoff=0.3, fmt=fmt)
 
-    left_owned = from_shapely_geometries(left_geoms)
-    right_owned = from_shapely_geometries(right_geoms)
+    left_owned, read_s1 = load_owned(left_spec, fmt)
+    right_owned, read_s2 = load_owned(right_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
-    # Warmup
     try:
         overlay_intersection_owned(left_owned, right_owned)
     except Exception:
@@ -83,6 +84,8 @@ def bench_gpu_overlay(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat},
     )
 
@@ -96,6 +99,7 @@ def bench_gpu_overlay(
     tier=3,
     legacy_script="benchmark_segment_filters.py",
     tags=("gpu",),
+    max_scale=5_000,
 )
 def bench_segment_filters(
     *,
@@ -103,21 +107,26 @@ def bench_segment_filters(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from shapely.affinity import translate
+    from vibespatial import benchmark_segment_filter
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import (
+        InputFormat,
+        ensure_shifted_fixture,
+        resolve_fixture_spec,
+    )
 
-    from vibespatial import benchmark_segment_filter, from_shapely_geometries
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
+    fmt = InputFormat(input_format)
+    left_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=5.0, yoff=0.0, fmt=fmt)
 
-    base = list(generate_polygons(
-        SyntheticSpec("polygon", "star", count=scale, seed=0)
-    ).geometries)
-    shifted = [translate(g, xoff=5.0, yoff=0.0) for g in base]
+    left_owned, read_s1 = load_owned(left_spec, fmt)
+    right_owned, read_s2 = load_owned(right_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
-    left = from_shapely_geometries(base)
-    right = from_shapely_geometries(shifted)
-    result = benchmark_segment_filter(left, right, tile_size=512)
+    result = benchmark_segment_filter(left_owned, right_owned, tile_size=512)
 
     timing = timing_from_samples([result.elapsed_seconds])
 
@@ -130,6 +139,8 @@ def bench_segment_filters(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={
             "naive_segment_pairs": result.naive_segment_pairs,
             "filtered_segment_pairs": result.filtered_segment_pairs,
@@ -146,6 +157,7 @@ def bench_segment_filters(
     tier=3,
     legacy_script="benchmark_segment_intersections.py",
     tags=("gpu",),
+    max_scale=5_000,
 )
 def bench_segment_intersections(
     *,
@@ -153,35 +165,35 @@ def bench_segment_intersections(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from shapely.affinity import translate
-
-    from vibespatial import (
-        classify_segment_intersections,
-        from_shapely_geometries,
-        generate_segment_candidates,
+    from vibespatial import classify_segment_intersections, generate_segment_candidates
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import (
+        InputFormat,
+        ensure_shifted_fixture,
+        resolve_fixture_spec,
     )
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_lines
 
-    base = list(generate_lines(
-        SyntheticSpec("line", "grid", count=scale, seed=0)
-    ).geometries)
-    shifted = [translate(g, xoff=0.5, yoff=0.5) for g in base]
+    fmt = InputFormat(input_format)
+    left_spec = resolve_fixture_spec("line", "random-walk", scale)
+    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.5, yoff=0.5, fmt=fmt)
 
-    left = from_shapely_geometries(base)
-    right = from_shapely_geometries(shifted)
-    candidates = generate_segment_candidates(left, right)
+    left_owned, read_s1 = load_owned(left_spec, fmt)
+    right_owned, read_s2 = load_owned(right_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
-    # Warmup
-    classify_segment_intersections(left, right, candidate_pairs=candidates)
+    candidates = generate_segment_candidates(left_owned, right_owned)
+
+    classify_segment_intersections(left_owned, right_owned, candidate_pairs=candidates)
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        classify_segment_intersections(left, right, candidate_pairs=candidates)
+        classify_segment_intersections(left_owned, right_owned, candidate_pairs=candidates)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -195,6 +207,8 @@ def bench_segment_intersections(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat},
     )
 
@@ -208,6 +222,7 @@ def bench_segment_intersections(
     tier=3,
     legacy_script="benchmark_segment_primitives.py",
     tags=("gpu",),
+    max_scale=5_000,
 )
 def bench_segment_primitives(
     *,
@@ -215,21 +230,26 @@ def bench_segment_primitives(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from shapely.affinity import translate
+    from vibespatial import benchmark_segment_intersections
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import (
+        InputFormat,
+        ensure_shifted_fixture,
+        resolve_fixture_spec,
+    )
 
-    from vibespatial import benchmark_segment_intersections, from_shapely_geometries
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_lines
+    fmt = InputFormat(input_format)
+    left_spec = resolve_fixture_spec("line", "random-walk", scale)
+    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.5, yoff=0.5, fmt=fmt)
 
-    base = list(generate_lines(
-        SyntheticSpec("line", "grid", count=scale, seed=0)
-    ).geometries)
-    shifted = [translate(g, xoff=0.5, yoff=0.5) for g in base]
+    left_owned, read_s1 = load_owned(left_spec, fmt)
+    right_owned, read_s2 = load_owned(right_spec, fmt)
+    read_seconds = read_s1 + read_s2
 
-    left = from_shapely_geometries(base)
-    right = from_shapely_geometries(shifted)
-    result = benchmark_segment_intersections(left, right, tile_size=512)
+    result = benchmark_segment_intersections(left_owned, right_owned, tile_size=512)
 
     timing = timing_from_samples([result.elapsed_seconds])
 
@@ -242,6 +262,8 @@ def bench_segment_primitives(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={
             "candidate_pairs": result.candidate_pairs,
             "proper_pairs": result.proper_pairs,

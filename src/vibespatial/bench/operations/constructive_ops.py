@@ -1,4 +1,4 @@
-"""Constructive operation benchmarks: clip-rect, gpu-constructive."""
+"""Constructive operation benchmarks: clip-rect, gpu-constructive, make-valid, gpu-dissolve, stroke-kernels."""
 from __future__ import annotations
 
 from typing import Any
@@ -19,6 +19,7 @@ from vibespatial.bench.schema import (
     tier=4,
     legacy_script="benchmark_clip_rect.py",
     tags=("gpu", "compare"),
+    max_scale=50_000,
 )
 def bench_clip_rect(
     *,
@@ -26,16 +27,15 @@ def bench_clip_rect(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_clip_by_rect, from_shapely_geometries
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_lines
+    from vibespatial import benchmark_clip_by_rect
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    dataset = generate_lines(SyntheticSpec("line", "grid", count=scale, seed=0))
-    owned = from_shapely_geometries(list(dataset.geometries))
+    spec = resolve_fixture_spec("line", "random-walk", scale)
+    owned, read_seconds = load_owned(spec, InputFormat(input_format))
 
     rect = (100.0, 100.0, 700.0, 700.0)
     result = benchmark_clip_by_rect(owned, *rect, dataset=f"line-{scale}")
@@ -63,6 +63,8 @@ def bench_clip_rect(
         baseline_name=baseline_name,
         baseline_timing=baseline_timing,
         speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={
             "candidate_rows": result.candidate_rows,
             "fast_rows": result.fast_rows,
@@ -87,16 +89,15 @@ def bench_gpu_constructive(
     repeat: int,
     compare: str | None,
     precision: str,
-    nvtx: bool = False,
-    gpu_sparkline: bool = False,
-    trace: bool = False,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import from_shapely_geometries, has_gpu_runtime
+    from vibespatial import has_gpu_runtime
+    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.constructive.clip_rect import clip_by_rect_owned
-    from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
 
     if not has_gpu_runtime():
         return BenchmarkResult(
@@ -108,15 +109,13 @@ def bench_gpu_constructive(
             status="skip",
             status_reason="GPU runtime not available",
             timing=timing_from_samples([]),
+            input_format=input_format,
         )
 
-    dataset = generate_polygons(
-        SyntheticSpec("polygon", "regular-grid", count=scale, seed=0)
-    )
-    owned = from_shapely_geometries(list(dataset.geometries))
+    spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    owned, read_seconds = load_owned(spec, InputFormat(input_format))
     rect = (100.0, 100.0, 700.0, 700.0)
 
-    # Warmup
     clip_by_rect_owned(owned, *rect)
 
     times: list[float] = []
@@ -136,13 +135,15 @@ def bench_gpu_constructive(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat, "rect": list(rect)},
     )
 
 
 @benchmark_operation(
     name="make-valid",
-    description="Compact-invalid-row make_valid benchmark",
+    description="make_valid benchmark on fixture with ~5% invalid polygons",
     category="constructive",
     geometry_types=("polygon",),
     default_scale=10_000,
@@ -156,21 +157,20 @@ def bench_make_valid(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from shapely.geometry import Polygon
-
     from vibespatial import benchmark_make_valid
+    from vibespatial.bench.fixture_loader import load_geodataframe
+    from vibespatial.bench.fixtures import InputFormat, ensure_invalids_fixture
 
-    invalid_every = 20
-    values = [
-        Polygon([(float(i), 0.0), (float(i) + 1.0, 1.0), (float(i) + 1.0, 2.0),
-                 (float(i) + 1.0, 1.0), (float(i), 0.0)])
-        if i % max(invalid_every, 1) == 0
-        else Polygon([(float(i), 0.0), (float(i), 1.0), (float(i) + 1.0, 1.0),
-                      (float(i) + 1.0, 0.0)])
-        for i in range(scale)
-    ]
+    fmt = InputFormat(input_format)
+    spec, _ = ensure_invalids_fixture(scale, fmt=fmt)
+
+    # Load via GeoDataFrame since benchmark_make_valid expects Shapely list
+    gdf, read_seconds = load_geodataframe(spec, fmt)
+    values = gdf.geometry.tolist()
+
     result = benchmark_make_valid(values)
 
     timing = timing_from_samples([result.compact_elapsed_seconds])
@@ -189,6 +189,8 @@ def bench_make_valid(
         baseline_name="baseline",
         baseline_timing=baseline_timing,
         speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repaired_rows": result.repaired_rows},
     )
 
@@ -209,30 +211,22 @@ def bench_gpu_dissolve(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
     from time import perf_counter
 
     import numpy as np
-    from shapely.geometry import box
 
-    import vibespatial.api as geopandas
+    from vibespatial.bench.fixture_loader import load_geodataframe
+    from vibespatial.bench.fixtures import InputFormat, ensure_grouped_boxes_fixture
     from vibespatial.overlay.dissolve import execute_grouped_box_union_gpu
 
+    fmt = InputFormat(input_format)
     groups = 100
-    rows_per_group = scale // groups
-    geometries = []
-    group_values = []
-    for group in range(groups):
-        base_y = float(group * 10.0)
-        for idx in range(rows_per_group):
-            base_x = float(idx)
-            geometries.append(box(base_x, base_y, base_x + 1.0, base_y + 1.0))
-            group_values.append(group)
+    spec, _ = ensure_grouped_boxes_fixture(scale, groups=groups, fmt=fmt)
+    frame, read_seconds = load_geodataframe(spec, fmt)
 
-    frame = geopandas.GeoDataFrame(
-        {"group": group_values, "geometry": geometries}, crs="EPSG:3857",
-    )
     values = np.asarray(frame.geometry.array, dtype=object)
     grouped = frame.groupby("group", sort=True, observed=False, dropna=True)[
         frame.geometry.name
@@ -242,7 +236,6 @@ def bench_gpu_dissolve(
         for _, positions in grouped.indices.items()
     ]
 
-    # Warmup
     execute_grouped_box_union_gpu(values, group_positions)
 
     times: list[float] = []
@@ -262,6 +255,8 @@ def bench_gpu_dissolve(
         status="pass",
         status_reason="ok",
         timing=timing,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"repeat": repeat, "groups": groups},
     )
 
@@ -275,6 +270,7 @@ def bench_gpu_dissolve(
     tier=4,
     legacy_script="benchmark_stroke_kernels.py",
     tags=("gpu", "compare"),
+    max_scale=50_000,
 )
 def bench_stroke_kernels(
     *,
@@ -282,13 +278,17 @@ def bench_stroke_kernels(
     repeat: int,
     compare: str | None,
     precision: str,
+    input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from shapely.geometry import Point
-
     from vibespatial import benchmark_point_buffer
+    from vibespatial.bench.fixture_loader import load_geodataframe
+    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    values = [Point(float(i), float(i) * 0.25) for i in range(scale)]
+    spec = resolve_fixture_spec("point", "grid", scale)
+    gdf, read_seconds = load_geodataframe(spec, InputFormat(input_format))
+    values = gdf.geometry.tolist()
+
     result = benchmark_point_buffer(values, distance=1.0, quad_segs=8)
 
     timing = timing_from_samples([result.owned_elapsed_seconds])
@@ -309,5 +309,7 @@ def bench_stroke_kernels(
         baseline_name="shapely" if baseline_timing else None,
         baseline_timing=baseline_timing,
         speedup=speedup,
+        input_format=input_format,
+        read_seconds=read_seconds,
         metadata={"fast_rows": result.fast_rows, "fallback_rows": result.fallback_rows},
     )
