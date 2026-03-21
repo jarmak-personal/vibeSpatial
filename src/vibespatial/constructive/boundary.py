@@ -7,13 +7,14 @@ Computes the topological boundary of each geometry:
 - MultiLineString: boundary is endpoints of all parts as MultiPoint.
 - MultiPolygon: boundary is all rings from all polygons as MultiLineString.
 
-GPU paths for Polygon and LineString families avoid the Shapely round-trip
-entirely.  Polygon boundary is a pure offset-relabeling (zero-copy for
-coordinates).  LineString boundary uses vectorized CuPy endpoint extraction.
+GPU paths for all six geometry families avoid the Shapely round-trip
+entirely.  Polygon and MultiPolygon boundary use pure offset-relabeling
+(zero-copy for coordinates).  LineString and MultiLineString boundary use
+vectorized CuPy endpoint extraction.
 
 ADR-0033 classification: Tier 2 (CuPy) for endpoint gather/interleave,
-pure offset relabeling for polygon boundary.  No custom NVRTC kernel needed
-because neither path involves geometry-specific inner loops.
+pure offset relabeling for polygon/multipolygon boundary.  No custom NVRTC
+kernel needed because no path involves geometry-specific inner loops.
 
 ADR-0002: CONSTRUCTIVE class -- stays fp64 by design per ADR-0002.
 PrecisionPlan wired at dispatch for observability.
@@ -40,7 +41,6 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
-
 
 # ---------------------------------------------------------------------------
 # CPU fallback: boundary via Shapely
@@ -142,6 +142,203 @@ def _boundary_linestring_gpu(device_buf, geom_count):
     )
 
 
+def _boundary_multilinestring_gpu(device_buf, geom_count):
+    """MultiLineString boundary: extract 2 endpoints per part as MultiPoint.
+
+    For each MultiLineString geometry, the boundary is a MultiPoint containing
+    the first and last coordinate of every part (LineString).  Uses the same
+    vectorized CuPy endpoint extraction as ``_boundary_linestring_gpu``, but
+    iterates over *parts* within each geometry rather than geometries directly.
+
+    Offset mapping:
+        Input:  geometry_offsets -> part_offsets -> coords
+        Output: geometry_offsets -> coords  (MultiPoint -- flat)
+
+    Each part contributes 2 endpoints, so output geometry g has
+    ``2 * (geometry_offsets[g+1] - geometry_offsets[g])`` points.
+    """
+    d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
+    d_part_offsets = cp.asarray(device_buf.part_offsets)
+    d_x = cp.asarray(device_buf.x)
+    d_y = cp.asarray(device_buf.y)
+
+    total_parts = int(d_part_offsets.shape[0]) - 1
+
+    # First and last coord index for each part
+    d_part_starts = d_part_offsets[:-1]
+    d_part_ends = d_part_offsets[1:] - 1
+    # Clamp for empty parts (0 coords)
+    d_part_ends = cp.maximum(d_part_ends, d_part_starts)
+
+    # Gather endpoints: 2 coords per part
+    d_first_x = d_x[d_part_starts]
+    d_first_y = d_y[d_part_starts]
+    d_last_x = d_x[d_part_ends]
+    d_last_y = d_y[d_part_ends]
+
+    # Interleave: [first_p0, last_p0, first_p1, last_p1, ...]
+    total_pts = 2 * total_parts
+    d_x_out = cp.empty(total_pts, dtype=cp.float64)
+    d_y_out = cp.empty(total_pts, dtype=cp.float64)
+    d_x_out[0::2] = d_first_x
+    d_x_out[1::2] = d_last_x
+    d_y_out[0::2] = d_first_y
+    d_y_out[1::2] = d_last_y
+
+    # Output geometry_offsets: each geometry has 2 * (parts_in_geom) points.
+    # Input geometry_offsets indexes into part_offsets, so parts-per-geom is
+    # d_geom_offsets[g+1] - d_geom_offsets[g].  Output offsets = cumulative
+    # sum of 2 * parts_per_geom.
+    d_parts_per_geom = d_geom_offsets[1:] - d_geom_offsets[:-1]
+    d_pts_per_geom = d_parts_per_geom * 2
+    d_out_geom_offsets = cp.empty(geom_count + 1, dtype=cp.int32)
+    d_out_geom_offsets[0] = 0
+    cp.cumsum(d_pts_per_geom, out=d_out_geom_offsets[1:])
+
+    # Detect empty MultiLineStrings: 0 parts
+    d_empty = d_parts_per_geom == 0
+
+    return DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTIPOINT,
+        x=d_x_out,
+        y=d_y_out,
+        geometry_offsets=d_out_geom_offsets,
+        empty_mask=d_empty,
+        part_offsets=None,
+        ring_offsets=None,
+        bounds=None,
+    )
+
+
+def _boundary_multipolygon_gpu(device_buf, geom_count):
+    """MultiPolygon boundary: reinterpret ring offsets as MultiLineString parts.
+
+    Zero-copy for coordinates -- only offset arrays are relabeled.
+    The input MultiPolygon has a three-level offset hierarchy:
+        geometry_offsets -> part_offsets -> ring_offsets -> coords
+    where part_offsets maps polygon-parts to their first ring, and
+    ring_offsets maps rings to their first coordinate.
+
+    The boundary flattens the polygon level: every ring (from any polygon
+    in the multi) becomes a LineString part in the output MultiLineString.
+    Output offset hierarchy:
+        geometry_offsets -> part_offsets -> coords
+    where part_offsets = input ring_offsets, and geometry_offsets is
+    recomputed so that geometry g maps to the total ring range contributed
+    by all of its constituent polygons.
+
+    Specifically, for geometry g the ring range is
+    ``[part_offsets[geometry_offsets[g]], part_offsets[geometry_offsets[g+1]])``
+    in the input.  The output geometry_offsets are obtained by gathering
+    part_offsets at the input geometry_offsets positions.
+    """
+    d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
+    d_part_offsets = cp.asarray(device_buf.part_offsets)
+
+    # Output geometry_offsets: compose geometry_offsets through part_offsets.
+    # d_part_offsets[d_geom_offsets[g]] gives the ring index where geometry g
+    # starts, which is exactly the output geometry_offsets value.
+    d_out_geom_offsets = d_part_offsets[d_geom_offsets]
+
+    # Detect empty MultiPolygons: 0 polygon-parts
+    d_parts_per_geom = d_geom_offsets[1:] - d_geom_offsets[:-1]
+    d_empty = d_parts_per_geom == 0
+
+    return DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTILINESTRING,
+        x=device_buf.x,
+        y=device_buf.y,
+        geometry_offsets=d_out_geom_offsets,
+        empty_mask=d_empty,
+        part_offsets=device_buf.ring_offsets,  # rings become LineString parts
+        ring_offsets=None,
+        bounds=None,
+    )
+
+
+def _merge_multipoint_buffers(buf_a, buf_b):
+    """Merge two MultiPoint DeviceFamilyGeometryBuffers into one.
+
+    Used when both LineString and MultiLineString families produce MultiPoint
+    output.  Concatenates coordinate arrays and adjusts geometry_offsets for
+    the second buffer.  Empty masks are concatenated.
+
+    Both buffers must be MultiPoint (no part_offsets or ring_offsets).
+    """
+    # Coordinate offset: second buffer's coords shift by length of first
+    n_coords_a = int(buf_a.x.shape[0])
+
+    d_x = cp.concatenate([buf_a.x, buf_b.x])
+    d_y = cp.concatenate([buf_a.y, buf_b.y])
+
+    # Adjust second buffer's geometry_offsets (skip its leading 0)
+    d_geom_offsets_b_shifted = cp.asarray(buf_b.geometry_offsets[1:]) + n_coords_a
+    d_geom_offsets = cp.concatenate([
+        cp.asarray(buf_a.geometry_offsets),
+        d_geom_offsets_b_shifted,
+    ])
+
+    d_empty = cp.concatenate([
+        cp.asarray(buf_a.empty_mask),
+        cp.asarray(buf_b.empty_mask),
+    ])
+
+    return DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTIPOINT,
+        x=d_x,
+        y=d_y,
+        geometry_offsets=d_geom_offsets,
+        empty_mask=d_empty,
+        part_offsets=None,
+        ring_offsets=None,
+        bounds=None,
+    )
+
+
+def _merge_multilinestring_buffers(buf_a, buf_b):
+    """Merge two MultiLineString DeviceFamilyGeometryBuffers into one.
+
+    Used when both Polygon and MultiPolygon families produce MultiLineString
+    output.  Concatenates coordinate arrays and part_offsets, adjusting
+    offsets for the second buffer.  Empty masks are concatenated.
+    """
+    n_coords_a = int(buf_a.x.shape[0])
+    n_parts_a = int(buf_a.part_offsets.shape[0]) - 1  # number of parts in A
+
+    d_x = cp.concatenate([buf_a.x, buf_b.x])
+    d_y = cp.concatenate([buf_a.y, buf_b.y])
+
+    # Merge part_offsets: shift B's coord references by A's coord count
+    d_part_offsets_b_shifted = cp.asarray(buf_b.part_offsets[1:]) + n_coords_a
+    d_part_offsets = cp.concatenate([
+        cp.asarray(buf_a.part_offsets),
+        d_part_offsets_b_shifted,
+    ])
+
+    # Merge geometry_offsets: shift B's part references by A's part count
+    d_geom_offsets_b_shifted = cp.asarray(buf_b.geometry_offsets[1:]) + n_parts_a
+    d_geom_offsets = cp.concatenate([
+        cp.asarray(buf_a.geometry_offsets),
+        d_geom_offsets_b_shifted,
+    ])
+
+    d_empty = cp.concatenate([
+        cp.asarray(buf_a.empty_mask),
+        cp.asarray(buf_b.empty_mask),
+    ])
+
+    return DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTILINESTRING,
+        x=d_x,
+        y=d_y,
+        geometry_offsets=d_geom_offsets,
+        empty_mask=d_empty,
+        part_offsets=d_part_offsets,
+        ring_offsets=None,
+        bounds=None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPU dispatch: registered kernel variant
 # ---------------------------------------------------------------------------
@@ -151,38 +348,36 @@ def _boundary_linestring_gpu(device_buf, geom_count):
     "gpu-cuda-python",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("polygon", "linestring"),
+    geometry_families=(
+        "polygon", "linestring", "multilinestring", "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "boundary"),
 )
 def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """GPU boundary for Polygon and LineString families.
+    """GPU boundary for all geometry families.
 
     - Polygon -> MultiLineString: zero-copy offset relabeling.
+    - MultiPolygon -> MultiLineString: offset composition (zero-copy coords).
     - LineString -> MultiPoint: vectorized CuPy endpoint extraction.
+    - MultiLineString -> MultiPoint: vectorized CuPy part-endpoint extraction.
     - Point / MultiPoint -> None: mark rows as invalid (empty boundary).
-    - MultiLineString / MultiPolygon: not supported -- raises
-      NotImplementedError so the caller falls through to CPU.
+
+    When both Polygon and MultiPolygon are present, the two MultiLineString
+    outputs are merged via coordinate concatenation + offset adjustment.
+    Similarly for LineString + MultiLineString producing two MultiPoint outputs.
     """
     d_state = owned._ensure_device_state()
 
-    # Gate: only handle families we have GPU paths for
-    gpu_families = {
-        GeometryFamily.POLYGON,
-        GeometryFamily.LINESTRING,
-        GeometryFamily.POINT,
-        GeometryFamily.MULTIPOINT,
-    }
-    present = set(d_state.families.keys())
-    if not present.issubset(gpu_families):
-        raise NotImplementedError(
-            "boundary GPU only supports Polygon/LineString/Point/MultiPoint; "
-            f"found {present - gpu_families}"
-        )
-
-    new_device_families = {}
+    new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
     out_tags = owned.tags.copy()
     out_validity = owned.validity.copy()
+
+    # Use original tags for source masks to avoid cross-contamination when
+    # two input families produce the same output family.  For example,
+    # MultiPolygon -> MultiLineString would pollute the MultiLineString ->
+    # MultiPoint remap if we matched against the already-modified out_tags.
+    src_tags = owned.tags
 
     for family, device_buf in d_state.families.items():
         geom_count = int(device_buf.geometry_offsets.shape[0]) - 1
@@ -191,29 +386,77 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
         if family is GeometryFamily.POLYGON:
             new_buf = _boundary_polygon_gpu(device_buf, geom_count)
-            new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
+            if GeometryFamily.MULTILINESTRING in new_device_families:
+                new_device_families[GeometryFamily.MULTILINESTRING] = (
+                    _merge_multilinestring_buffers(
+                        new_device_families[GeometryFamily.MULTILINESTRING],
+                        new_buf,
+                    )
+                )
+            else:
+                new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
             # Remap tags: Polygon rows -> MultiLineString
             poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
             mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-            out_tags[out_tags == poly_tag] = mls_tag
+            out_tags[src_tags == poly_tag] = mls_tag
+
+        elif family is GeometryFamily.MULTIPOLYGON:
+            new_buf = _boundary_multipolygon_gpu(device_buf, geom_count)
+            if GeometryFamily.MULTILINESTRING in new_device_families:
+                new_device_families[GeometryFamily.MULTILINESTRING] = (
+                    _merge_multilinestring_buffers(
+                        new_device_families[GeometryFamily.MULTILINESTRING],
+                        new_buf,
+                    )
+                )
+            else:
+                new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
+            # Remap tags: MultiPolygon rows -> MultiLineString
+            mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+            mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
+            out_tags[src_tags == mpoly_tag] = mls_tag
 
         elif family is GeometryFamily.LINESTRING:
             new_buf = _boundary_linestring_gpu(device_buf, geom_count)
-            new_device_families[GeometryFamily.MULTIPOINT] = new_buf
+            if GeometryFamily.MULTIPOINT in new_device_families:
+                new_device_families[GeometryFamily.MULTIPOINT] = (
+                    _merge_multipoint_buffers(
+                        new_device_families[GeometryFamily.MULTIPOINT],
+                        new_buf,
+                    )
+                )
+            else:
+                new_device_families[GeometryFamily.MULTIPOINT] = new_buf
             # Remap tags: LineString rows -> MultiPoint
             ls_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
             mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
-            out_tags[out_tags == ls_tag] = mp_tag
+            out_tags[src_tags == ls_tag] = mp_tag
+
+        elif family is GeometryFamily.MULTILINESTRING:
+            new_buf = _boundary_multilinestring_gpu(device_buf, geom_count)
+            if GeometryFamily.MULTIPOINT in new_device_families:
+                new_device_families[GeometryFamily.MULTIPOINT] = (
+                    _merge_multipoint_buffers(
+                        new_device_families[GeometryFamily.MULTIPOINT],
+                        new_buf,
+                    )
+                )
+            else:
+                new_device_families[GeometryFamily.MULTIPOINT] = new_buf
+            # Remap tags: MultiLineString rows -> MultiPoint
+            mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
+            mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+            out_tags[src_tags == mls_tag] = mp_tag
 
         elif family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT):
             # Boundary of Point / MultiPoint is empty -- mark rows invalid
             tag = FAMILY_TAGS[family]
-            pt_mask = owned.tags == tag
+            pt_mask = src_tags == tag
             out_validity[pt_mask] = False
 
     # Recompute family_row_offsets for the new tag assignments.
-    # Family types changed (Polygon -> MultiLineString, LineString -> MultiPoint),
-    # so the mapping from global row -> family-local row must be rebuilt.
+    # Family types changed (Polygon -> MultiLineString, LineString -> MultiPoint,
+    # etc.), so the mapping from global row -> family-local row must be rebuilt.
     new_family_row_offsets = np.full(owned.row_count, -1, dtype=np.int32)
     for fam in new_device_families:
         fam_tag = FAMILY_TAGS[fam]
@@ -254,9 +497,8 @@ def boundary_owned(
     owned : OwnedGeometryArray
         Input geometries.
     dispatch_mode : ExecutionMode or str, default AUTO
-        Execution mode hint.  ``GPU`` dispatches to the CuPy-based
-        implementation for Polygon and LineString families; other
-        families fall through to CPU/Shapely.
+        Execution mode hint.  ``GPU`` dispatches to the device-native
+        CuPy-based implementation for all geometry families.
 
     Returns
     -------
