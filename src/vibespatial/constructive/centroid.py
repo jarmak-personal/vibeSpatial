@@ -36,8 +36,6 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     OwnedGeometryArray,
-    build_device_resident_owned,
-    DeviceFamilyGeometryBuffer,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -983,7 +981,6 @@ def centroid_owned(
     is populated (vibeFrame path), GPU kernels read directly from
     device pointers with no copy.
     """
-    from vibespatial.constructive.point import _build_device_backed_point_output
     from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime import RuntimeSelection
     from vibespatial.runtime.precision import CoordinateStats, select_precision_plan

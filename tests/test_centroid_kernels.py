@@ -38,8 +38,6 @@ def _extract_cx_cy(result):
     if isinstance(result, tuple):
         return result
     # OwnedGeometryArray of Points — extract x/y from buffers
-    from vibespatial.geometry.buffers import GeometryFamily
-    from vibespatial.geometry.owned import FAMILY_TAGS
 
     geoms = result.to_shapely()
     cx = np.array([g.x if g is not None and not g.is_empty else np.nan for g in geoms])

@@ -21,11 +21,10 @@ import numpy as np
 
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
-    DeviceFamilyGeometryBuffer,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection

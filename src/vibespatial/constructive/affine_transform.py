@@ -33,11 +33,9 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
     build_device_resident_owned,
 )
 from vibespatial.runtime import ExecutionMode
@@ -49,7 +47,7 @@ from vibespatial.runtime.residency import Residency
 from .measurement import _PRECISION_PREAMBLE
 
 if TYPE_CHECKING:
-    from vibespatial.runtime.precision import PrecisionPlan
+    pass
 
 # ---------------------------------------------------------------------------
 # NVRTC kernel source
@@ -274,7 +272,6 @@ def _affine_transform_cpu(
     d: float, e: float, yoff: float,
 ) -> OwnedGeometryArray:
     """CPU affine transform — vectorized NumPy on coordinate buffers."""
-    from vibespatial.geometry.buffers import get_geometry_buffer_schema
 
     new_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
     for family, buf in owned.families.items():

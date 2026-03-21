@@ -22,9 +22,8 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,

@@ -18,7 +18,6 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.residency import Residency
 
-
 # ---------------------------------------------------------------------------
 # Phase 1: Device-resident builder
 # ---------------------------------------------------------------------------

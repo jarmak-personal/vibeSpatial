@@ -13,8 +13,8 @@ Usage:
 """
 from __future__ import annotations
 
-import sys
 import statistics
+import sys
 
 import numpy as np
 
@@ -136,9 +136,9 @@ def _get_gather_kernel():
 def nvrtc_gather(d_src, d_indices, n):
     """Launch NVRTC gather kernel, return output array."""
     from vibespatial.cuda._runtime import (
-        get_cuda_runtime,
-        KERNEL_PARAM_PTR,
         KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR,
+        get_cuda_runtime,
     )
     runtime = get_cuda_runtime()
     kernel = _get_gather_kernel()

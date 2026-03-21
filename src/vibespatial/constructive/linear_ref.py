@@ -23,13 +23,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
-from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     FamilyGeometryBuffer,
@@ -39,7 +39,6 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
-from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
 # GPU thresholds
