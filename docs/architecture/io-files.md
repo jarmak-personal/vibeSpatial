@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 203/280 lines
+Body Budget: 206/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-44 | Decision |
 | 45-54 | Performance Notes |
-| 55-113 | Current Behavior |
-| 114-203 | Measured Local Baseline |
+| 55-116 | Current Behavior |
+| 117-206 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -115,6 +115,9 @@ keeping GPU-native formats primary and legacy formats explicit.
     extraction stays on CPU via orjson (hybrid design per ADR-0038).
     Geometry parse: **1.8s** for 2.16 GB / 7.2M polygons (32x vs pyogrio).
     Total read including properties: **11.7s** (4.9x vs pyogrio).
+    File-to-device transfer uses kvikio when installed (parallel POSIX reads
+    with pinned bounce buffers, no GDS required), falling back to
+    `cp.asarray` otherwise. Thread count is tunable via `KVIKIO_NTHREADS`.
   - the `read_file` GPU path auto-selects `gpu-byte-classify` for GeoJSON
     files >10 MB when a CUDA device is available, before falling back to
     the pyogrio GPU WKB path

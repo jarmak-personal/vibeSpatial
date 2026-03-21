@@ -90,7 +90,7 @@ shared decode architecture and explicit format-level floor targets.
 
 Every format should map onto the same staged pipeline:
 
-1. source read
+1. source read (kvikio parallel POSIX with pinned bounce buffers when available)
 2. structural scan or metadata planning
 3. row-group, page, or feature-batch pruning
 4. family tagging and optional partition

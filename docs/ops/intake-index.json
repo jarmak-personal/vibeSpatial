@@ -3874,6 +3874,25 @@
     },
     {
       "kind": "repo",
+      "path": ".claude/projects/-home-picard-repos-vibeSpatial/memory/feedback_no_gds.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "feedback",
+        "gds",
+        "home",
+        "md",
+        "memory",
+        "no",
+        "picard",
+        "projects",
+        "repos",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/settings.json",
       "referenced_by": [],
       "symbols": [],
@@ -12894,6 +12913,7 @@
         "_cmd_kernel",
         "_cmd_compare",
         "_cmd_report",
+        "_cmd_fixtures",
         "_cmd_list",
         "_list_operations",
         "_list_pipelines",
@@ -12958,6 +12978,30 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/bench/fixture_loader.py",
+      "referenced_by": [],
+      "symbols": [
+        "_preferred_geoparquet_backend",
+        "load_owned",
+        "load_geodataframe"
+      ],
+      "tokens": [
+        "backend",
+        "bench",
+        "fixture",
+        "geodataframe",
+        "geoparquet",
+        "load",
+        "loader",
+        "owned",
+        "preferred",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/bench/fixture_profiles.py",
       "referenced_by": [],
       "symbols": [
@@ -12998,27 +13042,47 @@
       "path": "src/vibespatial/bench/fixtures.py",
       "referenced_by": [],
       "symbols": [
+        "InputFormat",
         "BenchmarkFixtureSpec",
         "default_fixture_dir",
         "list_fixture_specs",
         "get_fixture_spec",
         "fixture_path",
         "build_fixture_frame",
-        "ensure_fixture"
+        "ensure_fixture",
+        "fixture_path_for_format",
+        "ensure_fixture_format",
+        "ensure_fixture_all_formats",
+        "resolve_fixture_spec",
+        "resolve_shifted_fixture_spec",
+        "ensure_shifted_fixture",
+        "resolve_invalids_fixture_spec",
+        "ensure_invalids_fixture",
+        "resolve_grouped_boxes_fixture_spec",
+        "ensure_grouped_boxes_fixture"
       ],
       "tokens": [
+        "all",
         "bench",
         "benchmarkfixturespec",
+        "boxes",
         "build",
         "default",
         "dir",
         "ensure",
         "fixture",
         "fixtures",
+        "format",
+        "formats",
         "frame",
         "get",
+        "grouped",
+        "inputformat",
+        "invalids",
         "list",
         "py",
+        "resolve",
+        "shifted",
         "spec",
         "specs",
         "src",
@@ -15579,6 +15643,28 @@
         "src",
         "summary",
         "vectorized",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/kvikio_reader.py",
+      "referenced_by": [],
+      "symbols": [
+        "FileReadResult",
+        "read_file_to_device",
+        "has_kvikio"
+      ],
+      "tokens": [
+        "device",
+        "filereadresult",
+        "has",
+        "io",
+        "kvikio",
+        "py",
+        "read",
+        "reader",
+        "src",
         "vibespatial"
       ]
     },
@@ -20127,6 +20213,41 @@
         "test",
         "tests",
         "write"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_kvikio_reader.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_read_file_to_device_basic",
+        "test_read_file_to_device_empty",
+        "test_read_file_to_device_larger_than_bounce",
+        "test_fallback_without_kvikio",
+        "test_kvikio_path_returns_none_host_bytes",
+        "test_has_kvikio_returns_bool"
+      ],
+      "tokens": [
+        "basic",
+        "bool",
+        "bounce",
+        "bytes",
+        "device",
+        "empty",
+        "fallback",
+        "has",
+        "host",
+        "kvikio",
+        "larger",
+        "none",
+        "py",
+        "read",
+        "reader",
+        "returns",
+        "test",
+        "tests",
+        "than",
+        "without"
       ]
     },
     {
