@@ -53,4 +53,4 @@ Track scaffolded kernel modules, tests, and benchmark stubs.
 | Kernel | Module | Tier | Geometry Types | Source | Test | Benchmark |
 |---|---|---|---|---|---|---|
 <!-- KERNEL_INVENTORY:ROWS -->
-| `point_bounds` | `vibespatial.kernels.predicates` | Tier 4 | `point, polygon` | `src/vibespatial/kernels/predicates/point_bounds.py` | `tests/test_point_bounds.py` | `benchmarks/bench_point_bounds.py` |
+| `point_bounds` | `vibespatial.kernels.predicates` | Tier 4 | `point, polygon` | `src/vibespatial/kernels/predicates/point_bounds.py` | `tests/test_point_bounds.py` | `vsbench run point-predicates` |

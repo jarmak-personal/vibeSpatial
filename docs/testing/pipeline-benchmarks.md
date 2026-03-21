@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 141/220 lines
+Body Budget: 153/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -13,16 +13,16 @@ Section Map (Body Lines)
 |---|---|
 | 1-5 | Preamble |
 | 6-12 | Intent |
-| 13-21 | Request Signals |
-| 22-29 | Open First |
-| 30-35 | Verify |
-| 36-44 | Risks |
-| 45-58 | Entry Points |
-| 59-73 | Pipelines |
-| 74-86 | Suites |
-| 87-95 | Regression Rules |
-| 96-122 | Trace Contract |
-| 123-141 | CI Workflow |
+| 13-27 | Request Signals |
+| 28-39 | Open First |
+| 40-47 | Verify |
+| 48-56 | Risks |
+| 57-70 | Entry Points |
+| 71-85 | Pipelines |
+| 86-98 | Suites |
+| 99-107 | Regression Rules |
+| 108-134 | Trace Contract |
+| 135-153 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -43,17 +43,29 @@ timers.
 - nvtx
 - cpu gpu movement
 - benchmark artifact
+- vsbench
+- bench cli
+- benchmark operation
+- benchmark suite
+- benchmark compare
+- nvbench kernel
 
 ## Open First
 
 - docs/testing/pipeline-benchmarks.md
+- src/vibespatial/bench/cli.py
+- src/vibespatial/bench/catalog.py
+- src/vibespatial/bench/runner.py
+- src/vibespatial/bench/schema.py
+- src/vibespatial/bench/pipeline.py
 - scripts/benchmark_pipelines.py
 - scripts/check_pipeline_regressions.py
-- src/vibespatial/bench/pipeline.py
 - .github/workflows/pipeline-benchmarks.yml
 
 ## Verify
 
+- `uv run vsbench list operations`
+- `uv run vsbench run bounds --scale 1k --repeat 1 --quiet`
 - `uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q`
 - `uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2`
 - `uv run python scripts/check_docs.py --check`

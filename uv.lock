@@ -1842,6 +1842,19 @@ wheels = [
 ]
 
 [[package]]
+name = "rich"
+version = "14.3.3"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "markdown-it-py" },
+    { name = "pygments" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b3/c6/f3b320c27991c46f43ee9d856302c70dc2d0fb2dba4842ff739d5f46b393/rich-14.3.3.tar.gz", hash = "sha256:b8daa0b9e4eef54dd8cf7c86c03713f53241884e814f4e2f5fb342fe520f639b", size = 230582, upload-time = "2026-02-19T17:23:12.474Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/14/25/b208c5683343959b670dc001595f2f3737e051da617f66c31f7c4fa93abc/rich-14.3.3-py3-none-any.whl", hash = "sha256:793431c1f8619afa7d3b52b2cdec859562b950ea0d4b6b505397612db8d5362d", size = 310458, upload-time = "2026-02-19T17:23:13.732Z" },
+]
+
+[[package]]
 name = "rmm-cu12"
 version = "26.2.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2260,6 +2273,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+bench = [
+    { name = "rich" },
+]
 cu12 = [
     { name = "cuda-cccl", extra = ["cu12"], marker = "extra == 'extra-11-vibespatial-cu12'" },
     { name = "cuda-python", version = "12.9.6", source = { registry = "https://pypi.org/simple" } },
@@ -2323,10 +2339,11 @@ requires-dist = [
     { name = "pylibcudf-cu13", marker = "extra == 'cu13'", specifier = ">=26.2.1" },
     { name = "pyogrio", specifier = ">=0.8" },
     { name = "pyproj", specifier = ">=3.7.0" },
+    { name = "rich", marker = "extra == 'bench'", specifier = ">=13" },
     { name = "shapely", specifier = ">=2.1.0" },
     { name = "vibeproj" },
 ]
-provides-extras = ["cu12", "cu13"]
+provides-extras = ["cu12", "cu13", "bench"]
 
 [package.metadata.requires-dev]
 dev = [

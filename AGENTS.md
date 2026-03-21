@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 210/260 lines
+Body Budget: 211/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -20,11 +20,11 @@ Section Map (Body Lines)
 | 39-47 | Mission |
 | 48-57 | Startup |
 | 58-70 | Routing |
-| 71-97 | Project Shape |
-| 98-115 | Execution Model |
-| 116-127 | Test Strategy |
-| 128-137 | Build And Tooling |
-| 138-156 | Verification |
+| 71-98 | Project Shape |
+| 99-116 | Execution Model |
+| 117-128 | Test Strategy |
+| 129-138 | Build And Tooling |
+| 139-157 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -112,7 +112,8 @@ inspect the local area, then expand.
 - `scripts/extract_vendor_to_api.py`: extract vendored GeoPandas surfaces into the repo-owned API layer.
 - `scripts/upstream_native_coverage.py`: strict-native GeoPandas coverage analysis.
 - `scripts/bench_compact_gather.py`: compact+gather micro-benchmark (CuPy vs CCCL vs NVRTC).
-- `scripts/benchmark_pipelines.py`: end-to-end pipeline benchmarking and GPU sparkline profiling.
+- `vsbench` (entry point): unified benchmarking CLI for operations, pipelines, kernel microbenchmarks, and regression detection. See `src/vibespatial/bench/cli.py`.
+- `scripts/benchmark_pipelines.py`: end-to-end pipeline benchmarking and GPU sparkline profiling (legacy; prefer `vsbench suite`).
 - `scripts/check_architecture_lints.py`: validate architecture constraints and doc consistency.
 - `scripts/check_zero_copy.py`: zero-copy device transfer enforcement (ZCOPY001-003).
 - `scripts/check_perf_patterns.py`: performance anti-pattern detection (VPAT001-004).

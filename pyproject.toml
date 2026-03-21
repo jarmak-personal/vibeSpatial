@@ -67,6 +67,12 @@ cu13 = [
   "nvidia-ml-py>=13.590.48",
   "pylibcudf-cu13>=26.2.1",
 ]
+bench = [
+  "rich>=13",
+]
+
+[project.scripts]
+vsbench = "vibespatial.bench.cli:main"
 
 [dependency-groups]
 dev = [

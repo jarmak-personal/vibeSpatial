@@ -1,0 +1,106 @@
+"""Predefined benchmark suite definitions for vsbench CLI."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SuiteDefinition:
+    """A named collection of operations, pipelines, and scales to run."""
+
+    name: str
+    description: str
+    operations: tuple[str, ...]
+    pipelines: tuple[str, ...]
+    scales: tuple[int, ...]
+    kernels: tuple[str, ...] = ()  # Tier 2 NVBench kernel benchmarks
+
+
+SUITES: dict[str, SuiteDefinition] = {
+    "smoke": SuiteDefinition(
+        name="smoke",
+        description="Quick sanity check (~30s, 1K rows)",
+        operations=(
+            "bounds",
+            "gpu-pip",
+            "clip-rect",
+        ),
+        pipelines=(
+            "join-heavy",
+            "constructive",
+        ),
+        scales=(1_000,),
+    ),
+    "ci": SuiteDefinition(
+        name="ci",
+        description="CI gate suite (~5min, 100K rows)",
+        operations=(
+            "bounds",
+            "gpu-pip",
+            "clip-rect",
+            "binary-predicates",
+            "spatial-query",
+            "gpu-overlay",
+            "gpu-constructive",
+            "io-arrow",
+        ),
+        pipelines=(
+            "join-heavy",
+            "constructive",
+            "predicate-heavy",
+            "zero-transfer",
+        ),
+        scales=(100_000,),
+    ),
+    "full": SuiteDefinition(
+        name="full",
+        description="Full benchmark suite (~30min, 100K + 1M rows)",
+        operations=(
+            "bounds",
+            "gpu-pip",
+            "clip-rect",
+            "binary-predicates",
+            "spatial-query",
+            "gpu-overlay",
+            "gpu-constructive",
+            "gpu-predicates",
+            "point-predicates",
+            "bounds-pairs",
+            "segment-filters",
+            "segment-intersections",
+            "segment-primitives",
+            "make-valid",
+            "gpu-dissolve",
+            "dissolve-pipeline",
+            "stroke-kernels",
+            "gpu-decode",
+            "io-arrow",
+            "io-file",
+            "mixed-layouts",
+        ),
+        pipelines=(
+            "join-heavy",
+            "constructive",
+            "predicate-heavy",
+            "predicate-heavy-geopandas",
+            "zero-transfer",
+            "vegetation-corridor",
+            "vegetation-corridor-geopandas",
+            "parcel-zoning",
+            "parcel-zoning-geopandas",
+            "flood-exposure",
+            "flood-exposure-geopandas",
+            "site-suitability",
+            "site-suitability-geopandas",
+            "provenance-rewrite",
+        ),
+        scales=(100_000, 1_000_000),
+        kernels=(
+            "bounds-compute",
+            "point-in-polygon",
+            "segment-intersection",
+            "clip-rect",
+            "morton-sort",
+        ),
+    ),
+}

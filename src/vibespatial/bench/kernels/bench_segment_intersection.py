@@ -1,0 +1,65 @@
+"""NVBench kernel benchmark: segment intersection classification.
+
+Requires cuda-bench: pip install cuda-bench[cu12]
+
+Usage (standalone):
+    python bench_segment_intersection.py --scale 500 --output-json results.json
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="NVBench segment intersection benchmark")
+    parser.add_argument("--scale", type=int, default=500)
+    parser.add_argument("--precision", default="auto")
+    parser.add_argument("--output-json", type=Path, required=True)
+    parser.add_argument("--bandwidth", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        import cuda.bench as bench
+    except ImportError:
+        sys.exit("cuda-bench not installed. Install with: pip install cuda-bench[cu12]")
+
+    from shapely.affinity import translate
+
+    from vibespatial import (
+        classify_segment_intersections,
+        from_shapely_geometries,
+        generate_segment_candidates,
+    )
+    from vibespatial.testing.synthetic import SyntheticSpec, generate_lines
+
+    base = list(generate_lines(SyntheticSpec("line", "grid", count=args.scale, seed=0)).geometries)
+    shifted = [translate(g, xoff=0.5, yoff=0.5) for g in base]
+    left = from_shapely_geometries(base)
+    right = from_shapely_geometries(shifted)
+    candidates = generate_segment_candidates(left, right)
+
+    # Warmup
+    classify_segment_intersections(left, right, candidate_pairs=candidates)
+
+    def seg_bench(state: bench.State) -> None:
+        n = state.get_int64("NumElements")
+
+        def launcher(launch: bench.Launch) -> None:
+            classify_segment_intersections(left, right, candidate_pairs=candidates)
+
+        state.add_element_count(n)
+        state.exec(launcher)
+
+    b = bench.register(seg_bench)
+    b.add_int64_axis("NumElements", [args.scale])
+
+    bench.run_all_benchmarks(
+        ["--json", str(args.output_json)] + (sys.argv[1:] if argv is None else [])
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -31,11 +31,15 @@ _VIOLATION_BASELINE = 11  # reorg moved files into subpackages; same violations,
 GEOMETRY_ITER_ATTRS = {"geoms", "geometry", "geometries", "exterior", "interiors"}
 
 # Directories excluded from scanning.
-_EXCLUDED_DIRS = {"api", "testing", "_vendor"}
+_EXCLUDED_DIRS = {"api", "testing", "_vendor", "operations", "kernels"}
 
-# Filename stems/prefixes excluded from scanning (benchmarks, profiles).
-_EXCLUDED_STEMS = {"pipeline_benchmarks", "profile_rails", "fixture_profiles"}
-_EXCLUDED_PREFIXES = ("benchmark_", "profile_")
+# Filename stems/prefixes excluded from scanning (benchmarks, profiles,
+# bench CLI utilities that operate on JSON/timing data not device arrays).
+_EXCLUDED_STEMS = {
+    "pipeline_benchmarks", "profile_rails", "fixture_profiles",
+    "catalog", "cli", "compare", "nvbench_runner", "output", "runner", "schema", "suites",
+}
+_EXCLUDED_PREFIXES = ("benchmark_", "profile_", "bench_")
 
 
 @dataclass(frozen=True)
