@@ -1,17 +1,6 @@
 ---
 name: intake-router
-description: >
-  PROACTIVELY USE THIS SKILL to find relevant files and documentation before
-  starting any work. Use it instead of exploring the codebase manually. Trigger
-  on: any new task, request, question, bug, feature, investigation, or when you
-  need to find code, docs, tests, scripts, kernels, configs, ADRs, architecture
-  docs, or understand how something works. Also trigger on: "where is", "find",
-  "how does", "what file", "which module", "show me", "look up", "search for",
-  "navigate to", "open", "locate", "explore", "investigate", "understand",
-  "learn about", "read about", "check", "review", "audit", "debug", "fix",
-  "modify", "update", "add", "implement", "create", "write", "build", "refactor",
-  "test", "benchmark", "profile", "optimize". This is the fastest way to find
-  anything in the repo — always prefer it over manual grep/glob exploration.
+description: "PROACTIVELY USE THIS SKILL to find relevant files and documentation before starting any work. Use it instead of exploring the codebase manually. Trigger on: any new task, request, question, bug, feature, investigation, or when you need to find code, docs, tests, scripts, kernels, configs, ADRs, architecture docs, or understand how something works. Also trigger on: \"where is\", \"find\", \"how does\", \"what file\", \"which module\", \"show me\", \"look up\", \"search for\", \"navigate to\", \"open\", \"locate\", \"explore\", \"investigate\", \"understand\", \"learn about\", \"read about\", \"check\", \"review\", \"audit\", \"debug\", \"fix\", \"modify\", \"update\", \"add\", \"implement\", \"create\", \"write\", \"build\", \"refactor\", \"test\", \"benchmark\", \"profile\", \"optimize\". This is the fastest way to find anything in the repo — always prefer it over manual grep/glob exploration."
 user-invocable: true
 argument-hint: <natural language description of what you're looking for>
 ---

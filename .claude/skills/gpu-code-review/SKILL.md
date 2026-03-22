@@ -1,13 +1,6 @@
 ---
 name: gpu-code-review
-description: >
-  PROACTIVELY USE THIS SKILL when reviewing GPU kernel code, CUDA/NVRTC source,
-  CuPy operations, CCCL primitive usage, device memory management, stream-based
-  pipelining, or any GPU dispatch logic. This skill contains quantitative
-  thresholds, anti-pattern detection rules, and architecture-specific guidance
-  for A100, H100, RTX 3090, and RTX 4090 GPUs. Use it to catch performance
-  regressions, memory management issues, synchronization bugs, and precision
-  problems before they land.
+description: "PROACTIVELY USE THIS SKILL when reviewing GPU kernel code, CUDA/NVRTC source, CuPy operations, CCCL primitive usage, device memory management, stream-based pipelining, or any GPU dispatch logic. This skill contains quantitative thresholds, anti-pattern detection rules, and architecture-specific guidance for A100, H100, RTX 3090, and RTX 4090 GPUs. Use it to catch performance regressions, memory management issues, synchronization bugs, and precision problems before they land."
 user-invocable: true
 argument-hint: <file-path or PR diff to review>
 ---

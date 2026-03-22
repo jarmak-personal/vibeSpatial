@@ -1,12 +1,6 @@
 ---
 name: pre-land-review
-description: >
-  PROACTIVELY USE THIS SKILL before committing code, landing work, ending a
-  session, or when the user says "commit", "land", "done", "ship it", "wrap up",
-  or "let's finish". This is a MANDATORY gate — do not create a git commit
-  without completing this checklist. The pre-commit hook enforces deterministic
-  checks automatically, but the AI-powered review steps require you to run them
-  in-session before the commit.
+description: "The review gate that must pass before any commit lands. Called automatically by the /commit skill — do NOT invoke directly when the user says \"commit\", \"land\", \"ship it\", etc. (use /commit instead). Invoke directly only when you want to run the review without committing, or when another skill references it. This is a MANDATORY gate — do not create a git commit without completing this checklist."
 user-invocable: true
 argument-hint: "[git-ref range, default HEAD~1]"
 ---

@@ -1,11 +1,6 @@
 ---
 name: commit
-description: >
-  PROACTIVELY USE THIS SKILL when the user says "commit", "land", "land this",
-  "ship it", "done", "wrap up", "let's finish", or any intent to commit work.
-  This is the ONLY user entrypoint for the commit workflow — do not invoke
-  /pre-land-review directly for commits. Orchestrates the full landing flow:
-  pre-land review, staging, review marker, and git commit.
+description: "PROACTIVELY USE THIS SKILL when the user says \"commit\", \"land\", \"land this\", \"ship it\", \"done\", \"wrap up\", \"let's finish\", or any intent to commit work. This is the ONLY user entrypoint for the commit workflow — do not invoke /pre-land-review directly for commits. Orchestrates the full landing flow: pre-land review, staging, review marker, and git commit."
 user-invocable: true
 argument-hint: "[optional commit message override]"
 ---

@@ -1,12 +1,6 @@
 ---
 name: cuda-optimizer
-description: >
-  Use this skill to optimize existing CUDA/NVRTC kernel code, CuPy operations,
-  CCCL primitive usage, or GPU dispatch logic in src/vibespatial/. Unlike
-  gpu-code-review (which flags issues) and cuda-writing (which guides new code),
-  this skill reads existing code and produces concrete rewrites with measured
-  justification. Invoke on pre-existing kernel files to bring them up to NVIDIA
-  best-practice performance standards.
+description: "Use this skill to optimize existing CUDA/NVRTC kernel code, CuPy operations, CCCL primitive usage, or GPU dispatch logic in src/vibespatial/. Unlike gpu-code-review (which flags issues) and cuda-writing (which guides new code), this skill reads existing code and produces concrete rewrites with measured justification. Invoke on pre-existing kernel files to bring them up to NVIDIA best-practice performance standards."
 user-invocable: true
 argument-hint: <file-path or module-name to optimize>
 ---

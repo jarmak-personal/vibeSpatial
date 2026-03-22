@@ -1,15 +1,7 @@
 ---
 name: new-kernel-checklist
-description: >
-  PROACTIVELY USE THIS SKILL when adding a new GPU kernel, NVRTC kernel,
-  CCCL primitive wrapper, or any new GPU-dispatched operation to
-  src/vibespatial/. This checklist ensures every registration, warmup,
-  caching, precision, dispatch, test, benchmark, and documentation step is
-  completed. The cuda-engineer agent and gpu-code-review skill should
-  reference this checklist. Trigger on: "new kernel", "add kernel",
-  "implement kernel", "write kernel", "create kernel", "new GPU operation",
-  "add GPU", "scaffold kernel".
-user-invokable: true
+description: "PROACTIVELY USE THIS SKILL when adding a new GPU kernel, NVRTC kernel, CCCL primitive wrapper, or any new GPU-dispatched operation to src/vibespatial/. This checklist ensures every registration, warmup, caching, precision, dispatch, test, benchmark, and documentation step is completed. The cuda-engineer agent and gpu-code-review skill should reference this checklist. Trigger on: \"new kernel\", \"add kernel\", \"implement kernel\", \"write kernel\", \"create kernel\", \"new GPU operation\", \"add GPU\", \"scaffold kernel\"."
+user-invocable: true
 argument-hint: <kernel-name or description of the new operation>
 ---
 
