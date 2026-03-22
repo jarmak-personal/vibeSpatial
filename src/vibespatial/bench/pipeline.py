@@ -1299,6 +1299,7 @@ def _powerline_network_frame(count: int) -> geopandas.GeoDataFrame:
     """Sinusoidal linestrings mimicking powerline corridors."""
     dataset = generate_lines(SyntheticSpec("line", "river", count=max(count, 1), seed=10, vertices=12))
     values = np.asarray(list(dataset.geometries), dtype=object)
+    values = shapely.make_valid(values)
     return geopandas.GeoDataFrame(
         {
             "circuit_id": pd.Categorical(np.arange(len(values), dtype=np.int32) % max(min(len(values), 32), 1)),
@@ -1611,6 +1612,15 @@ def _profile_vegetation_corridor_pipeline(
                 stage.device = "cpu"
 
         # Stage 6: intersect vegetation with corridor
+        # Ensure corridor is valid before overlay — buffer+dissolve can
+        # produce ring edge artifacts that cause TopologyException.
+        try:
+            corridor_valid = make_valid_owned(owned=corridor_owned)
+            if corridor_valid.owned is not None:
+                corridor_owned = corridor_valid.owned
+        except Exception:
+            pass  # keep original corridor if make_valid fails
+
         with profiler.stage(
             "intersect_vegetation",
             category="refine",
@@ -1763,6 +1773,9 @@ def _profile_vegetation_corridor_geopandas_pipeline(
             stage.rows_out = int(len(dissolved))
 
         with profiler.stage("intersect_vegetation", category="refine", device=ExecutionMode.CPU, rows_in=int(len(veg_gdf))) as stage:
+            # make_valid after dissolve prevents TopologyException from
+            # non-noded intersections in the dissolved corridor boundary.
+            dissolved["geometry"] = shapely.make_valid(dissolved.geometry.values)
             clipped = geopandas.overlay(veg_gdf, dissolved[["geometry"]], how="intersection")
             stage.rows_out = int(len(clipped))
 
@@ -2045,7 +2058,12 @@ def _profile_parcel_zoning_geopandas_pipeline(
             stage.rows_out = int(len(joined))
 
         with profiler.stage("overlay_intersect", category="refine", device=ExecutionMode.CPU, rows_in=int(len(clipped))) as stage:
-            overlaid = geopandas.overlay(clipped, zones_gdf, how="intersection")
+            # geopandas.overlay rejects mixed geometry types; clip can
+            # produce GeometryCollections at boundaries.  Filter to
+            # polygonal types only.
+            poly_mask = clipped.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+            clipped_poly = clipped[poly_mask] if not poly_mask.all() else clipped
+            overlaid = geopandas.overlay(clipped_poly, zones_gdf, how="intersection")
             stage.rows_out = int(len(overlaid))
 
         output_path = root / "parcel-zoning-output.parquet"
@@ -2872,7 +2890,12 @@ def _profile_site_suitability_geopandas_pipeline(
             stage.rows_out = int(len(clipped))
 
         with profiler.stage("overlay_difference", category="refine", device=ExecutionMode.CPU, rows_in=int(len(clipped))) as stage:
-            suitable = geopandas.overlay(clipped, excl_gdf, how="difference")
+            # geopandas.overlay rejects mixed geometry types; clip can
+            # produce GeometryCollections at boundaries.  Filter to
+            # polygonal types only.
+            poly_mask = clipped.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+            clipped_poly = clipped[poly_mask] if not poly_mask.all() else clipped
+            suitable = geopandas.overlay(clipped_poly, excl_gdf, how="difference")
             stage.rows_out = int(len(suitable))
 
         with profiler.stage("buffer_transit", category="refine", device=ExecutionMode.CPU, rows_in=int(len(transit_gdf))) as stage:
