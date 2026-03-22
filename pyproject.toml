@@ -87,7 +87,7 @@ dev = [
   "furo>=2024.8",
   "myst-parser>=4",
   "sphinx>=8",
-  "sphinx-autodoc2>=0.5",
+  "sphinx-autoapi>=3.8",
   "sphinx-copybutton>=0.5",
   "pyarrow>=23.0.1",
 ]

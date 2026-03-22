@@ -5,7 +5,7 @@ Every entry links to the full auto-generated documentation with parameters,
 return types, and docstrings.
 
 For the complete module-by-module reference, see the
-{doc}`full API docs </apidocs/index>`.
+{doc}`full API docs </autoapi/vibespatial/index>`.
 
 ## Core Classes
 

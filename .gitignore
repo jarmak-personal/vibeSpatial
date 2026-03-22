@@ -20,6 +20,7 @@ __pycache__/
 # Docs build
 docs/_build/
 docs/apidocs/
+docs/autoapi/
 
 # Runtime artifacts
 cufile.log

@@ -9,35 +9,32 @@ extensions = [
     "myst_parser",
     "sphinx_copybutton",
     "sphinx.ext.intersphinx",
-    "autodoc2",
+    "autoapi.extension",
 ]
 
-# -- autodoc2: static-analysis API reference ---------------------------------
-autodoc2_packages = [
-    {
-        "path": "../src/vibespatial",
-        "module": "vibespatial",
-    },
+# -- sphinx-autoapi: static-analysis API reference ----------------------------
+autoapi_dirs = ["../src/vibespatial"]
+autoapi_type = "python"
+autoapi_root = "autoapi"
+autoapi_options = [
+    "members",
+    "undoc-members",
+    "show-module-summary",
+    "imported-members",
 ]
-autodoc2_render_plugin = "myst"
-autodoc2_hidden_objects = ["dunder", "private", "inherited"]
-# Respect __all__ on the top-level package so the generated index only shows
-# the curated public surface (not every internal submodule).
-autodoc2_module_all_regexes = [
-    r"vibespatial$",
+autoapi_ignore = [
+    "*/cuda/*",
+    "*/bench/*",
+    "*/testing/*",
+    # Internal overlay submodules fully re-exported through __init__.py.
+    "*/overlay/gpu.py",
+    "*/overlay/reconstruction.py",
+    "*/overlay/dissolve.py",
 ]
-# Skip submodules that are purely internal, fully re-exported through
-# __init__.py, or would pull in heavy GPU deps during static analysis.
-autodoc2_skip_module_regexes = [
-    r"vibespatial\.cuda\..*",
-    r"vibespatial\.bench\..*",
-    r"vibespatial\.testing$",
-    # These are fully re-exported through __init__.py; documenting both
-    # the submodule and the re-export creates duplicate-object warnings.
-    r"vibespatial\.overlay\.gpu$",
-    r"vibespatial\.overlay\.reconstruction$",
-    r"vibespatial\.overlay\.dissolve$",
-]
+autoapi_keep_files = True
+# Let our curated docs/user/api.md serve as the entry point; autoapi adds
+# its own toctree entry to the root for the full generated reference.
+autoapi_add_toctree_entry = True
 
 intersphinx_mapping = {
     "vibeproj": ("https://jarmak-personal.github.io/vibeProj/", None),
@@ -55,13 +52,19 @@ templates_path = ["_templates"]
 exclude_patterns = ["_build", "ops", "decisions/index.md"]
 
 # Suppress cosmetic warnings:
-# - toc.not_included: autodoc2 subpackage pages reachable via cross-refs
-# - autodoc2.all_resolve: ambiguous re-exports (overlay, sjoin, clip)
-# - duplicate: __init__.py re-exports create duplicate py:function entries
+# - duplicate: re-exports create duplicate py:function entries
+# - ref.python: ambiguous cross-refs from re-exported symbols
+# - ref.ref/ref.doc: GeoPandas docstrings reference upstream labels/docs
+# - image.not_readable: GeoPandas docstrings reference upstream SVGs
 suppress_warnings = [
-    "toc.not_included",
-    "autodoc2.all_resolve",
     "duplicate",
+    "ref.python",
+    "ref.ref",
+    "ref.doc",
+    "image.not_readable",
+    "toc.not_included",
+    "docutils",
+    "autoapi.python_import_resolution",
 ]
 
 # -- Theme: Furo + NEON GRID overlay -----------------------------------------
