@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 210/280 lines
+Body Budget: 212/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-44 | Decision |
 | 45-54 | Performance Notes |
-| 55-120 | Current Behavior |
-| 121-210 | Measured Local Baseline |
+| 55-122 | Current Behavior |
+| 123-212 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -83,11 +83,13 @@ keeping GPU-native formats primary and legacy formats explicit.
 - GeoJSON and Shapefile record dispatch events without fallback events.
 - Legacy formats such as GPKG emit explicit fallback events.
 - Repo-owned GeoJSON ingest now also has an internal staged owned path:
-  - `auto` now selects the `fast-json` strategy: `orjson` for parsing (when
-    available, otherwise CPython `json`) plus vectorized per-family coordinate
-    extraction directly into numpy owned buffers. This eliminates the old
-    per-feature `_append_geojson_geometry` loop and is 2.4-2.6x faster than
-    the previous `full-json` default, and 3.5-3.9x faster than `pyogrio`.
+  - `auto` prefers `gpu-byte-classify` when a GPU runtime is available,
+    producing device-resident geometry via NVRTC kernels. On CPU-only hosts,
+    `auto` falls back to `fast-json`: `orjson` for parsing (when available,
+    otherwise CPython `json`) plus vectorized per-family coordinate extraction
+    directly into numpy owned buffers. The `fast-json` path is 2.4-2.6x
+    faster than the previous `full-json` default, and 3.5-3.9x faster than
+    `pyogrio`.
   - `prefer="chunked"` splits the features array into byte-range chunks,
     parses each chunk with orjson, and extracts coordinates with vectorized
     numpy. Slightly slower than single-pass fast-json but reduces peak memory.

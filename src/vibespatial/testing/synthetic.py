@@ -5,6 +5,10 @@ import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from vibespatial.geometry.owned import OwnedGeometryArray
 
 import numpy as np
 from shapely import affinity
@@ -134,6 +138,57 @@ def generate_points(spec: SyntheticSpec) -> SyntheticDataset:
         raise ValueError(f"Unsupported point distribution: {spec.distribution}")
 
     return _coerce_dataset(spec, (Point(float(x), float(y)) for x, y in zip(xs, ys, strict=True)))
+
+
+def generate_points_xy(spec: SyntheticSpec) -> tuple[np.ndarray, np.ndarray]:
+    """Generate x/y coordinate arrays for points without Shapely objects.
+
+    Returns raw ``(xs, ys)`` numpy float64 arrays using the same generation
+    logic as ``generate_points``.
+    """
+    count = spec.resolved_count
+    xmin, ymin, xmax, ymax = spec.bounds
+    rng = _rng(spec.seed)
+
+    if spec.distribution == "uniform":
+        xs = rng.uniform(xmin, xmax, count)
+        ys = rng.uniform(ymin, ymax, count)
+    elif spec.distribution == "clustered":
+        centers_x = rng.uniform(xmin, xmax, spec.clusters)
+        centers_y = rng.uniform(ymin, ymax, spec.clusters)
+        picks = rng.integers(0, spec.clusters, count)
+        xs = centers_x[picks] + rng.normal(0.0, (xmax - xmin) / 30.0, count)
+        ys = centers_y[picks] + rng.normal(0.0, (ymax - ymin) / 30.0, count)
+        xs = np.clip(xs, xmin, xmax)
+        ys = np.clip(ys, ymin, ymax)
+    elif spec.distribution == "grid":
+        side = _grid_side(count)
+        xs_grid, ys_grid = np.meshgrid(
+            _linspace(xmin, xmax, side), _linspace(ymin, ymax, side)
+        )
+        xs = xs_grid.ravel()[:count]
+        ys = ys_grid.ravel()[:count]
+    elif spec.distribution == "along-line":
+        t = _linspace(0.0, 1.0, count)
+        xs = xmin + (xmax - xmin) * t
+        ys = ymin + (ymax - ymin) * (0.5 + 0.3 * np.sin(2 * math.pi * t))
+    else:
+        raise ValueError(f"Unsupported point distribution: {spec.distribution}")
+
+    return np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64)
+
+
+def generate_points_owned(spec: SyntheticSpec) -> OwnedGeometryArray:
+    """Generate points directly as an OwnedGeometryArray, bypassing Shapely.
+
+    Returns a HOST-resident OwnedGeometryArray built from raw coordinate
+    arrays via ``point_owned_from_xy``.  Callers that need device residency
+    can call ``owned.move_to("device", trigger="benchmark")`` afterward.
+    """
+    from vibespatial.constructive.point import point_owned_from_xy
+
+    xs, ys = generate_points_xy(spec)
+    return point_owned_from_xy(xs, ys)
 
 
 def generate_lines(spec: SyntheticSpec) -> SyntheticDataset:

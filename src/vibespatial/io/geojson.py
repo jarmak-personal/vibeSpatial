@@ -98,7 +98,15 @@ class GeoJSONIngestBenchmark:
 def plan_geojson_ingest(*, prefer: str = "auto") -> GeoJSONIngestPlan:
     use_pylibcudf = False
     if prefer == "auto":
-        selected_strategy = "fast-json"
+        # Prefer GPU byte-classify when a GPU runtime is available; this
+        # keeps data device-resident (zero-copy) and avoids a HOST->DEVICE
+        # transfer when downstream kernels consume the geometry.
+        from vibespatial.runtime._runtime import has_gpu_runtime
+
+        if has_gpu_runtime():
+            selected_strategy = "gpu-byte-classify"
+        else:
+            selected_strategy = "fast-json"
     else:
         selected_strategy = prefer
     implementation = {
@@ -1315,11 +1323,25 @@ def read_geojson_owned(source: str | Path, *, prefer: str = "auto") -> GeoJSONOw
             selected=ExecutionMode.GPU,
         )
         resolved = Path(source) if not isinstance(source, Path) else source
-        result = read_geojson_gpu(resolved)
-        return GeoJSONOwnedBatch(
-            geometry=result.owned,
-            _properties_loader=result.properties_loader(),
-        )
+        try:
+            result = read_geojson_gpu(resolved)
+            return GeoJSONOwnedBatch(
+                geometry=result.owned,
+                _properties_loader=result.properties_loader(),
+            )
+        except Exception:
+            if prefer != "auto":
+                raise
+            # auto mode: GPU parser failed (e.g. unsupported geometry types);
+            # fall through to CPU fast-json path.
+            record_dispatch_event(
+                surface="vibespatial.io.geojson",
+                operation="read_owned",
+                implementation="geojson_fast_json_vectorized",
+                reason="GPU byte-classify fallback to fast-json",
+                selected=ExecutionMode.CPU,
+            )
+            plan = plan_geojson_ingest(prefer="fast-json")
     # For the simdjson strategy, prefer reading as bytes to avoid str->bytes encode overhead.
     if plan.selected_strategy == "simdjson":
         if isinstance(source, Path):

@@ -32,9 +32,9 @@ Adopt a staged GeoJSON ingest design with three layers:
   boundaries are already isolated
 
 The default implementation for this decision is the streaming tokenizer plus
-native geometry assembly. After benchmarking, `read_geojson_owned(...,
-prefer="auto")` now selects full `json.loads` plus native assembly on host
-because it is faster than the current stream tokenizer. Public
+native geometry assembly. `read_geojson_owned(..., prefer="auto")` now
+selects `gpu-byte-classify` when a GPU runtime is available (producing
+device-resident geometry), falling back to `fast-json` on CPU-only hosts. Public
 `geopandas.read_file(..., driver="GeoJSON")` stays on `pyogrio` for now; the
 new staged path is exposed as an owned-ingest API and benchmark surface until
 it is semantically complete enough to replace the public host route.
@@ -93,8 +93,8 @@ That GPU path is now hybrid on purpose:
   promoted because JSONPath wildcard extraction is the new bottleneck
 - property materialization is now lazy on the owned batch, which avoids paying
   host-side property decode for geometry-only ingest paths
-- `auto` now picks the measured host winner instead of forcing the stream path
-  prematurely
+- `auto` now prefers `gpu-byte-classify` when GPU is available for zero-copy
+  device-resident output, falling back to `fast-json` on CPU-only hosts
 - the public `read_file` behavior avoids regressions while the owned path
   matures
 

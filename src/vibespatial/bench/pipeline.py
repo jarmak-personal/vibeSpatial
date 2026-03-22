@@ -396,12 +396,21 @@ def _read_geoparquet_owned_preferred(path: Path, *, preferred_backend: str) -> t
 
 
 def _read_geojson_owned_preferred(path: Path, *, preferred_mode: str):
-    if preferred_mode != "pylibcudf":
-        return read_geojson_owned(path, prefer="auto"), "cpu", ""
+    if preferred_mode == "pylibcudf":
+        try:
+            return read_geojson_owned(path, prefer="pylibcudf"), "gpu", ""
+        except Exception as exc:
+            return read_geojson_owned(path, prefer="fast-json"), "cpu", f"gpu read fallback: {exc.__class__.__name__}"
+
+    # For "auto" or "gpu-byte-classify", pass through to read_geojson_owned
+    # which will select the strategy (auto now prefers GPU when available).
     try:
-        return read_geojson_owned(path, prefer="pylibcudf"), "gpu", ""
+        batch = read_geojson_owned(path, prefer=preferred_mode)
+        device = "gpu" if batch.geometry.device_state is not None else "cpu"
+        return batch, device, ""
     except Exception as exc:
-        return read_geojson_owned(path, prefer="auto"), "cpu", f"gpu read fallback: {exc.__class__.__name__}"
+        batch = read_geojson_owned(path, prefer="fast-json")
+        return batch, "cpu", f"gpu read fallback: {exc.__class__.__name__}"
 
 
 def _read_geojson_geopandas_preferred(path: Path) -> tuple[geopandas.GeoDataFrame, str, str, str]:
@@ -776,7 +785,9 @@ def _profile_predicate_pipeline(
 
         source_path = root / "predicate.geojson"
         frame = _regular_points_frame(scale)
-        frame.to_file(source_path, driver="GeoJSON")
+        # Write RFC 7946 GeoJSON (no GDAL CRS block) so the GPU
+        # byte-classify parser can consume it directly.
+        source_path.write_text(frame.to_json())
 
         profiler = StageProfiler(
             operation="pipeline.predicate-heavy",

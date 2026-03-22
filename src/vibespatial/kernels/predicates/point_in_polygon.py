@@ -2366,6 +2366,11 @@ def point_in_polygon(
         # All strategies now return a normalized object-dtype ndarray.
         return _to_python_result(gpu_out)
 
+    # CPU path: ensure host-side buffers are materialized (device-resident
+    # arrays from the GPU byte-classify parser may have empty host buffers).
+    left._ensure_host_state()
+    right_array._ensure_host_state()
+
     # CPU path: full normalize with bounds (needed by CPU coarse filter).
     t0 = perf_counter()
     right = _normalize_right_input(polygons, expected_len=left.row_count)

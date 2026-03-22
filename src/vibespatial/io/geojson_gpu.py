@@ -186,9 +186,12 @@ extern "C" __global__ void find_number_boundaries(
     is_start[idx] = is_first_digit && is_sep_before;
 
     // Number ends: last numeric char followed by separator
+    // Space/newline included because GDAL/OGR writes "0.0 ]" with
+    // whitespace between the last coordinate value and closing bracket.
     unsigned char is_numeric = (c >= '0' && c <= '9') || c == '.' ||
                                c == 'e' || c == 'E' || c == '-' || c == '+';
-    unsigned char is_sep_after = (next == ',' || next == ']');
+    unsigned char is_sep_after = (next == ',' || next == ']' || next == ' '
+                                  || next == '\n' || next == '\r' || next == '\t');
     is_end[idx] = is_numeric && is_sep_after;
 }
 """

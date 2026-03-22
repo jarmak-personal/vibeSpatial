@@ -217,8 +217,24 @@ def test_read_geojson_owned_streams_feature_collection_to_owned_buffers(tmp_path
     assert batch.geometry.to_shapely()[1].equals(frame.geometry.iloc[1])
 
 
-def test_plan_geojson_ingest_prefers_stream_native_path() -> None:
+def test_plan_geojson_ingest_auto_selects_best_available() -> None:
+    from vibespatial.runtime._runtime import has_gpu_runtime
+
     plan = plan_geojson_ingest()
+
+    if has_gpu_runtime():
+        assert plan.selected_strategy == "gpu-byte-classify"
+        assert plan.implementation == "geojson_gpu_byte_classify"
+    else:
+        assert plan.selected_strategy == "fast-json"
+        assert plan.implementation == "geojson_fast_json_vectorized"
+    assert plan.uses_stream_tokenizer is False
+    assert plan.uses_native_geometry_assembly is True
+
+
+def test_plan_geojson_ingest_explicit_fast_json() -> None:
+    """Explicit prefer='fast-json' always selects the CPU fast-json path."""
+    plan = plan_geojson_ingest(prefer="fast-json")
 
     assert plan.implementation == "geojson_fast_json_vectorized"
     assert plan.selected_strategy == "fast-json"
