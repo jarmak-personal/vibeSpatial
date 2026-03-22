@@ -955,16 +955,20 @@ def _extract_segments_gpu(
 
         n_fam = fam_valid_rows.size
 
-        # Build empty_mask for these rows (vectorized host buffer lookup)
-        fam_empty = np.zeros(n_fam, dtype=np.uint8)
+        # Build empty_mask on device: upload host empty_mask, gather on device.
+        d_fam_valid = runtime.from_host(fam_valid_rows)
         if family_enum in geometry_array.families:
             host_buf = geometry_array.families[family_enum]
             fam_row_offsets = geometry_array.family_row_offsets[fam_valid_rows]
-            valid_fr = fam_row_offsets < len(host_buf.empty_mask)
-            fam_empty[valid_fr] = host_buf.empty_mask[fam_row_offsets[valid_fr]].astype(np.uint8)
-
-        d_fam_valid = runtime.from_host(fam_valid_rows)
-        d_fam_empty = runtime.from_host(fam_empty)
+            d_empty_mask = cp.asarray(host_buf.empty_mask.astype(np.uint8))
+            d_fam_row_off = cp.asarray(fam_row_offsets)
+            # Clamp indices and gather on device
+            d_valid_fr = d_fam_row_off < d_empty_mask.size
+            d_fam_empty = cp.zeros(n_fam, dtype=cp.uint8)
+            d_safe_idx = cp.minimum(d_fam_row_off, max(d_empty_mask.size - 1, 0))
+            d_fam_empty[d_valid_fr] = d_empty_mask[d_safe_idx[d_valid_fr]]
+        else:
+            d_fam_empty = cp.zeros(n_fam, dtype=cp.uint8)
 
         # Part and ring offsets (use zeros if not available)
         d_geom_off = d_buf.geometry_offsets
