@@ -4,12 +4,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
+from typing import TYPE_CHECKING
 
 import numpy as np
 import shapely
 from shapely.geometry import LineString, Polygon
 
 from vibespatial.geometry.owned import from_shapely_geometries
+
+if TYPE_CHECKING:
+    from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection, plan_kernel_dispatch
 from vibespatial.runtime.crossover import DispatchDecision
@@ -60,12 +64,50 @@ class StrokeKernelPlan:
     reason: str
 
 
-@dataclass(frozen=True)
 class BufferKernelResult:
-    geometries: np.ndarray
-    row_count: int
-    fast_rows: np.ndarray
-    fallback_rows: np.ndarray
+    """Result of a buffer kernel invocation.
+
+    When ``owned_result`` is set, ``geometries`` is materialized lazily on
+    first access so that callers that stay on the device-resident path
+    never pay for a D->H transfer.
+    """
+
+    __slots__ = (
+        "_geometries",
+        "fallback_rows",
+        "fast_rows",
+        "owned_result",
+        "row_count",
+    )
+
+    def __init__(
+        self,
+        *,
+        geometries: np.ndarray | None = None,
+        row_count: int,
+        fast_rows: np.ndarray,
+        fallback_rows: np.ndarray,
+        owned_result: OwnedGeometryArray | None = None,
+    ) -> None:
+        self._geometries = geometries
+        self.row_count = row_count
+        self.fast_rows = fast_rows
+        self.fallback_rows = fallback_rows
+        self.owned_result = owned_result
+
+    @property
+    def geometries(self) -> np.ndarray:
+        if self._geometries is None:
+            if self.owned_result is not None:
+                self._geometries = np.asarray(
+                    self.owned_result.to_shapely(), dtype=object
+                )
+            else:
+                raise ValueError(
+                    "BufferKernelResult has no geometries and no owned_result; "
+                    "at least one must be provided"
+                )
+        return self._geometries
 
 
 @dataclass(frozen=True)

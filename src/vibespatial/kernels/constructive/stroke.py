@@ -52,19 +52,23 @@ def point_buffer_kernel_gpu(
     *,
     quad_segs: int = 16,
 ) -> BufferKernelResult:
+    # NOTE: This registry path always starts from Shapely objects and pays
+    # the full Shapely -> OwnedGeometryArray -> Device transfer.  Callers
+    # that already hold a device-resident OwnedGeometryArray should call
+    # point_buffer_owned_array() directly to skip the H->D round-trip.
     from vibespatial.constructive.point import point_buffer_owned_array
     from vibespatial.geometry.owned import from_shapely_geometries
 
     geometries = np.asarray(values, dtype=object)
     owned = from_shapely_geometries(list(geometries))
     result = point_buffer_owned_array(owned, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
-    # Convert back to BufferKernelResult for API compatibility
-    shapely_geoms = np.asarray(result.to_shapely(), dtype=object)
+    row_count = result.row_count
     return BufferKernelResult(
-        geometries=shapely_geoms,
-        row_count=len(shapely_geoms),
-        fast_rows=np.arange(len(shapely_geoms), dtype=np.int32),
+        geometries=None,
+        row_count=row_count,
+        fast_rows=np.arange(row_count, dtype=np.int32),
         fallback_rows=np.asarray([], dtype=np.int32),
+        owned_result=result,
     )
 
 
