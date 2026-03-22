@@ -3825,41 +3825,55 @@
     },
     {
       "kind": "repo",
-      "path": ".claude/commands/maintainability-enforcer.md",
+      "path": ".claude/agents/gpu-code-reviewer.md",
       "referenced_by": [],
       "symbols": [],
       "tokens": [
+        "agents",
         "claude",
-        "commands",
-        "enforcer",
+        "code",
+        "gpu",
+        "md",
+        "reviewer"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/agents/maintainability-reviewer.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "claude",
         "maintainability",
-        "md"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".claude/commands/performance-analysis.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "analysis",
-        "claude",
-        "commands",
         "md",
-        "performance"
+        "reviewer"
       ]
     },
     {
       "kind": "repo",
-      "path": ".claude/commands/zero-copy-enforcer.md",
+      "path": ".claude/agents/performance-reviewer.md",
       "referenced_by": [],
       "symbols": [],
       "tokens": [
+        "agents",
         "claude",
-        "commands",
+        "md",
+        "performance",
+        "reviewer"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/agents/zero-copy-reviewer.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "claude",
         "copy",
-        "enforcer",
         "md",
+        "reviewer",
         "zero"
       ]
     },
