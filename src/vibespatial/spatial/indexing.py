@@ -6,9 +6,10 @@ from time import perf_counter
 import numpy as np
 
 from vibespatial.cuda.cccl_precompile import request_warmup
-from vibespatial.cuda.cccl_primitives import sort_pairs
+from vibespatial.cuda.cccl_primitives import exclusive_sum, sort_pairs
 
-request_warmup(["radix_sort_i32_i32", "radix_sort_u64_i32"])
+request_warmup(["radix_sort_i32_i32", "radix_sort_u64_i32", "exclusive_scan_i32"])
+
 
 try:
     import cupy as cp
@@ -19,6 +20,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
+    count_scatter_total,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
@@ -85,100 +87,171 @@ extern "C" __global__ void morton_keys_from_bounds(
   out_keys[row] = spread_bits_32(norm_x) | (spread_bits_32(norm_y) << 1);
 }
 
-/* Phase 4 — sweep-plane MBR overlap test.
+/* Sort-and-sweep MBR overlap test.
  *
- * Each thread handles one geometry from the left set and sweeps over a
- * Morton-sorted window of right geometries to find overlapping MBRs.
- * The sweep window is bounded by the left geometry's x-extent.
+ * Operates on a concatenated array of geometries, sorted by minx.
+ * Each thread handles one element and sweeps forward through the sorted
+ * array.  The sweep terminates when sorted_minx[j] > current_maxx,
+ * pruning the search space from O(n) to O(k) where k is the average
+ * x-overlap count.
  *
- * Two passes: pass 0 counts valid pairs per left geometry;
+ * For same_input mode: thread i sweeps forward and emits upper-triangle
+ * pairs (based on original row index) to avoid duplicates.
+ *
+ * For two-input mode: thread i sweeps forward and emits a pair whenever
+ * the two elements come from different sides (left vs right).  Because
+ * the sweep is directional (i < j in sorted order), each cross-side
+ * pair is discovered exactly once -- by whichever element appears first.
+ * The emitted pair is always (left_orig, right_orig) regardless of which
+ * side the sweeping element belongs to.
+ *
+ * Two passes: pass 0 counts valid pairs per sorted element;
  *             pass 1 writes pairs using a prefix-sum offset array.
  */
-extern "C" __global__ void sweep_mbr_overlap(
-    const double* left_bounds,     /* [left_count, 4] : minx,miny,maxx,maxy */
-    const int*    left_indices,     /* original row indices for left */
-    int           left_count,
-    const double* right_bounds,    /* [right_count, 4] */
-    const int*    right_indices,    /* original row indices for right */
-    int           right_count,
-    int*          out_left,         /* output left row indices (pass 1 only) */
-    int*          out_right,        /* output right row indices (pass 1 only) */
-    int*          counts,           /* per-left-row pair counts (pass 0: written; pass 1: read as offsets) */
-    int           pass_number,      /* 0 = count, 1 = scatter */
-    int           same_input,       /* 1 if left == right (upper-triangle mode) */
-    int           include_self      /* 1 to include (i,i) pairs in same_input mode */
+extern "C" __global__ void sweep_sorted_mbr_overlap(
+    const double* __restrict__ sorted_bounds,
+    const int*    __restrict__ sorted_orig,
+    const int*    __restrict__ sorted_side,
+    int           total_count,
+    int*          out_left,
+    int*          out_right,
+    int*          counts,
+    int           pass_number,
+    int           same_input,
+    int           include_self
 ) {
-  const int lid = blockIdx.x * blockDim.x + threadIdx.x;
-  if (lid >= left_count) return;
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= total_count) return;
 
-  const int lbase = lid * 4;
-  const double lx0 = left_bounds[lbase + 0];
-  const double ly0 = left_bounds[lbase + 1];
-  const double lx1 = left_bounds[lbase + 2];
-  const double ly1 = left_bounds[lbase + 3];
-
-  /* Skip NaN bounds */
-  if (isnan(lx0) || isnan(ly0) || isnan(lx1) || isnan(ly1)) {
-    if (pass_number == 0) counts[lid] = 0;
-    return;
-  }
+  const int ibase = i * 4;
+  const double ix0 = sorted_bounds[ibase + 0];
+  const double iy0 = sorted_bounds[ibase + 1];
+  const double ix1 = sorted_bounds[ibase + 2];
+  const double iy1 = sorted_bounds[ibase + 3];
+  const int i_orig = sorted_orig[i];
+  const int i_side = sorted_side[i];
 
   int pair_count = 0;
   int write_offset = 0;
-  if (pass_number == 1) write_offset = counts[lid];
+  if (pass_number == 1) write_offset = counts[i];
 
-  const int left_row = left_indices[lid];
+  /* Sweep forward: elements are sorted by minx, so once sorted_minx[j] > ix1
+   * no further element can overlap in x with element i. */
+  for (int j = i + 1; j < total_count; j++) {
+    const int jbase = j * 4;
+    const double jx0 = sorted_bounds[jbase + 0];
+    /* Early exit: sorted by minx, so jx0 > ix1 means no more x-overlap */
+    if (jx0 > ix1) break;
 
-  for (int rid = 0; rid < right_count; rid++) {
-    const int rbase = rid * 4;
-    const double rx0 = right_bounds[rbase + 0];
-    const double ry0 = right_bounds[rbase + 1];
-    const double rx1 = right_bounds[rbase + 2];
-    const double ry1 = right_bounds[rbase + 3];
+    const double jy0 = sorted_bounds[jbase + 1];
+    const double jx1 = sorted_bounds[jbase + 2];
+    const double jy1 = sorted_bounds[jbase + 3];
 
-    if (isnan(rx0) || isnan(ry0) || isnan(rx1) || isnan(ry1)) continue;
+    /* Full y-axis overlap test (x-overlap guaranteed by sweep condition) */
+    if (iy0 > jy1 || iy1 < jy0) continue;
 
-    /* MBR overlap test */
-    if (lx0 > rx1 || lx1 < rx0 || ly0 > ry1 || ly1 < ry0) continue;
+    const int j_orig = sorted_orig[j];
+    const int j_side = sorted_side[j];
 
-    const int right_row = right_indices[rid];
-
-    /* Upper-triangle filter for same-input mode */
     if (same_input) {
-      if (include_self) {
-        if (left_row > right_row) continue;
+      /* Same-input mode: each pair (i,j) where i < j in sorted order is
+       * discovered exactly once by the thread at position i.  Emit as
+       * (min_orig, max_orig) for upper-triangle.  Skip self-pairs
+       * (same original row index) unless include_self is set. */
+      if (i_orig == j_orig && !include_self) continue;
+      if (pass_number == 0) {
+        pair_count++;
       } else {
-        if (left_row >= right_row) continue;
+        /* Emit as (smaller_orig, larger_orig) */
+        if (i_orig <= j_orig) {
+          out_left[write_offset + pair_count] = i_orig;
+          out_right[write_offset + pair_count] = j_orig;
+        } else {
+          out_left[write_offset + pair_count] = j_orig;
+          out_right[write_offset + pair_count] = i_orig;
+        }
+        pair_count++;
       }
-    }
-
-    if (pass_number == 0) {
-      pair_count++;
     } else {
-      out_left[write_offset + pair_count] = left_row;
-      out_right[write_offset + pair_count] = right_row;
-      pair_count++;
+      /* Two-input mode: emit only cross-side pairs */
+      if (i_side == j_side) continue;
+      if (pass_number == 0) {
+        pair_count++;
+      } else {
+        /* Always emit as (left_orig, right_orig) */
+        if (i_side == 0) {
+          out_left[write_offset + pair_count] = i_orig;
+          out_right[write_offset + pair_count] = j_orig;
+        } else {
+          out_left[write_offset + pair_count] = j_orig;
+          out_right[write_offset + pair_count] = i_orig;
+        }
+        pair_count++;
+      }
     }
   }
 
-  if (pass_number == 0) counts[lid] = pair_count;
+  if (pass_number == 0) counts[i] = pair_count;
 }
 """
 
 
 @dataclass(frozen=True)
 class CandidatePairs:
-    left_indices: np.ndarray
-    right_indices: np.ndarray
+    """MBR candidate pair result with optional device-resident arrays.
+
+    When produced by the GPU path, ``_device_left_indices`` and
+    ``_device_right_indices`` hold CuPy device arrays.  The public
+    ``left_indices`` and ``right_indices`` properties lazily materialise
+    host (NumPy) arrays on first access, following the same pattern as
+    :class:`FlatSpatialIndex`.
+    """
+
+    _host_left_indices: object  # np.ndarray or None (lazy from device)
+    _host_right_indices: object  # np.ndarray or None (lazy from device)
     left_bounds: np.ndarray
     right_bounds: np.ndarray
     pairs_examined: int
     tile_size: int
     same_input: bool
+    _device_left_indices: object = None  # CuPy device array or None
+    _device_right_indices: object = None  # CuPy device array or None
+
+    @property
+    def left_indices(self) -> np.ndarray:
+        """Lazily materialise host left_indices from device (ADR-0005)."""
+        if self._host_left_indices is not None:
+            return self._host_left_indices
+        host = cp.asnumpy(self._device_left_indices).astype(np.int32, copy=False)
+        object.__setattr__(self, "_host_left_indices", host)
+        return host
+
+    @property
+    def right_indices(self) -> np.ndarray:
+        """Lazily materialise host right_indices from device (ADR-0005)."""
+        if self._host_right_indices is not None:
+            return self._host_right_indices
+        host = cp.asnumpy(self._device_right_indices).astype(np.int32, copy=False)
+        object.__setattr__(self, "_host_right_indices", host)
+        return host
+
+    @property
+    def device_left_indices(self):
+        """CuPy device array of left indices, or None if CPU-produced."""
+        return self._device_left_indices
+
+    @property
+    def device_right_indices(self):
+        """CuPy device array of right indices, or None if CPU-produced."""
+        return self._device_right_indices
 
     @property
     def count(self) -> int:
-        return int(self.left_indices.size)
+        if self._host_left_indices is not None:
+            return int(self._host_left_indices.size)
+        if self._device_left_indices is not None:
+            return int(self._device_left_indices.size)
+        return 0
 
 
 def _valid_row_mask(bounds: np.ndarray) -> np.ndarray:
@@ -191,45 +264,90 @@ def _generate_bounds_pairs_gpu(
     *,
     same_input: bool,
     include_self: bool,
-) -> tuple[np.ndarray, np.ndarray, int]:
-    """GPU path for MBR overlap pair generation using sweep-plane NVRTC kernel.
+) -> tuple[object, object, int]:
+    """GPU sort-and-sweep MBR overlap pair generation.
 
-    Returns (left_indices, right_indices, pairs_examined).
+    Returns ``(d_left_indices, d_right_indices, pairs_examined)`` where the
+    index arrays are CuPy device arrays (zero-copy -- no D->H transfer).
+    Returns numpy arrays for the empty-result edge case.
     """
     runtime = get_cuda_runtime()
     kernels = _indexing_kernels()
-    sweep_kernel = kernels["sweep_mbr_overlap"]
+    sweep_kernel = kernels["sweep_sorted_mbr_overlap"]
     ptr = runtime.pointer
 
-    left_valid_mask = ~np.isnan(left_bounds).any(axis=1)
-    right_valid_mask = left_valid_mask if same_input else ~np.isnan(right_bounds).any(axis=1)
-    left_valid = np.flatnonzero(left_valid_mask)
-    right_valid = left_valid if same_input else np.flatnonzero(right_valid_mask)
+    # --- Filter NaN bounds on device (Tier 2: CuPy element-wise) ---
+    d_left_bounds_full = cp.asarray(left_bounds)
+    d_left_valid_mask = ~cp.isnan(d_left_bounds_full).any(axis=1)
+    d_left_valid = cp.flatnonzero(d_left_valid_mask).astype(cp.int32, copy=False)
+    left_count = int(d_left_valid.size)
 
-    left_count = int(left_valid.size)
-    right_count = int(right_valid.size)
+    if same_input:
+        d_right_bounds_full = d_left_bounds_full
+        d_right_valid = d_left_valid
+        right_count = left_count
+    else:
+        d_right_bounds_full = cp.asarray(right_bounds)
+        d_right_valid_mask = ~cp.isnan(d_right_bounds_full).any(axis=1)
+        d_right_valid = cp.flatnonzero(d_right_valid_mask).astype(cp.int32, copy=False)
+        right_count = int(d_right_valid.size)
 
     if left_count == 0 or right_count == 0:
         empty = np.asarray([], dtype=np.int32)
         return empty, empty, 0
 
-    # Upload valid bounds subsets to device
-    left_valid_bounds = np.ascontiguousarray(left_bounds[left_valid])
-    right_valid_bounds = left_valid_bounds if same_input else np.ascontiguousarray(right_bounds[right_valid])
-    left_valid_indices = left_valid.astype(np.int32, copy=False)
-    right_valid_indices = left_valid_indices if same_input else right_valid.astype(np.int32, copy=False)
+    # --- Extract valid bounds subsets on device ---
+    d_left_valid_bounds = d_left_bounds_full[d_left_valid]  # [left_count, 4]
+    d_left_orig = d_left_valid  # original row indices (not mutated, no copy needed)
 
-    d_left_bounds = runtime.from_host(left_valid_bounds)
-    d_right_bounds = d_left_bounds if same_input else runtime.from_host(right_valid_bounds)
-    d_left_indices = runtime.from_host(left_valid_indices)
-    d_right_indices = d_left_indices if same_input else runtime.from_host(right_valid_indices)
-    d_counts = runtime.allocate((left_count,), np.int32)
+    if same_input:
+        d_right_valid_bounds = d_left_valid_bounds
+        d_right_orig = d_left_orig
+    else:
+        d_right_valid_bounds = d_right_bounds_full[d_right_valid]
+        d_right_orig = d_right_valid  # not mutated, no copy needed
 
-    # Pass 0: count pairs per left geometry
+    # --- Build concatenated sorted array for sweep ---
+    if same_input:
+        # Same-input mode: single array, all elements are both left and right
+        total_count = left_count
+        # Sort by minx (column 0 of bounds) on device
+        sort_order = cp.argsort(d_left_valid_bounds[:, 0]).astype(cp.int32, copy=False)
+        d_sorted_bounds = d_left_valid_bounds[sort_order]
+        d_sorted_bounds_flat = d_sorted_bounds.ravel().astype(cp.float64, copy=False)
+        d_sorted_orig = d_left_orig[sort_order]
+        d_sorted_side = cp.zeros(total_count, dtype=cp.int32)
+    else:
+        # Two-input mode: concatenate left (side=0) + right (side=1)
+        total_count = left_count + right_count
+        d_all_bounds = cp.concatenate([d_left_valid_bounds, d_right_valid_bounds], axis=0)
+        d_all_orig = cp.concatenate([d_left_orig, d_right_orig])
+        d_all_side = cp.concatenate([
+            cp.zeros(left_count, dtype=cp.int32),
+            cp.ones(right_count, dtype=cp.int32),
+        ])
+        # Sort by minx (column 0) on device
+        sort_order = cp.argsort(d_all_bounds[:, 0]).astype(cp.int32, copy=False)
+        d_sorted_bounds = d_all_bounds[sort_order]
+        d_sorted_bounds_flat = d_sorted_bounds.ravel().astype(cp.float64, copy=False)
+        d_sorted_orig = d_all_orig[sort_order]
+        d_sorted_side = d_all_side[sort_order]
+
+    # --- Pass 0: count pairs per sorted element ---
+    d_counts = runtime.allocate((total_count,), np.int32, zero=True)
+    _param_types = (
+        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+    )
     count_params = (
         (
-            ptr(d_left_bounds), ptr(d_left_indices), left_count,
-            ptr(d_right_bounds), ptr(d_right_indices), right_count,
+            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            total_count,
             0,  # out_left (unused in pass 0)
             0,  # out_right (unused in pass 0)
             ptr(d_counts),
@@ -237,86 +355,52 @@ def _generate_bounds_pairs_gpu(
             int(same_input),
             int(include_self),
         ),
-        (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I32,
-        ),
+        _param_types,
     )
-    grid, block = runtime.launch_config(sweep_kernel, left_count)
+    grid, block = runtime.launch_config(sweep_kernel, total_count)
     runtime.launch(sweep_kernel, grid=grid, block=block, params=count_params)
 
-    # Prefix sum on counts to get scatter offsets (using CuPy for element-wise, ADR-0033)
+    # Prefix sum for scatter offsets (CCCL exclusive_sum, ADR-0033)
     cp_counts = cp.asarray(d_counts)
-    total_pairs = int(cp_counts.sum())
+    d_offsets = exclusive_sum(cp_counts, synchronize=False)
+    total_pairs = count_scatter_total(runtime, cp_counts, d_offsets)
 
     if total_pairs == 0:
-        runtime.free(d_left_bounds)
-        if not same_input:
-            runtime.free(d_right_bounds)
-            runtime.free(d_right_indices)
-        runtime.free(d_left_indices)
-        runtime.free(d_counts)
         empty = np.asarray([], dtype=np.int32)
         return empty, empty, left_count * right_count
 
-    # Exclusive prefix sum to get write offsets
-    d_offsets = cp.empty_like(cp_counts)
-    cp.cumsum(cp_counts, out=d_offsets)
-    d_offsets -= cp_counts  # exclusive scan
-    # Copy offsets back into d_counts buffer for the kernel
-    cp.copyto(cp.asarray(d_counts), d_offsets)
-    cp.cuda.Stream.null.synchronize()
+    if total_pairs > 2_147_483_647:
+        raise OverflowError(
+            f"sweep_sorted_mbr_overlap: {total_pairs} candidate pairs exceed "
+            f"int32 offset capacity (2^31-1). Consider spatial partitioning."
+        )
 
-    # Allocate output arrays
+    # Copy offsets into counts buffer for the scatter kernel to read
+    cp.copyto(cp_counts, d_offsets)
+
+    # Allocate output arrays on device
     d_out_left = runtime.allocate((total_pairs,), np.int32)
     d_out_right = runtime.allocate((total_pairs,), np.int32)
 
-    # Pass 1: scatter pairs
+    # --- Pass 1: scatter pairs ---
     scatter_params = (
         (
-            ptr(d_left_bounds), ptr(d_left_indices), left_count,
-            ptr(d_right_bounds), ptr(d_right_indices), right_count,
+            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            total_count,
             ptr(d_out_left), ptr(d_out_right),
             ptr(d_counts),
             1,  # pass_number = 1
             int(same_input),
             int(include_self),
         ),
-        (
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-            KERNEL_PARAM_PTR,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I32,
-            KERNEL_PARAM_I32,
-        ),
+        _param_types,
     )
-    grid, block = runtime.launch_config(sweep_kernel, left_count)
+    grid, block = runtime.launch_config(sweep_kernel, total_count)
     runtime.launch(sweep_kernel, grid=grid, block=block, params=scatter_params)
-    runtime.synchronize()
-
-    # Transfer results back to host
-    left_result = runtime.copy_device_to_host(d_out_left).astype(np.int32, copy=False)
-    right_result = runtime.copy_device_to_host(d_out_right).astype(np.int32, copy=False)
-
-    # Clean up device memory
-    runtime.free(d_left_bounds)
-    if not same_input:
-        runtime.free(d_right_bounds)
-        runtime.free(d_right_indices)
-    runtime.free(d_left_indices)
-    runtime.free(d_counts)
-    runtime.free(d_out_left)
-    runtime.free(d_out_right)
+    # No sync needed -- CuPy arrays stay on device.
 
     pairs_examined = left_count * right_count
-    return left_result, right_result, pairs_examined
+    return cp.asarray(d_out_left), cp.asarray(d_out_right), pairs_examined
 
 
 def generate_bounds_pairs(
@@ -343,20 +427,24 @@ def generate_bounds_pairs(
         and cp is not None
     )
     if use_gpu:
-        left_indices, right_indices, pairs_examined = _generate_bounds_pairs_gpu(
+        d_left, d_right, pairs_examined = _generate_bounds_pairs_gpu(
             left_bounds,
             right_bounds,
             same_input=same_input,
             include_self=include_self,
         )
+        # Determine if GPU returned device arrays or host arrays (empty case)
+        is_device = cp is not None and isinstance(d_left, cp.ndarray)
         return CandidatePairs(
-            left_indices=left_indices,
-            right_indices=right_indices,
+            _host_left_indices=None if is_device else d_left,
+            _host_right_indices=None if is_device else d_right,
             left_bounds=left_bounds,
             right_bounds=right_bounds,
             pairs_examined=pairs_examined,
             tile_size=tile_size,
             same_input=same_input,
+            _device_left_indices=d_left if is_device else None,
+            _device_right_indices=d_right if is_device else None,
         )
 
     # CPU path: nested-tile loop
@@ -410,8 +498,8 @@ def generate_bounds_pairs(
         right_indices = np.asarray([], dtype=np.int32)
 
     return CandidatePairs(
-        left_indices=left_indices,
-        right_indices=right_indices,
+        _host_left_indices=left_indices,
+        _host_right_indices=right_indices,
         left_bounds=left_bounds,
         right_bounds=right_bounds,
         pairs_examined=pairs_examined,
@@ -508,15 +596,36 @@ class FlatSpatialIndex:
         *,
         tile_size: int = 256,
     ) -> CandidatePairs:
-        order = self.order
         ordered = self.geometry_array
         result = generate_bounds_pairs(other, ordered, tile_size=tile_size)
         if result.count == 0:
             return result
+        # When both order and result are device-resident, remap on device
+        # to avoid a D->H round-trip (ADR-0005).
+        if (
+            cp is not None
+            and self.device_order is not None
+            and result.device_right_indices is not None
+        ):
+            d_order = cp.asarray(self.device_order)
+            d_mapped_right = d_order[result.device_right_indices]
+            return CandidatePairs(
+                _host_left_indices=None,
+                _host_right_indices=None,
+                left_bounds=result.left_bounds,
+                right_bounds=result.right_bounds,
+                pairs_examined=result.pairs_examined,
+                tile_size=result.tile_size,
+                same_input=result.same_input,
+                _device_left_indices=result.device_left_indices,
+                _device_right_indices=d_mapped_right.astype(cp.int32, copy=False),
+            )
+        # CPU fallback: materialise to host and remap
+        order = self.order
         mapped_right = order[result.right_indices]
         return CandidatePairs(
-            left_indices=result.left_indices,
-            right_indices=mapped_right.astype(np.int32, copy=False),
+            _host_left_indices=result.left_indices,
+            _host_right_indices=mapped_right.astype(np.int32, copy=False),
             left_bounds=result.left_bounds,
             right_bounds=result.right_bounds,
             pairs_examined=result.pairs_examined,
@@ -536,7 +645,7 @@ class RegularGridRectIndex:
     size: int
 
 
-_INDEXING_KERNEL_NAMES = ("morton_keys_from_bounds", "sweep_mbr_overlap")
+_INDEXING_KERNEL_NAMES = ("morton_keys_from_bounds", "sweep_sorted_mbr_overlap")
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
