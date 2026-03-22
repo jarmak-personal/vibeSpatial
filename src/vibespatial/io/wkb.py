@@ -1999,6 +1999,58 @@ def _try_gpu_wkb_encode(
         return None
 
 
+def _try_gpu_wkb_encode_arrow(
+    owned: OwnedGeometryArray,
+    *,
+    field_name: str = "geometry",
+    crs: Any | None = None,
+) -> tuple | None:
+    """GPU WKB encode returning (pa.Field, pa.Array) for zero-copy parquet integration.
+
+    Unlike ``_try_gpu_wkb_encode`` which round-trips through ``.to_pylist()``,
+    this casts the device-resident pylibcudf column directly to a ``pa.Array``
+    via Arrow IPC -- a single bulk D->H transfer with no per-row Python
+    materialisation.  Returns None if GPU is unavailable or encode fails.
+    """
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
+    try:
+        runtime = get_cuda_runtime()
+        if not runtime.available():
+            return None
+    except Exception:
+        return None
+    if owned.row_count < 500:
+        return None
+    try:
+        import pyarrow as pa
+
+        plc_column = _encode_owned_wkb_column_device(owned)
+        # Single bulk D->H via Arrow -- no Python list intermediary
+        arrow_col = plc_column.to_arrow()
+        wkb_arr = arrow_col.cast(pa.binary())
+
+        field_metadata = {}
+        if crs is not None:
+            try:
+                crs_json = crs.to_json_dict()
+            except AttributeError:
+                crs_json = None
+            if crs_json is not None:
+                import json
+
+                field_metadata[b"ARROW:extension:metadata"] = json.dumps(
+                    {"crs": crs_json}
+                ).encode()
+        field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+        field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
+        return field, wkb_arr
+    except Exception:
+        return None
+
+
 def encode_wkb_owned(
     array: OwnedGeometryArray,
     *,
@@ -2051,12 +2103,32 @@ def _encode_owned_wkb_array(
     field_name: str = "geometry",
     crs: Any | None = None,
 ) -> tuple:
-    """Encode OwnedGeometryArray to WKB pyarrow array from owned buffers.
+    """Encode OwnedGeometryArray to WKB pyarrow array.
 
-    This avoids the np.asarray(DGA) → Shapely materialization path by
-    encoding WKB directly from owned coordinate buffers where possible.
-    For complex cases, falls back to Shapely's to_wkb.
+    Tries GPU-accelerated encoding first; falls back to host-side
+    row-by-row encoding only when GPU is unavailable.
     """
+    # Try GPU path -- keeps coordinates on device, encodes WKB in parallel
+    gpu_result = _try_gpu_wkb_encode_arrow(owned, field_name=field_name, crs=crs)
+    if gpu_result is not None:
+        record_dispatch_event(
+            surface="vibespatial.io.wkb",
+            operation="encode_to_parquet",
+            implementation="device_wkb_encode",
+            reason="GPU WKB encode for parquet write -- no host coordinate materialization",
+            selected=ExecutionMode.GPU,
+        )
+        return gpu_result
+
+    # CPU fallback -- needs host state
+    record_fallback_event(
+        surface="vibespatial.io.wkb",
+        reason="GPU WKB encode unavailable; falling back to host-side row-by-row WKB encode",
+        detail="GPU runtime not available or row count below threshold",
+        selected=ExecutionMode.CPU,
+        pipeline="io/wkb_encode",
+        d2h_transfer=True,
+    )
     import pyarrow as pa
 
     owned._ensure_host_state()
@@ -2078,6 +2150,7 @@ def _encode_owned_wkb_array(
             crs_json = None
         if crs_json is not None:
             import json
+
             field_metadata[b"ARROW:extension:metadata"] = json.dumps(
                 {"crs": crs_json}
             ).encode()
@@ -2179,4 +2252,15 @@ def _encode_family_row_wkb(
         return header + polygons
 
     raise ValueError(f"Unsupported geometry family for WKB encode: {family}")
+
+
+def encode_owned_wkb_device(
+    owned: OwnedGeometryArray,
+):
+    """Encode OwnedGeometryArray to WKB as a device-resident pylibcudf Column.
+
+    Zero-copy: coordinates stay on device, WKB is produced on device,
+    result stays on device.  Raises if GPU is unavailable.
+    """
+    return _encode_owned_wkb_column_device(owned)
 

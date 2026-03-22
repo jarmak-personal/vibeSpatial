@@ -1131,14 +1131,12 @@ def _write_geoparquet_native(
         arr = series.array
         owned = arr.to_owned()
 
-        # Ensure host state for encoding
-        owned._ensure_host_state()
-
         if use_geoarrow:
             # Try native GeoArrow encoding from owned buffers
             fast_path_reason = _owned_geoarrow_fast_path_reason(series, include_z=None)
             if fast_path_reason is None:
                 try:
+                    owned._ensure_host_state()  # GeoArrow reads host buffers
                     field, geom_arr = encode_owned_geoarrow_array(
                         owned,
                         field_name=col_name,
@@ -1155,14 +1153,17 @@ def _write_geoparquet_native(
                     continue
                 except Exception:
                     pass
-            # Fallback: WKB for mixed/empty/3D geometries
+            # Fallback: WKB for mixed/empty/3D geometries.
+            # The WKB encoder (_encode_owned_wkb_array) records its own
+            # dispatch/fallback events including d2h_transfer status, so we
+            # only record the GeoArrow->WKB encoding decision here.
             record_fallback_event(
                 surface="geopandas.geodataframe.to_parquet",
                 reason=f"GeoArrow fast path unavailable for column {col_name}: {fast_path_reason}; falling back to WKB",
                 detail=fast_path_reason or "encode error",
                 selected=ExecutionMode.CPU,
                 pipeline="io/to_parquet",
-                d2h_transfer=True,
+                d2h_transfer=False,
             )
 
         # WKB encoding — use owned-buffer WKB encoder when available
