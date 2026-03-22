@@ -1390,7 +1390,7 @@ class GeometryArray(ExtensionArray):
             )
             return merged_result
 
-        owned, selected = evaluate_geopandas_buffer(
+        buffer_result, selected = evaluate_geopandas_buffer(
             self._data,
             distance,
             quad_segs=quad_segs,
@@ -1400,7 +1400,7 @@ class GeometryArray(ExtensionArray):
             single_sided=single_sided,
             prebuilt_owned=self._owned,
         )
-        if owned is not None:
+        if buffer_result is not None:
             record_dispatch_event(
                 surface="geopandas.array.buffer",
                 operation="buffer",
@@ -1409,7 +1409,10 @@ class GeometryArray(ExtensionArray):
                 detail=f"rows={len(self)}, quad_segs={quad_segs}",
                 selected=selected,
             )
-            result = GeometryArray(np.asarray(owned, dtype=object), crs=self.crs)
+            if isinstance(buffer_result, OwnedGeometryArray):
+                result = GeometryArray.from_owned(buffer_result, crs=self.crs)
+            else:
+                result = GeometryArray(np.asarray(buffer_result, dtype=object), crs=self.crs)
             result._provenance = make_buffer_tag(self, distance, cap_style, join_style, single_sided, quad_segs)
             return result
         record_dispatch_event(

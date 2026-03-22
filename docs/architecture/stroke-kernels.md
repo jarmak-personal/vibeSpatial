@@ -5,7 +5,7 @@ Scope: Buffer and offset-curve kernel seam, prefix-sum emission strategy, and Sh
 Read If: You are changing buffer, offset_curve, or stroke-style constructive kernels.
 STOP IF: Your task already has the stroke kernel implementation open and only needs local implementation detail.
 Source Of Truth: Stroke kernel architecture for buffer and offset-curve constructive work.
-Body Budget: 62/220 lines
+Body Budget: 64/220 lines
 Document: docs/architecture/stroke-kernels.md
 
 Section Map (Body Lines)
@@ -18,8 +18,8 @@ Section Map (Body Lines)
 | 23-27 | Verify |
 | 28-32 | Risks |
 | 33-43 | Decision |
-| 44-51 | Current Scope |
-| 52-62 | Performance Notes |
+| 44-52 | Current Scope |
+| 53-64 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -68,8 +68,9 @@ pipelines.
 - `buffer`: owned prototype for positive-distance `Point` rows.
 - `offset_curve`: owned prototype for simple `LineString` rows with non-round
   joins.
-- Public GeoPandas adapters currently record explicit fallback and defer to
-  Shapely by default.
+- GPU-dispatched buffer surfaces (point, linestring, polygon) return
+  OwnedGeometryArray directly without Shapely materialization.
+- CPU/host fallback paths still defer to Shapely.
 
 ## Performance Notes
 
@@ -81,4 +82,5 @@ pipelines.
   current host prototype exists to validate shape and semantics, not to claim
   host-wide speed leadership yet.
 - Current host benchmarks at `1K` rows are about `4-5x` slower than Shapely for
-  both prototypes, so public dispatch stays on Shapely until GPU variants land.
+  both prototypes; GPU variants have landed and bypass Shapely entirely, while
+  the Shapely fallback applies only to CPU/host execution.

@@ -757,7 +757,7 @@ def evaluate_geopandas_buffer(
                     quad_segs=quad_segs,
                     dispatch_mode=ExecutionMode.GPU,
                 )
-                return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
+                return result, ExecutionMode.GPU
 
             result = point_buffer_owned(geometries, distance, quad_segs=quad_segs)
             if result.fallback_rows.size == 0:
@@ -795,7 +795,7 @@ def evaluate_geopandas_buffer(
                     mitre_limit=mitre_limit,
                     dispatch_mode=ExecutionMode.GPU,
                 )
-                return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
+                return result, ExecutionMode.GPU
 
         # --- Polygon buffer surface ---
         if _supports_polygon_buffer_gpu_surface(
@@ -819,7 +819,7 @@ def evaluate_geopandas_buffer(
                     mitre_limit=mitre_limit,
                     dispatch_mode=ExecutionMode.GPU,
                 )
-                return np.asarray(result.to_shapely(), dtype=object), ExecutionMode.GPU
+                return result, ExecutionMode.GPU
 
         return None, ExecutionMode.CPU
 
