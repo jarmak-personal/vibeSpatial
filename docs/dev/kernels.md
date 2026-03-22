@@ -9,7 +9,7 @@ is an NVRTC source compiled at runtime.
 |--------|--------|------------|
 | Bounds | `kernels/core.py` | Geometry bounds, total bounds, Morton keys |
 | Predicates | `kernels/predicates.py` | Point-in-polygon, point-within-bounds |
-| Segment intersection | `segment_primitives.py` | Classify segment intersections |
+| Segment intersection | `segment_primitives.py` | Extraction (count-scatter), candidate generation (sort-sweep + scatter), classification (Shewchuk adaptive) |
 | Overlay | `overlay_gpu.py` | Half-edge graph, split events, face extraction |
 | Stroke | `stroke_kernels.py` | Point buffer, offset curve |
 | Make valid | `make_valid_gpu.py` | GPU polygon repair |

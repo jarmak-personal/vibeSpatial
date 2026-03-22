@@ -10,5 +10,20 @@
     "variants": [
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "linestring",
+      "polygon",
+      "multilinestring",
+      "multipolygon"
+    ],
+    "kernel": "segment_intersection",
+    "module": "vibespatial.spatial.segment_primitives",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python",
+      "cpu"
+    ]
   }
 ]

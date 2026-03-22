@@ -5,7 +5,7 @@ Scope: Robust segment extraction, candidate generation, and exact intersection-c
 Read If: You are changing segment intersection math, degeneracy handling, or constructive-kernel foundations.
 STOP IF: You already have the segment primitive implementation open and only need local implementation detail.
 Source Of Truth: Phase-5 segment intersection primitive policy before overlay assembly.
-Body Budget: 103/220 lines
+Body Budget: 114/220 lines
 Document: docs/architecture/segment-primitives.md
 
 Section Map (Body Lines)
@@ -18,10 +18,10 @@ Section Map (Body Lines)
 | 31-36 | Risks |
 | 37-41 | Intent |
 | 42-52 | Options Considered |
-| 53-70 | Decision |
-| 71-84 | CCCL Mapping |
-| 85-98 | Degeneracy Semantics |
-| 99-103 | Consequences |
+| 53-74 | Decision |
+| 75-95 | CCCL Mapping |
+| 96-109 | Degeneracy Semantics |
+| 110-114 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.1` establishes the first constructive-kernel primitive layer: direct
@@ -78,33 +78,44 @@ staying compatible with later CCCL-backed GPU execution.
 
 Use option 3.
 
-The landed primitive now does the following:
+The landed primitive is a fully GPU-native 3-kernel pipeline:
 
-- extracts segments directly from owned coordinate buffers
-- generates candidate segment pairs from segment MBR overlap
-- classifies clear non-degenerate pairs in vectorized fp64 arithmetic
-- compacts ambiguous rows and reclassifies them with exact-style rational math
+- extracts segments from owned coordinate buffers via GPU count-scatter kernels
+- generates candidate pairs via O(n log n) sort-sweep with P95 OOM protection
+- classifies pairs on GPU with fast orientation filter and Shewchuk adaptive refinement
+- no host round-trip for ambiguous rows -- all refinement stays on device
 
-The implementation now has an explicit GPU classifier path for candidate pairs:
+The kernel registers as `KernelClass.PREDICATE` (not CONSTRUCTIVE) because
+on-GPU Shewchuk adaptive refinement handles precision internally, removing the
+need for forced fp64 compute on consumer GPUs.
 
-- fast orientation and proper-cross detection run in a CUDA kernel
-- ambiguous rows are compacted on device
-- the exact-style lane still handles only the compacted minority rows
-- result buffers can stay mirrored on device for later reconstruction work
+The implementation has three GPU kernel stages:
+
+- segment extraction via NVRTC count-scatter kernels (per-family dispatch)
+- candidate generation via CCCL radix sort + binary search sweep
+- classification with warp-cooperative MBR skip and on-GPU Shewchuk refinement
+- result buffers stay on device for later reconstruction work
 
 ## CCCL Mapping
 
-The intended GPU path should remain primitive-oriented:
+The GPU path uses a three-tier primitive strategy (ADR-0033):
 
-- direct segment extraction: gather/scatter from owned coordinate buffers
-- candidate generation: tiled MBR overlap plus CCCL `DeviceSelect`
-- fast classification: transform-style orientation/sign evaluation
-- ambiguity isolation: CCCL `DeviceSelect`
-- exact fallback: compacted minority pass only
-- output restoration: scatter back to original candidate order
-
-This does not land raw CUDA kernels. It lands the robust primitive contract
-that a future CCCL-backed implementation should preserve.
+- **Segment extraction** (Tier 1 NVRTC): two-pass count-scatter kernel with
+  per-family dispatch extracts segments directly from owned coordinate buffers.
+- **Candidate generation** (CCCL Tier 3a + CuPy Tier 2): O(n log n)
+  sort-sweep using CCCL `radix_sort` on right-segment x-midpoints, then
+  CCCL `lower_bound`/`upper_bound` binary search per left segment.
+  A **P95 half-width strategy** prevents OOM from outlier segments:
+  the binary-search window uses the 95th-percentile right half-width
+  (tight windows for 95% of segments), with a separate brute-force MBR
+  pass for the <=5% outlier right segments whose half-width exceeds P95.
+  Main and outlier candidates merge via `cp.concatenate` on device.
+  When right.count < 20 or P95 == max, the outlier pass is skipped.
+- **Fast classification** (Tier 1 NVRTC): warp-cooperative MBR skip,
+  fast orientation filter, Shewchuk adaptive refinement on GPU.
+  No ambiguous rows are sent to the host; all refinement stays on device.
+- **Compaction** (CuPy Tier 2): `compact_indices` via CuPy `flatnonzero`
+  for MBR overlap filtering and ambiguous-row isolation.
 
 ## Degeneracy Semantics
 

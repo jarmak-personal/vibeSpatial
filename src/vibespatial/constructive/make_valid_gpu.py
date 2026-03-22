@@ -733,7 +733,8 @@ def _detect_intra_ring_intersections(
     """Detect self-intersections within each ring using segment pair classification.
 
     Phase 8 GPU-resident: pair generation via NVRTC kernel (or CuPy fallback).
-    The classify_segment_pairs kernel call (already GPU) is unchanged.
+    Uses classify_segment_pairs_v2 with on-GPU Shewchuk adaptive refinement
+    (no ambiguous output — all classification is handled on-device).
 
     Returns (seg_a_ids, seg_b_ids, kinds, point_x, point_y) as device
     (CuPy) arrays.  Only returns pairs with kind != 0 (actual intersections).
@@ -818,12 +819,12 @@ def _detect_intra_ring_intersections(
 
     pair_count = total_pairs
 
-    # Use the existing classify_segment_pairs kernel from segment_primitives
-    from vibespatial.spatial.segment_primitives import _segment_intersection_kernels
+    # Use the v2 classify kernel with on-GPU Shewchuk adaptive refinement
+    # (no ambiguous output -- all refinement is handled on-device)
+    from vibespatial.spatial.segment_primitives import _classify_kernels
 
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    block = (256, 1, 1)
 
     # d_left_lookup and d_right_lookup are already on device from pair generation above
     d_out_kind = cp.zeros(pair_count, dtype=cp.int8)
@@ -833,12 +834,12 @@ def _detect_intra_ring_intersections(
     d_out_oy0 = cp.zeros(pair_count, dtype=cp.float64)
     d_out_ox1 = cp.zeros(pair_count, dtype=cp.float64)
     d_out_oy1 = cp.zeros(pair_count, dtype=cp.float64)
-    d_out_ambiguous = cp.zeros(pair_count, dtype=cp.uint8)
 
-    seg_kernels = _segment_intersection_kernels()
-    grid = (max(1, (pair_count + 255) // 256), 1, 1)
+    seg_kernels = _classify_kernels("double")
+    classify_kernel = seg_kernels["classify_segment_pairs_v2"]
+    grid, block = runtime.launch_config(classify_kernel, pair_count)
     runtime.launch(
-        seg_kernels["classify_segment_pairs"],
+        classify_kernel,
         grid=grid, block=block,
         params=(
             (ptr(d_left_lookup), ptr(d_right_lookup),
@@ -846,13 +847,13 @@ def _detect_intra_ring_intersections(
              ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
              ptr(d_out_kind), ptr(d_out_px), ptr(d_out_py),
              ptr(d_out_ox0), ptr(d_out_oy0), ptr(d_out_ox1), ptr(d_out_oy1),
-             ptr(d_out_ambiguous), pair_count),
+             pair_count),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+             KERNEL_PARAM_I32),
         ),
     )
     runtime.synchronize()
