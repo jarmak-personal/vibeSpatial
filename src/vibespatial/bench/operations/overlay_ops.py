@@ -56,16 +56,41 @@ def bench_gpu_overlay(
 
     fmt = InputFormat(input_format)
     left_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
-    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.3, yoff=0.3, fmt=fmt)
+    # Shift by a fraction of the cell size to guarantee overlap between
+    # the left and right polygon grids.  A fixed 0.3 offset may not
+    # overlap at every scale, so we derive the shift from the grid
+    # cell dimensions.
+    import math
+
+    side = max(1, math.ceil(math.sqrt(scale)))
+    xmin, ymin, xmax, ymax = left_spec.bounds
+    cell_w = (xmax - xmin) / side
+    cell_h = (ymax - ymin) / side
+    shift_x = cell_w * 0.3
+    shift_y = cell_h * 0.3
+    right_spec, _ = ensure_shifted_fixture(left_spec, xoff=shift_x, yoff=shift_y, fmt=fmt)
 
     left_owned, read_s1 = load_owned(left_spec, fmt)
     right_owned, read_s2 = load_owned(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
+    # Warmup with error guard: overlay on non-overlapping inputs can
+    # crash deep in the kernel with opaque IndexError / reshape errors.
     try:
         overlay_intersection_owned(left_owned, right_owned)
-    except Exception:
-        pass
+    except Exception as exc:
+        return BenchmarkResult(
+            operation="gpu-overlay",
+            tier=1,
+            scale=scale,
+            geometry_type="polygon",
+            precision=precision,
+            status="error",
+            status_reason=f"overlay warmup failed: {exc}",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
 
     times: list[float] = []
     for _ in range(max(1, repeat)):

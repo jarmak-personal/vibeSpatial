@@ -10539,6 +10539,23 @@
     },
     {
       "kind": "repo",
+      "path": "reports/dispatch-wiring-compliance-audit-2026-03-22.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "22",
+        "audit",
+        "compliance",
+        "dispatch",
+        "md",
+        "reports",
+        "wiring"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "reports/zero-copy-gap-analysis-2026-03-20.md",
       "referenced_by": [],
       "symbols": [],
@@ -13434,6 +13451,7 @@
       "path": "src/vibespatial/bench/operations/constructive_ops.py",
       "referenced_by": [],
       "symbols": [
+        "_clip_rect_from_owned",
         "bench_clip_rect",
         "bench_gpu_constructive",
         "bench_make_valid",
@@ -13450,6 +13468,7 @@
         "make",
         "operations",
         "ops",
+        "owned",
         "py",
         "rect",
         "src",

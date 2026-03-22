@@ -96,8 +96,8 @@ SUITES: dict[str, SuiteDefinition] = {
         ),
         scales=(100_000, 1_000_000),
         kernels=(
-            "bounds-compute",
-            "point-in-polygon",
+            "bounds",
+            "pip",
             "segment-intersection",
             "clip-rect",
             "morton-sort",

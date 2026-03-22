@@ -339,13 +339,14 @@ class TestMaterializationWithDiagnostics:
         ]
         assert len(mat_events) >= 1
 
-    def test_centroid_emits_diagnostic(self, dga_points):
+    def test_centroid_no_materialization(self, dga_points):
+        """Centroid is GPU-accelerated from owned buffers — no Shapely materialization."""
         _ = dga_points.centroid
         mat_events = [
             e for e in dga_points.diagnostics
             if e.kind == DiagnosticKind.MATERIALIZATION
         ]
-        assert len(mat_events) >= 1
+        assert len(mat_events) == 0
 
     def test_buffer_emits_diagnostic(self, dga_points):
         _ = dga_points.buffer(1.0)

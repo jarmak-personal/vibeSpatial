@@ -327,6 +327,33 @@ def bench_point_predicates(
     polys_owned, read_s2 = load_owned(polys_spec, fmt)
     read_seconds = read_s1 + read_s2
 
+    # Guard: ensure both arrays have rows before calling the kernel.
+    if points_owned.row_count == 0 or polys_owned.row_count == 0:
+        return BenchmarkResult(
+            operation="point-predicates",
+            tier=1,
+            scale=scale,
+            geometry_type="point+polygon",
+            precision=precision,
+            status="error",
+            status_reason=f"empty input: {points_owned.row_count} points, {polys_owned.row_count} polygons",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
+
+    # Align row counts: point_within_bounds requires equal-length inputs.
+    # If the fixtures produce different counts (e.g. grid rounding), truncate
+    # to the shorter one.
+    min_rows = min(points_owned.row_count, polys_owned.row_count)
+    if points_owned.row_count != polys_owned.row_count:
+        import numpy as np
+
+        if points_owned.row_count > min_rows:
+            points_owned = points_owned.take(np.arange(min_rows, dtype=np.intp))
+        if polys_owned.row_count > min_rows:
+            polys_owned = polys_owned.take(np.arange(min_rows, dtype=np.intp))
+
     # Warmup — point_within_bounds has known bugs with some OGA layouts
     try:
         point_within_bounds(points_owned, polys_owned, dispatch_mode=ExecutionMode.CPU)

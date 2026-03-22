@@ -1,6 +1,7 @@
 """Constructive operation benchmarks: clip-rect, gpu-constructive, make-valid, gpu-dissolve, stroke-kernels."""
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from vibespatial.bench.catalog import benchmark_operation
@@ -8,6 +9,26 @@ from vibespatial.bench.schema import (
     BenchmarkResult,
     timing_from_samples,
 )
+
+
+def _clip_rect_from_owned(owned: Any, fraction: float = 0.6) -> tuple[float, float, float, float]:
+    """Derive a clip rectangle from the actual geometry bounds of an OwnedGeometryArray.
+
+    Returns the central ``fraction`` of the total bounding box, guaranteeing
+    overlap with the input data.  Falls back to (0, 0, 1000, 1000) inner 60%
+    if bounds cannot be computed.
+    """
+    from vibespatial.kernels.core.geometry_analysis import compute_total_bounds
+
+    xmin, ymin, xmax, ymax = compute_total_bounds(owned)
+    if math.isnan(xmin) or math.isnan(ymin) or math.isnan(xmax) or math.isnan(ymax):
+        # Fallback: use default fixture bounds (0..1000) with the given fraction
+        margin = (1.0 - fraction) / 2.0
+        return (1000.0 * margin, 1000.0 * margin, 1000.0 * (1.0 - margin), 1000.0 * (1.0 - margin))
+    margin = (1.0 - fraction) / 2.0
+    dx = (xmax - xmin) * margin
+    dy = (ymax - ymin) * margin
+    return (xmin + dx, ymin + dy, xmax - dx, ymax - dy)
 
 
 @benchmark_operation(
@@ -37,8 +58,40 @@ def bench_clip_rect(
     spec = resolve_fixture_spec("line", "random-walk", scale)
     owned, read_seconds = load_owned(spec, InputFormat(input_format))
 
-    rect = (100.0, 100.0, 700.0, 700.0)
-    result = benchmark_clip_by_rect(owned, *rect, dataset=f"line-{scale}")
+    # Guard: if fixture produced 0 rows, report as error.
+    if owned.row_count == 0:
+        return BenchmarkResult(
+            operation="clip-rect",
+            tier=1,
+            scale=scale,
+            geometry_type="line",
+            precision=precision,
+            status="error",
+            status_reason="fixture produced 0 rows",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
+
+    # Derive clip rectangle from actual data bounds (central 60%) to
+    # guarantee overlap regardless of scale or fixture distribution.
+    rect = _clip_rect_from_owned(owned, fraction=0.6)
+
+    try:
+        result = benchmark_clip_by_rect(owned, *rect, dataset=f"line-{scale}")
+    except (IndexError, ValueError) as exc:
+        return BenchmarkResult(
+            operation="clip-rect",
+            tier=1,
+            scale=scale,
+            geometry_type="line",
+            precision=precision,
+            status="error",
+            status_reason=f"clip_by_rect crashed: {exc}",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
 
     timing = timing_from_samples([result.owned_elapsed_seconds])
 
@@ -114,9 +167,58 @@ def bench_gpu_constructive(
 
     spec = resolve_fixture_spec("polygon", "regular-grid", scale)
     owned, read_seconds = load_owned(spec, InputFormat(input_format))
-    rect = (100.0, 100.0, 700.0, 700.0)
 
-    clip_by_rect_owned(owned, *rect)
+    # Guard: if fixture produced 0 rows, report as error.
+    if owned.row_count == 0:
+        return BenchmarkResult(
+            operation="gpu-constructive",
+            tier=1,
+            scale=scale,
+            geometry_type="polygon",
+            precision=precision,
+            status="error",
+            status_reason="fixture produced 0 rows",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
+
+    # Derive clip rectangle from actual data bounds (central 60%) to
+    # guarantee overlap regardless of scale or fixture distribution.
+    rect = _clip_rect_from_owned(owned, fraction=0.6)
+
+    # Warmup run with guard for kernel-level crashes.
+    try:
+        warmup_result = clip_by_rect_owned(owned, *rect)
+    except (IndexError, ValueError) as exc:
+        return BenchmarkResult(
+            operation="gpu-constructive",
+            tier=1,
+            scale=scale,
+            geometry_type="polygon",
+            precision=precision,
+            status="error",
+            status_reason=f"clip warmup crashed: {exc}",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
+
+    # Guard: if the clip produces 0 rows even with data-derived rect,
+    # report as error rather than crashing downstream.
+    if warmup_result.owned_result is not None and warmup_result.owned_result.row_count == 0:
+        return BenchmarkResult(
+            operation="gpu-constructive",
+            tier=1,
+            scale=scale,
+            geometry_type="polygon",
+            precision=precision,
+            status="error",
+            status_reason="clip produced 0 rows with data-derived rect",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
 
     times: list[float] = []
     for _ in range(max(1, repeat)):

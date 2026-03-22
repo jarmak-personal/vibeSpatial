@@ -26,24 +26,20 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("cuda-bench not installed. Install with: pip install cuda-bench[cu12]")
 
     from vibespatial import from_shapely_geometries
-    from vibespatial.kernels.core.geometry_analysis import (
-        compute_geometry_bounds,
-        compute_morton_keys,
-    )
+    from vibespatial.kernels.core.geometry_analysis import compute_morton_keys
     from vibespatial.testing.synthetic import SyntheticSpec, generate_points
 
     dataset = generate_points(SyntheticSpec("point", "grid", count=args.scale, seed=0))
     owned = from_shapely_geometries(list(dataset.geometries))
-    bounds = compute_geometry_bounds(owned)
 
     # Warmup
-    compute_morton_keys(bounds)
+    compute_morton_keys(owned)
 
     def morton_bench(state: bench.State) -> None:
         n = state.get_int64("NumElements")
 
         def launcher(launch: bench.Launch) -> None:
-            compute_morton_keys(bounds)
+            compute_morton_keys(owned)
 
         state.add_element_count(n)
         if args.bandwidth:
