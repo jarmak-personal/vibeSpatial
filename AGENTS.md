@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 211/260 lines
+Body Budget: 207/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -20,11 +20,11 @@ Section Map (Body Lines)
 | 39-47 | Mission |
 | 48-57 | Startup |
 | 58-70 | Routing |
-| 71-98 | Project Shape |
-| 99-116 | Execution Model |
-| 117-128 | Test Strategy |
-| 129-138 | Build And Tooling |
-| 139-157 | Verification |
+| 71-96 | Project Shape |
+| 97-114 | Execution Model |
+| 115-126 | Test Strategy |
+| 127-136 | Build And Tooling |
+| 137-154 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -110,7 +110,6 @@ inspect the local area, then expand.
 - `scripts/install_githooks.py`: install `.githooks/pre-commit` for auto-refresh.
 - `scripts/vendor_geopandas_tests.py`: refresh vendored GeoPandas tests.
 - `scripts/extract_vendor_to_api.py`: extract vendored GeoPandas surfaces into the repo-owned API layer.
-- `scripts/upstream_native_coverage.py`: strict-native GeoPandas coverage analysis.
 - `scripts/bench_compact_gather.py`: compact+gather micro-benchmark (CuPy vs CCCL vs NVRTC).
 - `vsbench` (entry point): unified benchmarking CLI for operations, pipelines, kernel microbenchmarks, regression detection, and geopandas-vs-vibespatial shootout comparisons. See `src/vibespatial/bench/cli.py`.
 - `scripts/benchmark_pipelines.py`: end-to-end pipeline benchmarking and GPU sparkline profiling (legacy; prefer `vsbench suite`).
@@ -118,7 +117,6 @@ inspect the local area, then expand.
 - `scripts/check_zero_copy.py`: zero-copy device transfer enforcement (ZCOPY001-003).
 - `scripts/check_perf_patterns.py`: performance anti-pattern detection (VPAT001-004).
 - `scripts/check_maintainability.py`: intake discoverability enforcement (MAINT001-003).
-- `.claude/commands/`: Claude Code commands for AI-powered enforcement analysis.
 - `src/geopandas/`: local GeoPandas-compatible package surface owned by this repo.
 - `src/vibespatial/api/`: public API dispatch boundary for GeoPandas-facing methods.
 - `src/vibespatial/kernels/`: scaffolded owned kernel modules and variant manifest.
@@ -170,14 +168,13 @@ Do not borrow cuSpatial architecture by default. Re-justify every design.
 - Intake/doc changes (local only, enforced by pre-commit hook, not CI): `uv run python scripts/check_docs.py --check && uv run python scripts/intake.py "<request>"`
 - Runtime/package changes: `uv run pytest`
 - Pipeline benchmark / profiler changes: `uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q && uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2`
-- Strict-native GeoPandas coverage: `uv run python scripts/upstream_native_coverage.py --json`
 - Vendored test refresh: `uv run python scripts/vendor_geopandas_tests.py`
 - Architecture lint: `uv run python scripts/check_architecture_lints.py`
 - Zero-copy lint: `uv run python scripts/check_zero_copy.py --all`
 - Performance lint: `uv run python scripts/check_perf_patterns.py --all`
 - Maintainability lint: `uv run python scripts/check_maintainability.py --all`
 - Ruff lint: `uv run ruff check`
-- AI pre-land review: `/pre-land-review` (Claude Code command, opt-in)
+- AI pre-land review: `/commit` (runs /pre-land-review automatically)
 - Upstream smoke: `uv run pytest tests/upstream/geopandas/tests/test_config.py`
 
 If verification cannot run because dependencies, drivers, or local services are
@@ -233,7 +230,6 @@ automatically when you attempt to commit.
 1. Refresh vendored tests if upstream copy logic changed.
 2. Run the narrow verification gate for the edited surface.
 3. Run the end-to-end profile gate if runtime/kernel/pipeline code changed.
-4. **Run `/pre-land-review`** (or the individual enforcer commands) and resolve all findings.
+4. **Run `/commit`** which orchestrates pre-land review, staging, and commit.
 5. Update docs that define the changed workflow or invariant.
-6. Commit with a clear message and include current strict-native GeoPandas coverage in the commit message from `uv run python scripts/upstream_native_coverage.py --json`.
 7. Report any blockers, especially GPU availability.
