@@ -3980,6 +3980,34 @@
     },
     {
       "kind": "repo",
+      "path": ".claude/skills/dispatch-wiring/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "dispatch",
+        "md",
+        "skill",
+        "skills",
+        "wiring"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/skills/gis-domain/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "domain",
+        "gis",
+        "md",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/skills/gpu-code-review/SKILL.md",
       "referenced_by": [],
       "symbols": [],

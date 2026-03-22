@@ -25,9 +25,6 @@ from vibespatial.constructive.point import (
 from vibespatial.constructive.point import (
     point_owned_from_xy as _point_owned_from_xy,
 )
-from vibespatial.constructive.point import (
-    point_owned_from_xy_device as _point_owned_from_xy_device,
-)
 from vibespatial.constructive.polygon import polygon_centroids_owned
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
@@ -1635,13 +1632,15 @@ def _profile_vegetation_corridor_pipeline(
         ) as stage:
             if clipped_veg.row_count > 0:
                 # Compute centroids via GPU kernel (388x faster than Python loop)
-                cx, cy = polygon_centroids_owned(clipped_veg, dispatch_mode=_nearby_runtime)
-                # Build device-resident point array when GPU is available to
-                # avoid D->H->H->D round-trip: centroids stay on device through
-                # buffer and spatial index query (ADR-0005 zero-copy).
                 if _nearby_runtime is ExecutionMode.GPU:
-                    centroid_owned = _point_owned_from_xy_device(cx, cy)
+                    # return_owned=True: centroid kernel builds a device-resident
+                    # point OwnedGeometryArray directly from GPU buffers -- zero
+                    # D->H transfer (eliminates the old D->H->D ping-pong).
+                    centroid_owned = polygon_centroids_owned(
+                        clipped_veg, dispatch_mode=_nearby_runtime, return_owned=True,
+                    )
                 else:
+                    cx, cy = polygon_centroids_owned(clipped_veg, dispatch_mode=_nearby_runtime)
                     centroid_owned = _point_owned_from_xy(cx, cy)
                 # Buffer centroids by 1m using the owned buffer path
                 buffered_owned = point_buffer_owned_array(centroid_owned, 1.0, quad_segs=2)

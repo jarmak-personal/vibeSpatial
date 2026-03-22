@@ -511,15 +511,26 @@ def _polygon_centroid_kernels(compute_type: str = "double"):
 def _polygon_centroids_gpu(
     owned: OwnedGeometryArray,
     precision_plan: PrecisionPlan | None = None,
-) -> tuple[np.ndarray, np.ndarray] | None:
+    return_owned: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | OwnedGeometryArray | None:
     """GPU-accelerated polygon centroid computation via NVRTC shoelace kernel.
 
-    Returns (cx, cy) arrays of shape (row_count,) or None if GPU is
-    unavailable or no polygon families are present.  Respects ADR-0002
-    precision dispatch: fp32 with Kahan summation + coordinate centering
-    on consumer GPUs, native fp64 on datacenter GPUs.
+    When *return_owned* is False (default), returns (cx, cy) numpy arrays of
+    shape (row_count,) or None if GPU is unavailable or no polygon families
+    are present.
+
+    When *return_owned* is True, builds and returns a device-resident point
+    ``OwnedGeometryArray`` directly from the GPU centroid buffers -- no D->H
+    transfer.  The centroid device arrays become owned by the returned object.
+
+    Respects ADR-0002 precision dispatch: fp32 with Kahan summation +
+    coordinate centering on consumer GPUs, native fp64 on datacenter GPUs.
     """
+    import cupy as cp
+
+    from vibespatial.constructive.point import _build_device_backed_point_output
     from vibespatial.runtime.precision import PrecisionMode
+
     compute_type = "double"
     center_x, center_y = 0.0, 0.0
     if precision_plan is not None and precision_plan.compute_precision is PrecisionMode.FP32:
@@ -537,13 +548,20 @@ def _polygon_centroids_gpu(
     kernel = kernels["polygon_centroid"]
 
     row_count = owned.row_count
-    cx = np.full(row_count, np.nan, dtype=np.float64)
-    cy = np.full(row_count, np.nan, dtype=np.float64)
 
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
+
+    # Collect per-family kernel results for the return_owned path.  When
+    # return_owned is False we scatter into host numpy arrays as before.
+    if not return_owned:
+        cx = np.full(row_count, np.nan, dtype=np.float64)
+        cy = np.full(row_count, np.nan, dtype=np.float64)
+
+    # Track family results for return_owned device-side scatter.
+    family_results: list[tuple[np.ndarray, np.ndarray, object, object]] = []
 
     for tag, family_key in ((poly_tag, GeometryFamily.POLYGON), (mpoly_tag, GeometryFamily.MULTIPOLYGON)):
         row_mask = tags == tag
@@ -568,6 +586,7 @@ def _polygon_centroids_gpu(
         d_cx = runtime.allocate((family_rows_count,), np.float64)
         d_cy = runtime.allocate((family_rows_count,), np.float64)
 
+        cx_cy_owned = False  # tracks whether d_cx/d_cy ownership transferred
         try:
             ptr = runtime.pointer
             params = (
@@ -580,21 +599,77 @@ def _polygon_centroids_gpu(
             grid, block = runtime.launch_config(kernel, family_rows_count)
             runtime.launch(kernel, grid=grid, block=block, params=params)
 
-            family_cx = runtime.copy_device_to_host(d_cx)
-            family_cy = runtime.copy_device_to_host(d_cy)
+            if return_owned:
+                # Keep d_cx/d_cy on device; record for scatter below.
+                family_results.append((global_rows, family_rows, d_cx, d_cy))
+                cx_cy_owned = True
+            else:
+                family_cx = runtime.copy_device_to_host(d_cx)
+                family_cy = runtime.copy_device_to_host(d_cy)
 
-            # Scatter family results back to global row positions
-            cx[global_rows] = family_cx[family_rows]
-            cy[global_rows] = family_cy[family_rows]
+                # Scatter family results back to global row positions
+                cx[global_rows] = family_cx[family_rows]
+                cy[global_rows] = family_cy[family_rows]
         finally:
             runtime.free(d_x)
             runtime.free(d_y)
             runtime.free(d_ring_offsets)
             runtime.free(d_geom_offsets)
-            runtime.free(d_cx)
-            runtime.free(d_cy)
+            if not cx_cy_owned:
+                runtime.free(d_cx)
+                runtime.free(d_cy)
 
-    return cx, cy
+    if not return_owned:
+        return cx, cy
+
+    # ------------------------------------------------------------------
+    # return_owned path: build a device-resident point OwnedGeometryArray
+    # directly from device centroid buffers (zero D->H transfer).
+    # ------------------------------------------------------------------
+    if not family_results:
+        from vibespatial.constructive.point import _empty_point_output
+        return _empty_point_output()
+
+    if len(family_results) == 1:
+        # Single-family fast path: only one of polygon / multipolygon is
+        # present.  Scatter family-indexed results to global positions on
+        # device via CuPy fancy indexing.
+        global_rows, family_rows, d_cx_family, d_cy_family = family_results[0]
+        if global_rows.shape[0] == row_count:
+            # All rows belong to this family -- the family d_cx/d_cy arrays
+            # are already correctly sized (family_rows_count == row_count)
+            # but indexed by family row.  Gather into global order.
+            d_family_rows = cp.asarray(family_rows, dtype=np.int32)
+            d_cx_global = d_cx_family[d_family_rows]
+            d_cy_global = d_cy_family[d_family_rows]
+            runtime.free(d_cx_family)
+            runtime.free(d_cy_family)
+        else:
+            # Partial family: allocate global arrays, scatter.
+            d_cx_global = cp.full(row_count, np.nan, dtype=np.float64)
+            d_cy_global = cp.full(row_count, np.nan, dtype=np.float64)
+            d_global_rows = cp.asarray(global_rows, dtype=np.int32)
+            d_family_rows = cp.asarray(family_rows, dtype=np.int32)
+            d_cx_global[d_global_rows] = d_cx_family[d_family_rows]
+            d_cy_global[d_global_rows] = d_cy_family[d_family_rows]
+            runtime.free(d_cx_family)
+            runtime.free(d_cy_family)
+    else:
+        # Multi-family path: both polygon AND multipolygon families present.
+        # Allocate global device arrays and scatter each family's results.
+        d_cx_global = cp.full(row_count, np.nan, dtype=np.float64)
+        d_cy_global = cp.full(row_count, np.nan, dtype=np.float64)
+        for global_rows, family_rows, d_cx_family, d_cy_family in family_results:
+            d_global_rows = cp.asarray(global_rows, dtype=np.int32)
+            d_family_rows = cp.asarray(family_rows, dtype=np.int32)
+            d_cx_global[d_global_rows] = d_cx_family[d_family_rows]
+            d_cy_global[d_global_rows] = d_cy_family[d_family_rows]
+            runtime.free(d_cx_family)
+            runtime.free(d_cy_family)
+
+    return _build_device_backed_point_output(
+        d_cx_global, d_cy_global, row_count=row_count,
+    )
 
 
 def _polygon_buffer_kernels():
@@ -948,7 +1023,8 @@ def polygon_centroids_owned(
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = "auto",
-) -> tuple[np.ndarray, np.ndarray]:
+    return_owned: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | OwnedGeometryArray:
     """Compute polygon centroids directly from OwnedGeometryArray coordinate buffers.
 
     Uses the shoelace formula on ring coordinates (exterior ring only):
@@ -956,15 +1032,25 @@ def polygon_centroids_owned(
       cy = sum((y_i + y_{i+1}) * cross_i) / (6 * area)
       where cross_i = x_i * y_{i+1} - x_{i+1} * y_i
 
-    Returns (cx, cy) arrays of shape (row_count,).  GPU path uses
-    ADR-0002 precision dispatch: fp32 with Kahan summation + coordinate
-    centering on consumer GPUs, native fp64 on datacenter GPUs.
+    When *return_owned* is False (default), returns (cx, cy) numpy arrays of
+    shape (row_count,).
+
+    When *return_owned* is True, returns a device-resident point
+    ``OwnedGeometryArray`` built directly from GPU centroid buffers (zero
+    D->H transfer on the GPU path).  On CPU fallback the centroids are
+    computed on host and then uploaded via ``point_owned_from_xy_device``.
+
+    GPU path uses ADR-0002 precision dispatch: fp32 with Kahan summation +
+    coordinate centering on consumer GPUs, native fp64 on datacenter GPUs.
     """
     from vibespatial.runtime import RuntimeSelection
     from vibespatial.runtime.precision import select_precision_plan
 
     row_count = owned.row_count
     if row_count == 0:
+        if return_owned:
+            from vibespatial.constructive.point import _empty_point_output
+            return _empty_point_output()
         return np.empty(0, dtype=np.float64), np.empty(0, dtype=np.float64)
 
     # Dispatch decision
@@ -997,13 +1083,20 @@ def polygon_centroids_owned(
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
         )
         try:
-            result = _polygon_centroids_gpu(owned, precision_plan=precision_plan)
+            result = _polygon_centroids_gpu(
+                owned, precision_plan=precision_plan, return_owned=return_owned,
+            )
             if result is not None:
                 return result
         except Exception:
             pass  # fall through to CPU
 
-    return _polygon_centroids_cpu(owned)
+    # CPU fallback
+    cx_cpu, cy_cpu = _polygon_centroids_cpu(owned)
+    if return_owned:
+        from vibespatial.constructive.point import point_owned_from_xy_device
+        return point_owned_from_xy_device(cx_cpu, cy_cpu)
+    return cx_cpu, cy_cpu
 
 
 @register_kernel_variant(
