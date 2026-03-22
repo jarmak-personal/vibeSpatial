@@ -49,6 +49,7 @@ class MakeValidResult:
     null_rows: np.ndarray
     method: str
     keep_collapsed: bool
+    owned: object | None = None
 
 
 @dataclass(frozen=True)
@@ -502,6 +503,8 @@ def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: b
             if gpu_invalid_rows.size == 0:
                 # All rows passed GPU checks — skip shapely entirely.
                 # This is the zero-transfer fast path (ADR-0005).
+                # Carry the original owned so callers can stay
+                # device-resident without re-uploading via from_shapely.
                 _ensure_geometries()
                 result = geometries.copy()
                 return MakeValidResult(
@@ -512,6 +515,7 @@ def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: b
                     null_rows=np.flatnonzero(null_mask).astype(np.int32),
                     method=method,
                     keep_collapsed=keep_collapsed,
+                    owned=owned,
                 )
             valid_mask = gpu_mask
         else:

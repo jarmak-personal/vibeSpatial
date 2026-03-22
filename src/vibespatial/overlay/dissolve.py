@@ -605,16 +605,21 @@ def union_all_gpu(
     *,
     grid_size: float | None = None,
     dispatch_mode: ExecutionMode | str = "auto",
+    return_owned: bool = False,
 ) -> object:
-    """Union all geometries in *owned* into a single Shapely geometry.
+    """Union all geometries in *owned* into a single result.
+
+    When *return_owned* is False (default), returns a Shapely geometry
+    (per GeoPandas union_all API contract).  When True, returns a
+    single-row ``OwnedGeometryArray`` keeping the result device-resident
+    (ADR-0005 zero-copy).
 
     Uses GPU tree-reduce via overlay_union_owned when beneficial:
     - Keeps all intermediate results as OwnedGeometryArray (no D->H->D per round)
     - O(log N) pairwise overlay rounds, O(1) JIT cost (precompiled)
     - Falls back to Shapely for small N or non-polygon families
-
-    Returns a single Shapely geometry (per GeoPandas union_all API contract).
     """
+    from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime import ExecutionMode
     from vibespatial.runtime.adaptive import plan_dispatch_selection
     from vibespatial.runtime.dispatch import record_dispatch_event
@@ -625,9 +630,13 @@ def union_all_gpu(
 
     row_count = owned.row_count
     if row_count == 0:
+        if return_owned:
+            return from_shapely_geometries([GeometryCollection()])
         return GeometryCollection()
 
     if row_count == 1:
+        if return_owned:
+            return owned if owned.validity[0] else from_shapely_geometries([GeometryCollection()])
         geoms = owned.to_shapely()
         return geoms[0] if geoms[0] is not None else GeometryCollection()
 
@@ -653,12 +662,13 @@ def union_all_gpu(
         valid_tags = np.isin(owned.tags[owned.validity], list(polygon_tags))
         if np.all(valid_tags):
             try:
-                result = _union_all_tree_reduce_gpu(owned)
+                result = _union_all_tree_reduce_gpu(owned, return_owned=return_owned)
                 if result is not None:
+                    impl = "gpu_tree_reduce_overlay_owned" if return_owned else "gpu_tree_reduce_overlay"
                     record_dispatch_event(
                         surface="union_all",
                         operation="union_all",
-                        implementation="gpu_tree_reduce_overlay",
+                        implementation=impl,
                         reason=f"tree-reduce via overlay_union_owned, {int(np.ceil(np.log2(row_count)))} rounds",
                         detail=f"rows={row_count}",
                         selected=ExecutionMode.GPU,
@@ -679,44 +689,55 @@ def union_all_gpu(
     geoms = owned.to_shapely()
     valid = [g for g in geoms if g is not None and not shapely.is_empty(g)]
     if not valid:
+        if return_owned:
+            return from_shapely_geometries([GeometryCollection()])
         return GeometryCollection()
-    return shapely.make_valid(
+    merged = shapely.make_valid(
         shapely.union_all(np.asarray(valid, dtype=object), grid_size=grid_size)
     )
+    if return_owned:
+        return from_shapely_geometries([merged])
+    return merged
 
 
-def _union_all_tree_reduce_gpu(owned: OwnedGeometryArray) -> object | None:
+def _union_all_tree_reduce_gpu(
+    owned: OwnedGeometryArray,
+    *,
+    return_owned: bool = False,
+) -> object | None:
     """GPU tree-reduce: union N geometries in log₂(N) rounds.
 
-    Key optimization vs _gpu_union_group: keeps all intermediate results
-    as OwnedGeometryArray — no Shapely materialization between rounds.
-    Only materializes to Shapely for the final single-row result.
+    When *return_owned* is False (default), materializes the final result to
+    a Shapely geometry (single D→H).  When True, returns the single-row
+    ``OwnedGeometryArray`` directly — no final D→H.
 
     ADR-0002: CONSTRUCTIVE class, fp64 (segment intersection precision).
-    ADR-0005: Device-resident intermediates, single D→H at the end.
+    ADR-0005: Device-resident intermediates; single D→H only when needed.
     ADR-0033: Inherits overlay pipeline tiers (NVRTC + CCCL + CuPy).
     """
+    from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime import ExecutionMode
 
     from .gpu import overlay_union_owned
 
-    # Build initial list of single-row owned arrays
-    current: list[OwnedGeometryArray] = []
-    for i in range(owned.row_count):
-        row_owned = owned.take(np.array([i], dtype=np.intp))
-        # Skip null/empty rows
-        if not row_owned.validity[0]:
-            continue
-        geoms = row_owned.to_shapely()
-        if geoms[0] is None or shapely.is_empty(geoms[0]):
-            continue
-        current.append(row_owned)
+    # Single bulk D→H to identify non-empty rows (1 transfer, not N).
+    geoms = owned.to_shapely()
+    keep = np.array([
+        i for i in range(owned.row_count)
+        if owned.validity[i] and geoms[i] is not None and not shapely.is_empty(geoms[i])
+    ], dtype=np.intp)
 
-    if len(current) == 0:
+    if keep.size == 0:
+        if return_owned:
+            return from_shapely_geometries([GeometryCollection()])
         return GeometryCollection()
-    if len(current) == 1:
-        geoms = current[0].to_shapely()
-        return geoms[0]
+    if keep.size == 1:
+        if return_owned:
+            return owned.take(keep)
+        g = geoms[keep[0]]
+        return g
+
+    current = [owned.take(np.array([idx], dtype=np.intp)) for idx in keep]
 
     # Tree-reduce: each round halves the geometry count
     while len(current) > 1:
@@ -730,20 +751,28 @@ def _union_all_tree_reduce_gpu(owned: OwnedGeometryArray) -> object | None:
                     )
                     next_round.append(result)
                 except Exception:
-                    # Fallback: materialize pair to Shapely and union
                     left_g = current[i].to_shapely()[0]
                     right_g = current[i + 1].to_shapely()[0]
-                    from vibespatial.geometry.owned import from_shapely_geometries
                     merged = shapely.union(left_g, right_g)
                     next_round.append(from_shapely_geometries([merged]))
             else:
-                # Odd element passes through
                 next_round.append(current[i])
         current = next_round
 
-    # Final result: single-row OwnedGeometryArray → extract Shapely geometry
-    geoms = current[0].to_shapely()
-    result = geoms[0] if geoms else GeometryCollection()
+    if return_owned:
+        return current[0]
+
+    # Materialize final result to Shapely geometry
+    final_geoms = current[0].to_shapely()
+    result = final_geoms[0] if final_geoms else GeometryCollection()
     if result is not None and not shapely.is_valid(result):
         result = shapely.make_valid(result)
     return result
+
+
+def union_all_gpu_owned(owned, *, grid_size=None, dispatch_mode="auto"):
+    """Union all geometries into a single-row OwnedGeometryArray (device-resident).
+
+    Convenience wrapper: calls ``union_all_gpu`` with ``return_owned=True``.
+    """
+    return union_all_gpu(owned, grid_size=grid_size, dispatch_mode=dispatch_mode, return_owned=True)

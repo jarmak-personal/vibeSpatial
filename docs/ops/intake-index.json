@@ -14405,6 +14405,7 @@
         "_point_constructive_kernels",
         "_point_rows_and_xy",
         "point_owned_from_xy",
+        "point_owned_from_xy_device",
         "_empty_point_output",
         "_select_constructive_mode",
         "_build_point_buffers_cpu",
@@ -16415,7 +16416,8 @@
         "benchmark_dissolve_pipeline",
         "union_all_owned",
         "union_all_gpu",
-        "_union_all_tree_reduce_gpu"
+        "_union_all_tree_reduce_gpu",
+        "union_all_gpu_owned"
       ],
       "tokens": [
         "all",

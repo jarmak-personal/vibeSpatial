@@ -215,6 +215,70 @@ def point_owned_from_xy(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArray:
     )
 
 
+def point_owned_from_xy_device(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArray:
+    """Create a device-resident point OwnedGeometryArray from host x/y arrays.
+
+    Uploads coordinate data directly to the GPU and builds a device-resident
+    ``OwnedGeometryArray``.  Host-side x/y arrays are kept in the family
+    buffer for backward compatibility with code that reads ``buffer.x``
+    directly (e.g. ``predicates/support.py:extract_point_coordinates``).
+
+    Both arrays must be 1-D float64 of equal length.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    row_count = x.size
+    if y.size != row_count:
+        raise ValueError("x and y must have the same length")
+    if row_count == 0:
+        return _empty_point_output()
+
+    geom_offsets = np.arange(row_count + 1, dtype=np.int32)
+    validity = np.ones(row_count, dtype=bool)
+    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
+    family_row_offsets = np.arange(row_count, dtype=np.int32)
+    empty_mask = np.zeros(row_count, dtype=bool)
+    bounds = np.column_stack((x, y, x, y))
+
+    runtime = get_cuda_runtime()
+    device_x = runtime.from_host(x)
+    device_y = runtime.from_host(y)
+
+    point_buffer = FamilyGeometryBuffer(
+        family=GeometryFamily.POINT,
+        schema=get_geometry_buffer_schema(GeometryFamily.POINT),
+        row_count=row_count,
+        x=x,
+        y=y,
+        geometry_offsets=geom_offsets,
+        empty_mask=empty_mask,
+        bounds=bounds,
+    )
+
+    return OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families={GeometryFamily.POINT: point_buffer},
+        residency=Residency.DEVICE,
+        device_state=OwnedGeometryDeviceState(
+            validity=runtime.from_host(validity),
+            tags=runtime.from_host(tags),
+            family_row_offsets=runtime.from_host(family_row_offsets),
+            families={
+                GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+                    family=GeometryFamily.POINT,
+                    x=device_x,
+                    y=device_y,
+                    geometry_offsets=runtime.from_host(geom_offsets),
+                    empty_mask=runtime.from_host(empty_mask),
+                    bounds=runtime.from_host(bounds),
+                )
+            },
+        ),
+    )
+
+
 def _empty_point_output() -> OwnedGeometryArray:
     point_buffer = FamilyGeometryBuffer(
         family=GeometryFamily.POINT,

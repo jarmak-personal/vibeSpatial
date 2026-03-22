@@ -25,6 +25,9 @@ from vibespatial.constructive.point import (
 from vibespatial.constructive.point import (
     point_owned_from_xy as _point_owned_from_xy,
 )
+from vibespatial.constructive.point import (
+    point_owned_from_xy_device as _point_owned_from_xy_device,
+)
 from vibespatial.constructive.polygon import polygon_centroids_owned
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
@@ -41,7 +44,7 @@ from vibespatial.kernels.predicates.point_in_polygon import (
     get_last_gpu_substage_timings,
     point_in_polygon,
 )
-from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, union_all_owned
+from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, union_all_gpu_owned
 from vibespatial.overlay.gpu import (
     overlay_difference_owned,
     overlay_intersection_owned,
@@ -1166,16 +1169,59 @@ def _from_shapely_safe(geoms: list) -> OwnedGeometryArray:
     return from_shapely_geometries(filtered)
 
 
+def _batched_clip_many_vs_one(
+    many: OwnedGeometryArray,
+    one: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Batched GPU clip: intersect N polygons against 1 polygon in GPU-sized batches.
+
+    Bypasses spatial_overlay_owned (spatial-join overhead) and the
+    _GPU_OVERLAY_MAX_ROWS=10K limit in _overlay_owned.  Splits the many-side
+    into batches small enough for GPU pairwise overlay, replicates the
+    single-row side per batch, and collects results.
+
+    ADR-0005: keeps intermediate OwnedGeometryArrays device-resident within
+    each batch; materializes to Shapely only for the final merge.
+    """
+    _BATCH_SIZE = 4096
+    result_parts: list[object] = []
+    for start in range(0, many.row_count, _BATCH_SIZE):
+        end = min(start + _BATCH_SIZE, many.row_count)
+        batch_indices = np.arange(start, end, dtype=np.intp)
+        left_batch = many.take(batch_indices)
+        right_batch = one.take(np.zeros(len(batch_indices), dtype=np.intp))
+        try:
+            batch_result = overlay_intersection_owned(left_batch, right_batch)
+            batch_geoms = batch_result.to_shapely()
+            for g in batch_geoms:
+                if g is not None and not shapely.is_empty(g):
+                    result_parts.append(g)
+        except Exception:
+            left_geoms = np.asarray(left_batch.to_shapely(), dtype=object)
+            right_geom = one.to_shapely()[0]
+            if right_geom is not None and not shapely.is_empty(right_geom):
+                clipped = shapely.intersection(
+                    left_geoms,
+                    np.full(len(left_geoms), right_geom, dtype=object),
+                )
+                for g in clipped:
+                    if g is not None and not shapely.is_empty(g):
+                        result_parts.append(g)
+    if not result_parts:
+        empty = from_shapely_geometries([shapely.Point(0, 0)])
+        return empty.take(np.asarray([], dtype=np.int64))
+    return from_shapely_geometries(result_parts)
+
+
 def _overlay_intersection_with_fallback(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
 ) -> tuple[OwnedGeometryArray, bool]:
     """GPU-first overlay intersection with geopandas.overlay fallback.
 
-    Returns (result, fell_back) tuple.  Routes through GPU overlay for
-    polygon-only inputs; uses spatial_overlay_owned for mismatched row
-    counts (spatial join + batched pairwise overlay).  When one side has
-    a single row, replicates it via .take() for the fast pairwise GPU path.
+    Returns (result, fell_back) tuple.  For many-vs-1 patterns (e.g. 100K
+    veg x 1 corridor), uses batched GPU clip to avoid spatial-join overhead
+    and the _GPU_OVERLAY_MAX_ROWS CPU fallback.
     """
     try:
         _polygon_only = (
@@ -1183,19 +1229,20 @@ def _overlay_intersection_with_fallback(
             and set(right.families) <= {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
         )
         if left.row_count != right.row_count:
-            # For small 1-vs-N cases, replicate the single row via .take()
-            # and use fast GPU pairwise overlay.  For large N, use
-            # spatial_overlay_owned which does a spatial join first to
-            # avoid O(N) blind pairwise operations.
-            _REPLICATE_MAX = 100
+            # Many-vs-one fast path: batched GPU clip avoids spatial-join
+            # overhead and the 10K row GPU overlay limit.
             if (_polygon_only
-                    and min(left.row_count, right.row_count) == 1
-                    and max(left.row_count, right.row_count) <= _REPLICATE_MAX):
+                    and min(left.row_count, right.row_count) == 1):
                 if right.row_count == 1 and left.row_count > 1:
-                    right = right.take(np.zeros(left.row_count, dtype=np.intp))
+                    if left.row_count <= 100:
+                        right = right.take(np.zeros(left.row_count, dtype=np.intp))
+                        return overlay_intersection_owned(left, right), False
+                    return _batched_clip_many_vs_one(left, right), False
                 elif left.row_count == 1 and right.row_count > 1:
-                    left = left.take(np.zeros(right.row_count, dtype=np.intp))
-                return overlay_intersection_owned(left, right), False
+                    if right.row_count <= 100:
+                        left = left.take(np.zeros(right.row_count, dtype=np.intp))
+                        return overlay_intersection_owned(left, right), False
+                    return _batched_clip_many_vs_one(right, left), False
             return spatial_overlay_owned(left, right, how="intersection"), False
         if _polygon_only:
             return overlay_intersection_owned(left, right), False
@@ -1517,9 +1564,10 @@ def _profile_vegetation_corridor_pipeline(
             _record_stage_overheads(stage, audit, memory, buffered_lines)
 
         # Stage 5: dissolve corridor
-        # Single-group dissolve: all rows share group=0, so we tree-reduce
-        # directly on the OwnedGeometryArray via union_all_owned to avoid
-        # a D->H->GeoDataFrame->H->D round-trip (ADR-0005).
+        # Single-group dissolve: all rows share group=0.  Device-resident
+        # path (ADR-0005): when make_valid finds no repairs, use the
+        # original owned array directly and tree-reduce on device via
+        # union_all_gpu_owned.
         with profiler.stage(
             "dissolve_corridor",
             category="refine",
@@ -1528,14 +1576,15 @@ def _profile_vegetation_corridor_pipeline(
             detail="dissolve buffered corridor polygons into a single coverage polygon",
         ) as stage:
             try:
-                # Validate buffered geometries before union to avoid
-                # TopologyException from self-intersecting buffer output.
-                # Extract polygon components from any GeometryCollections
-                # that make_valid may produce from invalid inputs.
                 valid_result = make_valid_owned(owned=buffered_lines)
-                valid_geoms = _extract_polygonal_components(valid_result.geometries)
-                valid_owned = from_shapely_geometries(valid_geoms)
-                corridor_owned = union_all_owned(valid_owned)
+                if valid_result.repaired_rows.size == 0 and valid_result.owned is not None:
+                    # Zero-transfer fast path: all valid, stay on device.
+                    corridor_owned = union_all_gpu_owned(valid_result.owned)
+                else:
+                    # Repairs needed: fall through to Shapely path.
+                    valid_geoms = _extract_polygonal_components(valid_result.geometries)
+                    valid_owned = from_shapely_geometries(valid_geoms)
+                    corridor_owned = union_all_gpu_owned(valid_owned)
                 stage.rows_out = corridor_owned.row_count
                 stage.device = _selected_runtime_from_history(corridor_owned) or "gpu"
             except Exception:
@@ -1587,8 +1636,13 @@ def _profile_vegetation_corridor_pipeline(
             if clipped_veg.row_count > 0:
                 # Compute centroids via GPU kernel (388x faster than Python loop)
                 cx, cy = polygon_centroids_owned(clipped_veg, dispatch_mode=_nearby_runtime)
-                # Build owned point array directly from numpy arrays — no Shapely
-                centroid_owned = _point_owned_from_xy(cx, cy)
+                # Build device-resident point array when GPU is available to
+                # avoid D->H->H->D round-trip: centroids stay on device through
+                # buffer and spatial index query (ADR-0005 zero-copy).
+                if _nearby_runtime is ExecutionMode.GPU:
+                    centroid_owned = _point_owned_from_xy_device(cx, cy)
+                else:
+                    centroid_owned = _point_owned_from_xy(cx, cy)
                 # Buffer centroids by 1m using the owned buffer path
                 buffered_owned = point_buffer_owned_array(centroid_owned, 1.0, quad_segs=2)
                 # Build spatial index on buffered centroids and query poles
