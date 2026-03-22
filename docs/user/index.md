@@ -8,4 +8,5 @@ quickstart
 api
 gpu
 io
+benchmarking
 ```

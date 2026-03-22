@@ -1207,6 +1207,34 @@ def read_geoparquet(
     to_pandas_kwargs=None,
     **kwargs,
 ):
+    """Read a GeoParquet file into a GeoDataFrame.
+
+    When PyArrow is available the reader plans row-group selection from
+    spatial metadata, decodes WKB geometry on GPU when possible, and
+    produces device-resident ``OwnedGeometryArray`` without host
+    round-trips.
+
+    Aliased as ``vibespatial.read_parquet()``.
+
+    Parameters
+    ----------
+    path : str or Path
+        Path to the GeoParquet file.
+    columns : list of str, optional
+        Subset of columns to read.
+    storage_options : dict, optional
+        Storage options for fsspec-compatible filesystems.
+    bbox : tuple of (minx, miny, maxx, maxy), optional
+        Spatial filter bounding box for row-group pruning.
+    to_pandas_kwargs : dict, optional
+        Extra keyword arguments passed to ``pyarrow.Table.to_pandas()``.
+    **kwargs
+        Passed through to the underlying Parquet reader.
+
+    Returns
+    -------
+    GeoDataFrame
+    """
     metadata_summary = None
     geo_metadata = None
     filesystem = kwargs.get("filesystem")

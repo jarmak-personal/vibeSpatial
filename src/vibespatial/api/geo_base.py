@@ -143,6 +143,17 @@ def _delegate_geo_method(op, this, **kwargs):
 
 
 class GeoPandasBase:
+    """Mixin providing geometry operations shared by GeoSeries and GeoDataFrame.
+
+    Includes properties and measurements (area, length, bounds), binary
+    predicates (contains, intersects, within, ...), constructive operations
+    (buffer, centroid, simplify, ...), set operations (difference, union, ...),
+    distance metrics, coordinate transformations, and spatial indexing.
+
+    Operations dispatch to GPU kernels automatically when a CUDA device is
+    available and the input size exceeds the crossover threshold.
+    """
+
     @property
     def area(self):
         """Return a ``Series`` containing the area of each geometry in the

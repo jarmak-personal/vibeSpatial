@@ -9,6 +9,34 @@ extensions = [
     "myst_parser",
     "sphinx_copybutton",
     "sphinx.ext.intersphinx",
+    "autodoc2",
+]
+
+# -- autodoc2: static-analysis API reference ---------------------------------
+autodoc2_packages = [
+    {
+        "path": "../src/vibespatial",
+        "module": "vibespatial",
+    },
+]
+autodoc2_render_plugin = "myst"
+autodoc2_hidden_objects = ["dunder", "private", "inherited"]
+# Respect __all__ on the top-level package so the generated index only shows
+# the curated public surface (not every internal submodule).
+autodoc2_module_all_regexes = [
+    r"vibespatial$",
+]
+# Skip submodules that are purely internal, fully re-exported through
+# __init__.py, or would pull in heavy GPU deps during static analysis.
+autodoc2_skip_module_regexes = [
+    r"vibespatial\.cuda\..*",
+    r"vibespatial\.bench\..*",
+    r"vibespatial\.testing$",
+    # These are fully re-exported through __init__.py; documenting both
+    # the submodule and the re-export creates duplicate-object warnings.
+    r"vibespatial\.overlay\.gpu$",
+    r"vibespatial\.overlay\.reconstruction$",
+    r"vibespatial\.overlay\.dissolve$",
 ]
 
 intersphinx_mapping = {
@@ -25,6 +53,16 @@ myst_enable_extensions = [
 
 templates_path = ["_templates"]
 exclude_patterns = ["_build", "ops", "decisions/index.md"]
+
+# Suppress cosmetic warnings:
+# - toc.not_included: autodoc2 subpackage pages reachable via cross-refs
+# - autodoc2.all_resolve: ambiguous re-exports (overlay, sjoin, clip)
+# - duplicate: __init__.py re-exports create duplicate py:function entries
+suppress_warnings = [
+    "toc.not_included",
+    "autodoc2.all_resolve",
+    "duplicate",
+]
 
 # -- Theme: Furo + NEON GRID overlay -----------------------------------------
 html_theme = "furo"

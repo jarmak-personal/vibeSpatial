@@ -341,6 +341,35 @@ def read_vector_file(
     engine=None,
     **kwargs,
 ):
+    """Read a vector file into a GeoDataFrame.
+
+    Supports Shapefile, GeoPackage, GeoJSON, and any format readable by
+    pyogrio/fiona.  For GeoJSON and Shapefile inputs the reader attempts a
+    GPU-accelerated owned path first; other formats fall back to pyogrio.
+
+    Aliased as ``vibespatial.read_file()``.
+
+    Parameters
+    ----------
+    filename : str or Path
+        Path to the vector file.
+    bbox : tuple of (minx, miny, maxx, maxy), optional
+        Spatial filter bounding box.
+    mask : Geometry or GeoDataFrame, optional
+        Spatial filter mask geometry.
+    columns : list of str, optional
+        Subset of columns to read.
+    rows : int or slice, optional
+        Subset of rows to read.
+    engine : str, optional
+        Force a specific I/O engine (``"pyogrio"`` or ``"fiona"``).
+    **kwargs
+        Passed through to the underlying engine.
+
+    Returns
+    -------
+    GeoDataFrame
+    """
     plan = plan_vector_file_io(filename, operation=IOOperation.READ)
 
     # Try GPU-dominant owned path for GeoJSON and Shapefile.

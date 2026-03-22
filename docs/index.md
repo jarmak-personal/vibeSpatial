@@ -80,4 +80,5 @@ dev/index
 architecture/index
 decisions/adr-index
 testing/index
+apidocs/index
 ```
