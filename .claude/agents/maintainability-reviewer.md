@@ -26,6 +26,12 @@ routing system. You have NOT seen this code before — review with fresh eyes.
 ### Documentation Coherence
 - Do changed behaviors have matching doc updates?
 - Are new invariants documented in the right architecture doc?
+- Do new public functions/operations have doc entries in the relevant
+  architecture doc (e.g., `docs/dev/kernels.md`, `docs/architecture/`)?
+- Is the kernel inventory (`docs/testing/kernel-inventory.md`) updated
+  if a new kernel was added?
+- Is the variant manifest (`src/vibespatial/kernels/variant_manifest.json`)
+  updated if new kernel variants were registered?
 
 ### Cross-Reference Integrity
 - Are there dangling references to moved/deleted code?
