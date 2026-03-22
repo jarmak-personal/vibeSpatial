@@ -79,3 +79,55 @@ Tell the user the commit was created. Show the commit hash and summary.
 - The review marker is single-use: the commit-msg hook deletes it after a
   successful commit.
 - If the commit fails for any reason, re-run `/commit` from the top.
+
+## Review Enforcement — Zero Tolerance
+
+These rules govern how you handle findings from the pre-land review. They
+are NON-NEGOTIABLE.
+
+### NEVER reclassify BLOCKING as NIT
+
+If a sub-agent flags something as BLOCKING, it stays BLOCKING. You do not
+have authority to downgrade it. The only valid NIT is a known codebase-wide
+gap that requires a coordinated migration — not "it works fine" or "it's
+minor". When in doubt, it is BLOCKING.
+
+### NEVER excuse new debt with existing debt
+
+"Other functions don't do this either" is not a justification. Every new
+line of code must meet the standard. If existing code has a shortcoming
+(e.g., a function returns host arrays when it should return device arrays),
+your new code must not compound that problem by building on it. Instead:
+
+- If the fix is small (< 5 minutes): fix the upstream function too.
+- If the fix is structural: spawn a `cuda-engineer` agent with the context
+  needed to fix the upstream API, then build your code against the fixed
+  version.
+
+The goal is to shrink the cleanup backlog, not grow it.
+
+### NEVER accept CPU work in GPU code paths
+
+If a review finds host round-trips (D->H->D), CPU fallbacks, or Shapely
+calls inside a GPU-dispatched function, this is ALWAYS BLOCKING. Common
+excuses that are NOT valid:
+
+- "The upstream API returns host arrays" — Fix the upstream API or spawn
+  a cuda-engineer agent to do so. Do not build new GPU code on top of a
+  host-returning function.
+- "It's just one small transfer" — Small transfers have large latency.
+  Every D->H->D is a pipeline stall. Fix it.
+- "We'll clean it up later" — No. Later never comes. The cleanup sweep
+  gets harder with every new caller that depends on the broken path.
+
+### What to do when a finding requires upstream fixes
+
+Do NOT mark the review as LAND and leave a TODO. Instead:
+
+1. Spawn a `cuda-engineer` agent (background, worktree) with:
+   - The specific function/API that needs fixing
+   - What it currently returns (e.g., host array)
+   - What it should return (e.g., device array)
+   - The downstream code that needs it
+2. Wait for or incorporate the fix.
+3. Re-run `/commit` against the complete change.
