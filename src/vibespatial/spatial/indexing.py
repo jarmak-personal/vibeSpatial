@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from time import perf_counter
 
@@ -24,17 +25,20 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
-from vibespatial.geometry.owned import OwnedGeometryArray  # noqa: E402
+from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
     compute_geometry_bounds,
     compute_morton_keys,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
 _GPU_BOUNDS_PAIRS_THRESHOLD = 2_048
+
+logger = logging.getLogger(__name__)
 
 
 def _default_index_runtime_selection() -> RuntimeSelection:
@@ -647,15 +651,252 @@ class RegularGridRectIndex:
 
 _INDEXING_KERNEL_NAMES = ("morton_keys_from_bounds", "sweep_sorted_mbr_overlap")
 
+# ---------------------------------------------------------------------------
+# Segment MBR extraction kernels (Tier 1: geometry-specific inner loops)
+# ---------------------------------------------------------------------------
+# One kernel per geometry family.  Two-pass count/scatter:
+#   Pass 0 (pass_number==0): each thread counts segments for one geometry row.
+#   Pass 1 (pass_number==1): each thread scatters (row, seg_idx, minx,miny,maxx,maxy).
+#
+# The kernels receive coordinate buffers in SoA layout (separate x[], y[])
+# plus the offset hierarchy for the family.
+# ---------------------------------------------------------------------------
+
+_SEGMENT_MBR_KERNEL_SOURCE = """
+/* ---- LineString segment MBR ---- */
+extern "C" __global__ void segment_mbr_linestring(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int*    __restrict__ geom_offsets,
+    const int*    __restrict__ global_row_indices,
+    int           geom_count,
+    int*          counts,
+    int*          row_out,
+    int*          seg_out,
+    double*       bounds_out,
+    int           pass_number
+) {
+  for (int g = blockIdx.x * blockDim.x + threadIdx.x;
+       g < geom_count;
+       g += blockDim.x * gridDim.x) {
+    const int c0 = geom_offsets[g];
+    const int c1 = geom_offsets[g + 1];
+    const int n_seg = c1 - c0 - 1;
+    if (n_seg <= 0) {
+      if (pass_number == 0) counts[g] = 0;
+      continue;
+    }
+    if (pass_number == 0) {
+      counts[g] = n_seg;
+    } else {
+      const int base = counts[g];
+      const int grow = global_row_indices[g];
+      for (int s = 0; s < n_seg; s++) {
+        const int ci = c0 + s;
+        const double x0 = x[ci], y0 = y[ci];
+        const double x1 = x[ci + 1], y1 = y[ci + 1];
+        const int idx = base + s;
+        row_out[idx] = grow;
+        seg_out[idx] = s;
+        bounds_out[idx * 4 + 0] = fmin(x0, x1);
+        bounds_out[idx * 4 + 1] = fmin(y0, y1);
+        bounds_out[idx * 4 + 2] = fmax(x0, x1);
+        bounds_out[idx * 4 + 3] = fmax(y0, y1);
+      }
+    }
+  }
+}
+
+/* ---- Polygon segment MBR ---- */
+extern "C" __global__ void segment_mbr_polygon(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int*    __restrict__ geom_offsets,
+    const int*    __restrict__ ring_offsets,
+    const int*    __restrict__ global_row_indices,
+    int           geom_count,
+    int*          counts,
+    int*          row_out,
+    int*          seg_out,
+    double*       bounds_out,
+    int           pass_number
+) {
+  for (int g = blockIdx.x * blockDim.x + threadIdx.x;
+       g < geom_count;
+       g += blockDim.x * gridDim.x) {
+    const int r0 = geom_offsets[g];
+    const int r1 = geom_offsets[g + 1];
+    int total = 0;
+    for (int r = r0; r < r1; r++) {
+      const int rc0 = ring_offsets[r];
+      const int rc1 = ring_offsets[r + 1];
+      total += rc1 - rc0 - 1;
+    }
+    if (pass_number == 0) {
+      counts[g] = total;
+    } else {
+      const int base = counts[g];
+      const int grow = global_row_indices[g];
+      int seg = 0;
+      for (int r = r0; r < r1; r++) {
+        const int rc0 = ring_offsets[r];
+        const int rc1 = ring_offsets[r + 1];
+        const int n_seg = rc1 - rc0 - 1;
+        for (int s = 0; s < n_seg; s++) {
+          const int ci = rc0 + s;
+          const double x0 = x[ci], y0 = y[ci];
+          const double x1 = x[ci + 1], y1 = y[ci + 1];
+          const int idx = base + seg;
+          row_out[idx] = grow;
+          seg_out[idx] = seg;
+          bounds_out[idx * 4 + 0] = fmin(x0, x1);
+          bounds_out[idx * 4 + 1] = fmin(y0, y1);
+          bounds_out[idx * 4 + 2] = fmax(x0, x1);
+          bounds_out[idx * 4 + 3] = fmax(y0, y1);
+          seg++;
+        }
+      }
+    }
+  }
+}
+
+/* ---- MultiLineString segment MBR ---- */
+extern "C" __global__ void segment_mbr_multilinestring(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int*    __restrict__ geom_offsets,
+    const int*    __restrict__ part_offsets,
+    const int*    __restrict__ global_row_indices,
+    int           geom_count,
+    int*          counts,
+    int*          row_out,
+    int*          seg_out,
+    double*       bounds_out,
+    int           pass_number
+) {
+  for (int g = blockIdx.x * blockDim.x + threadIdx.x;
+       g < geom_count;
+       g += blockDim.x * gridDim.x) {
+    const int p0 = geom_offsets[g];
+    const int p1 = geom_offsets[g + 1];
+    int total = 0;
+    for (int p = p0; p < p1; p++) {
+      const int pc0 = part_offsets[p];
+      const int pc1 = part_offsets[p + 1];
+      total += pc1 - pc0 - 1;
+    }
+    if (pass_number == 0) {
+      counts[g] = total;
+    } else {
+      const int base = counts[g];
+      const int grow = global_row_indices[g];
+      int seg = 0;
+      for (int p = p0; p < p1; p++) {
+        const int pc0 = part_offsets[p];
+        const int pc1 = part_offsets[p + 1];
+        const int n_seg = pc1 - pc0 - 1;
+        for (int s = 0; s < n_seg; s++) {
+          const int ci = pc0 + s;
+          const double x0 = x[ci], y0 = y[ci];
+          const double x1 = x[ci + 1], y1 = y[ci + 1];
+          const int idx = base + seg;
+          row_out[idx] = grow;
+          seg_out[idx] = seg;
+          bounds_out[idx * 4 + 0] = fmin(x0, x1);
+          bounds_out[idx * 4 + 1] = fmin(y0, y1);
+          bounds_out[idx * 4 + 2] = fmax(x0, x1);
+          bounds_out[idx * 4 + 3] = fmax(y0, y1);
+          seg++;
+        }
+      }
+    }
+  }
+}
+
+/* ---- MultiPolygon segment MBR ---- */
+extern "C" __global__ void segment_mbr_multipolygon(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int*    __restrict__ geom_offsets,
+    const int*    __restrict__ part_offsets,
+    const int*    __restrict__ ring_offsets,
+    const int*    __restrict__ global_row_indices,
+    int           geom_count,
+    int*          counts,
+    int*          row_out,
+    int*          seg_out,
+    double*       bounds_out,
+    int           pass_number
+) {
+  for (int g = blockIdx.x * blockDim.x + threadIdx.x;
+       g < geom_count;
+       g += blockDim.x * gridDim.x) {
+    const int p0 = geom_offsets[g];
+    const int p1 = geom_offsets[g + 1];
+    int total = 0;
+    for (int p = p0; p < p1; p++) {
+      const int r0 = part_offsets[p];
+      const int r1 = part_offsets[p + 1];
+      for (int r = r0; r < r1; r++) {
+        const int rc0 = ring_offsets[r];
+        const int rc1 = ring_offsets[r + 1];
+        total += rc1 - rc0 - 1;
+      }
+    }
+    if (pass_number == 0) {
+      counts[g] = total;
+    } else {
+      const int base = counts[g];
+      const int grow = global_row_indices[g];
+      int seg = 0;
+      for (int p = p0; p < p1; p++) {
+        const int r0 = part_offsets[p];
+        const int r1 = part_offsets[p + 1];
+        for (int r = r0; r < r1; r++) {
+          const int rc0 = ring_offsets[r];
+          const int rc1 = ring_offsets[r + 1];
+          const int n_seg = rc1 - rc0 - 1;
+          for (int s = 0; s < n_seg; s++) {
+            const int ci = rc0 + s;
+            const double x0 = x[ci], y0 = y[ci];
+            const double x1 = x[ci + 1], y1 = y[ci + 1];
+            const int idx = base + seg;
+            row_out[idx] = grow;
+            seg_out[idx] = seg;
+            bounds_out[idx * 4 + 0] = fmin(x0, x1);
+            bounds_out[idx * 4 + 1] = fmin(y0, y1);
+            bounds_out[idx * 4 + 2] = fmax(x0, x1);
+            bounds_out[idx * 4 + 3] = fmax(y0, y1);
+            seg++;
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+_SEGMENT_MBR_KERNEL_NAMES = (
+    "segment_mbr_linestring",
+    "segment_mbr_polygon",
+    "segment_mbr_multilinestring",
+    "segment_mbr_multipolygon",
+)
+
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("indexing", _INDEXING_KERNEL_SOURCE, _INDEXING_KERNEL_NAMES),
+    ("segment-mbr", _SEGMENT_MBR_KERNEL_SOURCE, _SEGMENT_MBR_KERNEL_NAMES),
 ])
 
 
 def _indexing_kernels():
     return compile_kernel_group("indexing", _INDEXING_KERNEL_SOURCE, _INDEXING_KERNEL_NAMES)
+
+
+def _segment_mbr_kernels():
+    return compile_kernel_group("segment-mbr", _SEGMENT_MBR_KERNEL_SOURCE, _SEGMENT_MBR_KERNEL_NAMES)
 
 
 def _detect_regular_grid_rect_index(
@@ -912,16 +1153,58 @@ def build_flat_spatial_index(
 
 @dataclass(frozen=True)
 class SegmentMBRTable:
-    row_indices: np.ndarray
-    segment_indices: np.ndarray
-    bounds: np.ndarray
+    """Segment MBR table with optional device-resident arrays.
+
+    When produced by the GPU path, arrays are CuPy device arrays and
+    ``residency`` is ``Residency.DEVICE``.  The public properties
+    ``row_indices``, ``segment_indices``, and ``bounds`` return the
+    underlying arrays as-is (device or host).  Use ``to_host()`` to get
+    a copy with NumPy arrays on the host side.
+    """
+
+    row_indices: object  # np.ndarray or CuPy device array
+    segment_indices: object  # np.ndarray or CuPy device array
+    bounds: object  # np.ndarray (N,4) or CuPy device array (N,4)
+    residency: Residency = Residency.HOST
 
     @property
     def count(self) -> int:
-        return int(self.row_indices.size)
+        if self.row_indices is None:
+            return 0
+        return int(self.row_indices.shape[0]) if hasattr(self.row_indices, "shape") else int(self.row_indices.size)
+
+    def to_host(self) -> SegmentMBRTable:
+        """Return a host-resident copy (NumPy arrays).
+
+        If already host-resident, returns self.
+        """
+        if self.residency is Residency.HOST:
+            return self
+        return SegmentMBRTable(
+            row_indices=cp.asnumpy(self.row_indices),
+            segment_indices=cp.asnumpy(self.segment_indices),
+            bounds=cp.asnumpy(self.bounds),
+            residency=Residency.HOST,
+        )
 
 
-def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
+# ---------------------------------------------------------------------------
+# Kernel-family dispatch table for segment MBR extraction
+# ---------------------------------------------------------------------------
+
+_SEGMENT_FAMILY_KERNEL_MAP = {
+    GeometryFamily.LINESTRING: "segment_mbr_linestring",
+    GeometryFamily.POLYGON: "segment_mbr_polygon",
+    GeometryFamily.MULTILINESTRING: "segment_mbr_multilinestring",
+    GeometryFamily.MULTIPOLYGON: "segment_mbr_multipolygon",
+}
+
+# Families that produce segments (Points/MultiPoints do not have segments)
+_SEGMENT_FAMILIES = frozenset(_SEGMENT_FAMILY_KERNEL_MAP.keys())
+
+
+def _extract_segment_mbrs_cpu(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
+    """CPU fallback: extract segment MBRs via Shapely (triple-nested loop)."""
     row_indices: list[int] = []
     segment_indices: list[int] = []
     boxes: list[tuple[float, float, float, float]] = []
@@ -962,35 +1245,473 @@ def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
             row_indices=np.asarray([], dtype=np.int32),
             segment_indices=np.asarray([], dtype=np.int32),
             bounds=np.empty((0, 4), dtype=np.float64),
+            residency=Residency.HOST,
         )
     return SegmentMBRTable(
         row_indices=np.asarray(row_indices, dtype=np.int32),
         segment_indices=np.asarray(segment_indices, dtype=np.int32),
         bounds=np.asarray(boxes, dtype=np.float64),
+        residency=Residency.HOST,
     )
+
+
+def _launch_segment_mbr_family(
+    runtime,
+    kernels: dict,
+    family: GeometryFamily,
+    d_buf,
+    d_global_rows,
+    geom_count: int,
+) -> tuple[object, object, object] | None:
+    """Run the two-pass count/scatter for one geometry family on GPU.
+
+    Returns ``(d_row_out, d_seg_out, d_bounds_out)`` as CuPy arrays, or
+    ``None`` if no segments were produced.
+    """
+    kernel_name = _SEGMENT_FAMILY_KERNEL_MAP[family]
+    kernel = kernels[kernel_name]
+    ptr = runtime.pointer
+
+    # --- Build parameter list based on family ---
+    # All families share: x, y, geom_offsets, global_row_indices, geom_count,
+    #                      counts, row_out, seg_out, bounds_out, pass_number
+    # Polygon adds: ring_offsets
+    # MultiLineString adds: part_offsets
+    # MultiPolygon adds: part_offsets, ring_offsets
+
+    d_x = cp.asarray(d_buf.x)
+    d_y = cp.asarray(d_buf.y)
+    d_geom_offsets = cp.asarray(d_buf.geometry_offsets)
+
+    # Pass 0: count segments per geometry
+    d_counts = cp.zeros(geom_count, dtype=cp.int32)
+
+    if family == GeometryFamily.LINESTRING:
+        param_values_base = (
+            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
+            ptr(d_global_rows), geom_count,
+            ptr(d_counts),
+        )
+        param_types_base = (
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        )
+    elif family == GeometryFamily.POLYGON:
+        d_ring_offsets = cp.asarray(d_buf.ring_offsets)
+        param_values_base = (
+            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
+            ptr(d_ring_offsets), ptr(d_global_rows), geom_count,
+            ptr(d_counts),
+        )
+        param_types_base = (
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        )
+    elif family == GeometryFamily.MULTILINESTRING:
+        d_part_offsets = cp.asarray(d_buf.part_offsets)
+        param_values_base = (
+            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
+            ptr(d_part_offsets), ptr(d_global_rows), geom_count,
+            ptr(d_counts),
+        )
+        param_types_base = (
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        )
+    elif family == GeometryFamily.MULTIPOLYGON:
+        d_part_offsets = cp.asarray(d_buf.part_offsets)
+        d_ring_offsets = cp.asarray(d_buf.ring_offsets)
+        param_values_base = (
+            ptr(d_x), ptr(d_y), ptr(d_geom_offsets),
+            ptr(d_part_offsets), ptr(d_ring_offsets),
+            ptr(d_global_rows), geom_count,
+            ptr(d_counts),
+        )
+        param_types_base = (
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        )
+    else:
+        return None
+
+    # Count pass: row_out, seg_out, bounds_out are unused (null pointers)
+    count_params = (
+        (*param_values_base, 0, 0, 0, 0),  # row_out, seg_out, bounds_out, pass=0
+        (*param_types_base, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+    )
+    grid, block = runtime.launch_config(kernel, geom_count)
+    runtime.launch(kernel, grid=grid, block=block, params=count_params)
+
+    # Prefix sum for scatter offsets (CCCL, ADR-0033 Tier 3a)
+    d_offsets = exclusive_sum(d_counts, synchronize=False)
+    total = count_scatter_total(runtime, d_counts, d_offsets)
+
+    if total == 0:
+        return None
+
+    # Allocate output arrays on device
+    d_row_out = cp.empty(total, dtype=cp.int32)
+    d_seg_out = cp.empty(total, dtype=cp.int32)
+    d_bounds_out = cp.empty(total * 4, dtype=cp.float64)
+
+    # Copy offsets into counts buffer for scatter pass to read
+    cp.copyto(d_counts, d_offsets)
+
+    # Scatter pass
+    scatter_params = (
+        (*param_values_base, ptr(d_row_out), ptr(d_seg_out), ptr(d_bounds_out), 1),
+        (*param_types_base, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+    )
+    grid, block = runtime.launch_config(kernel, geom_count)
+    runtime.launch(kernel, grid=grid, block=block, params=scatter_params)
+
+    # Reshape bounds to (N, 4) -- no sync needed, stays on device
+    d_bounds_out = d_bounds_out.reshape(total, 4)
+    return d_row_out, d_seg_out, d_bounds_out
+
+
+def _extract_segment_mbrs_gpu(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
+    """GPU path: extract segment MBRs via NVRTC kernels.
+
+    Returns device-resident SegmentMBRTable with CuPy arrays.
+    No D->H transfer -- zero-copy end-to-end.
+    """
+    runtime = get_cuda_runtime()
+    kernels = _segment_mbr_kernels()
+    d_state = geometry_array._ensure_device_state()
+
+    # Hoist tag array to device once -- used for all family lookups
+    d_tags = cp.asarray(d_state.tags)
+
+    all_rows = []
+    all_segs = []
+    all_bounds = []
+
+    for family in _SEGMENT_FAMILIES:
+        if family not in d_state.families:
+            continue
+        d_buf = d_state.families[family]
+        geom_count = int(d_buf.geometry_offsets.shape[0]) - 1
+        if geom_count == 0:
+            continue
+
+        # Global row indices for this family
+        family_tag = FAMILY_TAGS[family]
+        d_global_rows = cp.flatnonzero(d_tags == family_tag).astype(cp.int32, copy=False)
+
+        result = _launch_segment_mbr_family(
+            runtime, kernels, family, d_buf, d_global_rows, geom_count,
+        )
+        if result is not None:
+            d_row_out, d_seg_out, d_bounds_out = result
+            all_rows.append(d_row_out)
+            all_segs.append(d_seg_out)
+            all_bounds.append(d_bounds_out)
+
+    if not all_rows:
+        return SegmentMBRTable(
+            row_indices=cp.empty(0, dtype=cp.int32),
+            segment_indices=cp.empty(0, dtype=cp.int32),
+            bounds=cp.empty((0, 4), dtype=cp.float64),
+            residency=Residency.DEVICE,
+        )
+
+    # Concatenate results from all families (Tier 2: CuPy)
+    d_all_rows = cp.concatenate(all_rows) if len(all_rows) > 1 else all_rows[0]
+    d_all_segs = cp.concatenate(all_segs) if len(all_segs) > 1 else all_segs[0]
+    d_all_bounds = cp.concatenate(all_bounds) if len(all_bounds) > 1 else all_bounds[0]
+
+    return SegmentMBRTable(
+        row_indices=d_all_rows,
+        segment_indices=d_all_segs,
+        bounds=d_all_bounds,
+        residency=Residency.DEVICE,
+    )
+
+
+def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
+    """Extract per-segment MBRs from all line/polygon geometries.
+
+    Dispatches to GPU when available, falling back to CPU otherwise.
+    The GPU path returns device-resident CuPy arrays (no D->H transfer).
+    """
+    use_gpu = has_gpu_runtime() and cp is not None
+    if use_gpu:
+        try:
+            return _extract_segment_mbrs_gpu(geometry_array)
+        except Exception:
+            logger.debug("GPU segment MBR extraction failed, falling back to CPU", exc_info=True)
+            record_fallback_event(
+                surface="extract_segment_mbrs",
+                reason="GPU kernel failed, falling back to CPU",
+            )
+    return _extract_segment_mbrs_cpu(geometry_array)
 
 
 @dataclass(frozen=True)
 class SegmentCandidatePairs:
-    left_rows: np.ndarray
-    left_segments: np.ndarray
-    right_rows: np.ndarray
-    right_segments: np.ndarray
+    """Segment candidate pairs with lazy device-to-host materialization.
+
+    When produced by the GPU path, ``_device_*`` fields hold CuPy device
+    arrays and ``_host_*`` fields are ``None``.  The public properties
+    lazily call ``cp.asnumpy()`` on first host access, following the
+    ``CandidatePairs`` pattern (ADR-0005).
+    """
+
+    _host_left_rows: object  # np.ndarray or None (lazy from device)
+    _host_left_segments: object  # np.ndarray or None (lazy from device)
+    _host_right_rows: object  # np.ndarray or None (lazy from device)
+    _host_right_segments: object  # np.ndarray or None (lazy from device)
     pairs_examined: int
+    _device_left_rows: object = None  # CuPy device array or None
+    _device_left_segments: object = None  # CuPy device array or None
+    _device_right_rows: object = None  # CuPy device array or None
+    _device_right_segments: object = None  # CuPy device array or None
+
+    @property
+    def left_rows(self) -> np.ndarray:
+        """Lazily materialise host left_rows from device (ADR-0005)."""
+        if self._host_left_rows is not None:
+            return self._host_left_rows
+        host = cp.asnumpy(self._device_left_rows).astype(np.int32, copy=False)
+        object.__setattr__(self, "_host_left_rows", host)
+        return host
+
+    @property
+    def left_segments(self) -> np.ndarray:
+        """Lazily materialise host left_segments from device (ADR-0005)."""
+        if self._host_left_segments is not None:
+            return self._host_left_segments
+        host = cp.asnumpy(self._device_left_segments).astype(np.int32, copy=False)
+        object.__setattr__(self, "_host_left_segments", host)
+        return host
+
+    @property
+    def right_rows(self) -> np.ndarray:
+        """Lazily materialise host right_rows from device (ADR-0005)."""
+        if self._host_right_rows is not None:
+            return self._host_right_rows
+        host = cp.asnumpy(self._device_right_rows).astype(np.int32, copy=False)
+        object.__setattr__(self, "_host_right_rows", host)
+        return host
+
+    @property
+    def right_segments(self) -> np.ndarray:
+        """Lazily materialise host right_segments from device (ADR-0005)."""
+        if self._host_right_segments is not None:
+            return self._host_right_segments
+        host = cp.asnumpy(self._device_right_segments).astype(np.int32, copy=False)
+        object.__setattr__(self, "_host_right_segments", host)
+        return host
+
+    @property
+    def device_left_rows(self):
+        """CuPy device array of left row indices, or None if CPU-produced."""
+        return self._device_left_rows
+
+    @property
+    def device_left_segments(self):
+        """CuPy device array of left segment indices, or None if CPU-produced."""
+        return self._device_left_segments
+
+    @property
+    def device_right_rows(self):
+        """CuPy device array of right row indices, or None if CPU-produced."""
+        return self._device_right_rows
+
+    @property
+    def device_right_segments(self):
+        """CuPy device array of right segment indices, or None if CPU-produced."""
+        return self._device_right_segments
 
     @property
     def count(self) -> int:
-        return int(self.left_rows.size)
+        if self._host_left_rows is not None:
+            return int(self._host_left_rows.size)
+        if self._device_left_rows is not None:
+            return int(self._device_left_rows.size)
+        return 0
 
 
-def generate_segment_mbr_pairs(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
+def _generate_segment_mbr_pairs_gpu(
+    left_segments: SegmentMBRTable,
+    right_segments: SegmentMBRTable,
+) -> SegmentCandidatePairs:
+    """GPU segment pair generation using sweep-sort overlap kernel.
+
+    Operates directly on device-resident segment bounds -- no D->H->D
+    ping-pong.  Uses the same ``sweep_sorted_mbr_overlap`` kernel as
+    geometry-level pair generation, but on segment-level MBRs.
+
+    The sweep kernel emits index pairs into the concatenated segment
+    array.  Device-side gather then maps these back to (row, segment).
+    """
+    runtime = get_cuda_runtime()
+    kernels = _indexing_kernels()
+    sweep_kernel = kernels["sweep_sorted_mbr_overlap"]
+    ptr = runtime.pointer
+
+    d_left_bounds_full = cp.asarray(left_segments.bounds)    # (N, 4) device
+    d_right_bounds_full = cp.asarray(right_segments.bounds)  # (M, 4) device
+    d_left_rows_full = cp.asarray(left_segments.row_indices)
+    d_left_segs_full = cp.asarray(left_segments.segment_indices)
+    d_right_rows_full = cp.asarray(right_segments.row_indices)
+    d_right_segs_full = cp.asarray(right_segments.segment_indices)
+
+    # --- Filter NaN bounds on device (Tier 2: CuPy element-wise) ---
+    d_left_valid = cp.flatnonzero(~cp.isnan(d_left_bounds_full).any(axis=1))
+    d_right_valid = cp.flatnonzero(~cp.isnan(d_right_bounds_full).any(axis=1))
+    left_count = int(d_left_valid.size)
+    right_count = int(d_right_valid.size)
+    pairs_examined = left_count * right_count
+
+    if left_count == 0 or right_count == 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return SegmentCandidatePairs(
+            _host_left_rows=None,
+            _host_left_segments=None,
+            _host_right_rows=None,
+            _host_right_segments=None,
+            pairs_examined=pairs_examined,
+            _device_left_rows=empty,
+            _device_left_segments=empty,
+            _device_right_rows=empty,
+            _device_right_segments=empty,
+        )
+
+    # --- Extract valid subsets on device ---
+    d_left_bounds = d_left_bounds_full[d_left_valid]
+    d_right_bounds = d_right_bounds_full[d_right_valid]
+    d_left_rows = d_left_rows_full[d_left_valid]
+    d_left_segs = d_left_segs_full[d_left_valid]
+    d_right_rows = d_right_rows_full[d_right_valid]
+    d_right_segs = d_right_segs_full[d_right_valid]
+
+    # --- Build concatenated sorted array on device (no host round-trip) ---
+    total_count = left_count + right_count
+    d_all_bounds = cp.concatenate([d_left_bounds, d_right_bounds], axis=0)
+    d_all_orig = cp.concatenate([
+        cp.arange(left_count, dtype=cp.int32),
+        cp.arange(right_count, dtype=cp.int32),
+    ])
+    d_all_side = cp.concatenate([
+        cp.zeros(left_count, dtype=cp.int32),
+        cp.ones(right_count, dtype=cp.int32),
+    ])
+
+    # Sort by minx (column 0) on device
+    sort_order = cp.argsort(d_all_bounds[:, 0]).astype(cp.int32, copy=False)
+    d_sorted_bounds = d_all_bounds[sort_order]
+    d_sorted_bounds_flat = d_sorted_bounds.ravel().astype(cp.float64, copy=False)
+    d_sorted_orig = d_all_orig[sort_order]
+    d_sorted_side = d_all_side[sort_order]
+
+    # --- Pass 0: count pairs per sorted element ---
+    d_counts = runtime.allocate((total_count,), np.int32, zero=True)
+    _param_types = (
+        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+        KERNEL_PARAM_PTR,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+        KERNEL_PARAM_I32,
+    )
+    count_params = (
+        (
+            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            total_count,
+            0, 0,  # out_left, out_right (unused in pass 0)
+            ptr(d_counts),
+            0,  # pass_number = 0
+            0,  # same_input = False
+            0,  # include_self = False
+        ),
+        _param_types,
+    )
+    grid, block = runtime.launch_config(sweep_kernel, total_count)
+    runtime.launch(sweep_kernel, grid=grid, block=block, params=count_params)
+
+    # Prefix sum for scatter offsets (CCCL, ADR-0033 Tier 3a)
+    cp_counts = cp.asarray(d_counts)
+    d_offsets = exclusive_sum(cp_counts, synchronize=False)
+    total_pairs = count_scatter_total(runtime, cp_counts, d_offsets)
+
+    if total_pairs > 2_147_483_647:
+        raise OverflowError(
+            f"sweep_segment_mbr_overlap: {total_pairs} segment pairs exceed "
+            f"int32 offset capacity (2^31-1). Consider spatial partitioning."
+        )
+
+    if total_pairs == 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return SegmentCandidatePairs(
+            _host_left_rows=None,
+            _host_left_segments=None,
+            _host_right_rows=None,
+            _host_right_segments=None,
+            pairs_examined=pairs_examined,
+            _device_left_rows=empty,
+            _device_left_segments=empty,
+            _device_right_rows=empty,
+            _device_right_segments=empty,
+        )
+
+    # Copy offsets into counts buffer for scatter pass
+    cp.copyto(cp_counts, d_offsets)
+
+    # Allocate output index arrays
+    d_out_left = runtime.allocate((total_pairs,), np.int32)
+    d_out_right = runtime.allocate((total_pairs,), np.int32)
+
+    # --- Pass 1: scatter pairs ---
+    scatter_params = (
+        (
+            ptr(d_sorted_bounds_flat), ptr(d_sorted_orig), ptr(d_sorted_side),
+            total_count,
+            ptr(d_out_left), ptr(d_out_right),
+            ptr(d_counts),
+            1,  # pass_number = 1
+            0,  # same_input = False
+            0,  # include_self = False
+        ),
+        _param_types,
+    )
+    grid, block = runtime.launch_config(sweep_kernel, total_count)
+    runtime.launch(sweep_kernel, grid=grid, block=block, params=scatter_params)
+
+    # Map index pairs back to (row, segment) via device-side gather
+    d_left_pair_idx = cp.asarray(d_out_left)
+    d_right_pair_idx = cp.asarray(d_out_right)
+
+    return SegmentCandidatePairs(
+        _host_left_rows=None,
+        _host_left_segments=None,
+        _host_right_rows=None,
+        _host_right_segments=None,
+        pairs_examined=pairs_examined,
+        _device_left_rows=d_left_rows[d_left_pair_idx],
+        _device_left_segments=d_left_segs[d_left_pair_idx],
+        _device_right_rows=d_right_rows[d_right_pair_idx],
+        _device_right_segments=d_right_segs[d_right_pair_idx],
+    )
+
+
+def _generate_segment_mbr_pairs_cpu(
+    left_segments: SegmentMBRTable,
+    right_segments: SegmentMBRTable,
     *,
     tile_size: int = 512,
 ) -> SegmentCandidatePairs:
-    left_segments = extract_segment_mbrs(left)
-    right_segments = extract_segment_mbrs(right)
+    """CPU fallback: tiled numpy MBR overlap on host."""
+    # Ensure host arrays
+    left_seg = left_segments.to_host() if left_segments.residency is Residency.DEVICE else left_segments
+    right_seg = right_segments.to_host() if right_segments.residency is Residency.DEVICE else right_segments
 
     left_rows_out: list[np.ndarray] = []
     left_segment_out: list[np.ndarray] = []
@@ -998,14 +1719,14 @@ def generate_segment_mbr_pairs(
     right_segment_out: list[np.ndarray] = []
     pairs_examined = 0
 
-    for left_start in range(0, left_segments.count, tile_size):
-        left_bounds = left_segments.bounds[left_start : left_start + tile_size]
-        left_rows = left_segments.row_indices[left_start : left_start + tile_size]
-        left_ids = left_segments.segment_indices[left_start : left_start + tile_size]
-        for right_start in range(0, right_segments.count, tile_size):
-            right_bounds = right_segments.bounds[right_start : right_start + tile_size]
-            right_rows = right_segments.row_indices[right_start : right_start + tile_size]
-            right_ids = right_segments.segment_indices[right_start : right_start + tile_size]
+    for left_start in range(0, left_seg.count, tile_size):
+        left_bounds = left_seg.bounds[left_start : left_start + tile_size]
+        left_rows = left_seg.row_indices[left_start : left_start + tile_size]
+        left_ids = left_seg.segment_indices[left_start : left_start + tile_size]
+        for right_start in range(0, right_seg.count, tile_size):
+            right_bounds = right_seg.bounds[right_start : right_start + tile_size]
+            right_rows = right_seg.row_indices[right_start : right_start + tile_size]
+            right_ids = right_seg.segment_indices[right_start : right_start + tile_size]
             pairs_examined += int(left_bounds.shape[0] * right_bounds.shape[0])
             intersects = (
                 (left_bounds[:, None, 0] <= right_bounds[None, :, 2])
@@ -1023,13 +1744,54 @@ def generate_segment_mbr_pairs(
 
     if not left_rows_out:
         empty = np.asarray([], dtype=np.int32)
-        return SegmentCandidatePairs(empty, empty, empty, empty, pairs_examined)
+        return SegmentCandidatePairs(
+            _host_left_rows=empty,
+            _host_left_segments=empty,
+            _host_right_rows=empty,
+            _host_right_segments=empty,
+            pairs_examined=pairs_examined,
+        )
     return SegmentCandidatePairs(
-        left_rows=np.concatenate(left_rows_out),
-        left_segments=np.concatenate(left_segment_out),
-        right_rows=np.concatenate(right_rows_out),
-        right_segments=np.concatenate(right_segment_out),
+        _host_left_rows=np.concatenate(left_rows_out),
+        _host_left_segments=np.concatenate(left_segment_out),
+        _host_right_rows=np.concatenate(right_rows_out),
+        _host_right_segments=np.concatenate(right_segment_out),
         pairs_examined=pairs_examined,
+    )
+
+
+def generate_segment_mbr_pairs(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    tile_size: int = 512,
+) -> SegmentCandidatePairs:
+    """Generate candidate segment pairs by MBR overlap filtering.
+
+    Dispatches to GPU when available.  The GPU path uses the existing
+    sweep-sort overlap kernel (``_generate_bounds_pairs_gpu``) on segment
+    bounds, returning device-resident CuPy arrays (no eager D->H transfer).
+    """
+    left_segments = extract_segment_mbrs(left)
+    right_segments = extract_segment_mbrs(right)
+
+    use_gpu = (
+        has_gpu_runtime()
+        and cp is not None
+        and left_segments.residency is Residency.DEVICE
+        and right_segments.residency is Residency.DEVICE
+    )
+    if use_gpu:
+        try:
+            return _generate_segment_mbr_pairs_gpu(left_segments, right_segments)
+        except Exception:
+            logger.debug("GPU segment pair generation failed, falling back to CPU", exc_info=True)
+            record_fallback_event(
+                surface="generate_segment_mbr_pairs",
+                reason="GPU kernel failed, falling back to CPU",
+            )
+    return _generate_segment_mbr_pairs_cpu(
+        left_segments, right_segments, tile_size=tile_size,
     )
 
 
