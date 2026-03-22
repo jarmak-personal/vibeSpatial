@@ -33,9 +33,9 @@ vibeSpatial's I/O architecture.
 1. **Geometry on GPU, properties on CPU** — vibeSpatial's GPU memory
    policy reserves device memory for geometry operations.  Property
    data (strings, mixed types) stays on the host.
-2. **Homogeneous Polygon files** — v1 targets single-family polygon
-   datasets (the dominant GIS use case).  Mixed geometry types are
-   deferred to v2.
+2. **Point, LineString, and Polygon** — supports homogeneous and mixed
+   files of these three types.  Multi-geometry types (MultiPoint,
+   MultiLineString, MultiPolygon) are deferred.
 3. **No chunking** — files must fit in GPU memory (~3x file size peak).
    Chunked processing for files exceeding GPU memory is deferred to v2.
 
@@ -43,22 +43,23 @@ vibeSpatial's I/O architecture.
 
 ### Hybrid GPU/CPU pipeline
 
-The parser uses 10 NVRTC kernels (all Tier 1 per ADR-0033) for
+The parser uses 12 NVRTC kernels (all Tier 1 per ADR-0033) for
 geometry extraction, with CPU-side orjson for property extraction:
 
 ```
-GPU pipeline (1.8s for 2.16 GB):
-  S0   np.fromfile → cp.asarray                    [PCIe transfer]
-  S1b  quote_toggle → uint8 cumsum → parity         [string awareness]
-  S2   compute_depth_deltas → int32 cumsum → depth   [structural depth]
-  S3   find_coord_key → flatnonzero → positions      [pattern match]
-  S3b  coord_span_end                                [per-feature depth scan]
-  S3c  count_rings_and_coords + scatter_ring_offsets  [GeoArrow offsets]
-  S4   find_number_boundaries + mark_coord_spans      [coord-only numbers]
-  S5   parse_ascii_floats → d_coords                  [ASCII → fp64]
-  S6   x = d_coords[0::2], y = d_coords[1::2]        [zero-copy views]
-  S7   _build_device_single_family_owned              [OwnedGeometryArray]
-  S8   find_feature_boundaries → D→H copy             [for CPU properties]
+GPU pipeline (1.8s for 2.16 GB polygons):
+  S0   kvikio / cp.asarray                             [file → device]
+  S1b  quote_toggle → uint8 cumsum → parity            [string awareness]
+  S2   compute_depth_deltas → int32 cumsum → depth      [structural depth]
+  S3   find_coord_key → flatnonzero → positions         [pattern match]
+  S3.5 find_type_key + classify_type_value → tags       [geometry type detection]
+  S3b  coord_span_end                                   [per-feature depth scan]
+  S3c  count_rings_and_coords + scatter_ring_offsets    [GeoArrow offsets]
+  S4   find_number_boundaries + mark_coord_spans        [coord-only numbers]
+  S5   parse_ascii_floats → d_coords                    [ASCII → fp64]
+  S6   x = d_coords[0::2], y = d_coords[1::2]          [zero-copy views]
+  S7   family-aware assembly (homogeneous or mixed)     [OwnedGeometryArray]
+  S8   find_feature_boundaries → D→H copy               [for CPU properties]
 
 CPU property extraction (9.2s, lazy):
   For each feature: slice host_bytes → orjson.loads → extract "properties"

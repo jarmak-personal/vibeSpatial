@@ -310,3 +310,301 @@ def test_polygon_with_hole(tmp_path):
     assert ring_off[0] == 0
     assert ring_off[1] == 5
     assert ring_off[2] == 10
+
+
+# ---------------------------------------------------------------------------
+# Point geometry helpers
+# ---------------------------------------------------------------------------
+def _make_point_feature(coords: list[float], properties: dict | None = None) -> dict:
+    return {
+        "type": "Feature",
+        "properties": properties or {},
+        "geometry": {
+            "type": "Point",
+            "coordinates": coords,
+        },
+    }
+
+
+def _make_linestring_feature(coords: list[list[float]], properties: dict | None = None) -> dict:
+    return {
+        "type": "Feature",
+        "properties": properties or {},
+        "geometry": {
+            "type": "LineString",
+            "coordinates": coords,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Test 11: Homogeneous Points
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_homogeneous_points(tmp_path):
+    features = [_make_point_feature([i * 0.1, i * 0.2], {"id": i}) for i in range(100)]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "points.geojson"
+    _write_geojson(path, fc)
+
+    gpu_batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    cpu_batch = read_geojson_owned(path, prefer="fast-json")
+
+    gpu_owned = gpu_batch.geometry
+    cpu_owned = cpu_batch.geometry
+
+    assert GeometryFamily.POINT in gpu_owned.families
+    gpu_buf = gpu_owned.families[GeometryFamily.POINT]
+    cpu_buf = cpu_owned.families[GeometryFamily.POINT]
+    assert gpu_buf.row_count == cpu_buf.row_count == 100
+
+    if gpu_owned.device_state is not None:
+        dev_buf = gpu_owned.device_state.families[GeometryFamily.POINT]
+        gpu_x = cp.asnumpy(dev_buf.x)
+        gpu_y = cp.asnumpy(dev_buf.y)
+    else:
+        gpu_x = gpu_buf.x
+        gpu_y = gpu_buf.y
+
+    np.testing.assert_allclose(gpu_x, cpu_buf.x, atol=1e-10)
+    np.testing.assert_allclose(gpu_y, cpu_buf.y, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Test 12: Homogeneous LineStrings
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_homogeneous_linestrings(tmp_path):
+    features = []
+    for i in range(50):
+        coords = [[j * 0.1 + i, j * 0.2 + i] for j in range(3 + i % 5)]
+        features.append(_make_linestring_feature(coords, {"id": i}))
+    fc = _make_feature_collection(features)
+    path = tmp_path / "lines.geojson"
+    _write_geojson(path, fc)
+
+    gpu_batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    cpu_batch = read_geojson_owned(path, prefer="fast-json")
+
+    gpu_owned = gpu_batch.geometry
+    cpu_owned = cpu_batch.geometry
+
+    assert GeometryFamily.LINESTRING in gpu_owned.families
+    gpu_buf = gpu_owned.families[GeometryFamily.LINESTRING]
+    cpu_buf = cpu_owned.families[GeometryFamily.LINESTRING]
+    assert gpu_buf.row_count == cpu_buf.row_count == 50
+
+    if gpu_owned.device_state is not None:
+        dev_buf = gpu_owned.device_state.families[GeometryFamily.LINESTRING]
+        gpu_x = cp.asnumpy(dev_buf.x)
+        gpu_y = cp.asnumpy(dev_buf.y)
+    else:
+        gpu_x = gpu_buf.x
+        gpu_y = gpu_buf.y
+
+    np.testing.assert_allclose(gpu_x, cpu_buf.x, atol=1e-10)
+    np.testing.assert_allclose(gpu_y, cpu_buf.y, atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Test 13: Mixed Point + LineString
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_mixed_point_linestring(tmp_path):
+    features = [
+        _make_point_feature([1.0, 2.0]),
+        _make_linestring_feature([[3.0, 4.0], [5.0, 6.0]]),
+        _make_point_feature([7.0, 8.0]),
+        _make_linestring_feature([[9.0, 10.0], [11.0, 12.0], [13.0, 14.0]]),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "mixed_pt_ls.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+
+    assert GeometryFamily.POINT in owned.families
+    assert GeometryFamily.LINESTRING in owned.families
+    assert owned.families[GeometryFamily.POINT].row_count == 2
+    assert owned.families[GeometryFamily.LINESTRING].row_count == 2
+
+    # Check Point coordinates
+    dev_pt = owned.device_state.families[GeometryFamily.POINT]
+    pt_x = cp.asnumpy(dev_pt.x)
+    pt_y = cp.asnumpy(dev_pt.y)
+    np.testing.assert_allclose(pt_x, [1.0, 7.0], atol=1e-10)
+    np.testing.assert_allclose(pt_y, [2.0, 8.0], atol=1e-10)
+
+    # Check LineString coordinates
+    dev_ls = owned.device_state.families[GeometryFamily.LINESTRING]
+    ls_x = cp.asnumpy(dev_ls.x)
+    ls_y = cp.asnumpy(dev_ls.y)
+    np.testing.assert_allclose(ls_x, [3.0, 5.0, 9.0, 11.0, 13.0], atol=1e-10)
+    np.testing.assert_allclose(ls_y, [4.0, 6.0, 10.0, 12.0, 14.0], atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Test 14: Mixed Point + Polygon
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_mixed_point_polygon(tmp_path):
+    features = [
+        _make_point_feature([0.0, 0.0]),
+        _make_polygon_feature(_simple_square(1.0, 1.0)),
+        _make_point_feature([2.0, 2.0]),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "mixed_pt_pg.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+
+    assert GeometryFamily.POINT in owned.families
+    assert GeometryFamily.POLYGON in owned.families
+    assert owned.families[GeometryFamily.POINT].row_count == 2
+    assert owned.families[GeometryFamily.POLYGON].row_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 15: Mixed all three types
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_mixed_all_three(tmp_path):
+    features = [
+        _make_point_feature([1.0, 2.0]),
+        _make_linestring_feature([[3.0, 4.0], [5.0, 6.0]]),
+        _make_polygon_feature(_simple_square(0.0, 0.0)),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "mixed_all.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+
+    assert GeometryFamily.POINT in owned.families
+    assert GeometryFamily.LINESTRING in owned.families
+    assert GeometryFamily.POLYGON in owned.families
+    assert owned.families[GeometryFamily.POINT].row_count == 1
+    assert owned.families[GeometryFamily.LINESTRING].row_count == 1
+    assert owned.families[GeometryFamily.POLYGON].row_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 16: Mixed with properties
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_mixed_properties(tmp_path):
+    features = [
+        _make_point_feature([1.0, 2.0], {"name": "pt"}),
+        _make_linestring_feature([[3.0, 4.0], [5.0, 6.0]], {"name": "ls"}),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "mixed_props.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    props = batch.properties
+    assert len(props) == 2
+    assert props[0]["name"] == "pt"
+    assert props[1]["name"] == "ls"
+
+
+# ---------------------------------------------------------------------------
+# Test 17: Single point
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_single_point(tmp_path):
+    fc = _make_feature_collection([_make_point_feature([42.0, -73.5])])
+    path = tmp_path / "single_pt.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.POINT in owned.families
+    assert owned.families[GeometryFamily.POINT].row_count == 1
+
+    dev_buf = owned.device_state.families[GeometryFamily.POINT]
+    np.testing.assert_allclose(cp.asnumpy(dev_buf.x), [42.0], atol=1e-10)
+    np.testing.assert_allclose(cp.asnumpy(dev_buf.y), [-73.5], atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Test 18: LineString with 2 points (minimum valid)
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_linestring_two_points(tmp_path):
+    fc = _make_feature_collection([
+        _make_linestring_feature([[0.0, 0.0], [1.0, 1.0]]),
+    ])
+    path = tmp_path / "ls_min.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.LINESTRING in owned.families
+    dev_buf = owned.device_state.families[GeometryFamily.LINESTRING]
+    assert len(cp.asnumpy(dev_buf.x)) == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 19: Type key not confused with Feature/FeatureCollection type
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_type_key_not_confused(tmp_path):
+    fc = _make_feature_collection([
+        _make_point_feature([1.0, 2.0]),
+        _make_polygon_feature(_simple_square(0.0, 0.0)),
+    ])
+    path = tmp_path / "type_filter.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    # Should have exactly 2 features, not confused by "type":"Feature" etc.
+    assert len(owned.validity) == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 20: "type" inside property string
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_type_in_property_string(tmp_path):
+    features = [
+        _make_point_feature([1.0, 2.0], {"desc": 'The "type": is in this string'}),
+        _make_point_feature([3.0, 4.0]),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "type_in_string.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    assert GeometryFamily.POINT in batch.geometry.families
+    assert batch.geometry.families[GeometryFamily.POINT].row_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 21: Unsupported MultiPoint raises error
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_unsupported_multipoint(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "MultiPoint",
+                    "coordinates": [[0, 0], [1, 1]],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "multipoint.geojson"
+    _write_geojson(path, fc)
+
+    with pytest.raises(NotImplementedError, match="unsupported geometry types"):
+        read_geojson_owned(path, prefer="gpu-byte-classify")

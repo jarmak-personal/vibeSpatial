@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 206/280 lines
+Body Budget: 210/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-44 | Decision |
 | 45-54 | Performance Notes |
-| 55-116 | Current Behavior |
-| 117-206 | Measured Local Baseline |
+| 55-120 | Current Behavior |
+| 121-210 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -109,10 +109,14 @@ keeping GPU-native formats primary and legacy formats explicit.
     loses ring structure for polygons
   - property dictionaries are materialized lazily on the owned batch, so
     geometry-only callers do not pay host-side property decode by default
-  - `prefer="gpu-byte-classify"` uses 10 NVRTC kernels for GPU byte
-    classification, structural scanning, coordinate extraction, and
-    ASCII-to-fp64 parsing directly on device-resident file bytes. Property
-    extraction stays on CPU via orjson (hybrid design per ADR-0038).
+  - `prefer="gpu-byte-classify"` uses 12 NVRTC kernels for GPU byte
+    classification, structural scanning, geometry type detection, coordinate
+    extraction, and ASCII-to-fp64 parsing directly on device-resident file
+    bytes. Supports homogeneous and mixed Point, LineString, and Polygon
+    files. Type detection scans for `"type":` keys at geometry depth,
+    classifies per-feature, then partitions into family-local decode batches
+    (per io-acceleration.md policy). Property extraction stays on CPU via
+    orjson (hybrid design per ADR-0038).
     Geometry parse: **1.8s** for 2.16 GB / 7.2M polygons (32x vs pyogrio).
     Total read including properties: **11.7s** (4.9x vs pyogrio).
     File-to-device transfer uses kvikio when installed (parallel POSIX reads

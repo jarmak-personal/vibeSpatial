@@ -5,8 +5,9 @@ byte classification, structural scanning, coordinate extraction, and
 ASCII-to-float64 parsing.  Property extraction stays on CPU (hybrid
 design per vibeSpatial GPU memory policy).
 
-v1 targets homogeneous Polygon files.  Mixed geometry types and chunked
-processing for files exceeding GPU memory are deferred to v2.
+Supports homogeneous and mixed Point, LineString, and Polygon files.
+Multi-geometry types (MultiPoint, MultiLineString, MultiPolygon) and
+chunked processing for files exceeding GPU memory are deferred.
 """
 from __future__ import annotations
 
@@ -24,9 +25,14 @@ from vibespatial.cuda._runtime import (
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import OwnedGeometryArray
+from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    OwnedGeometryArray,
+    _device_gather_offset_slices,
+)
 
-from .pylibcudf import _build_device_single_family_owned
+from .pylibcudf import _build_device_mixed_owned, _build_device_single_family_owned
 
 try:
     import cupy as cp
@@ -419,6 +425,98 @@ extern "C" __global__ void mark_coord_spans(
 }
 """
 
+_TYPE_KEY_SOURCE = r"""
+extern "C" __global__ void find_type_key(
+    const unsigned char* __restrict__ input,
+    const unsigned char* __restrict__ quote_parity,
+    const int* __restrict__ depth,
+    unsigned char* __restrict__ hits,
+    long long n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx > n - 7) {
+        if (idx < n) hits[idx] = 0;
+        return;
+    }
+
+    // Pattern: "type":  (7 bytes)
+    const unsigned char pat[7] = {'"','t','y','p','e','"',':'};
+
+    unsigned char match = 1;
+    for (int i = 0; i < 7; ++i) {
+        if (input[idx + i] != pat[i]) { match = 0; break; }
+    }
+    // Check quote parity at the colon (idx+6): for a real JSON key the
+    // opening and closing quotes cancel, so parity is 0 (even).
+    // Inside a string value the parity is 1 (odd).
+    if (match && quote_parity[idx + 6] != 0) {
+        match = 0;
+    }
+    // Check depth at geometry level: depth 4 is inside geometry object.
+    // Feature-level "type" is at depth 3, root-level at depth 1 — skip those.
+    if (match && depth[idx + 6] != 4) {
+        match = 0;
+    }
+    hits[idx] = match;
+}
+"""
+
+_CLASSIFY_TYPE_SOURCE = r"""
+extern "C" __global__ void classify_type_value(
+    const unsigned char* __restrict__ input,
+    const long long* __restrict__ type_positions,
+    signed char* __restrict__ family_tags,
+    int n_matches,
+    long long n_bytes
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_matches) return;
+
+    long long pos = type_positions[idx] + 7;  // skip past "type":
+
+    // Skip whitespace between colon and opening quote
+    while (pos < n_bytes && (input[pos] == ' ' || input[pos] == '\n'
+           || input[pos] == '\r' || input[pos] == '\t')) {
+        pos++;
+    }
+
+    // Expect opening quote
+    if (pos >= n_bytes || input[pos] != '"') {
+        family_tags[idx] = -2;
+        return;
+    }
+    pos++;  // skip the opening quote
+
+    // Classify by prefix matching on the type string value
+    if (pos >= n_bytes) {
+        family_tags[idx] = -2;
+        return;
+    }
+
+    if (input[pos] == 'P') {
+        if (pos + 2 < n_bytes && input[pos + 1] == 'o' && input[pos + 2] == 'i') {
+            family_tags[idx] = 0;  // Point
+        } else if (pos + 2 < n_bytes && input[pos + 1] == 'o' && input[pos + 2] == 'l') {
+            family_tags[idx] = 2;  // Polygon
+        } else {
+            family_tags[idx] = -2;
+        }
+    } else if (input[pos] == 'L') {
+        if (pos + 1 < n_bytes && input[pos + 1] == 'i') {
+            family_tags[idx] = 1;  // LineString
+        } else {
+            family_tags[idx] = -2;
+        }
+    } else if (input[pos] == 'M') {
+        family_tags[idx] = -2;  // Multi* types, unsupported
+    } else if (input[pos] == 'G') {
+        family_tags[idx] = -2;  // GeometryCollection, unsupported
+    } else {
+        family_tags[idx] = -2;
+    }
+}
+"""
+
 # Kernel name tuples
 _DEPTH_DELTAS_NAMES = ("compute_depth_deltas",)
 _CLASSIFY_NAMES = ("classify_bytes",)
@@ -431,6 +529,8 @@ _RING_COUNT_NAMES = ("count_rings_and_coords",)
 _SCATTER_COORDS_NAMES = ("scatter_ring_offsets",)
 _FEATURE_BOUNDARY_NAMES = ("find_feature_boundaries",)
 _MARK_COORD_SPANS_NAMES = ("mark_coord_spans",)
+_TYPE_KEY_NAMES = ("find_type_key",)
+_CLASSIFY_TYPE_NAMES = ("classify_type_value",)
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034 Level 2)
@@ -449,6 +549,8 @@ request_nvrtc_warmup([
     ("geojson-scatter-coords", _SCATTER_COORDS_SOURCE, _SCATTER_COORDS_NAMES),
     ("geojson-feature-boundary", _FEATURE_BOUNDARY_SOURCE, _FEATURE_BOUNDARY_NAMES),
     ("geojson-mark-spans", _MARK_COORD_SPANS_SOURCE, _MARK_COORD_SPANS_NAMES),
+    ("geojson-type-key", _TYPE_KEY_SOURCE, _TYPE_KEY_NAMES),
+    ("geojson-classify-type", _CLASSIFY_TYPE_SOURCE, _CLASSIFY_TYPE_NAMES),
 ])
 
 
@@ -498,6 +600,14 @@ def _feature_boundary_kernels():
 
 def _mark_coord_spans_kernels():
     return compile_kernel_group("geojson-mark-spans", _MARK_COORD_SPANS_SOURCE, _MARK_COORD_SPANS_NAMES)
+
+
+def _type_key_kernels():
+    return compile_kernel_group("geojson-type-key", _TYPE_KEY_SOURCE, _TYPE_KEY_NAMES)
+
+
+def _classify_type_kernels():
+    return compile_kernel_group("geojson-classify-type", _CLASSIFY_TYPE_SOURCE, _CLASSIFY_TYPE_NAMES)
 
 
 # ---------------------------------------------------------------------------
@@ -631,19 +741,14 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     n_features = int(len(d_coord_positions))
 
     if n_features == 0:
-        # Empty file — return empty geometry
-        d_x = cp.empty(0, dtype=cp.float64)
-        d_y = cp.empty(0, dtype=cp.float64)
-        d_geom_offsets = cp.zeros(1, dtype=cp.int32)
-        d_ring_offsets = cp.zeros(1, dtype=cp.int32)
+        # Empty file — return empty Point geometry
         owned = _build_device_single_family_owned(
-            family=GeometryFamily.POLYGON,
+            family=GeometryFamily.POINT,
             validity_device=cp.ones(0, dtype=cp.bool_),
-            x_device=d_x,
-            y_device=d_y,
-            geometry_offsets_device=d_geom_offsets,
+            x_device=cp.empty(0, dtype=cp.float64),
+            y_device=cp.empty(0, dtype=cp.float64),
+            geometry_offsets_device=cp.zeros(1, dtype=cp.int32),
             empty_mask_device=cp.zeros(0, dtype=cp.bool_),
-            ring_offsets_device=d_ring_offsets,
             detail="GPU byte-classification GeoJSON parse (empty)",
         )
         return GeoJSONGpuResult(
@@ -653,6 +758,49 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
             feature_starts=np.empty(0, dtype=np.int64),
             feature_ends=np.empty(0, dtype=np.int64),
         )
+
+    # S3.5: Type detection — find "type": at geometry depth and classify
+    tk_kernels = _type_key_kernels()
+    d_type_hits = cp.zeros(n, dtype=cp.uint8)
+    _launch_kernel(runtime, tk_kernels["find_type_key"], n, (
+        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_depth), ptr(d_type_hits), n_i64),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+    ))
+    d_type_positions = cp.flatnonzero(d_type_hits).astype(cp.int64)
+    del d_type_hits
+    n_type_matches = int(len(d_type_positions))
+    if n_type_matches != n_features:
+        raise ValueError(
+            f"GeoJSON type detection mismatch: found {n_type_matches} geometry "
+            f'"type" keys but {n_features} "coordinates" keys'
+        )
+
+    ct_kernels = _classify_type_kernels()
+    d_family_tags = cp.empty(n_features, dtype=cp.int8)
+    _launch_kernel(runtime, ct_kernels["classify_type_value"], n_features, (
+        (ptr(d_bytes), ptr(d_type_positions), ptr(d_family_tags),
+         np.int32(n_features), n_i64),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_I32, KERNEL_PARAM_I64),
+    ))
+    del d_type_positions
+
+    # Check for unsupported types
+    unsupported_mask = d_family_tags < 0
+    if cp.any(unsupported_mask):
+        n_unsupported = int(cp.sum(unsupported_mask))
+        raise NotImplementedError(
+            f"GPU GeoJSON parser: {n_unsupported} features have unsupported "
+            f"geometry types (MultiPoint, MultiLineString, MultiPolygon, or "
+            f"GeometryCollection)"
+        )
+
+    # Determine if homogeneous or mixed
+    unique_tags = cp.unique(d_family_tags)
+    is_homogeneous = len(unique_tags) == 1
+    single_tag = int(unique_tags[0]) if is_homogeneous else None
+    pg_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    has_polygons = bool(cp.any(unique_tags == pg_tag))
 
     # S3b: Find coordinate span ends
     span_kernels = _coord_span_end_kernels()
@@ -664,51 +812,75 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
          KERNEL_PARAM_I32, KERNEL_PARAM_I64),
     ))
 
-    # S3c: Count rings and coordinate pairs per feature
-    ring_kernels = _ring_count_kernels()
-    d_ring_counts = cp.empty(n_features, dtype=cp.int32)
-    d_pair_counts = cp.empty(n_features, dtype=cp.int32)
-    _launch_kernel(runtime, ring_kernels["count_rings_and_coords"], n_features, (
-        (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
-         ptr(d_ring_counts), ptr(d_pair_counts), np.int32(n_features)),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-    ))
+    # S3c: Count rings and coordinate pairs per feature.
+    # The kernel output has different semantics per type (see plan).
+    # For homogeneous Point we skip it entirely.
+    d_ring_counts = None
+    d_pair_counts = None
+    d_all_geometry_offsets = None  # Polygon ring-level offsets
+    d_ring_offsets = None
 
-    # Prefix sums for offsets
-    d_ring_offset_starts = cp.empty(n_features, dtype=cp.int32)
-    d_pair_offset_starts = cp.empty(n_features, dtype=cp.int32)
-    cp.cumsum(d_ring_counts, out=d_ring_offset_starts)
-    cp.cumsum(d_pair_counts, out=d_pair_offset_starts)
-    # Convert from inclusive to exclusive prefix sum
-    total_rings = int(d_ring_offset_starts[-1].get())
-    total_pairs = int(d_pair_offset_starts[-1].get())
-    d_ring_offset_starts = cp.concatenate([cp.zeros(1, dtype=cp.int32), d_ring_offset_starts[:-1]])
-    d_pair_offset_starts = cp.concatenate([cp.zeros(1, dtype=cp.int32), d_pair_offset_starts[:-1]])
+    if single_tag == FAMILY_TAGS[GeometryFamily.POINT]:
+        # Point: every feature has exactly 1 coordinate pair
+        d_effective_pairs = cp.ones(n_features, dtype=cp.int32)
+    else:
+        # Run counting kernel for LineString, Polygon, or mixed
+        ring_kernels = _ring_count_kernels()
+        d_ring_counts = cp.empty(n_features, dtype=cp.int32)
+        d_pair_counts = cp.empty(n_features, dtype=cp.int32)
+        _launch_kernel(runtime, ring_kernels["count_rings_and_coords"], n_features, (
+            (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
+             ptr(d_ring_counts), ptr(d_pair_counts), np.int32(n_features)),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        ))
 
-    # GeoArrow Polygon layout:
-    # geometry_offsets[i] indexes into ring_offsets (exclusive prefix sum of ring_counts)
-    # ring_offsets[j] indexes into coordinates (coord pair offsets per ring)
-    d_geometry_offsets = cp.empty(n_features + 1, dtype=cp.int32)
-    d_geometry_offsets[0] = 0
-    cp.cumsum(d_ring_counts, out=d_geometry_offsets[1:])
+        # S3d: Compute effective pair counts per feature based on type.
+        # Point: 1, LineString: ring_count, Polygon: pair_count
+        pt_tag = np.int8(FAMILY_TAGS[GeometryFamily.POINT])
+        ls_tag = np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING])
+        d_effective_pairs = cp.where(
+            d_family_tags == pt_tag,
+            np.int32(1),
+            cp.where(
+                d_family_tags == ls_tag,
+                d_ring_counts,
+                d_pair_counts,
+            ),
+        )
 
-    # ring_offsets: total_rings + 1 entries
-    d_ring_offsets = cp.empty(total_rings + 1, dtype=cp.int32)
-    d_ring_offsets[-1] = total_pairs  # sentinel
+    # Compute per-feature coordinate offsets in flat x/y
+    d_feature_coord_offsets = cp.zeros(n_features + 1, dtype=cp.int32)
+    cp.cumsum(d_effective_pairs, out=d_feature_coord_offsets[1:])
+    total_pairs = int(d_feature_coord_offsets[-1].get())
 
-    # The ring_offset_starts for the scatter kernel = geometry_offsets[0:n_features]
-    d_ring_scatter_starts = d_geometry_offsets[:n_features].copy()
+    # S3e: Polygon ring offsets (only when polygons are present)
+    if has_polygons and d_ring_counts is not None:
+        d_pair_offset_starts = cp.empty(n_features, dtype=cp.int32)
+        cp.cumsum(d_pair_counts, out=d_pair_offset_starts)
+        d_pair_offset_starts = cp.concatenate(
+            [cp.zeros(1, dtype=cp.int32), d_pair_offset_starts[:-1]]
+        )
 
-    scatter_kernels = _scatter_coords_kernels()
-    _launch_kernel(runtime, scatter_kernels["scatter_ring_offsets"], n_features, (
-        (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
-         ptr(d_ring_scatter_starts), ptr(d_pair_offset_starts),
-         ptr(d_ring_offsets), np.int32(n_features)),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-    ))
+        d_all_geometry_offsets = cp.empty(n_features + 1, dtype=cp.int32)
+        d_all_geometry_offsets[0] = 0
+        cp.cumsum(d_ring_counts, out=d_all_geometry_offsets[1:])
+        total_rings = int(d_all_geometry_offsets[-1].get())
+
+        d_ring_offsets = cp.empty(total_rings + 1, dtype=cp.int32)
+        d_ring_offsets[-1] = (d_pair_offset_starts[-1] + d_pair_counts[-1]) if n_features > 0 else 0
+
+        d_ring_scatter_starts = d_all_geometry_offsets[:n_features].copy()
+        scatter_kernels = _scatter_coords_kernels()
+        _launch_kernel(runtime, scatter_kernels["scatter_ring_offsets"], n_features, (
+            (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
+             ptr(d_ring_scatter_starts), ptr(d_pair_offset_starts),
+             ptr(d_ring_offsets), np.int32(n_features)),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        ))
+        del d_pair_offset_starts, d_ring_scatter_starts
 
     # S4: Find all number boundaries (with quote-state filter)
     nb_kernels = _num_bounds_kernels()
@@ -720,22 +892,19 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     ))
     del d_quote_parity
 
-    # Filter numbers to only those inside coordinate spans (exclude property numerics).
-    # GPU kernel marks coordinate span byte ranges.
+    # Filter numbers to only those inside coordinate spans
     mark_kernels = _mark_coord_spans_kernels()
     d_in_coords = cp.zeros(n, dtype=cp.uint8)
     _launch_kernel(runtime, mark_kernels["mark_coord_spans"], n_features, (
         (ptr(d_coord_positions), ptr(d_coord_ends), ptr(d_in_coords), np.int32(n_features)),
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
     ))
-
-    # Apply the mask: zero out starts/ends outside coordinate spans
     d_is_start = d_is_start * d_in_coords
     d_is_end = d_is_end * d_in_coords
     del d_in_coords
 
     d_starts = cp.flatnonzero(d_is_start).astype(cp.int64)
-    d_ends = cp.flatnonzero(d_is_end).astype(cp.int64) + 1  # end is exclusive
+    d_ends = cp.flatnonzero(d_is_end).astype(cp.int64) + 1
     del d_is_start, d_is_end
 
     n_nums = int(len(d_starts))
@@ -756,19 +925,15 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
 
     # Verify coordinate count matches expected pairs
     if total_pairs > 0 and len(d_x) != total_pairs:
-        # Mismatch — the filtering may have included/excluded some numbers.
-        # Truncate or pad to match the expected count from structural analysis.
         if len(d_x) > total_pairs:
             d_x = d_x[:total_pairs].copy()
             d_y = d_y[:total_pairs].copy()
         else:
-            # Pad with zeros (shouldn't happen with correct data)
             pad_x = cp.zeros(total_pairs - len(d_x), dtype=cp.float64)
             pad_y = cp.zeros(total_pairs - len(d_y), dtype=cp.float64)
             d_x = cp.concatenate([d_x, pad_x])
             d_y = cp.concatenate([d_y, pad_y])
 
-    # Make x/y contiguous for OwnedGeometryArray
     d_x = cp.ascontiguousarray(d_x)
     d_y = cp.ascontiguousarray(d_y)
 
@@ -781,34 +946,29 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
     ))
     d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
-    d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1  # include closing brace
+    d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1
 
-    # Free GPU intermediates no longer needed
     del d_bytes, d_depth, d_feat_start, d_feat_end, d_coord_positions, d_coord_ends
-    del d_pair_counts, d_pair_offset_starts, d_ring_scatter_starts
     del d_coords
 
-    # D→H copy of feature boundaries for CPU property extraction
     h_feat_starts = cp.asnumpy(d_feat_start_pos)
     h_feat_ends = cp.asnumpy(d_feat_end_pos)
     del d_feat_start_pos, d_feat_end_pos
 
-    # Empty geometries: features with zero rings
-    d_empty_mask = (d_geometry_offsets[1:] == d_geometry_offsets[:-1])
-    del d_ring_counts
-
-    # S7: Assemble OwnedGeometryArray
-    d_validity = ~d_empty_mask
-    owned = _build_device_single_family_owned(
-        family=GeometryFamily.POLYGON,
-        validity_device=d_validity,
-        x_device=d_x,
-        y_device=d_y,
-        geometry_offsets_device=d_geometry_offsets,
-        empty_mask_device=d_empty_mask,
-        ring_offsets_device=d_ring_offsets,
-        detail="GPU byte-classification GeoJSON parse",
-    )
+    # S7: Family-aware assembly
+    if is_homogeneous:
+        owned = _assemble_homogeneous(
+            single_tag, n_features, d_x, d_y,
+            d_effective_pairs, d_feature_coord_offsets,
+            d_ring_counts, d_all_geometry_offsets, d_ring_offsets,
+        )
+    else:
+        owned = _assemble_mixed(
+            n_features, d_x, d_y, d_family_tags,
+            d_effective_pairs, d_feature_coord_offsets,
+            d_ring_counts, d_pair_counts,
+            d_all_geometry_offsets, d_ring_offsets,
+        )
 
     return GeoJSONGpuResult(
         owned=owned,
@@ -816,4 +976,135 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
         host_bytes=host_bytes,
         feature_starts=h_feat_starts,
         feature_ends=h_feat_ends,
+    )
+
+
+def _assemble_homogeneous(
+    tag, n_features, d_x, d_y,
+    d_effective_pairs, d_feature_coord_offsets,
+    d_ring_counts, d_all_geometry_offsets, d_ring_offsets,
+):
+    """Build single-family OwnedGeometryArray for homogeneous files."""
+    d_empty_mask = (d_effective_pairs == 0)
+    d_validity = ~d_empty_mask
+
+    if tag == FAMILY_TAGS[GeometryFamily.POINT]:
+        d_geom_offsets = cp.arange(n_features + 1, dtype=cp.int32)
+        return _build_device_single_family_owned(
+            family=GeometryFamily.POINT,
+            validity_device=d_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_geom_offsets,
+            empty_mask_device=d_empty_mask,
+            detail="GPU byte-classification GeoJSON parse (Point)",
+        )
+
+    if tag == FAMILY_TAGS[GeometryFamily.LINESTRING]:
+        return _build_device_single_family_owned(
+            family=GeometryFamily.LINESTRING,
+            validity_device=d_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_feature_coord_offsets,
+            empty_mask_device=d_empty_mask,
+            detail="GPU byte-classification GeoJSON parse (LineString)",
+        )
+
+    # Polygon — use ring offsets
+    d_pg_empty = (d_all_geometry_offsets[1:] == d_all_geometry_offsets[:-1])
+    d_pg_validity = ~d_pg_empty
+    return _build_device_single_family_owned(
+        family=GeometryFamily.POLYGON,
+        validity_device=d_pg_validity,
+        x_device=d_x,
+        y_device=d_y,
+        geometry_offsets_device=d_all_geometry_offsets,
+        empty_mask_device=d_pg_empty,
+        ring_offsets_device=d_ring_offsets,
+        detail="GPU byte-classification GeoJSON parse (Polygon)",
+    )
+
+
+def _assemble_mixed(
+    n_features, d_x, d_y, d_family_tags,
+    d_effective_pairs, d_feature_coord_offsets,
+    d_ring_counts, d_pair_counts,
+    d_all_geometry_offsets, d_ring_offsets,
+):
+    """Build multi-family OwnedGeometryArray for mixed-type files."""
+    # Partition features by family
+    family_devices = {}
+    partitions = {}  # tag_val → rows (cached for reuse in tag assignment)
+    tag_map = [
+        (FAMILY_TAGS[GeometryFamily.POINT], GeometryFamily.POINT),
+        (FAMILY_TAGS[GeometryFamily.LINESTRING], GeometryFamily.LINESTRING),
+        (FAMILY_TAGS[GeometryFamily.POLYGON], GeometryFamily.POLYGON),
+    ]
+
+    # Pre-compute coords_2d once for LineString/Polygon gather operations
+    coords_2d = cp.column_stack([d_x, d_y]) if d_x.size > 0 else cp.empty((0, 2), dtype=cp.float64)
+
+    for tag_val, family in tag_map:
+        rows = cp.flatnonzero(d_family_tags == tag_val).astype(cp.int32)
+        if rows.size == 0:
+            continue
+        partitions[tag_val] = rows
+
+        n_f = rows.size
+
+        if family == GeometryFamily.POINT:
+            pt_starts = d_feature_coord_offsets[rows]
+            pt_x = d_x[pt_starts]
+            pt_y = d_y[pt_starts]
+            family_devices[family] = DeviceFamilyGeometryBuffer(
+                family=family,
+                x=cp.ascontiguousarray(pt_x),
+                y=cp.ascontiguousarray(pt_y),
+                geometry_offsets=cp.arange(n_f + 1, dtype=cp.int32),
+                empty_mask=cp.zeros(n_f, dtype=cp.bool_),
+            )
+
+        elif family == GeometryFamily.LINESTRING:
+            gathered, ls_geom_offsets = _device_gather_offset_slices(
+                coords_2d, d_feature_coord_offsets, rows,
+            )
+            family_devices[family] = DeviceFamilyGeometryBuffer(
+                family=family,
+                x=cp.ascontiguousarray(gathered[:, 0]) if gathered.size else cp.empty(0, dtype=cp.float64),
+                y=cp.ascontiguousarray(gathered[:, 1]) if gathered.size else cp.empty(0, dtype=cp.float64),
+                geometry_offsets=ls_geom_offsets,
+                empty_mask=(ls_geom_offsets[1:] == ls_geom_offsets[:-1]),
+            )
+
+        elif family == GeometryFamily.POLYGON:
+            ring_indices, pg_geom_offsets = _device_gather_offset_slices(
+                cp.arange(d_ring_offsets.size, dtype=cp.int32),
+                d_all_geometry_offsets,
+                rows,
+            )
+            pg_coords, pg_ring_offsets = _device_gather_offset_slices(
+                coords_2d, d_ring_offsets, ring_indices,
+            )
+            family_devices[family] = DeviceFamilyGeometryBuffer(
+                family=family,
+                x=cp.ascontiguousarray(pg_coords[:, 0]) if pg_coords.size else cp.empty(0, dtype=cp.float64),
+                y=cp.ascontiguousarray(pg_coords[:, 1]) if pg_coords.size else cp.empty(0, dtype=cp.float64),
+                geometry_offsets=pg_geom_offsets,
+                empty_mask=(pg_geom_offsets[1:] == pg_geom_offsets[:-1]),
+                ring_offsets=pg_ring_offsets,
+            )
+
+    # Build tags and family_row_offsets (reuse cached partitions)
+    d_validity = cp.ones(n_features, dtype=cp.bool_)
+    d_family_row_offsets = cp.full(n_features, -1, dtype=cp.int32)
+    for tag_val, rows in partitions.items():
+        d_family_row_offsets[rows] = cp.arange(int(rows.size), dtype=cp.int32)
+
+    return _build_device_mixed_owned(
+        validity_device=d_validity,
+        tags_device=d_family_tags,
+        family_row_offsets_device=d_family_row_offsets,
+        family_devices=family_devices,
+        detail="GPU byte-classification GeoJSON parse (mixed)",
     )

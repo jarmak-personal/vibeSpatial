@@ -79,7 +79,7 @@ That GPU path is now hybrid on purpose:
   adapter
 - geometry assembly no longer depends on Shapely objects for the staged path
 - the remaining bottleneck was isolated to Python-side tokenization, which
-  ADR-0038 resolved with GPU byte-classification (10 NVRTC kernels, 1.8s for
+  ADR-0038 resolved with GPU byte-classification (12 NVRTC kernels, 1.8s for
   2.16 GB / 7.2M polygons). CPU property extraction (9.2s) is now the
   remaining bottleneck
 - the repo now has a real GPU-assisted GeoJSON tokenizer path instead of only a
