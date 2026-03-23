@@ -5,7 +5,7 @@ Scope: Compact-invalid-row make_valid pipeline staging and repair-only-invalids 
 Read If: You are changing make_valid, validity checking, or topology repair pipelines.
 STOP IF: Your task already has the make_valid pipeline open and only needs local implementation detail.
 Source Of Truth: Make-valid pipeline architecture for compact-and-repair staging.
-Body Budget: 52/220 lines
+Body Budget: 62/220 lines
 Document: docs/architecture/make-valid.md
 
 Section Map (Body Lines)
@@ -18,7 +18,8 @@ Section Map (Body Lines)
 | 23-27 | Verify |
 | 28-32 | Risks |
 | 33-44 | Decision |
-| 45-52 | Performance Notes |
+| 45-54 | Dispatch |
+| 55-62 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -62,6 +63,16 @@ stages.
   ``MakeValidResult.owned`` carries the original device-resident array so
   downstream stages (e.g., dissolve) can stay on device without re-uploading
   (ADR-0005 zero-transfer chain).
+
+## Dispatch
+
+- ``make_valid_owned()`` owns runtime dispatch via ``plan_dispatch_selection()``
+  and records dispatch events internally; the API layer (``GeometryArray``,
+  ``DeviceGeometryArray``) does not record its own events.
+- Two kernel variants are registered (ADR-0033):
+  ``make_valid/gpu-nvrtc`` (polygon/multipolygon GPU repair) and
+  ``make_valid/cpu`` (all families, Shapely fallback).
+- The ``dispatch_mode`` parameter controls GPU/CPU/AUTO selection.
 
 ## Performance Notes
 

@@ -59,5 +59,22 @@
       "gpu-cuda-python",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon",
+      "linestring",
+      "multilinestring",
+      "point",
+      "multipoint"
+    ],
+    "kernel": "make_valid",
+    "module": "vibespatial.constructive.make_valid_pipeline",
+    "tier": 3,
+    "variants": [
+      "gpu-nvrtc",
+      "cpu"
+    ]
   }
 ]

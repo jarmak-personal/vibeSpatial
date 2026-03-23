@@ -7,7 +7,12 @@ from time import perf_counter
 import numpy as np
 import shapely
 
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 
 class MakeValidPrimitive(StrEnum):
@@ -50,6 +55,7 @@ class MakeValidResult:
     method: str
     keep_collapsed: bool
     owned: object | None = None
+    selected: ExecutionMode = ExecutionMode.CPU
 
 
 @dataclass(frozen=True)
@@ -208,7 +214,7 @@ def _gpu_polygon_validity_mask(owned) -> np.ndarray | None:
     # ADR-0002: select compute precision based on device profile
     from vibespatial.runtime import ExecutionMode as _EM
     from vibespatial.runtime import RuntimeSelection
-    from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+    from vibespatial.runtime.precision import select_precision_plan
     runtime_sel = RuntimeSelection(
         requested=_EM.GPU, selected=_EM.GPU,
         reason="make_valid GPU ring-structure validity check",
@@ -324,7 +330,7 @@ def _detect_self_intersections_gpu(owned, valid_mask: np.ndarray, geometries: np
     structural cases. For self-intersection detection, we use shapely.is_valid
     on only the subset that passed ring checks. This is still a win because:
     - If 90% of rows fail ring checks, shapely only runs on 10%
-    - The GPU ring check itself is <2ms for 100K rows (zero D→H transfer)
+    - The GPU ring check itself is <2ms for 100K rows (zero D->H transfer)
     - shapely.is_valid is vectorized C, efficient for the remaining subset
     """
     structurally_valid_rows = np.flatnonzero(valid_mask)
@@ -453,22 +459,82 @@ def _compute_validity_mask_gpu(geometries: np.ndarray, owned) -> tuple[np.ndarra
     return gpu_mask, True
 
 
-def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: bool = True,
-                     owned=None) -> MakeValidResult:
+# ---------------------------------------------------------------------------
+# Kernel variant registration (ADR-0033 tier system)
+# ---------------------------------------------------------------------------
+
+@register_kernel_variant(
+    "make_valid",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("nvrtc", "constructive", "make_valid", "compact-invalid"),
+)
+def _make_valid_gpu_repair(owned, repaired_rows, geometries, *, method, keep_collapsed):
+    """GPU repair via gpu_repair_invalid_polygons (ADR-0019 + ADR-0033)."""
+    from .make_valid_gpu import gpu_repair_invalid_polygons
+
+    return gpu_repair_invalid_polygons(
+        owned, repaired_rows, geometries,
+        method=method, keep_collapsed=keep_collapsed,
+    )
+
+
+@register_kernel_variant(
+    "make_valid",
+    "cpu",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
+    supports_mixed=True,
+    tags=("shapely", "constructive", "make_valid"),
+)
+def _make_valid_cpu_repair(geometries, repaired_rows, *, method, keep_collapsed):
+    """CPU repair via shapely.make_valid on invalid subset."""
+    result = geometries.copy()
+    if repaired_rows.size:
+        result[repaired_rows] = shapely.make_valid(
+            geometries[repaired_rows],
+            method=method,
+            keep_collapsed=keep_collapsed,
+        )
+    return result
+
+
+def make_valid_owned(
+    values=None,
+    *,
+    method: str = "linework",
+    keep_collapsed: bool = True,
+    owned=None,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+) -> MakeValidResult:
     """Validate and repair geometries using compact-invalid-row pattern (ADR-0019).
 
     Parameters
     ----------
     values : array-like of shapely geometries, optional
-        When *owned* is provided, *values* may be None — Shapely objects
+        When *owned* is provided, *values* may be None -- Shapely objects
         will only be materialized if GPU validity checks find invalid rows
         that require repair (lazy materialization per ADR-0005).
     method : repair method ("linework" or "structure")
     keep_collapsed : whether to keep collapsed geometries
-    owned : optional pre-built OwnedGeometryArray (avoids shapely→owned conversion
-            when data is already device-resident, eliminating D→H transfer for
+    owned : optional pre-built OwnedGeometryArray (avoids shapely->owned conversion
+            when data is already device-resident, eliminating D->H transfer for
             the validity check per ADR-0005)
+    dispatch_mode : requested execution mode (AUTO/GPU/CPU)
     """
+    row_count = owned.row_count if owned is not None else (len(values) if values is not None else 0)
+
+    selection = plan_dispatch_selection(
+        kernel_name="make_valid",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=row_count,
+        requested_mode=dispatch_mode,
+    )
+
     # Defer Shapely materialization: when owned is provided, we may not need
     # values at all (zero-transfer fast path).  Materialize lazily.
     geometries = None
@@ -484,44 +550,58 @@ def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: b
             geometries = np.asarray(owned.to_shapely(), dtype=object)
         else:
             raise ValueError("Either values or owned must be provided")
-        null_mask = np.asarray([g is None for g in geometries], dtype=bool)
+        # Preserve vectorized null_mask from ~owned.validity when already set
+        if null_mask is None:
+            null_mask = np.asarray([g is None for g in geometries], dtype=bool)
 
     # ADR-0019 compact-invalid-row: detect validity first, repair only invalids.
     # When an OwnedGeometryArray is provided (data already on device), use GPU
-    # ring-structure checks to avoid D→H transfer for the validity check.
+    # ring-structure checks to avoid D->H transfer for the validity check.
     # If all rows pass GPU ring checks, skip shapely entirely (zero-transfer).
-    if owned is not None:
+    gpu_detection_used = False
+    if owned is not None and selection.selected is ExecutionMode.GPU:
         # Compute null_mask from owned validity (no Shapely needed)
         null_mask = ~owned.validity
         gpu_mask = _gpu_polygon_validity_mask(owned)
         if gpu_mask is not None:
+            gpu_detection_used = True
             gpu_mask[null_mask] = False
             # Refine with self-intersection detection on structurally-valid subset
             _ensure_geometries()
             gpu_mask = _detect_self_intersections_gpu(owned, gpu_mask, geometries=geometries)
             gpu_invalid_rows = np.flatnonzero(~gpu_mask & ~null_mask)
             if gpu_invalid_rows.size == 0:
-                # All rows passed GPU checks — skip shapely entirely.
-                # This is the zero-transfer fast path (ADR-0005).
+                # All rows passed GPU checks -- no repair needed.
                 # Carry the original owned so callers can stay
                 # device-resident without re-uploading via from_shapely.
                 _ensure_geometries()
-                result = geometries.copy()
+                record_dispatch_event(
+                    surface="geopandas.array.make_valid",
+                    operation="make_valid",
+                    implementation="gpu_ring_validity_check",
+                    reason="GPU ring-structure checks: all rows valid, zero repair needed",
+                    detail=f"rows={row_count}, method={method}",
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.GPU,
+                )
                 return MakeValidResult(
-                    geometries=result,
-                    row_count=len(result),
+                    geometries=geometries,
+                    row_count=len(geometries),
                     valid_rows=np.flatnonzero(gpu_mask).astype(np.int32),
                     repaired_rows=np.asarray([], dtype=np.int32),
                     null_rows=np.flatnonzero(null_mask).astype(np.int32),
                     method=method,
                     keep_collapsed=keep_collapsed,
                     owned=owned,
+                    selected=ExecutionMode.GPU,
                 )
             valid_mask = gpu_mask
         else:
             _ensure_geometries()
             valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)
     else:
+        if owned is not None:
+            null_mask = ~owned.validity
         _ensure_geometries()
         valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)
 
@@ -531,28 +611,44 @@ def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: b
     valid_mask[null_mask] = False
     repaired_mask = (~null_mask) & (~valid_mask)
     repaired_rows = np.flatnonzero(repaired_mask).astype(np.int32)
+    selected = ExecutionMode.GPU if gpu_detection_used else ExecutionMode.CPU
     if repaired_rows.size:
         # Try GPU repair path first when owned data is available (ADR-0019 + ADR-0033)
         gpu_repair_done = False
-        if owned is not None and owned.device_state is not None:
+        if owned is not None and owned.device_state is not None and selection.selected is ExecutionMode.GPU:
             try:
-                from .make_valid_gpu import gpu_repair_invalid_polygons
-                gpu_result = gpu_repair_invalid_polygons(
+                gpu_result = _make_valid_gpu_repair(
                     owned, repaired_rows, geometries,
                     method=method, keep_collapsed=keep_collapsed,
                 )
                 if gpu_result is not None:
                     result = gpu_result.repaired_geometries
                     gpu_repair_done = True
+                    selected = ExecutionMode.GPU
             except Exception:
                 pass
 
         if not gpu_repair_done:
-            result[repaired_rows] = shapely.make_valid(
-                geometries[repaired_rows],
-                method=method,
-                keep_collapsed=keep_collapsed,
+            result = _make_valid_cpu_repair(
+                geometries, repaired_rows,
+                method=method, keep_collapsed=keep_collapsed,
             )
+            if not gpu_detection_used:
+                selected = ExecutionMode.CPU
+
+    impl = "gpu_ring_validity_check" if gpu_detection_used else "shapely_is_valid"
+    if repaired_rows.size:
+        impl += "+gpu_repair" if selected is ExecutionMode.GPU else "+shapely_make_valid"
+    record_dispatch_event(
+        surface="geopandas.array.make_valid",
+        operation="make_valid",
+        implementation=impl,
+        reason=f"make_valid dispatch: detection={'GPU' if gpu_detection_used else 'CPU'}, "
+               f"repair={selected.value}, {repaired_rows.size} rows repaired",
+        detail=f"rows={row_count}, method={method}, repaired={repaired_rows.size}",
+        requested=dispatch_mode,
+        selected=selected,
+    )
     return MakeValidResult(
         geometries=result,
         row_count=len(result),
@@ -561,16 +657,28 @@ def make_valid_owned(values=None, *, method: str = "linework", keep_collapsed: b
         null_rows=np.flatnonzero(null_mask).astype(np.int32),
         method=method,
         keep_collapsed=keep_collapsed,
+        selected=selected,
     )
 
 
-def evaluate_geopandas_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True, prebuilt_owned=None):
+def evaluate_geopandas_make_valid(
+    values,
+    *,
+    method: str = "linework",
+    keep_collapsed: bool = True,
+    prebuilt_owned=None,
+) -> MakeValidResult:
+    """Run make_valid and return the full MakeValidResult.
+
+    Returns MakeValidResult so callers can access .owned for device-resident
+    fast paths and .selected for dispatch event accuracy.
+    """
     from vibespatial.runtime.execution_trace import execution_trace
 
     with execution_trace("make_valid"):
         return make_valid_owned(
             values, method=method, keep_collapsed=keep_collapsed, owned=prebuilt_owned,
-        ).geometries
+        )
 
 
 def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True, dataset: str = "make-valid"):

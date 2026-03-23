@@ -1055,23 +1055,17 @@ class GeometryArray(ExtensionArray):
         method: Literal["linework", "structure"] = "linework",
         keep_collapsed: bool = True,
     ) -> GeometryArray:
-        record_dispatch_event(
-            surface="geopandas.array.make_valid",
-            operation="make_valid",
-            implementation="owned_compact_invalid_rows",
-            reason="compact invalid rows first and repair only the invalid subset",
-            detail=f"rows={len(self)}, method={method}, keep_collapsed={keep_collapsed}",
-            selected=ExecutionMode.CPU,
+        # Dispatch event is recorded inside make_valid_owned with
+        # accurate GPU/CPU selection (dispatch framework gap 7 fix).
+        result = evaluate_geopandas_make_valid(
+            self._data if self._owned is None else None,
+            method=method,
+            keep_collapsed=keep_collapsed,
+            prebuilt_owned=self._owned,
         )
-        return GeometryArray(
-            evaluate_geopandas_make_valid(
-                self._data if self._owned is None else None,
-                method=method,
-                keep_collapsed=keep_collapsed,
-                prebuilt_owned=self._owned,
-            ),
-            crs=self.crs,
-        )
+        if result.owned is not None:
+            return GeometryArray.from_owned(result.owned, crs=self.crs)
+        return GeometryArray(result.geometries, crs=self.crs)
 
     def reverse(self) -> GeometryArray:
         if self._owned is not None:

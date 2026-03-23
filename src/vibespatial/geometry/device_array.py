@@ -593,6 +593,10 @@ class DeviceGeometryArray(ExtensionArray):
             method=method,
             keep_collapsed=keep_collapsed,
         )
+        # When all rows are already valid, result.owned carries the original
+        # OwnedGeometryArray — reuse it directly to avoid a Shapely round-trip.
+        if result.owned is not None:
+            return DeviceGeometryArray._from_owned(result.owned, crs=self._crs)
         geoms = result.geometries
         new_owned = from_shapely_geometries(list(geoms) if not isinstance(geoms, list) else geoms)
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
