@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import warnings
 
 import numpy as np
@@ -562,9 +564,95 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     )
 
     if keep_geom_type:
-        result = _collection_extract(result, geom_type, keep_geom_type_warning)
+        result_owned = getattr(result.geometry.values, "_owned", None)
+        if result_owned is not None:
+            result = _collection_extract_owned(result, geom_type, keep_geom_type_warning)
+        else:
+            result = _collection_extract(result, geom_type, keep_geom_type_warning)
 
     result.reset_index(drop=True, inplace=True)
+    return result
+
+
+def _geom_type_to_target_families(geom_type: str) -> set[int] | None:
+    """Map a Shapely geom_type string to the set of OwnedGeometryArray family tags to keep.
+
+    Returns ``None`` if *geom_type* is not a recognized polygon, line, or point type.
+    Imports are deferred to avoid circular dependencies.
+    """
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    if geom_type in POLYGON_GEOM_TYPES:
+        return {FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]}
+    if geom_type in LINE_GEOM_TYPES:
+        return {
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            FAMILY_TAGS[GeometryFamily.MULTILINESTRING],
+        }
+    if geom_type in POINT_GEOM_TYPES:
+        return {FAMILY_TAGS[GeometryFamily.POINT], FAMILY_TAGS[GeometryFamily.MULTIPOINT]}
+    return None
+
+
+def _collection_extract_owned(df, geom_type, keep_geom_type_warning):
+    """Device-resident collection extract: filter by geometry family tag.
+
+    When the result GeoDataFrame's geometry column has OwnedGeometryArray
+    backing, we can filter by the ``tags`` array directly -- no Shapely
+    materialization, no ``.explode()``, no ``.dissolve()``.
+
+    OwnedGeometryArray does not represent GeometryCollections; constituent
+    geometries are stored as individual rows tagged by their concrete family.
+    Filtering is a simple mask on the tags array followed by
+    ``OwnedGeometryArray.take()``.
+    """
+    from vibespatial.geometry.owned import NULL_TAG
+
+    ga = df.geometry.values
+    owned = ga._owned
+
+    target_tags = _geom_type_to_target_families(geom_type)
+    if target_tags is None:
+        raise TypeError(f"`geom_type` does not support {geom_type}.")
+
+    tags = owned.tags
+    keep_mask = np.zeros(len(tags), dtype=bool)
+    for tag in target_tags:
+        keep_mask |= tags == tag
+
+    num_dropped = int((~keep_mask & (tags != NULL_TAG)).sum())
+
+    if num_dropped > 0 and keep_geom_type_warning:
+        warnings.warn(
+            "`keep_geom_type=True` in overlay resulted in "
+            f"{num_dropped} dropped geometries of different "
+            "geometry types than df1 has. Set `keep_geom_type=False` to retain all "
+            "geometries",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Also drop null rows (tags == NULL_TAG) to match the Shapely-path
+    # behaviour where geom_type.isin() returns False for None geometries.
+    keep_mask &= owned.validity
+
+    if keep_mask.all():
+        return df
+
+    # Filter both the DataFrame rows and the owned geometry array together.
+    # Use iloc for positional indexing -- the DataFrame may have a non-default
+    # index after concat in overlay sub-operations.
+    keep_indices = np.flatnonzero(keep_mask)
+    result = df.iloc[keep_indices].copy()
+    filtered_owned = owned.take(keep_indices)
+
+    # Rebuild the GeoSeries with owned backing to avoid Shapely materialisation.
+    geom_col = result._geometry_column_name
+    result[geom_col] = GeoSeries(
+        GeometryArray.from_owned(filtered_owned, crs=df.crs),
+        index=result.index,
+    )
     return result
 
 
