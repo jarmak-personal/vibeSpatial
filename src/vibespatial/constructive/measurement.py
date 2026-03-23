@@ -30,6 +30,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 
@@ -1142,10 +1143,26 @@ def area_owned(
         try:
             result = _area_gpu(owned, precision_plan=precision_plan)
             result[~owned.validity] = np.nan
+            record_dispatch_event(
+                surface="geopandas.array.area",
+                operation="area",
+                implementation="gpu_nvrtc_shoelace",
+                reason="GPU NVRTC area kernel",
+                detail=f"rows={row_count}, precision={precision_plan.compute_dtype}",
+                selected=ExecutionMode.GPU,
+            )
             return result
         except Exception:
             pass  # fall through to CPU
 
+    record_dispatch_event(
+        surface="geopandas.array.area",
+        operation="area",
+        implementation="numpy",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        selected=ExecutionMode.CPU,
+    )
     result = _area_cpu(owned)
     result[~owned.validity] = np.nan
     return result
@@ -1207,10 +1224,26 @@ def length_owned(
         try:
             result = _length_gpu(owned, precision_plan=precision_plan)
             result[~owned.validity] = np.nan
+            record_dispatch_event(
+                surface="geopandas.array.length",
+                operation="length",
+                implementation="gpu_nvrtc_segment_length",
+                reason="GPU NVRTC length kernel",
+                detail=f"rows={row_count}, precision={precision_plan.compute_dtype}",
+                selected=ExecutionMode.GPU,
+            )
             return result
         except Exception:
             pass  # fall through to CPU
 
+    record_dispatch_event(
+        surface="geopandas.array.length",
+        operation="length",
+        implementation="numpy",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        selected=ExecutionMode.CPU,
+    )
     result = _length_cpu(owned)
     result[~owned.validity] = np.nan
     return result
