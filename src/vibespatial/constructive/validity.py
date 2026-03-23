@@ -64,7 +64,7 @@ from .measurement import _PRECISION_PREAMBLE
 # Checks structural validity of polygon rings:
 #   1. Minimum 4 coordinates
 #   2. Ring closure (first == last)
-#   3. Correct orientation (exterior CCW / positive area, holes CW / negative)
+# Note: orientation is NOT checked (GEOS does not enforce winding in is_valid).
 # ---------------------------------------------------------------------------
 
 _IS_VALID_RINGS_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
@@ -2329,7 +2329,7 @@ def is_valid_owned(
     )
 
     # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons
-    # (ring closure, orientation).  select_precision_plan is called for
+    # (ring closure, self-intersection, hole containment, ring-pair interaction).  select_precision_plan is called for
     # observability only -- the kernel source is always _FP64.
     precision_plan = select_precision_plan(
         runtime_selection=selection,

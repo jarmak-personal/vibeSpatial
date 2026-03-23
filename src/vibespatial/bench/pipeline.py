@@ -2164,12 +2164,12 @@ def _profile_flood_exposure_pipeline(
             rows_in=buildings_owned.row_count,
             detail="GPU ring-check + compact-invalid-row repair (ADR-0019)",
         ) as stage:
-            # GPU ring-check fast path (ADR-0005 zero-transfer): run GPU ring
-            # validity detection on device-resident data.  If all rows pass,
+            # Full OGC validity fast path (ADR-0005 zero-transfer): run
+            # is_valid_owned on device-resident data.  If all rows pass,
             # skip shapely materialization entirely.
-            from vibespatial.constructive.make_valid_pipeline import _gpu_polygon_validity_mask
-            gpu_mask = _gpu_polygon_validity_mask(buildings_owned)
-            if gpu_mask is not None and np.all(gpu_mask | ~buildings_owned.validity):
+            from vibespatial.constructive.validity import is_valid_owned
+            gpu_mask = is_valid_owned(buildings_owned)
+            if np.all(gpu_mask | ~buildings_owned.validity):
                 # All non-null rows are structurally valid — skip shapely
                 buildings_valid = buildings_owned
                 stage.metadata["repaired_count"] = 0
