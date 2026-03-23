@@ -12901,6 +12901,7 @@
       "path": "src/vibespatial/api/tools/overlay.py",
       "referenced_by": [],
       "symbols": [
+        "_extract_owned_pair",
         "_ensure_geometry_column",
         "_intersecting_index_pairs",
         "_assemble_intersection_attributes",
@@ -12928,6 +12929,8 @@
         "intersecting",
         "intersection",
         "overlay",
+        "owned",
+        "pair",
         "pairs",
         "py",
         "src",
