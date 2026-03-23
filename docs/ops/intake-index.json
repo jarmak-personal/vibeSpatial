@@ -122535,12 +122535,14 @@
         "SpatialQueryExecution",
         "RegularGridPointIndex",
         "_DeviceCandidates",
+        "DeviceSpatialJoinResult",
         "SpatialJoinIndices",
         "_DeviceJoinResult"
       ],
       "tokens": [
         "devicecandidates",
         "devicejoinresult",
+        "devicespatialjoinresult",
         "py",
         "query",
         "regulargridpointindex",

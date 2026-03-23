@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import numpy as np
 import shapely
 from shapely.geometry.base import BaseGeometry
@@ -13,6 +15,7 @@ from vibespatial.spatial.query import (
     query_spatial_index,
     supports_owned_spatial_input,
 )
+from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 from vibespatial.spatial.query_utils import _to_owned
 
 from . import _compat as compat
@@ -95,6 +98,7 @@ class SpatialIndex:
         sort=False,
         distance=None,
         output_format="indices",
+        return_device=False,
     ):
         """
         Return all combinations of each input geometry
@@ -363,6 +367,7 @@ class SpatialIndex:
                 distance=distance,
                 output_format=output_format,
                 return_metadata=True,
+                return_device=return_device,
                 tree_shapely=tree_shapely_arr,
                 query_shapely=query_shapely_arr,
             )
