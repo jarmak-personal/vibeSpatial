@@ -72,8 +72,13 @@ def _assemble_intersection_attributes(idx1, idx2, df1, df2):
     Receives integer index arrays and attribute-only DataFrames (geometry
     columns already dropped).  Returns a merged DataFrame with attributes
     from both sides joined via the spatial index pairs.
+
+    Indices may be CuPy arrays (Phase 3) — materialized to host here since
+    pandas DataFrames are inherently host-side.
     """
-    pairs = pd.DataFrame({"__idx1": idx1, "__idx2": idx2})
+    h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
+    h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
+    pairs = pd.DataFrame({"__idx1": h_idx1, "__idx2": h_idx2})
     result = pairs.merge(
         df1,
         left_on="__idx1",
@@ -114,8 +119,8 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 binary_constructive_owned,
             )
 
-            left_sub = left_owned.take(np.asarray(idx1))
-            right_sub = right_owned.take(np.asarray(idx2))
+            left_sub = left_owned.take(idx1)
+            right_sub = right_owned.take(idx2)
             try:
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
@@ -203,8 +208,17 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             right_gathered = right_owned.take(idx2)
 
             # Build group offsets from the sorted idx1 split points.
-            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
-            group_offsets = np.concatenate([idx1_split_at, [len(idx2)]])
+            # Use the same array library as the indices to avoid D→H
+            # transfers when indices are already on device (Phase 3).
+            xp = np
+            if hasattr(idx1, "__cuda_array_interface__"):
+                try:
+                    import cupy
+                    xp = cupy
+                except ImportError:
+                    pass
+            idx1_unique, idx1_split_at = xp.unique(idx1, return_index=True)
+            group_offsets = xp.concatenate([idx1_split_at, xp.asarray([len(idx2)])])
 
             # GPU segmented union: one union per left geometry's neighbors.
             right_unions_owned = segmented_union_all(
@@ -221,7 +235,12 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             # differenced rows materialized from owned result.
             diff_shapely = np.asarray(diff_owned.to_shapely(), dtype=object)
             result_geoms = np.asarray(df1.geometry, dtype=object).copy()
-            result_geoms[idx1_unique] = diff_shapely
+            # Bring idx1_unique to host for numpy object array assignment
+            # (this is a materialization path, not a hot GPU path).
+            h_idx1_unique = (
+                idx1_unique.get() if hasattr(idx1_unique, "get") else idx1_unique
+            )
+            result_geoms[h_idx1_unique] = diff_shapely
 
             used_owned = True
         except (ImportError, NotImplementedError):
@@ -235,13 +254,18 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
         result_geoms = left_geoms.copy()
 
         if idx1.size > 0:
+            # Ensure host arrays for Shapely fallback path — indices may
+            # be CuPy when the owned path above raised an exception.
+            h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
+            h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
+
             right_geoms = np.asarray(df2.geometry, dtype=object)
             right_unions = np.empty(n_left, dtype=object)
             right_unions.fill(None)
 
             # O(N log N) grouping via np.split — avoids O(K*N) per-group mask scan.
-            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
-            idx2_groups = np.split(idx2, idx1_split_at[1:])
+            idx1_unique, idx1_split_at = np.unique(h_idx1, return_index=True)
+            idx2_groups = np.split(h_idx2, idx1_split_at[1:])
             for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
                 neighbors = right_geoms[neighbors_idx]
                 if len(neighbors) == 1:
