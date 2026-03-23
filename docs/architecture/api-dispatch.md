@@ -64,10 +64,10 @@ or hiding which implementation actually ran.
 - Record explicit dispatch events at the public method boundary for
   high-traffic surfaces (currently `buffer`, `offset_curve`, `clip_by_rect`,
   `make_valid`, `dissolve`, `intersection`, `union`, `difference`,
-  `symmetric_difference`, `boundary`, `convex_hull`, `area`, and `length`).
-  Unary constructive ops (`rotate`, `scale`, `skew`) and distance metrics
-  (`hausdorff_distance`, `frechet_distance`) route through owned paths
-  directly without per-call dispatch events.
+  `symmetric_difference`, `boundary`, `convex_hull`, `area`, `length`,
+  `hausdorff_distance`, and `frechet_distance`).
+  Unary constructive ops (`rotate`, `scale`, `skew`) route through owned
+  paths directly without per-call dispatch events.
 - Keep host-competitive Shapely paths in place when owned host prototypes are
   slower, but make that choice visible.
 

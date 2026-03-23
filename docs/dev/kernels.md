@@ -20,6 +20,7 @@ is an NVRTC source compiled at runtime.
 | Simplify | `constructive/simplify.py` | Visvalingam-Whyatt vertex elimination |
 | Validity / Simplicity | `constructive/validity.py` | is_valid (ring closure, min coords, orientation), is_simple (self-intersection) |
 | Clip by rect | `constructive/clip_rect.py` | Bounds-filtered rectangle clip (point, line, polygon families via Sutherland-Hodgman / Liang-Barsky GPU kernels) |
+| Distance metrics | `spatial/distance_metrics.py` | Hausdorff (min-of-max brute force), discrete Frechet (DP coupling matrix) |
 
 ## Adding a new kernel
 

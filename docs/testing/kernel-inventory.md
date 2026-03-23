@@ -5,7 +5,7 @@ Scope: Scaffolded kernel inventory, benchmark stubs, and generated test surfaces
 Read If: You are generating, reviewing, or extending owned kernel scaffolds.
 STOP IF: You already have the target kernel module and generated files open.
 Source Of Truth: Kernel scaffold inventory and generated surface map for repo-owned kernels.
-Body Budget: 43/220 lines
+Body Budget: 45/220 lines
 Document: docs/testing/kernel-inventory.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 15-20 | Open First |
 | 21-25 | Verify |
 | 26-30 | Risks |
-| 31-43 | Scaffolds |
+| 31-45 | Scaffolds |
 DOC_HEADER:END -->
 
 Generated kernel scaffolds land here first so agents can audit what exists and which tier gate applies.
@@ -61,3 +61,5 @@ Track scaffolded kernel modules, tests, and benchmark stubs.
 | `make_valid` | `vibespatial.constructive.make_valid_pipeline` | Tier 3 | `polygon, multipolygon, linestring, multilinestring, point, multipoint` | `src/vibespatial/constructive/make_valid_pipeline.py` | `tests/test_make_valid_pipeline.py` | `vsbench run constructive` |
 | `normalize` | `vibespatial.constructive.normalize` | Tier 1 | `point, multipoint, linestring, multilinestring, polygon, multipolygon` | `src/vibespatial/constructive/normalize.py` | `tests/test_normalize.py` | `vsbench run constructive` |
 | `clip_by_rect` | `vibespatial.constructive.clip_rect` | Tier 3 | `point, multipoint, linestring, multilinestring, polygon, multipolygon` | `src/vibespatial/constructive/clip_rect.py` | `tests/test_clip_rect.py` | `vsbench run constructive` |
+| `hausdorff_distance` | `vibespatial.spatial.distance_metrics` | Tier 1 | `point, multipoint, linestring, multilinestring, polygon` | `src/vibespatial/spatial/distance_metrics.py` | `tests/test_distance_metrics.py` | `vsbench run metric` |
+| `frechet_distance` | `vibespatial.spatial.distance_metrics` | Tier 1 | `linestring` | `src/vibespatial/spatial/distance_metrics.py` | `tests/test_distance_metrics.py` | `vsbench run metric` |

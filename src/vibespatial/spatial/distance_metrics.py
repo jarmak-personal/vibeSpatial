@@ -448,6 +448,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -667,6 +668,16 @@ def _hausdorff_pair(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
     return float(max(np.max(forward), np.max(backward)))
 
 
+@register_kernel_variant(
+    "hausdorff_distance",
+    "cpu",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("point", "multipoint", "linestring",
+                       "multilinestring", "polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("cpu", "metric", "hausdorff"),
+)
 def _hausdorff_cpu(owned_a, owned_b, n):
     """CPU Hausdorff fallback.  Returns ``np.ndarray`` of shape ``(n,)``."""
     result = np.full(n, np.nan, dtype=np.float64)
@@ -724,6 +735,15 @@ def _frechet_pair(coords_a: np.ndarray, coords_b: np.ndarray) -> float:
     return float(ca[na - 1, nb - 1])
 
 
+@register_kernel_variant(
+    "frechet_distance",
+    "cpu",
+    kernel_class=KernelClass.METRIC,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("linestring",),
+    supports_mixed=False,
+    tags=("cpu", "metric", "frechet"),
+)
 def _frechet_cpu(owned_a, owned_b, n):
     """CPU Frechet fallback.  Returns ``np.ndarray`` of shape ``(n,)``."""
     result = np.full(n, np.nan, dtype=np.float64)
@@ -776,11 +796,32 @@ def hausdorff_distance_owned(
 
     if selection.selected is ExecutionMode.GPU:
         try:
-            return _hausdorff_gpu(owned_a, owned_b)
+            result = _hausdorff_gpu(owned_a, owned_b)
         except (NotImplementedError, RuntimeError) as exc:
             logger.debug("Hausdorff GPU dispatch failed, falling back to CPU: %s", exc)
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.hausdorff_distance",
+                operation="hausdorff_distance",
+                implementation="hausdorff_gpu_nvrtc",
+                reason=selection.reason,
+                detail=f"rows={n}",
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
 
-    return _hausdorff_cpu(owned_a, owned_b, n)
+    result = _hausdorff_cpu(owned_a, owned_b, n)
+    record_dispatch_event(
+        surface="geopandas.array.hausdorff_distance",
+        operation="hausdorff_distance",
+        implementation="hausdorff_cpu_brute_force",
+        reason="CPU fallback",
+        detail=f"rows={n}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+    )
+    return result
 
 
 def frechet_distance_owned(
@@ -817,8 +858,29 @@ def frechet_distance_owned(
 
     if selection.selected is ExecutionMode.GPU:
         try:
-            return _frechet_gpu(owned_a, owned_b)
+            result = _frechet_gpu(owned_a, owned_b)
         except (NotImplementedError, RuntimeError) as exc:
             logger.debug("Frechet GPU dispatch failed, falling back to CPU: %s", exc)
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.frechet_distance",
+                operation="frechet_distance",
+                implementation="frechet_gpu_nvrtc",
+                reason=selection.reason,
+                detail=f"rows={n}",
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
 
-    return _frechet_cpu(owned_a, owned_b, n)
+    result = _frechet_cpu(owned_a, owned_b, n)
+    record_dispatch_event(
+        surface="geopandas.array.frechet_distance",
+        operation="frechet_distance",
+        implementation="frechet_cpu_dp",
+        reason="CPU fallback",
+        detail=f"rows={n}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+    )
+    return result

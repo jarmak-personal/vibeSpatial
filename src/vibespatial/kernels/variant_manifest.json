@@ -125,5 +125,33 @@
       "gpu-nvrtc",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "point",
+      "multipoint",
+      "linestring",
+      "multilinestring",
+      "polygon"
+    ],
+    "kernel": "hausdorff_distance",
+    "module": "vibespatial.spatial.distance_metrics",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python",
+      "cpu"
+    ]
+  },
+  {
+    "geom_types": [
+      "linestring"
+    ],
+    "kernel": "frechet_distance",
+    "module": "vibespatial.spatial.distance_metrics",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python",
+      "cpu"
+    ]
   }
 ]
