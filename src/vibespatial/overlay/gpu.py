@@ -1019,18 +1019,19 @@ def _empty_half_edge_graph(
     empty_i8 = np.asarray([], dtype=np.int8)
     empty_f64 = np.asarray([], dtype=np.float64)
     empty_device_i32 = runtime.allocate((0,), np.int32)
+    empty_device_i8 = runtime.allocate((0,), np.int8)
     empty_device_f64 = runtime.allocate((0,), np.float64)
     return HalfEdgeGraph(
-        source_segment_ids=empty_i32,
-        source_side=empty_i8,
-        row_indices=empty_i32,
-        part_indices=empty_i32,
-        ring_indices=empty_i32,
-        direction=empty_i8,
         left_segment_count=atomic_edges.left_segment_count,
         right_segment_count=atomic_edges.right_segment_count,
         runtime_selection=atomic_edges.runtime_selection,
         _edge_count=0,
+        _source_segment_ids=empty_i32,
+        _source_side=empty_i8,
+        _row_indices=empty_i32,
+        _part_indices=empty_i32,
+        _ring_indices=empty_i32,
+        _direction=empty_i8,
         _src_x=empty_f64,
         _src_y=empty_f64,
         _dst_x=empty_f64,
@@ -1054,6 +1055,12 @@ def _empty_half_edge_graph(
             next_edge_ids=empty_device_i32,
             src_x=empty_device_f64,
             src_y=empty_device_f64,
+            source_segment_ids=empty_device_i32,
+            source_side=empty_device_i8,
+            row_indices=empty_device_i32,
+            part_indices=empty_device_i32,
+            ring_indices=empty_device_i32,
+            direction=empty_device_i8,
         ),
     )
 
@@ -1609,8 +1616,9 @@ def _build_polygon_output_from_faces_gpu(
     d_ring_edge_counts = valid_cycle_lengths
 
     # Source row per cycle: take the row_index of the first edge (device-resident
-    # until Step 10 materialization boundary per ADR-0005)
-    d_row_indices = cp.asarray(half_edge_graph.row_indices)
+    # until Step 10 materialization boundary per ADR-0005).
+    # Read from device_state directly to avoid D->H->D round-trip.
+    d_row_indices = cp.asarray(device.row_indices)
     d_cycle_source_rows = d_row_indices[d_ring_edge_starts].astype(cp.int32)
 
     # --- Step 6: Compute ring coordinate offsets (Tier 3a: exclusive_scan) ---
@@ -2270,13 +2278,10 @@ def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
     )
     next_edge_ids = sorted_edge_ids[previous_positions]
 
+    # Carry per-edge metadata from AtomicEdgeTable device state directly
+    # -- no D->H transfer.  GPU consumers read device_state.row_indices etc.
+    ae_ds = atomic_edges.device_state
     return HalfEdgeGraph(
-        source_segment_ids=atomic_edges.source_segment_ids.copy(),
-        source_side=atomic_edges.source_side.copy(),
-        row_indices=atomic_edges.row_indices.copy(),
-        part_indices=atomic_edges.part_indices.copy(),
-        ring_indices=atomic_edges.ring_indices.copy(),
-        direction=atomic_edges.direction.copy(),
         left_segment_count=atomic_edges.left_segment_count,
         right_segment_count=atomic_edges.right_segment_count,
         runtime_selection=atomic_edges.runtime_selection,
@@ -2292,6 +2297,12 @@ def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
             next_edge_ids=next_edge_ids,
             src_x=device.src_x,
             src_y=device.src_y,
+            source_segment_ids=ae_ds.source_segment_ids,
+            source_side=ae_ds.source_side,
+            row_indices=ae_ds.row_indices,
+            part_indices=ae_ds.part_indices,
+            ring_indices=ae_ds.ring_indices,
+            direction=ae_ds.direction,
         ),
     )
 
@@ -2610,25 +2621,18 @@ def build_gpu_overlay_faces(
 
     edge_count = half_edge_graph.edge_count
     if edge_count == 0:
-        empty_i32 = np.asarray([0], dtype=np.int32)
-        empty_i8 = np.asarray([], dtype=np.int8)
-        empty_f64 = np.asarray([], dtype=np.float64)
-        empty_device_i32 = runtime.from_host(empty_i32)
+        empty_device_i32 = runtime.allocate((1,), np.int32)
+        empty_device_i32_flat = runtime.allocate((0,), np.int32)
         empty_device_i8 = runtime.allocate((0,), np.int8)
         empty_device_f64 = runtime.allocate((0,), np.float64)
+        # Device-primary empty face table -- host arrays are None and
+        # will be lazily materialized via _ensure_host if accessed.
         return OverlayFaceTable(
-            face_offsets=empty_i32,
-            face_edge_ids=np.asarray([], dtype=np.int32),
-            bounded_mask=empty_i8,
-            signed_area=empty_f64,
-            centroid_x=empty_f64,
-            centroid_y=empty_f64,
-            left_covered=empty_i8,
-            right_covered=empty_i8,
             runtime_selection=half_edge_graph.runtime_selection,
+            _face_count=0,
             device_state=OverlayFaceDeviceState(
                 face_offsets=empty_device_i32,
-                face_edge_ids=runtime.allocate((0,), np.int32),
+                face_edge_ids=empty_device_i32_flat,
                 bounded_mask=empty_device_i8,
                 signed_area=empty_device_f64,
                 centroid_x=empty_device_f64,
@@ -2643,37 +2647,31 @@ def build_gpu_overlay_faces(
         (d_face_offsets, d_face_edge_ids, d_bounded_mask, d_signed_area,
          d_centroid_x, d_centroid_y, d_label_x, d_label_y, face_count) = _gpu_face_walk(half_edge_graph)
 
-        if face_count == 0:
-            face_offsets = np.asarray([0], dtype=np.int32)
-            face_edge_ids = np.asarray([], dtype=np.int32)
-            bounded_mask = np.asarray([], dtype=np.int8)
-            signed_area = np.asarray([], dtype=np.float64)
-            centroid_x = np.asarray([], dtype=np.float64)
-            centroid_y = np.asarray([], dtype=np.float64)
-            left_covered = np.asarray([], dtype=np.int8)
-            right_covered = np.asarray([], dtype=np.int8)
-        else:
+        if face_count > 0:
             # GPU face labeling: test sample points against input geometries
             d_left_covered, d_right_covered = _gpu_label_face_coverage(
                 left, right, d_label_x, d_label_y, face_count)
-            # Mask out unbounded faces (keep on device — ADR-0005)
+            # Mask out unbounded faces (keep on device -- ADR-0005)
             d_left_covered = cp.where(d_bounded_mask != 0, d_left_covered, 0).astype(cp.int8)
             d_right_covered = cp.where(d_bounded_mask != 0, d_right_covered, 0).astype(cp.int8)
-            # Skip D→H transfer — lazy materialization on demand (ADR-0005)
-            pass
+        else:
+            # _gpu_face_walk already returned device arrays for the zero case
+            d_left_covered = cp.empty(0, dtype=cp.int8)
+            d_right_covered = cp.empty(0, dtype=cp.int8)
 
+        # Device-primary: host arrays are None, lazily materialized on demand
         return OverlayFaceTable(
             runtime_selection=half_edge_graph.runtime_selection,
             _face_count=face_count,
             device_state=OverlayFaceDeviceState(
-                face_offsets=d_face_offsets if face_count > 0 else runtime.from_host(face_offsets),
-                face_edge_ids=d_face_edge_ids if face_count > 0 else runtime.from_host(face_edge_ids),
-                bounded_mask=d_bounded_mask if face_count > 0 else runtime.from_host(bounded_mask),
-                signed_area=d_signed_area if face_count > 0 else runtime.from_host(signed_area),
-                centroid_x=d_centroid_x if face_count > 0 else runtime.from_host(centroid_x),
-                centroid_y=d_centroid_y if face_count > 0 else runtime.from_host(centroid_y),
-                left_covered=d_left_covered if face_count > 0 else runtime.from_host(left_covered),
-                right_covered=d_right_covered if face_count > 0 else runtime.from_host(right_covered),
+                face_offsets=d_face_offsets,
+                face_edge_ids=d_face_edge_ids,
+                bounded_mask=d_bounded_mask,
+                signed_area=d_signed_area,
+                centroid_x=d_centroid_x,
+                centroid_y=d_centroid_y,
+                left_covered=d_left_covered,
+                right_covered=d_right_covered,
             ),
         )
 
@@ -3014,25 +3012,20 @@ def build_gpu_split_events(
             unique_y = all_y[unique_indices]
             unique_keys = unique_pairs.keys
 
+            # Device-primary: derive row/part/ring metadata on host lazily.
+            # Eagerly compute and cache source_side, row/part/ring indices
+            # so that downstream consumers (build_gpu_atomic_edges) that
+            # access them on host get correct values without requiring the
+            # full D->H of source_segment_ids/t/x/y.
             host_source_ids = runtime.copy_device_to_host(unique_source_ids).astype(np.int32, copy=False)
-            host_t = runtime.copy_device_to_host(unique_t)
-            host_x = runtime.copy_device_to_host(unique_x)
-            host_y = runtime.copy_device_to_host(unique_y)
             source_side, row_indices, part_indices, ring_indices = _segment_metadata(
                 host_source_ids,
                 left_segments=left_segments,
                 right_segments=right_segments,
             )
+            unique_count = int(unique_source_ids.size)
 
             return SplitEventTable(
-                source_segment_ids=host_source_ids,
-                source_side=source_side,
-                row_indices=row_indices,
-                part_indices=part_indices,
-                ring_indices=ring_indices,
-                t=np.asarray(host_t, dtype=np.float64),
-                x=np.asarray(host_x, dtype=np.float64),
-                y=np.asarray(host_y, dtype=np.float64),
                 left_segment_count=left_count,
                 right_segment_count=right_count,
                 runtime_selection=result.runtime_selection,
@@ -3043,6 +3036,12 @@ def build_gpu_split_events(
                     x=unique_x,
                     y=unique_y,
                 ),
+                _count=unique_count,
+                _source_segment_ids=host_source_ids,
+                _source_side=source_side,
+                _row_indices=np.asarray(row_indices, dtype=np.int32),
+                _part_indices=np.asarray(part_indices, dtype=np.int32),
+                _ring_indices=np.asarray(ring_indices, dtype=np.int32),
             )
         finally:
             runtime.free(pair_counts)
@@ -3103,6 +3102,10 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
                 src_y=empty_device_f64,
                 dst_x=empty_device_f64,
                 dst_y=empty_device_f64,
+                row_indices=empty_device_i32,
+                part_indices=empty_device_i32,
+                ring_indices=empty_device_i32,
+                source_side=empty_device_i8,
             ),
             _count=0,
         )
@@ -3162,20 +3165,37 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
         )
         runtime.synchronize()
 
-        # Eagerly copy host arrays needed for row/part/ring index lookup.
-        # The remaining host fields (src_x, src_y, ...) are lazy via _ensure_host.
-        host_source_ids = runtime.copy_device_to_host(out_source_ids).astype(np.int32, copy=False)
-        host_direction = runtime.copy_device_to_host(out_direction).astype(np.int8, copy=False)
-
+        # Compute per-edge metadata entirely on device to avoid D->H transfers.
         left_count = split_events.left_segment_count
-        source_side = np.where(host_source_ids < left_count, 1, 2).astype(np.int8, copy=False)
-        clip_idx = np.clip(
-            np.searchsorted(split_events.source_segment_ids, host_source_ids),
-            0, max(split_events.count - 1, 0),
-        )
-        row_indices = split_events.row_indices[clip_idx]
-        part_indices = split_events.part_indices[clip_idx]
-        ring_indices = split_events.ring_indices[clip_idx]
+        d_out_source_ids = cp.asarray(out_source_ids)
+        d_source_side = cp.where(d_out_source_ids < left_count, cp.int8(1), cp.int8(2)).astype(cp.int8, copy=False)
+
+        # Map atomic edge source_segment_ids -> split event row/part/ring indices
+        # using device-side searchsorted + gather.
+        d_split_source_ids = cp.asarray(device.source_segment_ids)
+        split_count = split_events.count
+        d_clip_idx = cp.clip(
+            cp.searchsorted(d_split_source_ids, d_out_source_ids),
+            0, max(split_count - 1, 0),
+        ).astype(cp.int32, copy=False)
+
+        # Derive row/part/ring from split_events host metadata (already cached)
+        # by transferring the small lookup tables to device.
+        h_row = split_events.row_indices
+        h_part = split_events.part_indices
+        h_ring = split_events.ring_indices
+        d_se_row = cp.asarray(h_row) if h_row.size > 0 else cp.empty(0, dtype=cp.int32)
+        d_se_part = cp.asarray(h_part) if h_part.size > 0 else cp.empty(0, dtype=cp.int32)
+        d_se_ring = cp.asarray(h_ring) if h_ring.size > 0 else cp.empty(0, dtype=cp.int32)
+
+        if d_se_row.size > 0:
+            d_row_indices = d_se_row[d_clip_idx]
+            d_part_indices = d_se_part[d_clip_idx]
+            d_ring_indices = d_se_ring[d_clip_idx]
+        else:
+            d_row_indices = cp.empty(0, dtype=cp.int32)
+            d_part_indices = cp.empty(0, dtype=cp.int32)
+            d_ring_indices = cp.empty(0, dtype=cp.int32)
 
         return AtomicEdgeTable(
             left_segment_count=split_events.left_segment_count,
@@ -3188,14 +3208,12 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
                 src_y=out_src_y,
                 dst_x=out_dst_x,
                 dst_y=out_dst_y,
+                row_indices=d_row_indices,
+                part_indices=d_part_indices,
+                ring_indices=d_ring_indices,
+                source_side=d_source_side,
             ),
             _count=pair_count * 2,
-            _source_segment_ids=host_source_ids,
-            _source_side=source_side,
-            _row_indices=np.asarray(row_indices, dtype=np.int32),
-            _part_indices=np.asarray(part_indices, dtype=np.int32),
-            _ring_indices=np.asarray(ring_indices, dtype=np.int32),
-            _direction=host_direction,
         )
     finally:
         runtime.free(adjacency_mask)

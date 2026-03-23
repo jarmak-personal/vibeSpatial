@@ -1049,6 +1049,8 @@ def _atomic_edges_from_rings(
                 source_segment_ids=empty_d_i32, direction=empty_d_i8,
                 src_x=empty_d_f64, src_y=empty_d_f64,
                 dst_x=empty_d_f64, dst_y=empty_d_f64,
+                row_indices=empty_d_i32, part_indices=empty_d_i32,
+                ring_indices=empty_d_i32, source_side=empty_d_i8,
             ),
             _count=0,
         )
@@ -1117,17 +1119,9 @@ def _atomic_edges_from_rings(
     # Part indices: same as row indices for simple polygons
     d_part_indices = d_row_indices.copy()
 
-    # Build AtomicEdgeTable with lazy host materialization.
-    # The GPU path (build_gpu_half_edge_graph) only reads device_state,
-    # count, left_segment_count, right_segment_count, and runtime_selection
-    # — so the 6 coordinate/id D2H copies are skipped entirely on the hot
-    # path.  Eagerly provide row/part/ring/side indices needed by the
-    # HalfEdgeGraph constructor.
-    h_row_indices = cp.asnumpy(d_row_indices)
-    h_part_indices = cp.asnumpy(d_part_indices)
-    h_ring_indices = cp.asnumpy(d_ring_indices)
-    h_source_side = cp.asnumpy(d_source_side)
-
+    # Build AtomicEdgeTable with device-primary storage.
+    # build_gpu_half_edge_graph reads device_state metadata directly,
+    # so no D->H transfers needed here.  Host arrays lazily materialized.
     return AtomicEdgeTable(
         left_segment_count=total_segments,
         right_segment_count=0,
@@ -1137,12 +1131,12 @@ def _atomic_edges_from_rings(
             direction=d_direction,
             src_x=d_src_x, src_y=d_src_y,
             dst_x=d_dst_x, dst_y=d_dst_y,
+            row_indices=d_row_indices,
+            part_indices=d_part_indices,
+            ring_indices=d_ring_indices,
+            source_side=d_source_side,
         ),
         _count=total_atomic,
-        _row_indices=h_row_indices,
-        _part_indices=h_part_indices,
-        _ring_indices=h_ring_indices,
-        _source_side=h_source_side,
     )
 
 
