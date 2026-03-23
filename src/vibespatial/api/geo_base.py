@@ -4963,11 +4963,9 @@ GeometryCollection
         --------
         GeoSeries.intersection
         """
-        from vibespatial.api.geoseries import GeoSeries
-
-        geometry_array = GeometryArray(self.geometry.values)
-        clipped_geometry = geometry_array.clip_by_rect(xmin, ymin, xmax, ymax)
-        return GeoSeries(clipped_geometry, index=self.index, crs=self.crs)
+        return _delegate_geo_method(
+            "clip_by_rect", self, xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax
+        )
 
     def shortest_line(self, other, align=None):
         """Return the shortest two-point line between two geometries.
@@ -5302,11 +5300,7 @@ GeometryCollection
         1  POLYGON ((0 0, 1 1, 1 0, 0 0))   0.0   0.0   1.0   1.0
         2           LINESTRING (0 1, 1 2)   0.0   1.0   1.0   2.0
         """
-        values = self.geometry.values
-        if hasattr(values, "bounds"):
-            bounds = values.bounds
-        else:
-            bounds = GeometryArray(values).bounds
+        bounds = self.geometry.values.bounds
         return DataFrame(
             bounds, columns=["minx", "miny", "maxx", "maxy"], index=self.index
         )
@@ -5328,10 +5322,7 @@ GeometryCollection
         >>> gdf.total_bounds
         array([ 0., -1.,  3.,  2.])
         """
-        values = self.geometry.values
-        if hasattr(values, "total_bounds"):
-            return values.total_bounds
-        return GeometryArray(values).total_bounds
+        return self.geometry.values.total_bounds
 
     @property
     def sindex(self):
