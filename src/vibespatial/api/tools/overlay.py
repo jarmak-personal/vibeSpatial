@@ -33,6 +33,45 @@ def _extract_owned_pair(df1, df2):
     return None, None
 
 
+def _make_valid_geoseries(gs):
+    """Apply make_valid to polygon rows of a GeoSeries, preferring GPU path.
+
+    When the GeoSeries has owned backing, routes through make_valid_owned to
+    keep data device-resident and avoid Shapely materialisation.  Falls back
+    to the standard GeoSeries.make_valid() path otherwise.
+    """
+    ga = gs.values
+    owned = getattr(ga, '_owned', None)
+    poly_ix = gs.geom_type.isin(POLYGON_GEOM_TYPES)
+    if not poly_ix.any():
+        return gs
+
+    if owned is not None:
+        from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+
+        mv_result = make_valid_owned(owned=owned)
+        if mv_result.repaired_rows.size > 0:
+            # Repair happened — rebuild GeoSeries from repaired geometries.
+            # Preserve device residency via from_owned when possible; fall
+            # back to a plain GeometryArray when repair produced types that
+            # OwnedGeometryArray cannot represent (e.g. GeometryCollection).
+            try:
+                from vibespatial.geometry.owned import from_shapely_geometries
+
+                new_owned = from_shapely_geometries(list(mv_result.geometries))
+                new_ga = GeometryArray.from_owned(new_owned, crs=ga.crs)
+            except NotImplementedError:
+                new_ga = GeometryArray(mv_result.geometries, crs=ga.crs)
+            return GeoSeries(new_ga, index=gs.index)
+        # All rows already valid — owned backing preserved, return as-is.
+        return gs
+
+    # Shapely fallback path: no owned backing available.
+    gs = gs.copy()
+    gs.loc[poly_ix] = gs[poly_ix].make_valid()
+    return gs
+
+
 def _ensure_geometry_column(df):
     """Ensure that the geometry column is called 'geometry'.
 
@@ -192,8 +231,9 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
             right.reset_index(drop=True, inplace=True)
             intersections = left.intersection(right)
 
-        poly_ix = intersections.geom_type.isin(POLYGON_GEOM_TYPES)
-        intersections.loc[poly_ix] = intersections[poly_ix].make_valid()
+        # Post-intersection make_valid: use GPU path when owned backing is
+        # available to avoid Shapely materialisation on the critical path.
+        intersections = _make_valid_geoseries(intersections)
 
         geom_intersect = intersections
 
@@ -354,8 +394,9 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
 
         differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
 
-    poly_ix = differences.geom_type.isin(POLYGON_GEOM_TYPES)
-    differences.loc[poly_ix] = differences[poly_ix].make_valid()
+    # Post-difference make_valid: use GPU path when owned backing is
+    # available to avoid Shapely materialisation on the critical path.
+    differences = _make_valid_geoseries(differences)
     geom_diff = differences[~differences.is_empty].copy()
     dfdiff = df1[~differences.is_empty].copy()
     dfdiff[dfdiff._geometry_column_name] = geom_diff
@@ -587,6 +628,48 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     def _make_valid(df):
         df = df.copy()
         if df.geom_type.isin(POLYGON_GEOM_TYPES).all():
+            # GPU make_valid path: when owned backing is available, route
+            # through make_valid_owned to keep data device-resident and
+            # avoid Shapely materialisation on the overlay critical path.
+            ga = df.geometry.values
+            owned = getattr(ga, '_owned', None)
+            if make_valid and owned is not None:
+                from vibespatial.constructive.make_valid_pipeline import (
+                    make_valid_owned,
+                )
+
+                mv_result = make_valid_owned(owned=owned)
+                if mv_result.repaired_rows.size > 0:
+                    # Repair happened — rebuild geometry column from result.
+                    # make_valid may change geometry type (e.g. Polygon →
+                    # GeometryCollection), so we must go through Shapely
+                    # to honour _collection_extract downstream.  Fall back
+                    # to a plain GeometryArray when result contains types
+                    # that OwnedGeometryArray cannot represent.
+                    try:
+                        from vibespatial.geometry.owned import (
+                            from_shapely_geometries,
+                        )
+
+                        new_owned = from_shapely_geometries(
+                            list(mv_result.geometries),
+                        )
+                        new_ga = GeometryArray.from_owned(
+                            new_owned, crs=df.crs,
+                        )
+                    except NotImplementedError:
+                        new_ga = GeometryArray(
+                            mv_result.geometries, crs=df.crs,
+                        )
+                    col = df._geometry_column_name
+                    df[col] = GeoSeries(new_ga)
+                    df = _collection_extract(
+                        df, geom_type="Polygon", keep_geom_type_warning=False
+                    )
+                # else: all rows already valid — owned backing preserved
+                #       by df.copy() above (GeometryArray.copy preserves _owned).
+                return df
+
             mask = ~df.geometry.is_valid
             col = df._geometry_column_name
             if make_valid:
