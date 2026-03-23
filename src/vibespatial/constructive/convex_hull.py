@@ -47,8 +47,9 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.residency import Residency
 
 from .measurement import _PRECISION_PREAMBLE
@@ -777,6 +778,7 @@ def convex_hull_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> OwnedGeometryArray:
     """Compute the convex hull of each geometry.
 
@@ -790,6 +792,10 @@ def convex_hull_owned(
         Input geometries (any family).
     dispatch_mode : ExecutionMode or str
         Execution mode selection.  Defaults to AUTO.
+    precision : PrecisionMode or str
+        Precision mode selection.  Defaults to AUTO.
+        COARSE class: hull vertices are exact coordinate subsets,
+        stays fp64 on all devices.
 
     Returns
     -------
@@ -811,6 +817,12 @@ def convex_hull_owned(
 
     # Check if GPU path is viable
     if selection.selected is ExecutionMode.GPU and cp is not None:
+        # COARSE class: always fp64, precision_plan used only for event metadata.
+        precision_plan = select_precision_plan(
+            runtime_selection=selection,
+            kernel_class=KernelClass.COARSE,
+            requested=precision,
+        )
         # GPU path supports single-family non-MultiPolygon inputs
         families_with_rows = [
             fam for fam, buf in owned.families.items()
@@ -821,9 +833,29 @@ def convex_hull_owned(
 
         if is_single_family and not has_multipolygon:
             try:
-                return _convex_hull_gpu(owned)
+                result = _convex_hull_gpu(owned)
             except Exception:
                 logger.debug("GPU convex_hull failed, falling back to CPU",
                             exc_info=True)
+            else:
+                record_dispatch_event(
+                    surface="geopandas.array.convex_hull",
+                    operation="convex_hull",
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.GPU,
+                    implementation="convex_hull_gpu_nvrtc",
+                    reason=selection.reason,
+                    detail=f"precision={precision_plan.compute_precision}",
+                )
+                return result
 
-    return _convex_hull_cpu(owned)
+    result = _convex_hull_cpu(owned)
+    record_dispatch_event(
+        surface="geopandas.array.convex_hull",
+        operation="convex_hull",
+        requested=dispatch_mode,
+        selected=ExecutionMode.CPU,
+        implementation="convex_hull_cpu_numpy",
+        reason=selection.reason,
+    )
+    return result
