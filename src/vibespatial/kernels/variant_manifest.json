@@ -160,7 +160,7 @@
       "multipolygon"
     ],
     "kernel": "polygon_difference",
-    "module": "vibespatial.kernels.constructive",
+    "module": "vibespatial.kernels.constructive.polygon_difference",
     "tier": 3,
     "variants": [
       "gpu-overlay",

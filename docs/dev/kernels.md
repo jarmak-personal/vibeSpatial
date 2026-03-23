@@ -21,6 +21,9 @@ is an NVRTC source compiled at runtime.
 | Validity / Simplicity | `constructive/validity.py` | is_valid (ring closure, min coords, orientation), is_simple (self-intersection) |
 | Clip by rect | `constructive/clip_rect.py` | Bounds-filtered rectangle clip (point, line, polygon families via Sutherland-Hodgman / Liang-Barsky GPU kernels) |
 | Distance metrics | `spatial/distance_metrics.py` | Hausdorff (min-of-max brute force), discrete Frechet (DP coupling matrix) |
+| Polygon intersection | `kernels/constructive/polygon_intersection.py` | Element-wise Sutherland-Hodgman polygon clipping (count-scatter, device-resident output) |
+| Polygon difference | `kernels/constructive/polygon_difference.py` | Element-wise polygon difference via overlay topology pipeline (face selection) |
+| Segmented union | `kernels/constructive/segmented_union.py` | Per-group polygon union via binary-tree reduction of overlay_union_owned |
 
 ## Adding a new kernel
 

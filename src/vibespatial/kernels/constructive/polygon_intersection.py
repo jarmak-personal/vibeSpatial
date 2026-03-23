@@ -129,7 +129,7 @@ __device__ void line_intersect(
 /*  registers/local memory to count output vertices.                   */
 /* ------------------------------------------------------------------ */
 
-extern "C" __global__ void polygon_intersection_count(
+extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
     /* Left (subject) polygon buffers */
     const double* __restrict__ left_x,
     const double* __restrict__ left_y,
@@ -292,7 +292,7 @@ extern "C" __global__ void polygon_intersection_count(
 /*  the result vertices at the pre-computed offsets.                    */
 /* ------------------------------------------------------------------ */
 
-extern "C" __global__ void polygon_intersection_scatter(
+extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatter(
     /* Left (subject) polygon buffers */
     const double* __restrict__ left_x,
     const double* __restrict__ left_y,

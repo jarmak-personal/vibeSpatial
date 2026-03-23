@@ -219,10 +219,9 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
 
             # Assemble full result: unchanged left rows from GeoDataFrame,
             # differenced rows materialized from owned result.
-            diff_shapely = diff_owned.to_shapely()
+            diff_shapely = np.asarray(diff_owned.to_shapely(), dtype=object)
             result_geoms = np.asarray(df1.geometry, dtype=object).copy()
-            for i, pos in enumerate(idx1_unique):
-                result_geoms[pos] = diff_shapely[i]
+            result_geoms[idx1_unique] = diff_shapely
 
             used_owned = True
         except (ImportError, NotImplementedError):
