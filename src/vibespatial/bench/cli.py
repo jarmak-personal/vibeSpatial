@@ -152,6 +152,7 @@ def _output_mode(args: argparse.Namespace) -> str:
 def _write_output(text: str, output_path: Path | None) -> None:
     print(text)
     if output_path:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(text, encoding="utf-8")
         print(f"Written to {output_path}", file=sys.stderr)
 
