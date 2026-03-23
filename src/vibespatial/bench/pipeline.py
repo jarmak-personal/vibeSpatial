@@ -1178,10 +1178,12 @@ def _batched_clip_many_vs_one(
 ) -> OwnedGeometryArray:
     """Batched GPU clip: intersect N polygons against 1 polygon in GPU-sized batches.
 
-    Bypasses spatial_overlay_owned (spatial-join overhead) and the
-    _GPU_OVERLAY_MAX_ROWS=10K limit in _overlay_owned.  Splits the many-side
-    into batches small enough for GPU pairwise overlay, replicates the
+    Bypasses spatial_overlay_owned (spatial-join overhead).  Splits the
+    many-side into batches for GPU pairwise overlay, replicates the
     single-row side per batch, and collects results.
+
+    Note: the former _GPU_OVERLAY_MAX_ROWS=10K limit was removed in Phase 20;
+    batching here is retained for memory management of very large arrays.
 
     ADR-0005: keeps intermediate OwnedGeometryArrays device-resident within
     each batch; materializes to Shapely only for the final merge.
@@ -1223,8 +1225,7 @@ def _overlay_intersection_with_fallback(
     """GPU-first overlay intersection with geopandas.overlay fallback.
 
     Returns (result, fell_back) tuple.  For many-vs-1 patterns (e.g. 100K
-    veg x 1 corridor), uses batched GPU clip to avoid spatial-join overhead
-    and the _GPU_OVERLAY_MAX_ROWS CPU fallback.
+    veg x 1 corridor), uses batched GPU clip to avoid spatial-join overhead.
     """
     try:
         _polygon_only = (
@@ -1233,7 +1234,7 @@ def _overlay_intersection_with_fallback(
         )
         if left.row_count != right.row_count:
             # Many-vs-one fast path: batched GPU clip avoids spatial-join
-            # overhead and the 10K row GPU overlay limit.
+            # overhead and manages GPU memory for very large arrays.
             if (_polygon_only
                     and min(left.row_count, right.row_count) == 1):
                 if right.row_count == 1 and left.row_count > 1:

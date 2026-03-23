@@ -3849,15 +3849,14 @@ def _overlay_owned(
         if rectangle_fast_path is not None:
             return rectangle_fast_path
 
-    # For AUTO mode, use CPU shapely for bulk overlays where the full GPU
-    # overlay pipeline (split events → half-edge graph → face walk) would be
-    # slower than shapely's optimized C implementation. GPU overlay excels at
-    # pairwise operations but the topology construction cost dominates at
-    # high row counts. Threshold based on benchmark data (ADR-0016).
-    _GPU_OVERLAY_MAX_ROWS = 10_000
-    total_rows = left.row_count + right.row_count
-    if requested is ExecutionMode.AUTO and total_rows > _GPU_OVERLAY_MAX_ROWS:
-        return _overlay_owned(left, right, operation=operation, dispatch_mode=ExecutionMode.CPU)
+    # Phase 20: The 10K row CPU threshold (_GPU_OVERLAY_MAX_ROWS) has been
+    # removed.  Phases 7-15 eliminated the serial bottlenecks that made GPU
+    # overlay slower than Shapely at high row counts.  For AUTO mode the GPU
+    # path is now selected whenever a CUDA runtime is available; input
+    # residency is already on-device when the caller used the zero-copy
+    # pipeline, so no additional transfer heuristic is needed here — the
+    # adaptive runtime handles crossover decisions upstream via
+    # plan_dispatch_selection().
 
     split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
     atomic_edges = build_gpu_atomic_edges(split_events)
@@ -3982,8 +3981,8 @@ def spatial_overlay_owned(
 
     # Stage 2: Batch pairwise overlay.
     # Replicate left/right rows to form row-matched arrays, then run the
-    # standard pairwise overlay.  The _GPU_OVERLAY_MAX_ROWS threshold in
-    # _overlay_owned applies to the *pairwise* batch, not the spatial overlay.
+    # standard pairwise overlay via _overlay_owned (no row-count threshold;
+    # GPU overlay is available for all dataset sizes since Phase 20).
     #
     # Optimization: batch all pairs into a single pairwise overlay call by
     # gathering left rows at left_indices and right rows at right_indices.
