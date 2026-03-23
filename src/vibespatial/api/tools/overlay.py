@@ -169,38 +169,100 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
         ], used_owned
 
 
-def _overlay_difference(df1, df2):
-    """Overlay Difference operation used in overlay function."""
+def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
+    """Overlay Difference operation used in overlay function.
+
+    Returns
+    -------
+    tuple[GeoDataFrame, bool]
+        Result GeoDataFrame and whether the owned dispatch path was used.
+    """
     # ADR-0036 boundary: spatial index produces index arrays only.
     idx1, idx2 = _intersecting_index_pairs(df1, df2)
 
-    # Vectorized grouped-union approach: for each left geometry, compute
-    # left_i - union(overlapping right geometries).  Replaces per-geometry
-    # Python loop with grouped shapely.union_all + vectorized shapely.difference.
     n_left = len(df1)
-    left_geoms = np.asarray(df1.geometry, dtype=object)
-    result_geoms = left_geoms.copy()
+    used_owned = False
+    result_geoms = None
 
-    if idx1.size > 0:
-        right_geoms = np.asarray(df2.geometry, dtype=object)
-        right_unions = np.empty(n_left, dtype=object)
-        right_unions.fill(None)
+    # Owned-path dispatch: selective right materialization + GPU difference
+    # via binary_constructive_owned when both DataFrames have owned backing.
+    if idx1.size > 0 and left_owned is not None and right_owned is not None:
+        try:
+            from vibespatial.constructive.binary_constructive import (
+                binary_constructive_owned,
+            )
+            from vibespatial.geometry.owned import from_shapely_geometries
 
-        # O(N log N) grouping via np.split — avoids O(K*N) per-group mask scan.
-        idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
-        idx2_groups = np.split(idx2, idx1_split_at[1:])
-        for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
-            neighbors = right_geoms[neighbors_idx]
-            if len(neighbors) == 1:
-                right_unions[left_pos] = neighbors[0]
-            else:
-                right_unions[left_pos] = shapely.union_all(neighbors)
+            # Selective right materialization: only unique participating rows.
+            # right_owned.take() operates at buffer level -- no Shapely.
+            unique_right = np.unique(idx2)
+            right_sub = right_owned.take(unique_right)
+            right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
 
-        has_neighbors = np.zeros(n_left, dtype=bool)
-        has_neighbors[idx1_unique] = True
-        result_geoms[has_neighbors] = shapely.difference(
-            left_geoms[has_neighbors], right_unions[has_neighbors],
-        )
+            # Remap idx2 from original to subset space.
+            right_remap = np.empty(right_owned.row_count, dtype=np.intp)
+            right_remap[unique_right] = np.arange(len(unique_right))
+
+            # Grouped union of right neighbors per left geometry.
+            # O(N log N) grouping via np.split.
+            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
+            idx2_groups = np.split(idx2, idx1_split_at[1:])
+
+            right_union_list = []
+            for _left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
+                remapped = right_remap[neighbors_idx]
+                neighbors = right_shapely[remapped]
+                if len(neighbors) == 1:
+                    right_union_list.append(neighbors[0])
+                else:
+                    right_union_list.append(shapely.union_all(neighbors))
+
+            # Binary difference via owned dispatch (GPU when available).
+            left_sub = left_owned.take(idx1_unique)
+            right_union_owned = from_shapely_geometries(right_union_list)
+            diff_owned = binary_constructive_owned(
+                "difference", left_sub, right_union_owned,
+            )
+
+            # Assemble full result: unchanged left rows read from the
+            # GeoDataFrame (already host-side Shapely), differenced rows
+            # materialized from the GPU result only.
+            diff_shapely = diff_owned.to_shapely()
+            result_geoms = np.asarray(df1.geometry, dtype=object).copy()
+            for i, pos in enumerate(idx1_unique):
+                result_geoms[pos] = diff_shapely[i]
+
+            used_owned = True
+        except (ImportError, NotImplementedError):
+            pass
+
+    if result_geoms is None:
+        # Vectorized grouped-union approach: for each left geometry, compute
+        # left_i - union(overlapping right geometries).  Replaces per-geometry
+        # Python loop with grouped shapely.union_all + vectorized shapely.difference.
+        left_geoms = np.asarray(df1.geometry, dtype=object)
+        result_geoms = left_geoms.copy()
+
+        if idx1.size > 0:
+            right_geoms = np.asarray(df2.geometry, dtype=object)
+            right_unions = np.empty(n_left, dtype=object)
+            right_unions.fill(None)
+
+            # O(N log N) grouping via np.split — avoids O(K*N) per-group mask scan.
+            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
+            idx2_groups = np.split(idx2, idx1_split_at[1:])
+            for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
+                neighbors = right_geoms[neighbors_idx]
+                if len(neighbors) == 1:
+                    right_unions[left_pos] = neighbors[0]
+                else:
+                    right_unions[left_pos] = shapely.union_all(neighbors)
+
+            has_neighbors = np.zeros(n_left, dtype=bool)
+            has_neighbors[idx1_unique] = True
+            result_geoms[has_neighbors] = shapely.difference(
+                left_geoms[has_neighbors], right_unions[has_neighbors],
+            )
 
     differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
     poly_ix = differences.geom_type.isin(POLYGON_GEOM_TYPES)
@@ -208,13 +270,16 @@ def _overlay_difference(df1, df2):
     geom_diff = differences[~differences.is_empty].copy()
     dfdiff = df1[~differences.is_empty].copy()
     dfdiff[dfdiff._geometry_column_name] = geom_diff
-    return dfdiff
+    return dfdiff, used_owned
 
 
 def _overlay_identity(df1, df2, left_owned=None, right_owned=None):
-    """Overlay Identity operation used in overlay function."""
-    dfintersection, _ = _overlay_intersection(df1, df2, left_owned, right_owned)
-    dfdifference = _overlay_difference(df1, df2)
+    """Overlay Identity operation used in overlay function.
+
+    Returns (GeoDataFrame, bool) -- result and whether any sub-op used owned dispatch.
+    """
+    dfintersection, used_inter = _overlay_intersection(df1, df2, left_owned, right_owned)
+    dfdifference, used_diff = _overlay_difference(df1, df2, left_owned, right_owned)
     dfdifference = _ensure_geometry_column(dfdifference)
 
     # Columns that were suffixed in dfintersection need to be suffixed in dfdifference
@@ -237,13 +302,16 @@ def _overlay_identity(df1, df2, left_owned=None, right_owned=None):
         result = GeoDataFrame(result)
     if result.crs is None and df1.crs is not None:
         result = result.set_crs(df1.crs)
-    return result
+    return result, used_inter or used_diff
 
 
-def _overlay_symmetric_diff(df1, df2):
-    """Overlay Symmetric Difference operation used in overlay function."""
-    dfdiff1 = _overlay_difference(df1, df2)
-    dfdiff2 = _overlay_difference(df2, df1)
+def _overlay_symmetric_diff(df1, df2, left_owned=None, right_owned=None):
+    """Overlay Symmetric Difference operation used in overlay function.
+
+    Returns (GeoDataFrame, bool) -- result and whether any sub-op used owned dispatch.
+    """
+    dfdiff1, used1 = _overlay_difference(df1, df2, left_owned, right_owned)
+    dfdiff2, used2 = _overlay_difference(df2, df1, right_owned, left_owned)
     dfdiff1["__idx1"] = range(len(dfdiff1))
     dfdiff2["__idx2"] = range(len(dfdiff2))
     dfdiff1["__idx2"] = np.nan
@@ -264,13 +332,16 @@ def _overlay_symmetric_diff(df1, df2):
     dfsym.drop(["geometry_1", "geometry_2"], axis=1, inplace=True)
     dfsym.reset_index(drop=True, inplace=True)
     dfsym = GeoDataFrame(dfsym, geometry=geometry, crs=df1.crs)
-    return dfsym
+    return dfsym, used1 or used2
 
 
 def _overlay_union(df1, df2, left_owned=None, right_owned=None):
-    """Overlay Union operation used in overlay function."""
-    dfinter, _ = _overlay_intersection(df1, df2, left_owned, right_owned)
-    dfsym = _overlay_symmetric_diff(df1, df2)
+    """Overlay Union operation used in overlay function.
+
+    Returns (GeoDataFrame, bool) -- result and whether any sub-op used owned dispatch.
+    """
+    dfinter, used_inter = _overlay_intersection(df1, df2, left_owned, right_owned)
+    dfsym, used_sym = _overlay_symmetric_diff(df1, df2, left_owned, right_owned)
     dfunion = pd.concat([dfinter, dfsym], ignore_index=True, sort=False)
     # keep geometry column last
     columns = list(dfunion.columns)
@@ -281,7 +352,7 @@ def _overlay_union(df1, df2, left_owned=None, right_owned=None):
         result = GeoDataFrame(result)
     if result.crs is None and df1.crs is not None:
         result = result.set_crs(df1.crs)
-    return result
+    return result, used_inter or used_sym
 
 
 def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
@@ -469,17 +540,21 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     with warnings.catch_warnings():  # CRS checked above, suppress array-level warning
         warnings.filterwarnings("ignore", message="CRS mismatch between the CRS")
         if how == "difference":
-            result = _overlay_difference(df1, df2)
+            result, _used_owned = _overlay_difference(
+                df1, df2, left_owned, right_owned,
+            )
         elif how == "intersection":
             result, _used_owned = _overlay_intersection(
                 df1, df2, left_owned, right_owned,
             )
         elif how == "symmetric_difference":
-            result = _overlay_symmetric_diff(df1, df2)
+            result, _used_owned = _overlay_symmetric_diff(
+                df1, df2, left_owned, right_owned,
+            )
         elif how == "union":
-            result = _overlay_union(df1, df2, left_owned, right_owned)
+            result, _used_owned = _overlay_union(df1, df2, left_owned, right_owned)
         elif how == "identity":
-            result = _overlay_identity(df1, df2, left_owned, right_owned)
+            result, _used_owned = _overlay_identity(df1, df2, left_owned, right_owned)
 
         if how in ["intersection", "symmetric_difference", "union", "identity"]:
             result.drop(["__idx1", "__idx2"], axis=1, inplace=True)
@@ -489,9 +564,9 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
         operation=f"overlay_{how}",
         implementation="owned_dispatch" if _used_owned else "shapely_host",
         reason=(
-            "intersection via owned-path dispatch"
+            f"{how} via owned-path dispatch"
             if _used_owned
-            else "no owned backing, fallback, or composite op with CPU-only difference"
+            else "no owned backing or host fallback"
         ),
         detail=(
             f"left_rows={len(df1)}, right_rows={len(df2)}, "

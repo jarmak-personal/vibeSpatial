@@ -1778,6 +1778,28 @@ class GeometryArray(ExtensionArray):
         if self.crs.is_exact_same(crs):
             return self
 
+        # Owned-path dispatch: reproject on-device via vibeProj when DGA
+        # backing is available, avoiding Shapely materialization entirely.
+        if self._owned is not None:
+            try:
+                from vibespatial.geometry.device_array import _to_crs_owned
+                from vibespatial.runtime.dispatch import record_dispatch_event
+
+                dga_result = _to_crs_owned(self._owned, self.crs, crs)
+                record_dispatch_event(
+                    surface="geopandas.array.to_crs",
+                    operation="to_crs",
+                    implementation="vibeproj_device",
+                    reason="owned backing available, vibeProj on-device transform",
+                    detail=f"rows={len(self)}, src={self.crs}, dst={crs}",
+                    selected=ExecutionMode.GPU,
+                )
+                return GeometryArray.from_owned(dga_result._owned, crs=crs)
+            except (ImportError, NotImplementedError):
+                # vibeProj not installed or CRS not supported -- fall through
+                # to Shapely/pyproj path.
+                pass
+
         transform_func = _make_transform_func(self.crs, crs)
 
         new_data = transform(self._data, transform_func)

@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 133/200 lines
+Body Budget: 138/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -21,8 +21,8 @@ Section Map (Body Lines)
 | 66-75 | Fallback |
 | 76-89 | Session Execution Mode Override |
 | 90-104 | Provenance Rewrite Override |
-| 105-127 | Index-Array Boundary Model (ADR-0036) |
-| 128-133 | Compatibility |
+| 105-132 | Index-Array Boundary Model (ADR-0036) |
+| 133-138 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -145,6 +145,11 @@ Attribute assembly is always pandas on host.  GPU VRAM is reserved for geometry.
   buffer level (via `OwnedGeometryArray.take`), bypassing Shapely
   materialization.  Falls back to the standard GeoSeries path on
   `NotImplementedError` (e.g. GeometryCollection results).
+- `_overlay_difference` also dispatches through `binary_constructive_owned`
+  when owned backing is available: selective right materialization
+  (only unique participating rows via `take`), grouped union on host,
+  then GPU-accelerated difference.  `_overlay_symmetric_diff`,
+  `_overlay_union`, and `_overlay_identity` inherit this via delegation.
 - I/O paths (`io_geoparquet.py`) keep Arrow tables through geometry decode and
   defer `.to_pandas()` to the GeoDataFrame construction boundary.
 - Contract tests in `tests/test_index_array_boundary.py` validate the boundary
