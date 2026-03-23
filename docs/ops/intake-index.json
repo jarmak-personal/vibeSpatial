@@ -14206,10 +14206,12 @@
       "referenced_by": [],
       "symbols": [
         "_envelope_gpu",
+        "_envelope_cpu",
         "envelope_owned"
       ],
       "tokens": [
         "constructive",
+        "cpu",
         "envelope",
         "gpu",
         "owned",

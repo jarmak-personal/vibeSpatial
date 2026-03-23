@@ -35,8 +35,9 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.residency import Residency
 
 from .measurement import _PRECISION_PREAMBLE
@@ -143,45 +144,29 @@ def _envelope_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
 
 # ---------------------------------------------------------------------------
-# Public dispatch API
+# CPU fallback
 # ---------------------------------------------------------------------------
 
-def envelope_owned(
-    owned: OwnedGeometryArray,
-    *,
-    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
-) -> OwnedGeometryArray:
-    """Compute the envelope (bounding box) for each geometry.
-
-    Returns an OwnedGeometryArray of Polygon geometries.
-    """
-    row_count = owned.row_count
-    if row_count == 0:
-        from vibespatial.geometry.owned import from_shapely_geometries
-
-        return from_shapely_geometries([])
-
-    selection = plan_dispatch_selection(
-        kernel_name="envelope",
-        kernel_class=KernelClass.COARSE,
-        row_count=row_count,
-        requested_mode=dispatch_mode,
-    )
-
-    if selection.selected is ExecutionMode.GPU:
-        try:
-            return _envelope_gpu(owned)
-        except Exception:
-            pass
-
-    # CPU fallback: compute bounds and build polygons
+@register_kernel_variant(
+    "envelope",
+    "cpu",
+    kernel_class=KernelClass.COARSE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=(
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    tags=("shapely", "constructive", "envelope"),
+)
+def _envelope_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
+    """Compute envelope via vectorized bounds on host."""
+    from vibespatial.geometry.buffers import get_geometry_buffer_schema
     from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 
     bounds = compute_geometry_bounds(owned)
-    from vibespatial.geometry.buffers import get_geometry_buffer_schema
+    n = owned.row_count
 
-    # Build host-side Polygon OwnedGeometryArray
-    n = row_count
     x_out = np.empty(n * 5, dtype=np.float64)
     y_out = np.empty(n * 5, dtype=np.float64)
     x_out[0::5] = bounds[:, 0]  # xmin
@@ -221,3 +206,69 @@ def envelope_owned(
         families={GeometryFamily.POLYGON: polygon_buffer},
         residency=Residency.HOST,
     )
+
+
+# ---------------------------------------------------------------------------
+# Public dispatch API
+# ---------------------------------------------------------------------------
+
+def envelope_owned(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray:
+    """Compute the envelope (bounding box) for each geometry.
+
+    Returns an OwnedGeometryArray of Polygon geometries.
+    """
+    row_count = owned.row_count
+    if row_count == 0:
+        from vibespatial.geometry.owned import from_shapely_geometries
+
+        return from_shapely_geometries([])
+
+    selection = plan_dispatch_selection(
+        kernel_name="envelope",
+        kernel_class=KernelClass.COARSE,
+        row_count=row_count,
+        requested_mode=dispatch_mode,
+    )
+
+    if selection.selected is ExecutionMode.GPU:
+        precision_plan = select_precision_plan(
+            runtime_selection=selection,
+            kernel_class=KernelClass.COARSE,
+            requested=precision,
+        )
+        try:
+            result = _envelope_gpu(owned)
+        except Exception:
+            pass
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.envelope",
+                operation="envelope",
+                implementation="envelope_gpu_nvrtc",
+                reason=selection.reason,
+                detail=(
+                    f"rows={row_count}, "
+                    f"plan={precision_plan.compute_precision.value}, "
+                    f"actual=fp64 (COARSE, bounds-exact)"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
+
+    result = _envelope_cpu(owned)
+    record_dispatch_event(
+        surface="geopandas.array.envelope",
+        operation="envelope",
+        implementation="envelope_cpu_bounds",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+    )
+    return result

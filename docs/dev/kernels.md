@@ -14,6 +14,7 @@ is an NVRTC source compiled at runtime.
 | Stroke | `stroke_kernels.py` | Point buffer, offset curve |
 | Make valid | `make_valid_gpu.py` | GPU polygon repair |
 | Binary constructive | `constructive/binary_constructive.py` | Intersection, union, difference, symmetric difference (PIP + overlay dispatch) |
+| Envelope | `constructive/envelope.py` | Bounding-box polygon (5-vertex closed ring) |
 
 ## Adding a new kernel
 

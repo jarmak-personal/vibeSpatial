@@ -42,5 +42,22 @@
       "gpu-overlay-pip",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "point",
+      "multipoint",
+      "linestring",
+      "multilinestring",
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "envelope",
+    "module": "vibespatial.constructive.envelope",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python",
+      "cpu"
+    ]
   }
 ]
