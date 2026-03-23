@@ -753,15 +753,18 @@ assign_holes_to_exteriors(
     out_exterior_id[r] = r;
     return;
   }
-  // Hole: find smallest containing exterior
+  // Hole: find smallest containing exterior whose area exceeds |hole area|
   const double px = ring_centroid_x[r];
   const double py = ring_centroid_y[r];
+  const double abs_hole_area = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
   double best_area = 1e308;
   int best_exterior = -1;
   for (int ei = 0; ei < exterior_count; ++ei) {
     const int ext = exterior_indices[ei];
     const double ext_area = ring_area[ext];
     if (ext_area <= 0.0 || ext_area >= best_area) continue;
+    // Exterior must be strictly larger than the candidate hole
+    if (ext_area <= abs_hole_area) continue;
     // PIP test against exterior ring coordinates
     const int coord_start = ring_coord_offsets[ext];
     const int n = ring_edge_counts[ext] + 1;  // +1 for closure
@@ -1660,6 +1663,8 @@ def _build_polygon_output_from_faces_gpu(
 
     runtime = get_cuda_runtime()
     kernels = _overlay_face_assembly_kernels()
+    walk_kernels = _overlay_face_walk_kernels()
+    kernels.update(walk_kernels)
     ptr = runtime.pointer
     edge_count = half_edge_graph.edge_count
     face_count = faces.face_count
@@ -1815,14 +1820,8 @@ def _build_polygon_output_from_faces_gpu(
     # Each ring needs edge_count + 1 coordinates (for closure)
     ring_coord_counts = d_ring_edge_counts + 1
     d_ring_coord_offsets = exclusive_sum(ring_coord_counts.astype(cp.int32, copy=False))
-    # Batch two scalar reads into one D->H transfer: total_coords (offset[-1]+count[-1])
-    # and boundary_total (offset[-1]) — the latter is reused in Step 8 merge.
-    _scalar_pair = cp.asnumpy(cp.stack([
-        d_ring_coord_offsets[-1] + ring_coord_counts[-1],
-        d_ring_coord_offsets[-1],
-    ]))
-    total_coords = int(_scalar_pair[0])
-    boundary_total = int(_scalar_pair[1])
+    # Single scalar D->H read: total_coords = last_offset + last_count.
+    total_coords = int(cp.asnumpy(d_ring_coord_offsets[-1:] + ring_coord_counts[-1:])[0])
 
     # --- Step 7: Scatter ring coordinates via GPU kernel ---
     d_out_x = cp.empty(total_coords, dtype=cp.float64)
@@ -1878,8 +1877,13 @@ def _build_polygon_output_from_faces_gpu(
 
             # Scatter coordinates via GPU kernel
             d_hole_coord_counts = d_vh_lengths + 1  # +1 for ring closure
-            d_hole_coord_offsets = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
-            total_hole_coords = int(cp.asnumpy(d_hole_coord_offsets[-1:])[0])
+            d_hole_coord_offsets_partial = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
+            # exclusive_sum returns [0, c0, c0+c1, ...] of size n_valid_holes.
+            # Append the total to form a proper (n+1) offset array so that
+            # offsets[:-1] gives n start indices and offsets[1:] gives n ends.
+            _last_offset = d_hole_coord_offsets_partial[-1:] + d_hole_coord_counts[-1:]
+            d_hole_coord_offsets = cp.concatenate([d_hole_coord_offsets_partial, _last_offset])
+            total_hole_coords = int(cp.asnumpy(_last_offset)[0])
 
             d_hole_x = cp.empty(total_hole_coords, dtype=cp.float64)
             d_hole_y = cp.empty(total_hole_coords, dtype=cp.float64)
@@ -1962,7 +1966,9 @@ def _build_polygon_output_from_faces_gpu(
         # ring coords into a contiguous buffer. Use per-hole coord counts.
         d_hole_coord_counts = _d_hole_lengths + 1  # +1 for ring closure
         d_hole_offsets_compact = exclusive_sum(d_hole_coord_counts.astype(cp.int32))
-        total_hole_compact = int(cp.asnumpy(d_hole_offsets_compact[-1:])[0])
+        # exclusive_sum returns [0, c0, c0+c1, ...] of size n_holes; total
+        # is last_offset + last_count (not just last_offset).
+        total_hole_compact = int(cp.asnumpy(d_hole_offsets_compact[-1:])[0]) + int(cp.asnumpy(d_hole_coord_counts[-1:])[0])
 
         # Gather coords from the original hole buffer using starts + lengths
         if total_hole_compact > 0:
@@ -1979,15 +1985,20 @@ def _build_polygon_output_from_faces_gpu(
         d_hole_edge_counts = _d_hole_lengths
 
         # Merge: boundary rings [0..ring_count), hole rings [ring_count..total)
-        d_all_area = cp.concatenate((d_ring_area, _d_hole_area))
+        # Hole faces are traversed counterclockwise (positive area) in the
+        # overlay half-edge graph, but they represent interior rings that must
+        # have negative (clockwise) area so assign_holes_to_exteriors treats
+        # them as holes rather than self-assigned exteriors.
+        d_all_area = cp.concatenate((d_ring_area, -cp.abs(_d_hole_area)))
         d_all_cx = cp.concatenate((d_ring_centroid_x, _d_hole_cx))
         d_all_cy = cp.concatenate((d_ring_centroid_y, _d_hole_cy))
         d_all_x = cp.concatenate((d_out_x, d_hole_compact_x))
         d_all_y = cp.concatenate((d_out_y, d_hole_compact_y))
         # Merged coordinate offsets: boundary offsets + compact hole offsets shifted.
-        # boundary_total was already extracted in the batched scalar read at Step 6.
-        # Include ALL hole offsets (not [1:]) so every ring has a valid entry.
-        d_hole_offsets_shifted = d_hole_offsets_compact + boundary_total
+        # Use total_coords (not boundary_total) because total_coords is the
+        # actual byte count of boundary ring coordinates in d_out_x/d_out_y,
+        # i.e. where the compact hole coords start in d_all_x/d_all_y.
+        d_hole_offsets_shifted = d_hole_offsets_compact + total_coords
         d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted))
         d_all_edge_counts = cp.concatenate((d_ring_edge_counts, d_hole_edge_counts))
     else:
@@ -2291,13 +2302,14 @@ def _build_device_resident_polygon_output(
             family_row_offsets[output_row] = multipolygon_count
             multipolygon_count += 1
             for ext_idx, holes in exteriors:
-                multipolygon_part_offsets.append(len(multipolygon_ring_offsets) - 1)
                 for ring_idx in [ext_idx, *holes]:
                     multipolygon_ring_order.append(ring_idx)
                     n_coords = int(h_all_edge_counts[ring_idx]) + 1
                     multipolygon_ring_offsets.append(
                         multipolygon_ring_offsets[-1] + n_coords,
                     )
+                # Record end of this polygon part's rings
+                multipolygon_part_offsets.append(len(multipolygon_ring_offsets) - 1)
             multipolygon_geometry_offsets.append(len(multipolygon_part_offsets) - 1)
 
     # --- Build coordinate gather indices and execute on device ---

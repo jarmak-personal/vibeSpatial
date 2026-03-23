@@ -3855,6 +3855,18 @@
     },
     {
       "kind": "repo",
+      "path": ".beads/sync-state.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "beads",
+        "json",
+        "state",
+        "sync"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/agents/cuda-engineer.md",
       "referenced_by": [],
       "symbols": [],
