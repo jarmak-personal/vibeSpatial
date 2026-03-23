@@ -25,7 +25,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-17.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 105  # Phase 11: GPU boundary cycle detection eliminated 2 D->H transfers; Phase 4/6 net +1
+_VIOLATION_BASELINE = 104  # Phase 12: GPU hole assembly replaced 2 host-side transfer sites
 
 # Method names that pull data from device to host.
 D2H_APIS = {"get", "copy_to_host", "to_host", "asnumpy", "tolist", "to_pylist"}
