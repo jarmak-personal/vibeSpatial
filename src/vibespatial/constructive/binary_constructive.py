@@ -26,6 +26,15 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
 )
+from vibespatial.runtime._runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.kernel_registry import register_kernel_variant
+from vibespatial.runtime.precision import (
+    KernelClass,
+    PrecisionMode,
+    select_precision_plan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,94 +213,31 @@ def _dispatch_overlay_gpu(
     return fn(left, right)
 
 
-def binary_constructive_owned(
+# ---------------------------------------------------------------------------
+# Registered kernel variants
+# ---------------------------------------------------------------------------
+
+
+@register_kernel_variant(
+    "binary_constructive",
+    "cpu",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=(
+        "point", "linestring", "polygon",
+        "multipoint", "multilinestring", "multipolygon",
+    ),
+    supports_mixed=True,
+    tags=("shapely",),
+)
+def _binary_constructive_cpu(
     op: str,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     *,
     grid_size: float | None = None,
 ) -> OwnedGeometryArray:
-    """Element-wise binary constructive operation on owned arrays.
-
-    When both inputs are Polygon/MultiPolygon-only and no grid_size is
-    requested, dispatches to the GPU overlay pipeline which handles its
-    own GPU/CPU selection internally.  Otherwise falls back to Shapely.
-
-    Parameters
-    ----------
-    op : str
-        One of 'intersection', 'union', 'difference', 'symmetric_difference'.
-    left, right : OwnedGeometryArray
-        Input geometry arrays (must have same row count).
-    grid_size : float or None
-        Snap grid size for GEOS precision model. When set, forces the
-        Shapely/GEOS path because the overlay pipeline does not support
-        snapped precision.
-    """
-    if op not in _CONSTRUCTIVE_OPS:
-        raise ValueError(f"unsupported constructive operation: {op}")
-
-    if left.row_count != right.row_count:
-        raise ValueError(
-            f"row count mismatch: left={left.row_count}, right={right.row_count}"
-        )
-
-    if left.row_count == 0:
-        return from_shapely_geometries([])
-
-    # --- GPU fast path for Point-Polygon intersection/difference ---
-    # The PIP kernel does not support grid_size, so skip when set.
-    # union/symmetric_difference of Point-Polygon produce GeometryCollections
-    # which are complex — leave those to Shapely.
-    if grid_size is None and op in _POINT_POLYGON_OPS:
-        try:
-            if _is_point_only(left) and _is_polygon_only(right):
-                if op == "intersection":
-                    return _intersection_point_polygon_gpu(left, right)
-                else:  # difference
-                    return _difference_point_polygon_gpu(left, right)
-            elif _is_polygon_only(left) and _is_point_only(right):
-                # Symmetric case: intersection is commutative, so swap operands.
-                # difference(polygon, point) is not handled here — it produces
-                # polygons with point-holes which is complex.
-                if op == "intersection":
-                    return _intersection_point_polygon_gpu(right, left)
-        except Exception:
-            logger.debug(
-                "Point-Polygon GPU %s failed, falling back to Shapely",
-                op,
-                exc_info=True,
-            )
-
-    # --- GPU overlay fast path for Polygon-Polygon pairs ---
-    # The overlay pipeline does not support grid_size, so skip when set.
-    if grid_size is None and _is_polygon_only(left) and _is_polygon_only(right):
-        try:
-            result = _dispatch_overlay_gpu(op, left, right)
-            # Verify the overlay pipeline preserved row count.  Invalid
-            # geometries (e.g. self-intersecting bowties) can cause the
-            # pipeline to silently drop rows.  Fall through to Shapely
-            # when the count does not match so the caller sees correct
-            # results or GEOS-level errors.
-            if result.row_count == left.row_count:
-                return result
-            logger.debug(
-                "overlay GPU dispatch returned %d rows (expected %d) for %s, "
-                "falling back to Shapely",
-                result.row_count,
-                left.row_count,
-                op,
-            )
-        except Exception:
-            # Any failure in the overlay pipeline (unsupported geometry mix,
-            # GPU unavailable, etc.) falls through to the Shapely path.
-            logger.debug(
-                "overlay GPU dispatch failed for %s, falling back to Shapely",
-                op,
-                exc_info=True,
-            )
-
-    # --- Shapely fallback for non-polygon pairs or grid_size usage ---
+    """CPU fallback: Shapely element-wise binary constructive."""
     left_geoms = left.to_shapely()
     right_geoms = right.to_shapely()
 
@@ -305,6 +251,168 @@ def binary_constructive_owned(
         kwargs["grid_size"] = grid_size
 
     result_arr = getattr(shapely, op)(left_arr, right_arr, **kwargs)
-    result_list = result_arr.tolist()
+    return from_shapely_geometries(result_arr.tolist())
 
-    return from_shapely_geometries(result_list)
+
+@register_kernel_variant(
+    "binary_constructive",
+    "gpu-overlay-pip",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("point", "polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("cuda-python", "constructive", "overlay", "pip"),
+)
+def _binary_constructive_gpu(
+    op: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> OwnedGeometryArray | None:
+    """GPU binary constructive: overlay for poly-poly, PIP for point-poly.
+
+    Returns None when the family combination is not GPU-accelerated,
+    signalling the caller to fall back to CPU.
+    """
+    # --- Point-Polygon fast path (PIP kernel) ---
+    if op in _POINT_POLYGON_OPS:
+        try:
+            if _is_point_only(left) and _is_polygon_only(right):
+                if op == "intersection":
+                    return _intersection_point_polygon_gpu(left, right)
+                else:  # difference
+                    return _difference_point_polygon_gpu(left, right)
+            elif _is_polygon_only(left) and _is_point_only(right):
+                if op == "intersection":
+                    return _intersection_point_polygon_gpu(right, left)
+        except Exception:
+            logger.debug(
+                "Point-Polygon GPU %s failed, falling back to CPU",
+                op,
+                exc_info=True,
+            )
+
+    # --- Polygon-Polygon overlay path ---
+    if _is_polygon_only(left) and _is_polygon_only(right):
+        try:
+            result = _dispatch_overlay_gpu(op, left, right)
+            if result.row_count == left.row_count:
+                return result
+            logger.debug(
+                "overlay GPU dispatch returned %d rows (expected %d) for %s",
+                result.row_count,
+                left.row_count,
+                op,
+            )
+        except Exception:
+            logger.debug(
+                "overlay GPU dispatch failed for %s, falling back to CPU",
+                op,
+                exc_info=True,
+            )
+
+    return None
+
+
+def binary_constructive_owned(
+    op: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    grid_size: float | None = None,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray:
+    """Element-wise binary constructive operation on owned arrays.
+
+    Uses the standard dispatch framework: ``plan_dispatch_selection`` for
+    GPU/CPU routing, ``select_precision_plan`` for precision, and
+    ``record_dispatch_event`` for observability.
+
+    GPU paths:
+    - Polygon-Polygon pairs: overlay pipeline (face selection).
+    - Point-Polygon intersection/difference: PIP kernel + validity masking.
+
+    Parameters
+    ----------
+    op : str
+        One of 'intersection', 'union', 'difference', 'symmetric_difference'.
+    left, right : OwnedGeometryArray
+        Input geometry arrays (must have same row count).
+    grid_size : float or None
+        Snap grid size for GEOS precision model.  When set, forces the
+        CPU/Shapely path because the GPU pipeline does not support
+        snapped precision.
+    dispatch_mode : ExecutionMode or str, default AUTO
+        Execution mode hint.
+    precision : PrecisionMode or str, default AUTO
+        Precision mode for GPU path.
+    """
+    if op not in _CONSTRUCTIVE_OPS:
+        raise ValueError(f"unsupported constructive operation: {op}")
+
+    if left.row_count != right.row_count:
+        raise ValueError(
+            f"row count mismatch: left={left.row_count}, right={right.row_count}"
+        )
+
+    if left.row_count == 0:
+        return from_shapely_geometries([])
+
+    # Force CPU when grid_size is set (GPU pipeline doesn't support snapped precision)
+    effective_mode = dispatch_mode
+    if grid_size is not None:
+        effective_mode = ExecutionMode.CPU
+
+    selection = plan_dispatch_selection(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=left.row_count,
+        requested_mode=effective_mode,
+    )
+
+    gpu_attempted = False
+    if selection.selected is ExecutionMode.GPU:
+        # ADR-0002: CONSTRUCTIVE kernels stay fp64.  precision_plan is
+        # computed for observability (dispatch event detail) only; the
+        # overlay and PIP kernels manage their own precision internally.
+        precision_plan = select_precision_plan(
+            runtime_selection=selection,
+            kernel_class=KernelClass.CONSTRUCTIVE,
+            requested=precision,
+        )
+        gpu_attempted = True
+        result = _binary_constructive_gpu(op, left, right)
+        if result is not None:
+            record_dispatch_event(
+                surface=f"geopandas.array.{op}",
+                operation=op,
+                implementation="binary_constructive_gpu",
+                reason=selection.reason,
+                detail=(
+                    f"rows={left.row_count}, "
+                    f"precision={precision_plan.compute_precision.value}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
+
+    # CPU fallback: Shapely element-wise
+    if grid_size is not None:
+        fallback_reason = "grid_size requires GEOS precision model"
+    elif gpu_attempted:
+        fallback_reason = "GPU kernel returned None (unsupported family pair)"
+    else:
+        fallback_reason = selection.reason
+
+    result = _binary_constructive_cpu(op, left, right, grid_size=grid_size)
+    record_dispatch_event(
+        surface=f"geopandas.array.{op}",
+        operation=op,
+        implementation="binary_constructive_cpu",
+        reason=fallback_reason,
+        detail=f"rows={left.row_count}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+    )
+    return result

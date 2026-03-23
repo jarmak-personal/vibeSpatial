@@ -1279,14 +1279,8 @@ class GeometryArray(ExtensionArray):
                 result_owned = binary_constructive_owned(
                     op, self._owned, other_owned, **kwargs,
                 )
-                record_dispatch_event(
-                    surface=f"geopandas.array.{op}",
-                    operation=op,
-                    implementation="binary_constructive_owned",
-                    reason="owned binary constructive dispatch",
-                    detail=f"rows={len(self)}",
-                    selected=ExecutionMode.GPU,
-                )
+                # binary_constructive_owned records its own dispatch event
+                # with the accurate selected mode (GPU or CPU).
                 return GeometryArray.from_owned(result_owned, crs=self.crs)
 
         record_dispatch_event(

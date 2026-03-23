@@ -13,6 +13,7 @@ is an NVRTC source compiled at runtime.
 | Overlay | `overlay_gpu.py` | Half-edge graph, split events, face extraction |
 | Stroke | `stroke_kernels.py` | Point buffer, offset curve |
 | Make valid | `make_valid_gpu.py` | GPU polygon repair |
+| Binary constructive | `constructive/binary_constructive.py` | Intersection, union, difference, symmetric difference (PIP + overlay dispatch) |
 
 ## Adding a new kernel
 

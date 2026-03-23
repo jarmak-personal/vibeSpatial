@@ -13988,12 +13988,15 @@
         "_intersection_point_polygon_gpu",
         "_difference_point_polygon_gpu",
         "_dispatch_overlay_gpu",
+        "_binary_constructive_cpu",
+        "_binary_constructive_gpu",
         "binary_constructive_owned"
       ],
       "tokens": [
         "binary",
         "build",
         "constructive",
+        "cpu",
         "difference",
         "dispatch",
         "gpu",

@@ -25,5 +25,22 @@
       "gpu-cuda-python",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "point",
+      "linestring",
+      "polygon",
+      "multipoint",
+      "multilinestring",
+      "multipolygon"
+    ],
+    "kernel": "binary_constructive",
+    "module": "vibespatial.constructive.binary_constructive",
+    "tier": 3,
+    "variants": [
+      "gpu-overlay-pip",
+      "cpu"
+    ]
   }
 ]

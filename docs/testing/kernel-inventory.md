@@ -5,7 +5,7 @@ Scope: Scaffolded kernel inventory, benchmark stubs, and generated test surfaces
 Read If: You are generating, reviewing, or extending owned kernel scaffolds.
 STOP IF: You already have the target kernel module and generated files open.
 Source Of Truth: Kernel scaffold inventory and generated surface map for repo-owned kernels.
-Body Budget: 37/220 lines
+Body Budget: 38/220 lines
 Document: docs/testing/kernel-inventory.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 15-20 | Open First |
 | 21-25 | Verify |
 | 26-30 | Risks |
-| 31-37 | Scaffolds |
+| 31-38 | Scaffolds |
 DOC_HEADER:END -->
 
 Generated kernel scaffolds land here first so agents can audit what exists and which tier gate applies.
@@ -55,3 +55,4 @@ Track scaffolded kernel modules, tests, and benchmark stubs.
 <!-- KERNEL_INVENTORY:ROWS -->
 | `point_bounds` | `vibespatial.kernels.predicates` | Tier 4 | `point, polygon` | `src/vibespatial/kernels/predicates/point_bounds.py` | `tests/test_point_bounds.py` | `vsbench run point-predicates` |
 | `segment_intersection` | `vibespatial.spatial.segment_primitives` | Tier 1 | `linestring, polygon, multilinestring, multipolygon` | `src/vibespatial/spatial/segment_primitives.py` | `tests/test_segment_primitives.py` | `vsbench run segment-intersection` |
+| `binary_constructive` | `vibespatial.constructive.binary_constructive` | Tier 3 | `point, polygon, multipolygon` | `src/vibespatial/constructive/binary_constructive.py` | `tests/test_binary_constructive.py` | `vsbench run constructive` |
