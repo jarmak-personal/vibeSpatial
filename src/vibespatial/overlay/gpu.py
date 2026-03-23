@@ -26,6 +26,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_PTR,
     DeviceArray,
     compile_kernel_group,
+    count_scatter_total,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema  # noqa: E402
@@ -1448,11 +1449,20 @@ def _build_polygon_output_from_faces_gpu(
     faces: OverlayFaceTable,
     selected_face_indices: np.ndarray,
 ) -> OwnedGeometryArray | None:
-    """GPU face-to-polygon assembly (ADR-0016 Stage 8).
+    """GPU face-to-polygon assembly (Phase 11: GPU boundary cycle detection).
 
-    Replaces the CPU boundary walk with GPU kernels. Decouples face ownership
-    from source row identity by assigning holes to exteriors via GPU PIP on
-    face centroids. Returns device-resident OwnedGeometryArray per ADR-0005.
+    Full GPU pipeline:
+      Steps 1-2: Edge-to-face mapping and face selection via CuPy scatter.
+      Step 3: Boundary edge identification via NVRTC kernel.
+      Step 4: Boundary next-edge computation via NVRTC kernel.
+      Step 5: Cycle detection via GPU pointer jumping + list ranking;
+              per-cycle area/centroid via segmented reduction.
+      Steps 6-7: Coordinate offset computation and ring scatter via GPU.
+      Steps 7b-8: Hole ring extraction and merge on device.
+      Step 9: Hole-to-exterior assignment via GPU PIP kernel.
+      Step 10: GeoArrow output assembly with device-side sorting, grouping,
+              and coordinate gather; single bulk D->H transfer at the
+              ADR-0005 materialization boundary.
 
     Returns None if GPU is unavailable (caller falls back to CPU path).
     """
@@ -1833,65 +1843,269 @@ def _build_polygon_output_from_faces_gpu(
         ),
     )
 
-    # --- Step 10: Build output from GPU assignment results ---
-    # Transfer assignment results and coordinates to host for GeoArrow assembly.
-    # This is the explicit materialization boundary per ADR-0005.
-    h_exterior_id = cp.asnumpy(d_exterior_id)
-    _ = cp.asnumpy(d_all_area)
-    h_all_coord_offsets = cp.asnumpy(d_all_coord_offsets)
-    h_all_edge_counts = cp.asnumpy(d_all_edge_counts)
-    h_all_x = cp.asnumpy(d_all_x)
-    h_all_y = cp.asnumpy(d_all_y)
+    # --- Step 10: GPU-based GeoArrow output assembly ---
+    # Build GeoArrow offset arrays entirely on device, then transfer
+    # only the final buffers at the ADR-0005 materialization boundary.
+    # This replaces the prior host-side Python-loop assembly.
 
-    # Source rows: boundary rings from cycle walk, holes inherit from exterior
-    h_source_rows = np.zeros(total_ring_count, dtype=np.int32)
-    h_source_rows[:boundary_ring_count] = cp.asnumpy(d_cycle_source_rows)
+    # 10a. Source row for all rings on device
+    d_source_rows = cp.full(total_ring_count, -1, dtype=cp.int32)
+    d_source_rows[:boundary_ring_count] = d_cycle_source_rows
 
-    # Build exterior -> holes mapping from kernel output using vectorised
-    # NumPy filtering instead of a Python ``for ri in range(N)`` loop
-    # (hitlist #12).
-    exterior_indices_host = cp.asnumpy(d_exterior_indices)
+    # Holes inherit source row from their assigned exterior
+    d_all_ring_ids = cp.arange(total_ring_count, dtype=cp.int32)
+    d_hole_mask = (d_exterior_id >= 0) & (d_exterior_id != d_all_ring_ids)
+    # Validate hole exterior assignments: only keep holes whose exterior
+    # is actually in d_exterior_indices (Tier 2: CuPy boolean masking).
+    # Clamp d_exterior_id to [0, total_ring_count) before indexing to avoid
+    # negative-index wrap-around for -1 sentinel values.
+    d_ext_valid_set = cp.zeros(total_ring_count, dtype=cp.bool_)
+    d_ext_valid_set[d_exterior_indices] = True
+    d_ext_id_safe = cp.where(d_exterior_id >= 0, d_exterior_id, 0)
+    d_valid_hole_mask = d_hole_mask & d_ext_valid_set[d_ext_id_safe]
+    # Holes inherit source row from their exterior
+    d_hole_ring_ids = cp.flatnonzero(d_valid_hole_mask).astype(cp.int32, copy=False)
+    if d_hole_ring_ids.size > 0:
+        d_source_rows[d_hole_ring_ids] = d_source_rows[d_exterior_id[d_hole_ring_ids]]
 
-    all_ring_ids = np.arange(total_ring_count, dtype=np.int32)
-    hole_mask = (h_exterior_id >= 0) & (h_exterior_id != all_ring_ids)
-    hole_ring_ids = all_ring_ids[hole_mask]
-    hole_ext_ids = h_exterior_id[hole_mask]
-    # Further filter: only keep holes whose assigned exterior is valid
-    valid_ext_mask = np.isin(hole_ext_ids, exterior_indices_host)
-    hole_ring_ids = hole_ring_ids[valid_ext_mask]
-    hole_ext_ids = hole_ext_ids[valid_ext_mask]
+    # 10b. Build valid ring set: exteriors + valid holes
+    d_valid_ring_mask = d_exterior_mask | d_valid_hole_mask
+    d_valid_ring_ids = cp.flatnonzero(d_valid_ring_mask).astype(cp.int32, copy=False)
+    n_valid_rings = int(d_valid_ring_ids.size)
 
-    # Sort holes by (exterior_id, hole_ring_id) for deterministic ordering
-    sort_order = np.lexsort((hole_ring_ids, hole_ext_ids))
-    hole_ring_ids = hole_ring_ids[sort_order]
-    hole_ext_ids = hole_ext_ids[sort_order]
+    if n_valid_rings == 0:
+        return _empty_polygon_output(faces.runtime_selection)
 
-    # Group holes by exterior using searchsorted on the sorted exterior ids
-    exterior_to_holes: dict[int, np.ndarray] = {}
-    if hole_ring_ids.size > 0:
-        breaks = np.flatnonzero(np.diff(hole_ext_ids) != 0)
-        groups = np.split(hole_ring_ids, breaks + 1)
-        ext_keys = hole_ext_ids[np.concatenate(([0], breaks + 1))]
-        for k, g in zip(ext_keys, groups):
-            exterior_to_holes[int(k)] = g
+    # 10c. Sort valid rings by (source_row, exterior_id, is_hole, ring_id)
+    # Exteriors sort before their holes (is_hole=0 for exterior, 1 for hole).
+    # Use lexsort (last key is primary) to avoid int64 overflow on packed keys.
+    d_vr_source = d_source_rows[d_valid_ring_ids]
+    d_vr_exterior = d_exterior_id[d_valid_ring_ids]
+    d_vr_is_hole = d_valid_hole_mask[d_valid_ring_ids].astype(cp.int32)
 
-    def _ring_coords(ri: int) -> np.ndarray:
-        cs = int(h_all_coord_offsets[ri])
-        n = int(h_all_edge_counts[ri]) + 1
-        return np.column_stack((h_all_x[cs:cs + n], h_all_y[cs:cs + n]))
+    d_sorted_valid_idx = cp.lexsort(cp.stack((
+        d_valid_ring_ids,     # least significant: ring_id
+        d_vr_is_hole,         # is_hole (exterior=0 before hole=1)
+        d_vr_exterior,        # exterior_id
+        d_vr_source,          # most significant: source_row
+    )))
+    d_ordered_ring_ids = d_valid_ring_ids[d_sorted_valid_idx]
 
-    row_polygons: dict[int, list[list[np.ndarray]]] = {}
-    for ext_idx in exterior_indices_host.tolist():
-        ext_idx = int(ext_idx)
-        source_row = int(h_source_rows[ext_idx])
-        rings: list[np.ndarray] = [_ring_coords(ext_idx)]
-        hole_ids = exterior_to_holes.get(ext_idx)
-        if hole_ids is not None:
-            for hole_idx in hole_ids:
-                rings.append(_ring_coords(int(hole_idx)))
-        row_polygons.setdefault(source_row, []).append(rings)
+    # 10d. Identify polygon boundaries: a new polygon starts at each exterior
+    d_ordered_is_hole = d_vr_is_hole[d_sorted_valid_idx]
+    d_poly_start_mask = (d_ordered_is_hole == 0)
+    d_poly_starts = cp.flatnonzero(d_poly_start_mask).astype(cp.int32, copy=False)
+    n_polygons = int(d_poly_starts.size)
 
-    return _build_overlay_output_rows(row_polygons, faces.runtime_selection)
+    if n_polygons == 0:
+        return _empty_polygon_output(faces.runtime_selection)
+
+    # 10e. Rings per polygon (for GeoArrow geometry_offsets -> ring range)
+    d_poly_ends = cp.concatenate((d_poly_starts[1:],
+                                   cp.asarray([n_valid_rings], dtype=cp.int32)))
+    d_rings_per_poly = d_poly_ends - d_poly_starts
+
+    # 10f. Source row per polygon
+    d_poly_source_rows = d_source_rows[d_ordered_ring_ids[d_poly_starts]]
+
+    # 10g. Group polygons by source row for POLYGON vs MULTIPOLYGON classification
+    d_poly_row_start_mask = cp.empty(n_polygons, dtype=cp.bool_)
+    d_poly_row_start_mask[0] = True
+    if n_polygons > 1:
+        d_poly_row_start_mask[1:] = d_poly_source_rows[1:] != d_poly_source_rows[:-1]
+    d_row_starts = cp.flatnonzero(d_poly_row_start_mask).astype(cp.int32, copy=False)
+    n_output_rows = int(d_row_starts.size)
+    d_row_ends = cp.concatenate((d_row_starts[1:],
+                                  cp.asarray([n_polygons], dtype=cp.int32)))
+    d_polys_per_row = d_row_ends - d_row_starts
+
+    # 10h. Classify: rows with 1 polygon -> POLYGON, >1 -> MULTIPOLYGON
+    d_is_multipoly = d_polys_per_row > 1
+
+    # 10i. Gather ring coordinate data for ordered rings
+    d_ordered_coord_counts = d_all_edge_counts[d_ordered_ring_ids] + 1  # +1 closure
+    d_ordered_coord_offsets = exclusive_sum(d_ordered_coord_counts.astype(cp.int32, copy=False))
+    total_out_coords = count_scatter_total(runtime, d_ordered_coord_counts, d_ordered_coord_offsets)
+
+    # Gather coordinates from d_all_x/d_all_y into reordered output
+    d_final_x = cp.empty(total_out_coords, dtype=cp.float64)
+    d_final_y = cp.empty(total_out_coords, dtype=cp.float64)
+
+    # Build flat gather index: for each output coordinate slot, compute source position
+    if total_out_coords > 0:
+        d_slot_ids = cp.arange(total_out_coords, dtype=cp.int32)
+        d_slot_ring = cp.searchsorted(
+            d_ordered_coord_offsets[1:], d_slot_ids, side='right').astype(cp.int32)
+        d_slot_local = d_slot_ids - d_ordered_coord_offsets[d_slot_ring]
+        # Source ring in d_all arrays
+        d_src_ring_id = d_ordered_ring_ids[d_slot_ring]
+        d_src_coord_start = d_all_coord_offsets[d_src_ring_id]
+        d_src_pos = d_src_coord_start + d_slot_local
+        d_final_x = d_all_x[d_src_pos]
+        d_final_y = d_all_y[d_src_pos]
+
+    # 10j. Build GeoArrow offset arrays (Tier 2: CuPy + Tier 3a: exclusive_sum)
+    # Ring offsets within polygons: already d_ordered_coord_offsets
+    # Geometry offsets (polygon -> ring range): exclusive_sum of d_rings_per_poly
+    d_geom_ring_offsets = exclusive_sum(d_rings_per_poly.astype(cp.int32, copy=False))
+
+    # 10k. Transfer structural arrays to host at materialization boundary
+    # (ADR-0005). The bulk coordinate arrays and offset arrays computed on
+    # device above are transferred in one batch here.
+    h_final_x = cp.asnumpy(d_final_x)
+    h_final_y = cp.asnumpy(d_final_y)
+    h_ordered_coord_offsets = cp.asnumpy(
+        cp.concatenate((d_ordered_coord_offsets,
+                        cp.asarray([total_out_coords], dtype=cp.int32))))
+    h_geom_ring_offsets = cp.asnumpy(
+        cp.concatenate((d_geom_ring_offsets,
+                        cp.asarray([n_valid_rings], dtype=cp.int32))))
+    h_rings_per_poly = cp.asnumpy(d_rings_per_poly)
+    h_is_multipoly = cp.asnumpy(d_is_multipoly)
+    h_row_starts_np = cp.asnumpy(d_row_starts)
+    h_row_ends_np = cp.asnumpy(d_row_ends)
+
+    # 10l. Build family buffers from pre-computed offset arrays.
+    # All GPU work is complete; this section uses NumPy on host arrays
+    # transferred above (no further device calls).
+    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+
+    validity = np.ones(n_output_rows, dtype=bool)
+    tags = np.where(h_is_multipoly, mpoly_tag, poly_tag).astype(np.int8)
+
+    # Separate POLYGON vs MULTIPOLYGON rows
+    poly_row_mask = ~h_is_multipoly
+    mpoly_row_mask = h_is_multipoly
+    poly_row_indices = np.flatnonzero(poly_row_mask).astype(np.int32)
+    mpoly_row_indices = np.flatnonzero(mpoly_row_mask).astype(np.int32)
+
+    family_row_offsets = np.empty(n_output_rows, dtype=np.int32)
+    families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+
+    # Build POLYGON family (single-polygon-per-row entries).
+    # GeoArrow offset convention (matching _append_polygon_buffer_row):
+    #   geometry_offsets: starts empty, append(len(ring_offsets)) per polygon
+    #   ring_offsets: starts empty, append(coord_cursor) per ring
+    #   Sentinels added when building the final arrays.
+    if poly_row_indices.size > 0:
+        n_poly = int(poly_row_indices.size)
+        # Polygon index within the global polygon list for each POLYGON row
+        poly_row_poly_idx = h_row_starts_np[poly_row_indices]
+        # Ring range for each polygon
+        _p_ring_starts = h_geom_ring_offsets[poly_row_poly_idx]
+        _p_ring_ends = _p_ring_starts + h_rings_per_poly[poly_row_poly_idx]
+        # Build family-local ring_offsets and gather coordinates
+        p_ring_offsets: list[int] = []
+        p_x_chunks: list[np.ndarray] = []
+        p_y_chunks: list[np.ndarray] = []
+        p_bounds_list: list[tuple[float, float, float, float]] = []
+        p_geom_offsets: list[int] = []
+        coord_cursor_p = 0
+        for pi in range(n_poly):
+            p_geom_offsets.append(len(p_ring_offsets))
+            rs = int(_p_ring_starts[pi])
+            re = int(_p_ring_ends[pi])
+            for ri in range(rs, re):
+                cs = int(h_ordered_coord_offsets[ri])
+                ce = int(h_ordered_coord_offsets[ri + 1])
+                p_ring_offsets.append(coord_cursor_p)
+                p_x_chunks.append(h_final_x[cs:ce])
+                p_y_chunks.append(h_final_y[cs:ce])
+                coord_cursor_p += ce - cs
+            # Bounds from exterior ring (first ring of polygon)
+            first_cs = int(h_ordered_coord_offsets[rs])
+            first_ce = int(h_ordered_coord_offsets[rs + 1])
+            ext_x = h_final_x[first_cs:first_ce]
+            ext_y = h_final_y[first_cs:first_ce]
+            p_bounds_list.append((float(ext_x.min()), float(ext_y.min()),
+                                  float(ext_x.max()), float(ext_y.max())))
+        p_x = np.concatenate(p_x_chunks) if p_x_chunks else np.empty(0, dtype=np.float64)
+        p_y = np.concatenate(p_y_chunks) if p_y_chunks else np.empty(0, dtype=np.float64)
+        families[GeometryFamily.POLYGON] = FamilyGeometryBuffer(
+            family=GeometryFamily.POLYGON,
+            schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
+            row_count=n_poly,
+            x=p_x,
+            y=p_y,
+            geometry_offsets=np.asarray([*p_geom_offsets, len(p_ring_offsets)], dtype=np.int32),
+            empty_mask=np.zeros(n_poly, dtype=bool),
+            ring_offsets=np.asarray([*p_ring_offsets, coord_cursor_p], dtype=np.int32),
+            bounds=np.asarray(p_bounds_list, dtype=np.float64) if p_bounds_list else None,
+        )
+        for idx, ri in enumerate(poly_row_indices):
+            family_row_offsets[ri] = idx
+
+    # Build MULTIPOLYGON family (multi-polygon-per-row entries).
+    # GeoArrow offset convention (matching _append_multipolygon_buffer_row):
+    #   geometry_offsets: starts empty, append(len(part_offsets)) per row
+    #   part_offsets: starts empty, append(len(ring_offsets)) per part
+    #   ring_offsets: starts empty, append(coord_cursor) per ring
+    #   Sentinels added when building the final arrays.
+    if mpoly_row_indices.size > 0:
+        n_mpoly = int(mpoly_row_indices.size)
+        mp_geom_offsets: list[int] = []
+        mp_part_offsets: list[int] = []
+        mp_ring_offsets: list[int] = []
+        mp_x_chunks: list[np.ndarray] = []
+        mp_y_chunks: list[np.ndarray] = []
+        mp_bounds_list: list[tuple[float, float, float, float]] = []
+        coord_cursor = 0
+        for mi in range(n_mpoly):
+            row_idx = int(mpoly_row_indices[mi])
+            ps = int(h_row_starts_np[row_idx])
+            pe = int(h_row_ends_np[row_idx])
+            mp_geom_offsets.append(len(mp_part_offsets))
+            row_min_x = np.inf
+            row_min_y = np.inf
+            row_max_x = -np.inf
+            row_max_y = -np.inf
+            for pi in range(ps, pe):
+                mp_part_offsets.append(len(mp_ring_offsets))
+                rs = int(h_geom_ring_offsets[pi])
+                re = rs + int(h_rings_per_poly[pi])
+                for ri in range(rs, re):
+                    cs = int(h_ordered_coord_offsets[ri])
+                    ce = int(h_ordered_coord_offsets[ri + 1])
+                    mp_ring_offsets.append(coord_cursor)
+                    mp_x_chunks.append(h_final_x[cs:ce])
+                    mp_y_chunks.append(h_final_y[cs:ce])
+                    coord_cursor += ce - cs
+                # Bounds contribution from exterior ring of this part
+                first_cs = int(h_ordered_coord_offsets[rs])
+                first_ce = int(h_ordered_coord_offsets[rs + 1])
+                ext_x = h_final_x[first_cs:first_ce]
+                ext_y = h_final_y[first_cs:first_ce]
+                row_min_x = min(row_min_x, float(ext_x.min()))
+                row_min_y = min(row_min_y, float(ext_y.min()))
+                row_max_x = max(row_max_x, float(ext_x.max()))
+                row_max_y = max(row_max_y, float(ext_y.max()))
+            mp_bounds_list.append((row_min_x, row_min_y, row_max_x, row_max_y))
+        mp_x = np.concatenate(mp_x_chunks) if mp_x_chunks else np.empty(0, dtype=np.float64)
+        mp_y = np.concatenate(mp_y_chunks) if mp_y_chunks else np.empty(0, dtype=np.float64)
+        families[GeometryFamily.MULTIPOLYGON] = FamilyGeometryBuffer(
+            family=GeometryFamily.MULTIPOLYGON,
+            schema=get_geometry_buffer_schema(GeometryFamily.MULTIPOLYGON),
+            row_count=n_mpoly,
+            x=mp_x,
+            y=mp_y,
+            geometry_offsets=np.asarray([*mp_geom_offsets, len(mp_part_offsets)], dtype=np.int32),
+            empty_mask=np.zeros(n_mpoly, dtype=bool),
+            part_offsets=np.asarray([*mp_part_offsets, len(mp_ring_offsets)], dtype=np.int32),
+            ring_offsets=np.asarray([*mp_ring_offsets, coord_cursor], dtype=np.int32),
+            bounds=np.asarray(mp_bounds_list, dtype=np.float64) if mp_bounds_list else None,
+        )
+        for idx, ri in enumerate(mpoly_row_indices):
+            family_row_offsets[ri] = idx
+
+    return OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=families,
+        residency=Residency.HOST,
+        runtime_history=[faces.runtime_selection],
+    )
 
 
 def _build_polygon_output_from_faces(
@@ -3320,15 +3534,12 @@ def _overlay_owned(
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
     selected_face_indices = _select_overlay_face_indices(faces, operation=operation)
-    # Try CPU face assembly first (faster for most cases), fall back to GPU
-    # assembly when the CPU path hits "spans multiple source rows" error
-    # (ADR-0016 Stage 8).
-    try:
+    # GPU face assembly (Phase 11): boundary cycle detection via pointer
+    # jumping + segmented reduction.  Falls back to CPU serial path only
+    # when GPU is unavailable.
+    result = _build_polygon_output_from_faces_gpu(half_edge_graph, faces, selected_face_indices)
+    if result is None:
         result = _build_polygon_output_from_faces(half_edge_graph, faces, selected_face_indices)
-    except RuntimeError:
-        result = _build_polygon_output_from_faces_gpu(half_edge_graph, faces, selected_face_indices)
-        if result is None:
-            raise
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,
