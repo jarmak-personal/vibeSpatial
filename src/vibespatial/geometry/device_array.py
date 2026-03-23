@@ -357,36 +357,31 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def is_valid(self) -> np.ndarray:
-        """Validity via Shapely — materialization required.
+        """Validity via Shapely — kept on host path for OGC semantic parity.
 
-        NOTE: kept on Shapely path because to_shapely() mutates owned buffer
-        state, and downstream operations (area_owned, overlay filters) depend
-        on this cache being populated. is_valid_owned has different semantics
-        for degenerate buffers from file I/O. See overlay_nybb regression.
+        is_valid_owned() only checks structural validity (ring closure,
+        min coords, orientation).  Shapely also checks ring self-intersection,
+        ring crossings, holes-within-shell, etc.  Overlay pipelines use
+        is_valid to gate make_valid(); weaker checks would skip repair and
+        produce wrong overlay results.  Migrate to owned path only after
+        is_valid_owned() covers full OGC validity.
         """
         import shapely
 
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.is_valid: Shapely materialization required",
+            "DeviceGeometryArray.is_valid: Shapely materialization required"
+            " (is_valid_owned lacks full OGC validity checks)",
             visible=True,
         )
         return shapely.is_valid(self._ensure_shapely_cache())
 
     @property
     def is_simple(self) -> np.ndarray:
-        """Simplicity via Shapely — materialization required.
+        """Simplicity — GPU-accelerated from owned coordinate buffers, no Shapely."""
+        from vibespatial.constructive.validity import is_simple_owned
 
-        Same rationale as is_valid above.
-        """
-        import shapely
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.is_simple: Shapely materialization required",
-            visible=True,
-        )
-        return shapely.is_simple(self._ensure_shapely_cache())
+        return is_simple_owned(self._owned)
 
     @property
     def is_ring(self) -> np.ndarray:

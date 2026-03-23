@@ -324,6 +324,7 @@ class TestMaterializationWithDiagnostics:
         assert len(mat_events) == 0
 
     def test_is_valid_emits_diagnostic(self, dga_points):
+        """is_valid stays on Shapely path (OGC semantic parity needed)."""
         _ = dga_points.is_valid
         mat_events = [
             e for e in dga_points.diagnostics
@@ -331,13 +332,14 @@ class TestMaterializationWithDiagnostics:
         ]
         assert len(mat_events) >= 1
 
-    def test_is_simple_emits_diagnostic(self, dga_points):
+    def test_is_simple_no_materialization(self, dga_points):
+        """is_simple is GPU-accelerated from owned buffers — no Shapely materialization."""
         _ = dga_points.is_simple
         mat_events = [
             e for e in dga_points.diagnostics
             if e.kind == DiagnosticKind.MATERIALIZATION
         ]
-        assert len(mat_events) >= 1
+        assert len(mat_events) == 0
 
     def test_centroid_no_materialization(self, dga_points):
         """Centroid is GPU-accelerated from owned buffers — no Shapely materialization."""

@@ -46,8 +46,9 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
 from .measurement import _PRECISION_PREAMBLE
 
@@ -1100,14 +1101,51 @@ def _is_simple_gpu_multipolygons(d_buf, family_rows, result, global_rows):
     kernel_class=KernelClass.PREDICATE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "linestring", "multilinestring", "polygon", "multipolygon",
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
     ),
     supports_mixed=True,
+    precision_modes=(PrecisionMode.FP64,),
     tags=("cuda-python", "predicate", "validity"),
 )
-def _is_valid_gpu(owned):
+def _is_valid_gpu_dispatch(owned):
     """Registry marker — actual dispatch is inline in is_valid_owned."""
     raise NotImplementedError
+
+
+@register_kernel_variant(
+    "is_valid",
+    "cpu",
+    kernel_class=KernelClass.PREDICATE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=(
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    precision_modes=(PrecisionMode.FP64,),
+    tags=("shapely", "predicate", "validity"),
+)
+def _is_valid_cpu(owned: OwnedGeometryArray) -> np.ndarray:
+    """CPU fallback: per-family structural validity check."""
+    row_count = owned.row_count
+    result = np.ones(row_count, dtype=bool)
+    tags = owned.tags
+    family_row_offsets = owned.family_row_offsets
+
+    for family, buf in owned.families.items():
+        if buf.row_count == 0:
+            continue
+        tag = FAMILY_TAGS[family]
+        mask = tags == tag
+        if not np.any(mask):
+            continue
+        global_rows = np.flatnonzero(mask)
+        family_rows = family_row_offsets[global_rows]
+        family_result = _VALIDITY_DISPATCH[family](buf)
+        result[global_rows] = family_result[family_rows]
+
+    return result
 
 
 @register_kernel_variant(
@@ -1116,14 +1154,51 @@ def _is_valid_gpu(owned):
     kernel_class=KernelClass.PREDICATE,
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
-        "linestring", "multilinestring", "polygon", "multipolygon",
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
     ),
     supports_mixed=True,
+    precision_modes=(PrecisionMode.FP64,),
     tags=("cuda-python", "predicate", "simplicity"),
 )
-def _is_simple_gpu(owned):
+def _is_simple_gpu_dispatch(owned):
     """Registry marker — actual dispatch is inline in is_simple_owned."""
     raise NotImplementedError
+
+
+@register_kernel_variant(
+    "is_simple",
+    "cpu",
+    kernel_class=KernelClass.PREDICATE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=(
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    precision_modes=(PrecisionMode.FP64,),
+    tags=("shapely", "predicate", "simplicity"),
+)
+def _is_simple_cpu(owned: OwnedGeometryArray) -> np.ndarray:
+    """CPU fallback: per-family structural simplicity check."""
+    row_count = owned.row_count
+    result = np.ones(row_count, dtype=bool)
+    tags = owned.tags
+    family_row_offsets = owned.family_row_offsets
+
+    for family, buf in owned.families.items():
+        if buf.row_count == 0:
+            continue
+        tag = FAMILY_TAGS[family]
+        mask = tags == tag
+        if not np.any(mask):
+            continue
+        global_rows = np.flatnonzero(mask)
+        family_rows = family_row_offsets[global_rows]
+        family_result = _SIMPLICITY_DISPATCH[family](buf)
+        result[global_rows] = family_result[family_rows]
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1209,7 @@ def is_valid_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> np.ndarray:
     """Check structural validity of each geometry in an OwnedGeometryArray.
 
@@ -1150,6 +1226,8 @@ def is_valid_owned(
         The geometry array to validate.
     dispatch_mode : ExecutionMode or str
         GPU/CPU/AUTO execution mode.
+    precision : PrecisionMode or str
+        Precision dispatch mode (ADR-0002). PREDICATE class defaults to fp64.
 
     Returns
     -------
@@ -1167,6 +1245,15 @@ def is_valid_owned(
         requested_mode=dispatch_mode,
     )
 
+    # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons
+    # (ring closure, orientation).  select_precision_plan is called for
+    # observability only -- the kernel source is always _FP64.
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.PREDICATE,
+        requested=precision,
+    )
+
     use_gpu = (
         selection.selected is ExecutionMode.GPU
         and cp is not None
@@ -1176,6 +1263,7 @@ def is_valid_owned(
     result = np.ones(row_count, dtype=bool)
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
+    actually_used_gpu = False
 
     for family, buf in owned.families.items():
         if buf.row_count == 0:
@@ -1207,6 +1295,7 @@ def is_valid_owned(
                 elif family is GeometryFamily.MULTIPOLYGON:
                     _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows)
 
+                actually_used_gpu = True
                 continue  # skip CPU fallback
             except Exception:
                 pass  # fall through to CPU
@@ -1214,6 +1303,18 @@ def is_valid_owned(
         # --- CPU fallback ---
         family_result = _VALIDITY_DISPATCH[family](buf)
         result[global_rows] = family_result[family_rows]
+
+    selected_mode = ExecutionMode.GPU if actually_used_gpu else ExecutionMode.CPU
+    impl = "is_valid_gpu_nvrtc" if actually_used_gpu else "is_valid_cpu"
+    record_dispatch_event(
+        surface="geopandas.array.is_valid",
+        operation="is_valid",
+        requested=dispatch_mode,
+        selected=selected_mode,
+        implementation=impl,
+        reason=selection.reason,
+        detail=f"precision=fp64 (PREDICATE class, plan={precision_plan.compute_precision.value})",
+    )
 
     # Null geometries are valid (Shapely convention)
     # Already True by default; no action needed for nulls.
@@ -1224,6 +1325,7 @@ def is_simple_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> np.ndarray:
     """Check geometric simplicity of each geometry in an OwnedGeometryArray.
 
@@ -1242,6 +1344,8 @@ def is_simple_owned(
         The geometry array to check.
     dispatch_mode : ExecutionMode or str
         GPU/CPU/AUTO execution mode.
+    precision : PrecisionMode or str
+        Precision dispatch mode (ADR-0002). PREDICATE class defaults to fp64.
 
     Returns
     -------
@@ -1259,6 +1363,14 @@ def is_simple_owned(
         requested_mode=dispatch_mode,
     )
 
+    # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons.
+    # select_precision_plan is called for observability only.
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.PREDICATE,
+        requested=precision,
+    )
+
     use_gpu = (
         selection.selected is ExecutionMode.GPU
         and cp is not None
@@ -1268,6 +1380,7 @@ def is_simple_owned(
     result = np.ones(row_count, dtype=bool)
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
+    actually_used_gpu = False
 
     for family, buf in owned.families.items():
         if buf.row_count == 0:
@@ -1299,6 +1412,7 @@ def is_simple_owned(
                 elif family is GeometryFamily.MULTIPOLYGON:
                     _is_simple_gpu_multipolygons(d_buf, family_rows, result, global_rows)
 
+                actually_used_gpu = True
                 continue  # skip CPU fallback
             except Exception:
                 pass  # fall through to CPU
@@ -1306,6 +1420,18 @@ def is_simple_owned(
         # --- CPU fallback ---
         family_result = _SIMPLICITY_DISPATCH[family](buf)
         result[global_rows] = family_result[family_rows]
+
+    selected_mode = ExecutionMode.GPU if actually_used_gpu else ExecutionMode.CPU
+    impl = "is_simple_gpu_nvrtc" if actually_used_gpu else "is_simple_cpu"
+    record_dispatch_event(
+        surface="geopandas.array.is_simple",
+        operation="is_simple",
+        requested=dispatch_mode,
+        selected=selected_mode,
+        implementation=impl,
+        reason=selection.reason,
+        detail=f"precision=fp64 (PREDICATE class, plan={precision_plan.compute_precision.value})",
+    )
 
     # Null geometries are simple (Shapely convention)
     # Already True by default; no action needed for nulls.

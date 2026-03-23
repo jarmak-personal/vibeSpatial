@@ -15,6 +15,7 @@ is an NVRTC source compiled at runtime.
 | Make valid | `make_valid_gpu.py` | GPU polygon repair |
 | Binary constructive | `constructive/binary_constructive.py` | Intersection, union, difference, symmetric difference (PIP + overlay dispatch) |
 | Envelope | `constructive/envelope.py` | Bounding-box polygon (5-vertex closed ring) |
+| Validity / Simplicity | `constructive/validity.py` | is_valid (ring closure, min coords, orientation), is_simple (self-intersection) |
 
 ## Adding a new kernel
 
