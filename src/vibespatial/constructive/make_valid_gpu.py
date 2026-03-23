@@ -80,18 +80,36 @@ except ModuleNotFoundError:  # pragma: no cover
 # reverse_ring_coords: reverse coordinates for wrong-orientation rings
 
 _REPAIR_KERNEL_SOURCE = r"""
+// Phase B: check_ring_closure — one thread per ring.
+// Compare first and last vertex coordinates; output boolean mask.
+extern "C" __global__ void check_ring_closure(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    int* __restrict__ needs_closure,
+    const int ring_count
+) {
+    const int ring = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ring >= ring_count) return;
+    const int start = ring_offsets[ring];
+    const int end = ring_offsets[ring + 1];
+    const int len = end - start;
+    needs_closure[ring] = (len >= 2
+        && (x[start] != x[end - 1] || y[start] != y[end - 1])) ? 1 : 0;
+}
+
 // Phase B: close_rings — one thread per ring.
 // If first vertex != last vertex, write closing vertex into reserved slot.
 // new_ring_offsets[ring+1] has space for the extra vertex if needed.
 extern "C" __global__ void close_rings(
-    const double* x,
-    const double* y,
-    const int* ring_offsets,
-    const int* ring_needs_close,
-    const int* new_ring_offsets,
-    double* out_x,
-    double* out_y,
-    int ring_count
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ ring_needs_close,
+    const int* __restrict__ new_ring_offsets,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    const int ring_count
 ) {
     const int ring = blockIdx.x * blockDim.x + threadIdx.x;
     if (ring >= ring_count) return;
@@ -114,12 +132,12 @@ extern "C" __global__ void close_rings(
 // Phase B: flag_duplicate_vertices — one thread per vertex.
 // Flag vertex if it equals the previous vertex within the same ring.
 extern "C" __global__ void flag_duplicate_vertices(
-    const double* x,
-    const double* y,
-    const int* ring_offsets,
-    const int* vertex_ring_ids,
-    unsigned char* out_keep,
-    int vertex_count
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ vertex_ring_ids,
+    unsigned char* __restrict__ out_keep,
+    const int vertex_count
 ) {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= vertex_count) return;
@@ -141,12 +159,12 @@ extern "C" __global__ void flag_duplicate_vertices(
 // Phase B: compute_ring_shoelace — one thread per segment within a ring.
 // Outputs cross product xi*y(i+1) - x(i+1)*yi for shoelace formula.
 extern "C" __global__ void compute_ring_shoelace(
-    const double* x,
-    const double* y,
-    const int* ring_offsets,
-    double* out_cross,
-    int ring_count,
-    int vertex_count
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    double* __restrict__ out_cross,
+    const int ring_count,
+    const int vertex_count
 ) {
     const int v = blockIdx.x * blockDim.x + threadIdx.x;
     if (v >= vertex_count) return;
@@ -159,11 +177,11 @@ extern "C" __global__ void compute_ring_shoelace(
 
 // Phase B: reverse_ring_coords — one thread per vertex in rings that need reversal.
 extern "C" __global__ void reverse_ring_coords(
-    double* x,
-    double* y,
-    const int* ring_offsets,
-    const unsigned char* ring_needs_reverse,
-    int ring_count
+    double* __restrict__ x,
+    double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const unsigned char* __restrict__ ring_needs_reverse,
+    const int ring_count
 ) {
     const int ring = blockIdx.x * blockDim.x + threadIdx.x;
     if (ring >= ring_count) return;
@@ -406,6 +424,7 @@ extern "C" __global__ void rebuild_ring_coords(
 """
 
 _REPAIR_KERNEL_NAMES = (
+    "check_ring_closure",
     "close_rings",
     "flag_duplicate_vertices",
     "compute_ring_shoelace",
@@ -441,42 +460,41 @@ def _gpu_close_rings(
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Close unclosed rings by appending first vertex. Returns new x, y, ring_offsets.
 
-    Phase 7 GPU-resident: closure check via CuPy vectorised gather (no host copy).
+    Closure check via check_ring_closure NVRTC kernel (Tier 1, 1 thread/ring).
+    Copy+append via close_rings NVRTC kernel.  All device-resident, no host copy.
     """
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    block = (256, 1, 1)
 
-    # --- GPU-resident closure check (Tier 2: CuPy element-wise) ---
-    d_starts = d_ring_offsets[:-1]            # first vertex index per ring
-    d_ends = d_ring_offsets[1:]               # one-past-last index per ring
-    d_sizes = d_ends - d_starts               # vertex count per ring
+    # --- Step 1: NVRTC kernel checks which rings need closure (Tier 1) ---
+    d_needs_close = cp.empty(ring_count, dtype=cp.int32)
+    grid, block = runtime.launch_config(kernels["check_ring_closure"], ring_count)
+    runtime.launch(
+        kernels["check_ring_closure"],
+        grid=grid, block=block,
+        params=(
+            (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_needs_close), ring_count),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+        ),
+    )
 
-    # Gather first and last coordinates per ring (device-resident)
-    d_first_x = d_x[d_starts]
-    d_first_y = d_y[d_starts]
-    d_last_x = d_x[d_ends - 1]
-    d_last_y = d_y[d_ends - 1]
-
-    # Ring needs closing when size >= 2 and first != last
-    d_needs_close = (
-        (d_sizes >= 2)
-        & ((d_first_x != d_last_x) | (d_first_y != d_last_y))
-    ).astype(cp.int32)
-
+    # Early exit if no rings need closure (single scalar D2H)
     if int(cp.sum(d_needs_close)) == 0:
         return d_x, d_y, d_ring_offsets
 
-    # Compute new ring sizes and offsets on device
+    # --- Step 2: Compute new ring sizes and offsets on device (Tier 2: CuPy) ---
+    d_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
     d_new_sizes = d_sizes + d_needs_close
     d_new_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
     d_new_offsets[1:] = cp.cumsum(d_new_sizes)
     total_new = int(d_new_offsets[-1])
 
+    # --- Step 3: Copy vertices + append closure vertex where needed (Tier 1) ---
     d_out_x = cp.empty(total_new, dtype=cp.float64)
     d_out_y = cp.empty(total_new, dtype=cp.float64)
 
-    grid = (max(1, (ring_count + 255) // 256), 1, 1)
+    grid, block = runtime.launch_config(kernels["close_rings"], ring_count)
     runtime.launch(
         kernels["close_rings"],
         grid=grid, block=block,
@@ -499,25 +517,26 @@ def _gpu_remove_duplicate_vertices(
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
     """Remove consecutive duplicate vertices within each ring.
 
-    Phase 7 GPU-resident: vertex-to-ring mapping via cp.searchsorted,
-    compaction via compact_indices (CCCL), ring offsets via CuPy cumsum.
+    Tier 1: flag_duplicate_vertices NVRTC kernel (1 thread/vertex).
+    Tier 2: CuPy searchsorted for vertex-to-ring mapping, fancy indexing for compaction.
+    Tier 3a: CCCL compact_indices for keep-mask compaction, segmented_reduce_sum
+    for per-ring kept counts.  All device-resident, no host copy.
     """
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    block = (256, 1, 1)
-    vertex_count = int(d_x.size)
+    vertex_count = int(d_x.shape[0])
     if vertex_count == 0:
         return d_x, d_y, d_ring_offsets
 
-    # --- GPU-resident vertex→ring mapping (Tier 2: CuPy searchsorted) ---
+    # --- GPU-resident vertex-to-ring mapping (Tier 2: CuPy searchsorted) ---
     d_vertex_ids = cp.arange(vertex_count, dtype=cp.int32)
     d_vertex_ring_ids = cp.searchsorted(
         d_ring_offsets[1:], d_vertex_ids, side="right"
     ).astype(cp.int32)
 
+    # --- Flag duplicates via NVRTC kernel (Tier 1) ---
     d_keep = cp.empty(vertex_count, dtype=cp.uint8)
-
-    grid = (max(1, (vertex_count + 255) // 256), 1, 1)
+    grid, block = runtime.launch_config(kernels["flag_duplicate_vertices"], vertex_count)
     runtime.launch(
         kernels["flag_duplicate_vertices"],
         grid=grid, block=block,
@@ -528,11 +547,11 @@ def _gpu_remove_duplicate_vertices(
              KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
         ),
     )
-    runtime.synchronize()
+    # No explicit sync needed -- cp.sum below triggers implicit sync on same stream.
 
-    # Check if any duplicates found (device-side sum)
-    dup_count = int(vertex_count - int(cp.sum(d_keep)))
-    if dup_count == 0:
+    # Early exit if no duplicates found (single scalar D2H via cp.sum)
+    kept_count = int(cp.sum(d_keep))
+    if kept_count == vertex_count:
         return d_x, d_y, d_ring_offsets
 
     # --- GPU-resident compaction (Tier 3a: CCCL compact_indices) ---
@@ -542,12 +561,11 @@ def _gpu_remove_duplicate_vertices(
     new_x = d_x[d_kept_indices]
     new_y = d_y[d_kept_indices]
 
-    # --- GPU-resident ring offset rebuild (Tier 2: CuPy cumsum) ---
-    # Count kept vertices per ring using the keep mask
+    # --- GPU-resident ring offset rebuild ---
+    # Per-ring kept count via segmented reduce (Tier 3a: CCCL)
     d_keep_i32 = d_keep.astype(cp.int32)
     d_starts = d_ring_offsets[:-1]
     d_ends = d_ring_offsets[1:]
-    # Per-ring kept count via segmented reduce (CCCL)
     seg_result = segmented_reduce_sum(
         d_keep_i32, d_starts, d_ends, num_segments=ring_count,
     )
@@ -569,30 +587,30 @@ def _gpu_fix_ring_orientation(
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Fix ring orientation: exterior rings CCW (positive area), holes CW (negative area).
 
-    Phase 7 GPU-resident: activates the compute_ring_shoelace NVRTC kernel,
-    uses segmented_reduce_sum (CCCL) for per-ring signed area, then CuPy
-    element-wise logic with d_geom_offsets to determine orientation.
+    Tier 1: compute_ring_shoelace NVRTC kernel for per-vertex cross products.
+    Tier 3a: segmented_reduce_sum (CCCL) for per-ring signed area.
+    Tier 2: CuPy element-wise for exterior/hole classification and reversal mask.
+    Tier 1: reverse_ring_coords NVRTC kernel for coordinate reversal.
+    All device-resident, no host copy.
     """
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    block = (256, 1, 1)
 
-    vertex_count = int(d_x.size)
+    vertex_count = int(d_x.shape[0])
     if vertex_count < 3 or ring_count == 0:
         return d_x, d_y
 
-    # --- Step 1: Compute per-vertex shoelace cross products on GPU ---
-    # The compute_ring_shoelace kernel writes x[v]*y[v+1] - x[v+1]*y[v]
-    # for every vertex v.  The last vertex in each ring would read beyond
-    # its ring boundary, so we zero those contributions afterwards.
+    # --- Step 1: Compute per-vertex shoelace cross products (Tier 1: NVRTC) ---
+    # compute_ring_shoelace writes x[v]*y[v+1] - x[v+1]*y[v] for each vertex.
+    # Launch for vertex_count-1 to avoid out-of-bounds read on the last vertex.
+    # Zero-init so last-vertex-per-ring contributions are automatically 0.
     d_cross = cp.zeros(vertex_count, dtype=cp.float64)
-    # Launch for vertex_count - 1 to avoid reading x[vertex_count] / y[vertex_count]
     safe_count = vertex_count - 1
     if safe_count > 0:
-        grid_safe = (max(1, (safe_count + 255) // 256), 1, 1)
+        grid, block = runtime.launch_config(kernels["compute_ring_shoelace"], safe_count)
         runtime.launch(
             kernels["compute_ring_shoelace"],
-            grid=grid_safe, block=block,
+            grid=grid, block=block,
             params=(
                 (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_cross),
                  ring_count, safe_count),
@@ -601,23 +619,19 @@ def _gpu_fix_ring_orientation(
             ),
         )
 
-    # Zero out cross products at the last vertex of each ring (ring boundary)
-    # to prevent cross-ring contamination.
-    d_last_verts = d_ring_offsets[1:] - 1  # index of last vertex per ring
+    # Zero out cross products at ring boundaries to prevent cross-ring contamination
+    d_last_verts = d_ring_offsets[1:] - 1
     d_cross[d_last_verts] = 0.0
 
-    # --- Step 2: Segmented reduce to get per-ring signed area (CCCL) ---
+    # --- Step 2: Per-ring signed area via segmented reduce (Tier 3a: CCCL) ---
     d_starts = d_ring_offsets[:-1]
     d_ends = d_ring_offsets[1:]
     seg_result = segmented_reduce_sum(
         d_cross, d_starts, d_ends, num_segments=ring_count,
     )
-    d_ring_areas = seg_result.values * 0.5  # fp64 multiply
+    d_ring_areas = seg_result.values * 0.5
 
-    # --- Step 3: Determine which rings need reversal (CuPy element-wise) ---
-    # Build per-ring "is exterior" mask using d_geom_offsets.
-    # A ring is exterior if its index equals d_geom_offsets[p] for some polygon p.
-    # Equivalently, use searchsorted: ring_idx → polygon → first ring of that poly.
+    # --- Step 3: Classify exterior vs hole and build reversal mask (Tier 2: CuPy) ---
     d_ring_ids = cp.arange(ring_count, dtype=cp.int32)
     d_poly_of_ring = cp.searchsorted(
         d_geom_offsets[1:], d_ring_ids, side="right"
@@ -625,17 +639,18 @@ def _gpu_fix_ring_orientation(
     d_first_ring_of_poly = d_geom_offsets[d_poly_of_ring]
     d_is_exterior = (d_ring_ids == d_first_ring_of_poly)
 
-    # Exterior → should be CCW (positive area), reverse if negative
-    # Hole → should be CW (negative area), reverse if positive
+    # Exterior should be CCW (positive area); hole should be CW (negative area)
     d_needs_reverse = (
         (d_is_exterior & (d_ring_areas < 0))
         | (~d_is_exterior & (d_ring_areas > 0))
     ).astype(cp.uint8)
 
+    # Early exit if no rings need reversal (single scalar D2H via cp.sum)
     if int(cp.sum(d_needs_reverse)) == 0:
         return d_x, d_y
 
-    grid = (max(1, (ring_count + 255) // 256), 1, 1)
+    # --- Step 4: Reverse coordinates for wrong-orientation rings (Tier 1: NVRTC) ---
+    grid, block = runtime.launch_config(kernels["reverse_ring_coords"], ring_count)
     runtime.launch(
         kernels["reverse_ring_coords"],
         grid=grid, block=block,
@@ -645,7 +660,8 @@ def _gpu_fix_ring_orientation(
              KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
         ),
     )
-    runtime.synchronize()
+    # No explicit sync needed -- caller will either launch more same-stream
+    # work or trigger implicit sync via CuPy/D2H read.
     return d_x, d_y
 
 
@@ -689,8 +705,7 @@ def _extract_ring_segments_gpu(
     if kernels is not None:
         runtime = get_cuda_runtime()
         ptr = runtime.pointer
-        block = (256, 1, 1)
-        grid = (max(1, (total_segments + 255) // 256), 1, 1)
+        grid, block = runtime.launch_config(kernels["extract_ring_segments"], total_segments)
         runtime.launch(
             kernels["extract_ring_segments"],
             grid=grid, block=block,
@@ -703,7 +718,6 @@ def _extract_ring_segments_gpu(
                  KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
             ),
         )
-        runtime.synchronize()
     else:
         # Fallback: CuPy vectorised segment extraction (no NVRTC needed)
         d_seg_ids = cp.arange(total_segments, dtype=cp.int32)
@@ -774,8 +788,7 @@ def _detect_intra_ring_intersections(
     if kernels is not None and "generate_intra_ring_pairs" in kernels:
         runtime_gen = get_cuda_runtime()
         ptr_gen = runtime_gen.pointer
-        block_gen = (256, 1, 1)
-        grid_gen = (max(1, (total_pairs + 255) // 256), 1, 1)
+        grid_gen, block_gen = runtime_gen.launch_config(kernels["generate_intra_ring_pairs"], total_pairs)
         runtime_gen.launch(
             kernels["generate_intra_ring_pairs"],
             grid=grid_gen, block=block_gen,
@@ -788,7 +801,7 @@ def _detect_intra_ring_intersections(
                  KERNEL_PARAM_I32, KERNEL_PARAM_I32),
             ),
         )
-        runtime_gen.synchronize()
+        # No sync needed -- classify kernel runs on same null stream.
     else:
         # Fallback: host-side pair generation (NVRTC unavailable).
         # cp.asnumpy and Python for-loops are intentional here — this
@@ -856,7 +869,7 @@ def _detect_intra_ring_intersections(
              KERNEL_PARAM_I32),
         ),
     )
-    runtime.synchronize()
+    # No sync needed -- CuPy ops below run on same null stream.
 
     # Filter hits on device (Tier 2: CuPy boolean mask + fancy indexing)
     d_hit_mask = d_out_kind != 0
@@ -905,14 +918,13 @@ def _split_self_intersections_gpu(
     # Phase C: Count and scatter split events
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    block = (256, 1, 1)
     pair_count = int(d_seg_a.size)
     d_event_counts = cp.zeros(pair_count, dtype=cp.int32)
 
-    grid = (max(1, (pair_count + 255) // 256), 1, 1)
+    grid_count, block_count = runtime.launch_config(kernels["count_self_split_events"], pair_count)
     runtime.launch(
         kernels["count_self_split_events"],
-        grid=grid, block=block,
+        grid=grid_count, block=block_count,
         params=(
             (ptr(d_kinds), ptr(d_event_counts), pair_count),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
@@ -930,9 +942,10 @@ def _split_self_intersections_gpu(
     d_out_y = cp.empty(total_events, dtype=cp.float64)
     d_out_key = cp.empty(total_events, dtype=cp.uint64)
 
+    grid_scatter, block_scatter = runtime.launch_config(kernels["scatter_self_split_events"], pair_count)
     runtime.launch(
         kernels["scatter_self_split_events"],
-        grid=grid, block=block,
+        grid=grid_scatter, block=block_scatter,
         params=(
             (ptr(d_seg_a), ptr(d_seg_b), ptr(d_kinds), ptr(d_px), ptr(d_py),
              ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
@@ -1012,10 +1025,10 @@ def _split_self_intersections_gpu(
     d_new_x = cp.empty(total_new, dtype=cp.float64)
     d_new_y = cp.empty(total_new, dtype=cp.float64)
 
-    ring_grid = (max(1, (ring_count + 255) // 256), 1, 1)
+    ring_grid, ring_block = runtime.launch_config(kernels["rebuild_ring_coords"], ring_count)
     runtime.launch(
         kernels["rebuild_ring_coords"],
-        grid=ring_grid, block=block,
+        grid=ring_grid, block=ring_block,
         params=(
             (ptr(d_x), ptr(d_y), ptr(d_ring_offsets),
              ptr(d_sorted_seg_ids), ptr(d_sorted_x), ptr(d_sorted_y), ptr(d_sorted_t),
@@ -1031,7 +1044,7 @@ def _split_self_intersections_gpu(
              KERNEL_PARAM_I32, KERNEL_PARAM_I32),
         ),
     )
-    runtime.synchronize()
+    # No sync needed -- caller uses device arrays on same null stream.
     return d_new_x, d_new_y, d_new_ring_offsets, True
 
 
