@@ -29,7 +29,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ def distance_owned(
                 operation="distance",
                 implementation="distance_owned_gpu",
                 reason="element-wise distance via owned GPU kernels",
-                detail=f"rows={n}",
+                detail=f"rows={n}, precision={precision.value if hasattr(precision, 'value') else precision}",
                 selected=ExecutionMode.GPU,
             )
             return result
@@ -164,6 +164,12 @@ def evaluate_geopandas_dwithin(
     if selection.selected is not ExecutionMode.GPU:
         return None
 
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.METRIC,
+        requested=PrecisionMode.AUTO,
+    )
+
     try:
         left_owned = left if left_is_owned else from_shapely_geometries(left.tolist())
 
@@ -179,13 +185,16 @@ def evaluate_geopandas_dwithin(
         else:
             return None
 
-        result = dwithin_owned(left_owned, right_owned, distance)
+        result = dwithin_owned(
+            left_owned, right_owned, distance,
+            precision=precision_plan.compute_precision,
+        )
         record_dispatch_event(
             surface="geometry_array_dwithin",
             operation="dwithin",
             implementation="dwithin_owned_gpu",
             reason="element-wise dwithin via owned GPU kernels",
-            detail=f"rows={n}",
+            detail=f"rows={n}, precision={precision_plan.compute_precision.value}",
             selected=ExecutionMode.GPU,
         )
         return result

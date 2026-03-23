@@ -1057,7 +1057,17 @@ class DeviceGeometryArray(ExtensionArray):
             from vibespatial.spatial.distance_owned import dwithin_owned
             return dwithin_owned(self._owned, other_owned, distance)
         # Shapely fallback for unsupported 'other' types.
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.dispatch import record_dispatch_event
         d = self.distance(other)
+        record_dispatch_event(
+            surface="DeviceGeometryArray.dwithin",
+            operation="dwithin",
+            implementation="shapely_cpu",
+            reason="unsupported other type for owned dwithin path",
+            detail=f"rows={len(self)}, other_type={type(other).__name__}",
+            selected=ExecutionMode.CPU,
+        )
         return np.where(np.isnan(d), False, d <= distance)
 
     def hausdorff_distance(self, other, densify=None):
@@ -2026,15 +2036,27 @@ def _dwithin_scalar(
       5. Single cp.asnumpy D→H for the final boolean array
     """
     from vibespatial.runtime import ExecutionMode, get_requested_mode
+    from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
     try:
         import cupy as cp
     except ImportError:
         cp = None
 
+    from vibespatial.runtime.dispatch import record_dispatch_event
+
     runtime = get_cuda_runtime()
     if cp is None or not runtime.available() or get_requested_mode() is ExecutionMode.CPU:
-        return _dwithin_scalar_cpu(dga, geom, dist)
+        result = _dwithin_scalar_cpu(dga, geom, dist)
+        record_dispatch_event(
+            surface="DeviceGeometryArray._dwithin_scalar",
+            operation="dwithin",
+            implementation="shapely_cpu",
+            reason="GPU unavailable or CPU mode requested",
+            detail=f"rows={len(dga)}",
+            selected=ExecutionMode.CPU,
+        )
+        return result
 
     n = len(dga)
     owned = dga._owned
@@ -2068,14 +2090,36 @@ def _dwithin_scalar(
     d_right = d_candidates.astype(cp.int32)
     d_distances = runtime.allocate((cand_count,), np.float64)
 
+    # Resolve precision for the distance kernel (METRIC class per ADR-0002).
+    from vibespatial.runtime._runtime import RuntimeSelection
+    precision_selection = RuntimeSelection(
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+        reason="dwithin_scalar: GPU already confirmed available",
+    )
+    precision_plan = select_precision_plan(
+        runtime_selection=precision_selection,
+        kernel_class=KernelClass.METRIC,
+        requested=PrecisionMode.AUTO,
+    )
+
     # Dispatch to the appropriate distance kernel based on families.
     ok = _dwithin_dispatch_distance(
         query_owned, owned, d_left, d_right, d_distances, cand_count,
+        compute_precision=precision_plan.compute_precision,
     )
 
     if not ok:
         # Unsupported family combination — fall back to CPU on candidates only.
         runtime.free(d_distances)
+        record_dispatch_event(
+            surface="DeviceGeometryArray._dwithin_scalar",
+            operation="dwithin",
+            implementation="shapely_cpu",
+            reason="unsupported family combination for GPU distance kernel",
+            detail=f"rows={n}, candidates={cand_count}",
+            selected=ExecutionMode.CPU,
+        )
         return _dwithin_scalar_cpu(dga, geom, dist)
 
     # 4. Threshold filter + scatter on device (Tier 2 CuPy).
@@ -2085,6 +2129,14 @@ def _dwithin_scalar(
     runtime.free(d_distances)
 
     # 5. Single D→H transfer.
+    record_dispatch_event(
+        surface="DeviceGeometryArray._dwithin_scalar",
+        operation="dwithin",
+        implementation="dwithin_scalar_gpu",
+        reason="device-native bbox prefilter + distance kernel",
+        detail=f"rows={n}, candidates={cand_count}",
+        selected=ExecutionMode.GPU,
+    )
     return cp.asnumpy(d_result)
 
 
@@ -2118,14 +2170,24 @@ def _dwithin_dispatch_distance(
     d_right,
     d_distances,
     pair_count: int,
+    *,
+    compute_precision=None,
 ) -> bool:
     """Launch the appropriate GPU distance kernel for dwithin refinement.
 
     Returns True if a kernel was dispatched, False if unsupported.
     METRIC kernel class per ADR-0002 — precision forwarded to point_distance.
+    Segment distance stays fp64 (compliance gap tracked separately).
+
+    *compute_precision*: ``PrecisionMode`` forwarded to point_distance kernels.
+    Defaults to ``PrecisionMode.AUTO`` when ``None``.
     """
+    from vibespatial.runtime.precision import PrecisionMode
     from vibespatial.spatial.point_distance import compute_point_distance_gpu
     from vibespatial.spatial.segment_distance import compute_segment_distance_gpu
+
+    if compute_precision is None:
+        compute_precision = PrecisionMode.AUTO
 
     query_families = list(query_owned.families.keys())
     if not query_families:
@@ -2156,6 +2218,7 @@ def _dwithin_dispatch_distance(
                 return compute_point_distance_gpu(
                     query_owned, tree_owned, d_left, d_right, d_distances, pair_count,
                     tree_family=tree_family,
+                    compute_precision=compute_precision,
                 )
         return False
 
@@ -2164,6 +2227,7 @@ def _dwithin_dispatch_distance(
         return compute_point_distance_gpu(
             tree_owned, query_owned, d_right, d_left, d_distances, pair_count,
             tree_family=query_family,
+            compute_precision=compute_precision,
         )
 
     # Segment vs segment families.
