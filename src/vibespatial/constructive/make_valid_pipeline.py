@@ -428,35 +428,23 @@ def fusion_plan_for_make_valid(*, method: str = "linework", keep_collapsed: bool
 
 
 def _compute_validity_mask_gpu(geometries: np.ndarray, owned) -> tuple[np.ndarray, bool]:
-    """Attempt GPU validity detection; return (valid_mask, gpu_used).
+    """Compute full OGC validity via is_valid_owned; return (valid_mask, gpu_used).
 
     ADR-0019 compact-invalid-row pattern: compute validity on GPU, compact
     invalid indices, repair only invalid rows (Shapely backend), scatter back.
+
+    is_valid_owned covers all OGC validity checks (ring closure, self-intersection,
+    hole containment, ring crossing/overlap, interior connectedness) for all
+    geometry families, eliminating the need for Shapely fallback in detection.
     """
-    gpu_mask = _gpu_polygon_validity_mask(owned)
-    if gpu_mask is None:
+    from vibespatial.constructive.validity import is_valid_owned
+
+    try:
+        mask = is_valid_owned(owned)
+        return mask, True
+    except Exception:
+        # If GPU dispatch fails, fall back to Shapely
         return np.asarray(shapely.is_valid(geometries), dtype=bool), False
-
-    # GPU ring checks only cover polygon families.  For non-polygon rows,
-    # fall back to Shapely is_valid for those rows specifically.
-    from vibespatial.geometry.owned import FAMILY_TAGS
-
-    polygon_tags = set()
-    for family_name in ("polygon", "multipolygon"):
-        if family_name in FAMILY_TAGS:
-            polygon_tags.add(FAMILY_TAGS[family_name])
-
-    non_polygon_rows = np.flatnonzero(
-        owned.validity & ~np.isin(owned.tags, list(polygon_tags))
-    )
-    if non_polygon_rows.size > 0:
-        non_polygon_valid = shapely.is_valid(geometries[non_polygon_rows])
-        gpu_mask[non_polygon_rows] = np.asarray(non_polygon_valid, dtype=bool)
-
-    # Refine with self-intersection detection
-    gpu_mask = _detect_self_intersections_gpu(owned, gpu_mask)
-
-    return gpu_mask, True
 
 
 # ---------------------------------------------------------------------------
@@ -555,20 +543,18 @@ def make_valid_owned(
             null_mask = np.asarray([g is None for g in geometries], dtype=bool)
 
     # ADR-0019 compact-invalid-row: detect validity first, repair only invalids.
-    # When an OwnedGeometryArray is provided (data already on device), use GPU
-    # ring-structure checks to avoid D->H transfer for the validity check.
-    # If all rows pass GPU ring checks, skip shapely entirely (zero-transfer).
+    # When an OwnedGeometryArray is provided (data already on device), use
+    # is_valid_owned for full OGC validity detection without Shapely.
+    # If all rows pass, skip Shapely entirely (zero-transfer fast path, ADR-0005).
     gpu_detection_used = False
     if owned is not None and selection.selected is ExecutionMode.GPU:
         # Compute null_mask from owned validity (no Shapely needed)
         null_mask = ~owned.validity
-        gpu_mask = _gpu_polygon_validity_mask(owned)
-        if gpu_mask is not None:
+        from vibespatial.constructive.validity import is_valid_owned
+        try:
+            gpu_mask = is_valid_owned(owned)
             gpu_detection_used = True
             gpu_mask[null_mask] = False
-            # Refine with self-intersection detection on structurally-valid subset
-            _ensure_geometries()
-            gpu_mask = _detect_self_intersections_gpu(owned, gpu_mask, geometries=geometries)
             gpu_invalid_rows = np.flatnonzero(~gpu_mask & ~null_mask)
             if gpu_invalid_rows.size == 0:
                 # All rows passed GPU checks -- no repair needed.
@@ -578,8 +564,8 @@ def make_valid_owned(
                 record_dispatch_event(
                     surface="geopandas.array.make_valid",
                     operation="make_valid",
-                    implementation="gpu_ring_validity_check",
-                    reason="GPU ring-structure checks: all rows valid, zero repair needed",
+                    implementation="is_valid_owned_ogc",
+                    reason="Full OGC validity check: all rows valid, zero repair needed",
                     detail=f"rows={row_count}, method={method}",
                     requested=dispatch_mode,
                     selected=ExecutionMode.GPU,
@@ -596,7 +582,8 @@ def make_valid_owned(
                     selected=ExecutionMode.GPU,
                 )
             valid_mask = gpu_mask
-        else:
+        except Exception:
+            gpu_detection_used = False
             _ensure_geometries()
             valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)
     else:

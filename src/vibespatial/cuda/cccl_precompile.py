@@ -1085,6 +1085,7 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.constructive.measurement",
     "vibespatial.constructive.centroid",
     "vibespatial.constructive.clip_rect",
+    "vibespatial.constructive.validity",
 )
 
 
