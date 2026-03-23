@@ -5,7 +5,7 @@ Scope: GeoPandas method delegation, dispatch events, and object-construction avo
 Read If: You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.
 STOP IF: Your task already has the adapter implementation open and only needs local detail.
 Source Of Truth: API dispatch policy for GeoPandas-facing method boundaries.
-Body Budget: 63/220 lines
+Body Budget: 67/220 lines
 Document: docs/architecture/api-dispatch.md
 
 Section Map (Body Lines)
@@ -17,9 +17,9 @@ Section Map (Body Lines)
 | 17-23 | Open First |
 | 24-28 | Verify |
 | 29-34 | Risks |
-| 35-46 | Decision |
-| 47-56 | Performance Notes |
-| 57-63 | Current Behavior |
+| 35-50 | Decision |
+| 51-60 | Performance Notes |
+| 61-67 | Current Behavior |
 DOC_HEADER:END -->
 
 ## Intent
@@ -60,9 +60,13 @@ or hiding which implementation actually ran.
   `GeoDataFrame` instead of rebuilding wrapper arrays inside delegate helpers.
 - Allow `GeometryArray` to cache its owned-geometry conversion for repo-owned
   kernels that need it repeatedly.
-- Record explicit dispatch events at the public method boundary for repo-owned
-  method surfaces such as `buffer`, `offset_curve`, `clip_by_rect`,
-  `make_valid`, and `dissolve`.
+- Record explicit dispatch events at the public method boundary for
+  high-traffic surfaces (currently `buffer`, `offset_curve`, `clip_by_rect`,
+  `make_valid`, and `dissolve`).  Unary and binary constructive ops
+  (`boundary`, `convex_hull`, `intersection`, `union`, `difference`,
+  `symmetric_difference`, `rotate`, `scale`, `skew`) and distance metrics
+  (`hausdorff_distance`, `frechet_distance`) route through owned paths
+  directly without per-call dispatch events.
 - Keep host-competitive Shapely paths in place when owned host prototypes are
   slower, but make that choice visible.
 

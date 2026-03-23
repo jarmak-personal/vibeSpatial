@@ -262,6 +262,8 @@ def _is_valid_points(buf: FamilyGeometryBuffer) -> np.ndarray:
 def _is_valid_linestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
     """LineString is valid if it has >= 2 coordinates (or is empty)."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     offsets = buf.geometry_offsets
     counts = offsets[1:buf.row_count + 1] - offsets[:buf.row_count]
     # Empty linestrings (0 coords) are valid; 1-coord linestrings are invalid
@@ -284,6 +286,9 @@ def _is_valid_polygon_ring(
     length = coord_end - coord_start
     if length < 4:
         return False
+    # Guard against corrupt offsets exceeding coordinate array bounds
+    if coord_end > len(x):
+        return False
     # Ring closure check
     if x[coord_start] != x[coord_end - 1] or y[coord_start] != y[coord_end - 1]:
         return False
@@ -299,17 +304,23 @@ def _is_valid_polygon_ring(
 def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     """Polygon validity: ring closure, minimum coords, orientation."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     x = buf.x
     y = buf.y
     geom_offsets = buf.geometry_offsets
     ring_offsets = buf.ring_offsets
 
     for g in range(buf.row_count):
+        if buf.empty_mask[g]:
+            # Empty polygon -- valid
+            continue
+
         ring_start_idx = int(geom_offsets[g])
         ring_end_idx = int(geom_offsets[g + 1])
 
         if ring_start_idx == ring_end_idx:
-            # Empty polygon -- valid
+            # No rings -- valid
             continue
 
         for ring_idx, r in enumerate(range(ring_start_idx, ring_end_idx)):
@@ -332,10 +343,15 @@ def _is_valid_multipoints(buf: FamilyGeometryBuffer) -> np.ndarray:
 def _is_valid_multilinestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
     """MultiLineString validity: each part must have >= 2 coordinates."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     geom_offsets = buf.geometry_offsets
     part_offsets = buf.part_offsets
 
     for g in range(buf.row_count):
+        if buf.empty_mask[g]:
+            continue
+
         part_start_idx = int(geom_offsets[g])
         part_end_idx = int(geom_offsets[g + 1])
 
@@ -353,6 +369,8 @@ def _is_valid_multilinestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
 def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     """MultiPolygon validity: each polygon part checked for ring validity."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     x = buf.x
     y = buf.y
     geom_offsets = buf.geometry_offsets
@@ -360,6 +378,9 @@ def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     ring_offsets = buf.ring_offsets
 
     for g in range(buf.row_count):
+        if buf.empty_mask[g]:
+            continue
+
         poly_start = int(geom_offsets[g])
         poly_end = int(geom_offsets[g + 1])
 
@@ -451,6 +472,8 @@ def _linestring_self_intersects(
 def _is_simple_linestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
     """LineString is simple if no non-adjacent segments cross."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     x = buf.x
     y = buf.y
     offsets = buf.geometry_offsets
@@ -470,12 +493,17 @@ def _is_simple_linestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
 def _is_simple_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     """Polygon simplicity: check each ring for self-intersection."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     x = buf.x
     y = buf.y
     geom_offsets = buf.geometry_offsets
     ring_offsets = buf.ring_offsets
 
     for g in range(buf.row_count):
+        if buf.empty_mask[g]:
+            continue
+
         ring_start_idx = int(geom_offsets[g])
         ring_end_idx = int(geom_offsets[g + 1])
 
@@ -492,12 +520,17 @@ def _is_simple_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
 def _is_simple_multilinestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
     """MultiLineString simplicity: each part checked individually."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     x = buf.x
     y = buf.y
     geom_offsets = buf.geometry_offsets
     part_offsets = buf.part_offsets
 
     for g in range(buf.row_count):
+        if buf.empty_mask[g]:
+            continue
+
         part_start_idx = int(geom_offsets[g])
         part_end_idx = int(geom_offsets[g + 1])
 
@@ -514,6 +547,8 @@ def _is_simple_multilinestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
 def _is_simple_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     """MultiPolygon simplicity: each ring in each polygon checked."""
     result = np.ones(buf.row_count, dtype=bool)
+    if buf.x.size == 0 or buf.empty_mask.size == 0:
+        return result
     x = buf.x
     y = buf.y
     geom_offsets = buf.geometry_offsets
@@ -521,6 +556,9 @@ def _is_simple_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
     ring_offsets = buf.ring_offsets
 
     for g in range(buf.row_count):
+        if buf.empty_mask[g]:
+            continue
+
         poly_start = int(geom_offsets[g])
         poly_end = int(geom_offsets[g + 1])
 

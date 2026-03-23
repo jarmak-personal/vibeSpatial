@@ -357,7 +357,13 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def is_valid(self) -> np.ndarray:
-        """Validity — requires Shapely materialization."""
+        """Validity via Shapely — materialization required.
+
+        NOTE: kept on Shapely path because to_shapely() mutates owned buffer
+        state, and downstream operations (area_owned, overlay filters) depend
+        on this cache being populated. is_valid_owned has different semantics
+        for degenerate buffers from file I/O. See overlay_nybb regression.
+        """
         import shapely
 
         self._owned._record(
@@ -369,7 +375,10 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def is_simple(self) -> np.ndarray:
-        """Simplicity — requires Shapely materialization."""
+        """Simplicity via Shapely — materialization required.
+
+        Same rationale as is_valid above.
+        """
         import shapely
 
         self._owned._record(
@@ -403,14 +412,13 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def has_z(self) -> np.ndarray:
-        import shapely
+        """has_z from owned metadata — OwnedGeometryArray is 2D (x/y only)."""
+        return np.zeros(len(self), dtype=bool)
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.has_z: Shapely materialization required",
-            visible=True,
-        )
-        return shapely.has_z(self._ensure_shapely_cache())
+    @property
+    def has_m(self) -> np.ndarray:
+        """has_m from owned metadata — OwnedGeometryArray is 2D (x/y only)."""
+        return np.zeros(len(self), dtype=bool)
 
     def is_valid_reason(self) -> np.ndarray:
         import shapely
@@ -425,16 +433,11 @@ class DeviceGeometryArray(ExtensionArray):
     # Unary geometry operations that return new GeometryArrays
     @property
     def boundary(self):
-        import shapely
+        """Boundary — GPU-accelerated via owned path, no Shapely."""
+        from vibespatial.constructive.boundary import boundary_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.boundary: Shapely materialization required",
-            visible=True,
-        )
-        result = shapely.boundary(self._ensure_shapely_cache())
-        new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        result_owned = boundary_owned(self._owned)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def centroid(self):
@@ -446,16 +449,11 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def convex_hull(self):
-        import shapely
+        """Convex hull — GPU-accelerated via owned path, no Shapely."""
+        from vibespatial.constructive.convex_hull import convex_hull_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.convex_hull: Shapely materialization required",
-            visible=True,
-        )
-        result = shapely.convex_hull(self._ensure_shapely_cache())
-        new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        result_owned = convex_hull_owned(self._owned)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     @property
     def envelope(self):
@@ -495,20 +493,48 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.overlay.dissolve import union_all_gpu
         return union_all_gpu(self._owned, grid_size=grid_size)
 
-    # Methods that require Shapely
     def buffer(self, distance, resolution=16, **kwargs):
-        import shapely
+        """Buffer — routes through owned dispatch with GPU kernel when possible."""
+        from vibespatial.constructive.stroke import evaluate_geopandas_buffer
 
         self.check_geographic_crs(stacklevel=5)
         if isinstance(distance, pd.Series):
             distance = np.asarray(distance)
-        # Use Shapely cache for buffer (GPU point buffer available via GeometryArray path)
+
+        cap_style = kwargs.get("cap_style", "round")
+        join_style = kwargs.get("join_style", "round")
+        mitre_limit = float(kwargs.get("mitre_limit", 5.0))
+        single_sided = bool(kwargs.get("single_sided", False))
+
+        buffer_result, selected = evaluate_geopandas_buffer(
+            self._ensure_shapely_cache(),
+            distance,
+            quad_segs=resolution,
+            cap_style=cap_style,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
+            single_sided=single_sided,
+            prebuilt_owned=self._owned,
+        )
+        if buffer_result is not None:
+            if isinstance(buffer_result, OwnedGeometryArray):
+                return DeviceGeometryArray._from_owned(buffer_result, crs=self._crs)
+            new_owned = from_shapely_geometries(
+                np.asarray(buffer_result, dtype=object).tolist()
+            )
+            return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+
+        # Shapely fallback
+        import shapely
+
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.buffer: Shapely materialization required",
+            "DeviceGeometryArray.buffer: Shapely fallback",
             visible=True,
         )
-        result = shapely.buffer(self._ensure_shapely_cache(), distance, quad_segs=resolution, **kwargs)
+        result = shapely.buffer(
+            self._ensure_shapely_cache(), distance, quad_segs=resolution, **kwargs
+        )
         new_owned = from_shapely_geometries(result.tolist())
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
@@ -524,6 +550,42 @@ class DeviceGeometryArray(ExtensionArray):
 
         result = normalize_owned(self._owned)
         return DeviceGeometryArray._from_owned(result, crs=self._crs)
+
+    def offset_curve(self, distance, quad_segs=8, join_style="round", mitre_limit=5.0):
+        from vibespatial.constructive.stroke import evaluate_geopandas_offset_curve
+
+        result, selected = evaluate_geopandas_offset_curve(
+            self._ensure_shapely_cache(),
+            distance,
+            quad_segs=quad_segs,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
+        )
+        if result is not None:
+            new_owned = from_shapely_geometries(
+                np.asarray(result, dtype=object).tolist()
+            )
+            return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+
+        # Shapely fallback
+        import shapely
+
+        self._owned._record(
+            DiagnosticKind.MATERIALIZATION,
+            "DeviceGeometryArray.offset_curve: Shapely fallback",
+            visible=True,
+        )
+        fallback = shapely.offset_curve(
+            self._ensure_shapely_cache(),
+            distance,
+            quad_segs=quad_segs,
+            join_style=join_style,
+            mitre_limit=mitre_limit,
+        )
+        new_owned = from_shapely_geometries(
+            np.asarray(fallback, dtype=object).tolist()
+        )
+        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def make_valid(self, method="linework", keep_collapsed=True):
         from vibespatial.constructive.make_valid_pipeline import make_valid_owned
@@ -556,6 +618,30 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.affine_transform import translate_owned
 
         result_owned = translate_owned(self._owned, xoff, yoff, zoff)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
+
+    def rotate(self, angle, origin="center", use_radians=False):
+        from vibespatial.constructive.affine_transform import rotate_owned
+
+        result_owned = rotate_owned(
+            self._owned, angle, origin=origin, use_radians=use_radians
+        )
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
+
+    def scale(self, xfact=1.0, yfact=1.0, zfact=1.0, origin="center"):
+        from vibespatial.constructive.affine_transform import scale_owned
+
+        result_owned = scale_owned(
+            self._owned, xfact, yfact, zfact, origin=origin
+        )
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
+
+    def skew(self, xs=0.0, ys=0.0, origin="center", use_radians=False):
+        from vibespatial.constructive.affine_transform import skew_owned
+
+        result_owned = skew_owned(
+            self._owned, xs, ys, origin=origin, use_radians=use_radians
+        )
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
     def count_coordinates(self):
@@ -854,6 +940,46 @@ class DeviceGeometryArray(ExtensionArray):
         d = self.distance(other)
         return np.where(np.isnan(d), False, d <= distance)
 
+    def hausdorff_distance(self, other, densify=None):
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None:
+            from vibespatial.spatial.distance_metrics import hausdorff_distance_owned
+
+            return hausdorff_distance_owned(self._owned, other_owned, densify=densify)
+
+        import shapely
+
+        self._owned._record(
+            DiagnosticKind.MATERIALIZATION,
+            "DeviceGeometryArray.hausdorff_distance: Shapely fallback (unsupported other type)",
+            visible=True,
+        )
+        if isinstance(other, DeviceGeometryArray):
+            other = other._ensure_shapely_cache()
+        return shapely.hausdorff_distance(
+            self._ensure_shapely_cache(), other, densify=densify
+        )
+
+    def frechet_distance(self, other, densify=None):
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None:
+            from vibespatial.spatial.distance_metrics import frechet_distance_owned
+
+            return frechet_distance_owned(self._owned, other_owned, densify=densify)
+
+        import shapely
+
+        self._owned._record(
+            DiagnosticKind.MATERIALIZATION,
+            "DeviceGeometryArray.frechet_distance: Shapely fallback (unsupported other type)",
+            visible=True,
+        )
+        if isinstance(other, DeviceGeometryArray):
+            other = other._ensure_shapely_cache()
+        return shapely.frechet_distance(
+            self._ensure_shapely_cache(), other, densify=densify
+        )
+
     def clip_by_rect(self, xmin, ymin, xmax, ymax):
         from vibespatial.constructive.clip_rect import clip_by_rect_owned
         from vibespatial.runtime import get_requested_mode
@@ -901,61 +1027,47 @@ class DeviceGeometryArray(ExtensionArray):
                 crs=self._crs,
             )
 
-    def intersection(self, other, *args, **kwargs):
+    def _binary_constructive(self, op: str, other, *args, **kwargs):
+        """Shared dispatch for binary constructive ops (intersection, union, etc.)."""
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None:
+            from vibespatial.constructive.binary_constructive import (
+                binary_constructive_owned,
+            )
+
+            grid_size = kwargs.get("grid_size", None)
+            result_owned = binary_constructive_owned(
+                op, self._owned, other_owned, grid_size=grid_size
+            )
+            return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
+
+        # Shapely fallback for unsupported other types
         import shapely
 
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.intersection: Shapely materialization required",
+            f"DeviceGeometryArray.{op}: Shapely fallback (unsupported other type)",
             visible=True,
         )
         if isinstance(other, DeviceGeometryArray):
             other = other._ensure_shapely_cache()
-        result = shapely.intersection(self._ensure_shapely_cache(), other, *args, **kwargs)
+        result = getattr(shapely, op)(
+            self._ensure_shapely_cache(), other, *args, **kwargs
+        )
         new_owned = from_shapely_geometries(result.tolist())
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+
+    def intersection(self, other, *args, **kwargs):
+        return self._binary_constructive("intersection", other, *args, **kwargs)
 
     def union(self, other, *args, **kwargs):
-        import shapely
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.union: Shapely materialization required",
-            visible=True,
-        )
-        if isinstance(other, DeviceGeometryArray):
-            other = other._ensure_shapely_cache()
-        result = shapely.union(self._ensure_shapely_cache(), other, *args, **kwargs)
-        new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        return self._binary_constructive("union", other, *args, **kwargs)
 
     def difference(self, other, *args, **kwargs):
-        import shapely
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.difference: Shapely materialization required",
-            visible=True,
-        )
-        if isinstance(other, DeviceGeometryArray):
-            other = other._ensure_shapely_cache()
-        result = shapely.difference(self._ensure_shapely_cache(), other, *args, **kwargs)
-        new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        return self._binary_constructive("difference", other, *args, **kwargs)
 
     def symmetric_difference(self, other, *args, **kwargs):
-        import shapely
-
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.symmetric_difference: Shapely materialization required",
-            visible=True,
-        )
-        if isinstance(other, DeviceGeometryArray):
-            other = other._ensure_shapely_cache()
-        result = shapely.symmetric_difference(self._ensure_shapely_cache(), other, *args, **kwargs)
-        new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        return self._binary_constructive("symmetric_difference", other, *args, **kwargs)
 
     # ------------------------------------------------------------------
     # Shapely materialization (lazy, demand-driven)
