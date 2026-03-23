@@ -76,6 +76,65 @@ DeviceArray: TypeAlias = Any
 
 
 # ---------------------------------------------------------------------------
+# D2H transfer counter — lightweight instrumentation for zero-copy audits
+# ---------------------------------------------------------------------------
+
+_d2h_transfer_lock = threading.Lock()
+_d2h_transfer_count: int = 0
+
+
+def _increment_d2h_transfer_count() -> None:
+    """Increment the global D2H transfer counter (thread-safe)."""
+    global _d2h_transfer_count
+    with _d2h_transfer_lock:
+        _d2h_transfer_count += 1
+
+
+def get_d2h_transfer_count() -> int:
+    """Return the current D2H transfer count."""
+    with _d2h_transfer_lock:
+        return _d2h_transfer_count
+
+
+def reset_d2h_transfer_count() -> None:
+    """Reset the D2H transfer counter to zero."""
+    global _d2h_transfer_count
+    with _d2h_transfer_lock:
+        _d2h_transfer_count = 0
+
+
+@contextmanager
+def assert_zero_d2h_transfers():
+    """Assert no D2H transfers occur in the block.
+
+    Records the transfer count at entry and verifies it has not changed
+    at exit.  Raises ``AssertionError`` if any ``copy_device_to_host``
+    calls occurred inside the block.
+
+    Usage::
+
+        with assert_zero_d2h_transfers():
+            result = overlay(df1, df2)
+        assert result.geometry.values._owned.residency == Residency.DEVICE
+
+    This is complementary to the higher-level
+    ``execution_trace.assert_no_transfers()`` context manager, which tracks
+    transfers via the trace subsystem.  This counter operates at the CUDA
+    runtime level and catches transfers that bypass the trace system.
+    """
+    with _d2h_transfer_lock:
+        start_count = _d2h_transfer_count
+    yield
+    with _d2h_transfer_lock:
+        end_count = _d2h_transfer_count
+    if end_count != start_count:
+        raise AssertionError(
+            f"Expected zero D2H transfers, but {end_count - start_count} "
+            f"occurred (counter went from {start_count} to {end_count})"
+        )
+
+
+# ---------------------------------------------------------------------------
 # NVRTC disk cache — persists compiled CUBIN across process restarts
 # ---------------------------------------------------------------------------
 
@@ -357,6 +416,7 @@ class CudaDriverRuntime:
 
     def copy_device_to_host(self, device_array: DeviceArray, host_array: np.ndarray | None = None) -> np.ndarray:
         _require_gpu_arrays()
+        _increment_d2h_transfer_count()
         with self.activate():
             host = cp.asnumpy(device_array)
         if host_array is None:
@@ -444,6 +504,7 @@ class CudaDriverRuntime:
         returned array.
         """
         _require_gpu_arrays()
+        _increment_d2h_transfer_count()
         with self.activate():
             if host_array is None:
                 host_array = np.empty(device_array.shape, dtype=device_array.dtype)

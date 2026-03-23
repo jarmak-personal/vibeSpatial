@@ -22,6 +22,7 @@ ADR-0002: CONSTRUCTIVE class — stays fp64 on all devices per policy.
 from __future__ import annotations
 
 import logging
+import warnings
 
 import numpy as np
 import shapely
@@ -35,6 +36,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime._runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
@@ -301,9 +303,9 @@ def _binary_constructive_cpu(
     *,
     grid_size: float | None = None,
 ) -> OwnedGeometryArray:
-    """CPU fallback: Shapely element-wise binary constructive."""
-    left_geoms = left.to_shapely()
-    right_geoms = right.to_shapely()
+    """CPU-only mode: Shapely element-wise binary constructive."""
+    left_geoms = left.to_shapely()  # CPU-only mode
+    right_geoms = right.to_shapely()  # CPU-only mode
 
     left_arr = np.empty(len(left_geoms), dtype=object)
     left_arr[:] = left_geoms
@@ -314,7 +316,7 @@ def _binary_constructive_cpu(
     if grid_size is not None:
         kwargs["grid_size"] = grid_size
 
-    result_arr = getattr(shapely, op)(left_arr, right_arr, **kwargs)
+    result_arr = getattr(shapely, op)(left_arr, right_arr, **kwargs)  # CPU-only mode
     return from_shapely_geometries(result_arr.tolist())
 
 
@@ -675,7 +677,28 @@ def binary_constructive_owned(
     else:
         fallback_reason = selection.reason
 
-    result = _binary_constructive_cpu(op, left, right, grid_size=grid_size)
+    # Phase 24: Guard CPU fallback when GPU was explicitly requested with
+    # device-resident input.  This should not happen silently.
+    if gpu_attempted and selection.requested is ExecutionMode.GPU:
+        warnings.warn(
+            f"[vibeSpatial] binary_constructive '{op}': GPU was explicitly "
+            f"requested but the GPU kernel returned None for this family "
+            f"pair. Falling back to CPU/Shapely with D2H transfer. "
+            f"rows={left.row_count}",
+            stacklevel=2,
+        )
+
+    record_fallback_event(
+        surface=f"geopandas.array.{op}",
+        reason=fallback_reason,
+        detail=f"rows={left.row_count}, op={op}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+        pipeline="binary_constructive_owned",
+        d2h_transfer=gpu_attempted,  # D2H transfer occurs when GPU was attempted but fell back
+    )
+
+    result = _binary_constructive_cpu(op, left, right, grid_size=grid_size)  # CPU-only mode: Shapely
     record_dispatch_event(
         surface=f"geopandas.array.{op}",
         operation=op,

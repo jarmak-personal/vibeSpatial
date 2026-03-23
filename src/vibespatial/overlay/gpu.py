@@ -39,6 +39,7 @@ from vibespatial.geometry.owned import (  # noqa: E402
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
+from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.residency import Residency  # noqa: E402
 from vibespatial.spatial.segment_primitives import (  # noqa: E402
     SegmentIntersectionDeviceState,
@@ -3808,16 +3809,17 @@ def _overlay_owned(
         raise NotImplementedError("GPU overlay owned operations currently support polygon/multipolygon inputs")
 
     if requested is ExecutionMode.CPU:
+        # CPU-only mode: explicit CPU request, Shapely operations
         left_values = np.asarray(left.to_shapely(), dtype=object)
         right_values = np.asarray(right.to_shapely(), dtype=object)
         if operation == "intersection":
-            values = shapely.intersection(left_values, right_values).tolist()
+            values = shapely.intersection(left_values, right_values).tolist()  # CPU-only mode
         elif operation == "union":
-            values = shapely.union(left_values, right_values).tolist()
+            values = shapely.union(left_values, right_values).tolist()  # CPU-only mode
         elif operation == "difference":
-            values = shapely.difference(left_values, right_values).tolist()
+            values = shapely.difference(left_values, right_values).tolist()  # CPU-only mode
         elif operation == "symmetric_difference":
-            values = shapely.symmetric_difference(left_values, right_values).tolist()
+            values = shapely.symmetric_difference(left_values, right_values).tolist()  # CPU-only mode
         elif operation == "identity":
             values = [geometry for geometry in left_values.tolist() if geometry is not None and not geometry.is_empty]
         else:
@@ -3842,6 +3844,16 @@ def _overlay_owned(
     if requested is ExecutionMode.GPU and selected is not ExecutionMode.GPU:
         raise RuntimeError("GPU execution was requested, but no CUDA runtime is available")
     if requested is ExecutionMode.AUTO and selected is ExecutionMode.CPU:
+        # Phase 24: AUTO mode, no GPU available — CPU fallback is expected.
+        record_fallback_event(
+            surface=f"geopandas.overlay.{operation}",
+            reason="AUTO mode: no GPU runtime available",
+            detail=f"operation={operation}, left_rows={left.row_count}, right_rows={right.row_count}",
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+            pipeline="_overlay_owned",
+            d2h_transfer=False,
+        )
         return _overlay_owned(left, right, operation=operation, dispatch_mode=ExecutionMode.CPU)
 
     if operation == "intersection":
@@ -3896,8 +3908,6 @@ def _overlay_owned(
             gpu_fail_reason = f"GPU face assembly raised {type(exc).__name__}: {exc}"
 
         if gpu_failed:
-            from vibespatial.runtime.fallbacks import record_fallback_event
-
             record_fallback_event(
                 surface="overlay.gpu._overlay_owned",
                 reason=gpu_fail_reason,
@@ -4045,6 +4055,16 @@ def spatial_overlay_owned(
         _used_owned_dispatch = False
 
     if not _used_owned_dispatch:
+        # Phase 24: Record fallback event for spatial overlay CPU path.
+        record_fallback_event(
+            surface=f"geopandas.spatial_overlay.{how}",
+            reason="owned-path dispatch failed, falling back to Shapely",
+            detail=f"how={how}, pairs={len(left_indices)}",
+            requested=requested,
+            selected=ExecutionMode.CPU,
+            pipeline="spatial_overlay_owned",
+            d2h_transfer=True,
+        )
         # Shapely fallback: materialize participating rows for validation + clipping.
         left_shapely_orig = np.asarray(left_subset.to_shapely(), dtype=object)
         right_shapely_orig = np.asarray(right_subset.to_shapely(), dtype=object)
@@ -4127,14 +4147,15 @@ def spatial_overlay_owned(
                     pass  # fall through to general path
 
         if not _used_clip_by_rect and not _used_centroid_filter:
+            # CPU-only mode: general Shapely path for spatial overlay
             if how == "intersection":
-                result_geoms = shapely.intersection(left_shapely, right_shapely)
+                result_geoms = shapely.intersection(left_shapely, right_shapely)  # CPU-only mode
             elif how == "union":
-                result_geoms = shapely.union(left_shapely, right_shapely)
+                result_geoms = shapely.union(left_shapely, right_shapely)  # CPU-only mode
             elif how == "difference":
-                result_geoms = shapely.difference(left_shapely, right_shapely)
+                result_geoms = shapely.difference(left_shapely, right_shapely)  # CPU-only mode
             elif how == "symmetric_difference":
-                result_geoms = shapely.symmetric_difference(left_shapely, right_shapely)
+                result_geoms = shapely.symmetric_difference(left_shapely, right_shapely)  # CPU-only mode
             else:
                 raise ValueError(f"unsupported spatial overlay operation: {how}")
 

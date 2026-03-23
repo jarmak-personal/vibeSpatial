@@ -18,7 +18,7 @@ from vibespatial.api.geometry_array import (
 )
 from vibespatial.runtime._runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import strict_native_mode_enabled
+from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
 
@@ -213,13 +213,23 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 )
                 used_owned = True
             except NotImplementedError:
-                # binary_constructive_owned can't handle result types like
-                # GeometryCollections — fall back using already-gathered subsets
-                # to avoid re-materializing the full arrays.
+                # Phase 24: Guard — binary_constructive_owned raised
+                # NotImplementedError (e.g. GeometryCollection results).
+                # Record fallback event so this is never silent.
+                record_fallback_event(
+                    surface="geopandas.overlay.intersection",
+                    reason="binary_constructive_owned raised NotImplementedError",
+                    detail=f"rows={len(idx1)}, falling back to Shapely intersection",
+                    requested=ExecutionMode.AUTO,
+                    selected=ExecutionMode.CPU,
+                    pipeline="_overlay_intersection",
+                    d2h_transfer=True,
+                )
+                # CPU-only mode: Shapely intersection on already-gathered subsets
                 left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
                 right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
                 intersections = GeoSeries(
-                    shapely.intersection(left_shapely, right_shapely),
+                    shapely.intersection(left_shapely, right_shapely),  # CPU-only mode
                     crs=df1.crs,
                 )
 
@@ -347,7 +357,16 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             )
             used_owned = True
         except (ImportError, NotImplementedError):
-            pass
+            # Phase 24: Record fallback event when owned-path dispatch fails.
+            record_fallback_event(
+                surface="geopandas.overlay.difference",
+                reason="owned-path dispatch failed (ImportError or NotImplementedError)",
+                detail=f"left_rows={n_left}, idx1_size={idx1.size}",
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                pipeline="_overlay_difference",
+                d2h_transfer=True,
+            )
 
     if result_owned is not None:
         # Device-resident path: wrap the scattered OwnedGeometryArray
@@ -384,11 +403,11 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                     if len(neighbors) == 1:
                         right_unions[left_pos] = neighbors[0]
                     else:
-                        right_unions[left_pos] = shapely.union_all(neighbors)
+                        right_unions[left_pos] = shapely.union_all(neighbors)  # CPU-only mode
 
                 has_neighbors = np.zeros(n_left, dtype=bool)
                 has_neighbors[idx1_unique] = True
-                result_geoms[has_neighbors] = shapely.difference(
+                result_geoms[has_neighbors] = shapely.difference(  # CPU-only mode
                     left_geoms[has_neighbors], right_unions[has_neighbors],
                 )
 

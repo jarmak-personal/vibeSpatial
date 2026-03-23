@@ -10,6 +10,7 @@ import shapely
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
@@ -458,7 +459,9 @@ def _detect_self_intersections_gpu(owned, valid_mask: np.ndarray, geometries: np
             if geometries is None:
                 geometries = np.asarray(owned.to_shapely(), dtype=object)
             subset = geometries[structurally_valid_rows]
-            subset_valid = np.asarray(shapely.is_valid(subset), dtype=bool)
+            # CPU-only mode: self-intersection detection via Shapely on
+            # the subset that passed GPU ring-structure checks
+            subset_valid = np.asarray(shapely.is_valid(subset), dtype=bool)  # CPU-only mode
             valid_mask[structurally_valid_rows[~subset_valid]] = False
         except Exception:
             pass
@@ -625,8 +628,8 @@ def _compute_validity_mask_gpu(geometries: np.ndarray, owned) -> tuple[np.ndarra
         mask = is_valid_owned(owned)
         return mask, True
     except Exception:
-        # If GPU dispatch fails, fall back to Shapely
-        return np.asarray(shapely.is_valid(geometries), dtype=bool), False
+        # CPU-only mode: GPU ring checks not available, fall back to Shapely
+        return np.asarray(shapely.is_valid(geometries), dtype=bool), False  # CPU-only mode
 
 
 # ---------------------------------------------------------------------------
@@ -662,10 +665,10 @@ def _make_valid_gpu_repair(owned, repaired_rows, geometries, *, method, keep_col
     tags=("shapely", "constructive", "make_valid"),
 )
 def _make_valid_cpu_repair(geometries, repaired_rows, *, method, keep_collapsed):
-    """CPU repair via shapely.make_valid on invalid subset."""
+    """CPU-only mode: repair via shapely.make_valid on invalid subset."""
     result = geometries.copy()
     if repaired_rows.size:
-        result[repaired_rows] = shapely.make_valid(
+        result[repaired_rows] = shapely.make_valid(  # CPU-only mode
             geometries[repaired_rows],
             method=method,
             keep_collapsed=keep_collapsed,
@@ -769,14 +772,27 @@ def make_valid_owned(
                 )
             valid_mask = gpu_mask
         except Exception:
+            # Phase 24: GPU path selected but GPU polygon validity mask
+            # returned None (no polygon families or no GPU).  Fall back
+            # to Shapely is_valid and record the fallback event.
             gpu_detection_used = False
             _ensure_geometries()
-            valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)
+            valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)  # CPU-only mode
+            record_fallback_event(
+                surface="geopandas.array.make_valid",
+                reason="GPU selected but _gpu_polygon_validity_mask returned None",
+                detail=f"rows={row_count}, method={method}",
+                requested=dispatch_mode,
+                selected=ExecutionMode.CPU,
+                pipeline="make_valid_owned",
+                d2h_transfer=True,
+            )
     else:
         if owned is not None:
             null_mask = ~owned.validity
         _ensure_geometries()
-        valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)
+        # CPU-only mode: GPU ring checks not available, fall back to Shapely
+        valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)  # CPU-only mode
 
     # From here on we need Shapely geometries for repair
     _ensure_geometries()
@@ -802,6 +818,18 @@ def make_valid_owned(
                 pass
 
         if not gpu_repair_done:
+            # Phase 24: If GPU was selected but repair fell back to CPU,
+            # record the fallback event so this is not silent.
+            if selection.selected is ExecutionMode.GPU:
+                record_fallback_event(
+                    surface="geopandas.array.make_valid",
+                    reason="GPU repair failed or unavailable, falling back to shapely.make_valid",
+                    detail=f"rows={row_count}, repaired={repaired_rows.size}, method={method}",
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.CPU,
+                    pipeline="make_valid_owned",
+                    d2h_transfer=True,
+                )
             result = _make_valid_cpu_repair(
                 geometries, repaired_rows,
                 method=method, keep_collapsed=keep_collapsed,
@@ -865,7 +893,8 @@ def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bo
     compact_elapsed = perf_counter() - start
 
     start = perf_counter()
-    shapely.make_valid(geometries, method=method, keep_collapsed=keep_collapsed)
+    # Benchmark baseline: intentional Shapely call for comparison timing
+    shapely.make_valid(geometries, method=method, keep_collapsed=keep_collapsed)  # benchmark baseline
     baseline_elapsed = perf_counter() - start
 
     return MakeValidBenchmark(

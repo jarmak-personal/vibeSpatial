@@ -1281,8 +1281,8 @@ class GeometryArray(ExtensionArray):
                     # with the accurate selected mode (GPU or CPU).
                     return GeometryArray.from_owned(result_owned, crs=self.crs)
                 except NotImplementedError:
-                    # binary_constructive_owned can't handle result types like
-                    # GeometryCollections — fall through to Shapely fallback.
+                    # GeometryCollection or other unsupported family in result;
+                    # fall through to the Shapely host path below.
                     pass
 
         record_dispatch_event(
