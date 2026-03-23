@@ -2439,9 +2439,6 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     jump = cp.asarray(device.next_edge_ids).copy()
     max_iterations = max(1, int(np.ceil(np.log2(edge_count))))
 
-    grid = (max(1, (edge_count + 255) // 256), 1, 1)
-    block = (256, 1, 1)
-
     for _ in range(max_iterations):
         face_id = cp.minimum(face_id, face_id[jump])
         jump = jump[jump]
@@ -2456,6 +2453,7 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
     )
+    grid, block = runtime.launch_config(kernels["compute_shoelace_contributions"], edge_count)
     runtime.launch(kernels["compute_shoelace_contributions"], grid=grid, block=block, params=shoelace_params)
 
     # --- Step 3: Group edges by face_id via sort, then aggregate ---
@@ -2507,16 +2505,17 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     factor = 1.0 / (3.0 * safe_twice_area)
     centroid_x = cx_sums * factor
     centroid_y = cy_sums * factor
-    # For zero-area faces, use mean of coordinates
+    # For zero-area faces, use mean of coordinates.  Compute the fallback
+    # unconditionally on device (cheap segmented reduce + cp.where) to avoid
+    # the implicit D2H sync that cp.any(zero_area_mask) would trigger.
     zero_area_mask = twice_area == 0.0
-    if cp.any(zero_area_mask):
-        sorted_src_x = cp.asarray(device.src_x)[sorted_edge_ids]
-        sorted_src_y = cp.asarray(device.src_y)[sorted_edge_ids]
-        mean_x = segmented_reduce_sum(sorted_src_x, valid_starts, valid_ends, num_segments=face_count).values
-        mean_y = segmented_reduce_sum(sorted_src_y, valid_starts, valid_ends, num_segments=face_count).values
-        safe_lengths = cp.where(valid_lengths == 0, 1, valid_lengths).astype(cp.float64)
-        centroid_x = cp.where(zero_area_mask, mean_x / safe_lengths, centroid_x)
-        centroid_y = cp.where(zero_area_mask, mean_y / safe_lengths, centroid_y)
+    sorted_src_x = cp.asarray(device.src_x)[sorted_edge_ids]
+    sorted_src_y = cp.asarray(device.src_y)[sorted_edge_ids]
+    mean_x = segmented_reduce_sum(sorted_src_x, valid_starts, valid_ends, num_segments=face_count).values
+    mean_y = segmented_reduce_sum(sorted_src_y, valid_starts, valid_ends, num_segments=face_count).values
+    safe_lengths = cp.where(valid_lengths == 0, 1, valid_lengths).astype(cp.float64)
+    centroid_x = cp.where(zero_area_mask, mean_x / safe_lengths, centroid_x)
+    centroid_y = cp.where(zero_area_mask, mean_y / safe_lengths, centroid_y)
 
     # Build compact face_offsets and face_edge_ids in cycle traversal order.
     # GPU list ranking: each edge gets its position within its face cycle,
@@ -2530,9 +2529,10 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
     )
+    rank_grid, rank_block = runtime.launch_config(kernels["list_rank_within_cycle"], edge_count)
     runtime.launch(
         kernels["list_rank_within_cycle"],
-        grid=grid, block=block, params=rank_params,
+        grid=rank_grid, block=rank_block, params=rank_params,
     )
 
     # Pack (face_id, rank) into a single sort key so sort_pairs gives us
@@ -2554,7 +2554,7 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     # the face_id-sorted array since the packed key preserves face_id order.
     # Gather all valid-face edges into a contiguous output using vectorised
     # CuPy index arithmetic — no per-face host loop.
-    total_edges = int(cp.asnumpy(_total)[0])
+    total_edges = int(_total.item())
 
     # Build a flat gather index: for each slot in the output, compute the
     # source position in cycle_sorted_edge_ids.
@@ -2571,7 +2571,6 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     label_x = cp.empty(face_count, dtype=cp.float64)
     label_y = cp.empty(face_count, dtype=cp.float64)
     bounded_mask = cp.empty(face_count, dtype=cp.int8)
-    face_grid = (max(1, (face_count + 255) // 256), 1, 1)
     sample_params = (
         (ptr(device.src_x), ptr(device.src_y), ptr(device.next_edge_ids),
          ptr(face_offsets), ptr(face_edge_ids), ptr(signed_area),
@@ -2580,7 +2579,8 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
     )
-    runtime.launch(kernels["compute_face_sample_points"], grid=face_grid, block=block, params=sample_params)
+    sample_grid, sample_block = runtime.launch_config(kernels["compute_face_sample_points"], face_count)
+    runtime.launch(kernels["compute_face_sample_points"], grid=sample_grid, block=sample_block, params=sample_params)
 
     return face_offsets, face_edge_ids, bounded_mask, signed_area, centroid_x, centroid_y, label_x, label_y, face_count
 

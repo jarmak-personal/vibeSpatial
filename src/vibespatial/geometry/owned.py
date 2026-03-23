@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
 from typing import Any
@@ -138,6 +138,20 @@ class DeviceFamilyGeometryBuffer:
 
 
 @dataclass
+class DeviceMetadataState:
+    """Device-resident copies of the three routing metadata arrays.
+
+    When ``residency=DEVICE``, these arrays live on GPU and the
+    corresponding host numpy arrays in :class:`OwnedGeometryArray` may be
+    ``None``.  Accessing the host properties triggers a lazy D->H transfer.
+    """
+
+    validity: DeviceArray      # bool
+    tags: DeviceArray          # int8
+    family_row_offsets: DeviceArray  # int32
+
+
+@dataclass
 class OwnedGeometryDeviceState:
     validity: DeviceArray
     tags: DeviceArray
@@ -147,23 +161,123 @@ class OwnedGeometryDeviceState:
     row_bounds: DeviceArray | None = None  # cached per-row (N, 4) fp64 bounds on device
 
 
-@dataclass
 class OwnedGeometryArray:
-    validity: np.ndarray
-    tags: np.ndarray
-    family_row_offsets: np.ndarray
-    families: dict[GeometryFamily, FamilyGeometryBuffer]
-    residency: Residency = Residency.HOST
-    diagnostics: list[DiagnosticEvent] = field(default_factory=list)
-    runtime_history: list[RuntimeSelection] = field(default_factory=list)
-    geoarrow_backed: bool = False
-    shares_geoarrow_memory: bool = False
-    device_adopted: bool = False
-    device_state: OwnedGeometryDeviceState | None = None
+    """Columnar geometry storage with optional device-resident metadata.
+
+    The three routing metadata arrays -- ``validity``, ``tags``, and
+    ``family_row_offsets`` -- are exposed as properties.  When the array
+    is device-resident, the host numpy copies may be ``None`` internally;
+    accessing any property lazily transfers from GPU to CPU, preserving
+    full backward compatibility for host consumers while allowing
+    GPU-only pipelines to avoid the D->H transfer entirely.
+    """
+
+    def __init__(
+        self,
+        validity: np.ndarray | None,
+        tags: np.ndarray | None,
+        family_row_offsets: np.ndarray | None,
+        families: dict[GeometryFamily, FamilyGeometryBuffer],
+        residency: Residency = Residency.HOST,
+        diagnostics: list[DiagnosticEvent] | None = None,
+        runtime_history: list[RuntimeSelection] | None = None,
+        geoarrow_backed: bool = False,
+        shares_geoarrow_memory: bool = False,
+        device_adopted: bool = False,
+        device_state: OwnedGeometryDeviceState | None = None,
+        device_metadata: DeviceMetadataState | None = None,
+        _row_count: int | None = None,
+    ) -> None:
+        self._validity = validity
+        self._tags = tags
+        self._family_row_offsets = family_row_offsets
+        self.families = families
+        self.residency = residency
+        self.diagnostics: list[DiagnosticEvent] = diagnostics if diagnostics is not None else []
+        self.runtime_history: list[RuntimeSelection] = runtime_history if runtime_history is not None else []
+        self.geoarrow_backed = geoarrow_backed
+        self.shares_geoarrow_memory = shares_geoarrow_memory
+        self.device_adopted = device_adopted
+        self.device_state = device_state
+        self._device_metadata = device_metadata
+        # Cache row_count so we don't need to materialise host arrays just
+        # to query the length.  When host validity is present we derive it;
+        # otherwise the caller must supply _row_count explicitly.
+        if _row_count is not None:
+            self._row_count = _row_count
+        elif validity is not None:
+            self._row_count = int(validity.size)
+        elif device_metadata is not None:
+            self._row_count = int(device_metadata.validity.size)
+        elif device_state is not None:
+            self._row_count = int(device_state.validity.size)
+        else:
+            raise ValueError(
+                "Cannot determine row_count: provide validity or "
+                "device_metadata or _row_count"
+            )
+
+    # ------------------------------------------------------------------
+    # Lazy-materialising metadata properties
+    # ------------------------------------------------------------------
+
+    def _ensure_host_metadata(self) -> None:
+        """Transfer device metadata arrays to host if not already present."""
+        if self._validity is not None:
+            return  # already materialised
+        dm = self._device_metadata
+        if dm is None and self.device_state is not None:
+            # Fall back to device_state (pre-existing arrays)
+            dm = DeviceMetadataState(
+                validity=self.device_state.validity,
+                tags=self.device_state.tags,
+                family_row_offsets=self.device_state.family_row_offsets,
+            )
+        if dm is None:
+            raise RuntimeError(
+                "Host metadata is None and no device metadata available "
+                "for lazy materialisation"
+            )
+        runtime = get_cuda_runtime()
+        self._validity = runtime.copy_device_to_host(dm.validity)
+        self._tags = runtime.copy_device_to_host(dm.tags)
+        self._family_row_offsets = runtime.copy_device_to_host(dm.family_row_offsets)
+
+    @property
+    def validity(self) -> np.ndarray:
+        if self._validity is None:
+            self._ensure_host_metadata()
+        return self._validity  # type: ignore[return-value]
+
+    @validity.setter
+    def validity(self, value: np.ndarray | None) -> None:
+        self._validity = value
+        if value is not None:
+            self._row_count = int(value.size)
+
+    @property
+    def tags(self) -> np.ndarray:
+        if self._tags is None:
+            self._ensure_host_metadata()
+        return self._tags  # type: ignore[return-value]
+
+    @tags.setter
+    def tags(self, value: np.ndarray | None) -> None:
+        self._tags = value
+
+    @property
+    def family_row_offsets(self) -> np.ndarray:
+        if self._family_row_offsets is None:
+            self._ensure_host_metadata()
+        return self._family_row_offsets  # type: ignore[return-value]
+
+    @family_row_offsets.setter
+    def family_row_offsets(self, value: np.ndarray | None) -> None:
+        self._family_row_offsets = value
 
     @property
     def row_count(self) -> int:
-        return int(self.validity.size)
+        return self._row_count
 
     def family_has_rows(self, family: GeometryFamily) -> bool:
         """Check whether *family* has at least one geometry row to process.
@@ -302,10 +416,18 @@ class OwnedGeometryArray:
             raise RuntimeError("GPU execution was requested, but no CUDA device is available")
         t0 = perf_counter()
         total_bytes = self.validity.nbytes + self.tags.nbytes + self.family_row_offsets.nbytes
+        d_validity = runtime.from_host(self.validity)
+        d_tags = runtime.from_host(self.tags)
+        d_family_row_offsets = runtime.from_host(self.family_row_offsets)
+        self._device_metadata = DeviceMetadataState(
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_family_row_offsets,
+        )
         self.device_state = OwnedGeometryDeviceState(
-            validity=runtime.from_host(self.validity),
-            tags=runtime.from_host(self.tags),
-            family_row_offsets=runtime.from_host(self.family_row_offsets),
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_family_row_offsets,
             families={},
         )
         for family, buffer in self.families.items():
@@ -514,15 +636,18 @@ class OwnedGeometryArray:
                 host_materialized=False,
             )
 
-        # Small D→H for routing metadata
-        h_validity = cp.asnumpy(d_new_validity)
-        h_tags = cp.asnumpy(d_new_tags)
-        h_family_row_offsets = cp.asnumpy(d_new_family_row_offsets)
+        # Keep metadata device-only — host arrays stay None.
+        # Lazy _ensure_host_metadata() will transfer on first property access.
+        d_meta = DeviceMetadataState(
+            validity=d_new_validity,
+            tags=d_new_tags,
+            family_row_offsets=d_new_family_row_offsets,
+        )
 
         result = OwnedGeometryArray(
-            validity=h_validity,
-            tags=h_tags,
-            family_row_offsets=h_family_row_offsets,
+            validity=None,
+            tags=None,
+            family_row_offsets=None,
             families=new_host_families,
             residency=Residency.DEVICE,
             device_state=OwnedGeometryDeviceState(
@@ -531,6 +656,8 @@ class OwnedGeometryArray:
                 family_row_offsets=d_new_family_row_offsets,
                 families=new_device_families,
             ),
+            device_metadata=d_meta,
+            _row_count=int(d_indices.size),
         )
         result._record(
             DiagnosticKind.CREATED,
@@ -1356,6 +1483,16 @@ def build_device_resident_owned(
             host_materialized=False,
         )
 
+    d_validity = runtime.from_host(validity)
+    d_tags = runtime.from_host(tags)
+    d_family_row_offsets = runtime.from_host(family_row_offsets)
+
+    d_meta = DeviceMetadataState(
+        validity=d_validity,
+        tags=d_tags,
+        family_row_offsets=d_family_row_offsets,
+    )
+
     result = OwnedGeometryArray(
         validity=validity,
         tags=tags,
@@ -1363,11 +1500,12 @@ def build_device_resident_owned(
         families=host_families,
         residency=Residency.DEVICE,
         device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_family_row_offsets,
             families=device_families,
         ),
+        device_metadata=d_meta,
     )
     result._record(
         DiagnosticKind.CREATED,

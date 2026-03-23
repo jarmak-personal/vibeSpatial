@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 207/260 lines
+Body Budget: 233/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -25,7 +25,7 @@ Section Map (Body Lines)
 | 115-126 | Test Strategy |
 | 127-136 | Build And Tooling |
 | 137-154 | Verification |
-| ... | (3 additional sections omitted; open document body for full map) |
+| ... | (4 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 This repository is an agent-maintained spatial analytics project with a
@@ -233,3 +233,29 @@ automatically when you attempt to commit.
 4. **Run `/commit`** which orchestrates pre-land review, staging, and commit.
 5. Update docs that define the changed workflow or invariant.
 7. Report any blockers, especially GPU availability.
+
+## Landing the Plane (Session Completion)
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds

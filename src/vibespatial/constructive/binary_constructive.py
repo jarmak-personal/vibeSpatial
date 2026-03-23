@@ -21,6 +21,7 @@ import logging
 import numpy as np
 import shapely
 
+from vibespatial.cuda._runtime import DeviceArray
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
@@ -77,7 +78,9 @@ def _is_point_only(owned: OwnedGeometryArray) -> bool:
 
 def _build_point_polygon_result(
     points: OwnedGeometryArray,
-    new_validity: np.ndarray,
+    new_validity: np.ndarray | None,
+    *,
+    d_new_validity: DeviceArray | None = None,
 ) -> OwnedGeometryArray:
     """Build an OwnedGeometryArray that shares the Point coordinate buffers.
 
@@ -85,35 +88,71 @@ def _build_point_polygon_result(
     as *points* but replaces the top-level validity mask.  Rows where
     ``new_validity[i]`` is False become NULL in the output.
 
+    When *d_new_validity* is provided (a CuPy device array), the result
+    stores device-resident metadata directly and the host arrays are
+    set to ``None`` for lazy materialisation on first access.  This
+    eliminates D->H transfers for GPU-only consumers.
+
     Host family buffers are shared directly (no copy).  If the input
     has a device state, the result gets a new ``OwnedGeometryDeviceState``
     whose family buffers are shared but whose ``validity`` DeviceArray
-    reflects the new mask — ensuring downstream GPU consumers see the
+    reflects the new mask -- ensuring downstream GPU consumers see the
     correct null rows without re-uploading coordinates.
     """
-    from vibespatial.geometry.owned import OwnedGeometryDeviceState
+    from vibespatial.geometry.owned import DeviceMetadataState, OwnedGeometryDeviceState
 
     new_device_state = None
-    if points.device_state is not None:
-        from vibespatial.cuda._runtime import get_cuda_runtime
+    new_device_metadata = None
 
-        runtime = get_cuda_runtime()
+    if points.device_state is not None:
+        # Determine the device validity array
+        if d_new_validity is not None:
+            d_validity_out = d_new_validity
+        elif new_validity is not None:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+            runtime = get_cuda_runtime()
+            d_validity_out = runtime.from_host(new_validity)
+        else:
+            raise ValueError(
+                "Either new_validity or d_new_validity must be provided"
+            )
+
         new_device_state = OwnedGeometryDeviceState(
-            validity=runtime.from_host(new_validity),
+            validity=d_validity_out,
             tags=points.device_state.tags,
             family_row_offsets=points.device_state.family_row_offsets,
             families=dict(points.device_state.families),
         )
+        new_device_metadata = DeviceMetadataState(
+            validity=d_validity_out,
+            tags=points.device_state.tags,
+            family_row_offsets=points.device_state.family_row_offsets,
+        )
+
+    # When device metadata is available and no host validity was provided,
+    # keep host arrays None for lazy materialisation.
+    if d_new_validity is not None and new_device_metadata is not None:
+        # Device-resident result: host metadata is lazy
+        h_validity = None
+        h_tags = None
+        h_family_row_offsets = None
+    else:
+        # Host-resident result: copy the metadata arrays
+        h_validity = new_validity
+        h_tags = points.tags.copy()
+        h_family_row_offsets = points.family_row_offsets.copy()
 
     # Tags and family_row_offsets still index into the same family buffer.
     # For rows that are now invalid, the consumer will skip them via validity.
     result = OwnedGeometryArray(
-        validity=new_validity,
-        tags=points.tags.copy(),
-        family_row_offsets=points.family_row_offsets.copy(),
+        validity=h_validity,
+        tags=h_tags,
+        family_row_offsets=h_family_row_offsets,
         families=dict(points.families),
         residency=points.residency,
         device_state=new_device_state,
+        device_metadata=new_device_metadata,
+        _row_count=points.row_count,
     )
     return result
 
@@ -130,9 +169,8 @@ def _intersection_point_polygon_gpu(
     - either input NULL     -> NULL
 
     Uses the existing fused PIP kernel with ``_return_device=True`` to
-    obtain a device-resident boolean mask, then builds the output by
-    copying the input Point buffers and masking validity.  The only
-    D->H transfer is the boolean mask (N bytes).
+    obtain a device-resident boolean mask.  When the input has device
+    state, the boolean mask stays on GPU and no D->H transfer occurs.
 
     ADR-0033: Tier 2 (CuPy element-wise mask) over Tier 1 PIP kernel.
     """
@@ -141,19 +179,20 @@ def _intersection_point_polygon_gpu(
     # PIP kernel returns CuPy bool array (GPU) or numpy bool array (CPU).
     pip_mask = point_in_polygon(points, polygons, _return_device=True)
 
-    # Single D->H transfer of the boolean mask.  This is N booleans and
-    # is necessary because OwnedGeometryArray.validity is host-resident.
-    if hasattr(pip_mask, "get"):
-        # CuPy array — transfer to host
-        h_pip = pip_mask.get()
-    else:
-        # numpy array (CPU fallback)
-        h_pip = np.asarray(pip_mask, dtype=bool)
-
     # intersection: output is valid only where PIP is True.
     # pip_mask already encodes null handling (False when either input null).
-    new_validity = h_pip.astype(bool, copy=False)
-    return _build_point_polygon_result(points, new_validity)
+    if hasattr(pip_mask, "get") and points.device_state is not None:
+        # CuPy array + device state: keep entirely on device, no D->H.
+        d_new_validity = pip_mask.astype(bool, copy=False)
+        return _build_point_polygon_result(points, None, d_new_validity=d_new_validity)
+    else:
+        # CPU fallback or no device state: transfer to host.
+        if hasattr(pip_mask, "get"):
+            h_pip = pip_mask.get()
+        else:
+            h_pip = np.asarray(pip_mask, dtype=bool)
+        new_validity = h_pip.astype(bool, copy=False)
+        return _build_point_polygon_result(points, new_validity)
 
 
 def _difference_point_polygon_gpu(
@@ -168,22 +207,30 @@ def _difference_point_polygon_gpu(
     - left (point) NULL     -> NULL
     - right (polygon) NULL  -> keep the point (difference with NULL = identity)
 
+    When the input has device state, all boolean ops stay on GPU.
+
     ADR-0033: Tier 2 (CuPy element-wise mask) over Tier 1 PIP kernel.
     """
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
 
     pip_mask = point_in_polygon(points, polygons, _return_device=True)
 
-    if hasattr(pip_mask, "get"):
-        h_pip = pip_mask.get()
-    else:
-        h_pip = np.asarray(pip_mask, dtype=bool)
-
     # difference: output valid when left is valid AND point is NOT inside.
     # pip_mask is False for null right polygons, so ~pip_mask is True for
-    # those rows — preserving the identity semantics (point - NULL = point).
-    new_validity = points.validity & ~h_pip
-    return _build_point_polygon_result(points, new_validity)
+    # those rows -- preserving the identity semantics (point - NULL = point).
+    if hasattr(pip_mask, "get") and points.device_state is not None:
+        # CuPy array + device state: keep entirely on device, no D->H.
+        d_validity = points.device_state.validity.astype(bool, copy=False)
+        d_new_validity = d_validity & ~pip_mask.astype(bool, copy=False)
+        return _build_point_polygon_result(points, None, d_new_validity=d_new_validity)
+    else:
+        # CPU fallback or no device state: transfer to host.
+        if hasattr(pip_mask, "get"):
+            h_pip = pip_mask.get()
+        else:
+            h_pip = np.asarray(pip_mask, dtype=bool)
+        new_validity = points.validity & ~h_pip
+        return _build_point_polygon_result(points, new_validity)
 
 
 def _dispatch_overlay_gpu(
