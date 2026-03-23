@@ -2166,6 +2166,69 @@ def _select_overlay_face_indices(
     return np.flatnonzero(mask).astype(np.int32, copy=False)
 
 
+def _select_overlay_face_indices_gpu(
+    faces: OverlayFaceTable,
+    *,
+    operation: str,
+) -> cp.ndarray:
+    """Device-resident face selection -- no _ensure_host() D->H triggers.
+
+    Reads bounded_mask, left_covered, and right_covered directly from the
+    OverlayFaceTable's device_state, applies the overlay operation mask
+    entirely on device, and returns the selected face indices as a
+    device-resident CuPy int32 array.
+    """
+    ds = faces.device_state
+    d_bounded = cp.asarray(ds.bounded_mask)
+    d_left = cp.asarray(ds.left_covered)
+    d_right = cp.asarray(ds.right_covered)
+
+    if operation == "intersection":
+        d_mask = (d_bounded != 0) & (d_left != 0) & (d_right != 0)
+    elif operation == "union":
+        d_mask = (d_bounded != 0) & ((d_left != 0) | (d_right != 0))
+    elif operation == "difference":
+        d_mask = (d_bounded != 0) & (d_left != 0) & (d_right == 0)
+    elif operation == "symmetric_difference":
+        d_mask = (d_bounded != 0) & (d_left != d_right)
+    elif operation == "identity":
+        d_mask = (d_bounded != 0) & (d_left != 0)
+    else:
+        raise ValueError(f"unsupported overlay operation: {operation}")
+
+    return cp.flatnonzero(d_mask).astype(cp.int32)
+
+
+def _assemble_faces_from_device_indices(
+    half_edge_graph: HalfEdgeGraph,
+    faces: OverlayFaceTable,
+    d_selected_face_indices: cp.ndarray,
+) -> OwnedGeometryArray:
+    """Try CPU face assembly first, fall back to GPU.
+
+    Accepts device-resident (CuPy) face indices from
+    ``_select_overlay_face_indices_gpu`` and handles the D->H conversion
+    only for the CPU assembly path.  GPU assembly receives the CuPy array
+    directly (zero-copy).
+
+    The CPU-first ordering is intentional: CPU face boundary walking is
+    faster for most cases.  GPU assembly handles the "spans multiple
+    source rows" edge case (ADR-0016 Stage 8).
+    """
+    if d_selected_face_indices.size == 0:
+        return _empty_polygon_output(faces.runtime_selection)
+    try:
+        selected_face_indices = cp.asnumpy(d_selected_face_indices)
+        return _build_polygon_output_from_faces(half_edge_graph, faces, selected_face_indices)
+    except RuntimeError:
+        result = _build_polygon_output_from_faces_gpu(
+            half_edge_graph, faces, d_selected_face_indices,
+        )
+        if result is None:
+            raise
+        return result
+
+
 def _overlay_intersection_rectangles_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -3337,16 +3400,10 @@ def _overlay_owned(
     atomic_edges = build_gpu_atomic_edges(split_events)
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
-    selected_face_indices = _select_overlay_face_indices(faces, operation=operation)
-    # Try CPU face assembly first (faster for most cases), fall back to GPU
-    # assembly when the CPU path hits "spans multiple source rows" error
-    # (ADR-0016 Stage 8).
-    try:
-        result = _build_polygon_output_from_faces(half_edge_graph, faces, selected_face_indices)
-    except RuntimeError:
-        result = _build_polygon_output_from_faces_gpu(half_edge_graph, faces, selected_face_indices)
-        if result is None:
-            raise
+    # Phase 13: device-resident face selection eliminates D->H transfers on
+    # bounded_mask, left_covered, and right_covered.
+    d_selected_face_indices = _select_overlay_face_indices_gpu(faces, operation=operation)
+    result = _assemble_faces_from_device_indices(half_edge_graph, faces, d_selected_face_indices)
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,
