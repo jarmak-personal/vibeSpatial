@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import warnings
 
 import numpy as np
@@ -17,6 +19,7 @@ from vibespatial.api.geometry_array import (
 from vibespatial.runtime._runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import strict_native_mode_enabled
+from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
 
 def _extract_owned_pair(df1, df2):
@@ -47,12 +50,28 @@ def _ensure_geometry_column(df):
     return df
 
 
-def _intersecting_index_pairs(df1, df2):
+def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
     # ADR-0036 boundary: produces spatial index arrays only.
     # sindex.query has its own owned-dispatch path (sindex.py lines 334-378)
     # that routes through query_spatial_index when both sides support owned.
+    #
+    # Phase 2 zero-copy: when both DataFrames have owned (device-resident)
+    # backing, request device-resident index arrays from the spatial index
+    # to eliminate the D->H->D round-trip when downstream take() re-uploads.
+    # Returns DeviceSpatialJoinResult when device arrays are available,
+    # otherwise returns the standard (2, n) numpy array or (idx1, idx2) tuple.
     if not strict_native_mode_enabled():
-        return df2.sindex.query(df1.geometry, predicate="intersects", sort=True)
+        request_device = left_owned is not None and right_owned is not None
+        result = df2.sindex.query(
+            df1.geometry,
+            predicate="intersects",
+            sort=True,
+            return_device=request_device,
+        )
+        # DeviceSpatialJoinResult flows through directly to the caller.
+        if isinstance(result, DeviceSpatialJoinResult):
+            return result
+        return result
 
     idx1, idx2 = df2.sindex._tree.query(
         np.asarray(df1.geometry.array, dtype=object),
@@ -97,7 +116,26 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
         Result GeoDataFrame and whether the owned dispatch path was used.
     """
     # ADR-0036 boundary: spatial index produces index arrays only.
-    idx1, idx2 = _intersecting_index_pairs(df1, df2)
+    # Phase 2: pass owned arrays to request device-resident index pairs.
+    index_result = _intersecting_index_pairs(
+        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    )
+
+    # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
+    if isinstance(index_result, DeviceSpatialJoinResult):
+        d_idx1 = index_result.d_left_idx
+        d_idx2 = index_result.d_right_idx
+        # Host arrays for attribute assembly (pandas needs numpy).
+        idx1, idx2 = index_result.to_host()
+        _has_device_indices = True
+    else:
+        if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+            idx1, idx2 = index_result
+        else:
+            idx1, idx2 = index_result
+        d_idx1, d_idx2 = None, None
+        _has_device_indices = False
+
     used_owned = False
     # Create pairs of geometries in both dataframes to be intersected
     if idx1.size > 0 and idx2.size > 0:
@@ -114,8 +152,14 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 binary_constructive_owned,
             )
 
-            left_sub = left_owned.take(np.asarray(idx1))
-            right_sub = right_owned.take(np.asarray(idx2))
+            # Phase 2 zero-copy: pass CuPy device arrays directly to
+            # device_take() when available, eliminating H→D re-upload.
+            if _has_device_indices:
+                left_sub = left_owned.device_take(d_idx1)
+                right_sub = right_owned.device_take(d_idx2)
+            else:
+                left_sub = left_owned.take(np.asarray(idx1))
+                right_sub = right_owned.take(np.asarray(idx2))
             try:
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
@@ -181,7 +225,24 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
         Result GeoDataFrame and whether the owned dispatch path was used.
     """
     # ADR-0036 boundary: spatial index produces index arrays only.
-    idx1, idx2 = _intersecting_index_pairs(df1, df2)
+    # Phase 2: pass owned arrays to request device-resident index pairs.
+    index_result = _intersecting_index_pairs(
+        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    )
+
+    # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
+    if isinstance(index_result, DeviceSpatialJoinResult):
+        d_idx1 = index_result.d_left_idx
+        d_idx2 = index_result.d_right_idx
+        idx1, idx2 = index_result.to_host()
+        _has_device_indices = True
+    else:
+        if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+            idx1, idx2 = index_result
+        else:
+            idx1, idx2 = index_result
+        d_idx1, d_idx2 = None, None
+        _has_device_indices = False
 
     n_left = len(df1)
     used_owned = False
@@ -199,8 +260,12 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 segmented_union_all,
             )
 
-            # Gather right geometries at all neighbor indices (buffer-level).
-            right_gathered = right_owned.take(idx2)
+            # Phase 2 zero-copy: pass CuPy device arrays directly to
+            # device_take() when available, eliminating H→D re-upload.
+            if _has_device_indices:
+                right_gathered = right_owned.device_take(d_idx2)
+            else:
+                right_gathered = right_owned.take(idx2)
 
             # Build group offsets from the sorted idx1 split points.
             idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
