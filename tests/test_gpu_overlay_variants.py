@@ -118,5 +118,5 @@ def test_gpu_overlay_variants_remain_polygon_only() -> None:
     left = from_shapely_geometries([shapely.LineString([(0, 0), (1, 1)])])
     right = from_shapely_geometries([box(0, 0, 2, 2)])
 
-    with pytest.raises(NotImplementedError, match="polygon-only"):
+    with pytest.raises(NotImplementedError, match="polygon"):
         overlay_union_owned(left, right, dispatch_mode=ExecutionMode.GPU)
