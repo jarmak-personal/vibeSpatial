@@ -144,7 +144,11 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
             intersections = left.intersection(right)
 
         poly_ix = intersections.geom_type.isin(POLYGON_GEOM_TYPES)
-        intersections.loc[poly_ix] = intersections[poly_ix].make_valid()
+        if poly_ix.any():
+            # Apply make_valid to the full series to avoid loc assignment
+            # which destroys owned backing.  For non-polygon types this is
+            # a no-op.
+            intersections = intersections.make_valid()
 
         geom_intersect = intersections
 
@@ -185,7 +189,7 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
 
     n_left = len(df1)
     used_owned = False
-    result_geoms = None
+    result_owned = None
 
     # Owned-path dispatch: GPU segmented union + GPU difference when both
     # DataFrames have owned backing.  Avoids Shapely materialization for
@@ -195,6 +199,7 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
+            from vibespatial.geometry.owned import OwnedGeometryArray
             from vibespatial.kernels.constructive.segmented_union import (
                 segmented_union_all,
             )
@@ -217,20 +222,45 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 "difference", left_sub, right_unions_owned,
             )
 
-            # Assemble full result: unchanged left rows from GeoDataFrame,
-            # differenced rows materialized from owned result.
-            diff_shapely = np.asarray(diff_owned.to_shapely(), dtype=object)
-            result_geoms = np.asarray(df1.geometry, dtype=object).copy()
-            result_geoms[idx1_unique] = diff_shapely
+            # Assemble full result at the buffer level: scatter differenced
+            # rows back into a full-length array alongside unchanged rows.
+            # This avoids the Shapely materialization that was previously
+            # required for the scatter step.
+            unchanged_mask = np.ones(n_left, dtype=bool)
+            unchanged_mask[idx1_unique] = False
+            unchanged_indices = np.flatnonzero(unchanged_mask)
+
+            if unchanged_indices.size > 0:
+                unchanged_owned = left_owned.take(unchanged_indices)
+                combined_owned = OwnedGeometryArray.concat(
+                    [unchanged_owned, diff_owned],
+                )
+                # Build reorder mapping: unchanged go to their original
+                # positions, diff go to idx1_unique positions.
+                reorder = np.empty(n_left, dtype=np.int64)
+                reorder[unchanged_indices] = np.arange(unchanged_indices.size)
+                reorder[idx1_unique] = np.arange(
+                    unchanged_indices.size,
+                    unchanged_indices.size + idx1_unique.size,
+                )
+                result_owned = combined_owned.take(reorder)
+            else:
+                # All rows were differenced — diff_owned is the full result.
+                result_owned = diff_owned
 
             used_owned = True
         except (ImportError, NotImplementedError):
             pass
 
-    if result_geoms is None:
-        # Vectorized grouped-union approach: for each left geometry, compute
-        # left_i - union(overlapping right geometries).  Replaces per-geometry
-        # Python loop with grouped shapely.union_all + vectorized shapely.difference.
+    if result_owned is not None:
+        # Owned-path post-processing: make_valid and empty filtering at
+        # the owned level, preserving device-resident backing.
+        differences = GeoSeries(
+            GeometryArray.from_owned(result_owned, crs=df1.crs),
+            index=df1.index,
+        )
+    else:
+        # Shapely fallback path.
         left_geoms = np.asarray(df1.geometry, dtype=object)
         result_geoms = left_geoms.copy()
 
@@ -255,12 +285,22 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 left_geoms[has_neighbors], right_unions[has_neighbors],
             )
 
-    differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
+        differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
+
+    # make_valid the full series to avoid loc assignment which destroys
+    # owned backing.  For non-polygon types make_valid is a no-op.
     poly_ix = differences.geom_type.isin(POLYGON_GEOM_TYPES)
-    differences.loc[poly_ix] = differences[poly_ix].make_valid()
-    geom_diff = differences[~differences.is_empty].copy()
-    dfdiff = df1[~differences.is_empty].copy()
-    dfdiff[dfdiff._geometry_column_name] = geom_diff
+    if poly_ix.any():
+        differences = differences.make_valid()
+    non_empty = ~differences.is_empty
+    geom_diff = differences[non_empty].copy()
+    dfdiff = df1[non_empty].copy()
+    geo_col = dfdiff._geometry_column_name
+    # Use set_geometry to replace the geometry column while preserving
+    # owned backing and the original geometry column name.  The plain
+    # __setitem__ path (dfdiff[col] = series) destroys _owned.
+    geom_diff.name = geo_col
+    dfdiff = dfdiff.set_geometry(geom_diff, crs=df1.crs)
     return dfdiff, used_owned
 
 
@@ -310,7 +350,42 @@ def _overlay_symmetric_diff(df1, df2, left_owned=None, right_owned=None):
     # ensure geometry name (otherwise merge goes wrong)
     dfdiff1 = _ensure_geometry_column(dfdiff1)
     dfdiff2 = _ensure_geometry_column(dfdiff2)
-    # combine both 'difference' dataframes
+
+    # Check whether both differences carry owned-backed geometry.
+    # If so, bypass the merge-then-pick pattern (which destroys _owned)
+    # in favour of pd.concat which preserves owned backing via
+    # GeometryArray._concat_same_type.
+    diff1_owned = getattr(dfdiff1.geometry.values, '_owned', None)
+    diff2_owned = getattr(dfdiff2.geometry.values, '_owned', None)
+
+    if diff1_owned is not None and diff2_owned is not None:
+        # Align columns to match merge(..., suffixes=("_1","_2")) behavior:
+        # shared attribute columns get "_1"/"_2" suffix; unique columns
+        # keep their original names.
+        skip = {"geometry", "__idx1", "__idx2"}
+        attr1 = {c for c in dfdiff1.columns if c not in skip}
+        attr2 = {c for c in dfdiff2.columns if c not in skip}
+        shared = attr1 & attr2
+        rename1 = {c: f"{c}_1" for c in shared}
+        rename2 = {c: f"{c}_2" for c in shared}
+        if rename1:
+            dfdiff1 = dfdiff1.rename(columns=rename1)
+        if rename2:
+            dfdiff2 = dfdiff2.rename(columns=rename2)
+
+        dfsym = pd.concat(
+            [dfdiff1, dfdiff2], ignore_index=True, sort=False,
+        )
+        # keep geometry column last
+        columns = [c for c in dfsym.columns if c != "geometry"] + ["geometry"]
+        dfsym = dfsym.reindex(columns=columns)
+        if not isinstance(dfsym, GeoDataFrame):
+            dfsym = GeoDataFrame(dfsym)
+        if dfsym.crs is None and df1.crs is not None:
+            dfsym = dfsym.set_crs(df1.crs)
+        return dfsym, used1 or used2
+
+    # Shapely fallback: merge path (destroys owned backing).
     dfsym = dfdiff1.merge(
         dfdiff2, on=["__idx1", "__idx2"], how="outer", suffixes=("_1", "_2")
     )
@@ -492,9 +567,9 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
             mask = ~df.geometry.is_valid
             col = df._geometry_column_name
             if make_valid:
-                df.loc[mask, col] = df.loc[mask, col].make_valid()
-                # Extract only the input geometry type, as make_valid may change it
                 if mask.any():
+                    df.loc[mask, col] = df.loc[mask, col].make_valid()
+                    # Extract only the input geometry type, as make_valid may change it
                     df = _collection_extract(
                         df, geom_type="Polygon", keep_geom_type_warning=False
                     )

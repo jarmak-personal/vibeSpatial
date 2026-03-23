@@ -398,6 +398,88 @@ class OwnedGeometryArray:
         self._last_transfer_seconds = elapsed
         self._last_transfer_bytes = total_bytes
 
+    @classmethod
+    def concat(cls, arrays: list[OwnedGeometryArray]) -> OwnedGeometryArray:
+        """Concatenate multiple OwnedGeometryArrays at the buffer level.
+
+        Stays host-resident and avoids any Shapely materialization.
+        All input arrays are ensured to have host state before concatenation.
+        Device state is not carried over; the caller can move the result
+        to device if needed.
+        """
+        if not arrays:
+            return OwnedGeometryArray(
+                validity=np.empty(0, dtype=np.bool_),
+                tags=np.empty(0, dtype=np.int8),
+                family_row_offsets=np.empty(0, dtype=np.int32),
+                families={},
+                residency=Residency.HOST,
+            )
+        if len(arrays) == 1:
+            return arrays[0]
+
+        for arr in arrays:
+            arr._ensure_host_state()
+
+        # Concatenate top-level metadata arrays.
+        all_validity = np.concatenate([a.validity for a in arrays])
+        all_tags = np.concatenate([a.tags for a in arrays])
+
+        # Build concatenated family_row_offsets: each array's family-local
+        # offsets must be shifted by the cumulative family row count from
+        # preceding arrays.
+        total_rows = sum(a.row_count for a in arrays)
+        all_family_row_offsets = np.full(total_rows, -1, dtype=np.int32)
+
+        # Collect all families that appear in any array.
+        all_family_keys: set[GeometryFamily] = set()
+        for arr in arrays:
+            all_family_keys.update(arr.families.keys())
+
+        # Per-family cumulative row counts for offset shifting.
+        family_cumulative: dict[GeometryFamily, int] = {f: 0 for f in all_family_keys}
+        row_cursor = 0
+        for arr in arrays:
+            n = arr.row_count
+            for family in all_family_keys:
+                if family not in arr.families:
+                    continue
+                # Rows in this array belonging to this family.
+                family_mask = arr.tags == FAMILY_TAGS[family]
+                if not family_mask.any():
+                    continue
+                # Shift the family-local offsets by the cumulative count.
+                shift = family_cumulative[family]
+                src_offsets = arr.family_row_offsets[family_mask]
+                all_family_row_offsets[row_cursor + np.flatnonzero(family_mask)] = (
+                    src_offsets + shift
+                )
+                family_cumulative[family] += arr.families[family].row_count
+            row_cursor += n
+
+        # Concatenate per-family buffers.
+        new_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+        for family in all_family_keys:
+            buffers = [a.families[family] for a in arrays if family in a.families]
+            if not buffers:
+                continue
+            new_families[family] = _concat_family_buffers(family, buffers)
+
+        result = OwnedGeometryArray(
+            validity=all_validity,
+            tags=all_tags,
+            family_row_offsets=all_family_row_offsets,
+            families=new_families,
+            residency=Residency.HOST,
+        )
+        total = sum(a.row_count for a in arrays)
+        result._record(
+            DiagnosticKind.CREATED,
+            f"concatenated {len(arrays)} arrays totalling {total} rows",
+            visible=False,
+        )
+        return result
+
     def diagnostics_report(self) -> dict[str, Any]:
         return {
             "residency": self.residency.value,
@@ -742,6 +824,151 @@ def _take_family_buffer(
         )
 
     raise NotImplementedError(f"take not implemented for {buffer.family.value}")
+
+
+def _concat_offset_arrays(
+    offset_arrays: list[np.ndarray],
+    coord_counts: list[int],
+) -> np.ndarray:
+    """Concatenate offset arrays, shifting each by the cumulative coordinate count.
+
+    Each offset array has length (row_count + 1).  The result drops the
+    leading zero from all arrays after the first and shifts values so they
+    form a single contiguous offset array.
+    """
+    if len(offset_arrays) == 1:
+        return offset_arrays[0]
+    parts: list[np.ndarray] = [offset_arrays[0]]
+    cumulative = coord_counts[0]
+    for offsets, count in zip(offset_arrays[1:], coord_counts[1:], strict=True):
+        # Drop the leading 0 from subsequent arrays and shift.
+        parts.append(offsets[1:] + cumulative)
+        cumulative += count
+    return np.concatenate(parts).astype(np.int32)
+
+
+def _concat_family_buffers(
+    family: GeometryFamily,
+    buffers: list[FamilyGeometryBuffer],
+) -> FamilyGeometryBuffer:
+    """Concatenate multiple FamilyGeometryBuffers of the same family.
+
+    Coordinates are appended and offset arrays are shifted so that
+    the result is a single contiguous buffer.  No Shapely round-trip.
+    """
+    if len(buffers) == 1:
+        return buffers[0]
+
+    schema = buffers[0].schema
+    total_rows = sum(b.row_count for b in buffers)
+
+    new_x = np.concatenate([b.x for b in buffers]) if total_rows > 0 else np.empty(0, dtype=np.float64)
+    new_y = np.concatenate([b.y for b in buffers]) if total_rows > 0 else np.empty(0, dtype=np.float64)
+    new_empty_mask = np.concatenate([b.empty_mask for b in buffers])
+
+    # Bounds: concatenate if all have bounds, otherwise drop.
+    if all(b.bounds is not None for b in buffers):
+        new_bounds = np.concatenate([b.bounds for b in buffers])
+    else:
+        new_bounds = None
+
+    if family in (GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT):
+        # Single level of offsets: geometry_offsets -> coords
+        coord_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_geom_offsets = _concat_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            coord_counts,
+        )
+        return FamilyGeometryBuffer(
+            family=family,
+            schema=schema,
+            row_count=total_rows,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            bounds=new_bounds,
+        )
+
+    if family is GeometryFamily.POLYGON:
+        # Two levels: geometry_offsets -> ring_offsets -> coords
+        ring_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
+        geom_ring_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_ring_offsets = _concat_offset_arrays(
+            [b.ring_offsets for b in buffers],
+            ring_counts,
+        )
+        new_geom_offsets = _concat_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            geom_ring_counts,
+        )
+        return FamilyGeometryBuffer(
+            family=family,
+            schema=schema,
+            row_count=total_rows,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            ring_offsets=new_ring_offsets,
+            bounds=new_bounds,
+        )
+
+    if family is GeometryFamily.MULTILINESTRING:
+        # Two levels: geometry_offsets -> part_offsets -> coords
+        coord_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
+        geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_part_offsets = _concat_offset_arrays(
+            [b.part_offsets for b in buffers],
+            coord_counts,
+        )
+        new_geom_offsets = _concat_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            geom_part_counts,
+        )
+        return FamilyGeometryBuffer(
+            family=family,
+            schema=schema,
+            row_count=total_rows,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            part_offsets=new_part_offsets,
+            bounds=new_bounds,
+        )
+
+    if family is GeometryFamily.MULTIPOLYGON:
+        # Three levels: geometry_offsets -> part_offsets -> ring_offsets -> coords
+        ring_coord_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
+        part_ring_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
+        geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_ring_offsets = _concat_offset_arrays(
+            [b.ring_offsets for b in buffers],
+            ring_coord_counts,
+        )
+        new_part_offsets = _concat_offset_arrays(
+            [b.part_offsets for b in buffers],
+            part_ring_counts,
+        )
+        new_geom_offsets = _concat_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            geom_part_counts,
+        )
+        return FamilyGeometryBuffer(
+            family=family,
+            schema=schema,
+            row_count=total_rows,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            part_offsets=new_part_offsets,
+            ring_offsets=new_ring_offsets,
+            bounds=new_bounds,
+        )
+
+    raise NotImplementedError(f"concat not implemented for {family.value}")
 
 
 def _device_gather_offset_slices(

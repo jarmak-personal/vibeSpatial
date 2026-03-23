@@ -649,6 +649,9 @@ def make_valid_owned(
         requested=dispatch_mode,
         selected=selected,
     )
+    # When no rows needed repair and an owned array was provided, carry
+    # it through so callers can stay device-resident without re-uploading.
+    result_owned = owned if (repaired_rows.size == 0 and owned is not None) else None
     return MakeValidResult(
         geometries=result,
         row_count=len(result),
@@ -657,6 +660,7 @@ def make_valid_owned(
         null_rows=np.flatnonzero(null_mask).astype(np.int32),
         method=method,
         keep_collapsed=keep_collapsed,
+        owned=result_owned,
         selected=selected,
     )
 
