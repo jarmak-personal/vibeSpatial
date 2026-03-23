@@ -252,15 +252,19 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     n_left = len(df1)
     used_owned = False
     result_geoms = None
+    result_owned = None
 
     # Owned-path dispatch: GPU segmented union + GPU difference when both
     # DataFrames have owned backing.  Avoids Shapely materialization for
     # the union step when the segmented_union_all GPU kernel is available.
+    # Phase 18: uses concat_owned_scatter to keep the result device-resident
+    # instead of materializing via to_shapely().
     if idx1.size > 0 and left_owned is not None and right_owned is not None:
         try:
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
+            from vibespatial.geometry.owned import concat_owned_scatter
             from vibespatial.kernels.constructive.segmented_union import (
                 segmented_union_all,
             )
@@ -296,55 +300,60 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 "difference", left_sub, right_unions_owned,
             )
 
-            # Assemble full result: unchanged left rows from GeoDataFrame,
-            # differenced rows materialized from owned result.
-            diff_shapely = np.asarray(diff_owned.to_shapely(), dtype=object)
-            result_geoms = np.asarray(df1.geometry, dtype=object).copy()
-            # Bring idx1_unique to host for numpy object array assignment
-            # (this is a materialization path, not a hot GPU path).
-            h_idx1_unique = (
-                idx1_unique.get() if hasattr(idx1_unique, "get") else idx1_unique
+            # Assemble full result: scatter differenced rows into the
+            # original left owned array.  No to_shapely() materialisation.
+            result_owned = concat_owned_scatter(
+                left_owned, diff_owned, idx1_unique,
             )
-            result_geoms[h_idx1_unique] = diff_shapely
-
             used_owned = True
         except (ImportError, NotImplementedError):
             pass
 
-    if result_geoms is None:
-        # Vectorized grouped-union approach: for each left geometry, compute
-        # left_i - union(overlapping right geometries).  Replaces per-geometry
-        # Python loop with grouped shapely.union_all + vectorized shapely.difference.
-        left_geoms = np.asarray(df1.geometry, dtype=object)
-        result_geoms = left_geoms.copy()
+    if result_owned is not None:
+        # Device-resident path: wrap the scattered OwnedGeometryArray
+        # directly in a GeoSeries, preserving the owned backing.
+        differences = GeoSeries(
+            GeometryArray.from_owned(result_owned, crs=df1.crs),
+            index=df1.index,
+        )
+    else:
+        if result_geoms is None:
+            # Vectorized grouped-union approach: for each left geometry, compute
+            # left_i - union(overlapping right geometries).  Replaces per-geometry
+            # Python loop with grouped shapely.union_all + vectorized
+            # shapely.difference.
+            left_geoms = np.asarray(df1.geometry, dtype=object)
+            result_geoms = left_geoms.copy()
 
-        if idx1.size > 0:
-            # Ensure host arrays for Shapely fallback path — indices may
-            # be CuPy when the owned path above raised an exception.
-            h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
-            h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
+            if idx1.size > 0:
+                # Ensure host arrays for Shapely fallback path — indices may
+                # be CuPy when the owned path above raised an exception.
+                h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
+                h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
 
-            right_geoms = np.asarray(df2.geometry, dtype=object)
-            right_unions = np.empty(n_left, dtype=object)
-            right_unions.fill(None)
+                right_geoms = np.asarray(df2.geometry, dtype=object)
+                right_unions = np.empty(n_left, dtype=object)
+                right_unions.fill(None)
 
-            # O(N log N) grouping via np.split — avoids O(K*N) per-group mask scan.
-            idx1_unique, idx1_split_at = np.unique(h_idx1, return_index=True)
-            idx2_groups = np.split(h_idx2, idx1_split_at[1:])
-            for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
-                neighbors = right_geoms[neighbors_idx]
-                if len(neighbors) == 1:
-                    right_unions[left_pos] = neighbors[0]
-                else:
-                    right_unions[left_pos] = shapely.union_all(neighbors)
+                # O(N log N) grouping via np.split — avoids O(K*N) per-group
+                # mask scan.
+                idx1_unique, idx1_split_at = np.unique(h_idx1, return_index=True)
+                idx2_groups = np.split(h_idx2, idx1_split_at[1:])
+                for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
+                    neighbors = right_geoms[neighbors_idx]
+                    if len(neighbors) == 1:
+                        right_unions[left_pos] = neighbors[0]
+                    else:
+                        right_unions[left_pos] = shapely.union_all(neighbors)
 
-            has_neighbors = np.zeros(n_left, dtype=bool)
-            has_neighbors[idx1_unique] = True
-            result_geoms[has_neighbors] = shapely.difference(
-                left_geoms[has_neighbors], right_unions[has_neighbors],
-            )
+                has_neighbors = np.zeros(n_left, dtype=bool)
+                has_neighbors[idx1_unique] = True
+                result_geoms[has_neighbors] = shapely.difference(
+                    left_geoms[has_neighbors], right_unions[has_neighbors],
+                )
 
-    differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
+        differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
+
     poly_ix = differences.geom_type.isin(POLYGON_GEOM_TYPES)
     differences.loc[poly_ix] = differences[poly_ix].make_valid()
     geom_diff = differences[~differences.is_empty].copy()
