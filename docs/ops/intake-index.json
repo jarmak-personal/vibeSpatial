@@ -14228,10 +14228,12 @@
       "referenced_by": [],
       "symbols": [
         "_exterior_gpu",
+        "_exterior_cpu",
         "exterior_owned"
       ],
       "tokens": [
         "constructive",
+        "cpu",
         "exterior",
         "gpu",
         "owned",

@@ -26,11 +26,13 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
 from .measurement import _PRECISION_PREAMBLE
 
@@ -91,8 +93,6 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     d_state = owned._ensure_device_state()
 
     if GeometryFamily.POLYGON not in d_state.families:
-        from vibespatial.geometry.owned import from_shapely_geometries
-
         return from_shapely_geometries([None] * owned.row_count)
 
     d_poly = d_state.families[GeometryFamily.POLYGON]
@@ -118,8 +118,6 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     total_coords = int(out_geom_offsets[-1])
     if total_coords == 0:
-        from vibespatial.geometry.owned import from_shapely_geometries
-
         return from_shapely_geometries([None] * owned.row_count)
 
     # Compute source coordinate indices for gathering
@@ -133,11 +131,9 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         pos += length
 
     # Gather coordinates on device
-    d_src_indices = runtime.from_host(src_indices)
-    d_x_out = d_poly.x[cp.asarray(src_indices)]
-    d_y_out = d_poly.y[cp.asarray(src_indices)]
-
-    runtime.free(d_src_indices)
+    d_idx = cp.asarray(src_indices)
+    d_x_out = d_poly.x[d_idx]
+    d_y_out = d_poly.y[d_idx]
 
     # Build LineString output
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
@@ -174,6 +170,28 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
 
 # ---------------------------------------------------------------------------
+# CPU fallback: exterior via Shapely
+# ---------------------------------------------------------------------------
+
+@register_kernel_variant(
+    "exterior_ring",
+    "cpu",
+    kernel_class=KernelClass.COARSE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=True,
+    tags=("shapely", "constructive", "exterior"),
+)
+def _exterior_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
+    """Compute exterior ring using Shapely as reference implementation."""
+    import shapely
+
+    geoms = owned.to_shapely()
+    results = [shapely.get_exterior_ring(g) if g is not None else None for g in geoms]
+    return from_shapely_geometries(results)
+
+
+# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -181,30 +199,36 @@ def exterior_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> OwnedGeometryArray:
     """Extract exterior ring from Polygon geometries.
 
     Returns OwnedGeometryArray of LineString geometries.
     Non-polygon rows produce None.
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Input geometries.
+    dispatch_mode : ExecutionMode or str, default AUTO
+        Execution mode hint.
+    precision : PrecisionMode or str, default AUTO
+        Precision mode.  COARSE class stays fp64 by design per ADR-0002;
+        wired here for observability.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Exterior ring geometries.
     """
     row_count = owned.row_count
     if row_count == 0:
-        from vibespatial.geometry.owned import from_shapely_geometries
-
         return from_shapely_geometries([])
 
-    # Check if we have any polygons
+    # Short-circuit: no polygons means all-null output without touching device
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-    has_polys = np.any(owned.tags == poly_tag)
-    if not has_polys:
-        # No polygons: Shapely fallback for non-polygon types
-        import shapely
-
-        geoms = owned.to_shapely()
-        results = [shapely.get_exterior_ring(g) if g is not None else None for g in geoms]
-        from vibespatial.geometry.owned import from_shapely_geometries
-
-        return from_shapely_geometries(results)
+    if not np.any(owned.tags == poly_tag):
+        return from_shapely_geometries([None] * row_count)
 
     selection = plan_dispatch_selection(
         kernel_name="exterior_ring",
@@ -214,16 +238,38 @@ def exterior_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
+        precision_plan = select_precision_plan(
+            runtime_selection=selection,
+            kernel_class=KernelClass.COARSE,
+            requested=precision,
+        )
         try:
-            return _exterior_gpu(owned)
+            result = _exterior_gpu(owned)
         except Exception:
             pass
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.exterior",
+                operation="exterior",
+                implementation="exterior_ring_gpu_cupy",
+                reason=selection.reason,
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
 
-    # CPU fallback
-    import shapely
-
-    geoms = owned.to_shapely()
-    results = [shapely.get_exterior_ring(g) if g is not None else None for g in geoms]
-    from vibespatial.geometry.owned import from_shapely_geometries
-
-    return from_shapely_geometries(results)
+    result = _exterior_cpu(owned)
+    record_dispatch_event(
+        surface="geopandas.array.exterior",
+        operation="exterior",
+        implementation="exterior_cpu_shapely",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+    )
+    return result
