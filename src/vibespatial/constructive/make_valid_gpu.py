@@ -195,17 +195,17 @@ extern "C" __global__ void reverse_ring_coords(
 // Each thread computes its ring via binary search in seg_offsets, then reads
 // the two consecutive vertices from x/y to populate the flat segment table.
 extern "C" __global__ void extract_ring_segments(
-    const double* x,
-    const double* y,
-    const int* ring_offsets,
-    const int* seg_offsets,
-    double* seg_x0,
-    double* seg_y0,
-    double* seg_x1,
-    double* seg_y1,
-    int* seg_ring_ids,
-    int ring_count,
-    int total_segments
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ seg_offsets,
+    double* __restrict__ seg_x0,
+    double* __restrict__ seg_y0,
+    double* __restrict__ seg_x1,
+    double* __restrict__ seg_y1,
+    int* __restrict__ seg_ring_ids,
+    const int ring_count,
+    const int total_segments
 ) {
     const int seg = blockIdx.x * blockDim.x + threadIdx.x;
     if (seg >= total_segments) return;
@@ -227,47 +227,51 @@ extern "C" __global__ void extract_ring_segments(
 }
 
 // Phase A: generate_intra_ring_pairs — one thread per candidate pair.
-// Decodes (i, j) within a ring using triangular number formula.
+// O(1) decode of (i, j) within a ring using triangular number inversion.
 // pair_counts[ring] = k*(k-1)/2 - k for k segments (all non-adjacent pairs,
 // minus the wrap-around adjacency).
 extern "C" __global__ void generate_intra_ring_pairs(
-    const int* pair_offsets,
-    const int* seg_offsets,
-    const int* ring_seg_counts,
-    int* out_left,
-    int* out_right,
-    int ring_count,
-    int total_pairs
+    const int* __restrict__ pair_offsets,
+    const int* __restrict__ seg_offsets,
+    const int* __restrict__ ring_seg_counts,
+    int* __restrict__ out_left,
+    int* __restrict__ out_right,
+    const int ring_count,
+    const int total_pairs
 ) {
     const int pid = blockIdx.x * blockDim.x + threadIdx.x;
     if (pid >= total_pairs) return;
     // Binary search for the ring that owns this pair
     int lo = 0, hi = ring_count;
     while (lo < hi) {
-        int mid = (lo + hi) / 2;
+        int mid = (lo + hi) >> 1;
         if (pair_offsets[mid + 1] <= pid) lo = mid + 1;
         else hi = mid;
     }
     const int ring = lo;
-    const int local_pid = pid - pair_offsets[ring];
+    int lp = pid - pair_offsets[ring];
     const int k = ring_seg_counts[ring];
     const int base = seg_offsets[ring];
-    // Decode (i, j) from the linear pair index.
-    // We enumerate all pairs (i, j) with 0 <= i < j < k, skipping
-    // adjacent pairs (j == i+1) and the wrap-around pair (i==0, j==k-1).
-    // Iterate through the enumeration to find the right (i, j).
-    int idx = 0;
-    for (int i = 0; i < k; i++) {
-        for (int j = i + 2; j < k; j++) {
-            if (i == 0 && j == k - 1) continue;  // wrap-around adjacency
-            if (idx == local_pid) {
-                out_left[pid] = base + i;
-                out_right[pid] = base + j;
-                return;
-            }
-            idx++;
-        }
+    // Enumerate non-adjacent pairs (i,j) with j >= i+2 in row-major order.
+    // Row i=0 has j in {2..k-2} (k-3 pairs, skip wrap j=k-1).
+    // Row i>=1 has j in {i+2..k-1} (k-i-2 pairs each).
+    // Adjust local index past the wrap-pair gap at position k-3 in row 0:
+    if (lp >= k - 3) lp++;
+    // Now lp indexes into the full (i,j) table where row i has k-i-2 entries.
+    // Row i starts at prefix[i] = i*(2*k - 3 - i) / 2.
+    // Invert via quadratic: i = floor((2k-3 - sqrt((2k-3)^2 - 8*lp)) / 2)
+    const double disc = (double)(2*k - 3) * (double)(2*k - 3) - 8.0 * (double)lp;
+    int i = (int)((double)(2*k - 3) - sqrt(disc)) / 2;
+    // Clamp and correct for floating-point rounding
+    if (i < 0) i = 0;
+    int row_start = i * (2*k - 3 - i) / 2;
+    if (row_start + (k - i - 2) <= lp && i + 1 < k - 2) {
+        i++;
+        row_start = i * (2*k - 3 - i) / 2;
     }
+    const int j = lp - row_start + i + 2;
+    out_left[pid] = base + i;
+    out_right[pid] = base + j;
 }
 
 // Phase C: count self-intersection split events per intra-ring segment pair.
@@ -658,20 +662,21 @@ def _extract_ring_segments_gpu(
     d_y: cp.ndarray,
     d_ring_offsets: cp.ndarray,
     ring_count: int,
-    kernels: dict | None = None,
+    kernels: dict,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Extract consecutive vertex pairs as flat segment table from ring coords.
 
-    Phase 8 GPU-resident: seg_counts via CuPy, seg_offsets via exclusive_sum
-    (CCCL), then one NVRTC kernel thread per segment.
+    GPU-resident: seg_counts via CuPy element-wise (Tier 2), seg_offsets via
+    CuPy cumsum (Tier 4), then one NVRTC kernel thread per segment (Tier 1).
 
     Returns (seg_x0, seg_y0, seg_x1, seg_y1, seg_ring_ids) on device.
     """
-    # --- Compute seg_counts and seg_offsets on device ---
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+
+    # --- Compute seg_counts and seg_offsets on device (Tier 2: CuPy) ---
     d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
     d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int32)
-    _ = exclusive_sum(d_seg_counts)
-    # Build (ring_count+1)-element offset array
     d_seg_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
     d_seg_offsets[1:] = cp.cumsum(d_seg_counts)
     total_segments = int(d_seg_offsets[-1])
@@ -686,35 +691,20 @@ def _extract_ring_segments_gpu(
     d_seg_y1 = cp.empty(total_segments, dtype=cp.float64)
     d_seg_ring_ids = cp.empty(total_segments, dtype=cp.int32)
 
-    if kernels is not None:
-        runtime = get_cuda_runtime()
-        ptr = runtime.pointer
-        block = (256, 1, 1)
-        grid = (max(1, (total_segments + 255) // 256), 1, 1)
-        runtime.launch(
-            kernels["extract_ring_segments"],
-            grid=grid, block=block,
-            params=(
-                (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_seg_offsets),
-                 ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
-                 ptr(d_seg_ring_ids), ring_count, total_segments),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-            ),
-        )
-        runtime.synchronize()
-    else:
-        # Fallback: CuPy vectorised segment extraction (no NVRTC needed)
-        d_seg_ids = cp.arange(total_segments, dtype=cp.int32)
-        d_ring_of_seg = cp.searchsorted(d_seg_offsets[1:], d_seg_ids, side="right").astype(cp.int32)
-        d_local_seg = d_seg_ids - d_seg_offsets[d_ring_of_seg]
-        d_v = d_ring_offsets[d_ring_of_seg] + d_local_seg
-        d_seg_x0[:] = d_x[d_v]
-        d_seg_y0[:] = d_y[d_v]
-        d_seg_x1[:] = d_x[d_v + 1]
-        d_seg_y1[:] = d_y[d_v + 1]
-        d_seg_ring_ids[:] = d_ring_of_seg
+    kernel = kernels["extract_ring_segments"]
+    grid, block = runtime.launch_config(kernel, total_segments)
+    runtime.launch(
+        kernel,
+        grid=grid, block=block,
+        params=(
+            (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_seg_offsets),
+             ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
+             ptr(d_seg_ring_ids), ring_count, total_segments),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        ),
+    )
 
     return d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids
 
@@ -728,13 +718,14 @@ def _detect_intra_ring_intersections(
     total_segments: int,
     ring_count: int,
     d_ring_offsets: cp.ndarray,
-    kernels: dict | None = None,
+    kernels: dict,
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray]:
     """Detect self-intersections within each ring using segment pair classification.
 
-    Phase 8 GPU-resident: pair generation via NVRTC kernel (or CuPy fallback).
-    Uses classify_segment_pairs_v2 with on-GPU Shewchuk adaptive refinement
-    (no ambiguous output — all classification is handled on-device).
+    GPU-resident: per-ring segment counts via cp.bincount (Tier 2), pair counts
+    via CuPy element-wise (Tier 2), pair offsets via CuPy cumsum (Tier 4),
+    pair generation via NVRTC kernel (Tier 1), classification via
+    classify_segment_pairs_v2 (Tier 1).
 
     Returns (seg_a_ids, seg_b_ids, kinds, point_x, point_y) as device
     (CuPy) arrays.  Only returns pairs with kind != 0 (actual intersections).
@@ -745,15 +736,16 @@ def _detect_intra_ring_intersections(
         empty_i8 = cp.empty(0, dtype=cp.int8)
         return empty_i32, empty_i32, empty_i8, empty_f64, empty_f64
 
-    # --- GPU-resident segment offset table per ring (CuPy) ---
-    # d_seg_ring_ids is already on device; compute per-ring segment counts
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+
+    # --- GPU-resident segment offset table per ring (Tier 2: CuPy) ---
     d_ring_seg_counts = cp.bincount(d_seg_ring_ids, minlength=ring_count).astype(cp.int32)
     d_seg_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
     d_seg_offsets[1:] = cp.cumsum(d_ring_seg_counts)
 
-    # --- Compute pair counts per ring on device ---
+    # --- Compute pair counts per ring on device (Tier 2: CuPy) ---
     # For ring with k segments: pairs = k*(k-1)/2 - k (all pairs minus adjacent minus wrap)
-    # More precisely: total combos = k*(k-1)/2, adjacent = k (including wrap), non-adj = total - k
     d_k = d_ring_seg_counts.astype(cp.int64)
     d_pair_counts = cp.maximum(d_k * (d_k - 1) // 2 - d_k, 0).astype(cp.int32)
 
@@ -767,66 +759,30 @@ def _detect_intra_ring_intersections(
         empty_i8 = cp.empty(0, dtype=cp.int8)
         return empty_i32, empty_i32, empty_i8, empty_f64, empty_f64
 
-    # --- Generate pairs on GPU ---
+    # --- Generate pairs on GPU (Tier 1: NVRTC, 1 thread per pair) ---
     d_left_lookup = cp.empty(total_pairs, dtype=cp.int32)
     d_right_lookup = cp.empty(total_pairs, dtype=cp.int32)
 
-    if kernels is not None and "generate_intra_ring_pairs" in kernels:
-        runtime_gen = get_cuda_runtime()
-        ptr_gen = runtime_gen.pointer
-        block_gen = (256, 1, 1)
-        grid_gen = (max(1, (total_pairs + 255) // 256), 1, 1)
-        runtime_gen.launch(
-            kernels["generate_intra_ring_pairs"],
-            grid=grid_gen, block=block_gen,
-            params=(
-                (ptr_gen(d_pair_offsets), ptr_gen(d_seg_offsets),
-                 ptr_gen(d_ring_seg_counts), ptr_gen(d_left_lookup),
-                 ptr_gen(d_right_lookup), ring_count, total_pairs),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-            ),
-        )
-        runtime_gen.synchronize()
-    else:
-        # Fallback: host-side pair generation (NVRTC unavailable).
-        # cp.asnumpy and Python for-loops are intentional here — this
-        # path only executes when NVRTC compilation is not available.
-        h_ring_seg_counts = cp.asnumpy(d_ring_seg_counts)
-        h_seg_offsets = cp.asnumpy(d_seg_offsets)
-        left_ids = []
-        right_ids = []
-        for r in range(ring_count):
-            base = int(h_seg_offsets[r])
-            count = int(h_ring_seg_counts[r])
-            if count < 3:
-                continue
-            for i in range(count):
-                for j in range(i + 2, count):
-                    if i == 0 and j == count - 1:
-                        continue
-                    left_ids.append(base + i)
-                    right_ids.append(base + j)
-        if not left_ids:
-            empty_i32 = cp.empty(0, dtype=cp.int32)
-            empty_f64 = cp.empty(0, dtype=cp.float64)
-            empty_i8 = cp.empty(0, dtype=cp.int8)
-            return empty_i32, empty_i32, empty_i8, empty_f64, empty_f64
-        d_left_lookup = cp.asarray(np.asarray(left_ids, dtype=np.int32))
-        d_right_lookup = cp.asarray(np.asarray(right_ids, dtype=np.int32))
-        total_pairs = len(left_ids)
+    pair_kernel = kernels["generate_intra_ring_pairs"]
+    grid_gen, block_gen = runtime.launch_config(pair_kernel, total_pairs)
+    runtime.launch(
+        pair_kernel,
+        grid=grid_gen, block=block_gen,
+        params=(
+            (ptr(d_pair_offsets), ptr(d_seg_offsets),
+             ptr(d_ring_seg_counts), ptr(d_left_lookup),
+             ptr(d_right_lookup), ring_count, total_pairs),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+        ),
+    )
 
-    pair_count = total_pairs
-
-    # Use the v2 classify kernel with on-GPU Shewchuk adaptive refinement
-    # (no ambiguous output -- all refinement is handled on-device)
+    # --- Classify segment pairs (Tier 1: NVRTC) ---
+    # Uses on-GPU Shewchuk adaptive refinement (no ambiguous output)
     from vibespatial.spatial.segment_primitives import _classify_kernels
 
-    runtime = get_cuda_runtime()
-    ptr = runtime.pointer
-
-    # d_left_lookup and d_right_lookup are already on device from pair generation above
+    pair_count = total_pairs
     d_out_kind = cp.zeros(pair_count, dtype=cp.int8)
     d_out_px = cp.zeros(pair_count, dtype=cp.float64)
     d_out_py = cp.zeros(pair_count, dtype=cp.float64)
@@ -885,18 +841,18 @@ def _split_self_intersections_gpu(
 ) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, bool]:
     """Detect and split self-intersections. Returns new x, y, ring_offsets, had_splits.
 
-    Phases 8-9 GPU-resident: segment extraction via NVRTC, pair generation via
-    NVRTC, dedup via CuPy mask, split counts via cp.bincount, ring sizes via
-    segmented_reduce_sum.
+    GPU-resident: segment extraction via NVRTC (Tier 1), pair generation via
+    NVRTC (Tier 1), dedup via CuPy mask (Tier 2), split counts via
+    cp.bincount (Tier 2), ring sizes via segmented_reduce_sum (Tier 3a).
     """
-    # Phase A: Extract segments and detect intersections (Phase 8: GPU-resident)
+    # Phase A: Extract segments and detect intersections (GPU-resident)
     d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids = \
-        _extract_ring_segments_gpu(d_x, d_y, d_ring_offsets, ring_count, kernels=kernels)
+        _extract_ring_segments_gpu(d_x, d_y, d_ring_offsets, ring_count, kernels)
     total_segments = int(d_seg_x0.size)
 
     d_seg_a, d_seg_b, d_kinds, d_px, d_py = _detect_intra_ring_intersections(
         d_seg_x0, d_seg_y0, d_seg_x1, d_seg_y1, d_seg_ring_ids,
-        total_segments, ring_count, d_ring_offsets, kernels=kernels,
+        total_segments, ring_count, d_ring_offsets, kernels,
     )
 
     if d_seg_a.size == 0:
@@ -905,14 +861,14 @@ def _split_self_intersections_gpu(
     # Phase C: Count and scatter split events
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    block = (256, 1, 1)
     pair_count = int(d_seg_a.size)
     d_event_counts = cp.zeros(pair_count, dtype=cp.int32)
 
-    grid = (max(1, (pair_count + 255) // 256), 1, 1)
+    count_kernel = kernels["count_self_split_events"]
+    grid_count, block_count = runtime.launch_config(count_kernel, pair_count)
     runtime.launch(
-        kernels["count_self_split_events"],
-        grid=grid, block=block,
+        count_kernel,
+        grid=grid_count, block=block_count,
         params=(
             (ptr(d_kinds), ptr(d_event_counts), pair_count),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
@@ -930,9 +886,11 @@ def _split_self_intersections_gpu(
     d_out_y = cp.empty(total_events, dtype=cp.float64)
     d_out_key = cp.empty(total_events, dtype=cp.uint64)
 
+    scatter_kernel = kernels["scatter_self_split_events"]
+    grid_scatter, block_scatter = runtime.launch_config(scatter_kernel, pair_count)
     runtime.launch(
-        kernels["scatter_self_split_events"],
-        grid=grid, block=block,
+        scatter_kernel,
+        grid=grid_scatter, block=block_scatter,
         params=(
             (ptr(d_seg_a), ptr(d_seg_b), ptr(d_kinds), ptr(d_px), ptr(d_py),
              ptr(d_seg_x0), ptr(d_seg_y0), ptr(d_seg_x1), ptr(d_seg_y1),
@@ -1012,10 +970,11 @@ def _split_self_intersections_gpu(
     d_new_x = cp.empty(total_new, dtype=cp.float64)
     d_new_y = cp.empty(total_new, dtype=cp.float64)
 
-    ring_grid = (max(1, (ring_count + 255) // 256), 1, 1)
+    rebuild_kernel = kernels["rebuild_ring_coords"]
+    ring_grid, ring_block = runtime.launch_config(rebuild_kernel, ring_count)
     runtime.launch(
-        kernels["rebuild_ring_coords"],
-        grid=ring_grid, block=block,
+        rebuild_kernel,
+        grid=ring_grid, block=ring_block,
         params=(
             (ptr(d_x), ptr(d_y), ptr(d_ring_offsets),
              ptr(d_sorted_seg_ids), ptr(d_sorted_x), ptr(d_sorted_y), ptr(d_sorted_t),
