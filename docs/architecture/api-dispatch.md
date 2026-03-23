@@ -63,9 +63,9 @@ or hiding which implementation actually ran.
   kernels that need it repeatedly.
 - Record explicit dispatch events at the public method boundary for
   high-traffic surfaces (currently `buffer`, `offset_curve`, `clip_by_rect`,
-  `make_valid`, `dissolve`, `intersection`, `union`, `difference`, and
-  `symmetric_difference`).  Unary constructive ops (`boundary`,
-  `convex_hull`, `rotate`, `scale`, `skew`) and distance metrics
+  `make_valid`, `dissolve`, `intersection`, `union`, `difference`,
+  `symmetric_difference`, and `boundary`).  Unary constructive ops
+  (`convex_hull`, `rotate`, `scale`, `skew`) and distance metrics
   (`hausdorff_distance`, `frechet_distance`) route through owned paths
   directly without per-call dispatch events.
 - Keep host-competitive Shapely paths in place when owned host prototypes are
