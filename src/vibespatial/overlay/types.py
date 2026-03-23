@@ -21,26 +21,133 @@ class SplitEventDeviceState:
     t: DeviceArray
     x: DeviceArray
     y: DeviceArray
+    source_side: DeviceArray | None = None
+    row_indices: DeviceArray | None = None
+    part_indices: DeviceArray | None = None
+    ring_indices: DeviceArray | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class SplitEventTable:
-    source_segment_ids: np.ndarray
-    source_side: np.ndarray
-    row_indices: np.ndarray
-    part_indices: np.ndarray
-    ring_indices: np.ndarray
-    t: np.ndarray
-    x: np.ndarray
-    y: np.ndarray
+    """Split event table with lazy host materialization.
+
+    When produced by the GPU pipeline, all arrays live in ``device_state``
+    and host numpy arrays are lazily copied on first property access.
+    GPU-only consumers that read only ``device_state``, ``count``,
+    ``left_segment_count``, ``right_segment_count``, and
+    ``runtime_selection`` never trigger device-to-host copies.
+    """
     left_segment_count: int
     right_segment_count: int
     runtime_selection: RuntimeSelection
     device_state: SplitEventDeviceState
+    _count: int = 0
+    # Host arrays — lazily materialized from device_state on first access.
+    _source_segment_ids: np.ndarray | None = None
+    _source_side: np.ndarray | None = None
+    _row_indices: np.ndarray | None = None
+    _part_indices: np.ndarray | None = None
+    _ring_indices: np.ndarray | None = None
+    _t: np.ndarray | None = None
+    _x: np.ndarray | None = None
+    _y: np.ndarray | None = None
+
+    def _ensure_host(self) -> None:
+        """Lazily copy host arrays from device_state on first access."""
+        if self._source_segment_ids is not None:
+            return
+        ds = self.device_state
+        if ds is None:
+            return
+        runtime = get_cuda_runtime()
+        self._source_segment_ids = np.asarray(
+            runtime.copy_device_to_host(ds.source_segment_ids), dtype=np.int32,
+        )
+        self._t = np.asarray(
+            runtime.copy_device_to_host(ds.t), dtype=np.float64,
+        )
+        self._x = np.asarray(
+            runtime.copy_device_to_host(ds.x), dtype=np.float64,
+        )
+        self._y = np.asarray(
+            runtime.copy_device_to_host(ds.y), dtype=np.float64,
+        )
+        if ds.source_side is not None:
+            self._source_side = np.asarray(
+                runtime.copy_device_to_host(ds.source_side), dtype=np.int8,
+            )
+        else:
+            # Derive from source_segment_ids + left_segment_count
+            ids = self._source_segment_ids
+            self._source_side = np.where(ids < self.left_segment_count, 1, 2).astype(np.int8)
+        if ds.row_indices is not None:
+            self._row_indices = np.asarray(
+                runtime.copy_device_to_host(ds.row_indices), dtype=np.int32,
+            )
+        else:
+            self._row_indices = np.empty(0, dtype=np.int32)
+        if ds.part_indices is not None:
+            self._part_indices = np.asarray(
+                runtime.copy_device_to_host(ds.part_indices), dtype=np.int32,
+            )
+        else:
+            self._part_indices = np.empty(0, dtype=np.int32)
+        if ds.ring_indices is not None:
+            self._ring_indices = np.asarray(
+                runtime.copy_device_to_host(ds.ring_indices), dtype=np.int32,
+            )
+        else:
+            self._ring_indices = np.empty(0, dtype=np.int32)
+
+    @property
+    def source_segment_ids(self) -> np.ndarray:
+        self._ensure_host()
+        return self._source_segment_ids  # type: ignore[return-value]
+
+    @property
+    def source_side(self) -> np.ndarray:
+        self._ensure_host()
+        return self._source_side  # type: ignore[return-value]
+
+    @property
+    def row_indices(self) -> np.ndarray:
+        self._ensure_host()
+        return self._row_indices  # type: ignore[return-value]
+
+    @property
+    def part_indices(self) -> np.ndarray:
+        self._ensure_host()
+        return self._part_indices  # type: ignore[return-value]
+
+    @property
+    def ring_indices(self) -> np.ndarray:
+        self._ensure_host()
+        return self._ring_indices  # type: ignore[return-value]
+
+    @property
+    def t(self) -> np.ndarray:
+        self._ensure_host()
+        return self._t  # type: ignore[return-value]
+
+    @property
+    def x(self) -> np.ndarray:
+        self._ensure_host()
+        return self._x  # type: ignore[return-value]
+
+    @property
+    def y(self) -> np.ndarray:
+        self._ensure_host()
+        return self._y  # type: ignore[return-value]
 
     @property
     def count(self) -> int:
-        return int(self.source_segment_ids.size)
+        if self._count > 0:
+            return self._count
+        if self.device_state is not None and self.device_state.source_segment_ids is not None:
+            return int(self.device_state.source_segment_ids.size)
+        if self._source_segment_ids is not None:
+            return int(self._source_segment_ids.size)
+        return 0
 
 
 @dataclass(frozen=True)

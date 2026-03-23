@@ -1007,6 +1007,49 @@ def _segment_metadata(
     return source_side, row_indices, part_indices, ring_indices
 
 
+def _segment_metadata_gpu(
+    d_source_segment_ids,
+    *,
+    left_count: int,
+    left_segments: SegmentTable,
+    right_segments: SegmentTable,
+):
+    """Derive source_side / row / part / ring indices entirely on GPU.
+
+    Uploads the per-segment metadata arrays from left/right SegmentTables
+    to device, then uses CuPy fancy indexing to gather the per-event
+    metadata without any D→H transfers.
+    """
+    d_ids = cp.asarray(d_source_segment_ids)
+
+    # source_side: 1 for left, 2 for right
+    d_source_side = cp.where(d_ids < left_count, cp.int8(1), cp.int8(2))
+
+    # Upload per-segment metadata lookup tables to device and
+    # build combined lookup tables (left then right) so a single
+    # gather with the raw source_segment_id works directly.
+    d_all_row = cp.concatenate((
+        cp.asarray(left_segments.row_indices),
+        cp.asarray(right_segments.row_indices),
+    ))
+    d_all_part = cp.concatenate((
+        cp.asarray(left_segments.part_indices),
+        cp.asarray(right_segments.part_indices),
+    ))
+    d_all_ring = cp.concatenate((
+        cp.asarray(left_segments.ring_indices),
+        cp.asarray(right_segments.ring_indices),
+    ))
+
+    # Right-side IDs are offset by left_count in the combined table,
+    # which matches the segment numbering convention already.
+    d_row_indices = d_all_row[d_ids]
+    d_part_indices = d_all_part[d_ids]
+    d_ring_indices = d_all_ring[d_ids]
+
+    return d_source_side, d_row_indices, d_part_indices, d_ring_indices
+
+
 def _quantize_coordinate(values):
     return cp.rint(values * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
 
@@ -3014,25 +3057,18 @@ def build_gpu_split_events(
             unique_y = all_y[unique_indices]
             unique_keys = unique_pairs.keys
 
-            host_source_ids = runtime.copy_device_to_host(unique_source_ids).astype(np.int32, copy=False)
-            host_t = runtime.copy_device_to_host(unique_t)
-            host_x = runtime.copy_device_to_host(unique_x)
-            host_y = runtime.copy_device_to_host(unique_y)
-            source_side, row_indices, part_indices, ring_indices = _segment_metadata(
-                host_source_ids,
-                left_segments=left_segments,
-                right_segments=right_segments,
+            # Derive source_side / row / part / ring indices on GPU.
+            d_source_side, d_row_indices, d_part_indices, d_ring_indices = (
+                _segment_metadata_gpu(
+                    unique_source_ids,
+                    left_count=left_count,
+                    left_segments=left_segments,
+                    right_segments=right_segments,
+                )
             )
+            event_count = int(unique_source_ids.size)
 
             return SplitEventTable(
-                source_segment_ids=host_source_ids,
-                source_side=source_side,
-                row_indices=row_indices,
-                part_indices=part_indices,
-                ring_indices=ring_indices,
-                t=np.asarray(host_t, dtype=np.float64),
-                x=np.asarray(host_x, dtype=np.float64),
-                y=np.asarray(host_y, dtype=np.float64),
                 left_segment_count=left_count,
                 right_segment_count=right_count,
                 runtime_selection=result.runtime_selection,
@@ -3042,7 +3078,12 @@ def build_gpu_split_events(
                     t=unique_t,
                     x=unique_x,
                     y=unique_y,
+                    source_side=d_source_side,
+                    row_indices=d_row_indices,
+                    part_indices=d_part_indices,
+                    ring_indices=d_ring_indices,
                 ),
+                _count=event_count,
             )
         finally:
             runtime.free(pair_counts)
@@ -3162,21 +3203,25 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
         )
         runtime.synchronize()
 
-        # Eagerly copy host arrays needed for row/part/ring index lookup.
-        # The remaining host fields (src_x, src_y, ...) are lazy via _ensure_host.
-        host_source_ids = runtime.copy_device_to_host(out_source_ids).astype(np.int32, copy=False)
-        host_direction = runtime.copy_device_to_host(out_direction).astype(np.int8, copy=False)
-
-        left_count = split_events.left_segment_count
-        source_side = np.where(host_source_ids < left_count, 1, 2).astype(np.int8, copy=False)
-        clip_idx = np.clip(
-            np.searchsorted(split_events.source_segment_ids, host_source_ids),
+        # Derive row / part / ring indices on GPU via searchsorted
+        # against split_events device metadata, avoiding host round-trip.
+        d_out_ids = cp.asarray(out_source_ids)
+        se_device = split_events.device_state
+        d_se_source_ids = cp.asarray(se_device.source_segment_ids)
+        clip_idx = cp.clip(
+            cp.searchsorted(d_se_source_ids, d_out_ids),
             0, max(split_events.count - 1, 0),
         )
-        row_indices = split_events.row_indices[clip_idx]
-        part_indices = split_events.part_indices[clip_idx]
-        ring_indices = split_events.ring_indices[clip_idx]
+        d_se_row = cp.asarray(se_device.row_indices)
+        d_se_part = cp.asarray(se_device.part_indices)
+        d_se_ring = cp.asarray(se_device.ring_indices)
+        d_row_indices = d_se_row[clip_idx]
+        d_part_indices = d_se_part[clip_idx]
+        d_ring_indices = d_se_ring[clip_idx]
 
+        # Row/part/ring are eagerly materialized because the downstream
+        # half-edge graph builder consumes them on host.  source_segment_ids,
+        # direction, and coordinates remain lazy via _ensure_host.
         return AtomicEdgeTable(
             left_segment_count=split_events.left_segment_count,
             right_segment_count=split_events.right_segment_count,
@@ -3190,12 +3235,9 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
                 dst_y=out_dst_y,
             ),
             _count=pair_count * 2,
-            _source_segment_ids=host_source_ids,
-            _source_side=source_side,
-            _row_indices=np.asarray(row_indices, dtype=np.int32),
-            _part_indices=np.asarray(part_indices, dtype=np.int32),
-            _ring_indices=np.asarray(ring_indices, dtype=np.int32),
-            _direction=host_direction,
+            _row_indices=cp.asnumpy(d_row_indices).astype(np.int32, copy=False),
+            _part_indices=cp.asnumpy(d_part_indices).astype(np.int32, copy=False),
+            _ring_indices=cp.asnumpy(d_ring_indices).astype(np.int32, copy=False),
         )
     finally:
         runtime.free(adjacency_mask)
