@@ -18,10 +18,16 @@ from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
 )
-from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_kernel_dispatch
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, normalize_precision_mode
+from vibespatial.runtime.precision import (
+    KernelClass,
+    PrecisionMode,
+    normalize_precision_mode,
+    select_precision_plan,
+)
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 _BOUNDS_KERNEL_SOURCE_TEMPLATE = """
@@ -1002,37 +1008,6 @@ def _compute_geometry_bounds_gpu(
     return _compute_geometry_bounds_gpu_impl(geometry_array, compute_type=compute_type)
 
 
-def _resolve_bounds_plan(
-    geometry_array: OwnedGeometryArray,
-    *,
-    dispatch_mode: ExecutionMode | str,
-    precision: PrecisionMode | str,
-) -> tuple[RuntimeSelection, PrecisionMode]:
-    requested_mode = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
-    geometry_families = tuple(sorted(family.value for family in geometry_array.families))
-    plan = plan_kernel_dispatch(
-        kernel_name="compute_geometry_bounds",
-        kernel_class=KernelClass.COARSE,
-        row_count=geometry_array.row_count,
-        geometry_families=geometry_families,
-        mixed_geometry=len(geometry_families) > 1,
-        current_residency=geometry_array.residency,
-        requested_mode=requested_mode,
-        requested_precision=precision,
-    )
-    runtime_selection = plan.runtime_selection
-    if plan.variant is None:
-        if requested_mode is ExecutionMode.GPU:
-            raise NotImplementedError("compute_geometry_bounds has no GPU variant registered yet")
-        if runtime_selection.selected is ExecutionMode.GPU:
-            runtime_selection = RuntimeSelection(
-                requested=requested_mode,
-                selected=ExecutionMode.CPU,
-                reason="compute_geometry_bounds has no GPU variant registered; using explicit CPU fallback",
-            )
-    return runtime_selection, plan.precision_plan.compute_precision
-
-
 def compute_geometry_bounds(
     geometry_array: OwnedGeometryArray,
     *,
@@ -1040,22 +1015,51 @@ def compute_geometry_bounds(
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> np.ndarray:
     normalize_precision_mode(precision)
-    runtime_selection, compute_precision = _resolve_bounds_plan(
-        geometry_array,
-        dispatch_mode=dispatch_mode,
-        precision=precision,
+    row_count = geometry_array.row_count
+    geometry_families = tuple(sorted(family.value for family in geometry_array.families))
+
+    plan = plan_kernel_dispatch(
+        kernel_name="compute_geometry_bounds",
+        kernel_class=KernelClass.COARSE,
+        row_count=row_count,
+        geometry_families=geometry_families,
+        mixed_geometry=len(geometry_families) > 1,
+        current_residency=geometry_array.residency,
+        requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
-    geometry_array.record_runtime_selection(runtime_selection)
-    if runtime_selection.selected is ExecutionMode.GPU:
-        geometry_array.move_to(
-            Residency.DEVICE,
-            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-            reason="compute_geometry_bounds selected GPU execution",
+    selection = plan.runtime_selection
+    geometry_array.record_runtime_selection(selection)
+
+    if selection.selected is ExecutionMode.GPU:
+        precision_plan = select_precision_plan(
+            runtime_selection=selection,
+            kernel_class=KernelClass.COARSE,
+            requested=precision,
         )
         # Bounds always use fp64 compute: they are memory-bound (not compute-bound)
         # and fp32 rounding can shrink bounds, causing false negatives in spatial filtering.
         # The precision plan is still consulted for observability/diagnostics.
-        return _compute_geometry_bounds_gpu(geometry_array, compute_type="double")
+        try:
+            geometry_array.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="compute_geometry_bounds selected GPU execution",
+            )
+            result = _compute_geometry_bounds_gpu(geometry_array, compute_type="double")
+        except Exception:
+            pass  # fall through to CPU
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.bounds",
+                operation="bounds",
+                implementation="gpu_nvrtc_bounds",
+                reason="GPU NVRTC bounds kernel",
+                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
+                selected=ExecutionMode.GPU,
+            )
+            return result
+
     if geometry_array.residency is Residency.DEVICE or any(
         not buffer.host_materialized for buffer in geometry_array.families.values()
     ):
@@ -1064,6 +1068,14 @@ def compute_geometry_bounds(
             trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
             reason="compute_geometry_bounds selected CPU execution",
         )
+    record_dispatch_event(
+        surface="geopandas.array.bounds",
+        operation="bounds",
+        implementation="cpu_vectorized",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        selected=ExecutionMode.CPU,
+    )
     return _compute_geometry_bounds_cpu_vectorized(geometry_array)
 
 
