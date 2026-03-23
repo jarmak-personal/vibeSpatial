@@ -61,6 +61,34 @@ class _DeviceCandidates:
 
 
 @dataclass(frozen=True)
+class DeviceSpatialJoinResult:
+    """Device-resident spatial join index pairs (Phase 2 zero-copy overlay).
+
+    Holds left and right index arrays as CuPy int32 device arrays,
+    eliminating the D->H->D round-trip when both sides of an overlay
+    have owned (device-resident) geometry backing.
+
+    Use :meth:`to_host` when host-side numpy arrays are needed (e.g.,
+    for pandas attribute assembly or Shapely fallback paths).
+    """
+
+    d_left_idx: Any   # CuPy int32 device array
+    d_right_idx: Any  # CuPy int32 device array
+
+    def to_host(self) -> tuple[np.ndarray, np.ndarray]:
+        """Copy index arrays to host as numpy int32 arrays."""
+        runtime = get_cuda_runtime()
+        left = runtime.copy_device_to_host(self.d_left_idx).astype(np.int32, copy=False)
+        right = runtime.copy_device_to_host(self.d_right_idx).astype(np.int32, copy=False)
+        return left, right
+
+    @property
+    def size(self) -> int:
+        """Number of index pairs."""
+        return int(self.d_left_idx.size)
+
+
+@dataclass(frozen=True)
 class SpatialJoinIndices:
     """ADR-0036: Typed contract for spatial kernel index-array output.
 

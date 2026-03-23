@@ -1,21 +1,27 @@
 """GPU-accelerated geometry validity and simplicity checks.
 
-Structural validity checks (is_valid) and geometric simplicity checks
+OGC validity checks (is_valid) and geometric simplicity checks
 (is_simple) computed directly from OwnedGeometryArray coordinate buffers
 without Shapely materialization.
 
-is_valid checks:
+is_valid checks (matching GEOS/Shapely semantics):
 - Ring closure (first coord == last coord for polygon rings)
 - Minimum coordinate counts (LineString >= 2, Polygon ring >= 4)
-- Orientation (exterior CCW, holes CW via shoelace signed area)
+- Ring self-intersection (no non-adjacent segments cross within a ring)
+- Hole-in-shell containment (each hole's first vertex inside exterior ring)
+- Ring-pair interaction: no proper crossing, collinear overlap, or
+  multi-touch (2+ distinct contact points) between distinct rings
 - Null/empty geometries return True (matching Shapely behavior)
+Note: orientation (CCW/CW) is NOT checked by is_valid — GEOS does not
+enforce winding order as a validity rule.  Use orient.py for that.
 
 is_simple checks:
 - Points/MultiPoints: always True
 - LineStrings: no self-intersection (brute-force O(n^2) segment test)
 - Null/empty geometries return True
 
-ADR-0033: Tier 1 NVRTC for is_valid_rings and is_simple_segments kernels.
+ADR-0033: Tier 1 NVRTC for is_valid_rings, is_simple_segments,
+          holes_in_shell, and ring_pair_interaction kernels.
           Tier 2 CuPy for LineString validity (offset arithmetic) and
           per-ring-to-per-geometry reduction.
 ADR-0002: PREDICATE class.  Constructive-style ring checks stay fp64 on
@@ -58,7 +64,7 @@ from .measurement import _PRECISION_PREAMBLE
 # Checks structural validity of polygon rings:
 #   1. Minimum 4 coordinates
 #   2. Ring closure (first == last)
-#   3. Correct orientation (exterior CCW / positive area, holes CW / negative)
+# Note: orientation is NOT checked (GEOS does not enforce winding in is_valid).
 # ---------------------------------------------------------------------------
 
 _IS_VALID_RINGS_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
@@ -89,21 +95,10 @@ extern "C" __global__ void is_valid_rings(
         return;
     }}
 
-    /* Check 3: orientation via shoelace signed area (stays fp64 for exactness) */
-    double area2 = 0.0;
-    for (int j = start; j < end - 1; j++) {{
-        area2 += x[j] * y[j + 1] - x[j + 1] * y[j];
-    }}
-
-    const int ext = is_exterior[ring];
-    if (ext && area2 < 0.0) {{
-        ring_valid[ring] = 0;  /* exterior should be CCW (positive area) */
-        return;
-    }}
-    if (!ext && area2 > 0.0) {{
-        ring_valid[ring] = 0;  /* hole should be CW (negative area) */
-        return;
-    }}
+    /* Note: orientation (CCW exterior / CW hole) is NOT checked here.
+       GEOS/Shapely is_valid does not enforce winding order — it is a
+       convention, not a validity requirement per OGC SFS.  Orientation
+       can be checked separately via orient.py if needed. */
 
     ring_valid[ring] = 1;
 }}
@@ -172,6 +167,26 @@ void is_simple_segments(
             const double bx1 = x[start + j + 1];
             const double by1 = y[start + j + 1];
 
+            /* Check 1: endpoint coincidence (figure-8 patterns where a
+               vertex is visited twice at non-adjacent ring positions).
+               Only flag if intermediate path has non-zero length (excludes
+               degenerate duplicate vertices). */
+            if ((ax0 == bx0 && ay0 == by0) || (ax0 == bx1 && ay0 == by1) ||
+                (ax1 == bx0 && ay1 == by0) || (ax1 == bx1 && ay1 == by1)) {{
+                int has_travel = 0;
+                for (int k = i + 1; k < j && !has_travel; k++) {{
+                    if (x[start + k] != x[start + k + 1] ||
+                        y[start + k] != y[start + k + 1]) {{
+                        has_travel = 1;
+                    }}
+                }}
+                if (has_travel) {{
+                    atomicExch(&found_crossing, 1);
+                    continue;
+                }}
+            }}
+
+            /* Check 2: proper interior crossing */
             const double dx_b = bx1 - bx0;
             const double dy_b = by1 - by0;
             const double denom = dx_a * dy_b - dy_a * dx_b;
@@ -201,12 +216,449 @@ _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
     compute_type="double",
 )
 
+
+# ---------------------------------------------------------------------------
+# NVRTC kernel: holes_in_shell — 1 thread per hole ring (Tier 1, ADR-0033)
+#
+# Checks whether each hole ring's first vertex is contained within its
+# polygon's exterior ring using even-odd ray-casting.  A point on the
+# boundary counts as "inside" (valid per OGC: hole may touch shell at a
+# point).
+#
+# PREDICATE class, fp64 only — no centering needed for validity checks.
+# ---------------------------------------------------------------------------
+
+_HOLES_IN_SHELL_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+extern "C" __device__ inline bool point_on_segment_validity(
+    double px,
+    double py,
+    double ax,
+    double ay,
+    double bx,
+    double by
+) {{
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    const double cross = ((px - ax) * dy) - ((py - ay) * dx);
+    const double scale = fabs(dx) + fabs(dy) + 1.0;
+    if (fabs(cross) > (1e-12 * scale)) {{
+        return false;
+    }}
+    const double minx = ax < bx ? ax : bx;
+    const double maxx = ax > bx ? ax : bx;
+    const double miny = ay < by ? ay : by;
+    const double maxy = ay > by ? ay : by;
+    return px >= (minx - 1e-12) && px <= (maxx + 1e-12)
+        && py >= (miny - 1e-12) && py <= (maxy + 1e-12);
+}}
+
+extern "C" __device__ inline bool ring_contains_point_validity(
+    double px,
+    double py,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    int ring_idx
+) {{
+    const int coord_start = ring_offsets[ring_idx];
+    const int coord_end = ring_offsets[ring_idx + 1];
+
+    if ((coord_end - coord_start) < 4) {{
+        return false;
+    }}
+
+    bool inside = false;
+    for (int coord = coord_start + 1; coord < coord_end; ++coord) {{
+        const double ax = x[coord - 1];
+        const double ay = y[coord - 1];
+        const double bx = x[coord];
+        const double by = y[coord];
+
+        /* Boundary test: point on edge counts as inside (OGC validity) */
+        if (point_on_segment_validity(px, py, ax, ay, bx, by)) {{
+            return true;
+        }}
+
+        /* Even-odd crossing test */
+        const bool intersects = ((ay > py) != (by > py)) &&
+            (px < (((bx - ax) * (py - ay)) / (by - ay)) + ax);
+        if (intersects) {{
+            inside = !inside;
+        }}
+    }}
+    return inside;
+}}
+
+extern "C" __global__ void holes_in_shell(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ hole_ring_indices,
+    const int* __restrict__ exterior_ring_indices,
+    int* __restrict__ hole_valid,
+    int hole_count
+) {{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= hole_count) return;
+
+    const int hole_ring = hole_ring_indices[idx];
+    const int ext_ring = exterior_ring_indices[idx];
+
+    /* Read the first coordinate of the hole ring */
+    const int hole_start = ring_offsets[hole_ring];
+    const double px = x[hole_start];
+    const double py = y[hole_start];
+
+    /* Ray-cast against the exterior ring */
+    hole_valid[idx] = ring_contains_point_validity(
+        px, py, x, y, ring_offsets, ext_ring
+    ) ? 1 : 0;
+}}
+"""
+
+_HOLES_IN_SHELL_KERNEL_NAMES = ("holes_in_shell",)
+_HOLES_IN_SHELL_FP64 = _HOLES_IN_SHELL_KERNEL_SOURCE.format(compute_type="double")
+
+
+# ---------------------------------------------------------------------------
+# NVRTC kernel: ring_pair_interaction — 1 block per polygon part (Tier 1)
+#
+# Detects inter-ring violations within each polygon:
+#   - Proper crossing (segments from distinct rings cross) -> INVALID
+#   - Collinear overlap (rings share a segment) -> INVALID
+#   - Multi-touch (2+ distinct contact points between a ring pair) -> INVALID
+#   - Single touch (1 contact point between a ring pair) -> VALID per OGC
+#
+# PREDICATE class, fp64 only.  Uses Shewchuk orient2d_adaptive for exact
+# orientation predicates (embedded from segment_primitives.py).
+# ---------------------------------------------------------------------------
+
+_RING_PAIR_INTERACTION_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+/* ------------------------------------------------------------------ */
+/* Shewchuk error-free primitives (fp64 exact predicates)             */
+/* ------------------------------------------------------------------ */
+
+__device__ inline void two_product_rpi(double a, double b, double &p, double &e) {{
+    p = a * b;
+    e = fma(a, b, -p);
+}}
+
+__device__ inline void two_sum_rpi(double a, double b, double &s, double &e) {{
+    s = a + b;
+    double bv = s - a;
+    double av = s - bv;
+    double br = b - bv;
+    double ar = a - av;
+    e = ar + br;
+}}
+
+__device__ int orient2d_rpi(
+    double ax, double ay,
+    double bx, double by,
+    double cx, double cy
+) {{
+    double acx = ax - cx;
+    double bcx = bx - cx;
+    double acy = ay - cy;
+    double bcy = by - cy;
+
+    double detleft, detleft_err;
+    two_product_rpi(acx, bcy, detleft, detleft_err);
+
+    double detright, detright_err;
+    two_product_rpi(acy, bcx, detright, detright_err);
+
+    double det_sum, det_sum_err;
+    two_sum_rpi(detleft, -detright, det_sum, det_sum_err);
+
+    double B3 = detleft_err - detright_err + det_sum_err;
+    double det = det_sum + B3;
+
+    if (det > 0.0) return 1;
+    if (det < 0.0) return -1;
+    return 0;
+}}
+
+/* Check if point (px,py) is on segment (ax,ay)-(bx,by), assuming collinear.
+   Uses exact double comparisons (valid for fp64). */
+__device__ int point_on_seg_collinear_rpi(
+    double px, double py,
+    double ax, double ay,
+    double bx, double by
+) {{
+    double minx = ax < bx ? ax : bx;
+    double maxx = ax > bx ? ax : bx;
+    double miny = ay < by ? ay : by;
+    double maxy = ay > by ? ay : by;
+    return (px >= minx && px <= maxx && py >= miny && py <= maxy) ? 1 : 0;
+}}
+
+/* Record a touch point in shared memory, returning 1 if recorded. */
+__device__ int record_touch(
+    double tx, double ty, int ri, int rj,
+    volatile int* touch_count,
+    double* touch_x, double* touch_y,
+    int* touch_ring_i, int* touch_ring_j
+) {{
+    int slot = atomicAdd((int*)touch_count, 1);
+    if (slot < 64) {{
+        touch_x[slot] = tx;
+        touch_y[slot] = ty;
+        touch_ring_i[slot] = ri;
+        touch_ring_j[slot] = rj;
+        return 1;
+    }}
+    return 0;  /* overflow -- will flag invalid conservatively */
+}}
+
+/* ------------------------------------------------------------------ */
+/* Main kernel: 1 block per polygon part                              */
+/* ------------------------------------------------------------------ */
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+ring_pair_interaction(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    const int* __restrict__ poly_ring_starts,
+    const int* __restrict__ poly_ring_ends,
+    int* __restrict__ poly_valid,
+    const int poly_count
+) {{
+    const int poly = blockIdx.x;
+    if (poly >= poly_count) return;
+
+    const int ring_start = poly_ring_starts[poly];
+    const int ring_end = poly_ring_ends[poly];
+    const int n_rings = ring_end - ring_start;
+
+    /* Single-ring polygons have no inter-ring interactions */
+    if (n_rings < 2) {{
+        if (threadIdx.x == 0) poly_valid[poly] = 1;
+        return;
+    }}
+
+    /* Shared memory for early-exit flag + touch point recording */
+    __shared__ int found_invalid;
+    __shared__ int touch_count;
+    __shared__ double touch_x[64];
+    __shared__ double touch_y[64];
+    __shared__ int touch_ring_i[64];
+    __shared__ int touch_ring_j[64];
+
+    if (threadIdx.x == 0) {{
+        found_invalid = 0;
+        touch_count = 0;
+    }}
+    __syncthreads();
+
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    /* Iterate all pairs of distinct rings (i, j) with i < j */
+    for (int ri = 0; ri < n_rings && !found_invalid; ++ri) {{
+        const int ring_i = ring_start + ri;
+        const int ci_start = ring_offsets[ring_i];
+        const int ci_end = ring_offsets[ring_i + 1];
+        const int n_segs_i = ci_end - ci_start - 1;  /* closed ring: last = first */
+        if (n_segs_i < 1) continue;
+
+        for (int rj = ri + 1; rj < n_rings && !found_invalid; ++rj) {{
+            const int ring_j = ring_start + rj;
+            const int cj_start = ring_offsets[ring_j];
+            const int cj_end = ring_offsets[ring_j + 1];
+            const int n_segs_j = cj_end - cj_start - 1;
+            if (n_segs_j < 1) continue;
+
+            /* Total segment pairs for this ring pair */
+            const int total_pairs = n_segs_i * n_segs_j;
+
+            /* Threads stripe across segment pairs */
+            for (int pair_idx = tid; pair_idx < total_pairs && !found_invalid; pair_idx += stride) {{
+                const int si = pair_idx / n_segs_j;
+                const int sj = pair_idx - si * n_segs_j;
+
+                const double ax = x[ci_start + si];
+                const double ay = y[ci_start + si];
+                const double bx = x[ci_start + si + 1];
+                const double by = y[ci_start + si + 1];
+
+                const double cx = x[cj_start + sj];
+                const double cy = y[cj_start + sj];
+                const double dx = x[cj_start + sj + 1];
+                const double dy = y[cj_start + sj + 1];
+
+                /* MBR early reject */
+                double ab_minx = ax < bx ? ax : bx;
+                double ab_maxx = ax > bx ? ax : bx;
+                double ab_miny = ay < by ? ay : by;
+                double ab_maxy = ay > by ? ay : by;
+                double cd_minx = cx < dx ? cx : dx;
+                double cd_maxx = cx > dx ? cx : dx;
+                double cd_miny = cy < dy ? cy : dy;
+                double cd_maxy = cy > dy ? cy : dy;
+
+                if (ab_maxx < cd_minx || cd_maxx < ab_minx ||
+                    ab_maxy < cd_miny || cd_maxy < ab_miny) {{
+                    continue;
+                }}
+
+                /* Shewchuk exact orientations */
+                int o1 = orient2d_rpi(ax, ay, bx, by, cx, cy);
+                int o2 = orient2d_rpi(ax, ay, bx, by, dx, dy);
+                int o3 = orient2d_rpi(cx, cy, dx, dy, ax, ay);
+                int o4 = orient2d_rpi(cx, cy, dx, dy, bx, by);
+
+                /* Case 1: Proper crossing */
+                if (o1 != 0 && o2 != 0 && o1 != o2 && o3 != 0 && o4 != 0 && o3 != o4) {{
+                    atomicExch(&found_invalid, 1);
+                    continue;
+                }}
+
+                /* Case 2: Collinear -- all four orientations zero */
+                if (o1 == 0 && o2 == 0 && o3 == 0 && o4 == 0) {{
+                    int a_on_cd = point_on_seg_collinear_rpi(ax, ay, cx, cy, dx, dy);
+                    int b_on_cd = point_on_seg_collinear_rpi(bx, by, cx, cy, dx, dy);
+                    int c_on_ab = point_on_seg_collinear_rpi(cx, cy, ax, ay, bx, by);
+                    int d_on_ab = point_on_seg_collinear_rpi(dx, dy, ax, ay, bx, by);
+
+                    int containments = a_on_cd + b_on_cd + c_on_ab + d_on_ab;
+                    if (containments >= 3) {{
+                        /* True overlap: segments share an interval */
+                        atomicExch(&found_invalid, 1);
+                        continue;
+                    }}
+
+                    if (containments == 2) {{
+                        int shared_endpoints = 0;
+                        if (ax == cx && ay == cy) shared_endpoints++;
+                        if (ax == dx && ay == dy) shared_endpoints++;
+                        if (bx == cx && by == cy) shared_endpoints++;
+                        if (bx == dx && by == dy) shared_endpoints++;
+
+                        if (shared_endpoints >= 1) {{
+                            double tx, ty;
+                            if (ax == cx && ay == cy) {{ tx = ax; ty = ay; }}
+                            else if (ax == dx && ay == dy) {{ tx = ax; ty = ay; }}
+                            else if (bx == cx && by == cy) {{ tx = bx; ty = by; }}
+                            else {{ tx = bx; ty = by; }}
+                            record_touch(tx, ty, ri, rj,
+                                         &touch_count, touch_x, touch_y,
+                                         touch_ring_i, touch_ring_j);
+                        }} else {{
+                            atomicExch(&found_invalid, 1);
+                        }}
+                        continue;
+                    }}
+                    if (containments == 1) {{
+                        double tx, ty;
+                        if (a_on_cd) {{ tx = ax; ty = ay; }}
+                        else if (b_on_cd) {{ tx = bx; ty = by; }}
+                        else if (c_on_ab) {{ tx = cx; ty = cy; }}
+                        else {{ tx = dx; ty = dy; }}
+                        record_touch(tx, ty, ri, rj,
+                                     &touch_count, touch_x, touch_y,
+                                     touch_ring_i, touch_ring_j);
+                    }}
+                    continue;
+                }}
+
+                /* Case 3: T-intersection -- one endpoint on the other segment */
+                if (o1 == 0 && point_on_seg_collinear_rpi(cx, cy, ax, ay, bx, by)) {{
+                    record_touch(cx, cy, ri, rj,
+                                 &touch_count, touch_x, touch_y,
+                                 touch_ring_i, touch_ring_j);
+                }}
+                else if (o2 == 0 && point_on_seg_collinear_rpi(dx, dy, ax, ay, bx, by)) {{
+                    record_touch(dx, dy, ri, rj,
+                                 &touch_count, touch_x, touch_y,
+                                 touch_ring_i, touch_ring_j);
+                }}
+                else if (o3 == 0 && point_on_seg_collinear_rpi(ax, ay, cx, cy, dx, dy)) {{
+                    record_touch(ax, ay, ri, rj,
+                                 &touch_count, touch_x, touch_y,
+                                 touch_ring_i, touch_ring_j);
+                }}
+                else if (o4 == 0 && point_on_seg_collinear_rpi(bx, by, cx, cy, dx, dy)) {{
+                    record_touch(bx, by, ri, rj,
+                                 &touch_count, touch_x, touch_y,
+                                 touch_ring_i, touch_ring_j);
+                }}
+            }}
+        }}
+    }}
+
+    __syncthreads();
+
+    /* Thread 0: check for multi-touch (2+ distinct points per ring pair) */
+    if (threadIdx.x == 0) {{
+        if (found_invalid) {{
+            poly_valid[poly] = 0;
+            return;
+        }}
+
+        int tc = touch_count;
+        if (tc > 64) {{
+            /* Overflow: conservatively flag invalid */
+            poly_valid[poly] = 0;
+            return;
+        }}
+
+        /* Deduplicate touch points per ring pair and check for multi-touch.
+           For each ring pair (ri, rj), count distinct touch points.
+           If any pair has 2+, the interior is disconnected. */
+        int invalid = 0;
+        for (int a = 0; a < tc && !invalid; ++a) {{
+            int pair_ri = touch_ring_i[a];
+            int pair_rj = touch_ring_j[a];
+            int is_first = 1;
+            for (int b = 0; b < a; ++b) {{
+                if (touch_ring_i[b] == pair_ri && touch_ring_j[b] == pair_rj) {{
+                    is_first = 0;
+                    break;
+                }}
+            }}
+            if (!is_first) continue;
+            int distinct = 1;
+            for (int b = a + 1; b < tc; ++b) {{
+                if (touch_ring_i[b] != pair_ri || touch_ring_j[b] != pair_rj) continue;
+                int is_dup = 0;
+                for (int c = a; c < b; ++c) {{
+                    if (touch_ring_i[c] != pair_ri || touch_ring_j[c] != pair_rj) continue;
+                    if (touch_x[c] == touch_x[b] && touch_y[c] == touch_y[b]) {{
+                        is_dup = 1;
+                        break;
+                    }}
+                }}
+                if (!is_dup) {{
+                    distinct++;
+                    if (distinct >= 2) {{
+                        invalid = 1;
+                        break;
+                    }}
+                }}
+            }}
+        }}
+
+        poly_valid[poly] = invalid ? 0 : 1;
+    }}
+}}
+"""
+
+_RING_PAIR_INTERACTION_KERNEL_NAMES = ("ring_pair_interaction",)
+_RING_PAIR_INTERACTION_FP64 = _RING_PAIR_INTERACTION_KERNEL_SOURCE.format(
+    compute_type="double",
+)
+
+
 # Background precompilation (ADR-0034)
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
     ("is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES),
     ("is-simple-segments-fp64", _IS_SIMPLE_SEGMENTS_FP64, _IS_SIMPLE_SEGMENTS_KERNEL_NAMES),
+    ("holes-in-shell-fp64", _HOLES_IN_SHELL_FP64, _HOLES_IN_SHELL_KERNEL_NAMES),
+    ("ring-pair-interaction-fp64", _RING_PAIR_INTERACTION_FP64, _RING_PAIR_INTERACTION_KERNEL_NAMES),
 ])
 
 
@@ -251,6 +703,57 @@ def _segments_cross(
     return eps < t < (1.0 - eps) and eps < u < (1.0 - eps)
 
 
+def _point_on_segment_cpu(
+    px: float, py: float,
+    ax: float, ay: float, bx: float, by: float,
+) -> bool:
+    """Return True if point (px,py) lies on segment (ax,ay)-(bx,by)."""
+    dx = bx - ax
+    dy = by - ay
+    cross = (px - ax) * dy - (py - ay) * dx
+    scale = abs(dx) + abs(dy) + 1.0
+    if abs(cross) > 1e-12 * scale:
+        return False
+    minx = min(ax, bx)
+    maxx = max(ax, bx)
+    miny = min(ay, by)
+    maxy = max(ay, by)
+    return (
+        px >= minx - 1e-12 and px <= maxx + 1e-12
+        and py >= miny - 1e-12 and py <= maxy + 1e-12
+    )
+
+
+def _point_in_ring_even_odd(
+    px: float, py: float,
+    x: np.ndarray, y: np.ndarray,
+    coord_start: int, coord_end: int,
+) -> bool:
+    """Even-odd ray-cast: is (px,py) inside the ring [coord_start:coord_end]?
+
+    Returns True if the point is inside the ring OR on its boundary.
+    Used for OGC validity hole-in-shell containment check.
+    """
+    if (coord_end - coord_start) < 4:
+        return False
+    inside = False
+    for c in range(coord_start + 1, coord_end):
+        ax = float(x[c - 1])
+        ay = float(y[c - 1])
+        bx = float(x[c])
+        by = float(y[c])
+
+        # Boundary: point on edge counts as inside (OGC validity)
+        if _point_on_segment_cpu(px, py, ax, ay, bx, by):
+            return True
+
+        # Even-odd crossing test
+        if (ay > py) != (by > py):
+            if px < ((bx - ax) * (py - ay) / (by - ay)) + ax:
+                inside = not inside
+    return inside
+
+
 # ---------------------------------------------------------------------------
 # Per-family validity helpers (CPU)
 # ---------------------------------------------------------------------------
@@ -277,12 +780,15 @@ def _is_valid_polygon_ring(
     x: np.ndarray, y: np.ndarray, coord_start: int, coord_end: int,
     is_exterior: bool,
 ) -> bool:
-    """Check structural validity of a single polygon ring.
+    """Check OGC validity of a single polygon ring.
 
     Returns False if:
     - Ring has fewer than 4 coordinates
     - Ring is not closed (first != last)
-    - Ring has wrong orientation (exterior should be CCW, holes CW)
+    - Ring has self-intersection (non-adjacent segments cross)
+
+    Note: orientation (CCW exterior / CW hole) is NOT checked.
+    GEOS/Shapely is_valid does not enforce winding order.
     """
     length = coord_end - coord_start
     if length < 4:
@@ -293,17 +799,190 @@ def _is_valid_polygon_ring(
     # Ring closure check
     if x[coord_start] != x[coord_end - 1] or y[coord_start] != y[coord_end - 1]:
         return False
-    # Orientation check via shoelace
-    area2 = _shoelace_area_2x(x, y, coord_start, coord_end)
-    if is_exterior and area2 < 0:
-        return False  # exterior should be CCW (positive area)
-    if not is_exterior and area2 > 0:
-        return False  # holes should be CW (negative area)
+    # Self-intersection check: ring must be simple (no non-adjacent crossings)
+    if _linestring_self_intersects(x, y, coord_start, coord_end, is_ring=True):
+        return False
+    return True
+
+
+def _orient2d_exact(ax, ay, bx, by, cx, cy):
+    """Shewchuk-style exact orient2d using FMA error-free arithmetic (CPU)."""
+    import math
+    acx = ax - cx
+    bcx = bx - cx
+    acy = ay - cy
+    bcy = by - cy
+    # two_product via math.fma (Python 3.13+) or manual Dekker
+    detleft = acx * bcy
+    detleft_err = math.fma(acx, bcy, -detleft) if hasattr(math, 'fma') else 0.0
+    detright = acy * bcx
+    detright_err = math.fma(acy, bcx, -detright) if hasattr(math, 'fma') else 0.0
+    # two_sum
+    det_sum = detleft + (-detright)
+    bv = det_sum - detleft
+    av = det_sum - bv
+    br = (-detright) - bv
+    ar = detleft - av
+    det_sum_err = ar + br
+    B3 = detleft_err - detright_err + det_sum_err
+    det = det_sum + B3
+    if det > 0.0:
+        return 1
+    if det < 0.0:
+        return -1
+    return 0
+
+
+def _point_on_seg_collinear_cpu(px, py, ax, ay, bx, by):
+    """Check if point (px,py) is on segment (ax,ay)-(bx,by), assuming collinear."""
+    minx = min(ax, bx)
+    maxx = max(ax, bx)
+    miny = min(ay, by)
+    maxy = max(ay, by)
+    return px >= minx and px <= maxx and py >= miny and py <= maxy
+
+
+def _check_ring_pair_interaction_cpu(
+    x: np.ndarray, y: np.ndarray,
+    ring_offsets: np.ndarray,
+    ring_start_idx: int, ring_end_idx: int,
+) -> bool:
+    """Check inter-ring interactions for a single polygon's rings (CPU).
+
+    Returns True if the polygon passes all inter-ring OGC checks:
+      - No proper crossings between segments of distinct rings
+      - No collinear overlap (shared segments)
+      - No multi-touch (2+ distinct contact points per ring pair)
+
+    Returns False if any violation is found.
+    """
+    n_rings = ring_end_idx - ring_start_idx
+    if n_rings < 2:
+        return True
+
+    # For each pair of rings
+    for ri_idx in range(n_rings):
+        ring_i = ring_start_idx + ri_idx
+        ci_start = int(ring_offsets[ring_i])
+        ci_end = int(ring_offsets[ring_i + 1])
+        n_segs_i = ci_end - ci_start - 1
+        if n_segs_i < 1:
+            continue
+
+        for rj_idx in range(ri_idx + 1, n_rings):
+            ring_j = ring_start_idx + rj_idx
+            cj_start = int(ring_offsets[ring_j])
+            cj_end = int(ring_offsets[ring_j + 1])
+            n_segs_j = cj_end - cj_start - 1
+            if n_segs_j < 1:
+                continue
+
+            # Track touch points for this ring pair
+            touch_points: list[tuple[float, float]] = []
+
+            for si in range(n_segs_i):
+                ax = float(x[ci_start + si])
+                ay = float(y[ci_start + si])
+                bx = float(x[ci_start + si + 1])
+                by = float(y[ci_start + si + 1])
+
+                for sj in range(n_segs_j):
+                    cx = float(x[cj_start + sj])
+                    cy = float(y[cj_start + sj])
+                    dx = float(x[cj_start + sj + 1])
+                    dy = float(y[cj_start + sj + 1])
+
+                    # MBR early reject
+                    if (max(ax, bx) < min(cx, dx) or max(cx, dx) < min(ax, bx) or
+                            max(ay, by) < min(cy, dy) or max(cy, dy) < min(ay, by)):
+                        continue
+
+                    o1 = _orient2d_exact(ax, ay, bx, by, cx, cy)
+                    o2 = _orient2d_exact(ax, ay, bx, by, dx, dy)
+                    o3 = _orient2d_exact(cx, cy, dx, dy, ax, ay)
+                    o4 = _orient2d_exact(cx, cy, dx, dy, bx, by)
+
+                    # Case 1: Proper crossing
+                    if o1 != 0 and o2 != 0 and o1 != o2 and o3 != 0 and o4 != 0 and o3 != o4:
+                        return False
+
+                    # Case 2: Collinear
+                    if o1 == 0 and o2 == 0 and o3 == 0 and o4 == 0:
+                        a_on = _point_on_seg_collinear_cpu(ax, ay, cx, cy, dx, dy)
+                        b_on = _point_on_seg_collinear_cpu(bx, by, cx, cy, dx, dy)
+                        c_on = _point_on_seg_collinear_cpu(cx, cy, ax, ay, bx, by)
+                        d_on = _point_on_seg_collinear_cpu(dx, dy, ax, ay, bx, by)
+                        containments = int(a_on) + int(b_on) + int(c_on) + int(d_on)
+
+                        if containments >= 3:
+                            return False  # overlap
+
+                        if containments == 2:
+                            shared = 0
+                            if ax == cx and ay == cy:
+                                shared += 1
+                            if ax == dx and ay == dy:
+                                shared += 1
+                            if bx == cx and by == cy:
+                                shared += 1
+                            if bx == dx and by == dy:
+                                shared += 1
+                            if shared >= 1:
+                                # Shared endpoint touch
+                                if ax == cx and ay == cy:
+                                    tp = (ax, ay)
+                                elif ax == dx and ay == dy:
+                                    tp = (ax, ay)
+                                elif bx == cx and by == cy:
+                                    tp = (bx, by)
+                                else:
+                                    tp = (bx, by)
+                                if tp not in touch_points:
+                                    touch_points.append(tp)
+                            else:
+                                return False  # overlap
+                            continue
+
+                        if containments == 1:
+                            if a_on:
+                                tp = (ax, ay)
+                            elif b_on:
+                                tp = (bx, by)
+                            elif c_on:
+                                tp = (cx, cy)
+                            else:
+                                tp = (dx, dy)
+                            if tp not in touch_points:
+                                touch_points.append(tp)
+                        continue
+
+                    # Case 3: T-intersection
+                    if o1 == 0 and _point_on_seg_collinear_cpu(cx, cy, ax, ay, bx, by):
+                        tp = (cx, cy)
+                        if tp not in touch_points:
+                            touch_points.append(tp)
+                    elif o2 == 0 and _point_on_seg_collinear_cpu(dx, dy, ax, ay, bx, by):
+                        tp = (dx, dy)
+                        if tp not in touch_points:
+                            touch_points.append(tp)
+                    elif o3 == 0 and _point_on_seg_collinear_cpu(ax, ay, cx, cy, dx, dy):
+                        tp = (ax, ay)
+                        if tp not in touch_points:
+                            touch_points.append(tp)
+                    elif o4 == 0 and _point_on_seg_collinear_cpu(bx, by, cx, cy, dx, dy):
+                        tp = (bx, by)
+                        if tp not in touch_points:
+                            touch_points.append(tp)
+
+            # Multi-touch check: 2+ distinct points for this ring pair
+            if len(touch_points) >= 2:
+                return False
+
     return True
 
 
 def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
-    """Polygon validity: ring closure, minimum coords, orientation."""
+    """Polygon validity: ring closure, min coords, simplicity, hole containment, ring interaction."""
     result = np.ones(buf.row_count, dtype=bool)
     if buf.x.size == 0 or buf.empty_mask.size == 0:
         return result
@@ -324,6 +1003,8 @@ def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
             # No rings -- valid
             continue
 
+        # Step 1: Check all rings for structural validity + simplicity
+        rings_ok = True
         for ring_idx, r in enumerate(range(ring_start_idx, ring_end_idx)):
             coord_start = int(ring_offsets[r])
             coord_end = int(ring_offsets[r + 1])
@@ -331,7 +1012,34 @@ def _is_valid_polygons(buf: FamilyGeometryBuffer) -> np.ndarray:
 
             if not _is_valid_polygon_ring(x, y, coord_start, coord_end, is_exterior):
                 result[g] = False
+                rings_ok = False
                 break
+
+        if not rings_ok:
+            continue
+
+        # Step 2: Hole-in-shell containment
+        # Exterior ring is ring_start_idx; holes are ring_start_idx+1 .. ring_end_idx-1
+        holes_ok = True
+        ext_coord_start = int(ring_offsets[ring_start_idx])
+        ext_coord_end = int(ring_offsets[ring_start_idx + 1])
+        for r in range(ring_start_idx + 1, ring_end_idx):
+            hole_coord_start = int(ring_offsets[r])
+            hx = float(x[hole_coord_start])
+            hy = float(y[hole_coord_start])
+            if not _point_in_ring_even_odd(hx, hy, x, y, ext_coord_start, ext_coord_end):
+                result[g] = False
+                holes_ok = False
+                break
+
+        if not holes_ok:
+            continue
+
+        # Step 3: Ring-pair interaction (crossing, overlap, multi-touch)
+        if not _check_ring_pair_interaction_cpu(
+            x, y, ring_offsets, ring_start_idx, ring_end_idx,
+        ):
+            result[g] = False
 
     return result
 
@@ -368,7 +1076,7 @@ def _is_valid_multilinestrings(buf: FamilyGeometryBuffer) -> np.ndarray:
 
 
 def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
-    """MultiPolygon validity: each polygon part checked for ring validity."""
+    """MultiPolygon validity: ring validity, simplicity, hole containment, ring interaction."""
     result = np.ones(buf.row_count, dtype=bool)
     if buf.x.size == 0 or buf.empty_mask.size == 0:
         return result
@@ -389,6 +1097,8 @@ def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
             ring_start_idx = int(part_offsets[p])
             ring_end_idx = int(part_offsets[p + 1])
 
+            # Step 1: Check all rings for structural validity + simplicity
+            rings_ok = True
             for ring_idx, r in enumerate(range(ring_start_idx, ring_end_idx)):
                 coord_start = int(ring_offsets[r])
                 coord_end = int(ring_offsets[r + 1])
@@ -396,8 +1106,35 @@ def _is_valid_multipolygons(buf: FamilyGeometryBuffer) -> np.ndarray:
 
                 if not _is_valid_polygon_ring(x, y, coord_start, coord_end, is_exterior):
                     result[g] = False
+                    rings_ok = False
                     break
-            if not result[g]:
+
+            if not rings_ok:
+                break
+
+            # Step 2: Hole-in-shell containment for this polygon part
+            holes_ok = True
+            ext_coord_start = int(ring_offsets[ring_start_idx])
+            ext_coord_end = int(ring_offsets[ring_start_idx + 1])
+            for r in range(ring_start_idx + 1, ring_end_idx):
+                hole_coord_start = int(ring_offsets[r])
+                hx = float(x[hole_coord_start])
+                hy = float(y[hole_coord_start])
+                if not _point_in_ring_even_odd(
+                    hx, hy, x, y, ext_coord_start, ext_coord_end,
+                ):
+                    result[g] = False
+                    holes_ok = False
+                    break
+
+            if not holes_ok:
+                break
+
+            # Step 3: Ring-pair interaction (crossing, overlap, multi-touch)
+            if not _check_ring_pair_interaction_cpu(
+                x, y, ring_offsets, ring_start_idx, ring_end_idx,
+            ):
+                result[g] = False
                 break
 
     return result
@@ -427,13 +1164,25 @@ def _is_simple_multipoints(buf: FamilyGeometryBuffer) -> np.ndarray:
     return np.ones(buf.row_count, dtype=bool)
 
 
+def _endpoints_coincide(
+    ax0: float, ay0: float, ax1: float, ay1: float,
+    bx0: float, by0: float, bx1: float, by1: float,
+) -> bool:
+    """Return True if any endpoint of segment A equals any endpoint of segment B."""
+    return (
+        (ax0 == bx0 and ay0 == by0) or (ax0 == bx1 and ay0 == by1)
+        or (ax1 == bx0 and ay1 == by0) or (ax1 == bx1 and ay1 == by1)
+    )
+
+
 def _linestring_self_intersects(
     x: np.ndarray, y: np.ndarray, start: int, end: int,
     *, is_ring: bool = False,
 ) -> bool:
     """Brute-force O(n^2) self-intersection test for a linestring.
 
-    Checks whether any two non-adjacent segments properly cross.
+    Checks whether any two non-adjacent segments properly cross OR share
+    an endpoint (vertex coincidence at non-adjacent positions, e.g. figure-8).
 
     Parameters
     ----------
@@ -464,8 +1213,26 @@ def _linestring_self_intersects(
             bx1 = float(x[start + j + 1])
             by1 = float(y[start + j + 1])
 
+            # Check proper interior crossing
             if _segments_cross(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
                 return True
+
+            # Check endpoint coincidence (e.g. figure-8 patterns where a
+            # vertex is visited twice at non-adjacent ring positions).
+            # Only flag if the ring actually travels between positions i and j
+            # (not just degenerate zero-length segments from duplicate vertices).
+            if _endpoints_coincide(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
+                has_travel = False
+                for k in range(i + 1, j):
+                    kx0 = float(x[start + k])
+                    ky0 = float(y[start + k])
+                    kx1 = float(x[start + k + 1])
+                    ky1 = float(y[start + k + 1])
+                    if kx0 != kx1 or ky0 != ky1:
+                        has_travel = True
+                        break
+                if has_travel:
+                    return True
 
     return False
 
@@ -671,6 +1438,151 @@ def _reduce_span_simple_to_geom(d_span_simple, d_geometry_offsets, geom_count):
     return _reduce_ring_valid_to_geom(d_span_simple, d_geometry_offsets, geom_count)
 
 
+def _build_hole_and_exterior_indices(d_buf, family):
+    """Build hole_ring_indices and exterior_ring_indices for holes_in_shell kernel.
+
+    For Polygon:      geometry_offsets[g] is the exterior ring; rings
+                      geometry_offsets[g]+1 .. geometry_offsets[g+1]-1 are holes.
+                      Each hole's exterior ring is geometry_offsets[g].
+    For MultiPolygon: part_offsets[p] is the exterior ring of polygon part p;
+                      rings part_offsets[p]+1 .. part_offsets[p+1]-1 are holes.
+                      Each hole's exterior ring is part_offsets[p].
+
+    Returns (d_hole_ring_indices, d_exterior_ring_indices, hole_count).
+    All arrays are CuPy int32 on device.
+    """
+    ring_count = int(d_buf.ring_offsets.shape[0]) - 1
+    if ring_count == 0:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32), 0
+
+    # Build is_exterior mask
+    d_is_exterior = _build_is_exterior_for_validity(d_buf, family)
+
+    # Hole ring indices: all rings where is_exterior == 0
+    d_hole_ring_indices = cp.flatnonzero(d_is_exterior == 0).astype(cp.int32)
+    hole_count = int(d_hole_ring_indices.shape[0])
+    if hole_count == 0:
+        return d_hole_ring_indices, cp.empty(0, dtype=cp.int32), 0
+
+    # For each hole, find its polygon's exterior ring index.
+    # The exterior ring of a hole is the largest value in d_offsets[:-1] that
+    # is <= the hole's ring index.  We use searchsorted for this.
+    if family is GeometryFamily.POLYGON:
+        d_offsets = cp.asarray(d_buf.geometry_offsets)
+    else:
+        d_offsets = cp.asarray(d_buf.part_offsets)
+
+    # d_offsets[:-1] are the exterior ring indices (one per polygon part).
+    # For each hole ring index h, the exterior ring is d_offsets[k] where
+    # k = searchsorted(d_offsets, h, side='right') - 1
+    d_ext_starts = d_offsets[:-1]
+    d_pos = cp.searchsorted(d_ext_starts, d_hole_ring_indices, side="right") - 1
+    d_exterior_ring_indices = d_ext_starts[d_pos].astype(cp.int32)
+
+    return d_hole_ring_indices, d_exterior_ring_indices, hole_count
+
+
+def _launch_holes_in_shell_kernel(runtime, d_buf, d_hole_ring_indices,
+                                  d_exterior_ring_indices, hole_count):
+    """Launch the holes_in_shell kernel and return device result array (int32).
+
+    Returns a device array of shape (hole_count,) where 1 = hole inside shell,
+    0 = hole outside shell.
+    """
+    kernels = compile_kernel_group(
+        "holes-in-shell-fp64",
+        _HOLES_IN_SHELL_FP64,
+        _HOLES_IN_SHELL_KERNEL_NAMES,
+    )
+    kernel = kernels["holes_in_shell"]
+
+    d_hole_valid = runtime.allocate((hole_count,), np.int32, zero=True)
+    ptr = runtime.pointer
+    params = (
+        (ptr(d_buf.x), ptr(d_buf.y), ptr(d_buf.ring_offsets),
+         ptr(d_hole_ring_indices), ptr(d_exterior_ring_indices),
+         ptr(d_hole_valid), hole_count),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+    )
+    grid, block = runtime.launch_config(kernel, hole_count)
+    runtime.launch(kernel, grid=grid, block=block, params=params)
+    return d_hole_valid
+
+
+def _reduce_hole_valid_to_geom(d_hole_valid, d_hole_ring_indices,
+                               d_buf, family, family_rows, geom_count):
+    """Reduce per-hole validity to per-geometry using cumsum.
+
+    A geometry is valid (for hole containment) iff ALL its holes are inside
+    their respective exterior rings.
+
+    Maps hole indices back to geometries via the offset structure, then
+    uses the same cumsum trick as _reduce_ring_valid_to_geom.
+
+    Returns a CuPy array of bool (length geom_count) on device.
+    """
+    hole_count = int(d_hole_valid.shape[0])
+    if hole_count == 0:
+        return cp.ones(geom_count, dtype=cp.bool_)
+
+    # Build per-geometry ring ranges (same as the ring reduction uses)
+    d_family_rows = cp.asarray(family_rows)
+    if family is GeometryFamily.POLYGON:
+        d_starts = d_buf.geometry_offsets[d_family_rows]
+        d_ends = d_buf.geometry_offsets[d_family_rows + 1]
+    else:
+        # MultiPolygon: geometry -> part -> ring range
+        d_geom_offsets = d_buf.geometry_offsets[d_family_rows]
+        d_geom_offsets_end = d_buf.geometry_offsets[d_family_rows + 1]
+        d_starts = d_buf.part_offsets[d_geom_offsets]
+        d_ends = d_buf.part_offsets[d_geom_offsets_end]
+
+    # For each hole, find which geometry it belongs to, using the ring index.
+    # We map hole_ring_index -> geometry by searchsorted on d_ends.
+    # Hole ring h belongs to geometry g where d_starts[g] <= h < d_ends[g].
+    # Equivalently, g = searchsorted(d_ends, h+1, side='left') but that would
+    # require consecutive geometry ring ranges (which they are for the buffer).
+    #
+    # Simpler: cumsum of invalid holes, then diff at geometry boundaries.
+    # The hole ring indices are a subset of all ring indices, and the geometry
+    # ring ranges partition all ring indices.
+    #
+    # We use the full ring_count approach: create a full-ring invalid array
+    # (all zeros), set the invalid holes, then reduce as usual.
+    ring_count = int(d_buf.ring_offsets.shape[0]) - 1
+    d_hole_invalid_full = cp.zeros(ring_count, dtype=cp.int32)
+
+    # Mark rings where hole is not inside shell
+    d_invalid_holes = d_hole_valid == 0
+    d_invalid_hole_indices = d_hole_ring_indices[d_invalid_holes]
+    if d_invalid_hole_indices.size > 0:
+        d_hole_invalid_full[d_invalid_hole_indices] = 1
+
+    # Now reduce using the standard cumsum trick
+    d_cumsum = cp.cumsum(d_hole_invalid_full)
+    d_empty = d_starts == d_ends
+    d_result = cp.ones(geom_count, dtype=cp.bool_)
+
+    d_ne_indices = cp.flatnonzero(~d_empty)
+    if d_ne_indices.size > 0:
+        d_end_indices = d_ends[d_ne_indices] - 1
+        d_end_sums = d_cumsum[d_end_indices]
+
+        d_starts_ne = d_starts[d_ne_indices]
+        d_start_sums = cp.zeros(d_ne_indices.size, dtype=cp.int32)
+        d_has_prev = d_starts_ne > 0
+        d_hp_indices = cp.flatnonzero(d_has_prev)
+        if d_hp_indices.size > 0:
+            d_start_sums[d_hp_indices] = d_cumsum[d_starts_ne[d_hp_indices] - 1]
+
+        d_invalid_counts = d_end_sums - d_start_sums
+        d_result[d_ne_indices] = d_result[d_ne_indices] & (d_invalid_counts == 0)
+
+    return d_result
+
+
 # ---------------------------------------------------------------------------
 # GPU dispatch: is_valid per-family
 # ---------------------------------------------------------------------------
@@ -747,14 +1659,56 @@ def _is_valid_gpu_multilinestrings(d_buf, family_rows, result, global_rows):
     result[global_rows] = cp.asnumpy(d_result)
 
 
+def _launch_ring_pair_interaction_kernel(runtime, d_buf, d_poly_ring_starts,
+                                         d_poly_ring_ends, poly_count):
+    """Launch the ring_pair_interaction kernel and return device result (int32).
+
+    Returns a device array of shape (poly_count,) where 1 = valid (no
+    inter-ring violation), 0 = invalid (crossing, overlap, or multi-touch).
+    """
+    kernels = compile_kernel_group(
+        "ring-pair-interaction-fp64",
+        _RING_PAIR_INTERACTION_FP64,
+        _RING_PAIR_INTERACTION_KERNEL_NAMES,
+    )
+    kernel = kernels["ring_pair_interaction"]
+
+    d_poly_valid = runtime.allocate((poly_count,), np.int32, zero=True)
+    ptr = runtime.pointer
+    params = (
+        (ptr(d_buf.x), ptr(d_buf.y), ptr(d_buf.ring_offsets),
+         ptr(d_poly_ring_starts), ptr(d_poly_ring_ends),
+         ptr(d_poly_valid), poly_count),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+    )
+    # 1 block per polygon part — use occupancy API for optimal block size
+    block_size = runtime.optimal_block_size(kernel)
+    grid = (poly_count,)
+    block = (block_size,)
+    runtime.launch(kernel, grid=grid, block=block, params=params)
+    return d_poly_valid
+
+
 def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
-    """Polygon validity via NVRTC is_valid_rings kernel + per-ring reduction."""
+    """Polygon validity via NVRTC kernels + CuPy reduction.
+
+    OGC validity for polygon rings requires:
+    1. Structural checks (closure, min coords) via is_valid_rings
+    2. Ring simplicity (no self-intersection) via is_simple_segments
+    3. Hole containment (each hole's first vertex inside exterior ring)
+       via holes_in_shell
+    4. Ring-pair interaction (no crossing, overlap, or multi-touch)
+       via ring_pair_interaction
+    """
     runtime = get_cuda_runtime()
     ring_count = int(d_buf.ring_offsets.shape[0]) - 1
     if ring_count == 0:
         result[global_rows] = True
         return
 
+    # Step 1: structural ring validity (closure, min coords)
     kernels = compile_kernel_group(
         "is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES,
     )
@@ -762,6 +1716,9 @@ def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
 
     d_is_exterior = _build_is_exterior_for_validity(d_buf, GeometryFamily.POLYGON)
     d_ring_valid = runtime.allocate((ring_count,), np.int32, zero=True)
+    d_ring_simple = None
+    d_hole_valid = None
+    d_rpi_valid = None
     try:
         ptr = runtime.pointer
         params = (
@@ -773,15 +1730,23 @@ def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
         grid, block = runtime.launch_config(kernel, ring_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
 
+        # Step 2: ring simplicity (no self-intersection) via is_simple_segments
+        d_ring_simple = _launch_is_simple_kernel(
+            runtime, d_buf.x, d_buf.y, d_buf.ring_offsets, ring_count, is_ring=1,
+        )
+
+        # Combine: ring is valid only if structurally valid AND simple
+        d_ring_valid_cp = cp.asarray(d_ring_valid)
+        d_ring_simple_cp = cp.asarray(d_ring_simple)
+        d_ring_ok = (d_ring_valid_cp & d_ring_simple_cp).astype(cp.int32)
+
         # Reduce per-ring results to per-geometry (all rings must be valid)
         geom_count = int(family_rows.shape[0])
         d_family_rows = cp.asarray(family_rows)
         d_starts = d_buf.geometry_offsets[d_family_rows]
         d_ends = d_buf.geometry_offsets[d_family_rows + 1]
 
-        # Convert d_ring_valid to CuPy for cumsum
-        d_ring_valid_cp = cp.asarray(d_ring_valid)
-        d_invalid = 1 - d_ring_valid_cp
+        d_invalid = 1 - d_ring_ok
         d_cumsum = cp.cumsum(d_invalid)
 
         d_empty = d_starts == d_ends
@@ -802,16 +1767,60 @@ def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
             d_invalid_counts = d_end_sums - d_start_sums
             d_result[d_ne_indices] = (d_invalid_counts == 0)
 
+        # Stay on device: d_result is the running per-geometry validity mask
+
+        # Step 3: hole-in-shell containment
+        d_hole_indices, d_ext_indices, hole_count = \
+            _build_hole_and_exterior_indices(d_buf, GeometryFamily.POLYGON)
+        if hole_count > 0:
+            d_hole_valid = _launch_holes_in_shell_kernel(
+                runtime, d_buf, d_hole_indices, d_ext_indices, hole_count,
+            )
+            d_hole_geom = _reduce_hole_valid_to_geom(
+                cp.asarray(d_hole_valid), d_hole_indices,
+                d_buf, GeometryFamily.POLYGON, family_rows, geom_count,
+            )
+            # AND on device: geometry valid only if rings ok AND holes ok
+            d_result &= d_hole_geom
+
+        # Step 4: Ring-pair interaction (crossing, overlap, multi-touch)
+        # For Polygon: poly_ring_starts[g] = geometry_offsets[g],
+        #              poly_ring_ends[g]   = geometry_offsets[g+1]
+        # One polygon part per geometry row.
+        d_poly_ring_starts = d_buf.geometry_offsets[:-1]
+        d_poly_ring_ends = d_buf.geometry_offsets[1:]
+        total_polys = int(d_poly_ring_starts.shape[0])
+        d_rpi_valid = None
+        if total_polys > 0:
+            d_rpi_valid = _launch_ring_pair_interaction_kernel(
+                runtime, d_buf, d_poly_ring_starts, d_poly_ring_ends, total_polys,
+            )
+            # AND on device
+            d_rpi_cp = cp.asarray(d_rpi_valid)
+            d_result &= d_rpi_cp[d_family_rows].astype(cp.bool_)
+
+        # Single D->H transfer at the end
         result[global_rows] = cp.asnumpy(d_result)
     finally:
+        # LIFO deallocation order for pool coalescing
+        if d_rpi_valid is not None:
+            runtime.free(d_rpi_valid)
+        if d_hole_valid is not None:
+            runtime.free(d_hole_valid)
+        if d_ring_simple is not None:
+            runtime.free(d_ring_simple)
         runtime.free(d_ring_valid)
 
 
 def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
-    """MultiPolygon validity via NVRTC is_valid_rings kernel + reduction.
+    """MultiPolygon validity via NVRTC kernels + CuPy reduction.
 
-    MultiPolygon uses part_offsets to reach rings.  The exterior ring of
-    each part is ring 0 within that part (indexed via part_offsets).
+    MultiPolygon uses part_offsets to reach rings. OGC validity requires:
+    1. Structural checks (closure, min coords) via is_valid_rings
+    2. Ring simplicity (no self-intersection) via is_simple_segments
+    3. Hole containment via holes_in_shell
+    4. Ring-pair interaction (no crossing, overlap, or multi-touch)
+       via ring_pair_interaction
     """
     runtime = get_cuda_runtime()
     ring_count = int(d_buf.ring_offsets.shape[0]) - 1
@@ -819,6 +1828,7 @@ def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
         result[global_rows] = True
         return
 
+    # Step 1: structural ring validity (closure, min coords)
     kernels = compile_kernel_group(
         "is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES,
     )
@@ -826,6 +1836,9 @@ def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
 
     d_is_exterior = _build_is_exterior_for_validity(d_buf, GeometryFamily.MULTIPOLYGON)
     d_ring_valid = runtime.allocate((ring_count,), np.int32, zero=True)
+    d_ring_simple = None
+    d_hole_valid = None
+    d_rpi_valid = None
     try:
         ptr = runtime.pointer
         params = (
@@ -837,12 +1850,20 @@ def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
         grid, block = runtime.launch_config(kernel, ring_count)
         runtime.launch(kernel, grid=grid, block=block, params=params)
 
+        # Step 2: ring simplicity (no self-intersection) via is_simple_segments
+        d_ring_simple = _launch_is_simple_kernel(
+            runtime, d_buf.x, d_buf.y, d_buf.ring_offsets, ring_count, is_ring=1,
+        )
+
+        # Combine: ring is valid only if structurally valid AND simple
+        d_ring_valid_cp = cp.asarray(d_ring_valid)
+        d_ring_simple_cp = cp.asarray(d_ring_simple)
+        d_ring_ok = (d_ring_valid_cp & d_ring_simple_cp).astype(cp.int32)
+
         # For MultiPolygon: geometry_offsets -> parts, part_offsets -> rings.
-        # We need to reduce all rings across all parts of each geometry.
         # Build ring-level spans per geometry by chaining:
         #   ring_start = part_offsets[geometry_offsets[g]]
         #   ring_end = part_offsets[geometry_offsets[g+1]]
-        # (because part_offsets are contiguous ring indices for all parts)
         geom_count = int(family_rows.shape[0])
         d_family_rows = cp.asarray(family_rows)
         d_geom_offsets = d_buf.geometry_offsets[d_family_rows]
@@ -852,9 +1873,7 @@ def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
         d_starts = d_buf.part_offsets[d_geom_offsets]
         d_ends = d_buf.part_offsets[d_geom_offsets_end]
 
-        # Convert d_ring_valid to CuPy for cumsum
-        d_ring_valid_cp = cp.asarray(d_ring_valid)
-        d_invalid = 1 - d_ring_valid_cp
+        d_invalid = 1 - d_ring_ok
         d_cumsum = cp.cumsum(d_invalid)
 
         d_empty = d_starts == d_ends
@@ -875,8 +1894,69 @@ def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
             d_invalid_counts = d_end_sums - d_start_sums
             d_result[d_ne_indices] = (d_invalid_counts == 0)
 
+        # Stay on device: d_result is the running per-geometry validity mask
+
+        # Step 3: hole-in-shell containment
+        d_hole_indices, d_ext_indices, hole_count = \
+            _build_hole_and_exterior_indices(d_buf, GeometryFamily.MULTIPOLYGON)
+        if hole_count > 0:
+            d_hole_valid = _launch_holes_in_shell_kernel(
+                runtime, d_buf, d_hole_indices, d_ext_indices, hole_count,
+            )
+            d_hole_geom = _reduce_hole_valid_to_geom(
+                cp.asarray(d_hole_valid), d_hole_indices,
+                d_buf, GeometryFamily.MULTIPOLYGON, family_rows, geom_count,
+            )
+            # AND on device
+            d_result &= d_hole_geom
+
+        # Step 4: Ring-pair interaction (crossing, overlap, multi-touch)
+        # For MultiPolygon: each polygon part p has rings part_offsets[p]..part_offsets[p+1]
+        d_poly_ring_starts = d_buf.part_offsets[:-1]
+        d_poly_ring_ends = d_buf.part_offsets[1:]
+        total_polys = int(d_poly_ring_starts.shape[0])
+        if total_polys > 0:
+            d_rpi_valid = _launch_ring_pair_interaction_kernel(
+                runtime, d_buf, d_poly_ring_starts, d_poly_ring_ends, total_polys,
+            )
+            # Reduce per-part RPI to per-geometry: a geometry is invalid if ANY
+            # of its parts is invalid. Use cumsum trick on (1 - rpi_valid).
+            d_rpi_cp = cp.asarray(d_rpi_valid)
+            d_rpi_invalid = (1 - d_rpi_cp).astype(cp.int32)
+            d_rpi_cumsum = cp.cumsum(d_rpi_invalid)
+
+            d_family_rows_mp = cp.asarray(family_rows)
+            d_gstart = d_buf.geometry_offsets[d_family_rows_mp]
+            d_gend = d_buf.geometry_offsets[d_family_rows_mp + 1]
+
+            d_ge = d_gstart == d_gend
+            d_rpi_result = cp.ones(geom_count, dtype=cp.bool_)
+            d_ne = cp.flatnonzero(~d_ge)
+            if d_ne.size > 0:
+                d_e_idx = d_gend[d_ne] - 1
+                d_e_sums = d_rpi_cumsum[d_e_idx]
+                d_s_ne = d_gstart[d_ne]
+                d_s_sums = cp.zeros(d_ne.size, dtype=cp.int32)
+                d_hp = d_s_ne > 0
+                d_hp_idx = cp.flatnonzero(d_hp)
+                if d_hp_idx.size > 0:
+                    d_s_sums[d_hp_idx] = d_rpi_cumsum[d_s_ne[d_hp_idx] - 1]
+                d_ic = d_e_sums - d_s_sums
+                d_rpi_result[d_ne] = (d_ic == 0)
+
+            # AND on device
+            d_result &= d_rpi_result
+
+        # Single D->H transfer at the end
         result[global_rows] = cp.asnumpy(d_result)
     finally:
+        # LIFO deallocation order for pool coalescing
+        if d_rpi_valid is not None:
+            runtime.free(d_rpi_valid)
+        if d_hole_valid is not None:
+            runtime.free(d_hole_valid)
+        if d_ring_simple is not None:
+            runtime.free(d_ring_simple)
         runtime.free(d_ring_valid)
 
 
@@ -1211,12 +2291,15 @@ def is_valid_owned(
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> np.ndarray:
-    """Check structural validity of each geometry in an OwnedGeometryArray.
+    """Check OGC validity of each geometry in an OwnedGeometryArray.
 
     Checks performed per family:
     - Ring closure (first coord == last coord for polygon rings)
     - Minimum coordinate counts (LineString >= 2, Polygon ring >= 4)
-    - Orientation (exterior CCW, holes CW via shoelace signed area)
+    - Ring self-intersection (no non-adjacent segments cross within a ring)
+    - Hole-in-shell containment (each hole's first vertex inside exterior)
+    - Ring-pair interaction: no proper crossing, collinear overlap, or
+      multi-touch (2+ distinct contact points) between distinct rings
 
     Null and empty geometries return True, matching Shapely semantics.
 
@@ -1246,7 +2329,7 @@ def is_valid_owned(
     )
 
     # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons
-    # (ring closure, orientation).  select_precision_plan is called for
+    # (ring closure, self-intersection, hole containment, ring-pair interaction).  select_precision_plan is called for
     # observability only -- the kernel source is always _FP64.
     precision_plan = select_precision_plan(
         runtime_selection=selection,

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import warnings
 
 import numpy as np
@@ -17,6 +19,7 @@ from vibespatial.api.geometry_array import (
 from vibespatial.runtime._runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import strict_native_mode_enabled
+from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
 
 def _extract_owned_pair(df1, df2):
@@ -47,12 +50,28 @@ def _ensure_geometry_column(df):
     return df
 
 
-def _intersecting_index_pairs(df1, df2):
+def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
     # ADR-0036 boundary: produces spatial index arrays only.
     # sindex.query has its own owned-dispatch path (sindex.py lines 334-378)
     # that routes through query_spatial_index when both sides support owned.
+    #
+    # Phase 2 zero-copy: when both DataFrames have owned (device-resident)
+    # backing, request device-resident index arrays from the spatial index
+    # to eliminate the D->H->D round-trip when downstream take() re-uploads.
+    # Returns DeviceSpatialJoinResult when device arrays are available,
+    # otherwise returns the standard (2, n) numpy array or (idx1, idx2) tuple.
     if not strict_native_mode_enabled():
-        return df2.sindex.query(df1.geometry, predicate="intersects", sort=True)
+        request_device = left_owned is not None and right_owned is not None
+        result = df2.sindex.query(
+            df1.geometry,
+            predicate="intersects",
+            sort=True,
+            return_device=request_device,
+        )
+        # DeviceSpatialJoinResult flows through directly to the caller.
+        if isinstance(result, DeviceSpatialJoinResult):
+            return result
+        return result
 
     idx1, idx2 = df2.sindex._tree.query(
         np.asarray(df1.geometry.array, dtype=object),
@@ -72,8 +91,13 @@ def _assemble_intersection_attributes(idx1, idx2, df1, df2):
     Receives integer index arrays and attribute-only DataFrames (geometry
     columns already dropped).  Returns a merged DataFrame with attributes
     from both sides joined via the spatial index pairs.
+
+    Indices may be CuPy arrays (Phase 3) — materialized to host here since
+    pandas DataFrames are inherently host-side.
     """
-    pairs = pd.DataFrame({"__idx1": idx1, "__idx2": idx2})
+    h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
+    h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
+    pairs = pd.DataFrame({"__idx1": h_idx1, "__idx2": h_idx2})
     result = pairs.merge(
         df1,
         left_on="__idx1",
@@ -97,7 +121,26 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
         Result GeoDataFrame and whether the owned dispatch path was used.
     """
     # ADR-0036 boundary: spatial index produces index arrays only.
-    idx1, idx2 = _intersecting_index_pairs(df1, df2)
+    # Phase 2: pass owned arrays to request device-resident index pairs.
+    index_result = _intersecting_index_pairs(
+        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    )
+
+    # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
+    if isinstance(index_result, DeviceSpatialJoinResult):
+        d_idx1 = index_result.d_left_idx
+        d_idx2 = index_result.d_right_idx
+        # Host arrays for attribute assembly (pandas needs numpy).
+        idx1, idx2 = index_result.to_host()
+        _has_device_indices = True
+    else:
+        if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+            idx1, idx2 = index_result
+        else:
+            idx1, idx2 = index_result
+        d_idx1, d_idx2 = None, None
+        _has_device_indices = False
+
     used_owned = False
     # Create pairs of geometries in both dataframes to be intersected
     if idx1.size > 0 and idx2.size > 0:
@@ -114,8 +157,14 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 binary_constructive_owned,
             )
 
-            left_sub = left_owned.take(np.asarray(idx1))
-            right_sub = right_owned.take(np.asarray(idx2))
+            # Phase 2 zero-copy: pass CuPy device arrays directly to
+            # device_take() when available, eliminating H→D re-upload.
+            if _has_device_indices:
+                left_sub = left_owned.device_take(d_idx1)
+                right_sub = right_owned.device_take(d_idx2)
+            else:
+                left_sub = left_owned.take(np.asarray(idx1))
+                right_sub = right_owned.take(np.asarray(idx2))
             try:
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
@@ -181,30 +230,64 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
         Result GeoDataFrame and whether the owned dispatch path was used.
     """
     # ADR-0036 boundary: spatial index produces index arrays only.
-    idx1, idx2 = _intersecting_index_pairs(df1, df2)
+    # Phase 2: pass owned arrays to request device-resident index pairs.
+    index_result = _intersecting_index_pairs(
+        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    )
+
+    # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
+    if isinstance(index_result, DeviceSpatialJoinResult):
+        d_idx1 = index_result.d_left_idx
+        d_idx2 = index_result.d_right_idx
+        idx1, idx2 = index_result.to_host()
+        _has_device_indices = True
+    else:
+        if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+            idx1, idx2 = index_result
+        else:
+            idx1, idx2 = index_result
+        d_idx1, d_idx2 = None, None
+        _has_device_indices = False
 
     n_left = len(df1)
     used_owned = False
     result_geoms = None
+    result_owned = None
 
     # Owned-path dispatch: GPU segmented union + GPU difference when both
     # DataFrames have owned backing.  Avoids Shapely materialization for
     # the union step when the segmented_union_all GPU kernel is available.
+    # Phase 18: uses concat_owned_scatter to keep the result device-resident
+    # instead of materializing via to_shapely().
     if idx1.size > 0 and left_owned is not None and right_owned is not None:
         try:
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
+            from vibespatial.geometry.owned import concat_owned_scatter
             from vibespatial.kernels.constructive.segmented_union import (
                 segmented_union_all,
             )
 
-            # Gather right geometries at all neighbor indices (buffer-level).
-            right_gathered = right_owned.take(idx2)
+            # Phase 2 zero-copy: pass CuPy device arrays directly to
+            # device_take() when available, eliminating H→D re-upload.
+            if _has_device_indices:
+                right_gathered = right_owned.device_take(d_idx2)
+            else:
+                right_gathered = right_owned.take(idx2)
 
             # Build group offsets from the sorted idx1 split points.
-            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
-            group_offsets = np.concatenate([idx1_split_at, [len(idx2)]])
+            # Use the same array library as the indices to avoid D→H
+            # transfers when indices are already on device (Phase 3).
+            xp = np
+            if hasattr(idx1, "__cuda_array_interface__"):
+                try:
+                    import cupy
+                    xp = cupy
+                except ImportError:
+                    pass
+            idx1_unique, idx1_split_at = xp.unique(idx1, return_index=True)
+            group_offsets = xp.concatenate([idx1_split_at, xp.asarray([len(idx2)])])
 
             # GPU segmented union: one union per left geometry's neighbors.
             right_unions_owned = segmented_union_all(
@@ -217,45 +300,60 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 "difference", left_sub, right_unions_owned,
             )
 
-            # Assemble full result: unchanged left rows from GeoDataFrame,
-            # differenced rows materialized from owned result.
-            diff_shapely = np.asarray(diff_owned.to_shapely(), dtype=object)
-            result_geoms = np.asarray(df1.geometry, dtype=object).copy()
-            result_geoms[idx1_unique] = diff_shapely
-
+            # Assemble full result: scatter differenced rows into the
+            # original left owned array.  No to_shapely() materialisation.
+            result_owned = concat_owned_scatter(
+                left_owned, diff_owned, idx1_unique,
+            )
             used_owned = True
         except (ImportError, NotImplementedError):
             pass
 
-    if result_geoms is None:
-        # Vectorized grouped-union approach: for each left geometry, compute
-        # left_i - union(overlapping right geometries).  Replaces per-geometry
-        # Python loop with grouped shapely.union_all + vectorized shapely.difference.
-        left_geoms = np.asarray(df1.geometry, dtype=object)
-        result_geoms = left_geoms.copy()
+    if result_owned is not None:
+        # Device-resident path: wrap the scattered OwnedGeometryArray
+        # directly in a GeoSeries, preserving the owned backing.
+        differences = GeoSeries(
+            GeometryArray.from_owned(result_owned, crs=df1.crs),
+            index=df1.index,
+        )
+    else:
+        if result_geoms is None:
+            # Vectorized grouped-union approach: for each left geometry, compute
+            # left_i - union(overlapping right geometries).  Replaces per-geometry
+            # Python loop with grouped shapely.union_all + vectorized
+            # shapely.difference.
+            left_geoms = np.asarray(df1.geometry, dtype=object)
+            result_geoms = left_geoms.copy()
 
-        if idx1.size > 0:
-            right_geoms = np.asarray(df2.geometry, dtype=object)
-            right_unions = np.empty(n_left, dtype=object)
-            right_unions.fill(None)
+            if idx1.size > 0:
+                # Ensure host arrays for Shapely fallback path — indices may
+                # be CuPy when the owned path above raised an exception.
+                h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
+                h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
 
-            # O(N log N) grouping via np.split — avoids O(K*N) per-group mask scan.
-            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
-            idx2_groups = np.split(idx2, idx1_split_at[1:])
-            for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
-                neighbors = right_geoms[neighbors_idx]
-                if len(neighbors) == 1:
-                    right_unions[left_pos] = neighbors[0]
-                else:
-                    right_unions[left_pos] = shapely.union_all(neighbors)
+                right_geoms = np.asarray(df2.geometry, dtype=object)
+                right_unions = np.empty(n_left, dtype=object)
+                right_unions.fill(None)
 
-            has_neighbors = np.zeros(n_left, dtype=bool)
-            has_neighbors[idx1_unique] = True
-            result_geoms[has_neighbors] = shapely.difference(
-                left_geoms[has_neighbors], right_unions[has_neighbors],
-            )
+                # O(N log N) grouping via np.split — avoids O(K*N) per-group
+                # mask scan.
+                idx1_unique, idx1_split_at = np.unique(h_idx1, return_index=True)
+                idx2_groups = np.split(h_idx2, idx1_split_at[1:])
+                for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
+                    neighbors = right_geoms[neighbors_idx]
+                    if len(neighbors) == 1:
+                        right_unions[left_pos] = neighbors[0]
+                    else:
+                        right_unions[left_pos] = shapely.union_all(neighbors)
 
-    differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
+                has_neighbors = np.zeros(n_left, dtype=bool)
+                has_neighbors[idx1_unique] = True
+                result_geoms[has_neighbors] = shapely.difference(
+                    left_geoms[has_neighbors], right_unions[has_neighbors],
+                )
+
+        differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
+
     poly_ix = differences.geom_type.isin(POLYGON_GEOM_TYPES)
     differences.loc[poly_ix] = differences[poly_ix].make_valid()
     geom_diff = differences[~differences.is_empty].copy()
@@ -562,9 +660,95 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     )
 
     if keep_geom_type:
-        result = _collection_extract(result, geom_type, keep_geom_type_warning)
+        result_owned = getattr(result.geometry.values, "_owned", None)
+        if result_owned is not None:
+            result = _collection_extract_owned(result, geom_type, keep_geom_type_warning)
+        else:
+            result = _collection_extract(result, geom_type, keep_geom_type_warning)
 
     result.reset_index(drop=True, inplace=True)
+    return result
+
+
+def _geom_type_to_target_families(geom_type: str) -> set[int] | None:
+    """Map a Shapely geom_type string to the set of OwnedGeometryArray family tags to keep.
+
+    Returns ``None`` if *geom_type* is not a recognized polygon, line, or point type.
+    Imports are deferred to avoid circular dependencies.
+    """
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    if geom_type in POLYGON_GEOM_TYPES:
+        return {FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]}
+    if geom_type in LINE_GEOM_TYPES:
+        return {
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            FAMILY_TAGS[GeometryFamily.MULTILINESTRING],
+        }
+    if geom_type in POINT_GEOM_TYPES:
+        return {FAMILY_TAGS[GeometryFamily.POINT], FAMILY_TAGS[GeometryFamily.MULTIPOINT]}
+    return None
+
+
+def _collection_extract_owned(df, geom_type, keep_geom_type_warning):
+    """Device-resident collection extract: filter by geometry family tag.
+
+    When the result GeoDataFrame's geometry column has OwnedGeometryArray
+    backing, we can filter by the ``tags`` array directly -- no Shapely
+    materialization, no ``.explode()``, no ``.dissolve()``.
+
+    OwnedGeometryArray does not represent GeometryCollections; constituent
+    geometries are stored as individual rows tagged by their concrete family.
+    Filtering is a simple mask on the tags array followed by
+    ``OwnedGeometryArray.take()``.
+    """
+    from vibespatial.geometry.owned import NULL_TAG
+
+    ga = df.geometry.values
+    owned = ga._owned
+
+    target_tags = _geom_type_to_target_families(geom_type)
+    if target_tags is None:
+        raise TypeError(f"`geom_type` does not support {geom_type}.")
+
+    tags = owned.tags
+    keep_mask = np.zeros(len(tags), dtype=bool)
+    for tag in target_tags:
+        keep_mask |= tags == tag
+
+    num_dropped = int((~keep_mask & (tags != NULL_TAG)).sum())
+
+    if num_dropped > 0 and keep_geom_type_warning:
+        warnings.warn(
+            "`keep_geom_type=True` in overlay resulted in "
+            f"{num_dropped} dropped geometries of different "
+            "geometry types than df1 has. Set `keep_geom_type=False` to retain all "
+            "geometries",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Also drop null rows (tags == NULL_TAG) to match the Shapely-path
+    # behaviour where geom_type.isin() returns False for None geometries.
+    keep_mask &= owned.validity
+
+    if keep_mask.all():
+        return df
+
+    # Filter both the DataFrame rows and the owned geometry array together.
+    # Use iloc for positional indexing -- the DataFrame may have a non-default
+    # index after concat in overlay sub-operations.
+    keep_indices = np.flatnonzero(keep_mask)
+    result = df.iloc[keep_indices].copy()
+    filtered_owned = owned.take(keep_indices)
+
+    # Rebuild the GeoSeries with owned backing to avoid Shapely materialisation.
+    geom_col = result._geometry_column_name
+    result[geom_col] = GeoSeries(
+        GeometryArray.from_owned(filtered_owned, crs=df.crs),
+        index=result.index,
+    )
     return result
 
 

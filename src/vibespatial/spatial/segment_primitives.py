@@ -672,31 +672,169 @@ class DeviceSegmentTable:
     count: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class SegmentIntersectionResult:
-    left_rows: np.ndarray
-    left_segments: np.ndarray
-    left_lookup: np.ndarray
-    right_rows: np.ndarray
-    right_segments: np.ndarray
-    right_lookup: np.ndarray
-    kinds: np.ndarray
-    point_x: np.ndarray
-    point_y: np.ndarray
-    overlap_x0: np.ndarray
-    overlap_y0: np.ndarray
-    overlap_x1: np.ndarray
-    overlap_y1: np.ndarray
+    """Segment intersection results with lazy host materialization.
+
+    When produced by the GPU pipeline, all 14 result arrays live in
+    ``device_state`` and host numpy arrays are lazily copied on first
+    property access.  GPU-only consumers (e.g. ``build_gpu_split_events``)
+    that read only ``device_state``, ``candidate_pairs``, ``count``,
+    ``runtime_selection``, ``precision_plan``, and ``robustness_plan``
+    never trigger device-to-host copies.
+    """
     candidate_pairs: int
-    ambiguous_rows: np.ndarray
     runtime_selection: RuntimeSelection
     precision_plan: PrecisionPlan
     robustness_plan: RobustnessPlan
     device_state: SegmentIntersectionDeviceState | None = None
+    _count: int = 0
+    # Host arrays — lazily materialized from device_state on first access.
+    _left_rows: np.ndarray | None = None
+    _left_segments: np.ndarray | None = None
+    _left_lookup: np.ndarray | None = None
+    _right_rows: np.ndarray | None = None
+    _right_segments: np.ndarray | None = None
+    _right_lookup: np.ndarray | None = None
+    _kinds: np.ndarray | None = None
+    _point_x: np.ndarray | None = None
+    _point_y: np.ndarray | None = None
+    _overlap_x0: np.ndarray | None = None
+    _overlap_y0: np.ndarray | None = None
+    _overlap_x1: np.ndarray | None = None
+    _overlap_y1: np.ndarray | None = None
+    _ambiguous_rows: np.ndarray | None = None
+
+    def _ensure_host(self) -> None:
+        """Lazily copy host arrays from device_state on first access."""
+        if self._left_rows is not None:
+            return
+        ds = self.device_state
+        if ds is None:
+            return
+        runtime = get_cuda_runtime()
+        self._left_rows = np.asarray(
+            runtime.copy_device_to_host(ds.left_rows), dtype=np.int32,
+        )
+        self._left_segments = np.asarray(
+            runtime.copy_device_to_host(ds.left_segments), dtype=np.int32,
+        )
+        self._left_lookup = np.asarray(
+            runtime.copy_device_to_host(ds.left_lookup), dtype=np.int32,
+        )
+        self._right_rows = np.asarray(
+            runtime.copy_device_to_host(ds.right_rows), dtype=np.int32,
+        )
+        self._right_segments = np.asarray(
+            runtime.copy_device_to_host(ds.right_segments), dtype=np.int32,
+        )
+        self._right_lookup = np.asarray(
+            runtime.copy_device_to_host(ds.right_lookup), dtype=np.int32,
+        )
+        self._kinds = np.asarray(
+            runtime.copy_device_to_host(ds.kinds), dtype=np.int8,
+        )
+        self._point_x = np.asarray(
+            runtime.copy_device_to_host(ds.point_x), dtype=np.float64,
+        )
+        self._point_y = np.asarray(
+            runtime.copy_device_to_host(ds.point_y), dtype=np.float64,
+        )
+        self._overlap_x0 = np.asarray(
+            runtime.copy_device_to_host(ds.overlap_x0), dtype=np.float64,
+        )
+        self._overlap_y0 = np.asarray(
+            runtime.copy_device_to_host(ds.overlap_y0), dtype=np.float64,
+        )
+        self._overlap_x1 = np.asarray(
+            runtime.copy_device_to_host(ds.overlap_x1), dtype=np.float64,
+        )
+        self._overlap_y1 = np.asarray(
+            runtime.copy_device_to_host(ds.overlap_y1), dtype=np.float64,
+        )
+        self._ambiguous_rows = np.asarray(
+            runtime.copy_device_to_host(ds.ambiguous_rows), dtype=np.int32,
+        )
+
+    @property
+    def left_rows(self) -> np.ndarray:
+        self._ensure_host()
+        return self._left_rows  # type: ignore[return-value]
+
+    @property
+    def left_segments(self) -> np.ndarray:
+        self._ensure_host()
+        return self._left_segments  # type: ignore[return-value]
+
+    @property
+    def left_lookup(self) -> np.ndarray:
+        self._ensure_host()
+        return self._left_lookup  # type: ignore[return-value]
+
+    @property
+    def right_rows(self) -> np.ndarray:
+        self._ensure_host()
+        return self._right_rows  # type: ignore[return-value]
+
+    @property
+    def right_segments(self) -> np.ndarray:
+        self._ensure_host()
+        return self._right_segments  # type: ignore[return-value]
+
+    @property
+    def right_lookup(self) -> np.ndarray:
+        self._ensure_host()
+        return self._right_lookup  # type: ignore[return-value]
+
+    @property
+    def kinds(self) -> np.ndarray:
+        self._ensure_host()
+        return self._kinds  # type: ignore[return-value]
+
+    @property
+    def point_x(self) -> np.ndarray:
+        self._ensure_host()
+        return self._point_x  # type: ignore[return-value]
+
+    @property
+    def point_y(self) -> np.ndarray:
+        self._ensure_host()
+        return self._point_y  # type: ignore[return-value]
+
+    @property
+    def overlap_x0(self) -> np.ndarray:
+        self._ensure_host()
+        return self._overlap_x0  # type: ignore[return-value]
+
+    @property
+    def overlap_y0(self) -> np.ndarray:
+        self._ensure_host()
+        return self._overlap_y0  # type: ignore[return-value]
+
+    @property
+    def overlap_x1(self) -> np.ndarray:
+        self._ensure_host()
+        return self._overlap_x1  # type: ignore[return-value]
+
+    @property
+    def overlap_y1(self) -> np.ndarray:
+        self._ensure_host()
+        return self._overlap_y1  # type: ignore[return-value]
+
+    @property
+    def ambiguous_rows(self) -> np.ndarray:
+        self._ensure_host()
+        return self._ambiguous_rows  # type: ignore[return-value]
 
     @property
     def count(self) -> int:
-        return int(self.left_rows.size)
+        if self._count > 0:
+            return self._count
+        if self.device_state is not None and self.device_state.left_rows is not None:
+            return int(self.device_state.left_rows.size)
+        if self._left_rows is not None:
+            return int(self._left_rows.size)
+        return 0
 
     def kind_names(self) -> list[str]:
         return [SegmentIntersectionKind(int(value)).name.lower() for value in self.kinds]
@@ -1936,6 +2074,38 @@ def _select_segment_runtime(
     preferred_residency=Residency.DEVICE,
     tags=("cuda-python",),
 )
+def _empty_segment_intersection_result(
+    *,
+    runtime_selection: RuntimeSelection,
+    precision_plan: PrecisionPlan,
+    robustness_plan: RobustnessPlan,
+) -> SegmentIntersectionResult:
+    """Construct an empty SegmentIntersectionResult with host arrays."""
+    empty_i32 = np.asarray([], dtype=np.int32)
+    empty_f64 = np.asarray([], dtype=np.float64)
+    return SegmentIntersectionResult(
+        candidate_pairs=0,
+        runtime_selection=runtime_selection,
+        precision_plan=precision_plan,
+        robustness_plan=robustness_plan,
+        _count=0,
+        _left_rows=empty_i32,
+        _left_segments=empty_i32,
+        _left_lookup=empty_i32,
+        _right_rows=empty_i32,
+        _right_segments=empty_i32,
+        _right_lookup=empty_i32,
+        _kinds=empty_i32,
+        _point_x=empty_f64,
+        _point_y=empty_f64,
+        _overlap_x0=empty_f64,
+        _overlap_y0=empty_f64,
+        _overlap_x1=empty_f64,
+        _overlap_y1=empty_f64,
+        _ambiguous_rows=empty_i32,
+    )
+
+
 def _classify_segment_intersections_gpu(
     *,
     left: OwnedGeometryArray,
@@ -1965,24 +2135,7 @@ def _classify_segment_intersections_gpu(
     d_right_segs = _extract_segments_gpu(right, compute_type)
 
     if d_left_segs.count == 0 or d_right_segs.count == 0:
-        empty_i32 = np.asarray([], dtype=np.int32)
-        empty_f64 = np.asarray([], dtype=np.float64)
-        return SegmentIntersectionResult(
-            left_rows=empty_i32,
-            left_segments=empty_i32,
-            left_lookup=empty_i32,
-            right_rows=empty_i32,
-            right_segments=empty_i32,
-            right_lookup=empty_i32,
-            kinds=empty_i32,
-            point_x=empty_f64,
-            point_y=empty_f64,
-            overlap_x0=empty_f64,
-            overlap_y0=empty_f64,
-            overlap_x1=empty_f64,
-            overlap_y1=empty_f64,
-            candidate_pairs=0,
-            ambiguous_rows=empty_i32,
+        return _empty_segment_intersection_result(
             runtime_selection=runtime_selection,
             precision_plan=precision_plan,
             robustness_plan=robustness_plan,
@@ -1992,24 +2145,7 @@ def _classify_segment_intersections_gpu(
     d_candidates = _generate_candidates_gpu(d_left_segs, d_right_segs)
 
     if d_candidates.count == 0:
-        empty_i32 = np.asarray([], dtype=np.int32)
-        empty_f64 = np.asarray([], dtype=np.float64)
-        return SegmentIntersectionResult(
-            left_rows=empty_i32,
-            left_segments=empty_i32,
-            left_lookup=empty_i32,
-            right_rows=empty_i32,
-            right_segments=empty_i32,
-            right_lookup=empty_i32,
-            kinds=empty_i32,
-            point_x=empty_f64,
-            point_y=empty_f64,
-            overlap_x0=empty_f64,
-            overlap_y0=empty_f64,
-            overlap_x1=empty_f64,
-            overlap_y1=empty_f64,
-            candidate_pairs=0,
-            ambiguous_rows=empty_i32,
+        return _empty_segment_intersection_result(
             runtime_selection=runtime_selection,
             precision_plan=precision_plan,
             robustness_plan=robustness_plan,
@@ -2075,43 +2211,15 @@ def _classify_segment_intersections_gpu(
     grid, block = runtime.launch_config(classify_kernel, n_pairs)
     runtime.launch(classify_kernel, grid=grid, block=block, params=classify_params)
 
-    # Single sync before D2H transfer
+    # Sync GPU before returning device-primary result.
     runtime.synchronize()
 
-    # Transfer results to host
-    kinds = runtime.copy_device_to_host(device_kinds)
-    point_x = runtime.copy_device_to_host(device_point_x)
-    point_y = runtime.copy_device_to_host(device_point_y)
-    overlap_x0 = runtime.copy_device_to_host(device_overlap_x0)
-    overlap_y0 = runtime.copy_device_to_host(device_overlap_y0)
-    overlap_x1 = runtime.copy_device_to_host(device_overlap_x1)
-    overlap_y1 = runtime.copy_device_to_host(device_overlap_y1)
-    left_rows = runtime.copy_device_to_host(d_candidates.left_rows)
-    left_segments = runtime.copy_device_to_host(d_candidates.left_segments)
-    left_lookup = runtime.copy_device_to_host(d_candidates.left_lookup)
-    right_rows = runtime.copy_device_to_host(d_candidates.right_rows)
-    right_segments = runtime.copy_device_to_host(d_candidates.right_segments)
-    right_lookup = runtime.copy_device_to_host(d_candidates.right_lookup)
-
     # No ambiguous rows -- all refinement happens on GPU
-    ambiguous_rows = np.asarray([], dtype=np.int32)
+    d_ambiguous_rows = runtime.allocate((0,), np.int32)
 
+    # Device-primary: host arrays are lazily materialized on first access.
     return SegmentIntersectionResult(
-        left_rows=left_rows.astype(np.int32, copy=False),
-        left_segments=left_segments.astype(np.int32, copy=False),
-        left_lookup=left_lookup.astype(np.int32, copy=False),
-        right_rows=right_rows.astype(np.int32, copy=False),
-        right_segments=right_segments.astype(np.int32, copy=False),
-        right_lookup=right_lookup.astype(np.int32, copy=False),
-        kinds=np.asarray(kinds, dtype=np.int8),
-        point_x=np.asarray(point_x, dtype=np.float64),
-        point_y=np.asarray(point_y, dtype=np.float64),
-        overlap_x0=np.asarray(overlap_x0, dtype=np.float64),
-        overlap_y0=np.asarray(overlap_y0, dtype=np.float64),
-        overlap_x1=np.asarray(overlap_x1, dtype=np.float64),
-        overlap_y1=np.asarray(overlap_y1, dtype=np.float64),
         candidate_pairs=n_pairs,
-        ambiguous_rows=ambiguous_rows,
         runtime_selection=runtime_selection,
         precision_plan=precision_plan,
         robustness_plan=robustness_plan,
@@ -2129,8 +2237,9 @@ def _classify_segment_intersections_gpu(
             overlap_y0=device_overlap_y0,
             overlap_x1=device_overlap_x1,
             overlap_y1=device_overlap_y1,
-            ambiguous_rows=runtime.from_host(ambiguous_rows),
+            ambiguous_rows=d_ambiguous_rows,
         ),
+        _count=n_pairs,
     )
 
 
@@ -2189,24 +2298,7 @@ def _classify_segment_intersections_from_tables(
     robustness_plan: RobustnessPlan,
 ) -> SegmentIntersectionResult:
     if pairs.count == 0:
-        empty_i32 = np.asarray([], dtype=np.int32)
-        empty_f64 = np.asarray([], dtype=np.float64)
-        return SegmentIntersectionResult(
-            left_rows=empty_i32,
-            left_segments=empty_i32,
-            left_lookup=empty_i32,
-            right_rows=empty_i32,
-            right_segments=empty_i32,
-            right_lookup=empty_i32,
-            kinds=empty_i32,
-            point_x=empty_f64,
-            point_y=empty_f64,
-            overlap_x0=empty_f64,
-            overlap_y0=empty_f64,
-            overlap_x1=empty_f64,
-            overlap_y1=empty_f64,
-            candidate_pairs=0,
-            ambiguous_rows=empty_i32,
+        return _empty_segment_intersection_result(
             runtime_selection=runtime_selection,
             precision_plan=precision_plan,
             robustness_plan=robustness_plan,
@@ -2295,24 +2387,24 @@ def _classify_segment_intersections_from_tables(
         )
 
     return SegmentIntersectionResult(
-        left_rows=pairs.left_rows.copy(),
-        left_segments=pairs.left_segments.copy(),
-        left_lookup=pairs.left_lookup.copy(),
-        right_rows=pairs.right_rows.copy(),
-        right_segments=pairs.right_segments.copy(),
-        right_lookup=pairs.right_lookup.copy(),
-        kinds=kinds,
-        point_x=point_x,
-        point_y=point_y,
-        overlap_x0=overlap_x0,
-        overlap_y0=overlap_y0,
-        overlap_x1=overlap_x1,
-        overlap_y1=overlap_y1,
         candidate_pairs=int(pairs.count),
-        ambiguous_rows=ambiguous_rows,
         runtime_selection=runtime_selection,
         precision_plan=precision_plan,
         robustness_plan=robustness_plan,
+        _left_rows=pairs.left_rows.copy(),
+        _left_segments=pairs.left_segments.copy(),
+        _left_lookup=pairs.left_lookup.copy(),
+        _right_rows=pairs.right_rows.copy(),
+        _right_segments=pairs.right_segments.copy(),
+        _right_lookup=pairs.right_lookup.copy(),
+        _kinds=kinds,
+        _point_x=point_x,
+        _point_y=point_y,
+        _overlap_x0=overlap_x0,
+        _overlap_y0=overlap_y0,
+        _overlap_x1=overlap_x1,
+        _overlap_y1=overlap_y1,
+        _ambiguous_rows=ambiguous_rows,
     )
 
 

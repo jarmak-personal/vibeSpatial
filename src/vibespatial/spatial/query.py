@@ -48,6 +48,7 @@ from .query_candidates import (  # noqa: F401
 from .query_types import (  # noqa: F401
     _POLYGON_DE9IM_PREDICATES,
     SUPPORTED_GEOM_TYPES,
+    DeviceSpatialJoinResult,
     RegularGridPointIndex,
     SpatialJoinIndices,
     SpatialQueryExecution,
@@ -79,6 +80,7 @@ def query_spatial_index(
     distance: float | np.ndarray | None = None,
     output_format: str = "indices",
     return_metadata: bool = False,
+    return_device: bool = False,
     tree_shapely: np.ndarray | None = None,
     query_shapely: np.ndarray | None = None,
 ) -> Any:
@@ -544,6 +546,32 @@ def query_spatial_index(
     if output_format == "count":
         count = int(np.unique(left_idx).size) if left_idx.size > 0 else 0
         return (count, execution) if return_metadata else count
+
+    # Phase 2 zero-copy: when caller requests device-resident index arrays
+    # (e.g., overlay with both sides owned-backed), keep refined indices on
+    # device to feed directly into device_take() — eliminates H→D re-upload.
+    # Only applies to non-scalar "indices" format with GPU execution.
+    if (
+        return_device
+        and not scalar
+        and output_format == "indices"
+        and execution.selected is ExecutionMode.GPU
+        and has_gpu_runtime()
+    ):
+        import cupy as _cp
+
+        # Sort on device if requested (overlay always passes sort=True).
+        d_left = _cp.asarray(left_idx, dtype=_cp.int32)
+        d_right = _cp.asarray(right_idx, dtype=_cp.int32)
+        if sort and d_left.size > 0:
+            order = _cp.lexsort(_cp.stack([_cp.asarray(d_right, dtype=_cp.int64), _cp.asarray(d_left, dtype=_cp.int64)]))
+            d_left = d_left[order]
+            d_right = d_right[order]
+        device_result = DeviceSpatialJoinResult(
+            d_left_idx=d_left,
+            d_right_idx=d_right,
+        )
+        return (device_result, execution) if return_metadata else device_result
 
     if scalar:
         indices = right_idx.astype(np.intp, copy=False)

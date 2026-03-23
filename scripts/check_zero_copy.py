@@ -25,7 +25,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-17.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 106  # +1 from DGA offset_curve: to_shapely() now visible to linter (was hidden behind _ensure_shapely_cache)
+_VIOLATION_BASELINE = 105  # Phase 12 merge: GPU hole extraction replaces Phase 11 GeoArrow assembly; net 105
 
 # Method names that pull data from device to host.
 D2H_APIS = {"get", "copy_to_host", "to_host", "asnumpy", "tolist", "to_pylist"}

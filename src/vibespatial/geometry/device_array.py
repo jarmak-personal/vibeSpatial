@@ -357,24 +357,16 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def is_valid(self) -> np.ndarray:
-        """Validity via Shapely — kept on host path for OGC semantic parity.
+        """OGC validity — GPU-accelerated from owned coordinate buffers, no Shapely.
 
-        is_valid_owned() only checks structural validity (ring closure,
-        min coords, orientation).  Shapely also checks ring self-intersection,
-        ring crossings, holes-within-shell, etc.  Overlay pipelines use
-        is_valid to gate make_valid(); weaker checks would skip repair and
-        produce wrong overlay results.  Migrate to owned path only after
-        is_valid_owned() covers full OGC validity.
+        is_valid_owned() covers full OGC validity: ring closure, min coords,
+        ring self-intersection, hole-in-shell containment, ring-ring crossing,
+        collinear overlap, and interior connectedness (multi-touch detection).
+        Zero-copy: reads device buffers directly, returns boolean mask to host.
         """
-        import shapely
+        from vibespatial.constructive.validity import is_valid_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.is_valid: Shapely materialization required"
-            " (is_valid_owned lacks full OGC validity checks)",
-            visible=True,
-        )
-        return shapely.is_valid(self._ensure_shapely_cache())
+        return is_valid_owned(self._owned)
 
     @property
     def is_simple(self) -> np.ndarray:

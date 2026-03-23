@@ -72,10 +72,8 @@ def _polygon_difference_gpu(
     transfer point as all other overlay operations).
     """
     from vibespatial.overlay.gpu import (
-        _build_polygon_output_from_faces,
-        _build_polygon_output_from_faces_gpu,
-        _empty_polygon_output,
-        _select_overlay_face_indices,
+        _assemble_faces_from_device_indices,
+        _select_overlay_face_indices_gpu,
         build_gpu_atomic_edges,
         build_gpu_half_edge_graph,
         build_gpu_overlay_faces,
@@ -93,27 +91,13 @@ def _polygon_difference_gpu(
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
 
-    # Face selection: left_covered AND NOT right_covered (difference semantics)
-    selected_face_indices = _select_overlay_face_indices(faces, operation="difference")
+    # Phase 13: device-resident face selection eliminates D->H transfers on
+    # bounded_mask, left_covered, and right_covered.
+    d_selected_face_indices = _select_overlay_face_indices_gpu(faces, operation="difference")
 
-    if selected_face_indices.size == 0:
-        result = _empty_polygon_output(runtime_selection)
-        result.runtime_history.append(runtime_selection)
-        return result
-
-    # Try CPU face assembly first (faster for most cases), fall back to GPU
-    # assembly when the CPU path hits "spans multiple source rows" error
-    # (ADR-0016 Stage 8).
-    try:
-        result = _build_polygon_output_from_faces(
-            half_edge_graph, faces, selected_face_indices
-        )
-    except RuntimeError:
-        result = _build_polygon_output_from_faces_gpu(
-            half_edge_graph, faces, selected_face_indices
-        )
-        if result is None:
-            raise
+    result = _assemble_faces_from_device_indices(
+        half_edge_graph, faces, d_selected_face_indices,
+    )
 
     result.runtime_history.append(runtime_selection)
     return result

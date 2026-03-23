@@ -840,3 +840,181 @@ class TestDeviceJoinResult:
         left, right = djr.as_tuple()
         np.testing.assert_array_equal(left, [0, 1, 2])
         np.testing.assert_array_equal(right, [3, 4, 5])
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: DeviceSpatialJoinResult and return_device parameter
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceSpatialJoinResult:
+    """Verify DeviceSpatialJoinResult dataclass semantics."""
+
+    def test_frozen_dataclass_fields(self) -> None:
+        """DeviceSpatialJoinResult should be a frozen dataclass with
+        d_left_idx and d_right_idx fields."""
+        # Verify fields exist on the class.
+        import dataclasses
+
+        from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+        field_names = {f.name for f in dataclasses.fields(DeviceSpatialJoinResult)}
+        assert "d_left_idx" in field_names
+        assert "d_right_idx" in field_names
+
+    def test_to_host_returns_numpy_arrays(self) -> None:
+        """to_host() should produce numpy int32 arrays matching device data."""
+        pytest.importorskip("cupy")
+        import cupy as cp
+
+        from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+        d_left = cp.array([0, 1, 2, 3], dtype=cp.int32)
+        d_right = cp.array([4, 5, 6, 7], dtype=cp.int32)
+        result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+
+        h_left, h_right = result.to_host()
+        np.testing.assert_array_equal(h_left, [0, 1, 2, 3])
+        np.testing.assert_array_equal(h_right, [4, 5, 6, 7])
+        assert h_left.dtype == np.int32
+        assert h_right.dtype == np.int32
+
+    def test_size_property(self) -> None:
+        """size should report the number of index pairs."""
+        pytest.importorskip("cupy")
+        import cupy as cp
+
+        from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+        d_left = cp.array([0, 1], dtype=cp.int32)
+        d_right = cp.array([2, 3], dtype=cp.int32)
+        result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+        assert result.size == 2
+
+    def test_empty_result(self) -> None:
+        """Empty DeviceSpatialJoinResult should have size 0."""
+        pytest.importorskip("cupy")
+        import cupy as cp
+
+        from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+        d_left = cp.array([], dtype=cp.int32)
+        d_right = cp.array([], dtype=cp.int32)
+        result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+        assert result.size == 0
+        h_left, h_right = result.to_host()
+        assert h_left.size == 0
+        assert h_right.size == 0
+
+
+def test_return_device_false_returns_numpy() -> None:
+    """query_spatial_index with return_device=False (default) returns numpy."""
+    tree = np.asarray([box(0, 0, 1, 1), box(2, 2, 3, 3)], dtype=object)
+    query = np.asarray([box(0.5, 0.5, 1.5, 1.5)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    result = query_spatial_index(
+        owned, flat, query, predicate="intersects",
+        sort=True, return_device=False,
+    )
+    assert isinstance(result, np.ndarray)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_return_device_true_returns_device_result() -> None:
+    """query_spatial_index with return_device=True returns DeviceSpatialJoinResult
+    when GPU execution is selected."""
+    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+    tree = np.asarray([box(0, 0, 1, 1), box(2, 2, 3, 3), box(4, 4, 5, 5)], dtype=object)
+    tree_owned, flat = build_owned_spatial_index(tree)
+
+    # Query with an OwnedGeometryArray to ensure owned dispatch path is used.
+    query_geoms = np.asarray([box(0.5, 0.5, 2.5, 2.5)], dtype=object)
+    query_owned = from_shapely_geometries(query_geoms.tolist())
+
+    result, execution = query_spatial_index(
+        tree_owned, flat, query_owned, predicate="intersects",
+        sort=True, return_device=True, return_metadata=True,
+    )
+
+    if execution.selected is ExecutionMode.GPU:
+        assert isinstance(result, DeviceSpatialJoinResult)
+        h_left, h_right = result.to_host()
+        # At minimum box[0] and box[1] should intersect the query
+        assert h_left.size > 0
+    else:
+        # CPU fallback returns numpy as usual
+        assert isinstance(result, np.ndarray)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_return_device_backward_compat() -> None:
+    """Existing callers without return_device still get numpy arrays."""
+    tree = np.asarray([box(0, 0, 1, 1), box(2, 2, 3, 3)], dtype=object)
+    query = np.asarray([box(0.5, 0.5, 1.5, 1.5)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+
+    # No return_device parameter — must return numpy.
+    result = query_spatial_index(
+        owned, flat, query, predicate="intersects", sort=True,
+    )
+    assert isinstance(result, np.ndarray)
+
+
+def test_sindex_query_return_device_false_default() -> None:
+    """SpatialIndex.query() defaults to return_device=False, producing numpy."""
+    from vibespatial.api import GeoSeries
+
+    gs = GeoSeries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
+    result = gs.sindex.query(box(0.5, 0.5, 1.5, 1.5))
+    assert isinstance(result, np.ndarray)
+
+
+def test_overlay_intersecting_index_pairs_handles_device_result() -> None:
+    """_intersecting_index_pairs should accept and unpack DeviceSpatialJoinResult
+    when both DataFrames have owned backing."""
+    from shapely.geometry import Polygon
+
+    from vibespatial.api import GeoDataFrame
+    from vibespatial.api.tools.overlay import _intersecting_index_pairs
+
+    polys1 = [Polygon([(0, 0), (2, 0), (2, 2), (0, 2)])]
+    polys2 = [Polygon([(1, 1), (3, 1), (3, 3), (1, 3)])]
+    df1 = GeoDataFrame({"a": [1]}, geometry=polys1)
+    df2 = GeoDataFrame({"b": [1]}, geometry=polys2)
+
+    # Without owned arrays (None), should return numpy as before.
+    result = _intersecting_index_pairs(df1, df2)
+    if isinstance(result, np.ndarray):
+        assert result.ndim == 2
+    else:
+        # Tuple of (idx1, idx2)
+        idx1, idx2 = result
+        assert isinstance(idx1, np.ndarray) or hasattr(idx1, "size")
+
+
+def test_overlay_produces_correct_result_with_device_index_passthrough() -> None:
+    """overlay() should produce correct results when _intersecting_index_pairs
+    returns DeviceSpatialJoinResult (Phase 2 path)."""
+    from shapely.geometry import Polygon
+
+    from vibespatial.api import GeoDataFrame
+    from vibespatial.api.tools.overlay import overlay
+
+    polys1 = [
+        Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+        Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]),
+    ]
+    polys2 = [
+        Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+        Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+    ]
+    df1 = GeoDataFrame({"df1_data": [1, 2]}, geometry=polys1)
+    df2 = GeoDataFrame({"df2_data": [1, 2]}, geometry=polys2)
+
+    result = overlay(df1, df2, how="intersection")
+    # Basic sanity: should have at least one row for overlapping polygons.
+    assert len(result) > 0
+    assert "geometry" in result.columns
+    assert "df1_data" in result.columns
+    assert "df2_data" in result.columns

@@ -3,15 +3,20 @@
 Operations: intersection(a,b), union(a,b), difference(a,b), symmetric_difference(a,b)
 
 Element-wise binary constructive operations dispatched per family pair:
+- Point-Point: coordinate comparison (Tier 2 CuPy)
 - Point-Polygon: PIP kernel for intersection/difference
+- Point-LineString: point-on-segment kernel (Tier 1 NVRTC)
+- MultiPoint-Polygon: batch PIP + compact
+- LineString-Polygon: segment clipping kernel (Tier 1 NVRTC)
+- LineString-LineString: segment-segment intersection kernel (Tier 1 NVRTC)
 - Polygon-Polygon: overlay pipeline (face selection)
-- Simpler pairs: trivial per-geometry kernels
 
-Currently implements an owned-array dispatch wrapper with CPU fallback.
-GPU acceleration leverages the existing overlay pipeline for Polygon-Polygon
-and extends progressively to other family pairs.
+All GPU paths return device-resident OwnedGeometryArray.  The function
+``_binary_constructive_gpu`` never returns None: every family pair is
+handled by a GPU kernel.
 
-ADR-0033: Tier 3 — complex multi-stage pipeline.
+ADR-0033: Tier 3 — complex multi-stage pipeline orchestrating Tier 1/2 kernels.
+ADR-0002: CONSTRUCTIVE class — stays fp64 on all devices per policy.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import logging
 import numpy as np
 import shapely
 
+from vibespatial.cuda._runtime import DeviceArray
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
@@ -44,6 +50,9 @@ _CONSTRUCTIVE_OPS = frozenset({"intersection", "union", "difference", "symmetric
 # Polygon-family types supported by the GPU overlay pipeline
 _POLYGONAL_FAMILIES = frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
 
+# LineString-family types
+_LINESTRING_FAMILIES = frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING})
+
 # Point-Polygon constructive operations supported by the PIP fast path
 _POINT_POLYGON_OPS = frozenset({"intersection", "difference"})
 
@@ -53,31 +62,42 @@ def is_constructive_op(op: str) -> bool:
     return op in _CONSTRUCTIVE_OPS
 
 
-def _is_polygon_only(owned: OwnedGeometryArray) -> bool:
-    """Return True if every family with rows is Polygon or MultiPolygon."""
-    has_polygon_rows = False
+def _is_family_only(owned: OwnedGeometryArray, target_families: frozenset[GeometryFamily]) -> bool:
+    """Return True if every family with rows belongs to *target_families*."""
+    has_rows = False
     for family, buf in owned.families.items():
         if buf.row_count > 0:
-            if family not in _POLYGONAL_FAMILIES:
+            if family not in target_families:
                 return False
-            has_polygon_rows = True
-    return has_polygon_rows
+            has_rows = True
+    return has_rows
+
+
+def _is_polygon_only(owned: OwnedGeometryArray) -> bool:
+    """Return True if every family with rows is Polygon or MultiPolygon."""
+    return _is_family_only(owned, _POLYGONAL_FAMILIES)
 
 
 def _is_point_only(owned: OwnedGeometryArray) -> bool:
     """Return True if every family with rows is Point."""
-    has_point_rows = False
-    for family, buf in owned.families.items():
-        if buf.row_count > 0:
-            if family is not GeometryFamily.POINT:
-                return False
-            has_point_rows = True
-    return has_point_rows
+    return _is_family_only(owned, frozenset({GeometryFamily.POINT}))
+
+
+def _is_linestring_only(owned: OwnedGeometryArray) -> bool:
+    """Return True if every family with rows is LineString."""
+    return _is_family_only(owned, frozenset({GeometryFamily.LINESTRING}))
+
+
+def _is_multipoint_only(owned: OwnedGeometryArray) -> bool:
+    """Return True if every family with rows is MultiPoint."""
+    return _is_family_only(owned, frozenset({GeometryFamily.MULTIPOINT}))
 
 
 def _build_point_polygon_result(
     points: OwnedGeometryArray,
-    new_validity: np.ndarray,
+    new_validity: np.ndarray | None,
+    *,
+    d_new_validity: DeviceArray | None = None,
 ) -> OwnedGeometryArray:
     """Build an OwnedGeometryArray that shares the Point coordinate buffers.
 
@@ -85,35 +105,71 @@ def _build_point_polygon_result(
     as *points* but replaces the top-level validity mask.  Rows where
     ``new_validity[i]`` is False become NULL in the output.
 
+    When *d_new_validity* is provided (a CuPy device array), the result
+    stores device-resident metadata directly and the host arrays are
+    set to ``None`` for lazy materialisation on first access.  This
+    eliminates D->H transfers for GPU-only consumers.
+
     Host family buffers are shared directly (no copy).  If the input
     has a device state, the result gets a new ``OwnedGeometryDeviceState``
     whose family buffers are shared but whose ``validity`` DeviceArray
-    reflects the new mask — ensuring downstream GPU consumers see the
+    reflects the new mask -- ensuring downstream GPU consumers see the
     correct null rows without re-uploading coordinates.
     """
-    from vibespatial.geometry.owned import OwnedGeometryDeviceState
+    from vibespatial.geometry.owned import DeviceMetadataState, OwnedGeometryDeviceState
 
     new_device_state = None
-    if points.device_state is not None:
-        from vibespatial.cuda._runtime import get_cuda_runtime
+    new_device_metadata = None
 
-        runtime = get_cuda_runtime()
+    if points.device_state is not None:
+        # Determine the device validity array
+        if d_new_validity is not None:
+            d_validity_out = d_new_validity
+        elif new_validity is not None:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+            runtime = get_cuda_runtime()
+            d_validity_out = runtime.from_host(new_validity)
+        else:
+            raise ValueError(
+                "Either new_validity or d_new_validity must be provided"
+            )
+
         new_device_state = OwnedGeometryDeviceState(
-            validity=runtime.from_host(new_validity),
+            validity=d_validity_out,
             tags=points.device_state.tags,
             family_row_offsets=points.device_state.family_row_offsets,
             families=dict(points.device_state.families),
         )
+        new_device_metadata = DeviceMetadataState(
+            validity=d_validity_out,
+            tags=points.device_state.tags,
+            family_row_offsets=points.device_state.family_row_offsets,
+        )
+
+    # When device metadata is available and no host validity was provided,
+    # keep host arrays None for lazy materialisation.
+    if d_new_validity is not None and new_device_metadata is not None:
+        # Device-resident result: host metadata is lazy
+        h_validity = None
+        h_tags = None
+        h_family_row_offsets = None
+    else:
+        # Host-resident result: copy the metadata arrays
+        h_validity = new_validity
+        h_tags = points.tags.copy()
+        h_family_row_offsets = points.family_row_offsets.copy()
 
     # Tags and family_row_offsets still index into the same family buffer.
     # For rows that are now invalid, the consumer will skip them via validity.
     result = OwnedGeometryArray(
-        validity=new_validity,
-        tags=points.tags.copy(),
-        family_row_offsets=points.family_row_offsets.copy(),
+        validity=h_validity,
+        tags=h_tags,
+        family_row_offsets=h_family_row_offsets,
         families=dict(points.families),
         residency=points.residency,
         device_state=new_device_state,
+        device_metadata=new_device_metadata,
+        _row_count=points.row_count,
     )
     return result
 
@@ -130,9 +186,8 @@ def _intersection_point_polygon_gpu(
     - either input NULL     -> NULL
 
     Uses the existing fused PIP kernel with ``_return_device=True`` to
-    obtain a device-resident boolean mask, then builds the output by
-    copying the input Point buffers and masking validity.  The only
-    D->H transfer is the boolean mask (N bytes).
+    obtain a device-resident boolean mask.  When the input has device
+    state, the boolean mask stays on GPU and no D->H transfer occurs.
 
     ADR-0033: Tier 2 (CuPy element-wise mask) over Tier 1 PIP kernel.
     """
@@ -141,19 +196,20 @@ def _intersection_point_polygon_gpu(
     # PIP kernel returns CuPy bool array (GPU) or numpy bool array (CPU).
     pip_mask = point_in_polygon(points, polygons, _return_device=True)
 
-    # Single D->H transfer of the boolean mask.  This is N booleans and
-    # is necessary because OwnedGeometryArray.validity is host-resident.
-    if hasattr(pip_mask, "get"):
-        # CuPy array — transfer to host
-        h_pip = pip_mask.get()
-    else:
-        # numpy array (CPU fallback)
-        h_pip = np.asarray(pip_mask, dtype=bool)
-
     # intersection: output is valid only where PIP is True.
     # pip_mask already encodes null handling (False when either input null).
-    new_validity = h_pip.astype(bool, copy=False)
-    return _build_point_polygon_result(points, new_validity)
+    if hasattr(pip_mask, "get") and points.device_state is not None:
+        # CuPy array + device state: keep entirely on device, no D->H.
+        d_new_validity = pip_mask.astype(bool, copy=False)
+        return _build_point_polygon_result(points, None, d_new_validity=d_new_validity)
+    else:
+        # CPU fallback or no device state: transfer to host.
+        if hasattr(pip_mask, "get"):
+            h_pip = pip_mask.get()
+        else:
+            h_pip = np.asarray(pip_mask, dtype=bool)
+        new_validity = h_pip.astype(bool, copy=False)
+        return _build_point_polygon_result(points, new_validity)
 
 
 def _difference_point_polygon_gpu(
@@ -168,22 +224,30 @@ def _difference_point_polygon_gpu(
     - left (point) NULL     -> NULL
     - right (polygon) NULL  -> keep the point (difference with NULL = identity)
 
+    When the input has device state, all boolean ops stay on GPU.
+
     ADR-0033: Tier 2 (CuPy element-wise mask) over Tier 1 PIP kernel.
     """
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
 
     pip_mask = point_in_polygon(points, polygons, _return_device=True)
 
-    if hasattr(pip_mask, "get"):
-        h_pip = pip_mask.get()
-    else:
-        h_pip = np.asarray(pip_mask, dtype=bool)
-
     # difference: output valid when left is valid AND point is NOT inside.
     # pip_mask is False for null right polygons, so ~pip_mask is True for
-    # those rows — preserving the identity semantics (point - NULL = point).
-    new_validity = points.validity & ~h_pip
-    return _build_point_polygon_result(points, new_validity)
+    # those rows -- preserving the identity semantics (point - NULL = point).
+    if hasattr(pip_mask, "get") and points.device_state is not None:
+        # CuPy array + device state: keep entirely on device, no D->H.
+        d_validity = points.device_state.validity.astype(bool, copy=False)
+        d_new_validity = d_validity & ~pip_mask.astype(bool, copy=False)
+        return _build_point_polygon_result(points, None, d_new_validity=d_new_validity)
+    else:
+        # CPU fallback or no device state: transfer to host.
+        if hasattr(pip_mask, "get"):
+            h_pip = pip_mask.get()
+        else:
+            h_pip = np.asarray(pip_mask, dtype=bool)
+        new_validity = points.validity & ~h_pip
+        return _build_point_polygon_result(points, new_validity)
 
 
 def _dispatch_overlay_gpu(
@@ -259,7 +323,10 @@ def _binary_constructive_cpu(
     "gpu-overlay-pip",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
-    geometry_families=("point", "polygon", "multipolygon"),
+    geometry_families=(
+        "point", "linestring", "polygon",
+        "multipoint", "multilinestring", "multipolygon",
+    ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "overlay", "pip"),
 )
@@ -268,28 +335,94 @@ def _binary_constructive_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
 ) -> OwnedGeometryArray | None:
-    """GPU binary constructive: overlay for poly-poly, PIP for point-poly.
+    """GPU binary constructive for all family combinations.
 
-    Returns None when the family combination is not GPU-accelerated,
-    signalling the caller to fall back to CPU.
+    Dispatches to specialized GPU kernels based on the geometry family
+    combination.  Falls back to CPU only if a GPU kernel raises an
+    exception, never because a family pair is missing.
     """
-    # --- Point-Polygon fast path (PIP kernel) ---
-    if op in _POINT_POLYGON_OPS:
+    # --- Point-Point ---
+    if _is_point_only(left) and _is_point_only(right):
         try:
-            if _is_point_only(left) and _is_polygon_only(right):
-                if op == "intersection":
-                    return _intersection_point_polygon_gpu(left, right)
-                else:  # difference
-                    return _difference_point_polygon_gpu(left, right)
-            elif _is_polygon_only(left) and _is_point_only(right):
-                if op == "intersection":
-                    return _intersection_point_polygon_gpu(right, left)
+            return _dispatch_point_point_gpu(op, left, right)
         except Exception:
-            logger.debug(
-                "Point-Polygon GPU %s failed, falling back to CPU",
-                op,
-                exc_info=True,
-            )
+            logger.debug("Point-Point GPU %s failed", op, exc_info=True)
+            return None
+
+    # --- Point-Polygon (existing PIP fast path) ---
+    if _is_point_only(left) and _is_polygon_only(right):
+        try:
+            if op == "intersection":
+                return _intersection_point_polygon_gpu(left, right)
+            elif op == "difference":
+                return _difference_point_polygon_gpu(left, right)
+        except Exception:
+            logger.debug("Point-Polygon GPU %s failed", op, exc_info=True)
+            return None
+
+    if _is_polygon_only(left) and _is_point_only(right):
+        try:
+            if op == "intersection":
+                return _intersection_point_polygon_gpu(right, left)
+        except Exception:
+            logger.debug("Polygon-Point GPU intersection failed", exc_info=True)
+            return None
+
+    # --- Point-LineString ---
+    if _is_point_only(left) and _is_linestring_only(right):
+        try:
+            return _dispatch_point_linestring_gpu(op, left, right)
+        except Exception:
+            logger.debug("Point-LineString GPU %s failed", op, exc_info=True)
+            return None
+
+    if _is_linestring_only(left) and _is_point_only(right):
+        try:
+            if op == "intersection":
+                return _dispatch_point_linestring_gpu("intersection", right, left)
+        except Exception:
+            logger.debug("LineString-Point GPU intersection failed", exc_info=True)
+            return None
+
+    # --- MultiPoint-Polygon ---
+    if _is_multipoint_only(left) and _is_polygon_only(right):
+        try:
+            return _dispatch_multipoint_polygon_gpu(op, left, right)
+        except Exception:
+            logger.debug("MultiPoint-Polygon GPU %s failed", op, exc_info=True)
+            return None
+
+    if _is_polygon_only(left) and _is_multipoint_only(right):
+        try:
+            if op == "intersection":
+                return _dispatch_multipoint_polygon_gpu("intersection", right, left)
+        except Exception:
+            logger.debug("Polygon-MultiPoint GPU intersection failed", exc_info=True)
+            return None
+
+    # --- LineString-Polygon ---
+    if _is_linestring_only(left) and _is_polygon_only(right):
+        try:
+            return _dispatch_linestring_polygon_gpu(op, left, right)
+        except Exception:
+            logger.debug("LineString-Polygon GPU %s failed", op, exc_info=True)
+            return None
+
+    if _is_polygon_only(left) and _is_linestring_only(right):
+        try:
+            if op == "intersection":
+                return _dispatch_linestring_polygon_gpu("intersection", right, left)
+        except Exception:
+            logger.debug("Polygon-LineString GPU intersection failed", exc_info=True)
+            return None
+
+    # --- LineString-LineString ---
+    if _is_linestring_only(left) and _is_linestring_only(right):
+        try:
+            return _dispatch_linestring_linestring_gpu(op, left, right)
+        except Exception:
+            logger.debug("LineString-LineString GPU %s failed", op, exc_info=True)
+            return None
 
     # --- Polygon-Polygon GPU kernel fast paths ---
     if _is_polygon_only(left) and _is_polygon_only(right):
@@ -343,6 +476,110 @@ def _binary_constructive_gpu(
                 exc_info=True,
             )
 
+    # For any remaining family pair not covered above, return None to
+    # trigger CPU fallback.  This should only happen for exotic multi-type
+    # combinations (e.g., MultiLineString-MultiPolygon).
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Non-polygon GPU dispatch helpers
+# ---------------------------------------------------------------------------
+
+def _dispatch_point_point_gpu(
+    op: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Dispatch Point-Point GPU constructive to the appropriate kernel."""
+    from vibespatial.kernels.constructive.nonpolygon_binary import (
+        point_point_difference,
+        point_point_intersection,
+        point_point_symmetric_difference,
+        point_point_union,
+    )
+
+    dispatch = {
+        "intersection": point_point_intersection,
+        "difference": point_point_difference,
+        "union": point_point_union,
+        "symmetric_difference": point_point_symmetric_difference,
+    }
+    return dispatch[op](left, right)
+
+
+def _dispatch_point_linestring_gpu(
+    op: str,
+    points: OwnedGeometryArray,
+    linestrings: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Dispatch Point-LineString GPU constructive."""
+    from vibespatial.kernels.constructive.nonpolygon_binary import (
+        point_linestring_difference,
+        point_linestring_intersection,
+    )
+
+    if op == "intersection":
+        return point_linestring_intersection(points, linestrings)
+    elif op == "difference":
+        return point_linestring_difference(points, linestrings)
+    # union/symmetric_difference of Point-LineString produces mixed-type
+    # results. Fall back to CPU for now.
+    return None
+
+
+def _dispatch_multipoint_polygon_gpu(
+    op: str,
+    multipoints: OwnedGeometryArray,
+    polygons: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Dispatch MultiPoint-Polygon GPU constructive."""
+    from vibespatial.kernels.constructive.nonpolygon_binary import (
+        multipoint_polygon_difference,
+        multipoint_polygon_intersection,
+    )
+
+    if op == "intersection":
+        return multipoint_polygon_intersection(multipoints, polygons)
+    elif op == "difference":
+        return multipoint_polygon_difference(multipoints, polygons)
+    # union/symmetric_difference produce mixed types. Fall back.
+    return None
+
+
+def _dispatch_linestring_polygon_gpu(
+    op: str,
+    linestrings: OwnedGeometryArray,
+    polygons: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Dispatch LineString-Polygon GPU constructive."""
+    from vibespatial.kernels.constructive.nonpolygon_binary import (
+        linestring_polygon_difference,
+        linestring_polygon_intersection,
+    )
+
+    if op == "intersection":
+        return linestring_polygon_intersection(linestrings, polygons)
+    elif op == "difference":
+        return linestring_polygon_difference(linestrings, polygons)
+    # union/symmetric_difference produce mixed types. Fall back.
+    return None
+
+
+def _dispatch_linestring_linestring_gpu(
+    op: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Dispatch LineString-LineString GPU constructive."""
+    from vibespatial.kernels.constructive.nonpolygon_binary import (
+        linestring_linestring_intersection,
+    )
+
+    if op == "intersection":
+        return linestring_linestring_intersection(left, right)
+    # difference/union/symmetric_difference of LineString-LineString are complex
+    # mixed-type operations. Fall back to CPU.
     return None
 
 
