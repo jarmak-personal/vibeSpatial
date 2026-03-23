@@ -187,52 +187,38 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     used_owned = False
     result_geoms = None
 
-    # Owned-path dispatch: selective right materialization + GPU difference
-    # via binary_constructive_owned when both DataFrames have owned backing.
+    # Owned-path dispatch: GPU segmented union + GPU difference when both
+    # DataFrames have owned backing.  Avoids Shapely materialization for
+    # the union step when the segmented_union_all GPU kernel is available.
     if idx1.size > 0 and left_owned is not None and right_owned is not None:
         try:
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
-            from vibespatial.geometry.owned import from_shapely_geometries
-
-            # Selective right materialization: only unique participating rows.
-            # right_owned.take() operates at buffer level -- no Shapely.
-            unique_right = np.unique(idx2)
-            right_sub = right_owned.take(unique_right)
-            right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
-
-            # Remap idx2 from original to subset space.
-            right_remap = np.empty(right_owned.row_count, dtype=np.intp)
-            right_remap[unique_right] = np.arange(len(unique_right))
-
-            # Grouped union of right neighbors per left geometry.
-            # O(N log N) grouping via np.split.
-            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
-            idx2_groups = np.split(idx2, idx1_split_at[1:])
-
-            right_union_list = []
-            for _left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
-                remapped = right_remap[neighbors_idx]
-                neighbors = right_shapely[remapped]
-                if len(neighbors) == 1:
-                    right_union_list.append(neighbors[0])
-                else:
-                    right_union_list.append(shapely.union_all(neighbors))
-
-            # Binary difference via owned dispatch (GPU when available).
-            left_sub = left_owned.take(idx1_unique)
-            right_union_owned = from_shapely_geometries(right_union_list)
-            # Force CPU dispatch: right_union_owned is host-materialized
-            # from shapely.union_all, so GPU upload would be gratuitous.
-            diff_owned = binary_constructive_owned(
-                "difference", left_sub, right_union_owned,
-                dispatch_mode=ExecutionMode.CPU,
+            from vibespatial.kernels.constructive.segmented_union import (
+                segmented_union_all,
             )
 
-            # Assemble full result: unchanged left rows read from the
-            # GeoDataFrame (already host-side Shapely), differenced rows
-            # materialized from the GPU result only.
+            # Gather right geometries at all neighbor indices (buffer-level).
+            right_gathered = right_owned.take(idx2)
+
+            # Build group offsets from the sorted idx1 split points.
+            idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
+            group_offsets = np.concatenate([idx1_split_at, [len(idx2)]])
+
+            # GPU segmented union: one union per left geometry's neighbors.
+            right_unions_owned = segmented_union_all(
+                right_gathered, group_offsets,
+            )
+
+            # GPU difference: left[unique] - union(right_neighbors[unique]).
+            left_sub = left_owned.take(idx1_unique)
+            diff_owned = binary_constructive_owned(
+                "difference", left_sub, right_unions_owned,
+            )
+
+            # Assemble full result: unchanged left rows from GeoDataFrame,
+            # differenced rows materialized from owned result.
             diff_shapely = diff_owned.to_shapely()
             result_geoms = np.asarray(df1.geometry, dtype=object).copy()
             for i, pos in enumerate(idx1_unique):

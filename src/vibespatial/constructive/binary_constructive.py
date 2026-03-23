@@ -291,8 +291,41 @@ def _binary_constructive_gpu(
                 exc_info=True,
             )
 
-    # --- Polygon-Polygon overlay path ---
+    # --- Polygon-Polygon GPU kernel fast paths ---
     if _is_polygon_only(left) and _is_polygon_only(right):
+        # Try direct GPU kernels first (faster than full overlay pipeline
+        # for element-wise ops: no topology graph construction needed).
+        if op == "intersection":
+            try:
+                from vibespatial.kernels.constructive.polygon_intersection import (
+                    polygon_intersection,
+                )
+
+                result = polygon_intersection(left, right)
+                if result.row_count == left.row_count:
+                    return result
+            except Exception:
+                logger.debug(
+                    "polygon_intersection GPU kernel failed, trying overlay pipeline",
+                    exc_info=True,
+                )
+        elif op == "difference":
+            try:
+                from vibespatial.kernels.constructive.polygon_difference import (
+                    polygon_difference,
+                )
+
+                result = polygon_difference(left, right)
+                if result.row_count == left.row_count:
+                    return result
+            except Exception:
+                logger.debug(
+                    "polygon_difference GPU kernel failed, trying overlay pipeline",
+                    exc_info=True,
+                )
+
+        # Fall through to the general overlay pipeline for union,
+        # symmetric_difference, or when direct kernels fail.
         try:
             result = _dispatch_overlay_gpu(op, left, right)
             if result.row_count == left.row_count:

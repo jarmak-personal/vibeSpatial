@@ -153,5 +153,43 @@
       "gpu-cuda-python",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "polygon_difference",
+    "module": "vibespatial.kernels.constructive",
+    "tier": 3,
+    "variants": [
+      "gpu-overlay",
+      "cpu"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon"
+    ],
+    "kernel": "polygon_intersection",
+    "module": "vibespatial.kernels.constructive.polygon_intersection",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python",
+      "cpu"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "segmented_union_all",
+    "module": "vibespatial.kernels.constructive.segmented_union",
+    "tier": 3,
+    "variants": [
+      "gpu-overlay-tree-reduce",
+      "cpu"
+    ]
   }
 ]
