@@ -32,7 +32,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 _NORMALIZE_GPU_THRESHOLD = 500
 
@@ -192,6 +192,7 @@ def normalize_owned(
     owned: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> OwnedGeometryArray:
     """Normalize geometries to canonical form.
 
@@ -212,7 +213,7 @@ def normalize_owned(
 
     if selection.selected is ExecutionMode.GPU and row_count >= _NORMALIZE_GPU_THRESHOLD:
         try:
-            result = _normalize_gpu(owned)
+            result = _normalize_gpu(owned, precision=precision)
             if result is not None:
                 record_dispatch_event(
                     surface="normalize",
@@ -265,10 +266,14 @@ def _normalize_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     min_rows=_NORMALIZE_GPU_THRESHOLD,
     tags=("cuda-python", "ring-rotation", "linestring-reversal"),
 )
-def _normalize_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray | None:
+def _normalize_gpu(
+    owned: OwnedGeometryArray,
+    *,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray | None:
     """GPU path: NVRTC ring rotation + linestring reversal."""
     from vibespatial.runtime import RuntimeSelection, has_gpu_runtime
-    from vibespatial.runtime.precision import CoordinateStats, PrecisionMode, select_precision_plan
+    from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
 
     if not has_gpu_runtime():
         return None
@@ -291,7 +296,7 @@ def _normalize_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray | None:
     precision_plan = select_precision_plan(
         runtime_selection=runtime_sel,
         kernel_class=KernelClass.COARSE,
-        requested=PrecisionMode.AUTO,
+        requested=precision,
         coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
     )
     compute_type = "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"

@@ -489,8 +489,9 @@ class DeviceGeometryArray(ExtensionArray):
         return union_all_gpu(self._owned, grid_size=grid_size)
 
     def buffer(self, distance, resolution=16, **kwargs):
-        """Buffer — routes through owned dispatch with GPU kernel when possible."""
-        from vibespatial.constructive.stroke import evaluate_geopandas_buffer
+        """Buffer -- routes through owned dispatch with GPU kernel when possible."""
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.dispatch import record_dispatch_event
 
         self.check_geographic_crs(stacklevel=5)
         if isinstance(distance, pd.Series):
@@ -501,34 +502,120 @@ class DeviceGeometryArray(ExtensionArray):
         mitre_limit = float(kwargs.get("mitre_limit", 5.0))
         single_sided = bool(kwargs.get("single_sided", False))
 
-        buffer_result, selected = evaluate_geopandas_buffer(
-            self._ensure_shapely_cache(),
-            distance,
-            quad_segs=resolution,
-            cap_style=cap_style,
-            join_style=join_style,
-            mitre_limit=mitre_limit,
-            single_sided=single_sided,
-            prebuilt_owned=self._owned,
-        )
-        if buffer_result is not None:
-            if isinstance(buffer_result, OwnedGeometryArray):
-                return DeviceGeometryArray._from_owned(buffer_result, crs=self._crs)
-            new_owned = from_shapely_geometries(
-                np.asarray(buffer_result, dtype=object).tolist()
-            )
-            return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        # Route via owned metadata -- no Shapely materialization for classification
+        owned = self._owned
+        families = set(owned.families.keys())
+        all_valid = bool(np.all(owned.validity))
 
-        # Shapely fallback
+        if len(families) == 1 and all_valid and not single_sided:
+            family = next(iter(families))
+            buf = owned.families[family]
+            # Guard against device-resident stubs where empty_mask is zero-length
+            if not buf.host_materialized:
+                has_empties = True  # conservative: can't trust stub metadata
+            else:
+                has_empties = bool(np.any(buf.empty_mask))
+
+            if (
+                family is GeometryFamily.POINT
+                and not has_empties
+                and cap_style == "round"
+                and join_style == "round"
+            ):
+                from vibespatial.constructive.point import point_buffer_owned_array
+
+                try:
+                    result = point_buffer_owned_array(
+                        owned, distance, quad_segs=resolution,
+                    )
+                    record_dispatch_event(
+                        surface="DeviceGeometryArray.buffer",
+                        operation="buffer",
+                        implementation="point_buffer_owned_array",
+                        reason="DGA direct point buffer dispatch",
+                        detail=f"rows={len(self)}, family=point",
+                        selected=ExecutionMode.GPU,
+                    )
+                    return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                except Exception as exc:
+                    owned._record(
+                        DiagnosticKind.FALLBACK,
+                        f"DeviceGeometryArray.buffer: GPU point kernel failed: {exc!r}",
+                        visible=True,
+                    )
+
+            elif family is GeometryFamily.LINESTRING and not has_empties:
+                from vibespatial.constructive.linestring import linestring_buffer_owned_array
+
+                try:
+                    result = linestring_buffer_owned_array(
+                        owned, distance,
+                        quad_segs=resolution,
+                        cap_style=cap_style,
+                        join_style=join_style,
+                        mitre_limit=mitre_limit,
+                    )
+                    record_dispatch_event(
+                        surface="DeviceGeometryArray.buffer",
+                        operation="buffer",
+                        implementation="linestring_buffer_owned_array",
+                        reason="DGA direct linestring buffer dispatch",
+                        detail=f"rows={len(self)}, family=linestring",
+                        selected=ExecutionMode.GPU,
+                    )
+                    return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                except Exception as exc:
+                    owned._record(
+                        DiagnosticKind.FALLBACK,
+                        f"DeviceGeometryArray.buffer: GPU linestring kernel failed: {exc!r}",
+                        visible=True,
+                    )
+
+            elif family is GeometryFamily.POLYGON and not has_empties:
+                from vibespatial.constructive.polygon import polygon_buffer_owned_array
+
+                try:
+                    result = polygon_buffer_owned_array(
+                        owned, distance,
+                        quad_segs=resolution,
+                        join_style=join_style,
+                        mitre_limit=mitre_limit,
+                    )
+                    record_dispatch_event(
+                        surface="DeviceGeometryArray.buffer",
+                        operation="buffer",
+                        implementation="polygon_buffer_owned_array",
+                        reason="DGA direct polygon buffer dispatch",
+                        detail=f"rows={len(self)}, family=polygon",
+                        selected=ExecutionMode.GPU,
+                    )
+                    return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                except Exception as exc:
+                    owned._record(
+                        DiagnosticKind.FALLBACK,
+                        f"DeviceGeometryArray.buffer: GPU polygon kernel failed: {exc!r}",
+                        visible=True,
+                    )
+
+        # Shapely fallback for mixed families, nulls, empties, or unsupported params
         import shapely
 
-        self._owned._record(
+        owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.buffer: Shapely fallback",
             visible=True,
         )
+        shapely_geoms = self._owned.to_shapely()
         result = shapely.buffer(
-            self._ensure_shapely_cache(), distance, quad_segs=resolution, **kwargs
+            shapely_geoms, distance, quad_segs=resolution, **kwargs
+        )
+        record_dispatch_event(
+            surface="DeviceGeometryArray.buffer",
+            operation="buffer",
+            implementation="shapely_fallback",
+            reason="DGA buffer: mixed families, nulls, empties, or unsupported params",
+            detail=f"rows={len(self)}",
+            selected=ExecutionMode.CPU,
         )
         new_owned = from_shapely_geometries(result.tolist())
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
@@ -540,42 +627,76 @@ class DeviceGeometryArray(ExtensionArray):
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs
         )
 
-    def normalize(self):
+    def normalize(self, precision="auto"):
         from vibespatial.constructive.normalize import normalize_owned
 
-        result = normalize_owned(self._owned)
+        result = normalize_owned(self._owned, precision=precision)
         return DeviceGeometryArray._from_owned(result, crs=self._crs)
 
     def offset_curve(self, distance, quad_segs=8, join_style="round", mitre_limit=5.0):
-        from vibespatial.constructive.stroke import evaluate_geopandas_offset_curve
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.dispatch import record_dispatch_event
 
-        result, selected = evaluate_geopandas_offset_curve(
-            self._ensure_shapely_cache(),
-            distance,
-            quad_segs=quad_segs,
-            join_style=join_style,
-            mitre_limit=mitre_limit,
+        owned = self._owned
+
+        # Check eligibility from owned metadata: linestring-only + non-round join
+        families = set(owned.families.keys())
+        is_eligible = (
+            join_style != "round"
+            and len(families) == 1
+            and GeometryFamily.LINESTRING in families
         )
-        if result is not None:
-            new_owned = from_shapely_geometries(
-                np.asarray(result, dtype=object).tolist()
+
+        # Materialize once -- reuse in both eligible and fallback paths
+        owned._record(
+            DiagnosticKind.MATERIALIZATION,
+            "DeviceGeometryArray.offset_curve: Shapely materialization",
+            visible=True,
+        )
+        shapely_geoms = owned.to_shapely()
+
+        if is_eligible:
+            from vibespatial.constructive.stroke import offset_curve_owned
+
+            shapely_values = np.empty(len(self), dtype=object)
+            shapely_values[:] = shapely_geoms
+            result = offset_curve_owned(
+                shapely_values,
+                distance,
+                quad_segs=quad_segs,
+                join_style=join_style,
+                mitre_limit=mitre_limit,
             )
-            return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+            if result.fallback_rows.size == 0:
+                new_owned = from_shapely_geometries(
+                    np.asarray(result.geometries, dtype=object).tolist()
+                )
+                record_dispatch_event(
+                    surface="DeviceGeometryArray.offset_curve",
+                    operation="offset_curve",
+                    implementation="offset_curve_owned",
+                    reason="DGA offset_curve owned kernel (linestring, non-round join)",
+                    detail=f"rows={len(self)}, join_style={join_style}",
+                )
+                return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
         # Shapely fallback
         import shapely
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.offset_curve: Shapely fallback",
-            visible=True,
-        )
         fallback = shapely.offset_curve(
-            self._ensure_shapely_cache(),
+            shapely_geoms,
             distance,
             quad_segs=quad_segs,
             join_style=join_style,
             mitre_limit=mitre_limit,
+        )
+        record_dispatch_event(
+            surface="DeviceGeometryArray.offset_curve",
+            operation="offset_curve",
+            implementation="shapely_fallback",
+            reason="DGA offset_curve: ineligible for owned kernel or kernel had fallback rows",
+            detail=f"rows={len(self)}, join_style={join_style}",
+            selected=ExecutionMode.CPU,
         )
         new_owned = from_shapely_geometries(
             np.asarray(fallback, dtype=object).tolist()

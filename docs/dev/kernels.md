@@ -16,6 +16,7 @@ is an NVRTC source compiled at runtime.
 | Binary constructive | `constructive/binary_constructive.py` | Intersection, union, difference, symmetric difference (PIP + overlay dispatch) |
 | Envelope | `constructive/envelope.py` | Bounding-box polygon (5-vertex closed ring) |
 | Exterior ring | `constructive/exterior.py` | Polygon exterior ring extraction (LineString output) |
+| Normalize | `constructive/normalize.py` | Ring rotation (lex-min vertex), linestring reversal, multi-part sorting |
 | Simplify | `constructive/simplify.py` | Visvalingam-Whyatt vertex elimination |
 | Validity / Simplicity | `constructive/validity.py` | is_valid (ring closure, min coords, orientation), is_simple (self-intersection) |
 

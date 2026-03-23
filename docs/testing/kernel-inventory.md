@@ -5,7 +5,7 @@ Scope: Scaffolded kernel inventory, benchmark stubs, and generated test surfaces
 Read If: You are generating, reviewing, or extending owned kernel scaffolds.
 STOP IF: You already have the target kernel module and generated files open.
 Source Of Truth: Kernel scaffold inventory and generated surface map for repo-owned kernels.
-Body Budget: 41/220 lines
+Body Budget: 42/220 lines
 Document: docs/testing/kernel-inventory.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 15-20 | Open First |
 | 21-25 | Verify |
 | 26-30 | Risks |
-| 31-41 | Scaffolds |
+| 31-42 | Scaffolds |
 DOC_HEADER:END -->
 
 Generated kernel scaffolds land here first so agents can audit what exists and which tier gate applies.
@@ -59,3 +59,4 @@ Track scaffolded kernel modules, tests, and benchmark stubs.
 | `envelope` | `vibespatial.constructive.envelope` | Tier 1 | `point, multipoint, linestring, multilinestring, polygon, multipolygon` | `src/vibespatial/constructive/envelope.py` | `tests/test_envelope.py` | `vsbench run constructive` |
 | `geometry_simplify` | `vibespatial.constructive.simplify` | Tier 1 | `linestring, multilinestring, polygon, multipolygon` | `src/vibespatial/constructive/simplify.py` | `tests/test_zero_copy_pipeline.py` | `vsbench run constructive` |
 | `make_valid` | `vibespatial.constructive.make_valid_pipeline` | Tier 3 | `polygon, multipolygon, linestring, multilinestring, point, multipoint` | `src/vibespatial/constructive/make_valid_pipeline.py` | `tests/test_make_valid_pipeline.py` | `vsbench run constructive` |
+| `normalize` | `vibespatial.constructive.normalize` | Tier 1 | `point, multipoint, linestring, multilinestring, polygon, multipolygon` | `src/vibespatial/constructive/normalize.py` | `tests/test_normalize.py` | `vsbench run constructive` |
