@@ -781,6 +781,121 @@ assign_holes_to_exteriors(
   }
   out_exterior_id[r] = best_exterior;
 }
+
+// Count containment depth for boundary rings (positive area).
+// For each boundary ring r, count how many OTHER boundary rings from
+// the SAME source row with strictly larger area contain r's centroid.
+// Even depth → true exterior, odd depth → nested interior.
+// out_depth[r] is written for ALL boundary_count rings; callers
+// inspect it only for positive-area boundary rings.
+extern "C" __global__ void __launch_bounds__(256, 4)
+count_boundary_nesting_depth(
+    const double* __restrict__ centroid_x,
+    const double* __restrict__ centroid_y,
+    const double* __restrict__ ring_area,
+    const int* __restrict__ source_rows,
+    const int* __restrict__ coord_offsets,
+    const int* __restrict__ edge_counts,
+    const double* __restrict__ all_x,
+    const double* __restrict__ all_y,
+    int* __restrict__ out_depth,
+    int boundary_count
+) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= boundary_count) return;
+
+  const double area_r = ring_area[r];
+  if (area_r <= 0.0) {
+    out_depth[r] = 0;
+    return;
+  }
+  const double px = centroid_x[r];
+  const double py = centroid_y[r];
+  const int row_r = source_rows[r];
+  int depth = 0;
+
+  for (int c = 0; c < boundary_count; ++c) {
+    if (c == r) continue;
+    const double area_c = ring_area[c];
+    if (area_c <= area_r) continue;          // only larger rings
+    if (source_rows[c] != row_r) continue;   // same source row
+
+    // PIP test: does ring c contain (px, py)?
+    const int cs = coord_offsets[c];
+    const int n = edge_counts[c] + 1;  // +1 for closure
+    bool inside = false;
+    for (int k = 1; k < n; ++k) {
+      const double ax = all_x[cs + k - 1];
+      const double ay = all_y[cs + k - 1];
+      const double bx = all_x[cs + k];
+      const double by = all_y[cs + k];
+      if (((ay > py) != (by > py)) &&
+          (px < (((bx - ax) * (py - ay)) / (by - ay + 0.0)) + ax))
+        inside = !inside;
+    }
+    if (inside) depth += 1;
+  }
+  out_depth[r] = depth;
+}
+
+// Count nesting depth among sibling holes assigned to the same exterior.
+// For each ring r that has been assigned to an exterior (exterior_id[r] >= 0
+// and exterior_id[r] != r), count how many other rings sharing the same
+// exterior with strictly larger |area| contain r's centroid.
+// Even local depth → direct hole; odd → nested inside another hole (skip).
+extern "C" __global__ void __launch_bounds__(256, 4)
+count_sibling_hole_depth(
+    const double* __restrict__ centroid_x,
+    const double* __restrict__ centroid_y,
+    const double* __restrict__ ring_area,
+    const int* __restrict__ exterior_id,
+    const int* __restrict__ coord_offsets,
+    const int* __restrict__ edge_counts,
+    const double* __restrict__ all_x,
+    const double* __restrict__ all_y,
+    int* __restrict__ out_depth,
+    int ring_count
+) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= ring_count) return;
+
+  const int ext_r = exterior_id[r];
+  // Not a hole: either unassigned or self-assigned (exterior)
+  if (ext_r < 0 || ext_r == r) {
+    out_depth[r] = 0;
+    return;
+  }
+
+  const double px = centroid_x[r];
+  const double py = centroid_y[r];
+  const double abs_area_r = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
+  int depth = 0;
+
+  for (int c = 0; c < ring_count; ++c) {
+    if (c == r) continue;
+    if (exterior_id[c] != ext_r) continue;  // same exterior
+    if (exterior_id[c] == c) continue;       // c is the exterior itself
+    // c must have strictly larger |area|
+    const double abs_area_c = ring_area[c] < 0.0 ? -ring_area[c] : ring_area[c];
+    if (abs_area_c <= abs_area_r) continue;
+
+    // PIP test: does ring c contain (px, py)?
+    const int cs = coord_offsets[c];
+    const int n = edge_counts[c] + 1;  // +1 for closure
+    bool inside = false;
+    for (int k = 1; k < n; ++k) {
+      const double ax = all_x[cs + k - 1];
+      const double ay = all_y[cs + k - 1];
+      const double bx = all_x[cs + k];
+      const double by = all_y[cs + k];
+      if (((ay > py) != (by > py)) &&
+          (px < (((bx - ax) * (py - ay)) / (by - ay + 0.0)) + ax))
+        inside = !inside;
+    }
+    if (inside) depth += 1;
+  }
+  out_depth[r] = depth;
+}
 """
 
 _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
@@ -788,6 +903,8 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
     "compute_boundary_next",
     "scatter_ring_coordinates",
     "assign_holes_to_exteriors",
+    "count_boundary_nesting_depth",
+    "count_sibling_hole_depth",
 )
 
 
@@ -1786,10 +1903,11 @@ def _build_polygon_output_from_faces_gpu(
         d_all_cy = cp.concatenate((d_ring_centroid_y, _d_hole_cy))
         d_all_x = cp.concatenate((d_out_x, d_hole_compact_x))
         d_all_y = cp.concatenate((d_out_y, d_hole_compact_y))
-        # Merged coordinate offsets: boundary offsets + compact hole offsets shifted
-        # boundary_total was already extracted in the batched scalar read at Step 6
+        # Merged coordinate offsets: boundary offsets + compact hole offsets shifted.
+        # boundary_total was already extracted in the batched scalar read at Step 6.
+        # Include ALL hole offsets (not [1:]) so every ring has a valid entry.
         d_hole_offsets_shifted = d_hole_offsets_compact + boundary_total
-        d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted[1:]))
+        d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted))
         d_all_edge_counts = cp.concatenate((d_ring_edge_counts, d_hole_edge_counts))
     else:
         n_holes = 0
@@ -1803,11 +1921,53 @@ def _build_polygon_output_from_faces_gpu(
 
     total_ring_count = boundary_ring_count + n_holes
 
-    # Exterior mask: boundary rings with positive area (Tier 2: CuPy)
-    d_is_boundary = cp.zeros(total_ring_count, dtype=cp.bool_)
-    d_is_boundary[:boundary_ring_count] = True
-    d_exterior_mask = d_is_boundary & (d_all_area > 0.0)
-    d_exterior_indices = cp.flatnonzero(d_exterior_mask).astype(cp.int32)
+    # --- Source rows for ALL rings on device ---
+    # Boundary rings: from cycle walk; holes: inherit from exterior later.
+    d_all_source_rows = cp.full(total_ring_count, -1, dtype=cp.int32)
+    d_all_source_rows[:boundary_ring_count] = d_cycle_source_rows
+
+    # --- Step 8b: GPU nesting depth for boundary rings ---
+    # Boundary rings with positive area might be nested inside other
+    # positive-area boundary rings from the same source row. Count
+    # containment depth: even → true exterior, odd → nested interior.
+    d_is_boundary_flag = cp.zeros(total_ring_count, dtype=cp.bool_)
+    d_is_boundary_flag[:boundary_ring_count] = True
+    d_pos_area_boundary = d_is_boundary_flag & (d_all_area > 0.0)
+    n_pos_boundary = int(cp.sum(d_pos_area_boundary))
+
+    if n_pos_boundary > 1:
+        # Launch nesting depth kernel only when there are multiple
+        # positive-area boundary rings (single ring is trivially exterior)
+        d_boundary_depth = cp.zeros(boundary_ring_count, dtype=cp.int32)
+        boundary_depth_grid = (max(1, (boundary_ring_count + 255) // 256), 1, 1)
+        runtime.launch(
+            kernels["count_boundary_nesting_depth"],
+            grid=boundary_depth_grid, block=block,
+            params=(
+                (ptr(d_all_cx), ptr(d_all_cy), ptr(d_all_area),
+                 ptr(d_all_source_rows), ptr(d_all_coord_offsets),
+                 ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
+                 ptr(d_boundary_depth), boundary_ring_count),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            ),
+        )
+        # True exteriors: positive area + even nesting depth
+        d_even_depth = (d_boundary_depth % 2) == 0
+        d_exterior_mask = (d_all_area[:boundary_ring_count] > 0.0) & d_even_depth
+        # Extend to full ring array (hole rings are never exteriors)
+        d_exterior_mask_full = cp.zeros(total_ring_count, dtype=cp.bool_)
+        d_exterior_mask_full[:boundary_ring_count] = d_exterior_mask
+    else:
+        # Single or zero positive-area boundary rings: no nesting possible
+        d_exterior_mask_full = cp.zeros(total_ring_count, dtype=cp.bool_)
+        d_exterior_mask_full[:boundary_ring_count] = (
+            d_all_area[:boundary_ring_count] > 0.0
+        )
+
+    d_exterior_indices = cp.flatnonzero(d_exterior_mask_full).astype(cp.int32)
     exterior_count = int(d_exterior_indices.size)
 
     if exterior_count == 0:
@@ -1833,63 +1993,146 @@ def _build_polygon_output_from_faces_gpu(
         ),
     )
 
-    # --- Step 10: Build output from GPU assignment results ---
-    # Transfer assignment results and coordinates to host for GeoArrow assembly.
+    # --- Step 9b: GPU sibling hole nesting depth ---
+    # For each hole assigned to an exterior, count how many sibling holes
+    # (same exterior, larger |area|) contain its centroid. Even local
+    # depth → valid direct hole; odd → nested inside another hole (skip).
+    d_sibling_depth = cp.zeros(total_ring_count, dtype=cp.int32)
+
+    # Check if there are any holes assigned
+    d_is_hole = (d_exterior_id >= 0) & (d_exterior_id != cp.arange(total_ring_count, dtype=cp.int32))
+    n_assigned_holes = int(cp.sum(d_is_hole))
+
+    if n_assigned_holes > 1:
+        runtime.launch(
+            kernels["count_sibling_hole_depth"],
+            grid=ring_grid_all, block=block,
+            params=(
+                (ptr(d_all_cx), ptr(d_all_cy), ptr(d_all_area),
+                 ptr(d_exterior_id), ptr(d_all_coord_offsets),
+                 ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
+                 ptr(d_sibling_depth), total_ring_count),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            ),
+        )
+
+    # --- Step 10: GPU output assembly ---
+    # Build GeoArrow-format polygon output entirely on device.
+    # Valid holes: assigned to an exterior AND even sibling depth.
+    d_valid_hole_mask = d_is_hole & ((d_sibling_depth % 2) == 0)
+
+    # Also filter: only keep holes whose assigned exterior is a true exterior
+    d_ext_is_valid = d_exterior_mask_full[d_exterior_id.clip(0, total_ring_count - 1)]
+    d_valid_hole_mask = d_valid_hole_mask & d_ext_is_valid
+
+    # Propagate source rows from exterior to holes on device
+    d_hole_ext_ids = d_exterior_id.clip(0, total_ring_count - 1)
+    d_all_source_rows = cp.where(
+        d_valid_hole_mask,
+        d_all_source_rows[d_hole_ext_ids],
+        d_all_source_rows,
+    )
+
+    # Build the ordered ring list: for each exterior, gather its holes.
+    # Create a sort key: (source_row, exterior_id, is_exterior_flag desc,
+    # ring_id) so rings within a polygon group sort as
+    # [exterior, hole_0, hole_1, ...].
+    d_is_output_ring = d_exterior_mask_full | d_valid_hole_mask
+    d_output_ring_ids = cp.flatnonzero(d_is_output_ring).astype(cp.int32)
+    n_output_rings = int(d_output_ring_ids.size)
+
+    if n_output_rings == 0:
+        return _empty_polygon_output(faces.runtime_selection)
+
+    # For each output ring, its exterior id (exteriors map to themselves)
+    d_out_ext_id = cp.where(
+        d_exterior_mask_full[d_output_ring_ids],
+        d_output_ring_ids,
+        d_exterior_id[d_output_ring_ids],
+    )
+    d_out_source_row = d_all_source_rows[d_output_ring_ids]
+    d_out_is_ext = d_exterior_mask_full[d_output_ring_ids].astype(cp.int32)
+
+    # Sort by (source_row, exterior_id, NOT is_exterior, ring_id) so
+    # exteriors come first within each polygon group.
+    # Use CuPy lexsort (Tier 2) for arbitrary value ranges.
+    d_sort_order = cp.lexsort(cp.stack((
+        d_output_ring_ids,           # last key = least significant
+        1 - d_out_is_ext,            # exteriors (0) before holes (1)
+        d_out_ext_id,                # group by exterior
+        d_out_source_row,            # primary key: source row
+    )))
+    d_sorted_output_ids = d_output_ring_ids[d_sort_order]
+
+    # Identify polygon boundaries: a new polygon starts at each exterior ring
+    d_sorted_is_ext = d_exterior_mask_full[d_sorted_output_ids]
+    d_sorted_source_row = d_all_source_rows[d_sorted_output_ids]
+
+    # Each exterior starts a new polygon group
+    # Count rings per polygon (for ring_offsets)
+    d_poly_start_mask = d_sorted_is_ext
+    d_poly_starts = cp.flatnonzero(d_poly_start_mask).astype(cp.int32)
+    n_polygons = int(d_poly_starts.size)
+
+    if n_polygons == 0:
+        return _empty_polygon_output(faces.runtime_selection)
+
+    d_poly_ends = cp.concatenate((d_poly_starts[1:], cp.asarray([n_output_rings], dtype=cp.int32)))
+    d_rings_per_poly = d_poly_ends - d_poly_starts
+
+    # Source row per polygon (from the exterior ring)
+    d_poly_source_row = d_sorted_source_row[d_poly_starts]
+
+    # Polygons are already sorted by source row (primary sort key of the
+    # ring sort). Detect source-row group boundaries directly.
+    d_row_change = cp.empty(n_polygons, dtype=cp.bool_)
+    d_row_change[0] = True
+    if n_polygons > 1:
+        d_row_change[1:] = d_poly_source_row[1:] != d_poly_source_row[:-1]
+    d_row_starts = cp.flatnonzero(d_row_change).astype(cp.int32)
+    d_row_ends = cp.concatenate((d_row_starts[1:], cp.asarray([n_polygons], dtype=cp.int32)))
+    d_polys_per_row = d_row_ends - d_row_starts
+    n_output_rows = int(d_row_starts.size)
+
+    # Transfer the structural arrays to host for GeoArrow assembly.
     # This is the explicit materialization boundary per ADR-0005.
-    h_exterior_id = cp.asnumpy(d_exterior_id)
-    _ = cp.asnumpy(d_all_area)
+    h_sorted_output_ids = cp.asnumpy(d_sorted_output_ids)
+    h_rings_per_poly = cp.asnumpy(d_rings_per_poly)
+    h_polys_per_row = cp.asnumpy(d_polys_per_row)
+    h_row_source_ids = cp.asnumpy(d_poly_source_row[d_row_starts])
+    h_poly_starts = cp.asnumpy(d_poly_starts)
     h_all_coord_offsets = cp.asnumpy(d_all_coord_offsets)
     h_all_edge_counts = cp.asnumpy(d_all_edge_counts)
     h_all_x = cp.asnumpy(d_all_x)
     h_all_y = cp.asnumpy(d_all_y)
 
-    # Source rows: boundary rings from cycle walk, holes inherit from exterior
-    h_source_rows = np.zeros(total_ring_count, dtype=np.int32)
-    h_source_rows[:boundary_ring_count] = cp.asnumpy(d_cycle_source_rows)
-
-    # Build exterior -> holes mapping from kernel output using vectorised
-    # NumPy filtering instead of a Python ``for ri in range(N)`` loop
-    # (hitlist #12).
-    exterior_indices_host = cp.asnumpy(d_exterior_indices)
-
-    all_ring_ids = np.arange(total_ring_count, dtype=np.int32)
-    hole_mask = (h_exterior_id >= 0) & (h_exterior_id != all_ring_ids)
-    hole_ring_ids = all_ring_ids[hole_mask]
-    hole_ext_ids = h_exterior_id[hole_mask]
-    # Further filter: only keep holes whose assigned exterior is valid
-    valid_ext_mask = np.isin(hole_ext_ids, exterior_indices_host)
-    hole_ring_ids = hole_ring_ids[valid_ext_mask]
-    hole_ext_ids = hole_ext_ids[valid_ext_mask]
-
-    # Sort holes by (exterior_id, hole_ring_id) for deterministic ordering
-    sort_order = np.lexsort((hole_ring_ids, hole_ext_ids))
-    hole_ring_ids = hole_ring_ids[sort_order]
-    hole_ext_ids = hole_ext_ids[sort_order]
-
-    # Group holes by exterior using searchsorted on the sorted exterior ids
-    exterior_to_holes: dict[int, np.ndarray] = {}
-    if hole_ring_ids.size > 0:
-        breaks = np.flatnonzero(np.diff(hole_ext_ids) != 0)
-        groups = np.split(hole_ring_ids, breaks + 1)
-        ext_keys = hole_ext_ids[np.concatenate(([0], breaks + 1))]
-        for k, g in zip(ext_keys, groups):
-            exterior_to_holes[int(k)] = g
-
+    # Build row_polygons from the GPU-computed structure (Tier 2: host
+    # assembly of device-computed grouping). Each polygon's rings are
+    # already ordered [exterior, hole_0, hole_1, ...] by the sort.
     def _ring_coords(ri: int) -> np.ndarray:
         cs = int(h_all_coord_offsets[ri])
         n = int(h_all_edge_counts[ri]) + 1
         return np.column_stack((h_all_x[cs:cs + n], h_all_y[cs:cs + n]))
 
     row_polygons: dict[int, list[list[np.ndarray]]] = {}
-    for ext_idx in exterior_indices_host.tolist():
-        ext_idx = int(ext_idx)
-        source_row = int(h_source_rows[ext_idx])
-        rings: list[np.ndarray] = [_ring_coords(ext_idx)]
-        hole_ids = exterior_to_holes.get(ext_idx)
-        if hole_ids is not None:
-            for hole_idx in hole_ids:
-                rings.append(_ring_coords(int(hole_idx)))
-        row_polygons.setdefault(source_row, []).append(rings)
+    poly_cursor = 0
+    for row_idx in range(n_output_rows):
+        source_row = int(h_row_source_ids[row_idx])
+        n_polys = int(h_polys_per_row[row_idx])
+        polygons: list[list[np.ndarray]] = []
+        for _ in range(n_polys):
+            n_rings = int(h_rings_per_poly[poly_cursor])
+            ring_start = int(h_poly_starts[poly_cursor])
+            rings: list[np.ndarray] = []
+            for r in range(n_rings):
+                ri = int(h_sorted_output_ids[ring_start + r])
+                rings.append(_ring_coords(ri))
+            polygons.append(rings)
+            poly_cursor += 1
+        row_polygons[source_row] = polygons
 
     return _build_overlay_output_rows(row_polygons, faces.runtime_selection)
 
