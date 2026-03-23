@@ -26,7 +26,6 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_PTR,
     DeviceArray,
     compile_kernel_group,
-    count_scatter_total,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema  # noqa: E402
