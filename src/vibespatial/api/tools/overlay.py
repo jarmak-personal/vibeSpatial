@@ -397,9 +397,15 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     # Post-difference make_valid: use GPU path when owned backing is
     # available to avoid Shapely materialisation on the critical path.
     differences = _make_valid_geoseries(differences)
-    geom_diff = differences[~differences.is_empty].copy()
-    dfdiff = df1[~differences.is_empty].copy()
-    dfdiff[dfdiff._geometry_column_name] = geom_diff
+    non_empty = ~differences.is_empty
+    geom_diff = differences[non_empty].copy()
+    dfdiff = df1[non_empty].copy()
+    geo_col = dfdiff._geometry_column_name
+    # Use set_geometry to replace the geometry column while preserving
+    # owned backing and the original geometry column name.  The plain
+    # __setitem__ path (dfdiff[col] = series) destroys _owned.
+    geom_diff.name = geo_col
+    dfdiff = dfdiff.set_geometry(geom_diff, crs=df1.crs)
     return dfdiff, used_owned
 
 
@@ -449,7 +455,42 @@ def _overlay_symmetric_diff(df1, df2, left_owned=None, right_owned=None):
     # ensure geometry name (otherwise merge goes wrong)
     dfdiff1 = _ensure_geometry_column(dfdiff1)
     dfdiff2 = _ensure_geometry_column(dfdiff2)
-    # combine both 'difference' dataframes
+
+    # Check whether both differences carry owned-backed geometry.
+    # If so, bypass the merge-then-pick pattern (which destroys _owned)
+    # in favour of pd.concat which preserves owned backing via
+    # GeometryArray._concat_same_type.
+    diff1_owned = getattr(dfdiff1.geometry.values, '_owned', None)
+    diff2_owned = getattr(dfdiff2.geometry.values, '_owned', None)
+
+    if diff1_owned is not None and diff2_owned is not None:
+        # Align columns to match merge(..., suffixes=("_1","_2")) behavior:
+        # shared attribute columns get "_1"/"_2" suffix; unique columns
+        # keep their original names.
+        skip = {"geometry", "__idx1", "__idx2"}
+        attr1 = {c for c in dfdiff1.columns if c not in skip}
+        attr2 = {c for c in dfdiff2.columns if c not in skip}
+        shared = attr1 & attr2
+        rename1 = {c: f"{c}_1" for c in shared}
+        rename2 = {c: f"{c}_2" for c in shared}
+        if rename1:
+            dfdiff1 = dfdiff1.rename(columns=rename1)
+        if rename2:
+            dfdiff2 = dfdiff2.rename(columns=rename2)
+
+        dfsym = pd.concat(
+            [dfdiff1, dfdiff2], ignore_index=True, sort=False,
+        )
+        # keep geometry column last
+        columns = [c for c in dfsym.columns if c != "geometry"] + ["geometry"]
+        dfsym = dfsym.reindex(columns=columns)
+        if not isinstance(dfsym, GeoDataFrame):
+            dfsym = GeoDataFrame(dfsym)
+        if dfsym.crs is None and df1.crs is not None:
+            dfsym = dfsym.set_crs(df1.crs)
+        return dfsym, used1 or used2
+
+    # Shapely fallback: merge path (destroys owned backing).
     dfsym = dfdiff1.merge(
         dfdiff2, on=["__idx1", "__idx2"], how="outer", suffixes=("_1", "_2")
     )
@@ -673,9 +714,9 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
             mask = ~df.geometry.is_valid
             col = df._geometry_column_name
             if make_valid:
-                df.loc[mask, col] = df.loc[mask, col].make_valid()
-                # Extract only the input geometry type, as make_valid may change it
                 if mask.any():
+                    df.loc[mask, col] = df.loc[mask, col].make_valid()
+                    # Extract only the input geometry type, as make_valid may change it
                     df = _collection_extract(
                         df, geom_type="Polygon", keep_geom_type_warning=False
                     )

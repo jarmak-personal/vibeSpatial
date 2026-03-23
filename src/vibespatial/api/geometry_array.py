@@ -1273,12 +1273,17 @@ class GeometryArray(ExtensionArray):
                 other_owned = None
 
             if other_owned is not None:
-                result_owned = binary_constructive_owned(
-                    op, self._owned, other_owned, **kwargs,
-                )
-                # binary_constructive_owned records its own dispatch event
-                # with the accurate selected mode (GPU or CPU).
-                return GeometryArray.from_owned(result_owned, crs=self.crs)
+                try:
+                    result_owned = binary_constructive_owned(
+                        op, self._owned, other_owned, **kwargs,
+                    )
+                    # binary_constructive_owned records its own dispatch event
+                    # with the accurate selected mode (GPU or CPU).
+                    return GeometryArray.from_owned(result_owned, crs=self.crs)
+                except NotImplementedError:
+                    # binary_constructive_owned can't handle result types like
+                    # GeometryCollections — fall through to Shapely fallback.
+                    pass
 
         record_dispatch_event(
             surface=f"geopandas.array.{op}",
@@ -2480,6 +2485,14 @@ class GeometryArray(ExtensionArray):
         -------
         ExtensionArray
         """
+        # Owned-path: if ALL arrays have owned backing, concatenate at the
+        # buffer level without materializing Shapely objects.  This preserves
+        # device-resident geometry through pd.concat on GeoDataFrames.
+        if all(ga._owned is not None for ga in to_concat):
+            owned_arrays = [ga._owned for ga in to_concat]
+            result_owned = OwnedGeometryArray.concat(owned_arrays)
+            return GeometryArray.from_owned(result_owned, crs=_get_common_crs(to_concat))
+
         data = np.concatenate([ga._data for ga in to_concat])
         return GeometryArray(data, crs=_get_common_crs(to_concat))
 
