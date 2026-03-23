@@ -3851,18 +3851,63 @@ def _overlay_owned(
     atomic_edges = build_gpu_atomic_edges(split_events)
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
-    # Phase 13: device-resident face selection eliminates D->H transfers on
-    # bounded_mask, left_covered, and right_covered.
-    d_selected_face_indices = _select_overlay_face_indices_gpu(faces, operation=operation)
-    # Phase 11: _assemble_faces_from_device_indices tries CPU serial walk
-    # first, falls back to GPU boundary cycle detection via pointer jumping
-    # + segmented reduction.
-    result = _assemble_faces_from_device_indices(half_edge_graph, faces, d_selected_face_indices)
+    selected_face_indices = _select_overlay_face_indices(faces, operation=operation)
+    # GPU face assembly is the primary path.  The GPU pipeline (Phases 7-14)
+    # returns device-resident results, so it is strongly preferred.
+    #
+    # - GPU-explicit mode: GPU only, raise on failure.
+    # - AUTO mode: GPU first, CPU fallback when GPU is unavailable or errors.
+    if requested is ExecutionMode.GPU:
+        # Strict GPU: no fallback.
+        result = _build_polygon_output_from_faces_gpu(
+            half_edge_graph, faces, selected_face_indices,
+        )
+        if result is None:
+            raise RuntimeError(
+                "GPU face assembly returned None (device state unavailable) "
+                "despite GPU execution mode being requested"
+            )
+        face_assembly_mode = ExecutionMode.GPU
+    else:
+        # AUTO: GPU first, CPU fallback on failure.
+        gpu_result: OwnedGeometryArray | None = None
+        gpu_failed = False
+        gpu_fail_reason = ""
+        try:
+            gpu_result = _build_polygon_output_from_faces_gpu(
+                half_edge_graph, faces, selected_face_indices,
+            )
+            if gpu_result is None:
+                gpu_failed = True
+                gpu_fail_reason = "GPU face assembly unavailable (no device state)"
+        except Exception as exc:
+            gpu_failed = True
+            gpu_fail_reason = f"GPU face assembly raised {type(exc).__name__}: {exc}"
+
+        if gpu_failed:
+            from vibespatial.runtime.fallbacks import record_fallback_event
+
+            record_fallback_event(
+                surface="overlay.gpu._overlay_owned",
+                reason=gpu_fail_reason,
+                detail=f"operation={operation}",
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="overlay",
+                d2h_transfer=True,
+            )
+            result = _build_polygon_output_from_faces(
+                half_edge_graph, faces, selected_face_indices,
+            )
+            face_assembly_mode = ExecutionMode.CPU
+        else:
+            result = gpu_result  # type: ignore[assignment]
+            face_assembly_mode = ExecutionMode.GPU
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,
-            selected=ExecutionMode.GPU,
-            reason=f"GPU overlay {operation} selected",
+            selected=face_assembly_mode,
+            reason=f"GPU overlay {operation}: face assembly on {face_assembly_mode.value}",
         )
     )
     return result
