@@ -108,5 +108,22 @@
       "gpu-nvrtc",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "point",
+      "multipoint",
+      "linestring",
+      "multilinestring",
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "clip_by_rect",
+    "module": "vibespatial.constructive.clip_rect",
+    "tier": 3,
+    "variants": [
+      "gpu-nvrtc",
+      "cpu"
+    ]
   }
 ]

@@ -1568,6 +1568,44 @@ def _use_gpu_clip(owned: OwnedGeometryArray) -> bool:
     return total_coords >= _POLYGON_CLIP_GPU_THRESHOLD
 
 
+# ---------------------------------------------------------------------------
+# CPU clip path (called from clip_by_rect_owned; public variant registration
+# lives in kernels/constructive/clip_rect.py)
+# ---------------------------------------------------------------------------
+
+def _clip_by_rect_cpu(
+    owned: OwnedGeometryArray,
+    rect: tuple[float, float, float, float],
+    shapely_values: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """CPU clip_by_rect using Shapely with bounds pre-filtering.
+
+    Returns (result_geometries, candidate_rows).
+    """
+    bounds = compute_geometry_bounds(owned)
+    candidate_rows = np.flatnonzero(
+        _rect_intersects_bounds(bounds, rect)
+    ).astype(np.int32, copy=False)
+
+    result = np.empty(owned.row_count, dtype=object)
+    result[:] = EMPTY
+    invalid_mask = ~owned.validity
+    if invalid_mask.any():
+        result[invalid_mask] = None
+
+    if candidate_rows.size > 0:
+        if shapely_values is not None:
+            candidate_shapely = shapely_values[candidate_rows]
+        else:
+            candidate_shapely = _materialize_candidates_vectorized(
+                owned, candidate_rows
+            )
+        clipped = shapely.clip_by_rect(candidate_shapely, *rect)
+        result[candidate_rows] = np.asarray(clipped, dtype=object)
+
+    return result, candidate_rows
+
+
 def clip_by_rect_owned(
     values: Sequence[object | None] | np.ndarray | OwnedGeometryArray,
     xmin: float,
@@ -1796,42 +1834,19 @@ def clip_by_rect_owned(
             )
         raise NotImplementedError("clip_by_rect GPU variant currently supports point-only, polygon, and line owned arrays")
 
-    bounds = compute_geometry_bounds(owned)
-    candidate_rows = np.flatnonzero(_rect_intersects_bounds(bounds, rect)).astype(np.int32, copy=False)
-
-    # Build result template from validity (works whether shapely_values
-    # exists or not).
-    result = np.empty(owned.row_count, dtype=object)
-    result[:] = EMPTY
-    invalid_mask = ~owned.validity
-    if invalid_mask.any():
-        result[invalid_mask] = None
-
-    # If we already have a shapely array, use it directly.  Otherwise
-    # materialise only the candidate rows from the owned buffer using
-    # vectorized shapely constructors when possible -- avoids the
-    # expensive full to_shapely() conversion for non-candidate rows.
-    if candidate_rows.size > 0:
-        if shapely_values is not None:
-            candidate_shapely = shapely_values[candidate_rows]
-        else:
-            candidate_shapely = _materialize_candidates_vectorized(owned, candidate_rows)
-        clipped = shapely.clip_by_rect(candidate_shapely, *rect)
-        result[candidate_rows] = np.asarray(clipped, dtype=object)
-
-    fast_rows_arr = candidate_rows
-    fallback_index = np.asarray([], dtype=np.int32)
-
+    # CPU path: delegate to registered CPU kernel variant.
     # Skip the expensive from_shapely_geometries round-trip on the CPU
     # path.  The owned_result field defaults to None and callers that need
     # it (e.g. pipeline_benchmarks) already handle the None case.  This
     # avoids ~19ms of overhead that dominates the CPU clip path.
+    result, candidate_rows = _clip_by_rect_cpu(owned, rect, shapely_values)
+
     return RectClipResult(
         geometries=result,
         row_count=int(owned.row_count),
         candidate_rows=candidate_rows,
-        fast_rows=fast_rows_arr,
-        fallback_rows=fallback_index,
+        fast_rows=candidate_rows,
+        fallback_rows=np.asarray([], dtype=np.int32),
         runtime_selection=runtime_selection,
         precision_plan=precision_plan,
         robustness_plan=robustness_plan,
