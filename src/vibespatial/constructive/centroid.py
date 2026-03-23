@@ -982,7 +982,7 @@ def centroid_owned(
     device pointers with no copy.
     """
     from vibespatial.geometry.owned import from_shapely_geometries
-    from vibespatial.runtime import RuntimeSelection
+    from vibespatial.runtime.dispatch import record_dispatch_event
     from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
 
     row_count = owned.row_count
@@ -1007,23 +1007,38 @@ def centroid_owned(
                 coord_max = max(coord_max, float(buf.x.max()), float(buf.y.max()))
         span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
         precision_plan = select_precision_plan(
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
-                reason="geometry_centroid GPU dispatch",
-            ),
+            runtime_selection=selection,
             kernel_class=KernelClass.METRIC,
             requested=precision,
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
         )
         try:
-            return _centroid_gpu(owned, precision_plan=precision_plan)
+            result = _centroid_gpu(owned, precision_plan=precision_plan)
+            record_dispatch_event(
+                surface="geopandas.array.centroid",
+                operation="centroid",
+                implementation="gpu_nvrtc_centroid",
+                reason="GPU NVRTC centroid kernel",
+                detail=f"rows={row_count}, precision={precision_plan.compute_dtype}",
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+            )
+            return result
         except Exception:
             pass  # fall through to CPU
 
     cx, cy = _centroid_cpu(owned)
     cx[~owned.validity] = np.nan
     cy[~owned.validity] = np.nan
+    record_dispatch_event(
+        surface="geopandas.array.centroid",
+        operation="centroid",
+        implementation="numpy",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        requested=dispatch_mode,
+        selected=ExecutionMode.CPU,
+    )
     # Build host-resident Point OwnedGeometryArray from CPU results
     import shapely as _shapely
 

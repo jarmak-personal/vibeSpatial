@@ -14224,10 +14224,12 @@
       "referenced_by": [],
       "symbols": [
         "_exterior_gpu",
+        "_exterior_cpu",
         "exterior_owned"
       ],
       "tokens": [
         "constructive",
+        "cpu",
         "exterior",
         "gpu",
         "owned",
@@ -14381,6 +14383,8 @@
         "plan_make_valid_pipeline",
         "fusion_plan_for_make_valid",
         "_compute_validity_mask_gpu",
+        "_make_valid_gpu_repair",
+        "_make_valid_cpu_repair",
         "make_valid_owned",
         "evaluate_geopandas_make_valid",
         "benchmark_make_valid"
@@ -14390,6 +14394,7 @@
         "compile",
         "compute",
         "constructive",
+        "cpu",
         "detect",
         "evaluate",
         "format",
@@ -14411,6 +14416,7 @@
         "plan",
         "polygon",
         "py",
+        "repair",
         "self",
         "source",
         "src",
@@ -14716,6 +14722,7 @@
         "_simplify_gpu",
         "_vw_simplify_span",
         "_simplify_family_cpu",
+        "_simplify_cpu",
         "simplify_owned"
       ],
       "tokens": [
