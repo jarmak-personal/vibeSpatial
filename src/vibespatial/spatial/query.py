@@ -564,7 +564,7 @@ def query_spatial_index(
         d_left = _cp.asarray(left_idx, dtype=_cp.int32)
         d_right = _cp.asarray(right_idx, dtype=_cp.int32)
         if sort and d_left.size > 0:
-            order = _cp.lexsort((_cp.asarray(d_right, dtype=_cp.int64), _cp.asarray(d_left, dtype=_cp.int64)))
+            order = _cp.lexsort(_cp.stack([_cp.asarray(d_right, dtype=_cp.int64), _cp.asarray(d_left, dtype=_cp.int64)]))
             d_left = d_left[order]
             d_right = d_right[order]
         device_result = DeviceSpatialJoinResult(

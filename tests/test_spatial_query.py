@@ -930,7 +930,7 @@ def test_return_device_true_returns_device_result() -> None:
 
     # Query with an OwnedGeometryArray to ensure owned dispatch path is used.
     query_geoms = np.asarray([box(0.5, 0.5, 2.5, 2.5)], dtype=object)
-    query_owned = OwnedGeometryArray.from_shapely(query_geoms)
+    query_owned = from_shapely_geometries(query_geoms.tolist())
 
     result, execution = query_spatial_index(
         tree_owned, flat, query_owned, predicate="intersects",
