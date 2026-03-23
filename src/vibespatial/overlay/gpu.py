@@ -35,6 +35,7 @@ from vibespatial.geometry.owned import (  # noqa: E402
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
+    build_device_resident_owned,
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
@@ -1326,13 +1327,31 @@ def _point_in_ring(x: float, y: float, ring: np.ndarray) -> bool:
 
 
 def _empty_polygon_output(runtime_selection: RuntimeSelection) -> OwnedGeometryArray:
+    residency = Residency.DEVICE if cp is not None else Residency.HOST
+    empty_validity = np.asarray([], dtype=bool)
+    empty_tags = np.asarray([], dtype=np.int8)
+    empty_offsets = np.asarray([], dtype=np.int32)
+    device_state = None
+    if residency is Residency.DEVICE:
+        try:
+            rt = get_cuda_runtime()
+            device_state = OwnedGeometryDeviceState(
+                validity=rt.from_host(empty_validity),
+                tags=rt.from_host(empty_tags),
+                family_row_offsets=rt.from_host(empty_offsets),
+                families={},
+            )
+        except Exception:
+            residency = Residency.HOST
+            device_state = None
     return OwnedGeometryArray(
-        validity=np.asarray([], dtype=bool),
-        tags=np.asarray([], dtype=np.int8),
-        family_row_offsets=np.asarray([], dtype=np.int32),
+        validity=empty_validity,
+        tags=empty_tags,
+        family_row_offsets=empty_offsets,
         families={},
-        residency=Residency.HOST,
+        residency=residency,
         runtime_history=[runtime_selection],
+        device_state=device_state,
     )
 
 
@@ -2081,7 +2100,7 @@ def _build_polygon_output_from_faces_gpu(
             ),
         )
 
-    # --- Step 10: GPU output assembly ---
+    # --- Step 10: Device-resident output assembly ---
     # Build GeoArrow-format polygon output entirely on device.
     # Valid holes: assigned to an exterior AND even sibling depth.
     d_valid_hole_mask = d_is_hole & ((d_sibling_depth % 2) == 0)
@@ -2159,8 +2178,8 @@ def _build_polygon_output_from_faces_gpu(
     d_polys_per_row = d_row_ends - d_row_starts
     n_output_rows = int(d_row_starts.size)
 
-    # Transfer the structural arrays to host for GeoArrow assembly.
-    # This is the explicit materialization boundary per ADR-0005.
+    # Transfer only small O(ring_count) structural metadata to host.
+    # Coordinate arrays d_all_x/d_all_y stay on device (Phase 14 zero-copy).
     h_sorted_output_ids = cp.asnumpy(d_sorted_output_ids)
     h_rings_per_poly = cp.asnumpy(d_rings_per_poly)
     h_polys_per_row = cp.asnumpy(d_polys_per_row)
@@ -2168,35 +2187,179 @@ def _build_polygon_output_from_faces_gpu(
     h_poly_starts = cp.asnumpy(d_poly_starts)
     h_all_coord_offsets = cp.asnumpy(d_all_coord_offsets)
     h_all_edge_counts = cp.asnumpy(d_all_edge_counts)
-    h_all_x = cp.asnumpy(d_all_x)
-    h_all_y = cp.asnumpy(d_all_y)
 
-    # Build row_polygons from the GPU-computed structure (Tier 2: host
-    # assembly of device-computed grouping). Each polygon's rings are
-    # already ordered [exterior, hole_0, hole_1, ...] by the sort.
-    def _ring_coords(ri: int) -> np.ndarray:
-        cs = int(h_all_coord_offsets[ri])
-        n = int(h_all_edge_counts[ri]) + 1
-        return np.column_stack((h_all_x[cs:cs + n], h_all_y[cs:cs + n]))
+    return _build_device_resident_polygon_output(
+        d_all_x=d_all_x,
+        d_all_y=d_all_y,
+        h_all_coord_offsets=h_all_coord_offsets,
+        h_all_edge_counts=h_all_edge_counts,
+        h_sorted_output_ids=h_sorted_output_ids,
+        h_rings_per_poly=h_rings_per_poly,
+        h_polys_per_row=h_polys_per_row,
+        h_row_source_ids=h_row_source_ids,
+        h_poly_starts=h_poly_starts,
+        n_output_rows=n_output_rows,
+        runtime_selection=faces.runtime_selection,
+    )
 
-    row_polygons: dict[int, list[list[np.ndarray]]] = {}
+
+def _build_device_resident_polygon_output(
+    *,
+    d_all_x: cp.ndarray,
+    d_all_y: cp.ndarray,
+    h_all_coord_offsets: np.ndarray,
+    h_all_edge_counts: np.ndarray,
+    h_sorted_output_ids: np.ndarray,
+    h_rings_per_poly: np.ndarray,
+    h_polys_per_row: np.ndarray,
+    h_row_source_ids: np.ndarray,
+    h_poly_starts: np.ndarray,
+    n_output_rows: int,
+    runtime_selection: RuntimeSelection,
+) -> OwnedGeometryArray:
+    """Build device-resident OwnedGeometryArray from GPU face assembly results.
+
+    Accepts GPU-computed ring grouping (Phase 12 sibling hole nesting) and
+    builds GeoArrow offset arrays on host (they are small), then gathers
+    coordinates on device via CuPy fancy indexing.
+
+    Phase 14 (ADR-0005): eliminates dominant D->H coordinate transfer.
+    """
+    runtime = get_cuda_runtime()
+
+    # --- Build per-row polygon/multipolygon structure on host ---
+    # Use the GPU-computed grouping arrays to reconstruct row_exteriors.
+    # Each polygon's rings are already ordered [exterior, hole_0, hole_1, ...]
+    # by the Phase 12 GPU sort.
+    # row_exteriors: source_row -> list of (ext_ring_idx, [hole_ring_idx, ...])
+    row_exteriors: dict[int, list[tuple[int, list[int]]]] = {}
     poly_cursor = 0
     for row_idx in range(n_output_rows):
         source_row = int(h_row_source_ids[row_idx])
         n_polys = int(h_polys_per_row[row_idx])
-        polygons: list[list[np.ndarray]] = []
         for _ in range(n_polys):
             n_rings = int(h_rings_per_poly[poly_cursor])
             ring_start = int(h_poly_starts[poly_cursor])
-            rings: list[np.ndarray] = []
-            for r in range(n_rings):
-                ri = int(h_sorted_output_ids[ring_start + r])
-                rings.append(_ring_coords(ri))
-            polygons.append(rings)
+            ext_idx = int(h_sorted_output_ids[ring_start])
+            holes = [
+                int(h_sorted_output_ids[ring_start + r])
+                for r in range(1, n_rings)
+            ]
+            row_exteriors.setdefault(source_row, []).append((ext_idx, holes))
             poly_cursor += 1
-        row_polygons[source_row] = polygons
 
-    return _build_overlay_output_rows(row_polygons, faces.runtime_selection)
+    if not row_exteriors:
+        return _empty_polygon_output(runtime_selection)
+
+    ordered_rows = sorted(row_exteriors)
+    output_row_count = len(ordered_rows)
+    validity = np.ones(output_row_count, dtype=bool)
+    tags = np.full(output_row_count, -1, dtype=np.int8)
+    family_row_offsets = np.full(output_row_count, -1, dtype=np.int32)
+
+    # Separate into POLYGON (single exterior per row) and MULTIPOLYGON rows.
+    # For each family, build GeoArrow offset arrays and a coordinate gather
+    # plan (ordered list of ring indices whose coordinates are concatenated).
+    polygon_ring_order: list[int] = []        # ring indices in output order
+    polygon_ring_offsets: list[int] = [0]     # cumulative coord count
+    polygon_geometry_offsets: list[int] = [0]  # cumulative ring count per geometry
+    polygon_count = 0
+
+    multipolygon_ring_order: list[int] = []
+    multipolygon_ring_offsets: list[int] = [0]
+    multipolygon_part_offsets: list[int] = [0]
+    multipolygon_geometry_offsets: list[int] = [0]
+    multipolygon_count = 0
+
+    for output_row, source_row in enumerate(ordered_rows):
+        exteriors = row_exteriors[source_row]
+        if len(exteriors) == 1:
+            # Single polygon row
+            tags[output_row] = FAMILY_TAGS[GeometryFamily.POLYGON]
+            family_row_offsets[output_row] = polygon_count
+            polygon_count += 1
+            ext_idx, holes = exteriors[0]
+            # Exterior ring + hole rings
+            for ring_idx in [ext_idx, *holes]:
+                polygon_ring_order.append(ring_idx)
+                n_coords = int(h_all_edge_counts[ring_idx]) + 1
+                polygon_ring_offsets.append(polygon_ring_offsets[-1] + n_coords)
+            polygon_geometry_offsets.append(len(polygon_ring_offsets) - 1)
+        else:
+            # Multi-polygon row
+            tags[output_row] = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+            family_row_offsets[output_row] = multipolygon_count
+            multipolygon_count += 1
+            for ext_idx, holes in exteriors:
+                multipolygon_part_offsets.append(len(multipolygon_ring_offsets) - 1)
+                for ring_idx in [ext_idx, *holes]:
+                    multipolygon_ring_order.append(ring_idx)
+                    n_coords = int(h_all_edge_counts[ring_idx]) + 1
+                    multipolygon_ring_offsets.append(
+                        multipolygon_ring_offsets[-1] + n_coords,
+                    )
+            multipolygon_geometry_offsets.append(len(multipolygon_part_offsets) - 1)
+
+    # --- Build coordinate gather indices and execute on device ---
+    def _gather_coords_on_device(
+        ring_order: list[int],
+    ) -> tuple[cp.ndarray, cp.ndarray]:
+        """Build coordinate gather indices on host, execute gather on device."""
+        if not ring_order:
+            return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
+        # Build flat array of source coordinate indices for each ring
+        gather_chunks: list[np.ndarray] = []
+        for ring_idx in ring_order:
+            cs = int(h_all_coord_offsets[ring_idx])
+            n = int(h_all_edge_counts[ring_idx]) + 1
+            gather_chunks.append(np.arange(cs, cs + n, dtype=np.int64))
+        h_gather = np.concatenate(gather_chunks)
+        d_gather = cp.asarray(h_gather)
+        return d_all_x[d_gather], d_all_y[d_gather]
+
+    device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+
+    if polygon_count > 0:
+        d_poly_x, d_poly_y = _gather_coords_on_device(polygon_ring_order)
+        h_poly_geom_offsets = np.asarray(polygon_geometry_offsets, dtype=np.int32)
+        h_poly_ring_offsets = np.asarray(polygon_ring_offsets, dtype=np.int32)
+        device_families[GeometryFamily.POLYGON] = DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.POLYGON,
+            x=d_poly_x,
+            y=d_poly_y,
+            geometry_offsets=runtime.from_host(h_poly_geom_offsets),
+            empty_mask=runtime.from_host(np.zeros(polygon_count, dtype=np.bool_)),
+            ring_offsets=runtime.from_host(h_poly_ring_offsets),
+            bounds=None,
+        )
+
+    if multipolygon_count > 0:
+        d_mpoly_x, d_mpoly_y = _gather_coords_on_device(multipolygon_ring_order)
+        h_mpoly_geom_offsets = np.asarray(multipolygon_geometry_offsets, dtype=np.int32)
+        h_mpoly_part_offsets = np.asarray(multipolygon_part_offsets, dtype=np.int32)
+        h_mpoly_ring_offsets = np.asarray(multipolygon_ring_offsets, dtype=np.int32)
+        device_families[GeometryFamily.MULTIPOLYGON] = DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.MULTIPOLYGON,
+            x=d_mpoly_x,
+            y=d_mpoly_y,
+            geometry_offsets=runtime.from_host(h_mpoly_geom_offsets),
+            empty_mask=runtime.from_host(
+                np.zeros(multipolygon_count, dtype=np.bool_),
+            ),
+            part_offsets=runtime.from_host(h_mpoly_part_offsets),
+            ring_offsets=runtime.from_host(h_mpoly_ring_offsets),
+            bounds=None,
+        )
+
+    result = build_device_resident_owned(
+        device_families=device_families,
+        row_count=output_row_count,
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+    )
+    result.runtime_history.append(runtime_selection)
+    return result
 
 
 def _build_polygon_output_from_faces(
