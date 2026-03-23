@@ -90,6 +90,7 @@ PREDICATE_SPECS: dict[str, BinaryPredicateSpec] = {
     ),
     "overlaps": BinaryPredicateSpec("overlaps", CoarseRelation.INTERSECTS, "overlaps"),
     "disjoint": BinaryPredicateSpec("disjoint", CoarseRelation.DISJOINT, "disjoint"),
+    "equals": BinaryPredicateSpec("equals", CoarseRelation.INTERSECTS, "equals"),
 }
 
 _LINE_FAMILIES = (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)
@@ -105,12 +106,15 @@ _DE9IM_TAGS = _LINE_TAGS + _REGION_TAGS
 _DE9IM_PREDICATES = frozenset({
     "intersects", "contains", "within", "touches",
     "covers", "covered_by", "overlaps", "disjoint",
-    "contains_properly",
+    "contains_properly", "equals",
 })
 
 
+_SPECIAL_PREDICATES = frozenset({"equals_exact"})
+
+
 def supports_binary_predicate(name: str) -> bool:
-    return name in PREDICATE_SPECS
+    return name in PREDICATE_SPECS or name in _SPECIAL_PREDICATES
 
 
 def _coerce_array(
@@ -316,7 +320,7 @@ def _point_relation_to_predicate(
 
 def _point_equals_to_predicate(predicate: str, relation: np.ndarray) -> np.ndarray:
     equal = relation == POINT_LOCATION_INTERIOR
-    if predicate in {"intersects", "contains", "within", "covers", "covered_by", "contains_properly"}:
+    if predicate in {"intersects", "contains", "within", "covers", "covered_by", "contains_properly", "equals"}:
         return equal
     if predicate == "disjoint":
         return ~equal
@@ -1089,6 +1093,69 @@ def evaluate_binary_predicate(
     )
 
 
+def _evaluate_geopandas_equals_exact(
+    left: np.ndarray | OwnedGeometryArray,
+    right: object | np.ndarray | OwnedGeometryArray,
+    **kwargs: Any,
+) -> np.ndarray:
+    """Dispatch equals_exact through the dedicated coordinate-comparison path.
+
+    Unlike standard binary predicates, equals_exact cannot use bbox coarse
+    filtering because tolerance expands the match window beyond bbox overlap.
+    Routes to geom_equals_exact_owned for GPU/CPU dispatch.
+    """
+    from vibespatial.geometry.equality import geom_equals_exact_owned
+    from vibespatial.runtime import get_requested_mode
+
+    tolerance = kwargs["tolerance"] if "tolerance" in kwargs else 0.0
+
+    # Scalar right: fall back to Shapely vectorized equals_exact which
+    # handles scalar broadcasting natively in C, avoiding O(N) Python-side
+    # geometry duplication.
+    is_scalar = not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple))
+    if is_scalar:
+        left_shapely = (
+            np.asarray(left.to_shapely(), dtype=object)
+            if isinstance(left, OwnedGeometryArray)
+            else np.asarray(left, dtype=object)
+        )
+        result = shapely.equals_exact(left_shapely, right, tolerance=tolerance)
+        record_dispatch_event(
+            surface="geopandas.array.equals_exact",
+            operation="equals_exact",
+            implementation="shapely_scalar_broadcast",
+            reason="scalar right-hand operand; Shapely vectorized C path",
+            detail=f"rows={len(left_shapely)}, tolerance={tolerance}",
+            selected=ExecutionMode.CPU,
+        )
+        return result.astype(bool, copy=False)
+
+    # Coerce inputs to OwnedGeometryArray.
+    if isinstance(left, OwnedGeometryArray):
+        left_owned = left
+    else:
+        left_owned = from_shapely_geometries(list(left) if not isinstance(left, list) else left)
+
+    if isinstance(right, OwnedGeometryArray):
+        right_owned = right
+    else:
+        right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
+
+    dispatch_mode = get_requested_mode()
+    result = geom_equals_exact_owned(
+        left_owned, right_owned, tolerance, dispatch_mode=dispatch_mode,
+    )
+    record_dispatch_event(
+        surface="geopandas.array.equals_exact",
+        operation="equals_exact",
+        implementation="geom_equals_exact_owned",
+        reason="dedicated coordinate-comparison dispatch for equals_exact",
+        detail=f"rows={left_owned.row_count}, tolerance={tolerance}",
+        selected=dispatch_mode,
+    )
+    return result.astype(bool, copy=False)
+
+
 def evaluate_geopandas_binary_predicate(
     predicate: str,
     left: np.ndarray | OwnedGeometryArray,
@@ -1107,6 +1174,15 @@ def evaluate_geopandas_binary_predicate(
                 pipeline="predicate",
             )
             return None
+
+        # --- equals_exact special path ---
+        # Tolerance invalidates the standard bbox coarse filter (two
+        # geometries can match within tolerance even when their bboxes
+        # don't overlap).  Route directly to the dedicated coordinate-
+        # comparison dispatch in geometry/equality.py.
+        if predicate == "equals_exact":
+            return _evaluate_geopandas_equals_exact(left, right, **kwargs)
+
         left_coerced = left if isinstance(left, OwnedGeometryArray) else np.asarray(left, dtype=object)
         if isinstance(right, OwnedGeometryArray) or np.isscalar(right) or right is None:
             right_coerced = right

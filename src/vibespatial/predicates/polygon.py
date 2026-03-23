@@ -838,6 +838,8 @@ _PREDICATE_RULES: dict[str, tuple[int, int]] = {
     "disjoint": (0, DE9IM_II | DE9IM_IB | DE9IM_BI | DE9IM_BB),
     # contains_properly: contains (II set, EI/EB unset) AND BB unset
     "contains_properly": (DE9IM_II, DE9IM_EI | DE9IM_EB | DE9IM_BB),
+    # equals: II set, IE/BE/EI/EB all unset (T*F**FFF*)
+    "equals": (DE9IM_II, DE9IM_IE | DE9IM_BE | DE9IM_EI | DE9IM_EB),
 }
 
 _CONTACT_MASK = DE9IM_II | DE9IM_IB | DE9IM_BI | DE9IM_BB

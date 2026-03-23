@@ -166,3 +166,15 @@ def disjoint_exact(
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> BinaryPredicateResult:
     return evaluate_binary_predicate("disjoint", left, right, dispatch_mode=dispatch_mode, precision=precision)
+
+
+@_variant("equals")
+@_gpu_variant("equals")
+def equals_exact(
+    left: PredicateInput,
+    right: PredicateInput,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> BinaryPredicateResult:
+    return evaluate_binary_predicate("equals", left, right, dispatch_mode=dispatch_mode, precision=precision)

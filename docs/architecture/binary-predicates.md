@@ -5,23 +5,23 @@ Scope: Exact binary-predicate refine strategy, coarse-filter staging, and GeoPan
 Read If: You are changing exact predicate kernels, binary predicate dispatch, or GeoPandas predicate integration.
 STOP IF: You already have the binary-predicate engine open and only need local implementation detail.
 Source Of Truth: Phase-4 exact binary-predicate architecture policy before join assembly.
-Body Budget: 142/220 lines
+Body Budget: 145/220 lines
 Document: docs/architecture/binary-predicates.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-18 | Request Signals |
-| 19-26 | Open First |
-| 27-37 | Verify |
-| 38-43 | Risks |
-| 44-48 | Intent |
-| 49-78 | Decision |
-| 79-96 | Current Surface |
-| 97-109 | CCCL Mapping |
-| 110-123 | Host Crossover |
-| 124-142 | Consequences |
+| 3-20 | Request Signals |
+| 21-28 | Open First |
+| 29-39 | Verify |
+| 40-45 | Risks |
+| 46-50 | Intent |
+| 51-81 | Decision |
+| 82-99 | Current Surface |
+| 100-112 | CCCL Mapping |
+| 113-126 | Host Crossover |
+| 127-145 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -36,6 +36,8 @@ DOC_HEADER:END -->
 - touches
 - overlaps
 - disjoint
+- equals
+- equals_exact
 - cccl
 - geopandas predicate
 - DE-9IM
@@ -52,7 +54,7 @@ DOC_HEADER:END -->
 
 - `uv run pytest tests/test_binary_predicates.py tests/test_geopandas_binary_predicates.py`
 - `uv run pytest tests/test_geopandas_dispatch.py -q`
-- `uv run pytest tests/upstream/geopandas/tests/test_geom_methods.py -k "contains or within or intersects or covers or covered_by or touches or crosses"`
+- `uv run pytest tests/upstream/geopandas/tests/test_geom_methods.py -k "contains or within or intersects or covers or covered_by or touches or crosses or equals"`
 - `uv run pytest tests/test_gpu_binary_predicates.py -q --run-gpu`
 - `VIBESPATIAL_STRICT_NATIVE=1 uv run pytest tests/upstream/geopandas/tests/test_array.py -k "test_predicates_vector_scalar or test_predicates_vector_vector or test_chaining or test_raise_on_bad_sizes" -q`
 - `uv run python scripts/benchmark_gpu_predicates.py --scale 100000`
@@ -80,8 +82,9 @@ Use a staged exact-refine engine:
 - restore row order directly into the final boolean output
 
 This stage pattern applies to `intersects`, `within`, `contains`, `covers`,
-`covered_by`, `touches`, `crosses`, `contains_properly`, `overlaps`, and
-`disjoint`.
+`covered_by`, `touches`, `crosses`, `contains_properly`, `overlaps`,
+`disjoint`, and `equals`.  `equals_exact` uses a dedicated coordinate-
+comparison path (tolerance invalidates bbox coarse filtering).
 
 The current implementation now has a real but narrow CUDA path:
 
