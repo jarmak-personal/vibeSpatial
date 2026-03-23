@@ -1308,6 +1308,128 @@ def _materialize_family_row(buffer: FamilyGeometryBuffer, row_index: int) -> obj
     raise NotImplementedError(f"unsupported geometry family: {buffer.family.value}")
 
 
+def concat_owned_scatter(
+    base: OwnedGeometryArray,
+    replacement: OwnedGeometryArray,
+    indices: np.ndarray,
+) -> OwnedGeometryArray:
+    """Scatter *replacement* rows into *base* at *indices*, returning a new array.
+
+    Returns a new OwnedGeometryArray with the same row count as *base* where:
+    - rows at *indices* come from *replacement* (in order)
+    - all other rows come from *base*
+
+    ``len(indices)`` must equal ``replacement.row_count``.
+
+    Operates entirely at the buffer level — no Shapely materialisation.
+    When both inputs are host-resident the result is host-resident; when
+    both are device-resident, use :func:`device_concat_owned_scatter`
+    instead (future work).
+    """
+    from vibespatial.geometry.device_array import _concat_family_buffers
+
+    indices = np.asarray(indices, dtype=np.int64)
+    n_out = base.row_count
+    if indices.size != replacement.row_count:
+        raise ValueError(
+            f"indices length ({indices.size}) must equal replacement row_count "
+            f"({replacement.row_count})"
+        )
+
+    base._ensure_host_state()
+    replacement._ensure_host_state()
+
+    # 1. Build output metadata by copying base and overwriting at indices
+    out_validity = base.validity.copy()
+    out_tags = base.tags.copy()
+    out_validity[indices] = replacement.validity
+    out_tags[indices] = replacement.tags
+
+    # 2. Build a boolean mask identifying which output rows come from replacement
+    is_replacement = np.zeros(n_out, dtype=bool)
+    is_replacement[indices] = True
+
+    # 3. Per-family: gather rows from base and replacement, concatenate
+    out_family_row_offsets = np.full(n_out, -1, dtype=np.int32)
+    out_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+
+    # Pre-compute the inverse mapping: output position → replacement-local row.
+    # inv_map[output_pos] gives the replacement row index when output_pos is a
+    # replacement position; -1 otherwise.
+    inv_map = np.full(n_out, -1, dtype=np.int64)
+    inv_map[indices] = np.arange(replacement.row_count, dtype=np.int64)
+
+    # Collect all families present in the output
+    all_family_tags = set()
+    for tag_val in np.unique(out_tags):
+        if tag_val != NULL_TAG:
+            all_family_tags.add(int(tag_val))
+
+    for tag_val in sorted(all_family_tags):
+        family = TAG_FAMILIES[tag_val]
+
+        # Which output rows belong to this family?
+        family_mask = out_tags == tag_val
+        family_global_indices = np.flatnonzero(family_mask)
+
+        # Split into base-sourced and replacement-sourced rows
+        from_base_mask = ~is_replacement[family_global_indices]
+        from_repl_mask = is_replacement[family_global_indices]
+
+        base_global = family_global_indices[from_base_mask]
+        repl_global = family_global_indices[from_repl_mask]
+
+        bufs_to_concat: list[FamilyGeometryBuffer] = []
+        base_family_count = 0
+        repl_family_count = 0
+
+        # Gather from base's family buffer
+        if base_global.size > 0 and family in base.families:
+            base_family_rows = base.family_row_offsets[base_global]
+            base_taken = _take_family_buffer(base.families[family], base_family_rows)
+            bufs_to_concat.append(base_taken)
+            base_family_count = base_taken.row_count
+
+        # Gather from replacement's family buffer
+        if repl_global.size > 0 and family in replacement.families:
+            repl_local = inv_map[repl_global]
+            repl_family_rows = replacement.family_row_offsets[repl_local]
+            repl_taken = _take_family_buffer(replacement.families[family], repl_family_rows)
+            bufs_to_concat.append(repl_taken)
+            repl_family_count = repl_taken.row_count
+
+        if bufs_to_concat:
+            merged = _concat_family_buffers(family, bufs_to_concat)
+            out_families[family] = merged
+
+            # Assign family_row_offsets: base rows get 0..base_count-1,
+            # replacement rows get base_count..base_count+repl_count-1
+            if base_global.size > 0:
+                out_family_row_offsets[base_global] = np.arange(
+                    base_family_count, dtype=np.int32,
+                )
+            if repl_global.size > 0:
+                out_family_row_offsets[repl_global] = np.arange(
+                    base_family_count,
+                    base_family_count + repl_family_count,
+                    dtype=np.int32,
+                )
+
+    result = OwnedGeometryArray(
+        validity=out_validity,
+        tags=out_tags,
+        family_row_offsets=out_family_row_offsets,
+        families=out_families,
+        residency=Residency.HOST,
+    )
+    result._record(
+        DiagnosticKind.CREATED,
+        f"scatter {replacement.row_count} replacement rows into {base.row_count}-row base",
+        visible=False,
+    )
+    return result
+
+
 def build_device_resident_owned(
     *,
     device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer],
