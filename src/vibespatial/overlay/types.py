@@ -25,14 +25,18 @@ class SplitEventDeviceState:
     t: DeviceArray
     x: DeviceArray
     y: DeviceArray
+    source_side: DeviceArray | None = None
+    row_indices: DeviceArray | None = None
+    part_indices: DeviceArray | None = None
+    ring_indices: DeviceArray | None = None
 
 
 @dataclass
 class SplitEventTable:
-    """Split event table with device-primary storage and lazy host materialization.
+    """Split event table with lazy host materialization.
 
-    Device arrays in ``device_state`` are authoritative.  Host numpy arrays
-    are populated lazily via ``_ensure_host()`` on first property access.
+    When produced by the GPU pipeline, all arrays live in ``device_state``
+    and host numpy arrays are lazily copied on first property access.
     GPU-only consumers that read only ``device_state``, ``count``,
     ``left_segment_count``, ``right_segment_count``, and
     ``runtime_selection`` never trigger device-to-host copies.
@@ -42,7 +46,7 @@ class SplitEventTable:
     runtime_selection: RuntimeSelection
     device_state: SplitEventDeviceState
     _count: int = 0
-    # Host arrays -- lazily materialized from device_state on first access.
+    # Host arrays — lazily materialized from device_state on first access.
     _source_segment_ids: np.ndarray | None = None
     _source_side: np.ndarray | None = None
     _row_indices: np.ndarray | None = None
@@ -63,9 +67,41 @@ class SplitEventTable:
         self._source_segment_ids = np.asarray(
             runtime.copy_device_to_host(ds.source_segment_ids), dtype=np.int32,
         )
-        self._t = np.asarray(runtime.copy_device_to_host(ds.t), dtype=np.float64)
-        self._x = np.asarray(runtime.copy_device_to_host(ds.x), dtype=np.float64)
-        self._y = np.asarray(runtime.copy_device_to_host(ds.y), dtype=np.float64)
+        self._t = np.asarray(
+            runtime.copy_device_to_host(ds.t), dtype=np.float64,
+        )
+        self._x = np.asarray(
+            runtime.copy_device_to_host(ds.x), dtype=np.float64,
+        )
+        self._y = np.asarray(
+            runtime.copy_device_to_host(ds.y), dtype=np.float64,
+        )
+        if ds.source_side is not None:
+            self._source_side = np.asarray(
+                runtime.copy_device_to_host(ds.source_side), dtype=np.int8,
+            )
+        else:
+            # Derive from source_segment_ids + left_segment_count
+            ids = self._source_segment_ids
+            self._source_side = np.where(ids < self.left_segment_count, 1, 2).astype(np.int8)
+        if ds.row_indices is not None:
+            self._row_indices = np.asarray(
+                runtime.copy_device_to_host(ds.row_indices), dtype=np.int32,
+            )
+        else:
+            self._row_indices = np.empty(0, dtype=np.int32)
+        if ds.part_indices is not None:
+            self._part_indices = np.asarray(
+                runtime.copy_device_to_host(ds.part_indices), dtype=np.int32,
+            )
+        else:
+            self._part_indices = np.empty(0, dtype=np.int32)
+        if ds.ring_indices is not None:
+            self._ring_indices = np.asarray(
+                runtime.copy_device_to_host(ds.ring_indices), dtype=np.int32,
+            )
+        else:
+            self._ring_indices = np.empty(0, dtype=np.int32)
 
     @property
     def source_segment_ids(self) -> np.ndarray:
@@ -74,28 +110,23 @@ class SplitEventTable:
 
     @property
     def source_side(self) -> np.ndarray:
-        if self._source_side is None:
-            ids = self.source_segment_ids
-            self._source_side = np.where(ids < self.left_segment_count, 1, 2).astype(np.int8)
+        self._ensure_host()
         return self._source_side  # type: ignore[return-value]
 
     @property
     def row_indices(self) -> np.ndarray:
-        if self._row_indices is None:
-            return np.empty(0, dtype=np.int32)
-        return self._row_indices
+        self._ensure_host()
+        return self._row_indices  # type: ignore[return-value]
 
     @property
     def part_indices(self) -> np.ndarray:
-        if self._part_indices is None:
-            return np.empty(0, dtype=np.int32)
-        return self._part_indices
+        self._ensure_host()
+        return self._part_indices  # type: ignore[return-value]
 
     @property
     def ring_indices(self) -> np.ndarray:
-        if self._ring_indices is None:
-            return np.empty(0, dtype=np.int32)
-        return self._ring_indices
+        self._ensure_host()
+        return self._ring_indices  # type: ignore[return-value]
 
     @property
     def t(self) -> np.ndarray:
