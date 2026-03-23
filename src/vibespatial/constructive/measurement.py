@@ -1143,17 +1143,18 @@ def area_owned(
         try:
             result = _area_gpu(owned, precision_plan=precision_plan)
             result[~owned.validity] = np.nan
+        except Exception:
+            pass  # fall through to CPU
+        else:
             record_dispatch_event(
                 surface="geopandas.array.area",
                 operation="area",
                 implementation="gpu_nvrtc_shoelace",
                 reason="GPU NVRTC area kernel",
-                detail=f"rows={row_count}, precision={precision_plan.compute_dtype}",
+                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
-            pass  # fall through to CPU
 
     record_dispatch_event(
         surface="geopandas.array.area",
@@ -1224,17 +1225,18 @@ def length_owned(
         try:
             result = _length_gpu(owned, precision_plan=precision_plan)
             result[~owned.validity] = np.nan
+        except Exception:
+            pass  # fall through to CPU
+        else:
             record_dispatch_event(
                 surface="geopandas.array.length",
                 operation="length",
                 implementation="gpu_nvrtc_segment_length",
                 reason="GPU NVRTC length kernel",
-                detail=f"rows={row_count}, precision={precision_plan.compute_dtype}",
+                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
-            pass  # fall through to CPU
 
     record_dispatch_event(
         surface="geopandas.array.length",

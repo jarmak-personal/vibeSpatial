@@ -14,6 +14,8 @@ ADR-0002: COARSE class — simplification tolerance is user-specified.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 try:
@@ -37,11 +39,13 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass
-from vibespatial.runtime.residency import Residency
+from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
 from .measurement import _PRECISION_PREAMBLE
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # NVRTC kernel: compute effective area per vertex (Visvalingam-Whyatt)
@@ -446,6 +450,32 @@ def _simplify_family_cpu(buf, family, tolerance, preserve_topology=True):
 
 
 # ---------------------------------------------------------------------------
+# CPU dispatch variant (registered)
+# ---------------------------------------------------------------------------
+
+@register_kernel_variant(
+    "geometry_simplify",
+    "cpu",
+    kernel_class=KernelClass.COARSE,
+    execution_modes=(ExecutionMode.CPU,),
+    geometry_families=(
+        "linestring", "multilinestring", "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    tags=("cpu", "shapely", "simplify"),
+)
+def _simplify_cpu(owned, tolerance, preserve_topology=True):
+    """CPU simplify via Shapely's optimized C implementation."""
+    import shapely as _shapely
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    geoms = owned.to_shapely()
+    results = _shapely.simplify(geoms, tolerance, preserve_topology=preserve_topology)
+    return from_shapely_geometries(list(results))
+
+
+# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -455,6 +485,7 @@ def simplify_owned(
     *,
     preserve_topology: bool = True,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> OwnedGeometryArray:
     """Simplify geometries using Visvalingam-Whyatt algorithm.
 
@@ -467,6 +498,8 @@ def simplify_owned(
         If True, ensures simplified geometries remain valid.
     dispatch_mode : ExecutionMode
         Execution mode selection (AUTO / CPU / GPU).
+    precision : PrecisionMode
+        Precision mode selection (AUTO / FP32 / FP64).
 
     Returns
     -------
@@ -488,22 +521,37 @@ def simplify_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
+        # Precision plan computed for future fp32 kernel wiring (ADR-0002 COARSE).
+        # The GPU kernel currently runs fp64-only; the plan is not yet consumed.
+        _precision_plan = select_precision_plan(
+            runtime_selection=selection,
+            kernel_class=KernelClass.COARSE,
+            requested=precision,
+        )
         try:
-            return _simplify_gpu(owned, tolerance)
+            result = _simplify_gpu(owned, tolerance)
         except Exception:
-            pass  # fall through to CPU
+            logger.warning("GPU simplify failed, falling back to CPU", exc_info=True)
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.simplify",
+                operation="simplify",
+                implementation="gpu_nvrtc_vw_simplify",
+                reason="GPU NVRTC Visvalingam-Whyatt simplify kernel",
+                detail=f"rows={row_count}, precision=fp64",
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+            )
+            return result
 
-    new_families = {}
-    for family, buf in owned.families.items():
-        if buf.row_count == 0:
-            new_families[family] = buf
-            continue
-        new_families[family] = _simplify_family_cpu(buf, family, tolerance, preserve_topology)
-
-    return OwnedGeometryArray(
-        validity=owned.validity.copy(),
-        tags=owned.tags.copy(),
-        family_row_offsets=owned.family_row_offsets.copy(),
-        families=new_families,
-        residency=Residency.HOST,
+    result = _simplify_cpu(owned, tolerance, preserve_topology)
+    record_dispatch_event(
+        surface="geopandas.array.simplify",
+        operation="simplify",
+        implementation="cpu_vw_simplify",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        requested=dispatch_mode,
+        selected=ExecutionMode.CPU,
     )
+    return result

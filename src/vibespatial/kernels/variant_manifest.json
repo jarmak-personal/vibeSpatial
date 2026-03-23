@@ -62,6 +62,21 @@
   },
   {
     "geom_types": [
+      "linestring",
+      "multilinestring",
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "geometry_simplify",
+    "module": "vibespatial.constructive.simplify",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python",
+      "cpu"
+    ]
+  },
+  {
+    "geom_types": [
       "polygon",
       "multipolygon",
       "linestring",

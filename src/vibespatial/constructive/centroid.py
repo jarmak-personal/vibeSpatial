@@ -1014,18 +1014,19 @@ def centroid_owned(
         )
         try:
             result = _centroid_gpu(owned, precision_plan=precision_plan)
+        except Exception:
+            pass  # fall through to CPU
+        else:
             record_dispatch_event(
                 surface="geopandas.array.centroid",
                 operation="centroid",
                 implementation="gpu_nvrtc_centroid",
                 reason="GPU NVRTC centroid kernel",
-                detail=f"rows={row_count}, precision={precision_plan.compute_dtype}",
+                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
                 requested=dispatch_mode,
                 selected=ExecutionMode.GPU,
             )
             return result
-        except Exception:
-            pass  # fall through to CPU
 
     cx, cy = _centroid_cpu(owned)
     cx[~owned.validity] = np.nan

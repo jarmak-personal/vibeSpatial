@@ -14724,6 +14724,7 @@
         "_simplify_gpu",
         "_vw_simplify_span",
         "_simplify_family_cpu",
+        "_simplify_cpu",
         "simplify_owned"
       ],
       "tokens": [
