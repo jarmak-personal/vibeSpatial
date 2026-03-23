@@ -5,7 +5,7 @@ Scope: GeoPandas method delegation, dispatch events, and object-construction avo
 Read If: You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.
 STOP IF: Your task already has the adapter implementation open and only needs local detail.
 Source Of Truth: API dispatch policy for GeoPandas-facing method boundaries.
-Body Budget: 67/220 lines
+Body Budget: 68/220 lines
 Document: docs/architecture/api-dispatch.md
 
 Section Map (Body Lines)
@@ -14,12 +14,12 @@ Section Map (Body Lines)
 | 1-2 | Preamble |
 | 3-8 | Intent |
 | 9-16 | Request Signals |
-| 17-23 | Open First |
-| 24-28 | Verify |
-| 29-34 | Risks |
-| 35-50 | Decision |
-| 51-60 | Performance Notes |
-| 61-67 | Current Behavior |
+| 17-24 | Open First |
+| 25-29 | Verify |
+| 30-35 | Risks |
+| 36-51 | Decision |
+| 52-61 | Performance Notes |
+| 62-68 | Current Behavior |
 DOC_HEADER:END -->
 
 ## Intent
@@ -39,6 +39,7 @@ or hiding which implementation actually ran.
 ## Open First
 
 - docs/architecture/api-dispatch.md
+- src/vibespatial/api/geometry_array.py
 - src/vibespatial/geometry/device_array.py
 - src/geopandas/__init__.py
 - tests/test_geopandas_dispatch.py
@@ -62,9 +63,9 @@ or hiding which implementation actually ran.
   kernels that need it repeatedly.
 - Record explicit dispatch events at the public method boundary for
   high-traffic surfaces (currently `buffer`, `offset_curve`, `clip_by_rect`,
-  `make_valid`, and `dissolve`).  Unary and binary constructive ops
-  (`boundary`, `convex_hull`, `intersection`, `union`, `difference`,
-  `symmetric_difference`, `rotate`, `scale`, `skew`) and distance metrics
+  `make_valid`, `dissolve`, `intersection`, `union`, `difference`, and
+  `symmetric_difference`).  Unary constructive ops (`boundary`,
+  `convex_hull`, `rotate`, `scale`, `skew`) and distance metrics
   (`hausdorff_distance`, `frechet_distance`) route through owned paths
   directly without per-call dispatch events.
 - Keep host-competitive Shapely paths in place when owned host prototypes are

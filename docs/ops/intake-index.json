@@ -215,6 +215,7 @@
       },
       "open_first": [
         "docs/architecture/api-dispatch.md",
+        "src/vibespatial/api/geometry_array.py",
         "src/vibespatial/geometry/device_array.py",
         "src/geopandas/__init__.py",
         "tests/test_geopandas_dispatch.py"
@@ -12309,6 +12310,7 @@
       "kind": "source",
       "path": "src/vibespatial/api/geometry_array.py",
       "referenced_by": [
+        "docs/architecture/api-dispatch.md",
         "docs/architecture/binary-predicates.md"
       ],
       "symbols": [

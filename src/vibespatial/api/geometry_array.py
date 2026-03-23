@@ -754,6 +754,20 @@ class GeometryArray(ExtensionArray):
 
     @property
     def is_empty(self):
+        if self._owned is not None:
+            owned = self._owned
+            # Ensure host buffers are materialized (device-resident arrays
+            # may have empty host stubs with zero-length empty_mask).
+            owned._ensure_host_state()
+            result = np.zeros(owned.row_count, dtype=bool)
+            # Null rows carry NULL_TAG (-1) so they never match any family
+            # tag and correctly stay False (matching shapely.is_empty(None)).
+            for family, buf in owned.families.items():
+                tag = FAMILY_TAGS[family]
+                rows = np.flatnonzero(owned.tags == tag)
+                if rows.size > 0:
+                    result[rows] = buf.empty_mask[owned.family_row_offsets[rows]]
+            return result
         return shapely.is_empty(self._data)
 
     @property
@@ -786,10 +800,16 @@ class GeometryArray(ExtensionArray):
 
     @property
     def has_z(self):
+        if self._owned is not None:
+            # OwnedGeometryArray stores only 2D (x, y) coordinates.
+            return np.zeros(self._owned.row_count, dtype=bool)
         return shapely.has_z(self._data)
 
     @property
     def has_m(self):
+        if self._owned is not None:
+            # OwnedGeometryArray stores only 2D (x, y) coordinates.
+            return np.zeros(self._owned.row_count, dtype=bool)
         return shapely.has_m(self._data)
 
     @property
@@ -1241,11 +1261,42 @@ class GeometryArray(ExtensionArray):
 
     def _constructive_or_fallback(self, op, other, **kwargs) -> GeometryArray:
         """Dispatch binary constructive ops through owned path when available."""
-        if self._owned is not None and isinstance(other, GeometryArray) and other._owned is not None:
+        if self._owned is not None:
             from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
-            result_owned = binary_constructive_owned(op, self._owned, other._owned, **kwargs)
-            return GeometryArray.from_owned(result_owned, crs=self.crs)
+            # Coerce other to OwnedGeometryArray.
+            if isinstance(other, BaseGeometry):
+                # Broadcast scalar to match array length.  This is O(N) in
+                # from_shapely_geometries; a future optimisation is kernel-
+                # level broadcasting so only one row needs to be stored.
+                other_owned = from_shapely_geometries([other] * len(self))
+            elif isinstance(other, GeometryArray):
+                other_owned = other.to_owned()
+            else:
+                other_owned = None
+
+            if other_owned is not None:
+                result_owned = binary_constructive_owned(
+                    op, self._owned, other_owned, **kwargs,
+                )
+                record_dispatch_event(
+                    surface=f"geopandas.array.{op}",
+                    operation=op,
+                    implementation="binary_constructive_owned",
+                    reason="owned binary constructive dispatch",
+                    detail=f"rows={len(self)}",
+                    selected=ExecutionMode.GPU,
+                )
+                return GeometryArray.from_owned(result_owned, crs=self.crs)
+
+        record_dispatch_event(
+            surface=f"geopandas.array.{op}",
+            operation=op,
+            implementation="shapely_host",
+            reason="no owned geometry array available or unsupported other type",
+            detail=f"rows={len(self)}",
+            selected=ExecutionMode.CPU,
+        )
         return GeometryArray(
             self._binary_method(op, self, other, **kwargs), crs=self.crs,
         )
@@ -1922,12 +1973,15 @@ class GeometryArray(ExtensionArray):
     @property
     def total_bounds(self):
         if len(self) == 0:
-            # numpy 'min' cannot handle empty arrays
-            # TODO with numpy >= 1.15, the 'initial' argument can be used
             return np.array([np.nan, np.nan, np.nan, np.nan])
+        if self._owned is not None:
+            from vibespatial.kernels.core.geometry_analysis import (
+                compute_total_bounds,
+            )
+
+            return np.array(compute_total_bounds(self._owned))
         b = self.bounds
         with warnings.catch_warnings():
-            # if all rows are empty geometry / none, nan is expected
             warnings.filterwarnings(
                 "ignore", r"All-NaN slice encountered", RuntimeWarning
             )
