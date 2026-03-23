@@ -40,6 +40,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
@@ -335,11 +336,32 @@ def affine_transform_owned(
 
     if selection.selected is ExecutionMode.GPU:
         try:
-            return _affine_transform_gpu(owned, a, b, xoff, d, e, yoff)
+            result = _affine_transform_gpu(owned, a, b, xoff, d, e, yoff)
         except Exception:
             pass
+        else:
+            record_dispatch_event(
+                surface="geopandas.array.affine_transform",
+                operation="affine_transform",
+                implementation="affine_transform_gpu_nvrtc",
+                reason=selection.reason,
+                detail=f"rows={row_count}",
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
 
-    return _affine_transform_cpu(owned, a, b, xoff, d, e, yoff)
+    result = _affine_transform_cpu(owned, a, b, xoff, d, e, yoff)
+    record_dispatch_event(
+        surface="geopandas.array.affine_transform",
+        operation="affine_transform",
+        implementation="affine_transform_cpu_numpy",
+        reason="CPU fallback",
+        detail=f"rows={row_count}",
+        requested=selection.requested,
+        selected=ExecutionMode.CPU,
+    )
+    return result
 
 
 def translate_owned(
