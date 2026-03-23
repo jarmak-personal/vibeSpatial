@@ -49,6 +49,8 @@ def _ensure_geometry_column(df):
 
 def _intersecting_index_pairs(df1, df2):
     # ADR-0036 boundary: produces spatial index arrays only.
+    # sindex.query has its own owned-dispatch path (sindex.py lines 334-378)
+    # that routes through query_spatial_index when both sides support owned.
     if not strict_native_mode_enabled():
         return df2.sindex.query(df1.geometry, predicate="intersects", sort=True)
 
@@ -103,8 +105,9 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
         # level (no Shapely materialization), then binary_constructive_owned
         # routes to GPU when available.  GeoSeries.take() breaks the DGA chain
         # by materializing to Shapely, so we bypass it when owned is present.
-        # Note: owned arrays are extracted in overlay() BEFORE _make_valid,
-        # which destroys owned backing via df.copy().
+        # Note: GeometryArray.copy() preserves _owned, and __setitem__
+        # invalidates it on mutation, so owned survives _make_valid when
+        # all geometries are already valid.
         intersections = None
         if left_owned is not None and right_owned is not None:
             from vibespatial.constructive.binary_constructive import (
@@ -220,8 +223,11 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             # Binary difference via owned dispatch (GPU when available).
             left_sub = left_owned.take(idx1_unique)
             right_union_owned = from_shapely_geometries(right_union_list)
+            # Force CPU dispatch: right_union_owned is host-materialized
+            # from shapely.union_all, so GPU upload would be gratuitous.
             diff_owned = binary_constructive_owned(
                 "difference", left_sub, right_union_owned,
+                dispatch_mode=ExecutionMode.CPU,
             )
 
             # Assemble full result: unchanged left rows read from the
@@ -521,20 +527,14 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     if keep_geom_type:
         geom_type = df1.geom_type.iloc[0]
 
-    # Extract owned arrays BEFORE _make_valid, which destroys owned backing
-    # via df.copy() -> GeometryArray.copy() -> _owned dropped.
-    left_owned, right_owned = _extract_owned_pair(df1, df2)
-    _pre_rows = (len(df1), len(df2))
-
     df1 = _make_valid(df1)
     df2 = _make_valid(df2)
 
-    # If _make_valid dropped rows (invalid polygons that become
-    # GeometryCollections without a polygon component), the pre-extracted
-    # owned arrays have a different row-to-position mapping than the
-    # post-_make_valid DataFrames.  Invalidate to avoid stale indices.
-    if left_owned is not None and (len(df1), len(df2)) != _pre_rows:
-        left_owned = right_owned = None
+    # Extract owned arrays AFTER _make_valid.  GeometryArray.copy() now
+    # preserves _owned backing, and __setitem__ invalidates it only for
+    # mutated rows.  If _make_valid mutated all rows or dropped rows via
+    # _collection_extract, _owned will already be None here.
+    left_owned, right_owned = _extract_owned_pair(df1, df2)
 
     _used_owned = False
     with warnings.catch_warnings():  # CRS checked above, suppress array-level warning

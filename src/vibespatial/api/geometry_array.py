@@ -29,14 +29,12 @@ from vibespatial.api._compat import (
     requires_pyproj,
 )
 from vibespatial.api.sindex import SpatialIndex
-from vibespatial.predicates.binary import (
-    evaluate_geopandas_binary_predicate,
-    supports_binary_predicate,
-)
 from vibespatial.constructive.clip_rect import evaluate_geopandas_clip_by_rect
-from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.spatial.distance_owned import evaluate_geopandas_dwithin
 from vibespatial.constructive.make_valid_pipeline import evaluate_geopandas_make_valid
+from vibespatial.constructive.stroke import (
+    evaluate_geopandas_buffer,
+    evaluate_geopandas_offset_curve,
+)
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -45,6 +43,12 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
 )
+from vibespatial.predicates.binary import (
+    evaluate_geopandas_binary_predicate,
+    supports_binary_predicate,
+)
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.provenance import (
     ProvenanceTag,
     attempt_provenance_rewrite,
@@ -52,8 +56,7 @@ from vibespatial.runtime.provenance import (
     provenance_rewrites_enabled,
     record_rewrite_event,
 )
-from vibespatial.runtime import ExecutionMode
-from vibespatial.constructive.stroke import evaluate_geopandas_buffer, evaluate_geopandas_offset_curve
+from vibespatial.spatial.distance_owned import evaluate_geopandas_dwithin
 
 if typing.TYPE_CHECKING:
     import numpy.typing as npt
@@ -705,8 +708,8 @@ class GeometryArray(ExtensionArray):
         if owned is None:
             owned = self.to_owned()
         if self._owned_flat_sindex is None:
-            from vibespatial.spatial.indexing import build_flat_spatial_index
             from vibespatial.runtime import ExecutionMode, RuntimeSelection
+            from vibespatial.spatial.indexing import build_flat_spatial_index
 
             self._owned_flat_sindex = build_flat_spatial_index(
                 owned,
@@ -2024,7 +2027,19 @@ class GeometryArray(ExtensionArray):
 
     def copy(self, *args, **kwargs) -> GeometryArray:
         # still taking args/kwargs for compat with pandas 0.24
-        result = GeometryArray(self._data.copy(), crs=self._crs)
+        if self._owned is not None and self._shapely_data is None:
+            # Preserve owned backing without triggering Shapely materialization.
+            # __setitem__ invalidates _owned on mutation, so sharing is safe
+            # for the _make_valid pattern (copy → mutate subset → _owned cleared).
+            # Note: the shared OwnedGeometryArray has mutable device_state;
+            # callers that trigger move_to(HOST) on one copy affect the other.
+            # This is acceptable for the overlay pipeline where both copies
+            # operate on the same data at the same residency.
+            result = GeometryArray.from_owned(self._owned, crs=self._crs)
+        else:
+            result = GeometryArray(self._data.copy(), crs=self._crs)
+            if self._owned is not None:
+                result._owned = self._owned
         result._provenance = self._provenance
         return result
 
@@ -2036,6 +2051,13 @@ class GeometryArray(ExtensionArray):
                 fill_value = None
             elif not _is_scalar_geometry(fill_value):
                 raise TypeError("provide geometry or None as fill value")
+
+        # Owned-path: OwnedGeometryArray.take() operates at buffer level
+        # without Shapely materialization.  Preserves DGA chain for downstream
+        # dispatch (e.g., overlay intersection via binary_constructive_owned).
+        if self._owned is not None and not allow_fill:
+            result_owned = self._owned.take(np.asarray(indices))
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
 
         result = take(self._data, indices, allow_fill=allow_fill, fill_value=fill_value)
         if allow_fill and fill_value is None:

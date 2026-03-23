@@ -3427,145 +3427,165 @@ def spatial_overlay_owned(
     left_subset = left.take(unique_left) if len(unique_left) < left.row_count else left
     right_subset = right.take(unique_right) if len(unique_right) < right.row_count else right
 
-    # Materialize only participating rows to shapely.
-    left_shapely_orig = np.asarray(left_subset.to_shapely(), dtype=object)
-    right_shapely_orig = np.asarray(right_subset.to_shapely(), dtype=object)
+    # Owned-dispatch path: route pairwise overlay through binary_constructive_owned
+    # which handles validation, precision planning, and GPU/CPU dispatch internally.
+    # Avoids to_shapely() materialization for the entire pipeline.
+    _used_owned_dispatch = False
+    try:
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
-    # Validate input geometries ONCE before replication (ADR-0019).
-    # This avoids running make_valid on 10K replicated copies of the same
-    # invalid geometry. Validate on the (smaller) subset, then gather.
-    left_invalid_mask = ~np.asarray(shapely.is_valid(left_shapely_orig), dtype=bool)
-    right_invalid_mask = ~np.asarray(shapely.is_valid(right_shapely_orig), dtype=bool)
-    if np.any(left_invalid_mask):
-        left_shapely_orig[left_invalid_mask] = shapely.make_valid(left_shapely_orig[left_invalid_mask])
-    if np.any(right_invalid_mask):
-        right_shapely_orig[right_invalid_mask] = shapely.make_valid(right_shapely_orig[right_invalid_mask])
+        left_gathered = left_subset.take(left_subset_indices)
+        right_gathered = right_subset.take(right_subset_indices)
+        result_owned = binary_constructive_owned(how, left_gathered, right_gathered)
 
-    # Gather at pair indices (replication happens here, after validation)
-    left_shapely = left_shapely_orig[left_subset_indices]
-    right_shapely = right_shapely_orig[right_subset_indices]
-
-    # Fast path: many-vs-one intersection with clip_by_rect (ADR-0033 Tier 2).
-    # When right has exactly 1 geometry and how=="intersection", check if that
-    # geometry is an axis-aligned rectangle. If so, shapely.clip_by_rect is
-    # significantly faster than shapely.intersection for the many-vs-one case.
-    _used_clip_by_rect = False
-    if how == "intersection" and right.row_count == 1:
-        right_geom = right_shapely_orig[0]
-        if right_geom is not None and right_geom.geom_type == "Polygon" and not right_geom.is_empty:
-            coords = np.asarray(right_geom.exterior.coords)
-            # Rectangle check: exactly 5 coords (closed ring), all axis-aligned edges
-            if len(coords) == 5:
-                xs, ys = coords[:4, 0], coords[:4, 1]
-                x_vals = np.unique(xs)
-                y_vals = np.unique(ys)
-                if len(x_vals) == 2 and len(y_vals) == 2 and len(right_geom.interiors) == 0:
-                    xmin, xmax = float(x_vals[0]), float(x_vals[1])
-                    ymin, ymax = float(y_vals[0]), float(y_vals[1])
-                    result_geoms = shapely.clip_by_rect(left_shapely, xmin, ymin, xmax, ymax)
-                    _used_clip_by_rect = True
-
-    # Fast path: many-vs-one intersection with GPU centroid pre-filter.
-    # When intersecting N left polygons against 1 right polygon, most left
-    # polygons are fully contained.  GPU centroid + bbox test classifies
-    # ~90-100% as fully-inside (no clip needed), leaving only boundary
-    # polygons for the expensive Shapely intersection.  This reduces the
-    # CPU intersection work from O(N) to O(boundary_count).
-    _used_centroid_filter = False
-    if (not _used_clip_by_rect
-            and how == "intersection"
-            and right.row_count == 1
-            and left.row_count >= 100
-            and _has_polygonal_families(left)):
-        right_geom = right_shapely_orig[0]
-        if right_geom is not None and not right_geom.is_empty:
-            from vibespatial.constructive.polygon import polygon_centroids_owned
-            from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-            try:
-                # GPU centroid computation (Tier 1 NVRTC kernel, <1ms warm)
-                cx, cy = polygon_centroids_owned(left_subset)
-                centroids = shapely.points(cx, cy)
-                # Vectorized PIP: test centroids against the single mask polygon
-                inside_mask = np.asarray(shapely.within(centroids, right_geom), dtype=bool)
-                # For inside polygons, check bbox fully inside mask bbox
-                mask_bounds = right_geom.bounds  # (xmin, ymin, xmax, ymax)
-                left_bounds = compute_geometry_bounds(left_subset)
-                inside_idx = np.flatnonzero(inside_mask)
-                if inside_idx.size > 0:
-                    bbox_fully_inside = (
-                        (left_bounds[inside_idx, 0] >= mask_bounds[0])
-                        & (left_bounds[inside_idx, 1] >= mask_bounds[1])
-                        & (left_bounds[inside_idx, 2] <= mask_bounds[2])
-                        & (left_bounds[inside_idx, 3] >= mask_bounds[1])
-                    )
-                    fully_inside_rows = inside_idx[bbox_fully_inside]
-                else:
-                    fully_inside_rows = np.asarray([], dtype=np.intp)
-                # Remaining rows need actual intersection
-                all_rows = np.arange(left_subset.row_count)
-                need_clip_rows = np.setdiff1d(all_rows, fully_inside_rows)
-                if need_clip_rows.size < left_subset.row_count:
-                    # Build output: fully-inside polygons kept unchanged,
-                    # boundary polygons clipped via Shapely C intersection.
-                    result_parts = []
-                    if fully_inside_rows.size > 0:
-                        result_parts.extend(left_shapely_orig[fully_inside_rows].tolist())
-                    if need_clip_rows.size > 0:
-                        clip_left = left_shapely_orig[need_clip_rows]
-                        clip_right = np.full(len(need_clip_rows), right_geom, dtype=object)
-                        clipped = shapely.intersection(clip_left, clip_right)
-                        result_parts.extend(clipped.tolist())
-                    result_geoms = np.asarray(result_parts, dtype=object)
-                    _used_centroid_filter = True
-            except Exception:
-                pass  # fall through to general path
-
-    if not _used_clip_by_rect and not _used_centroid_filter:
-        if how == "intersection":
-            result_geoms = shapely.intersection(left_shapely, right_shapely)
-        elif how == "union":
-            result_geoms = shapely.union(left_shapely, right_shapely)
-        elif how == "difference":
-            result_geoms = shapely.difference(left_shapely, right_shapely)
-        elif how == "symmetric_difference":
-            result_geoms = shapely.symmetric_difference(left_shapely, right_shapely)
+        # Filter empty/null using owned-level metadata (validity + empty_mask)
+        # instead of to_shapely() — avoids D->H->D ping-pong.
+        # binary_constructive_owned returns polygon-family results (no
+        # GeometryCollections), so collection flattening is unnecessary.
+        result_owned._ensure_host_state()
+        non_empty = result_owned.validity.copy()
+        for family, buf in result_owned.families.items():
+            family_rows = (result_owned.tags == FAMILY_TAGS[family])
+            non_empty[family_rows] &= ~buf.empty_mask[
+                result_owned.family_row_offsets[family_rows]
+            ]
+        keep_indices = np.flatnonzero(non_empty)
+        if keep_indices.size == 0:
+            result = from_shapely_geometries([shapely.Point()])
+            result = result.take(np.asarray([], dtype=np.int64))
         else:
-            raise ValueError(f"unsupported spatial overlay operation: {how}")
+            result = result_owned.take(keep_indices)
+        _used_owned_dispatch = True
+    except (NotImplementedError, ImportError, ValueError):
+        _used_owned_dispatch = False
 
-    # Stage 3: Filter out empty/null results.
-    # Use vectorized shapely operations to avoid Python-level per-element loop
-    # for the common case (no GeometryCollections in output).
-    result_arr = np.asarray(result_geoms, dtype=object) if not isinstance(result_geoms, np.ndarray) else result_geoms
-    non_null = result_arr != None  # noqa: E711 — intentional identity check for numpy
-    non_empty_mask = np.zeros(len(result_arr), dtype=bool)
-    if np.any(non_null):
-        non_empty_mask[non_null] = ~shapely.is_empty(result_arr[non_null])
-    candidates = result_arr[non_empty_mask]
+    if not _used_owned_dispatch:
+        # Shapely fallback: materialize participating rows for validation + clipping.
+        left_shapely_orig = np.asarray(left_subset.to_shapely(), dtype=object)
+        right_shapely_orig = np.asarray(right_subset.to_shapely(), dtype=object)
 
-    # Check for GeometryCollections that need flattening
-    valid_geoms = []
-    has_collections = False
-    for g in candidates:
-        if g.geom_type == "GeometryCollection":
-            has_collections = True
-            for part in g.geoms:
-                if part.geom_type in (
-                    "Point", "LineString", "Polygon",
-                    "MultiPoint", "MultiLineString", "MultiPolygon",
-                ) and not part.is_empty:
-                    valid_geoms.append(part)
+        # Validate input geometries ONCE before replication (ADR-0019).
+        # This avoids running make_valid on 10K replicated copies of the same
+        # invalid geometry. Validate on the (smaller) subset, then gather.
+        left_invalid_mask = ~np.asarray(shapely.is_valid(left_shapely_orig), dtype=bool)
+        right_invalid_mask = ~np.asarray(shapely.is_valid(right_shapely_orig), dtype=bool)
+        if np.any(left_invalid_mask):
+            left_shapely_orig[left_invalid_mask] = shapely.make_valid(left_shapely_orig[left_invalid_mask])
+        if np.any(right_invalid_mask):
+            right_shapely_orig[right_invalid_mask] = shapely.make_valid(right_shapely_orig[right_invalid_mask])
+
+        # Gather at pair indices (replication happens here, after validation)
+        left_shapely = left_shapely_orig[left_subset_indices]
+        right_shapely = right_shapely_orig[right_subset_indices]
+
+    if not _used_owned_dispatch:
+        # Shapely fast paths and general case (only when owned dispatch failed).
+
+        # Fast path: many-vs-one intersection with clip_by_rect (ADR-0033 Tier 2).
+        _used_clip_by_rect = False
+        if how == "intersection" and right.row_count == 1:
+            right_geom = right_shapely_orig[0]
+            if right_geom is not None and right_geom.geom_type == "Polygon" and not right_geom.is_empty:
+                coords = np.asarray(right_geom.exterior.coords)
+                if len(coords) == 5:
+                    xs, ys = coords[:4, 0], coords[:4, 1]
+                    x_vals = np.unique(xs)
+                    y_vals = np.unique(ys)
+                    if len(x_vals) == 2 and len(y_vals) == 2 and len(right_geom.interiors) == 0:
+                        xmin, xmax = float(x_vals[0]), float(x_vals[1])
+                        ymin, ymax = float(y_vals[0]), float(y_vals[1])
+                        result_geoms = shapely.clip_by_rect(left_shapely, xmin, ymin, xmax, ymax)
+                        _used_clip_by_rect = True
+
+        # Fast path: many-vs-one intersection with GPU centroid pre-filter.
+        _used_centroid_filter = False
+        if (not _used_clip_by_rect
+                and how == "intersection"
+                and right.row_count == 1
+                and left.row_count >= 100
+                and _has_polygonal_families(left)):
+            right_geom = right_shapely_orig[0]
+            if right_geom is not None and not right_geom.is_empty:
+                from vibespatial.constructive.polygon import polygon_centroids_owned
+                from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+                try:
+                    cx, cy = polygon_centroids_owned(left_subset)
+                    centroids = shapely.points(cx, cy)
+                    inside_mask = np.asarray(shapely.within(centroids, right_geom), dtype=bool)
+                    mask_bounds = right_geom.bounds
+                    left_bounds = compute_geometry_bounds(left_subset)
+                    inside_idx = np.flatnonzero(inside_mask)
+                    if inside_idx.size > 0:
+                        bbox_fully_inside = (
+                            (left_bounds[inside_idx, 0] >= mask_bounds[0])
+                            & (left_bounds[inside_idx, 1] >= mask_bounds[1])
+                            & (left_bounds[inside_idx, 2] <= mask_bounds[2])
+                            & (left_bounds[inside_idx, 3] >= mask_bounds[1])
+                        )
+                        fully_inside_rows = inside_idx[bbox_fully_inside]
+                    else:
+                        fully_inside_rows = np.asarray([], dtype=np.intp)
+                    all_rows = np.arange(left_subset.row_count)
+                    need_clip_rows = np.setdiff1d(all_rows, fully_inside_rows)
+                    if need_clip_rows.size < left_subset.row_count:
+                        result_parts = []
+                        if fully_inside_rows.size > 0:
+                            result_parts.extend(left_shapely_orig[fully_inside_rows].tolist())
+                        if need_clip_rows.size > 0:
+                            clip_left = left_shapely_orig[need_clip_rows]
+                            clip_right = np.full(len(need_clip_rows), right_geom, dtype=object)
+                            clipped = shapely.intersection(clip_left, clip_right)
+                            result_parts.extend(clipped.tolist())
+                        result_geoms = np.asarray(result_parts, dtype=object)
+                        _used_centroid_filter = True
+                except Exception:
+                    pass  # fall through to general path
+
+        if not _used_clip_by_rect and not _used_centroid_filter:
+            if how == "intersection":
+                result_geoms = shapely.intersection(left_shapely, right_shapely)
+            elif how == "union":
+                result_geoms = shapely.union(left_shapely, right_shapely)
+            elif how == "difference":
+                result_geoms = shapely.difference(left_shapely, right_shapely)
+            elif how == "symmetric_difference":
+                result_geoms = shapely.symmetric_difference(left_shapely, right_shapely)
+            else:
+                raise ValueError(f"unsupported spatial overlay operation: {how}")
+
+    if not _used_owned_dispatch:
+        # Stage 3: Filter out empty/null results (Shapely path only).
+        # The owned-dispatch path does its own filtering above.
+        result_arr = np.asarray(result_geoms, dtype=object) if not isinstance(result_geoms, np.ndarray) else result_geoms
+        non_null = result_arr != None  # noqa: E711 — intentional identity check for numpy
+        non_empty_mask = np.zeros(len(result_arr), dtype=bool)
+        if np.any(non_null):
+            non_empty_mask[non_null] = ~shapely.is_empty(result_arr[non_null])
+        candidates = result_arr[non_empty_mask]
+
+        # Check for GeometryCollections that need flattening
+        valid_geoms = []
+        has_collections = False
+        for g in candidates:
+            if g.geom_type == "GeometryCollection":
+                has_collections = True
+                for part in g.geoms:
+                    if part.geom_type in (
+                        "Point", "LineString", "Polygon",
+                        "MultiPoint", "MultiLineString", "MultiPolygon",
+                    ) and not part.is_empty:
+                        valid_geoms.append(part)
+            else:
+                valid_geoms.append(g)
+
+        if not has_collections:
+            valid_geoms = list(candidates)
+
+        if not valid_geoms:
+            result = from_shapely_geometries([shapely.Point()])
+            result = result.take(np.asarray([], dtype=np.int64))
         else:
-            valid_geoms.append(g)
-
-    if not has_collections:
-        # Fast path: no GeometryCollections, use the numpy array directly
-        valid_geoms = list(candidates)
-
-    if not valid_geoms:
-        result = from_shapely_geometries([shapely.Point()])
-        result = result.take(np.asarray([], dtype=np.int64))
-    else:
-        result = from_shapely_geometries(valid_geoms)
+            result = from_shapely_geometries(valid_geoms)
 
     result.runtime_history.append(
         RuntimeSelection(
