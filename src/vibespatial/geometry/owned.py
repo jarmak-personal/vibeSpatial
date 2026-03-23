@@ -544,13 +544,23 @@ class OwnedGeometryArray:
         """Return a new OwnedGeometryArray containing only the rows at *indices*.
 
         Operates entirely at the buffer level -- no Shapely round-trip.
-        When the array is DEVICE-resident, dispatches to :meth:`device_take`
+        When the array is DEVICE-resident **or** indices are already on device
+        (CuPy / ``__cuda_array_interface__``), dispatches to :meth:`device_take`
         to keep all gathering on GPU.  Otherwise returns a HOST-resident array.
         """
+        # Route to device_take when indices are already on device — avoids
+        # a D→H transfer from np.asarray() followed by an H→D re-upload
+        # inside device_take.  Phase 3 (vibeSpatial-p23.3).
+        _indices_on_device = (
+            cp is not None
+            and hasattr(indices, "__cuda_array_interface__")
+        )
         if (
-            self.residency is Residency.DEVICE
-            and self.device_state is not None
-            and cp is not None
+            cp is not None
+            and (
+                (self.residency is Residency.DEVICE and self.device_state is not None)
+                or _indices_on_device
+            )
         ):
             return self.device_take(indices)
         self._ensure_host_state()
@@ -593,11 +603,12 @@ class OwnedGeometryArray:
             raise RuntimeError("CuPy is required for device_take")
         d_state = self._ensure_device_state()
 
-        # Accept numpy or CuPy indices
-        if isinstance(indices, np.ndarray):
-            d_indices = cp.asarray(indices)
-        else:
+        # Accept numpy or CuPy indices — skip H→D upload when indices
+        # are already on device (Phase 3: vibeSpatial-p23.3).
+        if hasattr(indices, "__cuda_array_interface__"):
             d_indices = indices
+        else:
+            d_indices = cp.asarray(indices)
 
         # Bool mask → integer indices
         if d_indices.dtype == cp.bool_ or d_indices.dtype == bool:
