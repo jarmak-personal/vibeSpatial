@@ -256,6 +256,8 @@ def _dispatch_overlay_gpu(
     op: str,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
 ) -> OwnedGeometryArray:
     """Dispatch to the GPU overlay pipeline for Polygon-Polygon pairs.
 
@@ -276,7 +278,7 @@ def _dispatch_overlay_gpu(
         "symmetric_difference": overlay_symmetric_difference_owned,
     }
     fn = dispatch[op]
-    return fn(left, right)
+    return fn(left, right, dispatch_mode=dispatch_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -336,12 +338,21 @@ def _binary_constructive_gpu(
     op: str,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
 ) -> OwnedGeometryArray | None:
     """GPU binary constructive for all family combinations.
 
     Dispatches to specialized GPU kernels based on the geometry family
     combination.  Falls back to CPU only if a GPU kernel raises an
     exception, never because a family pair is missing.
+
+    Parameters
+    ----------
+    dispatch_mode : ExecutionMode
+        Propagated to inner kernels (polygon_intersection, overlay).
+        Default is GPU since this function is only called when the
+        outer dispatch has already selected GPU execution.
     """
     # --- Point-Point ---
     if _is_point_only(left) and _is_point_only(right):
@@ -436,7 +447,7 @@ def _binary_constructive_gpu(
                     polygon_intersection,
                 )
 
-                result = polygon_intersection(left, right)
+                result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
                 if result.row_count == left.row_count:
                     return result
             except Exception:
@@ -450,7 +461,7 @@ def _binary_constructive_gpu(
                     polygon_difference,
                 )
 
-                result = polygon_difference(left, right)
+                result = polygon_difference(left, right, dispatch_mode=dispatch_mode)
                 if result.row_count == left.row_count:
                     return result
             except Exception:
@@ -462,7 +473,7 @@ def _binary_constructive_gpu(
         # Fall through to the general overlay pipeline for union,
         # symmetric_difference, or when direct kernels fail.
         try:
-            result = _dispatch_overlay_gpu(op, left, right)
+            result = _dispatch_overlay_gpu(op, left, right, dispatch_mode=dispatch_mode)
             if result.row_count == left.row_count:
                 return result
             logger.debug(
@@ -653,7 +664,7 @@ def binary_constructive_owned(
             requested=precision,
         )
         gpu_attempted = True
-        result = _binary_constructive_gpu(op, left, right)
+        result = _binary_constructive_gpu(op, left, right, dispatch_mode=selection.selected)
         if result is not None:
             record_dispatch_event(
                 surface=f"geopandas.array.{op}",

@@ -3856,14 +3856,6 @@ def _overlay_owned(
         )
         return _overlay_owned(left, right, operation=operation, dispatch_mode=ExecutionMode.CPU)
 
-    # Ensure host-side coordinate buffers are materialised.  Device-resident
-    # inputs from pylibcudf I/O have structural metadata on host but empty
-    # x/y stubs (host_materialized=False).  Both the rectangle fast path
-    # (_axis_aligned_box_bounds) and the general path (extract_segments)
-    # access polygon_buffer.x/y on host.
-    left._ensure_host_state()
-    right._ensure_host_state()
-
     if operation == "intersection":
         rectangle_fast_path = _overlay_intersection_rectangles_gpu(left, right, requested=requested)
         if rectangle_fast_path is not None:
@@ -4052,6 +4044,15 @@ def spatial_overlay_owned(
     try:
         from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
+        # Force GPU dispatch when a GPU runtime is available: the spatial
+        # overlay pipeline has already committed to GPU for spatial join
+        # and pair generation.  The pairwise constructive step must also
+        # use GPU to avoid the 50K CONSTRUCTIVE crossover threshold
+        # routing small pair batches to CPU (which triggers a fallback
+        # event per batch and forces a D->H->D round-trip through Shapely).
+        from vibespatial.runtime import has_gpu_runtime
+        _pairwise_mode = ExecutionMode.GPU if has_gpu_runtime() else requested
+
         if how in ("difference", "symmetric_difference"):
             # Union all right neighbours per left group, then compute one
             # set operation per unique left geometry.
@@ -4070,7 +4071,10 @@ def spatial_overlay_owned(
 
             # left_subset has one row per unique left geometry, aligned with
             # right_unions (one unioned geometry per group).
-            result_owned = binary_constructive_owned(how, left_subset, right_unions)
+            result_owned = binary_constructive_owned(
+                how, left_subset, right_unions,
+                dispatch_mode=_pairwise_mode,
+            )
 
         else:
             # intersection / union: process per-pair within each group.
@@ -4088,7 +4092,10 @@ def spatial_overlay_owned(
                     left_replicated = left_row.take(np.zeros(n_pairs, dtype=np.intp))
                 else:
                     left_replicated = left_row
-                grp_result = binary_constructive_owned(how, left_replicated, right_rows)
+                grp_result = binary_constructive_owned(
+                    how, left_replicated, right_rows,
+                    dispatch_mode=_pairwise_mode,
+                )
                 result_parts.append(grp_result)
 
             if result_parts:
