@@ -4031,7 +4031,18 @@ def spatial_overlay_owned(
 
         left_gathered = left_subset.take(left_subset_indices)
         right_gathered = right_subset.take(right_subset_indices)
-        result_owned = binary_constructive_owned(how, left_gathered, right_gathered)
+        # Force GPU dispatch when a GPU runtime is available: the spatial
+        # overlay pipeline has already committed to GPU for spatial join
+        # and pair generation.  The pairwise constructive step must also
+        # use GPU to avoid the 50K CONSTRUCTIVE crossover threshold
+        # routing small pair batches to CPU (which triggers a fallback
+        # event per batch and forces a D->H->D round-trip through Shapely).
+        from vibespatial.runtime import has_gpu_runtime
+        _pairwise_mode = ExecutionMode.GPU if has_gpu_runtime() else requested
+        result_owned = binary_constructive_owned(
+            how, left_gathered, right_gathered,
+            dispatch_mode=_pairwise_mode,
+        )
 
         # Filter empty/null using owned-level metadata (validity + empty_mask)
         # instead of to_shapely() — avoids D->H->D ping-pong.
