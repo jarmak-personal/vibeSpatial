@@ -263,6 +263,24 @@ class _DeviceMemoryMonitor:
         self.peak_bytes = max(self.peak_bytes or 0, peak)
 
 
+def _free_gpu_pool_memory() -> None:
+    """Release cached GPU memory back to the CUDA device.
+
+    CuPy's default memory pool caches freed blocks for reuse.  In multi-stage
+    GPU pipelines this causes memory fragmentation: intermediate arrays are
+    freed by Python but the pool retains the blocks, preventing later stages
+    from allocating contiguous regions.  Calling this between pipeline stages
+    returns cached blocks to the CUDA driver so they can be re-allocated.
+    """
+    if not has_gpu_runtime():
+        return
+    try:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort; do not crash the pipeline for cleanup failures
+
+
 def _regular_points_frame(rows: int) -> geopandas.GeoDataFrame:
     dataset = generate_points(SyntheticSpec("point", "grid", count=rows, seed=0))
     values = np.asarray(list(dataset.geometries), dtype=object)
@@ -1597,6 +1615,10 @@ def _profile_vegetation_corridor_pipeline(
             stage.device = _selected_runtime_from_history(buffered_lines) or "cpu"
             _record_stage_overheads(stage, audit, memory, buffered_lines)
 
+        # Release raw lines (buffered version is the working set now)
+        del lines_owned
+        _free_gpu_pool_memory()
+
         # Stage 5: dissolve corridor
         # Single-group dissolve: all rows share group=0.  Device-resident
         # path (ADR-0005): when make_valid finds no repairs, use the
@@ -1641,6 +1663,10 @@ def _profile_vegetation_corridor_pipeline(
                 stage.rows_out = int(len(dissolved))
                 stage.device = "cpu"
 
+        # Release buffered lines (dissolved corridor replaces them)
+        del buffered_lines
+        _free_gpu_pool_memory()
+
         # Stage 6: intersect vegetation with corridor
         # Ensure both corridor and vegetation are valid before overlay —
         # buffer+dissolve can produce ring edge artifacts that cause
@@ -1670,6 +1696,10 @@ def _profile_vegetation_corridor_pipeline(
             stage.device = "cpu" if overlay_fell_back else (_selected_runtime_from_history(clipped_veg) or "cpu")
             stage.metadata["overlay_fallback"] = overlay_fell_back
             _record_stage_overheads(stage, audit, memory, clipped_veg)
+
+        # Release vegetation and corridor (clipped_veg is the working set now)
+        del veg_owned, corridor_owned
+        _free_gpu_pool_memory()
 
         # Stage 7: find poles near clipped vegetation (spatial index query)
         # Compute polygon centroids via GPU NVRTC shoelace kernel (ADR-0033
@@ -1966,6 +1996,12 @@ def _profile_parcel_zoning_pipeline(
         if clipped_owned.row_count == 0:
             clipped_owned = parcels_owned
 
+        # Release original parcels (clipped version is the working set now)
+        if clipped_owned is not parcels_owned:
+            del parcels_owned
+        del parcels_frame
+        _free_gpu_pool_memory()
+
         _index_runtime = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
         with profiler.stage(
             "build_index",
@@ -2004,6 +2040,10 @@ def _profile_parcel_zoning_pipeline(
             stage.rows_out = hit_count
             stage.metadata["pairs_examined"] = hit_count
             _record_stage_overheads(stage, audit, memory, clipped_owned, zones_owned)
+
+        # Release spatial index between sjoin and overlay stages
+        del flat_index
+        _free_gpu_pool_memory()
 
         with profiler.stage(
             "overlay_intersect",
@@ -2244,6 +2284,12 @@ def _profile_flood_exposure_pipeline(
             stage.metadata["gpu_ring_check"] = True
             _record_stage_overheads(stage, audit, memory, buildings_valid)
 
+        # Release the original buildings array if make_valid produced a new one
+        if buildings_valid is not buildings_owned:
+            del buildings_owned
+        del gpu_mask
+        _free_gpu_pool_memory()
+
         _index_runtime = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
         with profiler.stage(
             "build_index",
@@ -2284,6 +2330,10 @@ def _profile_flood_exposure_pipeline(
             stage.metadata["at_risk_buildings"] = int(hit_indices.size)
             _record_stage_overheads(stage, audit, memory, buildings_valid, flood_owned)
 
+        # Flood zones and spatial index no longer needed after spatial join
+        del flood_owned, flat_index, flood_batch, indices
+        _free_gpu_pool_memory()
+
         with profiler.stage(
             "filter_buildings",
             category="filter",
@@ -2297,6 +2347,10 @@ def _profile_flood_exposure_pipeline(
                 filtered = from_shapely_geometries([])
             stage.rows_out = filtered.row_count
             _record_stage_overheads(stage, audit, memory, filtered)
+
+        # Full buildings array no longer needed; filtered subset is sufficient
+        del buildings_valid
+        _free_gpu_pool_memory()
 
         with profiler.stage(
             "buffer_risk_zone",
@@ -2318,6 +2372,10 @@ def _profile_flood_exposure_pipeline(
                 risk_zones = from_shapely_geometries([])
                 stage.rows_out = 0
             _record_stage_overheads(stage, audit, memory, risk_zones)
+
+        # Release filtered buildings and intermediate point arrays
+        del filtered
+        _free_gpu_pool_memory()
 
         output = geopandas.GeoDataFrame(
             {"geometry": geoseries_from_owned(risk_zones, crs="EPSG:4326")},
@@ -2518,6 +2576,10 @@ def _profile_network_service_area_pipeline(
             stage.device = _selected_runtime_from_history(buffered_network) or "cpu"
             _record_stage_overheads(stage, audit, memory, buffered_network)
 
+        # Release raw network lines (buffered version is the working set now)
+        del network_owned
+        _free_gpu_pool_memory()
+
         with profiler.stage(
             "dissolve_service_area",
             category="refine",
@@ -2537,6 +2599,10 @@ def _profile_network_service_area_pipeline(
                 method="unary", grid_size=None, agg_kwargs={},
             )
             stage.rows_out = int(len(dissolved))
+
+        # Release buffered network (dissolved version replaces it)
+        del buffered_network, service_frame
+        _free_gpu_pool_memory()
 
         with profiler.stage(
             "clip_to_admin",
@@ -2776,6 +2842,12 @@ def _profile_site_suitability_pipeline(
         if clipped_owned.row_count == 0:
             clipped_owned = parcels_owned
 
+        # Release original parcels (clipped_owned is the working set now)
+        if clipped_owned is not parcels_owned:
+            del parcels_owned
+        del parcels_frame
+        _free_gpu_pool_memory()
+
         with profiler.stage(
             "overlay_difference",
             category="refine",
@@ -2798,6 +2870,12 @@ def _profile_site_suitability_pipeline(
         if suitable.row_count == 0:
             suitable = clipped_owned
 
+        # Release clipped parcels and exclusion zones now that difference is done
+        if suitable is not clipped_owned:
+            del clipped_owned
+        del exclusions_owned, excl_batch
+        _free_gpu_pool_memory()
+
         with profiler.stage(
             "buffer_transit",
             category="refine",
@@ -2811,6 +2889,10 @@ def _profile_site_suitability_pipeline(
             stage.rows_out = transit_buffered.row_count
             stage.device = _selected_runtime_from_history(transit_buffered) or "cpu"
             _record_stage_overheads(stage, audit, memory, transit_buffered)
+
+        # Release raw transit points (buffered version is the working set now)
+        del transit_owned
+        _free_gpu_pool_memory()
 
         _index_runtime = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
         with profiler.stage(
@@ -2850,6 +2932,10 @@ def _profile_site_suitability_pipeline(
             stage.rows_out = hit_count
             stage.metadata["parcels_near_transit"] = hit_count
             _record_stage_overheads(stage, audit, memory, suitable, transit_buffered)
+
+        # Release transit buffers and spatial index before output materialization
+        del transit_buffered, flat_index
+        _free_gpu_pool_memory()
 
         output = geopandas.GeoDataFrame(
             {"geometry": geoseries_from_owned(suitable, crs="EPSG:4326")},
