@@ -1884,6 +1884,21 @@ def decode_wkb_owned(
     *,
     on_invalid: str = "raise",
 ) -> OwnedGeometryArray:
+    # Try GPU-accelerated decode first: convert list[bytes] to PyArrow binary
+    # array (single bulk allocation) and use the existing device WKB pipeline.
+    # This eliminates the per-geometry Python parsing loop that dominates cost.
+    gpu_result = _try_gpu_wkb_list_decode(values)
+    if gpu_result is not None:
+        record_dispatch_event(
+            surface="vibespatial.io.wkb",
+            operation="decode",
+            implementation="device_wkb_decode",
+            reason="GPU WKB decode via pylibcudf device pipeline (list[bytes] input)",
+            selected=ExecutionMode.GPU,
+        )
+        return gpu_result
+
+    # Fall through to host-side staged decode.
     plan = plan_wkb_bridge(IOOperation.DECODE)
     record_dispatch_event(
         surface="vibespatial.io.wkb",
@@ -1902,6 +1917,59 @@ def decode_wkb_owned(
             pipeline="io/wkb_decode",
         )
     return array
+
+
+def _try_gpu_wkb_list_decode(
+    values: list[bytes | str | None] | tuple[bytes | str | None, ...],
+) -> OwnedGeometryArray | None:
+    """Convert list[bytes] to PyArrow binary array and use GPU WKB decode pipeline.
+
+    This avoids the per-geometry Python parsing loop in _decode_native_wkb by
+    doing a single bulk H2D transfer via PyArrow -> pylibcudf -> device decode.
+    """
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
+    try:
+        runtime = get_cuda_runtime()
+        if not runtime.available():
+            return None
+    except Exception:
+        return None
+
+    # Not worth GPU overhead for tiny arrays.
+    if len(values) < 500:
+        return None
+
+    try:
+        import pyarrow as pa
+        import pylibcudf as plc
+
+        from .pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
+
+        # Normalize hex strings to bytes before creating the Arrow array.
+        normalized: list[bytes | None] = [
+            _normalize_wkb_value(v) for v in values
+        ]
+
+        # Single bulk allocation: list[bytes|None] -> pa.BinaryArray.
+        arrow_array = pa.array(normalized, type=pa.binary())
+
+        # pylibcudf requires string/large_string layout (identical to binary).
+        arrow_str = pa.Array.from_buffers(
+            pa.string(),
+            len(arrow_array),
+            arrow_array.buffers(),
+            null_count=arrow_array.null_count,
+        )
+
+        plc_column = plc.Column.from_arrow(arrow_str)
+        return _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
+    except (ImportError, NotImplementedError):
+        return None
+    except Exception:
+        return None
 
 
 def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGeometryArray:
