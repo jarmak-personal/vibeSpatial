@@ -1110,8 +1110,9 @@ def _extract_segments_vectorized(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
     """Vectorized extraction of segments from line-family buffers.
 
-    Uses numpy fancy indexing on contiguous buffer.x / buffer.y arrays
-    instead of per-coordinate Python list.append loops.
+    Uses numpy offset arithmetic and fancy indexing on contiguous
+    buffer.x / buffer.y arrays.  No per-row Python loops -- all span
+    computation and coordinate gathering are bulk numpy operations.
 
     Returns
     -------
@@ -1121,14 +1122,14 @@ def _extract_segments_vectorized(
     part_row_map : which row index (into global_row_indices) each part belongs to (int32)
     global_row_indices : ordered list of global row indices that have line data
     """
-    # Collect per-span (start, end) ranges and metadata in bulk, then
-    # do a single vectorized extraction pass.
-    span_starts: list[int] = []
-    span_ends: list[int] = []
-    span_family_idx: list[int] = []  # which family's buffer each span belongs to
-    part_row_map_list: list[int] = []  # row idx (into global_row_indices) for each part
-    global_row_indices: list[int] = []
+    # Accumulate per-family vectorized results, then concatenate once.
+    all_span_starts: list[np.ndarray] = []
+    all_span_ends: list[np.ndarray] = []
+    all_span_family_idx: list[np.ndarray] = []
+    all_part_row_map: list[np.ndarray] = []
+    global_row_indices_parts: list[np.ndarray] = []
     family_buffers: list[object] = []
+    row_base = 0  # running offset into global_row_indices
 
     for family in line_families:
         buffer = owned.families[family]
@@ -1137,53 +1138,115 @@ def _extract_segments_vectorized(
         fam_idx = len(family_buffers)
         family_buffers.append(buffer)
 
-        if buffer.row_count == 0 or buffer.geometry_offsets is None or len(buffer.geometry_offsets) < 2:
-            for global_row in family_rows:
-                global_row_indices.append(int(global_row))
+        n_fam_rows = len(family_rows)
+        if n_fam_rows == 0:
             continue
 
-        for global_row in family_rows:
-            row_idx = len(global_row_indices)
-            global_row_indices.append(int(global_row))
-            local_row = int(owned.family_row_offsets[global_row])
+        if buffer.row_count == 0 or buffer.geometry_offsets is None or len(buffer.geometry_offsets) < 2:
+            # Empty buffer -- register rows but produce no spans.
+            global_row_indices_parts.append(family_rows)
+            row_base += n_fam_rows
+            continue
 
-            if buffer.empty_mask.size > local_row and buffer.empty_mask[local_row]:
+        # Register all family rows in global_row_indices.
+        global_row_indices_parts.append(family_rows)
+
+        # Map global rows -> local buffer rows (vectorized).
+        local_rows = owned.family_row_offsets[family_rows].astype(np.intp, copy=False)
+
+        # Filter out empty geometries (vectorized).
+        if buffer.empty_mask.size > 0:
+            safe_local = np.minimum(local_rows, buffer.empty_mask.size - 1)
+            non_empty_mask = ~buffer.empty_mask[safe_local] | (local_rows >= buffer.empty_mask.size)
+        else:
+            non_empty_mask = np.ones(n_fam_rows, dtype=bool)
+
+        if family == GeometryFamily.LINESTRING:
+            # Each non-empty row -> one span from geometry_offsets.
+            ne_idx = np.flatnonzero(non_empty_mask)
+            if len(ne_idx) == 0:
+                row_base += n_fam_rows
                 continue
+            ne_local = local_rows[ne_idx]
+            s = buffer.geometry_offsets[ne_local]
+            e = buffer.geometry_offsets[ne_local + 1]
+            # Filter spans with >= 2 coordinates.
+            valid_span = (e - s) >= 2
+            keep = np.flatnonzero(valid_span)
+            if len(keep) == 0:
+                row_base += n_fam_rows
+                continue
+            all_span_starts.append(np.asarray(s[keep], dtype=np.int64))
+            all_span_ends.append(np.asarray(e[keep], dtype=np.int64))
+            all_span_family_idx.append(np.full(len(keep), fam_idx, dtype=np.int32))
+            # Row indices are positions within the global_row_indices array.
+            all_part_row_map.append((row_base + ne_idx[keep]).astype(np.int32))
+        else:
+            # MultiLineString: each non-empty row -> multiple spans via
+            # geometry_offsets -> part_offsets indirection.
+            ne_idx = np.flatnonzero(non_empty_mask)
+            if len(ne_idx) == 0:
+                row_base += n_fam_rows
+                continue
+            ne_local = local_rows[ne_idx]
+            part_start = buffer.geometry_offsets[ne_local]
+            part_end = buffer.geometry_offsets[ne_local + 1]
+            part_counts = (part_end - part_start).astype(np.intp)
+            total_parts = int(np.sum(part_counts))
+            if total_parts == 0:
+                row_base += n_fam_rows
+                continue
+            # Expand row indices: one entry per part within each row.
+            row_idx_expanded = np.repeat(row_base + ne_idx, part_counts).astype(np.int32)
+            # Build flat array of all part indices.
+            # For each row, part indices are [part_start, ..., part_end - 1].
+            part_offsets_cum = np.empty(len(ne_idx) + 1, dtype=np.int64)
+            part_offsets_cum[0] = 0
+            np.cumsum(part_counts, out=part_offsets_cum[1:])
+            # Flat part indices via broadcasting with offset correction.
+            flat_part_idx = np.repeat(part_start, part_counts) + (
+                np.arange(total_parts, dtype=np.int64)
+                - np.repeat(part_offsets_cum[:-1], part_counts)
+            )
+            s = buffer.part_offsets[flat_part_idx]
+            e = buffer.part_offsets[flat_part_idx + 1]
+            valid_span = (e - s) >= 2
+            keep = np.flatnonzero(valid_span)
+            if len(keep) == 0:
+                row_base += n_fam_rows
+                continue
+            all_span_starts.append(np.asarray(s[keep], dtype=np.int64))
+            all_span_ends.append(np.asarray(e[keep], dtype=np.int64))
+            all_span_family_idx.append(np.full(len(keep), fam_idx, dtype=np.int32))
+            all_part_row_map.append(row_idx_expanded[keep])
 
-            if family == GeometryFamily.LINESTRING:
-                s = int(buffer.geometry_offsets[local_row])
-                e = int(buffer.geometry_offsets[local_row + 1])
-                if e - s >= 2:
-                    span_starts.append(s)
-                    span_ends.append(e)
-                    span_family_idx.append(fam_idx)
-                    part_row_map_list.append(row_idx)
-            else:
-                # MultiLineString
-                part_start = int(buffer.geometry_offsets[local_row])
-                part_end = int(buffer.geometry_offsets[local_row + 1])
-                for idx in range(part_start, part_end):
-                    s = int(buffer.part_offsets[idx])
-                    e = int(buffer.part_offsets[idx + 1])
-                    if e - s >= 2:
-                        span_starts.append(s)
-                        span_ends.append(e)
-                        span_family_idx.append(fam_idx)
-                        part_row_map_list.append(row_idx)
+        row_base += n_fam_rows
 
-    if not span_starts:
+    # Merge global_row_indices from all families.
+    if global_row_indices_parts:
+        global_row_indices_arr = np.concatenate(global_row_indices_parts)
+    else:
+        global_row_indices_arr = np.empty(0, dtype=np.intp)
+    global_row_indices = global_row_indices_arr.astype(np.int32, copy=False)
+    n_rows = global_row_indices.shape[0]
+
+    if not all_span_starts:
         empty = np.empty(0, dtype=np.float64)
         return (
             empty, empty, empty, empty,
-            np.zeros(len(global_row_indices) + 1, dtype=np.int32),
+            np.zeros(n_rows + 1, dtype=np.int32),
             np.zeros(1, dtype=np.int32),
             np.empty(0, dtype=np.int32),
             global_row_indices,
         )
 
-    # Compute segment counts per span: (end - start - 1)
-    starts_arr = np.asarray(span_starts, dtype=np.int64)
-    ends_arr = np.asarray(span_ends, dtype=np.int64)
+    # Concatenate all per-family results into flat arrays.
+    starts_arr = np.concatenate(all_span_starts)
+    ends_arr = np.concatenate(all_span_ends)
+    span_family_idx = np.concatenate(all_span_family_idx)
+    part_row_map_arr = np.concatenate(all_part_row_map)
+
+    # Compute segment counts per span: (end - start - 1).
     seg_counts = (ends_arr - starts_arr - 1).astype(np.int32)
     total_segments = int(np.sum(seg_counts))
 
@@ -1191,44 +1254,64 @@ def _extract_segments_vectorized(
         empty = np.empty(0, dtype=np.float64)
         return (
             empty, empty, empty, empty,
-            np.zeros(len(global_row_indices) + 1, dtype=np.int32),
-            np.zeros(len(span_starts) + 1, dtype=np.int32),
-            np.asarray(part_row_map_list, dtype=np.int32),
+            np.zeros(n_rows + 1, dtype=np.int32),
+            np.zeros(len(seg_counts) + 1, dtype=np.int32),
+            part_row_map_arr,
             global_row_indices,
         )
 
-    # Build flat index arrays for vectorized gather.
-    # For each span, we need indices [start, start+1, ..., end-2] for x0/y0
-    # and [start+1, start+2, ..., end-1] for x1/y1.
+    # Build per-part segment offsets (cumulative).
+    part_segment_offsets = np.empty(len(seg_counts) + 1, dtype=np.int32)
+    part_segment_offsets[0] = 0
+    np.cumsum(seg_counts, out=part_segment_offsets[1:])
+
+    # Build flat gather indices for all spans at once.
+    # For each span with k = end - start - 1 segments, we need indices
+    # [start, start+1, ..., start+k-1] for the p0 endpoint and
+    # [start+1, ..., start+k] for the p1 endpoint.
+    # Use np.repeat(starts, seg_counts) + within-span offsets.
+    within_offsets = np.arange(total_segments, dtype=np.int64)
+    span_base = np.repeat(part_segment_offsets[:-1], seg_counts).astype(np.int64)
+    local_offsets = within_offsets - span_base
+    gather_p0 = np.repeat(starts_arr, seg_counts) + local_offsets
+    gather_p1 = gather_p0 + 1
+
+    # Gather coordinates.  When all spans come from a single family
+    # buffer (common case), do a single fancy-index gather.  Otherwise
+    # gather per-family and scatter into the output.
     seg_x0 = np.empty(total_segments, dtype=np.float64)
     seg_y0 = np.empty(total_segments, dtype=np.float64)
     seg_x1 = np.empty(total_segments, dtype=np.float64)
     seg_y1 = np.empty(total_segments, dtype=np.float64)
 
-    out_pos = 0
-    for i, (s, e, fi) in enumerate(zip(span_starts, span_ends, span_family_idx)):
-        n = e - s - 1
-        if n <= 0:
-            continue
-        buf = family_buffers[fi]
-        # Vectorized slice: buffer.x[s:e-1] and buffer.x[s+1:e]
-        seg_x0[out_pos:out_pos + n] = buf.x[s:e - 1]
-        seg_y0[out_pos:out_pos + n] = buf.y[s:e - 1]
-        seg_x1[out_pos:out_pos + n] = buf.x[s + 1:e]
-        seg_y1[out_pos:out_pos + n] = buf.y[s + 1:e]
-        out_pos += n
+    unique_fam = np.unique(span_family_idx)
+    if len(unique_fam) == 1:
+        # Fast path: single family buffer.
+        buf = family_buffers[int(unique_fam[0])]
+        seg_x0[:] = buf.x[gather_p0]
+        seg_y0[:] = buf.y[gather_p0]
+        seg_x1[:] = buf.x[gather_p1]
+        seg_y1[:] = buf.y[gather_p1]
+    else:
+        # Multi-family: gather per family using segment-level mask.
+        seg_fam_idx = np.repeat(span_family_idx, seg_counts)
+        for fi in unique_fam:
+            fi_int = int(fi)
+            buf = family_buffers[fi_int]
+            mask = seg_fam_idx == fi_int
+            idx0 = gather_p0[mask]
+            idx1 = gather_p1[mask]
+            seg_x0[mask] = buf.x[idx0]
+            seg_y0[mask] = buf.y[idx0]
+            seg_x1[mask] = buf.x[idx1]
+            seg_y1[mask] = buf.y[idx1]
 
-    # Build per-part segment offsets (cumulative)
-    part_segment_offsets = np.empty(len(seg_counts) + 1, dtype=np.int32)
-    part_segment_offsets[0] = 0
-    np.cumsum(seg_counts, out=part_segment_offsets[1:])
-
-    # Build per-row segment offsets from part offsets
-    part_row_map_arr = np.asarray(part_row_map_list, dtype=np.int32)
-    n_rows = len(global_row_indices)
+    # Build per-row segment offsets from part data (np.bincount — truly vectorized C loop).
     row_segment_offsets = np.zeros(n_rows + 1, dtype=np.int32)
-    for pi, ri in enumerate(part_row_map_list):
-        row_segment_offsets[ri + 1] += int(seg_counts[pi])
+    if seg_counts.size > 0:
+        row_segment_offsets[1:] = np.bincount(
+            part_row_map_arr, weights=seg_counts.astype(np.float64), minlength=n_rows,
+        ).astype(np.int32)
     np.cumsum(row_segment_offsets, out=row_segment_offsets)
 
     return (
