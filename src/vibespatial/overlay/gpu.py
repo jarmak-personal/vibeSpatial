@@ -3997,49 +3997,105 @@ def spatial_overlay_owned(
     left_indices = candidate_pairs.left_indices
     right_indices = candidate_pairs.right_indices
 
-    # Stage 2: Batch pairwise overlay.
-    # Replicate left/right rows to form row-matched arrays, then run the
-    # standard pairwise overlay via _overlay_owned (no row-count threshold;
-    # GPU overlay is available for all dataset sizes since Phase 20).
+    # Stage 2: Per-left-group processing.
     #
-    # Optimization: batch all pairs into a single pairwise overlay call by
-    # gathering left rows at left_indices and right rows at right_indices.
-    # For vegetation-corridor (10K × 1), this gathers 10K left + replicates
-    # 1 right row 10K times — equivalent to a clip operation.
+    # Previous approach gathered ALL pairs into a single batch and ran one
+    # global binary_constructive_owned call.  This caused two bugs:
+    #   Bug 1 (O(n**2) scaling): segment candidate generation used a GLOBAL
+    #     sort-sweep so segments from independent geometry pairs
+    #     cross-contaminated, producing O(n**2) segment comparisons.
+    #   Bug 2 (incorrect difference): computed L_i - R_j per pair instead of
+    #     L_i - union(R_j for all j overlapping L_i), yielding multiple
+    #     partial-difference fragments per left geometry.
+    #
+    # Fix: group pairs by left index and process each left geometry
+    # independently.  For difference/symmetric_difference, union all right
+    # neighbours first via segmented_union_all (matching the approach in
+    # _overlay_difference in api/tools/overlay.py).  For intersection/union,
+    # process per-pair within each group to keep segment sets isolated.
     #
     # Performance: selective materialization (ADR-0005).
-    # Instead of materializing ALL rows via to_shapely(), use take() to subset
-    # to only the unique participating rows first (buffer-level, no Shapely
-    # round-trip), then materialize the smaller subset. For 10K vegetation
-    # vs 1 corridor where 5K overlap, this halves the D→H transfer cost.
-    unique_left = np.unique(left_indices)
+    # take() subsets participating rows at buffer level — no Shapely
+    # round-trip.  Per-group calls each handle O(1) segment pairs, giving
+    # overall O(N) scaling instead of O(N**2).
+
+    # Sort pairs by left index for grouping.
+    sort_order = np.argsort(left_indices, kind="mergesort")
+    left_indices = left_indices[sort_order]
+    right_indices = right_indices[sort_order]
+
+    unique_left, group_starts = np.unique(left_indices, return_index=True)
+    group_ends = np.append(group_starts[1:], len(left_indices))
+
     unique_right = np.unique(right_indices)
-
-    # Remap pair indices from original row space to subset row space.
-    # E.g., if unique_left = [2, 5, 7] and left_indices = [5, 2, 7, 5],
-    # then remapped left_indices = [1, 0, 2, 1].
-    left_remap = np.empty(left.row_count, dtype=np.intp)
-    left_remap[unique_left] = np.arange(len(unique_left))
-    right_remap = np.empty(right.row_count, dtype=np.intp)
-    right_remap[unique_right] = np.arange(len(unique_right))
-
-    left_subset_indices = left_remap[left_indices]
-    right_subset_indices = right_remap[right_indices]
 
     # take() operates at buffer level — no Shapely materialization.
     left_subset = left.take(unique_left) if len(unique_left) < left.row_count else left
     right_subset = right.take(unique_right) if len(unique_right) < right.row_count else right
 
-    # Owned-dispatch path: route pairwise overlay through binary_constructive_owned
-    # which handles validation, precision planning, and GPU/CPU dispatch internally.
-    # Avoids to_shapely() materialization for the entire pipeline.
+    # Remap right indices from original row space to right_subset row space.
+    right_remap = np.empty(right.row_count, dtype=np.intp)
+    right_remap[unique_right] = np.arange(len(unique_right))
+    right_subset_indices = right_remap[right_indices]
+
+    # Remap left indices: unique_left[i] -> i (left_subset row space).
+    # left_subset row i corresponds to unique_left[i] in the original array.
+    # For per-group processing we iterate over groups 0..len(unique_left)-1.
+
+    # ------------------------------------------------------------------
+    # Owned-dispatch path: per-left-group processing via binary_constructive_owned.
+    # For difference/symmetric_difference, uses segmented_union_all to union
+    # right neighbours before computing the set operation — matching the
+    # correct semantics of L_i - union(R_j for all j).
+    # ------------------------------------------------------------------
     _used_owned_dispatch = False
     try:
         from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
-        left_gathered = left_subset.take(left_subset_indices)
-        right_gathered = right_subset.take(right_subset_indices)
-        result_owned = binary_constructive_owned(how, left_gathered, right_gathered)
+        if how in ("difference", "symmetric_difference"):
+            # Union all right neighbours per left group, then compute one
+            # set operation per unique left geometry.
+            # This mirrors the approach in _overlay_difference (api/tools/overlay.py).
+            from vibespatial.kernels.constructive.segmented_union import (
+                segmented_union_all,
+            )
+
+            # Build CSR-style group offsets for segmented_union_all.
+            group_offsets = np.empty(len(group_starts) + 1, dtype=np.int64)
+            group_offsets[:-1] = group_starts
+            group_offsets[-1] = len(right_subset_indices)
+
+            right_gathered = right_subset.take(right_subset_indices)
+            right_unions = segmented_union_all(right_gathered, group_offsets)
+
+            # left_subset has one row per unique left geometry, aligned with
+            # right_unions (one unioned geometry per group).
+            result_owned = binary_constructive_owned(how, left_subset, right_unions)
+
+        else:
+            # intersection / union: process per-pair within each group.
+            # Each (L_i, R_j) pair produces an independent result fragment.
+            # Processing per-group keeps segment sets isolated, avoiding
+            # global O(n**2) cross-contamination.
+            result_parts: list[OwnedGeometryArray] = []
+            for grp_idx in range(len(unique_left)):
+                start, end = group_starts[grp_idx], group_ends[grp_idx]
+                n_pairs = end - start
+                left_row = left_subset.take(np.array([grp_idx]))
+                right_rows = right_subset.take(right_subset_indices[start:end])
+                # Replicate left row to match the number of right neighbours.
+                if n_pairs > 1:
+                    left_replicated = left_row.take(np.zeros(n_pairs, dtype=np.intp))
+                else:
+                    left_replicated = left_row
+                grp_result = binary_constructive_owned(how, left_replicated, right_rows)
+                result_parts.append(grp_result)
+
+            if result_parts:
+                result_owned = OwnedGeometryArray.concat(result_parts)
+            else:
+                result_owned = from_shapely_geometries([shapely.Point()])
+                result_owned = result_owned.take(np.asarray([], dtype=np.int64))
 
         # Filter empty/null using owned-level metadata (validity + empty_mask)
         # instead of to_shapely() — avoids D->H->D ping-pong.
@@ -4087,10 +4143,6 @@ def spatial_overlay_owned(
         if np.any(right_invalid_mask):
             right_shapely_orig[right_invalid_mask] = shapely.make_valid(right_shapely_orig[right_invalid_mask])
 
-        # Gather at pair indices (replication happens here, after validation)
-        left_shapely = left_shapely_orig[left_subset_indices]
-        right_shapely = right_shapely_orig[right_subset_indices]
-
     if not _used_owned_dispatch:
         # Shapely fast paths and general case (only when owned dispatch failed).
 
@@ -4107,7 +4159,8 @@ def spatial_overlay_owned(
                     if len(x_vals) == 2 and len(y_vals) == 2 and len(right_geom.interiors) == 0:
                         xmin, xmax = float(x_vals[0]), float(x_vals[1])
                         ymin, ymax = float(y_vals[0]), float(y_vals[1])
-                        result_geoms = shapely.clip_by_rect(left_shapely, xmin, ymin, xmax, ymax)
+                        # Clip all participating left geometries against the rectangle.
+                        result_geoms = shapely.clip_by_rect(left_shapely_orig, xmin, ymin, xmax, ymax)
                         _used_clip_by_rect = True
 
         # Fast path: many-vs-one intersection with GPU centroid pre-filter.
@@ -4141,29 +4194,75 @@ def spatial_overlay_owned(
                     all_rows = np.arange(left_subset.row_count)
                     need_clip_rows = np.setdiff1d(all_rows, fully_inside_rows)
                     if need_clip_rows.size < left_subset.row_count:
-                        result_parts = []
+                        result_parts_shapely: list = []
                         if fully_inside_rows.size > 0:
-                            result_parts.extend(left_shapely_orig[fully_inside_rows].tolist())
+                            result_parts_shapely.extend(left_shapely_orig[fully_inside_rows].tolist())
                         if need_clip_rows.size > 0:
                             clip_left = left_shapely_orig[need_clip_rows]
                             clip_right = np.full(len(need_clip_rows), right_geom, dtype=object)
                             clipped = shapely.intersection(clip_left, clip_right)
-                            result_parts.extend(clipped.tolist())
-                        result_geoms = np.asarray(result_parts, dtype=object)
+                            result_parts_shapely.extend(clipped.tolist())
+                        result_geoms = np.asarray(result_parts_shapely, dtype=object)
                         _used_centroid_filter = True
                 except Exception:
                     pass  # fall through to general path
 
         if not _used_clip_by_rect and not _used_centroid_filter:
-            # CPU-only mode: general Shapely path for spatial overlay
-            if how == "intersection":
-                result_geoms = shapely.intersection(left_shapely, right_shapely)  # CPU-only mode
-            elif how == "union":
-                result_geoms = shapely.union(left_shapely, right_shapely)  # CPU-only mode
-            elif how == "difference":
-                result_geoms = shapely.difference(left_shapely, right_shapely)  # CPU-only mode
+            # Per-left-group Shapely path: process each left geometry against
+            # its overlapping right neighbours independently.  For difference,
+            # this computes L_i - union(R_j) to produce correct results.
+            if how == "difference":
+                result_list: list = []
+                for grp_idx in range(len(unique_left)):
+                    start, end = group_starts[grp_idx], group_ends[grp_idx]
+                    left_geom = left_shapely_orig[grp_idx]
+                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
+                    if len(right_neighbors) == 1:
+                        right_union = right_neighbors[0]
+                    else:
+                        right_union = shapely.union_all(right_neighbors)
+                    diff = shapely.difference(np.array([left_geom], dtype=object),
+                                              np.array([right_union], dtype=object))
+                    result_list.append(diff[0])
+                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
             elif how == "symmetric_difference":
-                result_geoms = shapely.symmetric_difference(left_shapely, right_shapely)  # CPU-only mode
+                result_list = []
+                for grp_idx in range(len(unique_left)):
+                    start, end = group_starts[grp_idx], group_ends[grp_idx]
+                    left_geom = left_shapely_orig[grp_idx]
+                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
+                    if len(right_neighbors) == 1:
+                        right_union = right_neighbors[0]
+                    else:
+                        right_union = shapely.union_all(right_neighbors)
+                    sd = shapely.symmetric_difference(
+                        np.array([left_geom], dtype=object),
+                        np.array([right_union], dtype=object),
+                    )
+                    result_list.append(sd[0])
+                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
+            elif how == "intersection":
+                # Per-pair intersection: L_i intersect R_j for each pair.
+                result_list = []
+                for grp_idx in range(len(unique_left)):
+                    start, end = group_starts[grp_idx], group_ends[grp_idx]
+                    left_geom = left_shapely_orig[grp_idx]
+                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
+                    left_arr = np.full(len(right_neighbors), left_geom, dtype=object)
+                    inter = shapely.intersection(left_arr, right_neighbors)
+                    result_list.extend(inter.tolist())
+                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
+            elif how == "union":
+                # Per-pair union: L_i union R_j for each pair.
+                result_list = []
+                for grp_idx in range(len(unique_left)):
+                    start, end = group_starts[grp_idx], group_ends[grp_idx]
+                    left_geom = left_shapely_orig[grp_idx]
+                    right_neighbors = right_shapely_orig[right_subset_indices[start:end]]
+                    left_arr = np.full(len(right_neighbors), left_geom, dtype=object)
+                    unions = shapely.union(left_arr, right_neighbors)
+                    result_list.extend(unions.tolist())
+                result_geoms = np.asarray(result_list, dtype=object) if result_list else np.asarray([], dtype=object)
             else:
                 raise ValueError(f"unsupported spatial overlay operation: {how}")
 
