@@ -48,6 +48,13 @@ _FLOAT_EPSILON = np.finfo(np.float64).eps
 _ORIENTATION_ERRBOUND = (3.0 + 16.0 * _FLOAT_EPSILON) * _FLOAT_EPSILON
 _SEGMENT_GPU_THRESHOLD = 4_096
 
+# Maximum candidate pairs for the main sweep before switching to batched
+# processing.  128M pairs = ~1 GB for two int32 pair arrays.  Pathological
+# inputs (e.g., grid-pattern lines where P95 x-half-width spans the full
+# coordinate range) can produce O(n²) raw candidates that OOM without
+# this guard.
+_MAIN_SWEEP_MAX_PAIRS = 128 * 1024 * 1024
+
 # ---------------------------------------------------------------------------
 # Family type codes matching GeometryFamily enum order (0-based)
 # ---------------------------------------------------------------------------
@@ -1232,6 +1239,176 @@ def _extract_segments_gpu(
 # This replaces the O(n^2) tiled brute-force approach.
 # ---------------------------------------------------------------------------
 
+
+def _main_sweep_scatter_and_filter(
+    cp, runtime, n_chunk, chunk_total, chunk_offsets,
+    chunk_range_start, chunk_range_end,
+    sorted_right_idx, scatter_fn, ptr,
+    left_minx, left_maxx, left_miny, left_maxy,
+    right_minx, right_maxx, right_miny, right_maxy,
+    outlier_mask_bool, left_idx_offset,
+):
+    """Scatter candidate pairs for a chunk of left segments and apply MBR filter.
+
+    Parameters
+    ----------
+    n_chunk : int
+        Number of left segments in this chunk.
+    chunk_total : int
+        Total raw candidates for this chunk.
+    chunk_offsets : device array
+        Exclusive-sum offsets for this chunk (length n_chunk).
+    chunk_range_start, chunk_range_end : device array
+        Binary-search range bounds for this chunk (length n_chunk).
+    left_idx_offset : int
+        Global left-segment index offset for this chunk (0 for unbatched).
+
+    Returns
+    -------
+    (left_indices, right_indices) : tuple of device arrays
+        Surviving candidate pairs with global left indices.
+    """
+    d_left_pair = runtime.allocate((chunk_total,), np.int32)
+    d_right_pair = runtime.allocate((chunk_total,), np.int32)
+
+    grid, block = runtime.launch_config(scatter_fn, n_chunk)
+    runtime.launch(
+        scatter_fn,
+        grid=grid, block=block,
+        params=(
+            (ptr(chunk_offsets), ptr(chunk_range_start), ptr(chunk_range_end),
+             ptr(sorted_right_idx), ptr(d_left_pair), ptr(d_right_pair),
+             n_chunk),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_I32),
+        ),
+    )
+
+    # Remap chunk-local left indices to global indices.
+    if left_idx_offset > 0:
+        d_left_pair += left_idx_offset
+
+    # Full MBR overlap filter on device
+    d_lminx = left_minx[d_left_pair]
+    d_lmaxx = left_maxx[d_left_pair]
+    d_lminy = left_miny[d_left_pair]
+    d_lmaxy = left_maxy[d_left_pair]
+    d_rminx = right_minx[d_right_pair]
+    d_rmaxx = right_maxx[d_right_pair]
+    d_rminy = right_miny[d_right_pair]
+    d_rmaxy = right_maxy[d_right_pair]
+
+    overlap = (
+        (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
+        (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
+    )
+    # Exclude outlier right segments from main results to prevent
+    # duplicates with the outlier pass.
+    if outlier_mask_bool is not None:
+        overlap &= ~outlier_mask_bool[d_right_pair]
+    overlap_u8 = overlap.astype(cp.uint8)
+
+    result = compact_indices(overlap_u8)
+    if result.count > 0:
+        keep = result.values
+        return d_left_pair[keep], d_right_pair[keep]
+    return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+
+
+def _main_sweep_unbatched(
+    cp, runtime, n_left, total_raw_candidates,
+    d_cand_offsets, d_range_start_i32, d_range_end_i32,
+    sorted_right_idx, scatter_fn, ptr,
+    left_minx, left_maxx, left_miny, left_maxy,
+    right_minx, right_maxx, right_miny, right_maxy,
+    outlier_mask_bool,
+):
+    """Process the main sweep in a single pass (fits in memory)."""
+    return _main_sweep_scatter_and_filter(
+        cp, runtime, n_left, total_raw_candidates,
+        d_cand_offsets, d_range_start_i32, d_range_end_i32,
+        sorted_right_idx, scatter_fn, ptr,
+        left_minx, left_maxx, left_miny, left_maxy,
+        right_minx, right_maxx, right_miny, right_maxy,
+        outlier_mask_bool, left_idx_offset=0,
+    )
+
+
+def _main_sweep_batched(
+    cp, runtime, n_left, d_cand_counts,
+    d_range_start_i32, d_range_end_i32,
+    sorted_right_idx, scatter_fn, ptr,
+    left_minx, left_maxx, left_miny, left_maxy,
+    right_minx, right_maxx, right_miny, right_maxy,
+    outlier_mask_bool,
+):
+    """Process the main sweep in memory-bounded batches.
+
+    Splits left segments into chunks where each chunk's total candidate
+    pairs fits within ``_MAIN_SWEEP_MAX_PAIRS``.  Uses per-left candidate
+    counts (on device) to find chunk boundaries via cumulative sum and
+    binary search -- no host round-trip per chunk to size the split.
+    """
+    # Build a running cumulative sum of per-left candidate counts so we
+    # can binary-search for chunk boundaries entirely on device.
+    h_counts = runtime.copy_device_to_host(d_cand_counts)  # D2H -- one transfer for all chunk sizing
+    cum_counts = np.cumsum(h_counts, dtype=np.int64)
+    total_all = int(cum_counts[-1])
+
+    # Determine chunk boundaries: each chunk's total candidates <= cap.
+    chunk_starts = [0]
+    target = _MAIN_SWEEP_MAX_PAIRS
+    while target < total_all:
+        # Find first left index where cumulative count exceeds target.
+        idx = int(np.searchsorted(cum_counts, target, side="right"))
+        if idx <= chunk_starts[-1]:
+            # Single left segment exceeds the cap -- must include at least one.
+            idx = chunk_starts[-1] + 1
+        chunk_starts.append(min(idx, n_left))
+        target = int(cum_counts[min(idx, n_left) - 1]) + _MAIN_SWEEP_MAX_PAIRS
+    if chunk_starts[-1] < n_left:
+        chunk_starts.append(n_left)
+
+    batch_left_parts = []
+    batch_right_parts = []
+
+    for ci in range(len(chunk_starts) - 1):
+        cs = chunk_starts[ci]
+        ce = chunk_starts[ci + 1]
+        chunk_size = ce - cs
+
+        # Slice per-left arrays for this chunk (device slicing, no D2H).
+        chunk_counts = d_cand_counts[cs:ce]
+        chunk_range_start = d_range_start_i32[cs:ce]
+        chunk_range_end = d_range_end_i32[cs:ce]
+
+        # Chunk-local offsets: exclusive prefix sum starting from 0.
+        chunk_offsets = exclusive_sum(chunk_counts, synchronize=False)
+        chunk_total = count_scatter_total(runtime, chunk_counts, chunk_offsets)
+
+        if chunk_total == 0:
+            continue
+
+        bl, br = _main_sweep_scatter_and_filter(
+            cp, runtime, chunk_size, chunk_total,
+            chunk_offsets, chunk_range_start, chunk_range_end,
+            sorted_right_idx, scatter_fn, ptr,
+            left_minx, left_maxx, left_miny, left_maxy,
+            right_minx, right_maxx, right_miny, right_maxy,
+            outlier_mask_bool, left_idx_offset=cs,
+        )
+        if bl.size > 0:
+            batch_left_parts.append(bl)
+            batch_right_parts.append(br)
+
+    if not batch_left_parts:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+    if len(batch_left_parts) == 1:
+        return batch_left_parts[0], batch_right_parts[0]
+    return cp.concatenate(batch_left_parts), cp.concatenate(batch_right_parts)
+
+
 def _generate_candidates_gpu(
     left: DeviceSegmentTable,
     right: DeviceSegmentTable,
@@ -1340,62 +1517,37 @@ def _generate_candidates_gpu(
     total_raw_candidates = count_scatter_total(runtime, d_cand_counts, d_cand_offsets)
 
     if total_raw_candidates > 0:
-        # GPU-side scatter: expand (range_start, range_end) into pair arrays
-        # entirely on device via NVRTC kernel -- no host round-trip.
-        d_left_pair = runtime.allocate((total_raw_candidates,), np.int32)
-        d_right_pair = runtime.allocate((total_raw_candidates,), np.int32)
-
-        scatter_kernels = _candidate_scatter_kernels()
-        scatter_fn = scatter_kernels["scatter_candidate_pairs"]
-        grid, block = runtime.launch_config(scatter_fn, left.count)
-
         # range_start/range_end are CuPy uint arrays; cast to int32 for kernel
         d_range_start_i32 = cp.asarray(range_start, dtype=cp.int32)
         d_range_end_i32 = cp.asarray(range_end, dtype=cp.int32)
-
+        scatter_kernels = _candidate_scatter_kernels()
+        scatter_fn = scatter_kernels["scatter_candidate_pairs"]
         ptr = runtime.pointer
-        runtime.launch(
-            scatter_fn,
-            grid=grid, block=block,
-            params=(
-                (ptr(d_cand_offsets), ptr(d_range_start_i32), ptr(d_range_end_i32),
-                 ptr(sorted_right_idx), ptr(d_left_pair), ptr(d_right_pair),
-                 left.count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
-            ),
-        )
 
-        # Full MBR overlap filter on device
-        d_lminx = left_minx[d_left_pair]
-        d_lmaxx = left_maxx[d_left_pair]
-        d_lminy = left_miny[d_left_pair]
-        d_lmaxy = left_maxy[d_left_pair]
-        d_rminx = right_minx[d_right_pair]
-        d_rmaxx = right_maxx[d_right_pair]
-        d_rminy = right_miny[d_right_pair]
-        d_rmaxy = right_maxy[d_right_pair]
-
-        main_overlap = (
-            (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
-            (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
-        )
-        # Exclude outlier right segments from main results to prevent
-        # duplicates with the outlier pass.  Outlier rights will be
-        # handled exclusively by the brute-force MBR pass below.
-        if outlier_mask_bool is not None:
-            main_overlap &= ~outlier_mask_bool[d_right_pair]
-        main_overlap_u8 = main_overlap.astype(cp.uint8)
-
-        main_compact = compact_indices(main_overlap_u8)
-        if main_compact.count > 0:
-            main_keep = main_compact.values
-            main_final_left = d_left_pair[main_keep]
-            main_final_right = d_right_pair[main_keep]
+        if total_raw_candidates <= _MAIN_SWEEP_MAX_PAIRS:
+            # --- Fast path: all candidates fit in memory at once ---
+            main_final_left, main_final_right = _main_sweep_unbatched(
+                cp, runtime, left.count, total_raw_candidates,
+                d_cand_offsets, d_range_start_i32, d_range_end_i32,
+                sorted_right_idx, scatter_fn, ptr,
+                left_minx, left_maxx, left_miny, left_maxy,
+                right_minx, right_maxx, right_miny, right_maxy,
+                outlier_mask_bool,
+            )
         else:
-            main_final_left = cp.empty(0, dtype=cp.int32)
-            main_final_right = cp.empty(0, dtype=cp.int32)
+            # --- Batched path: split left segments into chunks whose
+            # total candidates fit within _MAIN_SWEEP_MAX_PAIRS.
+            # Uses per-left candidate counts (already on device) to
+            # determine chunk boundaries.  Each chunk: recompute
+            # chunk-local offsets, scatter, MBR filter, collect.
+            main_final_left, main_final_right = _main_sweep_batched(
+                cp, runtime, left.count, d_cand_counts,
+                d_range_start_i32, d_range_end_i32,
+                sorted_right_idx, scatter_fn, ptr,
+                left_minx, left_maxx, left_miny, left_maxy,
+                right_minx, right_maxx, right_miny, right_maxy,
+                outlier_mask_bool,
+            )
     else:
         main_final_left = cp.empty(0, dtype=cp.int32)
         main_final_right = cp.empty(0, dtype=cp.int32)
