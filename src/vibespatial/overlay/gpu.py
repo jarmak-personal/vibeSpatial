@@ -3856,6 +3856,14 @@ def _overlay_owned(
         )
         return _overlay_owned(left, right, operation=operation, dispatch_mode=ExecutionMode.CPU)
 
+    # Ensure host-side coordinate buffers are materialised.  Device-resident
+    # inputs from pylibcudf I/O have structural metadata on host but empty
+    # x/y stubs (host_materialized=False).  The overlay pipeline accesses
+    # polygon_buffer.x/y on host in multiple places (rectangle detection,
+    # segment extraction via extract_segments).
+    left._ensure_host_state()
+    right._ensure_host_state()
+
     if operation == "intersection":
         rectangle_fast_path = _overlay_intersection_rectangles_gpu(left, right, requested=requested)
         if rectangle_fast_path is not None:

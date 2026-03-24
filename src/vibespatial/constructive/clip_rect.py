@@ -29,6 +29,7 @@ from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import (  # noqa: E402
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
+    FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
     from_shapely_geometries,
@@ -1086,8 +1087,346 @@ def _clip_line_family_gpu(
 
 
 # ---------------------------------------------------------------------------
-# Batched GPU line clip — all line segments in a single kernel launch
+# Batched GPU line clip — vectorized segment extraction + reassembly
 # ---------------------------------------------------------------------------
+
+
+def _extract_segments_vectorized(
+    owned: OwnedGeometryArray,
+    line_families: list[GeometryFamily],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
+    """Vectorized extraction of segments from line-family buffers.
+
+    Uses numpy fancy indexing on contiguous buffer.x / buffer.y arrays
+    instead of per-coordinate Python list.append loops.
+
+    Returns
+    -------
+    seg_x0, seg_y0, seg_x1, seg_y1 : flat segment endpoint arrays (float64)
+    row_segment_offsets : cumulative segment count per row (int32, length = len(global_row_indices) + 1)
+    part_segment_offsets : cumulative segment count per part (int32, length = total_parts + 1)
+    part_row_map : which row index (into global_row_indices) each part belongs to (int32)
+    global_row_indices : ordered list of global row indices that have line data
+    """
+    # Collect per-span (start, end) ranges and metadata in bulk, then
+    # do a single vectorized extraction pass.
+    span_starts: list[int] = []
+    span_ends: list[int] = []
+    span_family_idx: list[int] = []  # which family's buffer each span belongs to
+    part_row_map_list: list[int] = []  # row idx (into global_row_indices) for each part
+    global_row_indices: list[int] = []
+    family_buffers: list[object] = []
+
+    for family in line_families:
+        buffer = owned.families[family]
+        tag = FAMILY_TAGS[family]
+        family_rows = np.flatnonzero(owned.tags == tag)
+        fam_idx = len(family_buffers)
+        family_buffers.append(buffer)
+
+        if buffer.row_count == 0 or buffer.geometry_offsets is None or len(buffer.geometry_offsets) < 2:
+            for global_row in family_rows:
+                global_row_indices.append(int(global_row))
+            continue
+
+        for global_row in family_rows:
+            row_idx = len(global_row_indices)
+            global_row_indices.append(int(global_row))
+            local_row = int(owned.family_row_offsets[global_row])
+
+            if buffer.empty_mask.size > local_row and buffer.empty_mask[local_row]:
+                continue
+
+            if family == GeometryFamily.LINESTRING:
+                s = int(buffer.geometry_offsets[local_row])
+                e = int(buffer.geometry_offsets[local_row + 1])
+                if e - s >= 2:
+                    span_starts.append(s)
+                    span_ends.append(e)
+                    span_family_idx.append(fam_idx)
+                    part_row_map_list.append(row_idx)
+            else:
+                # MultiLineString
+                part_start = int(buffer.geometry_offsets[local_row])
+                part_end = int(buffer.geometry_offsets[local_row + 1])
+                for idx in range(part_start, part_end):
+                    s = int(buffer.part_offsets[idx])
+                    e = int(buffer.part_offsets[idx + 1])
+                    if e - s >= 2:
+                        span_starts.append(s)
+                        span_ends.append(e)
+                        span_family_idx.append(fam_idx)
+                        part_row_map_list.append(row_idx)
+
+    if not span_starts:
+        empty = np.empty(0, dtype=np.float64)
+        return (
+            empty, empty, empty, empty,
+            np.zeros(len(global_row_indices) + 1, dtype=np.int32),
+            np.zeros(1, dtype=np.int32),
+            np.empty(0, dtype=np.int32),
+            global_row_indices,
+        )
+
+    # Compute segment counts per span: (end - start - 1)
+    starts_arr = np.asarray(span_starts, dtype=np.int64)
+    ends_arr = np.asarray(span_ends, dtype=np.int64)
+    seg_counts = (ends_arr - starts_arr - 1).astype(np.int32)
+    total_segments = int(np.sum(seg_counts))
+
+    if total_segments == 0:
+        empty = np.empty(0, dtype=np.float64)
+        return (
+            empty, empty, empty, empty,
+            np.zeros(len(global_row_indices) + 1, dtype=np.int32),
+            np.zeros(len(span_starts) + 1, dtype=np.int32),
+            np.asarray(part_row_map_list, dtype=np.int32),
+            global_row_indices,
+        )
+
+    # Build flat index arrays for vectorized gather.
+    # For each span, we need indices [start, start+1, ..., end-2] for x0/y0
+    # and [start+1, start+2, ..., end-1] for x1/y1.
+    seg_x0 = np.empty(total_segments, dtype=np.float64)
+    seg_y0 = np.empty(total_segments, dtype=np.float64)
+    seg_x1 = np.empty(total_segments, dtype=np.float64)
+    seg_y1 = np.empty(total_segments, dtype=np.float64)
+
+    out_pos = 0
+    for i, (s, e, fi) in enumerate(zip(span_starts, span_ends, span_family_idx)):
+        n = e - s - 1
+        if n <= 0:
+            continue
+        buf = family_buffers[fi]
+        # Vectorized slice: buffer.x[s:e-1] and buffer.x[s+1:e]
+        seg_x0[out_pos:out_pos + n] = buf.x[s:e - 1]
+        seg_y0[out_pos:out_pos + n] = buf.y[s:e - 1]
+        seg_x1[out_pos:out_pos + n] = buf.x[s + 1:e]
+        seg_y1[out_pos:out_pos + n] = buf.y[s + 1:e]
+        out_pos += n
+
+    # Build per-part segment offsets (cumulative)
+    part_segment_offsets = np.empty(len(seg_counts) + 1, dtype=np.int32)
+    part_segment_offsets[0] = 0
+    np.cumsum(seg_counts, out=part_segment_offsets[1:])
+
+    # Build per-row segment offsets from part offsets
+    part_row_map_arr = np.asarray(part_row_map_list, dtype=np.int32)
+    n_rows = len(global_row_indices)
+    row_segment_offsets = np.zeros(n_rows + 1, dtype=np.int32)
+    for pi, ri in enumerate(part_row_map_list):
+        row_segment_offsets[ri + 1] += int(seg_counts[pi])
+    np.cumsum(row_segment_offsets, out=row_segment_offsets)
+
+    return (
+        seg_x0, seg_y0, seg_x1, seg_y1,
+        row_segment_offsets, part_segment_offsets,
+        part_row_map_arr, global_row_indices,
+    )
+
+
+def _reassemble_lines_to_arrays(
+    out_x0: np.ndarray,
+    out_y0: np.ndarray,
+    out_x1: np.ndarray,
+    out_y1: np.ndarray,
+    valid: np.ndarray,
+    row_segment_offsets: np.ndarray,
+    part_segment_offsets: np.ndarray,
+    part_row_map: np.ndarray,
+    global_row_indices: list[int],
+    row_count: int,
+) -> np.ndarray:
+    """Reassemble clipped segments into Shapely geometries per row.
+
+    Uses vectorized valid-mask slicing per part rather than per-segment
+    Python loops.  Still produces Shapely objects for backward compatibility.
+    """
+    result = np.empty(row_count, dtype=object)
+    result[:] = None
+
+    n_rows = len(global_row_indices)
+    n_parts = len(part_segment_offsets) - 1
+
+    # Build a mapping from row index to its parts
+    # row_parts[ri] = list of part indices
+    row_parts: list[list[int]] = [[] for _ in range(n_rows)]
+    for pi in range(n_parts):
+        ri = int(part_row_map[pi])
+        row_parts[ri].append(pi)
+
+    for ri in range(n_rows):
+        global_row = global_row_indices[ri]
+        parts_for_row = row_parts[ri]
+
+        if not parts_for_row:
+            result[global_row] = EMPTY
+            continue
+
+        all_line_parts: list[list[tuple[float, float]]] = []
+        for pi in parts_for_row:
+            seg_start = int(part_segment_offsets[pi])
+            seg_end = int(part_segment_offsets[pi + 1])
+            if seg_start == seg_end:
+                continue
+
+            # Vectorized: get valid mask slice for this part
+            part_valid = valid[seg_start:seg_end]
+            valid_indices = np.flatnonzero(part_valid)
+
+            if valid_indices.size == 0:
+                continue
+
+            # Extract valid segments for this part
+            abs_indices = seg_start + valid_indices
+            vx0 = out_x0[abs_indices]
+            vy0 = out_y0[abs_indices]
+            vx1 = out_x1[abs_indices]
+            vy1 = out_y1[abs_indices]
+
+            # Merge consecutive segments: two segments are consecutive if
+            # segment[i].end == segment[i+1].start (within epsilon).
+            part_segments: list[list[tuple[float, float]]] = []
+            for si in range(len(valid_indices)):
+                segment = (float(vx0[si]), float(vy0[si]), float(vx1[si]), float(vy1[si]))
+                _merge_clipped_segments(part_segments, segment)
+            all_line_parts.extend(part_segments)
+
+        result[global_row] = _build_linestring_result(all_line_parts)
+
+    return result
+
+
+def _build_line_clip_owned_result(
+    out_x0: np.ndarray,
+    out_y0: np.ndarray,
+    out_x1: np.ndarray,
+    out_y1: np.ndarray,
+    valid: np.ndarray,
+    row_segment_offsets: np.ndarray,
+    part_segment_offsets: np.ndarray,
+    part_row_map: np.ndarray,
+    global_row_indices: list[int],
+) -> OwnedGeometryArray | None:
+    """Build an OwnedGeometryArray directly from clipped segment arrays.
+
+    Constructs coordinate and offset arrays for a LineString-family OGA
+    without going through Shapely construction.  Each part with valid
+    segments becomes one LineString row in the output.
+    """
+    from vibespatial.geometry.buffers import get_geometry_buffer_schema
+
+    n_parts = len(part_segment_offsets) - 1
+    if n_parts == 0:
+        return None
+
+    # Collect coordinates for all valid line parts.
+    # Each valid-segments run within a part becomes a linestring.
+    all_coords_x: list[np.ndarray] = []
+    all_coords_y: list[np.ndarray] = []
+    line_lengths: list[int] = []
+
+    for pi in range(n_parts):
+        seg_start = int(part_segment_offsets[pi])
+        seg_end = int(part_segment_offsets[pi + 1])
+        if seg_start == seg_end:
+            continue
+
+        part_valid = valid[seg_start:seg_end]
+        valid_indices = np.flatnonzero(part_valid)
+        if valid_indices.size == 0:
+            continue
+
+        abs_indices = seg_start + valid_indices
+        vx0 = out_x0[abs_indices]
+        vy0 = out_y0[abs_indices]
+        vx1 = out_x1[abs_indices]
+        vy1 = out_y1[abs_indices]
+
+        # Build coordinate arrays: for N valid segments, we get
+        # up to N+1 coordinates (start of first + end of each).
+        # Detect breaks where end[i] != start[i+1].
+        if len(valid_indices) == 1:
+            all_coords_x.append(np.array([vx0[0], vx1[0]]))
+            all_coords_y.append(np.array([vy0[0], vy1[0]]))
+            line_lengths.append(2)
+        else:
+            # Check continuity between consecutive segments
+            breaks = np.where(
+                (np.abs(vx1[:-1] - vx0[1:]) > _POINT_EPSILON)
+                | (np.abs(vy1[:-1] - vy0[1:]) > _POINT_EPSILON)
+            )[0]
+
+            if breaks.size == 0:
+                # All segments are continuous: one linestring
+                coords_x = np.empty(len(valid_indices) + 1, dtype=np.float64)
+                coords_y = np.empty(len(valid_indices) + 1, dtype=np.float64)
+                coords_x[:-1] = vx0
+                coords_x[-1] = vx1[-1]
+                coords_y[:-1] = vy0
+                coords_y[-1] = vy1[-1]
+                all_coords_x.append(coords_x)
+                all_coords_y.append(coords_y)
+                line_lengths.append(len(coords_x))
+            else:
+                # Multiple linestrings from breaks
+                split_points = np.concatenate(([0], breaks + 1, [len(valid_indices)]))
+                for j in range(len(split_points) - 1):
+                    s, e = int(split_points[j]), int(split_points[j + 1])
+                    if e - s < 1:
+                        continue
+                    n_seg = e - s
+                    coords_x = np.empty(n_seg + 1, dtype=np.float64)
+                    coords_y = np.empty(n_seg + 1, dtype=np.float64)
+                    coords_x[:-1] = vx0[s:e]
+                    coords_x[-1] = vx1[e - 1]
+                    coords_y[:-1] = vy0[s:e]
+                    coords_y[-1] = vy1[e - 1]
+                    if len(coords_x) >= 2:
+                        all_coords_x.append(coords_x)
+                        all_coords_y.append(coords_y)
+                        line_lengths.append(len(coords_x))
+
+    if not all_coords_x:
+        return None
+
+    # Build flat coordinate arrays and geometry_offsets for OGA
+    total_coords = sum(line_lengths)
+    flat_x = np.empty(total_coords, dtype=np.float64)
+    flat_y = np.empty(total_coords, dtype=np.float64)
+    geometry_offsets = np.empty(len(line_lengths) + 1, dtype=np.int32)
+    geometry_offsets[0] = 0
+    pos = 0
+    for i, (cx, cy) in enumerate(zip(all_coords_x, all_coords_y)):
+        n = len(cx)
+        flat_x[pos:pos + n] = cx
+        flat_y[pos:pos + n] = cy
+        pos += n
+        geometry_offsets[i + 1] = pos
+
+    line_count = len(line_lengths)
+    empty_mask = np.zeros(line_count, dtype=np.bool_)
+    validity = np.ones(line_count, dtype=np.bool_)
+    tags = np.full(line_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
+    family_row_offsets = np.arange(line_count, dtype=np.int32)
+
+    line_buffer = FamilyGeometryBuffer(
+        family=GeometryFamily.LINESTRING,
+        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
+        row_count=line_count,
+        x=flat_x,
+        y=flat_y,
+        geometry_offsets=geometry_offsets,
+        empty_mask=empty_mask,
+        host_materialized=True,
+    )
+    return OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families={GeometryFamily.LINESTRING: line_buffer},
+    )
+
 
 def _clip_all_lines_gpu(
     owned: OwnedGeometryArray,
@@ -1095,10 +1434,8 @@ def _clip_all_lines_gpu(
 ) -> np.ndarray:
     """Batch-clip ALL linestring/multilinestring rows on GPU via Liang-Barsky.
 
-    Extracts every segment from every line-family row into flat coordinate
-    arrays, launches a single ``lb_clip_segments`` kernel, then reassembles
-    clipped segments into shapely LineString / MultiLineString objects keyed
-    by global row index.
+    Vectorized extraction: uses numpy fancy indexing on contiguous buffer.x/y
+    arrays instead of per-coordinate Python list.append loops.
 
     Returns an object array of length ``owned.row_count`` where each entry is
     the clipped geometry (or ``None`` for rows that are not line families).
@@ -1113,100 +1450,31 @@ def _clip_all_lines_gpu(
     if not line_families:
         return result
 
-    # -- Step 1: extract all segments across all line rows ----------------
-    all_x0: list[float] = []
-    all_y0: list[float] = []
-    all_x1: list[float] = []
-    all_y1: list[float] = []
-    # Track per-row segment ranges so we can reassemble later.
-    # Each entry is (global_row, span_segment_counts) where
-    # span_segment_counts is a list of segment counts per linestring part.
-    row_meta: list[tuple[int, list[int]]] = []
+    # -- Step 1: vectorized segment extraction ----------------------------
+    (
+        seg_x0, seg_y0, seg_x1, seg_y1,
+        row_segment_offsets, part_segment_offsets,
+        part_row_map, global_row_indices,
+    ) = _extract_segments_vectorized(owned, line_families)
 
-    for family in line_families:
-        buffer = owned.families[family]
-        tag = FAMILY_TAGS[family]
-        family_rows = np.flatnonzero(owned.tags == tag)
-        if buffer.row_count == 0 or buffer.geometry_offsets is None or len(buffer.geometry_offsets) < 2:
-            for global_row in family_rows:
-                row_meta.append((int(global_row), []))
-            continue
-
-        for global_row in family_rows:
-            local_row = int(owned.family_row_offsets[global_row])
-            if buffer.empty_mask.size > local_row and buffer.empty_mask[local_row]:
-                row_meta.append((int(global_row), []))
-                continue
-
-            # Determine coordinate spans per linestring part.
-            if family == GeometryFamily.LINESTRING:
-                # geometry_offsets gives coord range directly.
-                spans = [(
-                    int(buffer.geometry_offsets[local_row]),
-                    int(buffer.geometry_offsets[local_row + 1]),
-                )]
-            else:
-                # MultiLineString: geometry_offsets -> part_offsets -> coords.
-                part_start = int(buffer.geometry_offsets[local_row])
-                part_end = int(buffer.geometry_offsets[local_row + 1])
-                spans = [
-                    (int(buffer.part_offsets[idx]), int(buffer.part_offsets[idx + 1]))
-                    for idx in range(part_start, part_end)
-                ]
-
-            span_segment_counts: list[int] = []
-            for start, end in spans:
-                count = max(0, end - start - 1)
-                span_segment_counts.append(count)
-                for ci in range(start, end - 1):
-                    all_x0.append(float(buffer.x[ci]))
-                    all_y0.append(float(buffer.y[ci]))
-                    all_x1.append(float(buffer.x[ci + 1]))
-                    all_y1.append(float(buffer.y[ci + 1]))
-
-            row_meta.append((int(global_row), span_segment_counts))
-
-    total_segments = len(all_x0)
+    total_segments = len(seg_x0)
     if total_segments == 0:
-        for global_row, _ in row_meta:
+        for global_row in global_row_indices:
             result[global_row] = EMPTY
         return result
 
     # -- Step 2: single GPU kernel launch ---------------------------------
-    seg_x0 = np.asarray(all_x0, dtype=np.float64)
-    seg_y0 = np.asarray(all_y0, dtype=np.float64)
-    seg_x1 = np.asarray(all_x1, dtype=np.float64)
-    seg_y1 = np.asarray(all_y1, dtype=np.float64)
-
     out_x0, out_y0, out_x1, out_y1, valid = _clip_line_segments_gpu(
         seg_x0, seg_y0, seg_x1, seg_y1, rect,
     )
 
-    # -- Step 3: reassemble clipped segments per row ----------------------
-    seg_idx = 0
-    for global_row, span_counts in row_meta:
-        if not span_counts:
-            result[global_row] = EMPTY
-            continue
-
-        parts: list[list[tuple[float, float]]] = []
-        for span_count in span_counts:
-            part_segments: list[list[tuple[float, float]]] = []
-            for _ in range(span_count):
-                if valid[seg_idx]:
-                    segment = (
-                        float(out_x0[seg_idx]),
-                        float(out_y0[seg_idx]),
-                        float(out_x1[seg_idx]),
-                        float(out_y1[seg_idx]),
-                    )
-                    _merge_clipped_segments(part_segments, segment)
-                seg_idx += 1
-            parts.extend(part_segments)
-
-        result[global_row] = _build_linestring_result(parts)
-
-    return result
+    # -- Step 3: vectorized reassembly ------------------------------------
+    return _reassemble_lines_to_arrays(
+        out_x0, out_y0, out_x1, out_y1, valid,
+        row_segment_offsets, part_segment_offsets,
+        part_row_map, global_row_indices,
+        owned.row_count,
+    )
 
 
 def _row_family_and_local_index(owned: OwnedGeometryArray, row_index: int):
