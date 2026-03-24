@@ -954,9 +954,38 @@ scatter_candidate_pairs(
         ++write_pos;
     }
 }
+
+// Batched variant: processes left segments [left_start, left_start+batch_size).
+// Write positions are shifted by -offset_base so output starts at index 0.
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_candidate_pairs_batch(
+    const int* __restrict__ cand_offsets,
+    const int* __restrict__ range_start,
+    const int* __restrict__ range_end,
+    const int* __restrict__ sorted_right_idx,
+    int* __restrict__ out_left,
+    int* __restrict__ out_right,
+    const int left_start,
+    const int batch_size,
+    const int offset_base
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= batch_size) return;
+
+    const int i = left_start + tid;
+    const int rs = range_start[i];
+    const int re = range_end[i];
+    int write_pos = cand_offsets[i] - offset_base;
+
+    for (int j = rs; j < re; ++j) {
+        out_left[write_pos] = i;
+        out_right[write_pos] = sorted_right_idx[j];
+        ++write_pos;
+    }
+}
 """
 
-_CANDIDATE_SCATTER_KERNEL_NAMES = ("scatter_candidate_pairs",)
+_CANDIDATE_SCATTER_KERNEL_NAMES = ("scatter_candidate_pairs", "scatter_candidate_pairs_batch")
 
 # Pre-format kernel sources for warmup
 _EXTRACT_SOURCE_FP64 = _format_extract_source("double")
@@ -1232,6 +1261,275 @@ def _extract_segments_gpu(
 # This replaces the O(n^2) tiled brute-force approach.
 # ---------------------------------------------------------------------------
 
+# Peak bytes per raw candidate pair during scatter+MBR-filter:
+#   2 x int32 pair arrays = 8 bytes
+#   8 x float64 gathered bounds = 64 bytes
+#   1 x bool overlap mask = 1 byte
+#   1 x uint8 cast = 1 byte
+# Total ~74 bytes.  Use 80 for safety headroom.
+_BYTES_PER_RAW_PAIR = 80
+
+# Absolute floor: never create batches smaller than 1M pairs.
+_MIN_BATCH_PAIRS = 1 * 1024 * 1024
+
+
+def _compute_max_batch_pairs() -> int:
+    """Return the maximum number of raw candidate pairs per batch.
+
+    Uses 50% of currently-free device VRAM divided by the peak per-pair
+    memory cost during the scatter+filter phase.  Falls back to 16M pairs
+    (~1.2 GB peak) if the VRAM query fails.
+    """
+    import cupy as cp
+
+    try:
+        free_bytes, _total_bytes = cp.cuda.Device().mem_info
+    except Exception:
+        # Fallback: conservative 16M pairs (~1.2 GB)
+        return 16 * 1024 * 1024
+
+    # Use 50% of free VRAM for candidate pair processing.
+    usable_bytes = free_bytes // 2
+    max_pairs = usable_bytes // _BYTES_PER_RAW_PAIR
+
+    return max(max_pairs, _MIN_BATCH_PAIRS)
+
+
+def _main_sweep_scatter_and_filter(
+    *,
+    runtime,
+    left: DeviceSegmentTable,
+    d_cand_offsets,
+    range_start,
+    range_end,
+    sorted_right_idx,
+    left_minx,
+    left_maxx,
+    left_miny,
+    left_maxy,
+    right_minx,
+    right_maxx,
+    right_miny,
+    right_maxy,
+    outlier_mask_bool,
+    total_raw_candidates: int,
+):
+    """Scatter raw candidates and MBR-filter, batching to fit in VRAM.
+
+    When ``total_raw_candidates`` fits in a single batch this is identical
+    to the original unbatched code path — no performance regression for
+    small inputs.  For large candidate counts that would OOM, left segments
+    are partitioned into batches whose raw pair count fits within 50% of
+    free VRAM.
+
+    Returns (main_final_left, main_final_right) as CuPy int32 arrays.
+    """
+    import cupy as cp
+
+    max_batch_pairs = _compute_max_batch_pairs()
+
+    # Fast path: everything fits in one batch — no overhead.
+    if total_raw_candidates <= max_batch_pairs:
+        return _scatter_and_filter_single(
+            runtime=runtime,
+            left=left,
+            d_cand_offsets=d_cand_offsets,
+            range_start=range_start,
+            range_end=range_end,
+            sorted_right_idx=sorted_right_idx,
+            left_minx=left_minx,
+            left_maxx=left_maxx,
+            left_miny=left_miny,
+            left_maxy=left_maxy,
+            right_minx=right_minx,
+            right_maxx=right_maxx,
+            right_miny=right_miny,
+            right_maxy=right_maxy,
+            outlier_mask_bool=outlier_mask_bool,
+            left_start=0,
+            left_end=left.count,
+            offset_base=0,
+            batch_raw_count=total_raw_candidates,
+        )
+
+    # --- Batched path: partition left segments into VRAM-bounded chunks ---
+    # We need batch boundaries [b0, b1, b2, ...] such that
+    #   d_cand_offsets[b_{k+1}] - d_cand_offsets[b_k] <= max_batch_pairs
+    # The offsets array is monotonically non-decreasing, so we use a simple
+    # host-side scan of the offsets to find batch boundaries.
+    # Transfer d_cand_offsets to host — one int32 array of size n_left (small).
+    runtime.synchronize()  # ensure exclusive_sum is complete
+    h_offsets = cp.asnumpy(d_cand_offsets)
+
+    n_left = left.count
+    # Also need the total so we can compute the last batch's count.
+    # total_raw_candidates is already available.
+
+    batch_boundaries = [0]
+    batch_start_offset = 0
+    for i in range(1, n_left):
+        batch_pair_count = int(h_offsets[i]) - batch_start_offset
+        if batch_pair_count > max_batch_pairs:
+            # End the previous batch at segment i (exclusive).
+            batch_boundaries.append(i)
+            batch_start_offset = int(h_offsets[i])
+
+    batch_boundaries.append(n_left)
+
+    # Process each batch, collecting surviving pairs.
+    result_left_parts = []
+    result_right_parts = []
+
+    for b in range(len(batch_boundaries) - 1):
+        b_lo = batch_boundaries[b]
+        b_hi = batch_boundaries[b + 1]
+        if b_lo >= b_hi:
+            continue
+
+        b_offset_base = int(h_offsets[b_lo])
+        if b_hi < n_left:
+            b_raw_count = int(h_offsets[b_hi]) - b_offset_base
+        else:
+            b_raw_count = total_raw_candidates - b_offset_base
+
+        if b_raw_count == 0:
+            continue
+
+        b_left, b_right = _scatter_and_filter_single(
+            runtime=runtime,
+            left=left,
+            d_cand_offsets=d_cand_offsets,
+            range_start=range_start,
+            range_end=range_end,
+            sorted_right_idx=sorted_right_idx,
+            left_minx=left_minx,
+            left_maxx=left_maxx,
+            left_miny=left_miny,
+            left_maxy=left_maxy,
+            right_minx=right_minx,
+            right_maxx=right_maxx,
+            right_miny=right_miny,
+            right_maxy=right_maxy,
+            outlier_mask_bool=outlier_mask_bool,
+            left_start=b_lo,
+            left_end=b_hi,
+            offset_base=b_offset_base,
+            batch_raw_count=b_raw_count,
+        )
+        if b_left.size > 0:
+            result_left_parts.append(b_left)
+            result_right_parts.append(b_right)
+
+    if not result_left_parts:
+        return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+    if len(result_left_parts) == 1:
+        return result_left_parts[0], result_right_parts[0]
+    return cp.concatenate(result_left_parts), cp.concatenate(result_right_parts)
+
+
+def _scatter_and_filter_single(
+    *,
+    runtime,
+    left: DeviceSegmentTable,
+    d_cand_offsets,
+    range_start,
+    range_end,
+    sorted_right_idx,
+    left_minx,
+    left_maxx,
+    left_miny,
+    left_maxy,
+    right_minx,
+    right_maxx,
+    right_miny,
+    right_maxy,
+    outlier_mask_bool,
+    left_start: int,
+    left_end: int,
+    offset_base: int,
+    batch_raw_count: int,
+):
+    """Scatter candidate pairs for left segments [left_start, left_end)
+    and apply MBR overlap filter.  Returns (filtered_left, filtered_right).
+
+    When left_start==0, left_end==n_left, and offset_base==0 this is
+    identical to the original unbatched code path.
+    """
+    import cupy as cp
+
+    batch_size = left_end - left_start
+
+    d_left_pair = runtime.allocate((batch_raw_count,), np.int32)
+    d_right_pair = runtime.allocate((batch_raw_count,), np.int32)
+
+    scatter_kernels = _candidate_scatter_kernels()
+    ptr = runtime.pointer
+
+    # range_start/range_end are CuPy uint arrays; cast to int32 for kernel
+    d_range_start_i32 = cp.asarray(range_start, dtype=cp.int32)
+    d_range_end_i32 = cp.asarray(range_end, dtype=cp.int32)
+
+    if left_start == 0 and left_end == left.count:
+        # Unbatched path: use the original kernel (no offset arithmetic).
+        scatter_fn = scatter_kernels["scatter_candidate_pairs"]
+        grid, block = runtime.launch_config(scatter_fn, left.count)
+        runtime.launch(
+            scatter_fn,
+            grid=grid, block=block,
+            params=(
+                (ptr(d_cand_offsets), ptr(d_range_start_i32), ptr(d_range_end_i32),
+                 ptr(sorted_right_idx), ptr(d_left_pair), ptr(d_right_pair),
+                 left.count),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32),
+            ),
+        )
+    else:
+        # Batched path: use the batch-aware kernel variant.
+        scatter_fn = scatter_kernels["scatter_candidate_pairs_batch"]
+        grid, block = runtime.launch_config(scatter_fn, batch_size)
+        runtime.launch(
+            scatter_fn,
+            grid=grid, block=block,
+            params=(
+                (ptr(d_cand_offsets), ptr(d_range_start_i32), ptr(d_range_end_i32),
+                 ptr(sorted_right_idx), ptr(d_left_pair), ptr(d_right_pair),
+                 left_start, batch_size, offset_base),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+            ),
+        )
+
+    # Full MBR overlap filter on device
+    d_lminx = left_minx[d_left_pair]
+    d_lmaxx = left_maxx[d_left_pair]
+    d_lminy = left_miny[d_left_pair]
+    d_lmaxy = left_maxy[d_left_pair]
+    d_rminx = right_minx[d_right_pair]
+    d_rmaxx = right_maxx[d_right_pair]
+    d_rminy = right_miny[d_right_pair]
+    d_rmaxy = right_maxy[d_right_pair]
+
+    main_overlap = (
+        (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
+        (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
+    )
+    # Exclude outlier right segments from main results to prevent
+    # duplicates with the outlier pass.  Outlier rights will be
+    # handled exclusively by the brute-force MBR pass below.
+    if outlier_mask_bool is not None:
+        main_overlap &= ~outlier_mask_bool[d_right_pair]
+    main_overlap_u8 = main_overlap.astype(cp.uint8)
+
+    main_compact = compact_indices(main_overlap_u8)
+    if main_compact.count > 0:
+        main_keep = main_compact.values
+        return d_left_pair[main_keep], d_right_pair[main_keep]
+    return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
+
+
 def _generate_candidates_gpu(
     left: DeviceSegmentTable,
     right: DeviceSegmentTable,
@@ -1340,62 +1638,24 @@ def _generate_candidates_gpu(
     total_raw_candidates = count_scatter_total(runtime, d_cand_counts, d_cand_offsets)
 
     if total_raw_candidates > 0:
-        # GPU-side scatter: expand (range_start, range_end) into pair arrays
-        # entirely on device via NVRTC kernel -- no host round-trip.
-        d_left_pair = runtime.allocate((total_raw_candidates,), np.int32)
-        d_right_pair = runtime.allocate((total_raw_candidates,), np.int32)
-
-        scatter_kernels = _candidate_scatter_kernels()
-        scatter_fn = scatter_kernels["scatter_candidate_pairs"]
-        grid, block = runtime.launch_config(scatter_fn, left.count)
-
-        # range_start/range_end are CuPy uint arrays; cast to int32 for kernel
-        d_range_start_i32 = cp.asarray(range_start, dtype=cp.int32)
-        d_range_end_i32 = cp.asarray(range_end, dtype=cp.int32)
-
-        ptr = runtime.pointer
-        runtime.launch(
-            scatter_fn,
-            grid=grid, block=block,
-            params=(
-                (ptr(d_cand_offsets), ptr(d_range_start_i32), ptr(d_range_end_i32),
-                 ptr(sorted_right_idx), ptr(d_left_pair), ptr(d_right_pair),
-                 left.count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32),
-            ),
+        main_final_left, main_final_right = _main_sweep_scatter_and_filter(
+            runtime=runtime,
+            left=left,
+            d_cand_offsets=d_cand_offsets,
+            range_start=range_start,
+            range_end=range_end,
+            sorted_right_idx=sorted_right_idx,
+            left_minx=left_minx,
+            left_maxx=left_maxx,
+            left_miny=left_miny,
+            left_maxy=left_maxy,
+            right_minx=right_minx,
+            right_maxx=right_maxx,
+            right_miny=right_miny,
+            right_maxy=right_maxy,
+            outlier_mask_bool=outlier_mask_bool,
+            total_raw_candidates=total_raw_candidates,
         )
-
-        # Full MBR overlap filter on device
-        d_lminx = left_minx[d_left_pair]
-        d_lmaxx = left_maxx[d_left_pair]
-        d_lminy = left_miny[d_left_pair]
-        d_lmaxy = left_maxy[d_left_pair]
-        d_rminx = right_minx[d_right_pair]
-        d_rmaxx = right_maxx[d_right_pair]
-        d_rminy = right_miny[d_right_pair]
-        d_rmaxy = right_maxy[d_right_pair]
-
-        main_overlap = (
-            (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
-            (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
-        )
-        # Exclude outlier right segments from main results to prevent
-        # duplicates with the outlier pass.  Outlier rights will be
-        # handled exclusively by the brute-force MBR pass below.
-        if outlier_mask_bool is not None:
-            main_overlap &= ~outlier_mask_bool[d_right_pair]
-        main_overlap_u8 = main_overlap.astype(cp.uint8)
-
-        main_compact = compact_indices(main_overlap_u8)
-        if main_compact.count > 0:
-            main_keep = main_compact.values
-            main_final_left = d_left_pair[main_keep]
-            main_final_right = d_right_pair[main_keep]
-        else:
-            main_final_left = cp.empty(0, dtype=cp.int32)
-            main_final_right = cp.empty(0, dtype=cp.int32)
     else:
         main_final_left = cp.empty(0, dtype=cp.int32)
         main_final_right = cp.empty(0, dtype=cp.int32)
@@ -1416,9 +1676,8 @@ def _generate_candidates_gpu(
             # Batched brute-force: process outlier rights in chunks to avoid
             # materializing O(n_left * n_outliers) pairs which would OOM at
             # scale (e.g. 1M left × 50K outliers = 50B elements = 200+ GB).
-            # Batch size is adaptive: cap expanded pairs at ~64M to keep
-            # peak memory under ~1 GB regardless of n_left.
-            _MAX_EXPANDED_PAIRS = 64 * 1024 * 1024
+            # Batch size adapts to available VRAM (same policy as main sweep).
+            _MAX_EXPANDED_PAIRS = _compute_max_batch_pairs()
             _OUTLIER_BATCH = max(1, _MAX_EXPANDED_PAIRS // max(n_left, 1))
             batch_left_parts = []
             batch_right_parts = []
