@@ -103,11 +103,11 @@ Current state:
 - the owned GPU point-only path is now faster than Shapely on the benchmark
   harness and can re-enter from device-backed point arrays without materializing
   the full source batch
-- non-point families still do not have a public GPU clip path
-
-So the adapter still records an explicit fallback event and leaves the host path
-on Shapely until broader constructive GPU coverage exists, not because the
-point-only path is still too slow.
+- polygon families have a device-resident GPU clip path via Sutherland-Hodgman
+  kernel with vectorized ring extraction and direct OGA construction
+- line families have a device-resident GPU clip path via Liang-Barsky kernel
+  with CuPy/CCCL coordinate assembly (``_build_line_clip_device_result``)
+- both polygon and line GPU paths return ``Residency.DEVICE`` OwnedGeometryArrays
 
 ## CCCL Mapping
 

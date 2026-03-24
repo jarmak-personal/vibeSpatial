@@ -1636,7 +1636,7 @@ def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
 def _build_polygon_output_from_faces_gpu(
     half_edge_graph: HalfEdgeGraph,
     faces: OverlayFaceTable,
-    selected_face_indices: np.ndarray,
+    selected_face_indices: np.ndarray | cp.ndarray,
 ) -> OwnedGeometryArray | None:
     """GPU face-to-polygon assembly (Phase 11: GPU boundary cycle detection).
 
@@ -2614,29 +2614,6 @@ def _build_polygon_output_from_faces(
         row_polygons.setdefault(cycle_rows[exterior_index], []).append(rings)
 
     return _build_overlay_output_rows(row_polygons, faces.runtime_selection)
-
-
-def _select_overlay_face_indices(
-    faces: OverlayFaceTable,
-    *,
-    operation: str,
-) -> np.ndarray:
-    bounded = faces.bounded_mask != 0
-    left_covered = faces.left_covered != 0
-    right_covered = faces.right_covered != 0
-    if operation == "intersection":
-        mask = bounded & left_covered & right_covered
-    elif operation == "union":
-        mask = bounded & (left_covered | right_covered)
-    elif operation == "difference":
-        mask = bounded & left_covered & ~right_covered
-    elif operation == "symmetric_difference":
-        mask = bounded & (left_covered != right_covered)
-    elif operation == "identity":
-        mask = bounded & left_covered
-    else:
-        raise ValueError(f"unsupported overlay operation: {operation}")
-    return np.flatnonzero(mask).astype(np.int32, copy=False)
 
 
 def _select_overlay_face_indices_gpu(
@@ -3882,7 +3859,9 @@ def _overlay_owned(
     atomic_edges = build_gpu_atomic_edges(split_events)
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
-    selected_face_indices = _select_overlay_face_indices(faces, operation=operation)
+    # Phase 13: Device-resident face selection — avoids triggering
+    # _ensure_host() D->H on bounded_mask/left_covered/right_covered.
+    d_selected_face_indices = _select_overlay_face_indices_gpu(faces, operation=operation)
     # GPU face assembly is the primary path.  The GPU pipeline (Phases 7-14)
     # returns device-resident results, so it is strongly preferred.
     #
@@ -3891,7 +3870,7 @@ def _overlay_owned(
     if requested is ExecutionMode.GPU:
         # Strict GPU: no fallback.
         result = _build_polygon_output_from_faces_gpu(
-            half_edge_graph, faces, selected_face_indices,
+            half_edge_graph, faces, d_selected_face_indices,
         )
         if result is None:
             raise RuntimeError(
@@ -3906,7 +3885,7 @@ def _overlay_owned(
         gpu_fail_reason = ""
         try:
             gpu_result = _build_polygon_output_from_faces_gpu(
-                half_edge_graph, faces, selected_face_indices,
+                half_edge_graph, faces, d_selected_face_indices,
             )
             if gpu_result is None:
                 gpu_failed = True
@@ -3925,6 +3904,8 @@ def _overlay_owned(
                 pipeline="overlay",
                 d2h_transfer=True,
             )
+            # CPU fallback needs host indices
+            selected_face_indices = cp.asnumpy(d_selected_face_indices)
             result = _build_polygon_output_from_faces(
                 half_edge_graph, faces, selected_face_indices,
             )

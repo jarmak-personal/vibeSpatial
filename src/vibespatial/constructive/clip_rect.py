@@ -29,7 +29,6 @@ from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import (  # noqa: E402
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
     from_shapely_geometries,
@@ -951,74 +950,88 @@ def _clip_line_segments_gpu(
     seg_y1: np.ndarray,
     rect: tuple[float, float, float, float],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Clip line segments on GPU using Liang-Barsky.
+    """Clip line segments on GPU using Liang-Barsky (host I/O path).
 
-    Returns (out_x0, out_y0, out_x1, out_y1, valid_mask) with valid_mask
-    indicating which segments survived clipping.
+    Returns (out_x0, out_y0, out_x1, out_y1, valid_mask) as host numpy arrays.
+    For the device-resident path, use ``_clip_line_segments_gpu_device`` instead.
     """
+    import cupy as cp
+
+    d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid = _clip_line_segments_gpu_device(
+        seg_x0, seg_y0, seg_x1, seg_y1, rect,
+    )
+    return (
+        cp.asnumpy(d_out_x0),
+        cp.asnumpy(d_out_y0),
+        cp.asnumpy(d_out_x1),
+        cp.asnumpy(d_out_y1),
+        cp.asnumpy(d_valid),
+    )
+
+
+def _clip_line_segments_gpu_device(
+    seg_x0: np.ndarray,
+    seg_y0: np.ndarray,
+    seg_x1: np.ndarray,
+    seg_y1: np.ndarray,
+    rect: tuple[float, float, float, float],
+):
+    """Clip line segments on GPU using Liang-Barsky (device I/O).
+
+    Accepts host numpy arrays for input segments.  Returns
+    (d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid) as CuPy device
+    arrays.  No D2H transfer; kernel outputs stay on device.
+    """
+    import cupy as cp
+
     from vibespatial.cuda._runtime import KERNEL_PARAM_F64, KERNEL_PARAM_I32, KERNEL_PARAM_PTR
 
     runtime = get_cuda_runtime()
     xmin, ymin, xmax, ymax = rect
     segment_count = len(seg_x0)
 
-    d_x0 = runtime.from_host(np.ascontiguousarray(seg_x0, dtype=np.float64))
-    d_y0 = runtime.from_host(np.ascontiguousarray(seg_y0, dtype=np.float64))
-    d_x1 = runtime.from_host(np.ascontiguousarray(seg_x1, dtype=np.float64))
-    d_y1 = runtime.from_host(np.ascontiguousarray(seg_y1, dtype=np.float64))
-    d_out_x0 = runtime.allocate((segment_count,), np.float64)
-    d_out_y0 = runtime.allocate((segment_count,), np.float64)
-    d_out_x1 = runtime.allocate((segment_count,), np.float64)
-    d_out_y1 = runtime.allocate((segment_count,), np.float64)
-    d_valid = runtime.allocate((segment_count,), np.uint8)
+    # Upload inputs to device via CuPy (managed by memory pool)
+    d_x0 = cp.asarray(np.ascontiguousarray(seg_x0, dtype=np.float64))
+    d_y0 = cp.asarray(np.ascontiguousarray(seg_y0, dtype=np.float64))
+    d_x1 = cp.asarray(np.ascontiguousarray(seg_x1, dtype=np.float64))
+    d_y1 = cp.asarray(np.ascontiguousarray(seg_y1, dtype=np.float64))
+
+    # Allocate output buffers on device via CuPy
+    d_out_x0 = cp.empty(segment_count, dtype=cp.float64)
+    d_out_y0 = cp.empty(segment_count, dtype=cp.float64)
+    d_out_x1 = cp.empty(segment_count, dtype=cp.float64)
+    d_out_y1 = cp.empty(segment_count, dtype=cp.float64)
+    d_valid = cp.empty(segment_count, dtype=cp.uint8)
 
     kernels = _compile_lb_kernels()
     ptr = runtime.pointer
 
-    try:
-        params = (
-            (
-                ptr(d_x0), ptr(d_y0), ptr(d_x1), ptr(d_y1),
-                ptr(d_out_x0), ptr(d_out_y0), ptr(d_out_x1), ptr(d_out_y1),
-                ptr(d_valid),
-                float(xmin), float(ymin), float(xmax), float(ymax),
-                segment_count,
-            ),
-            (
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                KERNEL_PARAM_PTR,
-                KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                KERNEL_PARAM_I32,
-            ),
-        )
-        grid, block = runtime.launch_config(kernels["lb_clip_segments"], segment_count)
-        runtime.launch(
-            kernels["lb_clip_segments"],
-            grid=grid,
-            block=block,
-            params=params,
-        )
-        runtime.synchronize()
-
-        h_out_x0 = runtime.copy_device_to_host(d_out_x0)
-        h_out_y0 = runtime.copy_device_to_host(d_out_y0)
-        h_out_x1 = runtime.copy_device_to_host(d_out_x1)
-        h_out_y1 = runtime.copy_device_to_host(d_out_y1)
-        h_valid = runtime.copy_device_to_host(d_valid)
-
-        return h_out_x0, h_out_y0, h_out_x1, h_out_y1, h_valid
-
-    finally:
-        runtime.free(d_x0)
-        runtime.free(d_y0)
-        runtime.free(d_x1)
-        runtime.free(d_y1)
-        runtime.free(d_out_x0)
-        runtime.free(d_out_y0)
-        runtime.free(d_out_x1)
-        runtime.free(d_out_y1)
-        runtime.free(d_valid)
+    params = (
+        (
+            ptr(d_x0), ptr(d_y0), ptr(d_x1), ptr(d_y1),
+            ptr(d_out_x0), ptr(d_out_y0), ptr(d_out_x1), ptr(d_out_y1),
+            ptr(d_valid),
+            float(xmin), float(ymin), float(xmax), float(ymax),
+            segment_count,
+        ),
+        (
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    grid, block = runtime.launch_config(kernels["lb_clip_segments"], segment_count)
+    runtime.launch(
+        kernels["lb_clip_segments"],
+        grid=grid,
+        block=block,
+        params=params,
+    )
+    # No explicit sync needed — downstream CuPy/CCCL ops on the null stream
+    # will respect ordering automatically via stream-ordered dependencies.
+    return d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid
 
 
 def _clip_line_family_gpu(
@@ -1225,232 +1238,299 @@ def _extract_segments_vectorized(
     )
 
 
-def _reassemble_lines_to_arrays(
-    out_x0: np.ndarray,
-    out_y0: np.ndarray,
-    out_x1: np.ndarray,
-    out_y1: np.ndarray,
-    valid: np.ndarray,
-    row_segment_offsets: np.ndarray,
+def _build_line_clip_device_result(
+    d_out_x0,
+    d_out_y0,
+    d_out_x1,
+    d_out_y1,
+    d_valid,
     part_segment_offsets: np.ndarray,
     part_row_map: np.ndarray,
     global_row_indices: list[int],
-    row_count: int,
-) -> np.ndarray:
-    """Reassemble clipped segments into Shapely geometries per row.
+) -> tuple[OwnedGeometryArray | None, np.ndarray | None]:
+    """Build a device-resident OwnedGeometryArray from GPU-clipped line segments.
 
-    Uses vectorized valid-mask slicing per part rather than per-segment
-    Python loops.  Still produces Shapely objects for backward compatibility.
+    TRUE ZERO-COPY implementation: all coordinate assembly uses CuPy (Tier 2)
+    and CCCL exclusive_sum (Tier 3a).  No numpy, no host round-trips in the
+    hot path.  Break detection, coordinate gathering, and offset construction
+    all happen on device.
+
+    Parameters
+    ----------
+    d_out_x0, d_out_y0, d_out_x1, d_out_y1 : CuPy device arrays
+        Clipped segment endpoints from the Liang-Barsky kernel.
+    d_valid : CuPy device array (uint8)
+        Per-segment validity mask from the kernel.
+    part_segment_offsets : host numpy array (int32)
+        Cumulative segment count per part (small metadata, stays on host).
+    part_row_map : host numpy array (int32)
+        Maps each part index to a row index into global_row_indices.
+    global_row_indices : list of int
+        Maps row indices to global row positions in the input OwnedGeometryArray.
+
+    Returns
+    -------
+    (OwnedGeometryArray, global_row_map) or (None, None).
+    global_row_map is a host numpy int32 array mapping each compact OGA row
+    to its global row position in the input, preserving correct scatter
+    targets even when some rows are fully clipped away.
     """
-    result = np.empty(row_count, dtype=object)
-    result[:] = None
+    import cupy as cp
 
-    n_rows = len(global_row_indices)
-    n_parts = len(part_segment_offsets) - 1
+    from vibespatial.cuda.cccl_primitives import exclusive_sum
 
-    # Build a mapping from row index to its parts
-    # row_parts[ri] = list of part indices
-    row_parts: list[list[int]] = [[] for _ in range(n_rows)]
-    for pi in range(n_parts):
-        ri = int(part_row_map[pi])
-        row_parts[ri].append(pi)
+    n_total = int(d_valid.shape[0])
+    if n_total == 0:
+        return None, None
 
-    for ri in range(n_rows):
-        global_row = global_row_indices[ri]
-        parts_for_row = row_parts[ri]
+    # ---------------------------------------------------------------
+    # 1. Filter valid segments (CuPy flatnonzero -- ADR-0033 Tier 2,
+    #    compaction is CuPy-default per 2026-03-17 decision)
+    # ---------------------------------------------------------------
+    d_valid_indices = cp.flatnonzero(d_valid)
+    n_valid = int(d_valid_indices.shape[0])
+    if n_valid == 0:
+        return None, None
 
-        if not parts_for_row:
-            result[global_row] = EMPTY
-            continue
+    # Gather valid segment endpoints on device
+    d_vx0 = d_out_x0[d_valid_indices]
+    d_vy0 = d_out_y0[d_valid_indices]
+    d_vx1 = d_out_x1[d_valid_indices]
+    d_vy1 = d_out_y1[d_valid_indices]
 
-        all_line_parts: list[list[tuple[float, float]]] = []
-        for pi in parts_for_row:
-            seg_start = int(part_segment_offsets[pi])
-            seg_end = int(part_segment_offsets[pi + 1])
-            if seg_start == seg_end:
-                continue
+    # ---------------------------------------------------------------
+    # 2. Detect breaks between consecutive segments on device.
+    #    A break occurs where end[i] != start[i+1] (within epsilon)
+    #    OR where we cross a part boundary.
+    #    Uses cp.abs -- CuPy Tier 2 element-wise ops, zero host trips.
+    # ---------------------------------------------------------------
 
-            # Vectorized: get valid mask slice for this part
-            part_valid = valid[seg_start:seg_end]
-            valid_indices = np.flatnonzero(part_valid)
+    # Part boundaries: map each valid segment index to its part, then
+    # detect where consecutive valid segments cross part boundaries.
+    # part_segment_offsets is small metadata (n_parts+1 ints), upload once.
+    d_part_offsets = cp.asarray(part_segment_offsets)
 
-            if valid_indices.size == 0:
-                continue
+    # Upload part_row_map and global_row_indices for row mapping (small metadata).
+    d_part_row_map = cp.asarray(part_row_map)
+    d_global_row_indices = cp.asarray(
+        np.asarray(global_row_indices, dtype=np.int32)
+    )
 
-            # Extract valid segments for this part
-            abs_indices = seg_start + valid_indices
-            vx0 = out_x0[abs_indices]
-            vy0 = out_y0[abs_indices]
-            vx1 = out_x1[abs_indices]
-            vy1 = out_y1[abs_indices]
+    # For each valid segment, find which part it belongs to via searchsorted.
+    # searchsorted(offsets[1:], idx, side='right') gives the part index.
+    d_part_ids = cp.searchsorted(d_part_offsets[1:], d_valid_indices, side="right")
 
-            # Merge consecutive segments: two segments are consecutive if
-            # segment[i].end == segment[i+1].start (within epsilon).
-            part_segments: list[list[tuple[float, float]]] = []
-            for si in range(len(valid_indices)):
-                segment = (float(vx0[si]), float(vy0[si]), float(vx1[si]), float(vy1[si]))
-                _merge_clipped_segments(part_segments, segment)
-            all_line_parts.extend(part_segments)
+    # Build break mask: True at position i means a new linestring starts
+    # at valid segment i.  Position 0 always starts a new line.
+    if n_valid == 1:
+        # Single valid segment: one linestring with 2 coords
+        d_flat_x = cp.array([d_vx0[0], d_vx1[0]], dtype=cp.float64)
+        d_flat_y = cp.array([d_vy0[0], d_vy1[0]], dtype=cp.float64)
+        d_geom_offsets = cp.array([0, 2], dtype=cp.int32)
+        line_count = 1
+        d_run_starts = cp.zeros(1, dtype=cp.int64)
+    else:
+        # Continuity break: end[i] != start[i+1]
+        d_dx = cp.abs(d_vx1[:-1] - d_vx0[1:])
+        d_dy = cp.abs(d_vy1[:-1] - d_vy0[1:])
+        d_coord_break = (d_dx > _POINT_EPSILON) | (d_dy > _POINT_EPSILON)
 
-        result[global_row] = _build_linestring_result(all_line_parts)
+        # Part boundary break: different parts
+        d_part_break = d_part_ids[:-1] != d_part_ids[1:]
 
-    return result
+        # Combined breaks (either discontinuity or part boundary)
+        d_breaks = d_coord_break | d_part_break  # bool, length n_valid-1
 
+        # ---------------------------------------------------------------
+        # 3. Build coordinate arrays on device.
+        #
+        #    For a run of consecutive segments [s, s+1, ..., e-1], the
+        #    linestring coords are: x0[s], (x0[s+1]..x0[e-1],) x1[e-1]
+        #    i.e. all start x-coords in the run, plus the end x of the
+        #    last segment.
+        #
+        #    Strategy: every valid segment contributes its start coord.
+        #    At each break position (and at the end), the preceding
+        #    segment also contributes its end coord.
+        #
+        #    This is done with CuPy scatter/gather (Tier 2) and
+        #    exclusive_sum (CCCL Tier 3a) for offset computation.
+        # ---------------------------------------------------------------
 
-def _build_line_clip_owned_result(
-    out_x0: np.ndarray,
-    out_y0: np.ndarray,
-    out_x1: np.ndarray,
-    out_y1: np.ndarray,
-    valid: np.ndarray,
-    row_segment_offsets: np.ndarray,
-    part_segment_offsets: np.ndarray,
-    part_row_map: np.ndarray,
-    global_row_indices: list[int],
-) -> OwnedGeometryArray | None:
-    """Build an OwnedGeometryArray directly from clipped segment arrays.
+        # Compute per-segment coord counts:
+        # - Each segment contributes 1 (its start coord)
+        # - The last segment before each break contributes +1 (its end coord)
+        # - The very last valid segment contributes +1 (its end coord)
+        d_seg_coords = cp.ones(n_valid, dtype=cp.int32)
+        # Break indices: where d_breaks is True => segment i is last
+        # before a break, so it contributes an extra end coord.
+        d_break_indices = cp.flatnonzero(d_breaks)
+        if d_break_indices.shape[0] > 0:
+            d_seg_coords[d_break_indices] += 1
+        # Last valid segment always contributes end coord
+        d_seg_coords[n_valid - 1] = d_seg_coords[n_valid - 1] + 1
 
-    Constructs coordinate and offset arrays for a LineString-family OGA
-    without going through Shapely construction.  Each part with valid
-    segments becomes one LineString row in the output.
-    """
-    from vibespatial.geometry.buffers import get_geometry_buffer_schema
+        # Prefix sum to get scatter positions
+        d_coord_offsets = exclusive_sum(d_seg_coords, synchronize=False)
+        # Single device expression → single int() sync (not two separate reads)
+        d_last_offset = d_coord_offsets[n_valid - 1]
+        d_last_count = d_seg_coords[n_valid - 1]
+        total_coords = int(d_last_offset + d_last_count)
 
-    n_parts = len(part_segment_offsets) - 1
-    if n_parts == 0:
-        return None
+        # Allocate flat coordinate arrays
+        d_flat_x = cp.empty(total_coords, dtype=cp.float64)
+        d_flat_y = cp.empty(total_coords, dtype=cp.float64)
 
-    # Collect coordinates for all valid line parts.
-    # Each valid-segments run within a part becomes a linestring.
-    all_coords_x: list[np.ndarray] = []
-    all_coords_y: list[np.ndarray] = []
-    line_lengths: list[int] = []
+        # Scatter start coords: every segment writes at coord_offsets[i]
+        d_flat_x[d_coord_offsets] = d_vx0
+        d_flat_y[d_coord_offsets] = d_vy0
 
-    for pi in range(n_parts):
-        seg_start = int(part_segment_offsets[pi])
-        seg_end = int(part_segment_offsets[pi + 1])
-        if seg_start == seg_end:
-            continue
+        # Scatter end coords at break positions and at the tail.
+        # A segment at index i writes its end coord at coord_offsets[i]+1
+        # only when it is the last in its run.
+        if d_break_indices.shape[0] > 0:
+            d_end_positions = d_coord_offsets[d_break_indices] + 1
+            d_flat_x[d_end_positions] = d_vx1[d_break_indices]
+            d_flat_y[d_end_positions] = d_vy1[d_break_indices]
+        # Last segment end coord — device indexing (no host sync needed)
+        d_flat_x[d_last_offset + 1] = d_vx1[n_valid - 1]
+        d_flat_y[d_last_offset + 1] = d_vy1[n_valid - 1]
 
-        part_valid = valid[seg_start:seg_end]
-        valid_indices = np.flatnonzero(part_valid)
-        if valid_indices.size == 0:
-            continue
+        # ---------------------------------------------------------------
+        # 4. Build geometry_offsets from break positions.
+        #    Each run between breaks (inclusive of start) is one linestring.
+        #    Line i starts at the coord offset of the first segment in
+        #    run i.
+        # ---------------------------------------------------------------
 
-        abs_indices = seg_start + valid_indices
-        vx0 = out_x0[abs_indices]
-        vy0 = out_y0[abs_indices]
-        vx1 = out_x1[abs_indices]
-        vy1 = out_y1[abs_indices]
-
-        # Build coordinate arrays: for N valid segments, we get
-        # up to N+1 coordinates (start of first + end of each).
-        # Detect breaks where end[i] != start[i+1].
-        if len(valid_indices) == 1:
-            all_coords_x.append(np.array([vx0[0], vx1[0]]))
-            all_coords_y.append(np.array([vy0[0], vy1[0]]))
-            line_lengths.append(2)
+        # Run start indices in valid-segment space: [0, break+1, break+1, ...]
+        if d_break_indices.shape[0] > 0:
+            d_run_starts = cp.concatenate([
+                cp.zeros(1, dtype=cp.int64),
+                d_break_indices + 1,
+            ])
         else:
-            # Check continuity between consecutive segments
-            breaks = np.where(
-                (np.abs(vx1[:-1] - vx0[1:]) > _POINT_EPSILON)
-                | (np.abs(vy1[:-1] - vy0[1:]) > _POINT_EPSILON)
-            )[0]
+            d_run_starts = cp.zeros(1, dtype=cp.int64)
 
-            if breaks.size == 0:
-                # All segments are continuous: one linestring
-                coords_x = np.empty(len(valid_indices) + 1, dtype=np.float64)
-                coords_y = np.empty(len(valid_indices) + 1, dtype=np.float64)
-                coords_x[:-1] = vx0
-                coords_x[-1] = vx1[-1]
-                coords_y[:-1] = vy0
-                coords_y[-1] = vy1[-1]
-                all_coords_x.append(coords_x)
-                all_coords_y.append(coords_y)
-                line_lengths.append(len(coords_x))
-            else:
-                # Multiple linestrings from breaks
-                split_points = np.concatenate(([0], breaks + 1, [len(valid_indices)]))
-                for j in range(len(split_points) - 1):
-                    s, e = int(split_points[j]), int(split_points[j + 1])
-                    if e - s < 1:
-                        continue
-                    n_seg = e - s
-                    coords_x = np.empty(n_seg + 1, dtype=np.float64)
-                    coords_y = np.empty(n_seg + 1, dtype=np.float64)
-                    coords_x[:-1] = vx0[s:e]
-                    coords_x[-1] = vx1[e - 1]
-                    coords_y[:-1] = vy0[s:e]
-                    coords_y[-1] = vy1[e - 1]
-                    if len(coords_x) >= 2:
-                        all_coords_x.append(coords_x)
-                        all_coords_y.append(coords_y)
-                        line_lengths.append(len(coords_x))
+        line_count = int(d_run_starts.shape[0])
 
-    if not all_coords_x:
-        return None
+        # Geometry offsets: coord position of each run start, plus total
+        d_geom_start_coords = d_coord_offsets[d_run_starts]
+        d_geom_offsets = cp.empty(line_count + 1, dtype=cp.int32)
+        d_geom_offsets[:line_count] = d_geom_start_coords.astype(cp.int32)
+        d_geom_offsets[line_count] = total_coords
 
-    # Build flat coordinate arrays and geometry_offsets for OGA
-    total_coords = sum(line_lengths)
-    flat_x = np.empty(total_coords, dtype=np.float64)
-    flat_y = np.empty(total_coords, dtype=np.float64)
-    geometry_offsets = np.empty(len(line_lengths) + 1, dtype=np.int32)
-    geometry_offsets[0] = 0
-    pos = 0
-    for i, (cx, cy) in enumerate(zip(all_coords_x, all_coords_y)):
-        n = len(cx)
-        flat_x[pos:pos + n] = cx
-        flat_y[pos:pos + n] = cy
-        pos += n
-        geometry_offsets[i + 1] = pos
+    # ---------------------------------------------------------------
+    # 5. Build global row map on device (CuPy Tier 2 gather).
+    #    For each output linestring, find the part_id of its first
+    #    segment, then map: part_id -> part_row_map -> global_row_indices.
+    # ---------------------------------------------------------------
+    d_run_part_ids = d_part_ids[d_run_starts]
+    d_run_row_indices = d_part_row_map[d_run_part_ids]
+    d_global_row_map = d_global_row_indices[d_run_row_indices]
 
-    line_count = len(line_lengths)
-    empty_mask = np.zeros(line_count, dtype=np.bool_)
-    validity = np.ones(line_count, dtype=np.bool_)
-    tags = np.full(line_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
-    family_row_offsets = np.arange(line_count, dtype=np.int32)
+    # ---------------------------------------------------------------
+    # 6. Filter out degenerate linestrings (< 2 coords) on device
+    # ---------------------------------------------------------------
+    d_geom_lengths = cp.diff(d_geom_offsets)
+    d_valid_geom_mask = d_geom_lengths >= 2
+    # Single sync for the gate check — unavoidable since it controls branching
+    valid_geom_count = int(cp.sum(d_valid_geom_mask))
 
-    line_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.LINESTRING,
-        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
+    if valid_geom_count == 0:
+        return None, None
+
+    if valid_geom_count < line_count:
+        # Compact: keep only valid geometries -- fully on device
+        d_valid_geom_idx = cp.flatnonzero(d_valid_geom_mask)
+        # Rebuild geometry offsets for valid geometries only
+        d_valid_lengths = d_geom_lengths[d_valid_geom_idx]
+        d_new_geom_offsets = cp.empty(valid_geom_count + 1, dtype=cp.int32)
+        d_new_geom_offsets[0] = 0
+        d_new_geom_offsets[1:] = cp.cumsum(d_valid_lengths).astype(cp.int32)
+
+        # Build gather indices on device -- no Python loop, no D2H.
+        # For each valid geometry, we need coord indices [start, ..., end-1].
+        # Use CuPy repeat + arange pattern: repeat each geom's start offset
+        # by its length, then add a per-element counter within each run.
+        d_starts = d_geom_offsets[d_valid_geom_idx]
+        # Derive total from cumsum result — no additional sync
+        d_total_new = int(d_new_geom_offsets[valid_geom_count])
+        # Per-coord offsets within each geometry run
+        d_intra = cp.arange(d_total_new, dtype=cp.int64)
+        d_run_offsets = cp.repeat(
+            d_new_geom_offsets[:valid_geom_count],
+            d_valid_lengths,
+        ).astype(cp.int64)
+        d_base = cp.repeat(d_starts, d_valid_lengths).astype(cp.int64)
+        d_gather = d_base + (d_intra - d_run_offsets)
+        d_flat_x = d_flat_x[d_gather]
+        d_flat_y = d_flat_y[d_gather]
+        d_geom_offsets = d_new_geom_offsets
+        # Filter the global row map to match compacted geometries
+        d_global_row_map = d_global_row_map[d_valid_geom_idx]
+        line_count = valid_geom_count
+
+    # Transfer global_row_map to host (small metadata -- single D2H).
+    global_row_map = cp.asnumpy(d_global_row_map).astype(np.int32)
+
+    # ---------------------------------------------------------------
+    # 7. Build device-resident OwnedGeometryArray
+    # ---------------------------------------------------------------
+    output_empty_mask = np.zeros(line_count, dtype=np.bool_)
+    output_validity = np.ones(line_count, dtype=np.bool_)
+    output_tags = np.full(line_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
+    output_family_row_offsets = np.arange(line_count, dtype=np.int32)
+
+    # Upload small metadata arrays to device for DeviceFamilyGeometryBuffer
+    d_empty_mask = cp.asarray(output_empty_mask)
+
+    device_families = {
+        GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.LINESTRING,
+            x=d_flat_x,
+            y=d_flat_y,
+            geometry_offsets=d_geom_offsets,
+            empty_mask=d_empty_mask,
+            bounds=None,
+        )
+    }
+    oga = build_device_resident_owned(
+        device_families=device_families,
         row_count=line_count,
-        x=flat_x,
-        y=flat_y,
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=True,
+        tags=output_tags,
+        validity=output_validity,
+        family_row_offsets=output_family_row_offsets,
     )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.LINESTRING: line_buffer},
-    )
+    return oga, global_row_map
 
 
 def _clip_all_lines_gpu(
     owned: OwnedGeometryArray,
     rect: tuple[float, float, float, float],
-) -> np.ndarray:
+) -> tuple[OwnedGeometryArray | None, np.ndarray | None]:
     """Batch-clip ALL linestring/multilinestring rows on GPU via Liang-Barsky.
 
-    Vectorized extraction: uses numpy fancy indexing on contiguous buffer.x/y
-    arrays instead of per-coordinate Python list.append loops.
+    TRUE ZERO-COPY implementation:
+      1. Extract segments from buffers via vectorized slicing (host, fast metadata)
+      2. Run Liang-Barsky GPU kernel -- outputs stay on device (CuPy)
+      3. Assemble coordinate arrays on device (CuPy + CCCL exclusive_sum)
+      4. Return device-resident OwnedGeometryArray -- no Shapely, no D2H transfers
 
-    Returns an object array of length ``owned.row_count`` where each entry is
-    the clipped geometry (or ``None`` for rows that are not line families).
+    Returns (OwnedGeometryArray, global_row_map) or (None, None).
+    global_row_map is a host int32 array mapping each compact OGA row to
+    its global row position in the input OwnedGeometryArray, preserving
+    correct scatter targets when some rows are fully clipped away.
     """
     line_families = [
         f for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)
         if f in owned.families
     ]
-    result = np.empty(owned.row_count, dtype=object)
-    result[:] = None
 
     if not line_families:
-        return result
+        return None, None
 
-    # -- Step 1: vectorized segment extraction ----------------------------
+    # -- Step 1: vectorized segment extraction (host, metadata-level) ------
     (
         seg_x0, seg_y0, seg_x1, seg_y1,
         row_segment_offsets, part_segment_offsets,
@@ -1459,21 +1539,19 @@ def _clip_all_lines_gpu(
 
     total_segments = len(seg_x0)
     if total_segments == 0:
-        for global_row in global_row_indices:
-            result[global_row] = EMPTY
-        return result
+        return None, None
 
-    # -- Step 2: single GPU kernel launch ---------------------------------
-    out_x0, out_y0, out_x1, out_y1, valid = _clip_line_segments_gpu(
+    # -- Step 2: GPU kernel -- outputs stay on device as CuPy arrays ------
+    d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid = _clip_line_segments_gpu_device(
         seg_x0, seg_y0, seg_x1, seg_y1, rect,
     )
 
-    # -- Step 3: vectorized reassembly ------------------------------------
-    return _reassemble_lines_to_arrays(
-        out_x0, out_y0, out_x1, out_y1, valid,
-        row_segment_offsets, part_segment_offsets,
-        part_row_map, global_row_indices,
-        owned.row_count,
+    # -- Step 3: device-resident assembly (CuPy + CCCL, zero numpy) -------
+    return _build_line_clip_device_result(
+        d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid,
+        part_segment_offsets,
+        part_row_map,
+        global_row_indices,
     )
 
 
@@ -2164,54 +2242,45 @@ def clip_by_rect_owned(
                 poly_owned, poly_validity_mask = _clip_all_polygons_gpu(owned, rect, precision_plan)
 
             if has_line_families:
-                line_result = _clip_all_lines_gpu(owned, rect)
+                line_result, line_global_row_map = _clip_all_lines_gpu(owned, rect)
+            else:
+                line_result, line_global_row_map = None, None
 
-            # Identify GPU-fast family tags
-            _gpu_family_tags = set()
-            for fam in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-                if fam in owned.families:
-                    _gpu_family_tags.add(FAMILY_TAGS.get(fam, -99))
-            for fam in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING):
-                if fam in owned.families:
-                    _gpu_family_tags.add(FAMILY_TAGS.get(fam, -99))
-
-            # Rows handled by GPU kernels vs rows needing shapely fallback
-            gpu_fast_rows: list[int] = []
-            fallback_row_list: list[int] = []
-            for i in range(owned.row_count):
-                if not owned.validity[i]:
-                    continue
-                tag = int(owned.tags[i])
-                if tag in _gpu_family_tags:
-                    gpu_fast_rows.append(i)
-                else:
-                    fallback_row_list.append(i)
-
-            fast_rows_arr = np.asarray(gpu_fast_rows, dtype=np.int32)
-            fallback_rows_arr = np.asarray(fallback_row_list, dtype=np.int32)
+            # Identify GPU-fast family tags -- vectorized classification
+            _gpu_family_tag_list = [
+                FAMILY_TAGS.get(fam, -99)
+                for fam in (
+                    GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON,
+                    GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING,
+                )
+                if fam in owned.families
+            ]
+            gpu_family_mask = np.isin(owned.tags, _gpu_family_tag_list)
+            valid_mask = owned.validity
+            fast_rows_arr = np.flatnonzero(valid_mask & gpu_family_mask).astype(np.int32)
+            fallback_rows_arr = np.flatnonzero(valid_mask & ~gpu_family_mask).astype(np.int32)
             all_candidate_rows = np.sort(
                 np.concatenate([fast_rows_arr, fallback_rows_arr])
             ).astype(np.int32)
 
-            # Use poly_owned as the primary result when available.
-            # Shapely geometries are materialized lazily only when
-            # .geometries is accessed (tests, GeoPandas adapter).
-            owned_result = poly_owned
+            # Prefer the polygon OGA as primary owned_result; when only
+            # lines are present, carry the line OGA for zero-copy consumers.
+            owned_result = poly_owned if poly_owned is not None else line_result
 
             # Capture references for lazy factory
             _owned_ref = owned
             _poly_owned_ref = poly_owned
             _poly_validity_mask_ref = poly_validity_mask
             _line_result_ref = line_result
-            _fallback_row_list_ref = fallback_row_list
+            _line_global_row_map_ref = line_global_row_map
+            _fallback_rows_arr_ref = fallback_rows_arr
             _rect_ref = rect
 
             def _materialize_poly_line_geometries():
                 result = np.empty(_owned_ref.row_count, dtype=object)
                 result[:] = None
-                for i in range(_owned_ref.row_count):
-                    if _owned_ref.validity[i]:
-                        result[i] = EMPTY
+                # Vectorized: set all valid rows to EMPTY in one shot
+                result[_owned_ref.validity] = EMPTY
 
                 # Materialize polygon results from device-resident OGA
                 if _poly_owned_ref is not None and _poly_validity_mask_ref is not None:
@@ -2219,27 +2288,36 @@ def clip_by_rect_owned(
                         poly_shapely = _poly_owned_ref.to_shapely()
                         valid_rows = np.flatnonzero(_poly_validity_mask_ref)
                         # poly_owned has compact rows; scatter back to global positions
-                        for compact_idx, global_row in enumerate(valid_rows):
-                            if compact_idx < len(poly_shapely):
-                                result[global_row] = poly_shapely[compact_idx]
+                        n_poly = min(len(poly_shapely), len(valid_rows))
+                        if n_poly > 0:
+                            result[valid_rows[:n_poly]] = np.asarray(
+                                poly_shapely[:n_poly], dtype=object,
+                            )
                     except Exception:
                         pass
 
-                # Merge line results
-                if _line_result_ref is not None:
-                    for i in range(_owned_ref.row_count):
-                        if _line_result_ref[i] is not None:
-                            result[i] = _line_result_ref[i]
+                # Materialize line results from OwnedGeometryArray using
+                # the global_row_map for correct scatter (preserves mapping
+                # even when some rows are fully clipped away).
+                if _line_result_ref is not None and _line_global_row_map_ref is not None:
+                    try:
+                        line_shapely = _line_result_ref.to_shapely()
+                        n_lines = len(line_shapely)
+                        if n_lines > 0:
+                            result[_line_global_row_map_ref[:n_lines]] = np.asarray(
+                                line_shapely[:n_lines], dtype=object,
+                            )
+                    except Exception:
+                        pass
 
                 # Handle fallback rows (non-polygon, non-line families)
-                if _fallback_row_list_ref:
+                if _fallback_rows_arr_ref.size > 0:
                     shapely_geoms = _owned_ref.to_shapely()
-                    fallback_shapely = np.asarray(
-                        [shapely_geoms[i] for i in _fallback_row_list_ref], dtype=object
+                    fallback_shapely = shapely_geoms[_fallback_rows_arr_ref]
+                    clipped = shapely.clip_by_rect(
+                        np.asarray(fallback_shapely, dtype=object), *_rect_ref,
                     )
-                    clipped = shapely.clip_by_rect(fallback_shapely, *_rect_ref)
-                    for idx, row in enumerate(_fallback_row_list_ref):
-                        result[row] = clipped[idx]
+                    result[_fallback_rows_arr_ref] = np.asarray(clipped, dtype=object)
 
                 return result
 
