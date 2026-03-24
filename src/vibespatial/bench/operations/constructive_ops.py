@@ -148,7 +148,7 @@ def bench_gpu_constructive(
     from time import perf_counter
 
     from vibespatial import has_gpu_runtime
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.constructive.clip_rect import clip_by_rect_owned
 
@@ -165,8 +165,9 @@ def bench_gpu_constructive(
             input_format=input_format,
         )
 
+    fmt = InputFormat(input_format)
     spec = resolve_fixture_spec("polygon", "regular-grid", scale)
-    owned, read_seconds = load_owned(spec, InputFormat(input_format))
+    owned, read_seconds = load_owned(spec, fmt)
 
     # Guard: if fixture produced 0 rows, report as error.
     if owned.row_count == 0:
@@ -228,6 +229,26 @@ def bench_gpu_constructive(
 
     timing = timing_from_samples(times)
 
+    # Baseline: Shapely clip_by_rect on the same data
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf, _ = load_geodataframe(spec, fmt)
+        geom_arr = gdf.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.clip_by_rect(geom_arr, *rect)
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="gpu-constructive",
         tier=1,
@@ -237,6 +258,9 @@ def bench_gpu_constructive(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={"repeat": repeat, "rect": list(rect)},
@@ -319,6 +343,7 @@ def bench_gpu_dissolve(
     from time import perf_counter
 
     import numpy as np
+    import shapely
 
     from vibespatial.bench.fixture_loader import load_geodataframe
     from vibespatial.bench.fixtures import InputFormat, ensure_grouped_boxes_fixture
@@ -348,6 +373,23 @@ def bench_gpu_dissolve(
 
     timing = timing_from_samples(times)
 
+    # Baseline: Shapely unary_union per group (the CPU equivalent of dissolve)
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            for positions in group_positions:
+                if positions.size > 0:
+                    shapely.union_all(values[positions])
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="gpu-dissolve",
         tier=1,
@@ -357,6 +399,9 @@ def bench_gpu_dissolve(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={"repeat": repeat, "groups": groups},

@@ -33,7 +33,7 @@ def bench_gpu_overlay(
     from time import perf_counter
 
     from vibespatial import has_gpu_runtime
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import (
         InputFormat,
         ensure_shifted_fixture,
@@ -100,6 +100,28 @@ def bench_gpu_overlay(
 
     timing = timing_from_samples(times)
 
+    # Baseline: Shapely pairwise intersection on the same data
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf_left, _ = load_geodataframe(left_spec, fmt)
+        gdf_right, _ = load_geodataframe(right_spec, fmt)
+        left_arr = gdf_left.geometry.to_numpy()
+        right_arr = gdf_right.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.intersection(left_arr, right_arr)
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="gpu-overlay",
         tier=1,
@@ -109,6 +131,9 @@ def bench_gpu_overlay(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={"repeat": repeat},
@@ -135,8 +160,10 @@ def bench_segment_filters(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
+    from time import perf_counter
+
     from vibespatial import benchmark_segment_filter
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import (
         InputFormat,
         ensure_shifted_fixture,
@@ -155,6 +182,30 @@ def bench_segment_filters(
 
     timing = timing_from_samples([result.elapsed_seconds])
 
+    # Baseline: Shapely STRtree candidate filtering (the CPU equivalent
+    # of segment-level MBR pair generation)
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf_left, _ = load_geodataframe(left_spec, fmt)
+        gdf_right, _ = load_geodataframe(right_spec, fmt)
+        left_arr = gdf_left.geometry.to_numpy()
+        right_arr = gdf_right.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            tree = shapely.STRtree(left_arr)
+            tree.query(right_arr, predicate="intersects")
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely-strtree"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="segment-filters",
         tier=1,
@@ -164,6 +215,9 @@ def bench_segment_filters(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={
@@ -196,7 +250,7 @@ def bench_segment_intersections(
     from time import perf_counter
 
     from vibespatial import classify_segment_intersections, generate_segment_candidates
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import (
         InputFormat,
         ensure_shifted_fixture,
@@ -223,6 +277,28 @@ def bench_segment_intersections(
 
     timing = timing_from_samples(times)
 
+    # Baseline: Shapely pairwise intersection on the same line geometries
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf_left, _ = load_geodataframe(left_spec, fmt)
+        gdf_right, _ = load_geodataframe(right_spec, fmt)
+        left_arr = gdf_left.geometry.to_numpy()
+        right_arr = gdf_right.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.intersection(left_arr, right_arr)
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="segment-intersections",
         tier=1,
@@ -232,6 +308,9 @@ def bench_segment_intersections(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={"repeat": repeat},
@@ -258,8 +337,10 @@ def bench_segment_primitives(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
+    from time import perf_counter
+
     from vibespatial import benchmark_segment_intersections
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import (
         InputFormat,
         ensure_shifted_fixture,
@@ -278,6 +359,29 @@ def bench_segment_primitives(
 
     timing = timing_from_samples([result.elapsed_seconds])
 
+    # Baseline: Shapely pairwise intersection (the CPU equivalent of
+    # the full segment intersection primitive pipeline)
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf_left, _ = load_geodataframe(left_spec, fmt)
+        gdf_right, _ = load_geodataframe(right_spec, fmt)
+        left_arr = gdf_left.geometry.to_numpy()
+        right_arr = gdf_right.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.intersection(left_arr, right_arr)
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="segment-primitives",
         tier=1,
@@ -287,6 +391,9 @@ def bench_segment_primitives(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={

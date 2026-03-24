@@ -315,7 +315,7 @@ def bench_point_predicates(
     from time import perf_counter
 
     from vibespatial import ExecutionMode
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.kernels.predicates import point_within_bounds
 
@@ -379,6 +379,34 @@ def bench_point_predicates(
 
     timing = timing_from_samples(times)
 
+    # Baseline: Shapely within on the same data (pairwise point-in-polygon)
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf_points, _ = load_geodataframe(points_spec, fmt)
+        gdf_polys, _ = load_geodataframe(polys_spec, fmt)
+        points_arr = gdf_points.geometry.to_numpy()
+        polys_arr = gdf_polys.geometry.to_numpy()
+
+        # Align to same row count
+        if len(points_arr) != len(polys_arr):
+            min_len = min(len(points_arr), len(polys_arr))
+            points_arr = points_arr[:min_len]
+            polys_arr = polys_arr[:min_len]
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.within(points_arr, polys_arr)
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="point-predicates",
         tier=1,
@@ -388,6 +416,9 @@ def bench_point_predicates(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={"repeat": repeat},

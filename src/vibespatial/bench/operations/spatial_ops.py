@@ -105,12 +105,13 @@ def bench_spatial_query(
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.spatial.indexing import build_flat_spatial_index
 
+    fmt = InputFormat(input_format)
     spec = resolve_fixture_spec("polygon", "regular-grid", scale)
-    owned, read_seconds = load_owned(spec, InputFormat(input_format))
+    owned, read_seconds = load_owned(spec, fmt)
 
     build_flat_spatial_index(owned)
 
@@ -122,6 +123,26 @@ def bench_spatial_query(
 
     timing = timing_from_samples(times)
 
+    # Baseline: Shapely STRtree construction on the same data
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf, _ = load_geodataframe(spec, fmt)
+        geom_arr = gdf.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.STRtree(geom_arr)
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely-strtree"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
+
     return BenchmarkResult(
         operation="spatial-query",
         tier=1,
@@ -131,6 +152,9 @@ def bench_spatial_query(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={"repeat": repeat},
@@ -157,15 +181,40 @@ def bench_bounds_pairs(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
+    from time import perf_counter
+
     from vibespatial import benchmark_bounds_pairs
-    from vibespatial.bench.fixture_loader import load_owned
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
+    fmt = InputFormat(input_format)
     spec = resolve_fixture_spec("point", "uniform", scale)
-    owned, read_seconds = load_owned(spec, InputFormat(input_format))
+    owned, read_seconds = load_owned(spec, fmt)
     result = benchmark_bounds_pairs(owned, dataset="uniform", tile_size=256)
 
     timing = timing_from_samples([result.elapsed_seconds])
+
+    # Baseline: Shapely STRtree build + query_pairs for MBR candidate
+    # generation (the CPU equivalent of tiled bounds-pair filtering)
+    baseline_timing = None
+    speedup = None
+    baseline_name = None
+    if compare == "shapely" or compare is None:
+        import shapely
+
+        gdf, _ = load_geodataframe(spec, fmt)
+        geom_arr = gdf.geometry.to_numpy()
+
+        shapely_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            tree = shapely.STRtree(geom_arr)
+            tree.query(geom_arr, predicate="intersects")
+            shapely_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(shapely_times)
+        baseline_name = "shapely-strtree"
+        if timing.median_seconds > 0:
+            speedup = baseline_timing.median_seconds / timing.median_seconds
 
     return BenchmarkResult(
         operation="bounds-pairs",
@@ -176,6 +225,9 @@ def bench_bounds_pairs(
         status="pass",
         status_reason="ok",
         timing=timing,
+        baseline_name=baseline_name,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={
