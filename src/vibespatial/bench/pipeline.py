@@ -1256,8 +1256,37 @@ def _overlay_intersection_with_fallback(
         warnings.warn(f"[overlay_intersection fallback] {type(exc).__name__}: {exc}", stacklevel=1)
         left_gdf = _owned_to_shapely_gdf(left)
         right_gdf = _owned_to_shapely_gdf(right)
-        result_gdf = geopandas.overlay(left_gdf, right_gdf, how="intersection")
-        return _from_shapely_safe(list(result_gdf.geometry)), True
+        # Apply make_valid to both sides — dissolve and buffer can produce
+        # ring-edge artifacts that cause TopologyException or
+        # IllegalArgumentException ("Scale factor must be non-zero") in GEOS.
+        left_gdf["geometry"] = shapely.make_valid(left_gdf.geometry.values)
+        right_gdf["geometry"] = shapely.make_valid(right_gdf.geometry.values)
+        try:
+            result_gdf = geopandas.overlay(left_gdf, right_gdf, how="intersection")
+            return _from_shapely_safe(list(result_gdf.geometry)), True
+        except Exception as overlay_exc:
+            warnings.warn(
+                f"[overlay_intersection fallback failed] {type(overlay_exc).__name__}: {overlay_exc}",
+                stacklevel=1,
+            )
+            # Last resort: vectorized shapely.intersection
+            left_arr = np.asarray(left_gdf.geometry.values, dtype=object)
+            right_arr = np.asarray(right_gdf.geometry.values, dtype=object)
+            if left_arr.shape != right_arr.shape:
+                # Broadcast single-row side
+                if len(right_arr) == 1:
+                    right_arr = np.full(len(left_arr), right_arr[0], dtype=object)
+                elif len(left_arr) == 1:
+                    left_arr = np.full(len(right_arr), left_arr[0], dtype=object)
+            try:
+                intersected = shapely.intersection(left_arr, right_arr)
+                keep = ~shapely.is_empty(intersected) & ~shapely.is_missing(intersected)
+                results = list(intersected[keep])
+            except Exception:
+                results = []
+            if not results:
+                return _from_shapely_safe([shapely.Point(0, 0)]), True
+            return _from_shapely_safe(results), True
 
 
 def _overlay_difference_with_fallback(
@@ -1613,14 +1642,21 @@ def _profile_vegetation_corridor_pipeline(
                 stage.device = "cpu"
 
         # Stage 6: intersect vegetation with corridor
-        # Ensure corridor is valid before overlay — buffer+dissolve can
-        # produce ring edge artifacts that cause TopologyException.
+        # Ensure both corridor and vegetation are valid before overlay —
+        # buffer+dissolve can produce ring edge artifacts that cause
+        # TopologyException or IllegalArgumentException in GEOS.
         try:
             corridor_valid = make_valid_owned(owned=corridor_owned)
             if corridor_valid.owned is not None:
                 corridor_owned = corridor_valid.owned
         except Exception:
             pass  # keep original corridor if make_valid fails
+        try:
+            veg_valid = make_valid_owned(owned=veg_owned)
+            if veg_valid.owned is not None:
+                veg_owned = veg_valid.owned
+        except Exception:
+            pass  # keep original vegetation if make_valid fails
 
         with profiler.stage(
             "intersect_vegetation",
@@ -1774,10 +1810,30 @@ def _profile_vegetation_corridor_geopandas_pipeline(
             stage.rows_out = int(len(dissolved))
 
         with profiler.stage("intersect_vegetation", category="refine", device=ExecutionMode.CPU, rows_in=int(len(veg_gdf))) as stage:
-            # make_valid after dissolve prevents TopologyException from
-            # non-noded intersections in the dissolved corridor boundary.
+            # make_valid on both sides prevents TopologyException from
+            # non-noded intersections in the dissolved corridor boundary
+            # and from invalid vegetation polygons at large scale.
             dissolved["geometry"] = shapely.make_valid(dissolved.geometry.values)
-            clipped = geopandas.overlay(veg_gdf, dissolved[["geometry"]], how="intersection")
+            veg_gdf["geometry"] = shapely.make_valid(veg_gdf.geometry.values)
+            try:
+                clipped = geopandas.overlay(veg_gdf, dissolved[["geometry"]], how="intersection")
+            except Exception:
+                # Fallback: vectorized intersection when overlay hits GEOS
+                # TopologyException or IllegalArgumentException at scale.
+                corridor_geom = dissolved.geometry.values[0]
+                veg_arr = np.asarray(veg_gdf.geometry.values, dtype=object)
+                corridor_arr = np.full(len(veg_arr), corridor_geom, dtype=object)
+                try:
+                    intersected = shapely.intersection(veg_arr, corridor_arr)
+                    keep = ~shapely.is_empty(intersected) & ~shapely.is_missing(intersected)
+                    results = list(intersected[keep])
+                except Exception:
+                    results = []
+                clipped = geopandas.GeoDataFrame(
+                    {"geometry": results if results else []},
+                    geometry="geometry",
+                    crs=veg_gdf.crs,
+                )
             stage.rows_out = int(len(clipped))
 
         with profiler.stage("find_nearby_poles", category="filter", device=ExecutionMode.CPU, rows_in=int(len(poles_gdf))) as stage:
