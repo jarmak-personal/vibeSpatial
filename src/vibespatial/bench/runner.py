@@ -359,10 +359,13 @@ def run_suite(
             for pr in own_results:
                 _progress(pr, idx=item_idx, total=total_items)
         except Exception as exc:
+            # Use the first suite scale as a best-effort value for the
+            # error result (pipeline.py iterates scales internally).
+            error_scale = suite_def.scales[0] if suite_def.scales else 0
             result = BenchmarkResult(
                 operation=pipeline_name,
                 tier=1,
-                scale=0,
+                scale=error_scale,
                 geometry_type="mixed",
                 precision="auto",
                 status="error",
