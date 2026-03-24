@@ -1034,7 +1034,12 @@ def _extract_segments_gpu(
             count=0,
         )
 
-    d_family_codes = d_state.tags
+    # The count_segments / scatter_segments kernels declare family_codes as
+    # ``const int*`` (int32), but d_state.tags is int8.  Passing an int8
+    # pointer to a kernel that reads 4-byte ints causes every thread to read
+    # a garbage family code, producing zero segment counts and (when the
+    # underlying memory layout changes) an illegal-address fault.
+    d_family_codes = d_state.tags.astype(cp.int32) if d_state.tags.dtype != cp.int32 else d_state.tags
     d_family_row_offsets = d_state.family_row_offsets
 
     # We need unified offset arrays across all families.

@@ -48,6 +48,10 @@ def coerce_geometry_array(
 
 
 def extract_point_coordinates(array: OwnedGeometryArray) -> tuple[np.ndarray, np.ndarray]:
+    # Ensure host-side buffer data is materialized for device-resident arrays.
+    # Device-resident OGAs from GPU I/O have x/y as empty stubs.
+    if any(not buf.host_materialized for buf in array.families.values()):
+        array._ensure_host_state()
     coords = np.full((array.row_count, 2), np.nan, dtype=np.float64)
     empty_mask = np.zeros(array.row_count, dtype=bool)
     buffer = array.families.get(GeometryFamily.POINT)
@@ -73,6 +77,9 @@ def extract_point_coordinates(array: OwnedGeometryArray) -> tuple[np.ndarray, np
 
 
 def extract_empty_rows(array: OwnedGeometryArray) -> np.ndarray:
+    # Ensure host-side buffer data is materialized for device-resident arrays.
+    if any(not buf.host_materialized for buf in array.families.values()):
+        array._ensure_host_state()
     empty_mask = np.zeros(array.row_count, dtype=bool)
     for family, buffer in array.families.items():
         family_rows = np.flatnonzero(array.tags == FAMILY_TAGS[family])

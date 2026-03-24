@@ -312,6 +312,10 @@ def _generate_candidates_gpu_multi_device(
             scatter_kernel, grid=scatter_grid, block=scatter_block, params=scatter_params,
         )
 
+        # Synchronize before the finally block frees input buffers —
+        # the scatter kernel may still be reading them asynchronously.
+        runtime.synchronize()
+
         return _DeviceCandidates(
             d_left=device_left,
             d_right=device_right,
@@ -590,6 +594,10 @@ def _generate_candidates_morton_range_gpu(
             scatter_kernel, grid=scatter_grid, block=scatter_block,
             params=scatter_params,
         )
+
+        # Synchronize before the finally block frees input buffers —
+        # the scatter kernel may still be reading them asynchronously.
+        runtime.synchronize()
 
         result = _DeviceCandidates(
             d_left=d_left, d_right=d_right, total_pairs=total_pairs,

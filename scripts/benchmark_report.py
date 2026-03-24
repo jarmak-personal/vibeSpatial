@@ -117,18 +117,20 @@ def _stage_detail_rows(stages: list[dict], total: float) -> str:
 
 
 def _discover_pairs(results: dict[str, dict]) -> list[tuple[str, str]]:
-    """Auto-discover vibeSpatial vs geopandas pipeline pairs.
+    """Auto-discover vibeSpatial vs baseline pipeline/operation pairs.
 
-    Any pipeline named ``<base>-geopandas`` is paired with ``<base>``.
+    Matches ``<base>-geopandas`` or ``<base>-cpu`` with ``<base>``.
     """
-    gp_suffix = "-geopandas"
-    bases: list[str] = []
+    suffixes = ("-geopandas", "-cpu", "-shapely")
+    seen_bases: dict[str, str] = {}  # base → paired key
     for key in sorted(results):
-        if key.endswith(gp_suffix):
-            base = key[: -len(gp_suffix)]
-            if base in results:
-                bases.append(base)
-    return [(base, f"{base}{gp_suffix}") for base in bases]
+        for sfx in suffixes:
+            if key.endswith(sfx):
+                base = key[: -len(sfx)]
+                if base in results and base not in seen_bases:
+                    seen_bases[base] = key
+                break
+    return [(base, paired) for base, paired in seen_bases.items()]
 
 
 def _render_comparison_section(
@@ -180,7 +182,7 @@ def _render_comparison_section(
     return (
         f'<div class="scale-card">'
         f'<h2 class="scale-header" onclick="this.parentElement.classList.toggle(\'collapsed\')">'
-        f"&#9660; Scale: {scale:,}</h2>"
+        f'&#9660; {"Pipelines (variable scale)" if scale == 0 else f"Scale: {scale:,}"}</h2>'
         f'<div class="scale-body">{axis_html}{"".join(sections)}</div>'
         f"</div>"
     )
@@ -333,6 +335,40 @@ h1 { color: #58a6ff; margin-bottom: 8px; }
 """
 
 
+def _normalize_result(r: dict) -> dict:
+    """Normalize operation-level results to the pipeline-result shape.
+
+    Pipeline results have ``elapsed_seconds``, ``status: "ok"``, and
+    ``stages``.  Operation results use ``timing.mean_seconds``,
+    ``status: "pass"``, and carry a ``baseline_timing`` dict instead of
+    a paired ``-geopandas`` entry.  This function bridges the gap so the
+    rendering code can handle both.
+    """
+    if "elapsed_seconds" in r:
+        return r  # already pipeline-shaped
+
+    out = dict(r)
+    timing = r.get("timing", {})
+    out["elapsed_seconds"] = timing.get("mean_seconds", 0.0)
+
+    # Map "pass" → "ok" so the renderer status checks work.
+    if out.get("status") == "pass":
+        out["status"] = "ok"
+
+    # Synthesise a paired -geopandas entry from baseline_timing when present
+    # so the comparison renderer can discover it.
+    if r.get("baseline_timing"):
+        baseline = dict(r)
+        baseline["elapsed_seconds"] = r["baseline_timing"].get("mean_seconds", 0.0)
+        baseline["status"] = "ok"
+        baseline.pop("baseline_timing", None)
+        baseline.pop("speedup", None)
+        name = r.get("pipeline") or r.get("operation", "unknown")
+        out["_baseline_entry"] = (f"{name}-{r.get('baseline_name', 'cpu')}", baseline)
+
+    return out
+
+
 def render_html(data: dict) -> str:
     meta = data.get("metadata", {})
     suite = meta.get("suite", "?")
@@ -341,7 +377,13 @@ def render_html(data: dict) -> str:
     # Group results by scale
     by_scale: dict[int, dict[str, dict]] = defaultdict(dict)
     for r in data.get("results", []):
-        by_scale[r["scale"]][r["pipeline"]] = r
+        nr = _normalize_result(r)
+        name = nr.get("pipeline") or nr.get("operation", "unknown")
+        by_scale[nr["scale"]][name] = nr
+        # Inject the synthesised baseline entry so _discover_pairs finds it.
+        if "_baseline_entry" in nr:
+            bl_name, bl_entry = nr.pop("_baseline_entry")
+            by_scale[nr["scale"]][bl_name] = bl_entry
 
     bar_width = 620
 
@@ -351,10 +393,10 @@ def render_html(data: dict) -> str:
         for cat, c in _STAGE_COLORS.items()
     )
 
-    # Scale sections
+    # Scale sections — put scale=0 (variable-scale pipelines) last.
     scale_sections = "\n".join(
         _render_comparison_section(scale, results, bar_width)
-        for scale, results in sorted(by_scale.items())
+        for scale, results in sorted(by_scale.items(), key=lambda kv: (kv[0] == 0, kv[0]))
     )
 
     return f"""<!DOCTYPE html>
