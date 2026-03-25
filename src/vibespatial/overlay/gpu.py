@@ -355,6 +355,13 @@ compute_shoelace_contributions(
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= edge_count) return;
   const int next_i = (int)next_edge_ids[i];
+  // Bounds check: prevent ILLEGAL_ADDRESS from corrupted topology.
+  if (next_i < 0 || next_i >= edge_count) {
+    out_cross[i] = 0.0;
+    out_cx_contrib[i] = 0.0;
+    out_cy_contrib[i] = 0.0;
+    return;
+  }
   const double x0 = src_x[i];
   const double y0 = src_y[i];
   const double x1 = src_x[next_i];
@@ -380,7 +387,8 @@ compute_face_sample_points(
     double* __restrict__ out_label_x,
     double* __restrict__ out_label_y,
     signed char* __restrict__ out_bounded,
-    int face_count
+    int face_count,
+    int total_edge_count
 ) {
   const int f = blockIdx.x * blockDim.x + threadIdx.x;
   if (f >= face_count) return;
@@ -423,6 +431,8 @@ compute_face_sample_points(
   for (int k = 0; k < n_edges; k++) {
     const int eid = face_edge_ids[start + k];
     const int next_eid = (int)next_edge_ids[eid];
+    // Bounds check: prevent ILLEGAL_ADDRESS from corrupted topology.
+    if (next_eid < 0 || next_eid >= total_edge_count) continue;
     const double x0 = src_x[eid];
     const double y0 = src_y[eid];
     const double x1 = src_x[next_eid];
@@ -443,9 +453,14 @@ compute_face_sample_points(
 // One thread per edge: compute the rank (position) of each edge within its
 // face cycle.  face_id[e] holds the canonical root of the cycle (the minimum
 // edge id, computed by prior pointer jumping).  next_edge_ids[e] gives the
-// next edge in the cycle.  Each thread walks backward from its edge to the
-// root, counting steps.  For typical overlay faces (3-20 edges) this
-// completes in microseconds per thread.
+// next edge in the cycle.  Each thread walks from the root forward through
+// next_edge_ids counting steps until reaching e.
+//
+// Bounds safety: every next_edge_ids dereference checks 0 <= cur < edge_count
+// to prevent ILLEGAL_ADDRESS from corrupted half-edge topology.  If the walk
+// reaches max_walk without finding e (degenerate/broken cycle), rank is set
+// to the thread index within the cycle to produce a deterministic (if
+// arbitrary) ordering rather than colliding ranks that corrupt the sort.
 extern "C" __global__ void __launch_bounds__(256, 4)
 list_rank_within_cycle(
     const int* __restrict__ face_id,
@@ -463,10 +478,21 @@ list_rank_within_cycle(
     return;
   }
 
+  // Bounds-check root before first dereference.
+  if (root < 0 || root >= edge_count) {
+    out_rank[e] = e;  // fallback: use edge id as rank
+    return;
+  }
+
   // Walk next_edge_ids from root until we reach e, counting steps.
   int cur = (int)next_edge_ids[root];
   int steps = 1;
   while (cur != e && steps < max_walk) {
+    // Bounds check: prevent ILLEGAL_ADDRESS on corrupted topology.
+    if (cur < 0 || cur >= edge_count) {
+      out_rank[e] = e;  // fallback: deterministic but arbitrary rank
+      return;
+    }
     cur = (int)next_edge_ids[cur];
     steps++;
   }
@@ -701,6 +727,10 @@ compute_boundary_next(
 // Each ring is a boundary cycle. ring_edge_starts[r] is the starting
 // boundary edge for ring r. We follow boundary_next to walk the cycle
 // and write coordinates.
+//
+// Bounds safety: src_x_count is the total number of elements in src_x/src_y.
+// Every edge index is bounds-checked before dereferencing to prevent
+// ILLEGAL_ADDRESS from corrupted half-edge topology or boundary_next cycles.
 extern "C" __global__ void __launch_bounds__(256, 4)
 scatter_ring_coordinates(
     const double* __restrict__ src_x,
@@ -711,7 +741,8 @@ scatter_ring_coordinates(
     const int* __restrict__ boundary_next,
     double* __restrict__ out_x,
     double* __restrict__ out_y,
-    int ring_count
+    int ring_count,
+    int src_x_count
 ) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= ring_count) return;
@@ -720,8 +751,26 @@ scatter_ring_coordinates(
   const int offset = ring_coord_offsets[r];
   const int n_edges = ring_edge_counts[r];
 
+  // Bounds check start_edge
+  if (start_edge < 0 || start_edge >= src_x_count) {
+    // Write zeros for the ring + closure to avoid uninitialized output
+    for (int k = 0; k <= n_edges; ++k) {
+      out_x[offset + k] = 0.0;
+      out_y[offset + k] = 0.0;
+    }
+    return;
+  }
+
   int current = start_edge;
   for (int k = 0; k < n_edges; ++k) {
+    if (current < 0 || current >= src_x_count) {
+      // Fill remaining with start_edge coords (degenerate but safe)
+      for (int j = k; j <= n_edges; ++j) {
+        out_x[offset + j] = src_x[start_edge];
+        out_y[offset + j] = src_y[start_edge];
+      }
+      return;
+    }
     out_x[offset + k] = src_x[current];
     out_y[offset + k] = src_y[current];
     current = boundary_next[current];
@@ -1098,6 +1147,44 @@ def _batch_point_in_ring_gpu(
 def _require_gpu_arrays() -> None:
     if cp is None:
         raise RuntimeError("CuPy is required for overlay split GPU primitives")
+
+
+def _free_split_event_device_state(split_events: SplitEventTable) -> None:
+    """Release SplitEventTable device arrays that are no longer needed.
+
+    After build_gpu_atomic_edges has consumed the split events, the large
+    float64 buffers (x, y, t, packed_keys) and int32 metadata arrays on
+    device are dead.  Freeing them promptly reduces peak GPU memory by
+    ~40-60% of the split event footprint.
+
+    Phase 25: overlay pipeline memory optimization.
+    """
+    runtime = get_cuda_runtime()
+    ds = split_events.device_state
+    if ds is None:
+        return
+    for arr in (ds.source_segment_ids, ds.packed_keys, ds.t, ds.x, ds.y,
+                ds.source_side, ds.row_indices, ds.part_indices, ds.ring_indices):
+        runtime.free(arr)
+
+
+def _free_atomic_edge_excess(atomic_edges: AtomicEdgeTable) -> None:
+    """Release AtomicEdgeTable device arrays NOT shared with HalfEdgeGraph.
+
+    The HalfEdgeGraph holds references to src_x, src_y and per-edge metadata
+    (source_segment_ids, source_side, row_indices, part_indices, ring_indices,
+    direction) from the AtomicEdgeDeviceState.  Only dst_x and dst_y are
+    exclusively consumed during half-edge graph construction and are safe to
+    free.
+
+    Phase 25: overlay pipeline memory optimization.
+    """
+    runtime = get_cuda_runtime()
+    ds = atomic_edges.device_state
+    if ds is None:
+        return
+    runtime.free(ds.dst_x)
+    runtime.free(ds.dst_y)
 
 
 def _segment_metadata(
@@ -1725,11 +1812,17 @@ def _build_polygon_output_from_faces_gpu(
     # --- Step 5: Detect boundary cycles via GPU pointer jumping ---
     boundary_edge_indices = cp.flatnonzero(d_is_boundary != 0).astype(cp.int32, copy=False)
     boundary_count = int(boundary_edge_indices.size)
+    # Phase 25 memory: d_is_boundary, d_edge_face_ids, d_face_selected,
+    # and the Step 1 face_offsets/edge_ids copies are dead.
+    del d_is_boundary, d_edge_face_ids, d_face_selected
+    del d_face_offsets, d_face_edge_ids
 
     # Build compact boundary-local next array
     edge_to_compact = cp.full(edge_count, -1, dtype=cp.int32)
     edge_to_compact[boundary_edge_indices] = cp.arange(boundary_count, dtype=cp.int32)
     compact_next = edge_to_compact[d_boundary_next[boundary_edge_indices]]
+    # Phase 25 memory: edge_to_compact is dead after compact_next is built.
+    del edge_to_compact
 
     # Pointer jumping to find cycle labels (minimum compact index in cycle)
     cycle_label = cp.arange(boundary_count, dtype=cp.int32)
@@ -1738,6 +1831,8 @@ def _build_polygon_output_from_faces_gpu(
     for _ in range(max_iter_b):
         cycle_label = cp.minimum(cycle_label, cycle_label[jump_b])
         jump_b = jump_b[jump_b]
+    # Phase 25 memory: jump_b is dead after pointer jumping.
+    del jump_b
 
     # List ranking: compute position within each cycle using NVRTC kernel
     d_rank_b = cp.empty(boundary_count, dtype=cp.int32)
@@ -1756,9 +1851,14 @@ def _build_polygon_output_from_faces_gpu(
 
     # Sort by (cycle_label, rank) to get cycle-ordered boundary edges
     packed_b = cycle_label.astype(cp.int64) * int(boundary_count) + d_rank_b.astype(cp.int64)
+    # Phase 25 memory: d_rank_b and d_compact_next_i64 are dead.
+    del d_rank_b, d_compact_next_i64
     b_sort = sort_pairs(packed_b, cp.arange(boundary_count, dtype=cp.int32), synchronize=False)
+    del packed_b
     sorted_compact_ids = b_sort.values
     sorted_labels = cycle_label[sorted_compact_ids]
+    # Phase 25 memory: cycle_label consumed; compact_next dead.
+    del cycle_label, compact_next
 
     # Find unique cycles and their segment boundaries
     b_start_mask = cp.empty(boundary_count, dtype=cp.bool_)
@@ -1768,11 +1868,13 @@ def _build_polygon_output_from_faces_gpu(
     cycle_starts = cp.flatnonzero(b_start_mask).astype(cp.int32, copy=False)
     cycle_ends = cp.concatenate((cycle_starts[1:], cp.asarray([boundary_count], dtype=cp.int32)))
     cycle_lengths = cycle_ends - cycle_starts
+    del b_start_mask, sorted_labels
 
     # Filter cycles with >= 3 edges
     valid_cycle_mask = cycle_lengths >= 3
     valid_cycle_indices = cp.flatnonzero(valid_cycle_mask).astype(cp.int32, copy=False)
     ring_count = int(valid_cycle_indices.size)
+    del valid_cycle_mask
 
     if ring_count == 0:
         return _empty_polygon_output(faces.runtime_selection)
@@ -1780,9 +1882,11 @@ def _build_polygon_output_from_faces_gpu(
     valid_cycle_starts = cycle_starts[valid_cycle_indices]
     valid_cycle_ends = cycle_ends[valid_cycle_indices]
     valid_cycle_lengths = cycle_lengths[valid_cycle_indices]
+    del cycle_starts, cycle_ends, cycle_lengths, valid_cycle_indices
 
     # Map sorted compact ids back to full edge ids for the valid cycles
     sorted_full_edge_ids = boundary_edge_indices[sorted_compact_ids]
+    del sorted_compact_ids
 
     # Compute per-boundary-edge shoelace contributions on device
     d_src_x_b = cp.asarray(device.src_x)
@@ -1792,24 +1896,30 @@ def _build_polygon_output_from_faces_gpu(
     b_next_edges = d_boundary_next[sorted_full_edge_ids]
     b_x1 = d_src_x_b[b_next_edges]
     b_y1 = d_src_y_b[b_next_edges]
+    del b_next_edges
     b_cross = b_x0 * b_y1 - b_x1 * b_y0
     b_cx_contrib = (b_x0 + b_x1) * b_cross
     b_cy_contrib = (b_y0 + b_y1) * b_cross
+    # Phase 25 memory: boundary coordinate arrays consumed by cross products.
+    del b_x0, b_y0, b_x1, b_y1
 
     # Segmented reduce for per-cycle area and centroid
     cross_sums_b = segmented_reduce_sum(b_cross, valid_cycle_starts, valid_cycle_ends, num_segments=ring_count).values
     cx_sums_b = segmented_reduce_sum(b_cx_contrib, valid_cycle_starts, valid_cycle_ends, num_segments=ring_count).values
     cy_sums_b = segmented_reduce_sum(b_cy_contrib, valid_cycle_starts, valid_cycle_ends, num_segments=ring_count).values
+    del b_cross, b_cx_contrib, b_cy_contrib
 
     d_ring_area = cross_sums_b * 0.5
     safe_twice_b = cp.where(cross_sums_b == 0.0, 1.0, cross_sums_b)
     factor_b = 1.0 / (3.0 * safe_twice_b)
     d_ring_centroid_x = cx_sums_b * factor_b
     d_ring_centroid_y = cy_sums_b * factor_b
+    del cross_sums_b, cx_sums_b, cy_sums_b, safe_twice_b, factor_b
 
     # Ring edge starts (first full edge id of each valid cycle) and counts
     d_ring_edge_starts = sorted_full_edge_ids[valid_cycle_starts]
     d_ring_edge_counts = valid_cycle_lengths
+    del sorted_full_edge_ids, valid_cycle_starts, valid_cycle_ends, valid_cycle_lengths
 
     # Source row per cycle: take the row_index of the first edge (device-resident
     # until Step 10 materialization boundary per ADR-0005).
@@ -1825,8 +1935,13 @@ def _build_polygon_output_from_faces_gpu(
     total_coords = int(cp.asnumpy(d_ring_coord_offsets[-1:] + ring_coord_counts[-1:])[0])
 
     # --- Step 7: Scatter ring coordinates via GPU kernel ---
-    d_out_x = cp.empty(total_coords, dtype=cp.float64)
-    d_out_y = cp.empty(total_coords, dtype=cp.float64)
+    # Zero-fill to prevent denormalized garbage in unwritten positions if the
+    # scatter kernel skips any coordinate slot due to an out-of-bounds
+    # boundary_next index.  cp.empty() would recycle a pool block containing
+    # stale int32 metadata, which reinterprets as denormalized float64 values
+    # (e.g. 4e-316) that crash GEOS with TopologyException.
+    d_out_x = cp.zeros(total_coords, dtype=cp.float64)
+    d_out_y = cp.zeros(total_coords, dtype=cp.float64)
     ring_grid = (max(1, (ring_count + 255) // 256), 1, 1)
     runtime.launch(
         kernels["scatter_ring_coordinates"],
@@ -1835,13 +1950,18 @@ def _build_polygon_output_from_faces_gpu(
             (ptr(device.src_x), ptr(device.src_y),
              ptr(d_ring_edge_starts), ptr(d_ring_coord_offsets),
              ptr(d_ring_edge_counts), ptr(d_boundary_next),
-             ptr(d_out_x), ptr(d_out_y), ring_count),
+             ptr(d_out_x), ptr(d_out_y), ring_count,
+             edge_count),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+             KERNEL_PARAM_I32),
         ),
     )
+
+    # Phase 25 memory: d_ring_edge_starts, d_ring_coord_offsets, and
+    # d_ring_edge_counts are still needed for Step 8 merge.
 
     # --- Step 7b: Extract hole rings from unselected bounded faces ---
     # Per ADR-0016, holes are unselected bounded faces whose ring coordinates
@@ -1851,7 +1971,9 @@ def _build_polygon_output_from_faces_gpu(
     d_face_selected_bool = cp.zeros(face_count, dtype=cp.bool_)
     d_face_selected_bool[cp.asarray(selected_face_indices)] = True
     d_hole_mask = (d_bounded_mask_dev != 0) & (~d_face_selected_bool)
+    del d_bounded_mask_dev, d_face_selected_bool
     d_hole_fi = cp.flatnonzero(d_hole_mask).astype(cp.int32)
+    del d_hole_mask
 
     # Extract hole ring coordinates using scatter_ring_coordinates kernel.
     # Hole faces use next_edge_ids (not boundary_next) for edge traversal.
@@ -1886,8 +2008,9 @@ def _build_polygon_output_from_faces_gpu(
             d_hole_coord_offsets = cp.concatenate([d_hole_coord_offsets_partial, _last_offset])
             total_hole_coords = int(cp.asnumpy(_last_offset)[0])
 
-            d_hole_x = cp.empty(total_hole_coords, dtype=cp.float64)
-            d_hole_y = cp.empty(total_hole_coords, dtype=cp.float64)
+            # Zero-fill: same rationale as boundary ring output above.
+            d_hole_x = cp.zeros(total_hole_coords, dtype=cp.float64)
+            d_hole_y = cp.zeros(total_hole_coords, dtype=cp.float64)
             hole_grid = (max(1, (n_valid_holes + 255) // 256), 1, 1)
             runtime.launch(
                 kernels["scatter_ring_coordinates"],
@@ -1896,18 +2019,18 @@ def _build_polygon_output_from_faces_gpu(
                     (ptr(device.src_x), ptr(device.src_y),
                      ptr(d_hole_edge_starts), ptr(d_hole_coord_offsets),
                      ptr(d_vh_lengths), ptr(d_next_i32),
-                     ptr(d_hole_x), ptr(d_hole_y), n_valid_holes),
+                     ptr(d_hole_x), ptr(d_hole_y), n_valid_holes,
+                     edge_count),
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                     KERNEL_PARAM_I32),
                 ),
             )
 
             # Compute per-hole-ring shoelace area/centroid on device
-            # Build slot → ring mapping for segmented reduce
-            hole_slot_ids = cp.arange(total_hole_coords, dtype=cp.int32)
-            _ = cp.searchsorted(d_hole_coord_offsets[1:], hole_slot_ids, side='right').astype(cp.int32)
+            # Phase 25 memory: removed unused hole_slot_ids searchsorted result.
             # Shoelace: cross product per edge (skip last coord = closure)
             h_x0 = d_hole_x[:-1] if total_hole_coords > 1 else d_hole_x
             h_y0 = d_hole_y[:-1] if total_hole_coords > 1 else d_hole_y
@@ -1918,23 +2041,27 @@ def _build_polygon_output_from_faces_gpu(
             h_cross = h_x0 * h_y1 - h_x1 * h_y0
             h_cx_c = (h_x0 + h_x1) * h_cross
             h_cy_c = (h_y0 + h_y1) * h_cross
+            del h_x0, h_y0, h_x1, h_y1
 
-            # Segmented reduce — use coord-based segments (each ring's coords
+            # Segmented reduce -- use coord-based segments (each ring's coords
             # are contiguous, last coord is closure vertex)
             hole_seg_starts = d_hole_coord_offsets[:-1]
             hole_seg_ends = d_hole_coord_offsets[1:] - 1  # exclude closure vertex from cross products
             h_area = segmented_reduce_sum(h_cross, hole_seg_starts, hole_seg_ends, num_segments=n_valid_holes).values * 0.5
             h_cx_sum = segmented_reduce_sum(h_cx_c, hole_seg_starts, hole_seg_ends, num_segments=n_valid_holes).values
             h_cy_sum = segmented_reduce_sum(h_cy_c, hole_seg_starts, hole_seg_ends, num_segments=n_valid_holes).values
+            del h_cross, h_cx_c, h_cy_c, hole_seg_starts, hole_seg_ends
             h_safe_twice = cp.where(h_area == 0.0, 0.5, h_area * 2.0)
             h_factor = 1.0 / (3.0 * h_safe_twice)
             h_centroid_x = h_cx_sum * h_factor
             h_centroid_y = h_cy_sum * h_factor
+            del h_cx_sum, h_cy_sum, h_safe_twice, h_factor
 
             # Filter degenerate holes on device (|area| < 1e-12)
             d_nondegenerate = cp.abs(h_area) >= 1e-12
             d_nondegen_idx = cp.flatnonzero(d_nondegenerate).astype(cp.int32)
             n_valid_nondegenerate = int(d_nondegen_idx.size)
+            del d_nondegenerate
 
             if n_valid_nondegenerate > 0:
                 # Keep only non-degenerate hole rings (device-resident)
@@ -2002,6 +2129,12 @@ def _build_polygon_output_from_faces_gpu(
         d_hole_offsets_shifted = d_hole_offsets_compact + total_coords
         d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted))
         d_all_edge_counts = cp.concatenate((d_ring_edge_counts, d_hole_edge_counts))
+        # Phase 25 memory: pre-merge ring arrays consumed by concatenation.
+        del d_ring_area, d_ring_centroid_x, d_ring_centroid_y
+        del d_out_x, d_out_y, d_ring_coord_offsets, d_ring_edge_counts
+        del d_hole_compact_x, d_hole_compact_y, d_hole_offsets_compact
+        del _d_hole_area, _d_hole_cx, _d_hole_cy, d_hole_edge_counts
+        del d_hole_offsets_shifted
     else:
         n_holes = 0
         d_all_area = d_ring_area
@@ -2012,6 +2145,10 @@ def _build_polygon_output_from_faces_gpu(
         d_all_coord_offsets = d_ring_coord_offsets
         d_all_edge_counts = d_ring_edge_counts
 
+    # Phase 25 memory: boundary_next, face data copies, and hole-detection
+    # arrays are dead after the merge.
+    del d_boundary_next, d_face_offsets_dev, d_face_edge_ids_dev, d_next_i32
+    del d_hole_fi, d_src_x_b, d_src_y_b
     total_ring_count = boundary_ring_count + n_holes
 
     # --- Source rows for ALL rings on device ---
@@ -2749,47 +2886,61 @@ def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
     point_order = cp.lexsort(cp.stack((qy, qx)))
     sorted_qx = qx[point_order]
     sorted_qy = qy[point_order]
+    del qx, qy  # Phase 25 memory: quantized coords consumed
     point_start_mask = cp.empty((int(all_x.size),), dtype=cp.bool_)
     point_start_mask[0] = True
     if int(all_x.size) > 1:
         point_start_mask[1:] = (sorted_qx[1:] != sorted_qx[:-1]) | (sorted_qy[1:] != sorted_qy[:-1])
+    del sorted_qx, sorted_qy  # Phase 25 memory: sorted quantized coords consumed
     point_node_ids_sorted = cp.cumsum(point_start_mask.astype(cp.int32), dtype=cp.int32) - 1
     point_node_ids = cp.empty((int(all_x.size),), dtype=cp.int32)
     point_node_ids[point_order] = point_node_ids_sorted
+    del point_node_ids_sorted  # Phase 25 memory
 
     src_node_ids = point_node_ids[:edge_count]
     dst_node_ids = point_node_ids[edge_count:]
     node_x = all_x[point_order][point_start_mask]
     node_y = all_y[point_order][point_start_mask]
+    del all_x, all_y, point_order, point_start_mask  # Phase 25 memory
 
     angle = cp.arctan2(device.dst_y - device.src_y, device.dst_x - device.src_x)
     angle_key = _quantize_coordinate(angle + np.pi)
     edge_ids = cp.arange(edge_count, dtype=cp.int32)
     sorted_edge_ids = cp.lexsort(cp.stack((edge_ids, angle_key, src_node_ids)))
+    del angle_key  # Phase 25 memory
     sorted_src_nodes = src_node_ids[sorted_edge_ids]
 
     span_start_mask = cp.empty((edge_count,), dtype=cp.bool_)
     span_start_mask[0] = True
     if edge_count > 1:
         span_start_mask[1:] = sorted_src_nodes[1:] != sorted_src_nodes[:-1]
+    del sorted_src_nodes  # Phase 25 memory
     span_group_ids = cp.cumsum(span_start_mask.astype(cp.int32), dtype=cp.int32) - 1
     span_starts = cp.flatnonzero(span_start_mask).astype(cp.int32, copy=False)
     span_ends = cp.concatenate((span_starts[1:], cp.asarray([edge_count], dtype=cp.int32)))
+    del span_start_mask  # Phase 25 memory
     edge_positions = cp.empty((edge_count,), dtype=cp.int32)
     edge_positions[sorted_edge_ids] = cp.arange(edge_count, dtype=cp.int32)
 
     twin_edge_ids = edge_ids ^ 1
+    del edge_ids  # Phase 25 memory
     twin_positions = edge_positions[twin_edge_ids]
+    del twin_edge_ids  # Phase 25 memory
     twin_group_ids = span_group_ids[twin_positions]
+    del span_group_ids  # Phase 25 memory
     twin_group_starts = span_starts[twin_group_ids]
     twin_group_ends = span_ends[twin_group_ids]
+    del twin_group_ids, span_starts, span_ends  # Phase 25 memory
     previous_positions = twin_positions - 1
+    del twin_positions  # Phase 25 memory
     previous_positions = cp.where(
         previous_positions < twin_group_starts,
         twin_group_ends - 1,
         previous_positions,
     )
+    del twin_group_starts, twin_group_ends  # Phase 25 memory
     next_edge_ids = sorted_edge_ids[previous_positions]
+    del previous_positions  # Phase 25 memory
 
     # Carry per-edge metadata from AtomicEdgeTable device state directly
     # -- no D->H transfer.  GPU consumers read device_state.row_indices etc.
@@ -2980,6 +3131,9 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     grid, block = runtime.launch_config(kernels["compute_shoelace_contributions"], edge_count)
     runtime.launch(kernels["compute_shoelace_contributions"], grid=grid, block=block, params=shoelace_params)
 
+    # Phase 25 memory: jump is dead after pointer jumping.
+    del jump
+
     # --- Step 3: Group edges by face_id via sort, then aggregate ---
     edge_ids = cp.arange(edge_count, dtype=cp.int32)
     sort_result = sort_pairs(face_id, edge_ids, synchronize=False)
@@ -2991,8 +3145,10 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     face_start_mask[0] = True
     if edge_count > 1:
         face_start_mask[1:] = sorted_face_ids[1:] != sorted_face_ids[:-1]
+    del sorted_face_ids  # Phase 25 memory
     starts = cp.flatnonzero(face_start_mask).astype(cp.int32, copy=False)
     ends = cp.concatenate((starts[1:], cp.asarray([edge_count], dtype=cp.int32)))
+    del face_start_mask  # Phase 25 memory
 
     # Per-face edge counts
     face_lengths = ends - starts
@@ -3010,16 +3166,20 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     valid_starts = starts[valid_face_indices]
     valid_ends = ends[valid_face_indices]
     valid_lengths = face_lengths[valid_face_indices]
+    del starts, ends, face_lengths, valid_face_indices  # Phase 25 memory
 
     # Segmented reduce for cross, cx_contrib, cy_contrib
     # Reorder contributions to match sorted edge order
     sorted_cross = d_cross[sorted_edge_ids]
     sorted_cx = d_cx_contrib[sorted_edge_ids]
     sorted_cy = d_cy_contrib[sorted_edge_ids]
+    # Phase 25 memory: raw contribution arrays consumed after gather.
+    del d_cross, d_cx_contrib, d_cy_contrib
 
     cross_sums = segmented_reduce_sum(sorted_cross, valid_starts, valid_ends, num_segments=face_count).values
     cx_sums = segmented_reduce_sum(sorted_cx, valid_starts, valid_ends, num_segments=face_count).values
     cy_sums = segmented_reduce_sum(sorted_cy, valid_starts, valid_ends, num_segments=face_count).values
+    del sorted_cross, sorted_cx, sorted_cy  # Phase 25 memory
 
     # signed_area = twice_area * 0.5
     signed_area = cross_sums * 0.5
@@ -3040,6 +3200,8 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     safe_lengths = cp.where(valid_lengths == 0, 1, valid_lengths).astype(cp.float64)
     centroid_x = cp.where(zero_area_mask, mean_x / safe_lengths, centroid_x)
     centroid_y = cp.where(zero_area_mask, mean_y / safe_lengths, centroid_y)
+    del zero_area_mask, sorted_src_x, sorted_src_y, mean_x, mean_y, safe_lengths  # Phase 25 memory
+    del cross_sums, cx_sums, cy_sums, twice_area, safe_twice_area, factor  # Phase 25 memory
 
     # Build compact face_offsets and face_edge_ids in cycle traversal order.
     # GPU list ranking: each edge gets its position within its face cycle,
@@ -3090,6 +3252,10 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     # source position in the cycle-sorted full array
     src_pos = valid_starts[slot_face] + slot_local
     face_edge_ids = cycle_sorted_edge_ids[src_pos]
+    # Phase 25 memory: face walk intermediates consumed.
+    del slot_ids, slot_face, slot_local, src_pos, cycle_sorted_edge_ids
+    del sorted_edge_ids, valid_starts, valid_ends, valid_lengths
+    del packed_key, d_rank
 
     # --- Step 4: Face sample points via kernel ---
     label_x = cp.empty(face_count, dtype=cp.float64)
@@ -3098,10 +3264,12 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     sample_params = (
         (ptr(device.src_x), ptr(device.src_y), ptr(device.next_edge_ids),
          ptr(face_offsets), ptr(face_edge_ids), ptr(signed_area),
-         ptr(label_x), ptr(label_y), ptr(bounded_mask), face_count),
+         ptr(label_x), ptr(label_y), ptr(bounded_mask), face_count,
+         edge_count),
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+         KERNEL_PARAM_I32),
     )
     sample_grid, sample_block = runtime.launch_config(kernels["compute_face_sample_points"], face_count)
     runtime.launch(kernels["compute_face_sample_points"], grid=sample_grid, block=sample_block, params=sample_params)
@@ -3857,7 +4025,19 @@ def _overlay_owned(
 
     split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
     atomic_edges = build_gpu_atomic_edges(split_events)
+    # Phase 25 memory: split_events device state is fully consumed by
+    # build_gpu_atomic_edges.  Free its device arrays to release ~5 large
+    # float64 buffers (x, y, t, packed_keys, source_segment_ids) before
+    # the half-edge graph and face table allocate more.
+    _free_split_event_device_state(split_events)
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
+    # Phase 25 memory: atomic_edges device state arrays that are NOT
+    # shared with half_edge_graph can be freed.  The HalfEdgeGraph keeps
+    # references to src_x, src_y, source_segment_ids, source_side,
+    # row_indices, part_indices, ring_indices, direction from the
+    # AtomicEdgeDeviceState — but dst_x and dst_y are only needed during
+    # build_gpu_half_edge_graph and can be freed now.
+    _free_atomic_edge_excess(atomic_edges)
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
     # Phase 13: Device-resident face selection — avoids triggering
     # _ensure_host() D->H on bounded_mask/left_covered/right_covered.
@@ -3913,6 +4093,11 @@ def _overlay_owned(
         else:
             result = gpu_result  # type: ignore[assignment]
             face_assembly_mode = ExecutionMode.GPU
+    # Phase 25 memory: free intermediate overlay structures once the final
+    # OwnedGeometryArray has been built.  The result holds its own device
+    # coordinate arrays; the half-edge graph, face table, and face indices
+    # are no longer needed.
+    del half_edge_graph, faces, d_selected_face_indices
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,

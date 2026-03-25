@@ -365,7 +365,14 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
     """Binary-tree reduction of group_owned via overlay_union_owned.
 
     Intermediate results stay device-resident.  O(log2(N)) rounds.
+
+    If a GPU overlay fails (e.g. ILLEGAL_ADDRESS from degenerate half-edge
+    topology), the pair falls back to Shapely CPU union.  After multiple
+    consecutive GPU failures (suggesting CUDA context corruption), the
+    rest of the reduction proceeds entirely on CPU.
     """
+    from vibespatial.geometry.owned import from_shapely_geometries
+
     from vibespatial.overlay.gpu import overlay_union_owned
 
     # Split into single-row OwnedGeometryArrays for pairwise reduction.
@@ -375,18 +382,47 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
     ]
 
     rounds = 0
-    max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 1
+    max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
+    consecutive_gpu_failures = 0
+    _GPU_FAILURE_THRESHOLD = 3
 
     while len(current) > 1 and rounds < max_rounds:
         next_round: list[OwnedGeometryArray] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
-                merged = overlay_union_owned(
-                    current[i],
-                    current[i + 1],
-                    dispatch_mode=ExecutionMode.GPU,
-                )
-                next_round.append(merged)
+                gpu_ok = False
+                if consecutive_gpu_failures < _GPU_FAILURE_THRESHOLD:
+                    try:
+                        merged = overlay_union_owned(
+                            current[i],
+                            current[i + 1],
+                            dispatch_mode=ExecutionMode.GPU,
+                        )
+                        next_round.append(merged)
+                        gpu_ok = True
+                        consecutive_gpu_failures = 0
+                    except Exception:
+                        consecutive_gpu_failures += 1
+
+                if not gpu_ok:
+                    # CPU fallback for this pair.
+                    try:
+                        left_g = current[i].to_shapely()[0]
+                    except Exception:
+                        left_g = _EMPTY_POLYGON
+                    try:
+                        right_g = current[i + 1].to_shapely()[0]
+                    except Exception:
+                        right_g = _EMPTY_POLYGON
+                    try:
+                        merged_g = shapely.union(left_g, right_g)
+                        if merged_g is not None and not shapely.is_valid(merged_g):
+                            merged_g = shapely.make_valid(merged_g)
+                    except Exception:
+                        merged_g = _EMPTY_POLYGON
+                    next_round.append(from_shapely_geometries(
+                        [merged_g if merged_g is not None else _EMPTY_POLYGON],
+                    ))
             else:
                 # Odd element passes through.
                 next_round.append(current[i])

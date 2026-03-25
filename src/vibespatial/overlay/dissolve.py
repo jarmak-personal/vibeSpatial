@@ -705,22 +705,30 @@ def _union_all_tree_reduce_gpu(
     *,
     return_owned: bool = False,
 ) -> object | None:
-    """GPU tree-reduce: union N geometries in log₂(N) rounds.
+    """GPU tree-reduce: union N geometries in log2(N) rounds.
 
     When *return_owned* is False (default), materializes the final result to
-    a Shapely geometry (single D→H).  When True, returns the single-row
-    ``OwnedGeometryArray`` directly — no final D→H.
+    a Shapely geometry (single D->H).  When True, returns the single-row
+    ``OwnedGeometryArray`` directly -- no final D->H.
 
     ADR-0002: CONSTRUCTIVE class, fp64 (segment intersection precision).
-    ADR-0005: Device-resident intermediates; single D→H only when needed.
+    ADR-0005: Device-resident intermediates; single D->H only when needed.
     ADR-0033: Inherits overlay pipeline tiers (NVRTC + CCCL + CuPy).
+
+    Resilience: if a GPU overlay raises a CUDA error (e.g. ILLEGAL_ADDRESS
+    from degenerate half-edge topology), the pair falls back to Shapely CPU
+    union.  If the CUDA context itself becomes unusable (multiple consecutive
+    GPU failures suggesting context corruption), the entire remaining
+    reduction switches to CPU to avoid cascading failures.
     """
+    import math
+
     from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime import ExecutionMode
 
     from .gpu import overlay_union_owned
 
-    # Single bulk D→H to identify non-empty rows (1 transfer, not N).
+    # Single bulk D->H to identify non-empty rows (1 transfer, not N).
     geoms = owned.to_shapely()
     keep = np.array([
         i for i in range(owned.row_count)
@@ -739,25 +747,66 @@ def _union_all_tree_reduce_gpu(
 
     current = [owned.take(np.array([idx], dtype=np.intp)) for idx in keep]
 
-    # Tree-reduce: each round halves the geometry count
-    while len(current) > 1:
+    # Tree-reduce: each round halves the geometry count.
+    # Safety: cap rounds to prevent infinite loop from unexpected behavior,
+    # and track consecutive GPU failures to detect context corruption.
+    max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
+    rounds = 0
+    consecutive_gpu_failures = 0
+    _GPU_FAILURE_THRESHOLD = 3  # switch to full-CPU after this many consecutive failures
+
+    while len(current) > 1 and rounds < max_rounds:
         next_round: list[OwnedGeometryArray] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
-                try:
-                    result = overlay_union_owned(
-                        current[i], current[i + 1],
-                        dispatch_mode=ExecutionMode.GPU,
-                    )
-                    next_round.append(result)
-                except Exception:
-                    left_g = current[i].to_shapely()[0]
-                    right_g = current[i + 1].to_shapely()[0]
-                    merged = shapely.union(left_g, right_g)
-                    next_round.append(from_shapely_geometries([merged]))
+                gpu_ok = False
+                if consecutive_gpu_failures < _GPU_FAILURE_THRESHOLD:
+                    try:
+                        result = overlay_union_owned(
+                            current[i], current[i + 1],
+                            dispatch_mode=ExecutionMode.GPU,
+                        )
+                        next_round.append(result)
+                        gpu_ok = True
+                        consecutive_gpu_failures = 0
+                    except Exception:
+                        consecutive_gpu_failures += 1
+
+                if not gpu_ok:
+                    # CPU fallback: materialize both sides and use Shapely.
+                    # Use try/except for to_shapely() since it may fail if
+                    # the CUDA context is corrupted (device-resident data).
+                    try:
+                        left_g = current[i].to_shapely()[0]
+                    except Exception:
+                        left_g = _EMPTY
+                    try:
+                        right_g = current[i + 1].to_shapely()[0]
+                    except Exception:
+                        right_g = _EMPTY
+                    try:
+                        merged = shapely.union(left_g, right_g)
+                        if merged is not None and not shapely.is_valid(merged):
+                            merged = shapely.make_valid(merged)
+                    except Exception:
+                        merged = _EMPTY
+                    next_round.append(from_shapely_geometries(
+                        [merged if merged is not None else _EMPTY],
+                    ))
             else:
                 next_round.append(current[i])
+        # Release previous round's intermediates promptly.
+        del current
         current = next_round
+        rounds += 1
+        # Phase 25 memory: release GPU pool memory between tree-reduce
+        # rounds so overlay intermediates (split events, half-edge graphs,
+        # face tables) don't accumulate across rounds.
+        try:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+            get_cuda_runtime().free_pool_memory()
+        except Exception:
+            pass  # best-effort cleanup
 
     if return_owned:
         return current[0]

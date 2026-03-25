@@ -95,6 +95,68 @@ def _is_multipoint_only(owned: OwnedGeometryArray) -> bool:
     return _is_family_only(owned, frozenset({GeometryFamily.MULTIPOINT}))
 
 
+def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -> bool:
+    """Check whether the Sutherland-Hodgman polygon intersection kernel can handle these inputs.
+
+    The SH kernel has two documented limitations (polygon_intersection.py lines 66-76):
+    1. Holes are not handled -- only exterior rings are used.
+    2. The per-thread workspace is limited to ``_MAX_CLIP_VERTS`` (64) vertices.
+       Clipping a polygon with ``l_n`` vertices against a polygon with ``r_n``
+       exterior-ring edges can produce up to ``l_n + r_n`` intermediate vertices.
+       When this exceeds the workspace limit, vertices are silently dropped and
+       the kernel produces ``validity=False`` for valid intersections.
+
+    Returns True if ALL pairs can be handled by the SH kernel.  Returns False if
+    any pair exceeds the kernel's capabilities, in which case the caller should
+    fall through to the CPU/Shapely path.
+
+    Uses vectorized NumPy operations on offset arrays to avoid per-row Python
+    loops (VPAT001 compliance).
+    """
+    # Import the workspace limit from the kernel module.
+    from vibespatial.kernels.constructive.polygon_intersection import (
+        _MAX_CLIP_VERTS,
+    )
+
+    for side_label, side in (("right", right), ("left", left)):
+        side._ensure_host_state()
+        for family, buf in side.families.items():
+            if buf.row_count == 0:
+                continue
+            geom_offsets = buf.geometry_offsets
+            ring_offsets = buf.ring_offsets
+
+            # Vectorized ring-count check: rings_per_row = geom_offsets[1:] - geom_offsets[:-1]
+            rings_per_row = np.diff(geom_offsets)
+
+            # Check for holes (any polygon with >1 ring)
+            if np.any(rings_per_row > 1):
+                logger.debug(
+                    "SH kernel skip: %s polygon has rows with holes "
+                    "(max rings per row = %d)",
+                    side_label, int(rings_per_row.max()),
+                )
+                return False
+
+            # Vectorized vertex-count check for exterior rings.
+            # first_ring_idx is geom_offsets[:-1] for rows with at least 1 ring.
+            has_rings = rings_per_row > 0
+            if not np.any(has_rings):
+                continue
+            first_ring_idx = geom_offsets[:-1][has_rings]
+            ext_verts = ring_offsets[first_ring_idx + 1] - ring_offsets[first_ring_idx]
+            max_verts = int(ext_verts.max()) if ext_verts.size > 0 else 0
+            if max_verts > _MAX_CLIP_VERTS:
+                logger.debug(
+                    "SH kernel skip: %s polygon exterior ring has %d vertices "
+                    "(limit %d)",
+                    side_label, max_verts, _MAX_CLIP_VERTS,
+                )
+                return False
+
+    return True
+
+
 def _build_point_polygon_result(
     points: OwnedGeometryArray,
     new_validity: np.ndarray | None,
@@ -442,6 +504,25 @@ def _binary_constructive_gpu(
         # Try direct GPU kernels first (faster than full overlay pipeline
         # for element-wise ops: no topology graph construction needed).
         if op == "intersection":
+            # The Sutherland-Hodgman kernel has known limitations: no holes,
+            # and a per-thread workspace limit of _MAX_CLIP_VERTS.  Check
+            # whether the inputs are within the kernel's capabilities before
+            # calling it.  When they are not (e.g. complex polygons with
+            # holes or many vertices), return None immediately to trigger
+            # CPU/Shapely fallback which handles all cases correctly.
+            #
+            # We also skip the overlay pipeline fall-through in this case:
+            # the overlay pipeline builds a full topology graph per pair
+            # (~15s per pair), making it impractical for many-vs-one
+            # workloads (e.g. 1000 vegetation polygons vs 1 corridor).
+            # CPU/Shapely handles this in 0.06s for 1000 pairs.
+            if not _sh_kernel_can_handle(left, right):
+                logger.debug(
+                    "polygon_intersection SH kernel skipped: input exceeds "
+                    "kernel capabilities (holes or vertex count), falling "
+                    "back to CPU/Shapely",
+                )
+                return None
             try:
                 from vibespatial.kernels.constructive.polygon_intersection import (
                     polygon_intersection,
