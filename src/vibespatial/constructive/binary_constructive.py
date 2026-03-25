@@ -23,11 +23,16 @@ from __future__ import annotations
 
 import logging
 import warnings
+from typing import TYPE_CHECKING
 
 import numpy as np
 import shapely
 
 from vibespatial.cuda._runtime import DeviceArray
+
+if TYPE_CHECKING:
+    from vibespatial.spatial.segment_primitives import DeviceSegmentTable
+
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
@@ -320,6 +325,7 @@ def _dispatch_overlay_gpu(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     """Dispatch to the GPU overlay pipeline for Polygon-Polygon pairs.
 
@@ -340,7 +346,10 @@ def _dispatch_overlay_gpu(
         "symmetric_difference": overlay_symmetric_difference_owned,
     }
     fn = dispatch[op]
-    return fn(left, right, dispatch_mode=dispatch_mode)
+    return fn(
+        left, right, dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +411,7 @@ def _binary_constructive_gpu(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray | None:
     """GPU binary constructive for all family combinations.
 
@@ -415,6 +425,8 @@ def _binary_constructive_gpu(
         Propagated to inner kernels (polygon_intersection, overlay).
         Default is GPU since this function is only called when the
         outer dispatch has already selected GPU execution.
+    _cached_right_segments : DeviceSegmentTable, optional
+        Pre-extracted right-side segments for reuse (lyy.15).
     """
     # --- Point-Point ---
     if _is_point_only(left) and _is_point_only(right):
@@ -550,7 +562,10 @@ def _binary_constructive_gpu(
         # Fall through to the general overlay pipeline for union,
         # symmetric_difference, or when direct kernels fail.
         try:
-            result = _dispatch_overlay_gpu(op, left, right, dispatch_mode=dispatch_mode)
+            result = _dispatch_overlay_gpu(
+                op, left, right, dispatch_mode=dispatch_mode,
+                _cached_right_segments=_cached_right_segments,
+            )
             if result.row_count == left.row_count:
                 return result
             logger.debug(
@@ -681,6 +696,7 @@ def binary_constructive_owned(
     grid_size: float | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     """Element-wise binary constructive operation on owned arrays.
 
@@ -706,6 +722,10 @@ def binary_constructive_owned(
         Execution mode hint.
     precision : PrecisionMode or str, default AUTO
         Precision mode for GPU path.
+    _cached_right_segments : DeviceSegmentTable, optional
+        Pre-extracted right-side device segments for reuse (lyy.15).
+        Passed through to the overlay pipeline to avoid redundant
+        segment extraction in N-vs-1 overlay loops.
     """
     if op not in _CONSTRUCTIVE_OPS:
         raise ValueError(f"unsupported constructive operation: {op}")
@@ -741,7 +761,10 @@ def binary_constructive_owned(
             requested=precision,
         )
         gpu_attempted = True
-        result = _binary_constructive_gpu(op, left, right, dispatch_mode=selection.selected)
+        result = _binary_constructive_gpu(
+            op, left, right, dispatch_mode=selection.selected,
+            _cached_right_segments=_cached_right_segments,
+        )
         if result is not None:
             record_dispatch_event(
                 surface=f"geopandas.array.{op}",

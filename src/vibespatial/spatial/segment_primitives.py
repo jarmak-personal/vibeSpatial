@@ -2412,12 +2412,21 @@ def _classify_segment_intersections_gpu(
     precision_plan: PrecisionPlan,
     robustness_plan: RobustnessPlan,
     tile_size: int = 512,
+    _cached_right_device_segments: DeviceSegmentTable | None = None,
 ) -> SegmentIntersectionResult:
     """Full GPU-native segment intersection pipeline.
 
     Kernel 1: GPU segment extraction (NVRTC count-scatter)
     Kernel 2: GPU candidate generation (sort-sweep with CCCL radix sort)
     Kernel 3: GPU classification with Shewchuk adaptive refinement
+
+    Parameters
+    ----------
+    _cached_right_device_segments : DeviceSegmentTable, optional
+        Pre-extracted right-side segments.  When provided, skips
+        ``_extract_segments_gpu(right)`` entirely.  Used by
+        ``spatial_overlay_owned`` to avoid re-extracting the same
+        corridor geometry N times in an N-vs-1 overlay loop (lyy.15).
     """
     runtime = get_cuda_runtime()
 
@@ -2426,7 +2435,11 @@ def _classify_segment_intersections_gpu(
 
     # --- Kernel 1: Extract segments on GPU ---
     d_left_segs = _extract_segments_gpu(left, compute_type)
-    d_right_segs = _extract_segments_gpu(right, compute_type)
+    d_right_segs = (
+        _cached_right_device_segments
+        if _cached_right_device_segments is not None
+        else _extract_segments_gpu(right, compute_type)
+    )
 
     if d_left_segs.count == 0 or d_right_segs.count == 0:
         return _empty_segment_intersection_result(
@@ -2714,6 +2727,7 @@ def classify_segment_intersections(
     tile_size: int = 512,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _cached_right_device_segments: DeviceSegmentTable | None = None,
 ) -> SegmentIntersectionResult:
     """Classify all segment-segment intersections between two geometry arrays.
 
@@ -2730,6 +2744,8 @@ def classify_segment_intersections(
         Force GPU, CPU, or AUTO dispatch.
     precision : PrecisionMode
         Force fp32, fp64, or AUTO precision.
+    _cached_right_device_segments : DeviceSegmentTable, optional
+        Pre-extracted right-side device segments for reuse (lyy.15).
 
     Returns
     -------
@@ -2771,6 +2787,7 @@ def classify_segment_intersections(
             precision_plan=precision_plan,
             robustness_plan=robustness_plan,
             tile_size=tile_size,
+            _cached_right_device_segments=_cached_right_device_segments,
         )
 
     # CPU fallback

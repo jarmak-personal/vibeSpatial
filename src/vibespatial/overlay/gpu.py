@@ -4334,18 +4334,27 @@ def build_gpu_split_events(
     *,
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> SplitEventTable:
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
 
     # GPU-native segment extraction -- no CPU loop, no host round-trip.
+    # lyy.15: reuse pre-extracted right-side segments when provided
+    # (N-vs-1 overlay caches the corridor segments once).
     left_segments = _extract_segments_gpu(left)
-    right_segments = _extract_segments_gpu(right)
+    _owns_right_segments = _cached_right_segments is None
+    right_segments = (
+        _cached_right_segments
+        if _cached_right_segments is not None
+        else _extract_segments_gpu(right)
+    )
 
     result = intersection_result or classify_segment_intersections(
         left,
         right,
         dispatch_mode=dispatch_mode,
+        _cached_right_device_segments=_cached_right_segments,
     )
     if result.runtime_selection.selected is not ExecutionMode.GPU:
         raise RuntimeError("build_gpu_split_events requires a GPU segment-intersection result")
@@ -4586,7 +4595,12 @@ def build_gpu_split_events(
     finally:
         # Free DeviceSegmentTable arrays (x0/y0/x1/y1 are aliases of
         # left_x0 etc., plus row/segment/part/ring metadata).
-        for _dst in (left_segments, right_segments):
+        # lyy.15: skip freeing right_segments when they are cached
+        # (caller owns the lifetime of the cached segments).
+        _segs_to_free = [left_segments]
+        if _owns_right_segments:
+            _segs_to_free.append(right_segments)
+        for _dst in _segs_to_free:
             runtime.free(_dst.x0)
             runtime.free(_dst.y0)
             runtime.free(_dst.x1)
@@ -4722,9 +4736,10 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
         d_part_indices = d_se_part[clip_idx]
         d_ring_indices = d_se_ring[clip_idx]
 
-        # Row/part/ring are eagerly materialized because the downstream
-        # half-edge graph builder consumes them on host.  source_segment_ids,
-        # direction, and coordinates remain lazy via _ensure_host.
+        # Row/part/ring stay on device; downstream build_gpu_half_edge_graph
+        # reads device_state directly.  Host copies are lazily materialized
+        # via AtomicEdgeTable.row_indices / part_indices / ring_indices
+        # properties on first access.
         return AtomicEdgeTable(
             left_segment_count=split_events.left_segment_count,
             right_segment_count=split_events.right_segment_count,
@@ -4742,9 +4757,6 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
                 source_side=d_source_side,
             ),
             _count=pair_count * 2,
-            _row_indices=cp.asnumpy(d_row_indices).astype(np.int32, copy=False),
-            _part_indices=cp.asnumpy(d_part_indices).astype(np.int32, copy=False),
-            _ring_indices=cp.asnumpy(d_ring_indices).astype(np.int32, copy=False),
         )
     finally:
         runtime.free(adjacency_mask)
@@ -4756,8 +4768,12 @@ def overlay_intersection_owned(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
-    return _overlay_owned(left, right, operation="intersection", dispatch_mode=dispatch_mode)
+    return _overlay_owned(
+        left, right, operation="intersection", dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+    )
 
 
 def overlay_union_owned(
@@ -4765,8 +4781,12 @@ def overlay_union_owned(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
-    return _overlay_owned(left, right, operation="union", dispatch_mode=dispatch_mode)
+    return _overlay_owned(
+        left, right, operation="union", dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+    )
 
 
 def overlay_difference_owned(
@@ -4774,8 +4794,12 @@ def overlay_difference_owned(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
-    return _overlay_owned(left, right, operation="difference", dispatch_mode=dispatch_mode)
+    return _overlay_owned(
+        left, right, operation="difference", dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+    )
 
 
 def overlay_symmetric_difference_owned(
@@ -4783,8 +4807,12 @@ def overlay_symmetric_difference_owned(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
-    return _overlay_owned(left, right, operation="symmetric_difference", dispatch_mode=dispatch_mode)
+    return _overlay_owned(
+        left, right, operation="symmetric_difference", dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+    )
 
 
 def overlay_identity_owned(
@@ -4792,8 +4820,12 @@ def overlay_identity_owned(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
-    return _overlay_owned(left, right, operation="identity", dispatch_mode=dispatch_mode)
+    return _overlay_owned(
+        left, right, operation="identity", dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+    )
 
 
 def _overlay_owned(
@@ -4802,6 +4834,7 @@ def _overlay_owned(
     *,
     operation: str,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray:
     requested = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     _polygonal_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
@@ -4882,7 +4915,11 @@ def _overlay_owned(
     # adaptive runtime handles crossover decisions upstream via
     # plan_dispatch_selection().
 
-    split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
+    split_events = build_gpu_split_events(
+        left, right,
+        dispatch_mode=ExecutionMode.GPU,
+        _cached_right_segments=_cached_right_segments,
+    )
     atomic_edges = build_gpu_atomic_edges(split_events)
     # Phase 25 memory: split_events device state is fully consumed by
     # build_gpu_atomic_edges.  Free its device arrays to release ~5 large
@@ -5388,21 +5425,68 @@ def spatial_overlay_owned(
             # global O(n**2) cross-contamination.
             result_parts: list[OwnedGeometryArray] = []
             _xp = cp if _pairs_on_device else np  # array module for index construction
-            for grp_idx in range(len(unique_left)):
-                start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
-                n_pairs = end - start
-                left_row = left_subset.take(_xp.array([grp_idx], dtype=_xp.int64))
-                right_rows = right_subset.take(right_subset_indices[start:end])
-                # Replicate left row to match the number of right neighbours.
-                if n_pairs > 1:
-                    left_replicated = left_row.take(_xp.zeros(n_pairs, dtype=_xp.int64))
-                else:
-                    left_replicated = left_row
-                grp_result = binary_constructive_owned(
-                    how, left_replicated, right_rows,
-                    dispatch_mode=_pairwise_mode,
-                )
-                result_parts.append(grp_result)
+
+            # lyy.15: Cache right-side segment extraction for broadcast_right.
+            # In the N-vs-1 pattern, the right geometry (corridor) is identical
+            # for every pair.  Pre-extract its segments ONCE and reuse across
+            # all iterations, avoiding redundant _extract_segments_gpu calls
+            # (2 per iteration: once in build_gpu_split_events, once in
+            # classify_segment_intersections).
+            _cached_right_segs: DeviceSegmentTable | None = None
+            if (
+                strategy.name == "broadcast_right"
+                and right_subset.row_count == 1
+                and cp is not None
+                and len(unique_left) > 1
+            ):
+                try:
+                    _cached_right_segs = _extract_segments_gpu(right_subset)
+                    logger.debug(
+                        "lyy.15: cached right-side segments (%d segments) "
+                        "for %d per-group iterations",
+                        _cached_right_segs.count, len(unique_left),
+                    )
+                except Exception:
+                    logger.debug(
+                        "lyy.15: right-side segment caching failed, "
+                        "falling through to per-iteration extraction",
+                        exc_info=True,
+                    )
+                    _cached_right_segs = None
+
+            try:
+                for grp_idx in range(len(unique_left)):
+                    start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
+                    n_pairs = end - start
+                    left_row = left_subset.take(_xp.array([grp_idx], dtype=_xp.int64))
+                    right_rows = right_subset.take(right_subset_indices[start:end])
+                    # Replicate left row to match the number of right neighbours.
+                    if n_pairs > 1:
+                        left_replicated = left_row.take(_xp.zeros(n_pairs, dtype=_xp.int64))
+                    else:
+                        left_replicated = left_row
+                    grp_result = binary_constructive_owned(
+                        how, left_replicated, right_rows,
+                        dispatch_mode=_pairwise_mode,
+                        _cached_right_segments=_cached_right_segs,
+                    )
+                    result_parts.append(grp_result)
+            finally:
+                # lyy.15: Free cached right-side segments after all
+                # iterations (or on exception).
+                if _cached_right_segs is not None:
+                    _rt = get_cuda_runtime()
+                    _rt.free(_cached_right_segs.x0)
+                    _rt.free(_cached_right_segs.y0)
+                    _rt.free(_cached_right_segs.x1)
+                    _rt.free(_cached_right_segs.y1)
+                    _rt.free(_cached_right_segs.row_indices)
+                    _rt.free(_cached_right_segs.segment_indices)
+                    if _cached_right_segs.part_indices is not None:
+                        _rt.free(_cached_right_segs.part_indices)
+                    if _cached_right_segs.ring_indices is not None:
+                        _rt.free(_cached_right_segs.ring_indices)
+                    _cached_right_segs = None
 
             if result_parts:
                 result_owned = OwnedGeometryArray.concat(result_parts)
