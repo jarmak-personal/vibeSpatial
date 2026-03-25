@@ -270,3 +270,76 @@ def test_chunked_plan_iterator_empty_workload() -> None:
         total_rows=0,
     )
     assert list(iterator) == []
+
+
+# ---------------------------------------------------------------------------
+# Explicit GPU mode bypasses crossover threshold (lyy.26)
+# ---------------------------------------------------------------------------
+
+_GPU_TEST_SNAPSHOT = DeviceSnapshot(
+    backend=MonitoringBackend.UNAVAILABLE,
+    gpu_available=True,
+    device_profile=DEFAULT_CONSUMER_PROFILE,
+    reason="test snapshot with GPU",
+)
+
+
+def test_explicit_gpu_bypasses_constructive_crossover_small_batch() -> None:
+    """When dispatch_mode=GPU, small batches must stay on GPU.
+
+    The CONSTRUCTIVE crossover threshold is 50K rows.  With AUTO, a
+    1-row batch would be routed to CPU.  With explicit GPU, the
+    crossover check is skipped entirely.
+    """
+    plan = plan_adaptive_execution(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        workload=WorkloadProfile(row_count=1),
+        requested_mode=ExecutionMode.GPU,
+        device_snapshot=_GPU_TEST_SNAPSHOT,
+    )
+    assert plan.dispatch_decision is DispatchDecision.GPU
+    assert plan.runtime_selection.selected is ExecutionMode.GPU
+    assert plan.runtime_selection.requested is ExecutionMode.GPU
+
+
+def test_auto_mode_respects_constructive_crossover() -> None:
+    """AUTO mode routes small CONSTRUCTIVE batches to CPU."""
+    plan = plan_adaptive_execution(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        workload=WorkloadProfile(row_count=100),
+        requested_mode=ExecutionMode.AUTO,
+        device_snapshot=_GPU_TEST_SNAPSHOT,
+    )
+    assert plan.dispatch_decision is DispatchDecision.CPU
+    assert plan.runtime_selection.selected is ExecutionMode.CPU
+
+
+def test_auto_mode_routes_to_gpu_above_constructive_crossover() -> None:
+    """AUTO mode routes large CONSTRUCTIVE batches to GPU."""
+    plan = plan_adaptive_execution(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        workload=WorkloadProfile(row_count=60_000),
+        requested_mode=ExecutionMode.AUTO,
+        device_snapshot=_GPU_TEST_SNAPSHOT,
+    )
+    assert plan.dispatch_decision is DispatchDecision.GPU
+    assert plan.runtime_selection.selected is ExecutionMode.GPU
+
+
+def test_explicit_gpu_bypasses_crossover_for_all_kernel_classes() -> None:
+    """Explicit GPU mode skips crossover for every kernel class."""
+    for kernel_class in KernelClass:
+        plan = plan_adaptive_execution(
+            kernel_name=f"test_{kernel_class.value}",
+            kernel_class=kernel_class,
+            workload=WorkloadProfile(row_count=1),
+            requested_mode=ExecutionMode.GPU,
+            device_snapshot=_GPU_TEST_SNAPSHOT,
+        )
+        assert plan.dispatch_decision is DispatchDecision.GPU, (
+            f"explicit GPU should bypass crossover for {kernel_class.value}"
+        )
+        assert plan.runtime_selection.selected is ExecutionMode.GPU

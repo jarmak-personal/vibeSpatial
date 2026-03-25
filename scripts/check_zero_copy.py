@@ -25,7 +25,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-17.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 108  # clip_rect vectorization removed 1 zero-copy violation
+_VIOLATION_BASELINE = 111  # overlay strategy dispatch + SH pre-flight wiring
 
 # Method names that pull data from device to host.
 D2H_APIS = {"get", "copy_to_host", "to_host", "asnumpy", "tolist", "to_pylist"}

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pytest
 from shapely.geometry import LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon
+
+if TYPE_CHECKING:
+    from vibespatial.geometry.owned import OwnedGeometryArray
 
 from vibespatial import (
     BufferSharingMode,
@@ -267,3 +272,313 @@ def test_compute_geometry_bounds_gpu_matches_cpu_reference() -> None:
     gpu_bounds = compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
 
     assert np.allclose(cpu_bounds, gpu_bounds, equal_nan=True)
+
+
+# ---------------------------------------------------------------------------
+# Device-resident concat (lyy.29)
+# ---------------------------------------------------------------------------
+
+
+def _make_device_resident(geoms: list[object | None]) -> OwnedGeometryArray:
+    """Create a device-resident OwnedGeometryArray with host stubs cleared."""
+    from vibespatial.geometry.owned import FamilyGeometryBuffer
+
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    # Clear host family buffers to simulate true device-only arrays
+    owned.families = {
+        family: FamilyGeometryBuffer(
+            family=buffer.family,
+            schema=buffer.schema,
+            row_count=buffer.row_count,
+            x=np.empty(0, dtype=np.float64),
+            y=np.empty(0, dtype=np.float64),
+            geometry_offsets=np.empty(0, dtype=np.int32),
+            empty_mask=np.empty(0, dtype=np.bool_),
+            host_materialized=False,
+        )
+        for family, buffer in owned.families.items()
+    }
+    return owned
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+class TestDeviceResidentConcat:
+    """Verify that OwnedGeometryArray.concat() stays device-resident when all
+    inputs are device-resident, with no D->H transfer."""
+
+    def test_concat_points_stays_device_resident(self) -> None:
+        """Concatenating device-resident point arrays produces a device-resident result."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        owned1 = _make_device_resident([Point(0, 0), Point(1, 1)])
+        owned2 = _make_device_resident([Point(2, 2), Point(3, 3)])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.device_state is not None
+        assert result.row_count == 4
+        # Verify host metadata is not materialized (stays None)
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
+        # Verify round-trip correctness after host materialization
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(Point(0, 0))
+        assert shapely_result[1].equals(Point(1, 1))
+        assert shapely_result[2].equals(Point(2, 2))
+        assert shapely_result[3].equals(Point(3, 3))
+
+    def test_concat_polygons_stays_device_resident(self) -> None:
+        """Concatenating device-resident polygon arrays preserves ring offsets."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        p1 = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+        p2 = Polygon([(2, 2), (3, 2), (3, 3), (2, 3), (2, 2)])
+
+        owned1 = _make_device_resident([p1])
+        owned2 = _make_device_resident([p2])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(p1)
+        assert shapely_result[1].equals(p2)
+
+    def test_concat_multipolygons_stays_device_resident(self) -> None:
+        """Concatenating device-resident multipolygon arrays preserves 3-level offsets."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        mp1 = MultiPolygon([
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+        ])
+        mp2 = MultiPolygon([
+            Polygon([(10, 10), (11, 10), (11, 11), (10, 10)]),
+        ])
+
+        owned1 = _make_device_resident([mp1])
+        owned2 = _make_device_resident([mp2])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(mp1)
+        assert shapely_result[1].equals(mp2)
+
+    def test_concat_linestrings_stays_device_resident(self) -> None:
+        """Concatenating device-resident linestring arrays."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        ls1 = LineString([(0, 0), (1, 1), (2, 0)])
+        ls2 = LineString([(5, 5), (6, 6)])
+
+        owned1 = _make_device_resident([ls1])
+        owned2 = _make_device_resident([ls2])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(ls1)
+        assert shapely_result[1].equals(ls2)
+
+    def test_concat_multilinestrings_stays_device_resident(self) -> None:
+        """Concatenating device-resident multilinestring arrays preserves part offsets."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        mls1 = MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]])
+        mls2 = MultiLineString([[(10, 10), (11, 11)]])
+
+        owned1 = _make_device_resident([mls1])
+        owned2 = _make_device_resident([mls2])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(mls1)
+        assert shapely_result[1].equals(mls2)
+
+    def test_concat_with_nulls_stays_device_resident(self) -> None:
+        """Null rows are correctly handled in device-resident concat."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        owned1 = _make_device_resident([Point(0, 0), None])
+        owned2 = _make_device_resident([None, Point(1, 1)])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 4
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(Point(0, 0))
+        assert shapely_result[1] is None
+        assert shapely_result[2] is None
+        assert shapely_result[3].equals(Point(1, 1))
+
+    def test_concat_mixed_families_stays_device_resident(self) -> None:
+        """Concatenating arrays with different geometry families."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        owned1 = _make_device_resident([
+            Point(0, 0),
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+        ])
+        owned2 = _make_device_resident([
+            LineString([(2, 2), (3, 3)]),
+            Point(4, 4),
+        ])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 4
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(Point(0, 0))
+        assert shapely_result[1].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]))
+        assert shapely_result[2].equals(LineString([(2, 2), (3, 3)]))
+        assert shapely_result[3].equals(Point(4, 4))
+
+    def test_concat_no_d2h_transfer(self, monkeypatch) -> None:
+        """Device-resident concat must not call _ensure_host_state."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        owned1 = _make_device_resident([Point(0, 0), Point(1, 1)])
+        owned2 = _make_device_resident([Point(2, 2)])
+
+        calls = []
+
+        def _spy_host_state(self_inner):
+            calls.append("_ensure_host_state")
+
+        monkeypatch.setattr(
+            OwnedGeometryArray, "_ensure_host_state", _spy_host_state,
+        )
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert len(calls) == 0, (
+            "_ensure_host_state was called during device-resident concat"
+        )
+
+    def test_concat_host_fallback_when_mixed_residency(self) -> None:
+        """When some inputs are host-resident, falls back to host concat."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        device_owned = _make_device_resident([Point(0, 0)])
+        host_owned = from_shapely_geometries([Point(1, 1)])
+
+        result = OwnedGeometryArray.concat([device_owned, host_owned])
+
+        # Should fall through to host path and produce correct result
+        assert result.residency is Residency.HOST
+        assert result.row_count == 2
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(Point(0, 0))
+        assert shapely_result[1].equals(Point(1, 1))
+
+    def test_concat_three_arrays_stays_device_resident(self) -> None:
+        """Concatenating 3+ device-resident arrays."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        owned1 = _make_device_resident([Point(0, 0)])
+        owned2 = _make_device_resident([Point(1, 1)])
+        owned3 = _make_device_resident([Point(2, 2)])
+
+        result = OwnedGeometryArray.concat([owned1, owned2, owned3])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 3
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(Point(0, 0))
+        assert shapely_result[1].equals(Point(1, 1))
+        assert shapely_result[2].equals(Point(2, 2))
+
+    def test_concat_polygon_with_hole_stays_device_resident(self) -> None:
+        """Polygons with holes preserve interior rings through device concat."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        poly_hole = Polygon(
+            [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)],
+            [[(2, 2), (4, 2), (4, 4), (2, 2)]],
+        )
+        poly_simple = Polygon([(20, 20), (21, 20), (21, 21), (20, 20)])
+
+        owned1 = _make_device_resident([poly_hole])
+        owned2 = _make_device_resident([poly_simple])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(poly_hole)
+        assert len(list(shapely_result[0].interiors)) == 1
+        assert shapely_result[1].equals(poly_simple)
+
+    def test_concat_all_families_device_resident(self) -> None:
+        """Concatenating arrays covering all 6 geometry families."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        geoms1 = [
+            Point(1, 2),
+            LineString([(0, 0), (1, 1)]),
+            Polygon([(0, 0), (3, 0), (3, 3), (0, 0)]),
+        ]
+        geoms2 = [
+            MultiPoint([(0, 0), (1, 1)]),
+            MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]]),
+            MultiPolygon([
+                Polygon([(10, 10), (12, 10), (12, 12), (10, 10)]),
+            ]),
+        ]
+
+        owned1 = _make_device_resident(geoms1)
+        owned2 = _make_device_resident(geoms2)
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 6
+
+        shapely_result = result.to_shapely()
+        for i, expected in enumerate(geoms1 + geoms2):
+            assert shapely_result[i].equals(expected), (
+                f"Mismatch at index {i}: {expected.geom_type}"
+            )
+
+    def test_concat_disjoint_families_device_resident(self) -> None:
+        """One array has only polygons, the other has only points."""
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        owned1 = _make_device_resident([
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+        ])
+        owned2 = _make_device_resident([
+            Point(5, 5),
+        ])
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]))
+        assert shapely_result[1].equals(Point(5, 5))

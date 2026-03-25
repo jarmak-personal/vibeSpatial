@@ -524,10 +524,13 @@ class OwnedGeometryArray:
     def concat(cls, arrays: list[OwnedGeometryArray]) -> OwnedGeometryArray:
         """Concatenate multiple OwnedGeometryArrays at the buffer level.
 
-        Stays host-resident and avoids any Shapely materialization.
-        All input arrays are ensured to have host state before concatenation.
-        Device state is not carried over; the caller can move the result
-        to device if needed.
+        When ALL inputs are device-resident (``residency == DEVICE``) and
+        have device state populated, concatenation is performed entirely on
+        GPU using CuPy -- no D->H transfer occurs.  The result is a
+        device-resident OGA with lazy host stubs.
+
+        When ANY input is host-resident (or lacks device state), falls back
+        to the existing host-side concatenation path.
         """
         if not arrays:
             return OwnedGeometryArray(
@@ -540,6 +543,18 @@ class OwnedGeometryArray:
         if len(arrays) == 1:
             return arrays[0]
 
+        # --- Device-resident fast path ---
+        all_device = (
+            cp is not None
+            and all(
+                a.residency is Residency.DEVICE and a.device_state is not None
+                for a in arrays
+            )
+        )
+        if all_device:
+            return cls._concat_device(arrays)
+
+        # --- Host fallback path ---
         for arr in arrays:
             arr._ensure_host_state()
 
@@ -598,6 +613,119 @@ class OwnedGeometryArray:
         result._record(
             DiagnosticKind.CREATED,
             f"concatenated {len(arrays)} arrays totalling {total} rows",
+            visible=False,
+        )
+        return result
+
+    @classmethod
+    def _concat_device(cls, arrays: list[OwnedGeometryArray]) -> OwnedGeometryArray:
+        """Device-resident concatenation -- all work stays on GPU.
+
+        Precondition: every element of *arrays* has ``residency == DEVICE``
+        and a populated ``device_state``.  Called from :meth:`concat` only
+        after the precondition has been verified.
+        """
+        device_states = [a.device_state for a in arrays]
+
+        # 1. Concatenate routing metadata on device.
+        d_all_validity = cp.concatenate([ds.validity for ds in device_states])
+        d_all_tags = cp.concatenate([ds.tags for ds in device_states])
+        total_rows = int(d_all_validity.size)
+
+        # 2. Collect all family keys that appear across inputs.
+        all_family_keys: set[GeometryFamily] = set()
+        for ds in device_states:
+            all_family_keys.update(ds.families.keys())
+
+        # 3. Build concatenated family_row_offsets on device.
+        #    Each array's per-family offsets must be shifted by the
+        #    cumulative family row count from preceding arrays.
+        d_all_family_row_offsets = cp.full(total_rows, -1, dtype=cp.int32)
+        family_cumulative: dict[GeometryFamily, int] = {f: 0 for f in all_family_keys}
+        row_cursor = 0
+        for arr, ds in zip(arrays, device_states, strict=True):
+            n = arr.row_count
+            for family in all_family_keys:
+                if family not in ds.families:
+                    continue
+                family_tag = FAMILY_TAGS[family]
+                # Boolean mask for rows belonging to this family in this chunk
+                chunk_tags = ds.tags
+                family_mask = chunk_tags == family_tag
+                if not bool(cp.any(family_mask)):
+                    continue
+
+                shift = family_cumulative[family]
+                src_offsets = ds.family_row_offsets[family_mask]
+
+                # Compute global positions for the family rows in this chunk
+                chunk_positions = cp.flatnonzero(family_mask).astype(cp.int64)
+                d_all_family_row_offsets[row_cursor + chunk_positions] = (
+                    src_offsets + shift
+                )
+
+                # Count family rows: number of rows in device family buffer
+                d_buf = ds.families[family]
+                family_row_count = int(d_buf.geometry_offsets.size) - 1 if d_buf.geometry_offsets.size > 0 else 0
+                family_cumulative[family] += family_row_count
+            row_cursor += n
+
+        # 4. Concatenate per-family device buffers.
+        new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+        for family in all_family_keys:
+            family_bufs = [
+                ds.families[family]
+                for ds in device_states
+                if family in ds.families
+            ]
+            if not family_bufs:
+                continue
+            new_device_families[family] = _concat_device_family_buffers(
+                family, family_bufs,
+            )
+
+        # 5. Build host-side placeholder families (host_materialized=False).
+        new_host_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+        for family, d_buf in new_device_families.items():
+            schema = get_geometry_buffer_schema(family)
+            fam_row_count = int(d_buf.geometry_offsets.size) - 1 if d_buf.geometry_offsets.size > 0 else 0
+            new_host_families[family] = FamilyGeometryBuffer(
+                family=family,
+                schema=schema,
+                row_count=fam_row_count,
+                x=np.empty(0, dtype=np.float64),
+                y=np.empty(0, dtype=np.float64),
+                geometry_offsets=np.empty(0, dtype=np.int32),
+                empty_mask=np.empty(0, dtype=np.bool_),
+                host_materialized=False,
+            )
+
+        # 6. Assemble device-resident OGA -- host metadata arrays are None;
+        #    lazy _ensure_host_metadata() will transfer on first access.
+        d_meta = DeviceMetadataState(
+            validity=d_all_validity,
+            tags=d_all_tags,
+            family_row_offsets=d_all_family_row_offsets,
+        )
+        result = OwnedGeometryArray(
+            validity=None,
+            tags=None,
+            family_row_offsets=None,
+            families=new_host_families,
+            residency=Residency.DEVICE,
+            device_state=OwnedGeometryDeviceState(
+                validity=d_all_validity,
+                tags=d_all_tags,
+                family_row_offsets=d_all_family_row_offsets,
+                families=new_device_families,
+            ),
+            device_metadata=d_meta,
+            _row_count=total_rows,
+        )
+        result._record(
+            DiagnosticKind.CREATED,
+            f"device-resident concatenation of {len(arrays)} arrays "
+            f"totalling {total_rows} rows",
             visible=False,
         )
         return result
@@ -983,6 +1111,146 @@ def _concat_offset_arrays(
         parts.append(offsets[1:] + cumulative)
         cumulative += count
     return np.concatenate(parts).astype(np.int32)
+
+
+def _concat_device_offset_arrays(
+    offset_arrays: list[DeviceArray],
+    element_counts: list[int],
+) -> DeviceArray:
+    """Concatenate offset arrays on device, shifting each by cumulative counts.
+
+    CuPy equivalent of :func:`_concat_offset_arrays`.  Each offset array has
+    length ``(row_count + 1)``.  The result drops the leading zero from all
+    arrays after the first and shifts values so they form a single contiguous
+    offset array.  All work stays on device.
+    """
+    if len(offset_arrays) == 1:
+        return offset_arrays[0]
+    parts: list[DeviceArray] = [offset_arrays[0]]
+    cumulative = element_counts[0]
+    for offsets, count in zip(offset_arrays[1:], element_counts[1:], strict=True):
+        # Drop the leading 0 from subsequent arrays and shift.
+        parts.append(offsets[1:] + cumulative)
+        cumulative += count
+    return cp.concatenate(parts).astype(cp.int32)
+
+
+def _concat_device_family_buffers(
+    family: GeometryFamily,
+    buffers: list[DeviceFamilyGeometryBuffer],
+) -> DeviceFamilyGeometryBuffer:
+    """Concatenate multiple DeviceFamilyGeometryBuffers on device.
+
+    CuPy equivalent of :func:`_concat_family_buffers`.  Coordinates are
+    concatenated and offset arrays are shifted so the result is a single
+    contiguous device buffer.  All work stays on GPU -- no D->H transfer.
+    """
+    if len(buffers) == 1:
+        return buffers[0]
+
+    total_rows = sum(int(b.geometry_offsets.size) - 1 for b in buffers if b.geometry_offsets.size > 0)
+    if total_rows == 0:
+        return buffers[0]
+
+    new_x = cp.concatenate([b.x for b in buffers]) if any(b.x.size for b in buffers) else cp.empty(0, dtype=cp.float64)
+    new_y = cp.concatenate([b.y for b in buffers]) if any(b.y.size for b in buffers) else cp.empty(0, dtype=cp.float64)
+    new_empty_mask = cp.concatenate([b.empty_mask for b in buffers])
+
+    # Bounds: concatenate if all have bounds, otherwise drop.
+    if all(b.bounds is not None for b in buffers):
+        new_bounds = cp.concatenate([b.bounds for b in buffers])
+    else:
+        new_bounds = None
+
+    if family in (GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT):
+        # Single level of offsets: geometry_offsets -> coords
+        coord_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_geom_offsets = _concat_device_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            coord_counts,
+        )
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            bounds=new_bounds,
+        )
+
+    if family is GeometryFamily.POLYGON:
+        # Two levels: geometry_offsets -> ring_offsets -> coords
+        ring_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
+        geom_ring_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_ring_offsets = _concat_device_offset_arrays(
+            [b.ring_offsets for b in buffers],
+            ring_counts,
+        )
+        new_geom_offsets = _concat_device_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            geom_ring_counts,
+        )
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            ring_offsets=new_ring_offsets,
+            bounds=new_bounds,
+        )
+
+    if family is GeometryFamily.MULTILINESTRING:
+        # Two levels: geometry_offsets -> part_offsets -> coords
+        coord_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
+        geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_part_offsets = _concat_device_offset_arrays(
+            [b.part_offsets for b in buffers],
+            coord_counts,
+        )
+        new_geom_offsets = _concat_device_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            geom_part_counts,
+        )
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            part_offsets=new_part_offsets,
+            bounds=new_bounds,
+        )
+
+    if family is GeometryFamily.MULTIPOLYGON:
+        # Three levels: geometry_offsets -> part_offsets -> ring_offsets -> coords
+        ring_coord_counts = [int(b.ring_offsets[-1]) if b.ring_offsets.size > 0 else 0 for b in buffers]
+        part_ring_counts = [int(b.part_offsets[-1]) if b.part_offsets.size > 0 else 0 for b in buffers]
+        geom_part_counts = [int(b.geometry_offsets[-1]) if b.geometry_offsets.size > 0 else 0 for b in buffers]
+        new_ring_offsets = _concat_device_offset_arrays(
+            [b.ring_offsets for b in buffers],
+            ring_coord_counts,
+        )
+        new_part_offsets = _concat_device_offset_arrays(
+            [b.part_offsets for b in buffers],
+            part_ring_counts,
+        )
+        new_geom_offsets = _concat_device_offset_arrays(
+            [b.geometry_offsets for b in buffers],
+            geom_part_counts,
+        )
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            part_offsets=new_part_offsets,
+            ring_offsets=new_ring_offsets,
+            bounds=new_bounds,
+        )
+
+    raise NotImplementedError(f"device concat not implemented for {family.value}")
 
 
 def _concat_family_buffers(

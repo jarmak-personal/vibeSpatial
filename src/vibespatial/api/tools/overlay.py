@@ -16,7 +16,7 @@ from vibespatial.api.geometry_array import (
     _check_crs,
     _crs_mismatch_warn,
 )
-from vibespatial.runtime._runtime import ExecutionMode
+from vibespatial.runtime._runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
@@ -204,9 +204,17 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
             else:
                 left_sub = left_owned.take(np.asarray(idx1))
                 right_sub = right_owned.take(np.asarray(idx2))
+            # Force GPU dispatch when a GPU runtime is available: the
+            # overlay pipeline has device-resident data and the 50K
+            # CONSTRUCTIVE crossover threshold should not route small
+            # batches to CPU, forcing a D->H->D round-trip.
+            _pairwise_mode = (
+                ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
+            )
             try:
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
+                    dispatch_mode=_pairwise_mode,
                 )
                 intersections = GeoSeries(
                     GeometryArray.from_owned(result_owned, crs=df1.crs),
@@ -220,7 +228,7 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                     surface="geopandas.overlay.intersection",
                     reason="binary_constructive_owned raised NotImplementedError",
                     detail=f"rows={len(idx1)}, falling back to Shapely intersection",
-                    requested=ExecutionMode.AUTO,
+                    requested=_pairwise_mode,
                     selected=ExecutionMode.CPU,
                     pipeline="_overlay_intersection",
                     d2h_transfer=True,
@@ -319,6 +327,14 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 segmented_union_all,
             )
 
+            # Force GPU dispatch when a GPU runtime is available: the
+            # overlay pipeline has device-resident data and the 50K
+            # CONSTRUCTIVE crossover threshold should not route small
+            # batches to CPU, forcing a D->H->D round-trip.
+            _pairwise_mode = (
+                ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
+            )
+
             # Phase 2 zero-copy: pass CuPy device arrays directly to
             # device_take() when available, eliminating H→D re-upload.
             if _has_device_indices:
@@ -348,6 +364,7 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             left_sub = left_owned.take(idx1_unique)
             diff_owned = binary_constructive_owned(
                 "difference", left_sub, right_unions_owned,
+                dispatch_mode=_pairwise_mode,
             )
 
             # Assemble full result: scatter differenced rows into the
@@ -358,11 +375,14 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             used_owned = True
         except (ImportError, NotImplementedError):
             # Phase 24: Record fallback event when owned-path dispatch fails.
+            _fallback_requested = (
+                ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
+            )
             record_fallback_event(
                 surface="geopandas.overlay.difference",
                 reason="owned-path dispatch failed (ImportError or NotImplementedError)",
                 detail=f"left_rows={n_left}, idx1_size={idx1.size}",
-                requested=ExecutionMode.AUTO,
+                requested=_fallback_requested,
                 selected=ExecutionMode.CPU,
                 pipeline="_overlay_difference",
                 d2h_transfer=True,

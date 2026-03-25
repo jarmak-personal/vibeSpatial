@@ -1353,54 +1353,7 @@ class DeviceGeometryArray(ExtensionArray):
             return cls._from_owned(empty_owned)
 
         all_owned = [arr._owned for arr in to_concat]
-
-        # Concatenate top-level arrays
-        new_validity = np.concatenate([o.validity for o in all_owned])
-        new_tags = np.concatenate([o.tags for o in all_owned])
-
-        # Merge families: accumulate per-family buffers and rewrite family_row_offsets
-        all_families: dict[GeometryFamily, list[FamilyGeometryBuffer]] = {}
-        for owned in all_owned:
-            for family, buf in owned.families.items():
-                all_families.setdefault(family, []).append(buf)
-
-        new_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
-        family_row_counts: dict[GeometryFamily, int] = {}
-        for family, bufs in all_families.items():
-            new_families[family] = _concat_family_buffers(family, bufs)
-            family_row_counts[family] = new_families[family].row_count
-
-        # Rebuild family_row_offsets with correct cumulative offsets
-        new_family_row_offsets = np.full(new_validity.size, -1, dtype=np.int32)
-        family_cursor: dict[GeometryFamily, int] = {f: 0 for f in all_families}
-        global_offset = 0
-        for owned in all_owned:
-            n = owned.row_count
-            for i in range(n):
-                global_idx = global_offset + i
-                tag = new_tags[global_idx]
-                if tag == NULL_TAG:
-                    continue
-                family = TAG_FAMILIES[int(tag)]
-                new_family_row_offsets[global_idx] = family_cursor[family] + owned.family_row_offsets[i]
-            # Advance cursors
-            for family in all_families:
-                if family in owned.families:
-                    family_cursor[family] += owned.families[family].row_count
-            global_offset += n
-
-        new_owned = OwnedGeometryArray(
-            validity=new_validity,
-            tags=new_tags,
-            family_row_offsets=new_family_row_offsets,
-            families=new_families,
-            residency=Residency.HOST,
-        )
-        new_owned._record(
-            DiagnosticKind.CREATED,
-            f"DeviceGeometryArray: concatenated {len(to_concat)} arrays",
-            visible=False,
-        )
+        new_owned = OwnedGeometryArray.concat(all_owned)
 
         # Use CRS from first array that has one
         crs = None

@@ -161,6 +161,8 @@ scatter_segments(
     const int* __restrict__ seg_offsets,
     int* __restrict__ out_row_idx,
     int* __restrict__ out_seg_idx,
+    int* __restrict__ out_part_idx,
+    int* __restrict__ out_ring_idx,
     double* __restrict__ out_x0,
     double* __restrict__ out_y0,
     double* __restrict__ out_x1,
@@ -184,6 +186,8 @@ scatter_segments(
         for (int c = cs; c < ce - 1; ++c) {{{{
             out_row_idx[write_pos] = global_row;
             out_seg_idx[write_pos] = seg_idx++;
+            out_part_idx[write_pos] = 0;
+            out_ring_idx[write_pos] = 0;
             out_x0[write_pos] = x[c];
             out_y0[write_pos] = y[c];
             out_x1[write_pos] = x[c + 1];
@@ -194,11 +198,14 @@ scatter_segments(
         const int rs = geom_off[fam_row];
         const int re = geom_off[fam_row + 1];
         for (int ri = rs; ri < re; ++ri) {{{{
+            const int ring_local = ri - rs;
             const int cs = ring_off[ri];
             const int ce = ring_off[ri + 1];
             for (int c = cs; c < ce - 1; ++c) {{{{
                 out_row_idx[write_pos] = global_row;
                 out_seg_idx[write_pos] = seg_idx++;
+                out_part_idx[write_pos] = 0;
+                out_ring_idx[write_pos] = ring_local;
                 out_x0[write_pos] = x[c];
                 out_y0[write_pos] = y[c];
                 out_x1[write_pos] = x[c + 1];
@@ -210,11 +217,14 @@ scatter_segments(
         const int ps = geom_off[fam_row];
         const int pe = geom_off[fam_row + 1];
         for (int pi = ps; pi < pe; ++pi) {{{{
+            const int part_local = pi - ps;
             const int cs = part_off[pi];
             const int ce = part_off[pi + 1];
             for (int c = cs; c < ce - 1; ++c) {{{{
                 out_row_idx[write_pos] = global_row;
                 out_seg_idx[write_pos] = seg_idx++;
+                out_part_idx[write_pos] = part_local;
+                out_ring_idx[write_pos] = -1;
                 out_x0[write_pos] = x[c];
                 out_y0[write_pos] = y[c];
                 out_x1[write_pos] = x[c + 1];
@@ -226,14 +236,18 @@ scatter_segments(
         const int ps = geom_off[fam_row];
         const int pe = geom_off[fam_row + 1];
         for (int pi = ps; pi < pe; ++pi) {{{{
+            const int polygon_local = pi - ps;
             const int rs = part_off[pi];
             const int re = part_off[pi + 1];
             for (int ri = rs; ri < re; ++ri) {{{{
+                const int ring_local = ri - rs;
                 const int cs = ring_off[ri];
                 const int ce = ring_off[ri + 1];
                 for (int c = cs; c < ce - 1; ++c) {{{{
                     out_row_idx[write_pos] = global_row;
                     out_seg_idx[write_pos] = seg_idx++;
+                    out_part_idx[write_pos] = polygon_local;
+                    out_ring_idx[write_pos] = ring_local;
                     out_x0[write_pos] = x[c];
                     out_y0[write_pos] = y[c];
                     out_x1[write_pos] = x[c + 1];
@@ -670,6 +684,8 @@ class DeviceSegmentTable:
     x1: DeviceArray
     y1: DeviceArray
     count: int
+    part_indices: DeviceArray | None = None
+    ring_indices: DeviceArray | None = None
 
 
 @dataclass
@@ -1061,6 +1077,8 @@ def _extract_segments_gpu(
             x1=runtime.allocate((0,), np.float64),
             y1=runtime.allocate((0,), np.float64),
             count=0,
+            part_indices=runtime.allocate((0,), np.int32),
+            ring_indices=runtime.allocate((0,), np.int32),
         )
 
     # The count_segments / scatter_segments kernels declare family_codes as
@@ -1103,6 +1121,8 @@ def _extract_segments_gpu(
 
     all_row_idx = []
     all_seg_idx = []
+    all_part_idx = []
+    all_ring_idx = []
     all_x0 = []
     all_y0 = []
     all_x1 = []
@@ -1177,6 +1197,8 @@ def _extract_segments_gpu(
         # Step 3: Allocate and scatter
         d_out_row = runtime.allocate((fam_total,), np.int32)
         d_out_seg = runtime.allocate((fam_total,), np.int32)
+        d_out_part = runtime.allocate((fam_total,), np.int32)
+        d_out_ring = runtime.allocate((fam_total,), np.int32)
         d_out_x0 = runtime.allocate((fam_total,), np.float64)
         d_out_y0 = runtime.allocate((fam_total,), np.float64)
         d_out_x1 = runtime.allocate((fam_total,), np.float64)
@@ -1188,14 +1210,14 @@ def _extract_segments_gpu(
              ptr(d_geom_off), ptr(d_part_off), ptr(d_ring_off),
              ptr(d_fam_empty), ptr(d_buf.x), ptr(d_buf.y),
              ptr(d_seg_offsets),
-             ptr(d_out_row), ptr(d_out_seg),
+             ptr(d_out_row), ptr(d_out_seg), ptr(d_out_part), ptr(d_out_ring),
              ptr(d_out_x0), ptr(d_out_y0), ptr(d_out_x1), ptr(d_out_y1),
              n_fam),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_I32),
         )
@@ -1204,6 +1226,8 @@ def _extract_segments_gpu(
 
         all_row_idx.append(d_out_row)
         all_seg_idx.append(d_out_seg)
+        all_part_idx.append(d_out_part)
+        all_ring_idx.append(d_out_ring)
         all_x0.append(d_out_x0)
         all_y0.append(d_out_y0)
         all_x1.append(d_out_x1)
@@ -1225,6 +1249,8 @@ def _extract_segments_gpu(
             x1=runtime.allocate((0,), np.float64),
             y1=runtime.allocate((0,), np.float64),
             count=0,
+            part_indices=runtime.allocate((0,), np.int32),
+            ring_indices=runtime.allocate((0,), np.int32),
         )
 
     # Concatenate per-family results on device (CuPy Tier 2)
@@ -1237,6 +1263,8 @@ def _extract_segments_gpu(
             x1=all_x1[0],
             y1=all_y1[0],
             count=total_segments,
+            part_indices=all_part_idx[0],
+            ring_indices=all_ring_idx[0],
         )
 
     return DeviceSegmentTable(
@@ -1247,6 +1275,8 @@ def _extract_segments_gpu(
         x1=cp.concatenate(all_x1),
         y1=cp.concatenate(all_y1),
         count=total_segments,
+        part_indices=cp.concatenate(all_part_idx),
+        ring_indices=cp.concatenate(all_ring_idx),
     )
 
 

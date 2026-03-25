@@ -39,14 +39,16 @@ from vibespatial.geometry.owned import (  # noqa: E402
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
+from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.residency import Residency  # noqa: E402
 from vibespatial.spatial.segment_primitives import (  # noqa: E402
+    DeviceSegmentTable,
     SegmentIntersectionDeviceState,
     SegmentIntersectionResult,
     SegmentTable,
+    _extract_segments_gpu,
     classify_segment_intersections,
-    extract_segments,
 )
 
 from .types import (  # noqa: E402  # Re-exported for backward compatibility
@@ -1220,35 +1222,59 @@ def _segment_metadata_gpu(
     d_source_segment_ids,
     *,
     left_count: int,
-    left_segments: SegmentTable,
-    right_segments: SegmentTable,
+    left_segments: SegmentTable | DeviceSegmentTable,
+    right_segments: SegmentTable | DeviceSegmentTable,
 ):
     """Derive source_side / row / part / ring indices entirely on GPU.
 
-    Uploads the per-segment metadata arrays from left/right SegmentTables
-    to device, then uses CuPy fancy indexing to gather the per-event
-    metadata without any D→H transfers.
+    When *left_segments* and *right_segments* are ``DeviceSegmentTable``
+    instances (GPU-resident), the lookup tables are used directly on
+    device with zero host-device transfers.  When they are CPU-resident
+    ``SegmentTable`` instances, the metadata arrays are uploaded once.
     """
     d_ids = cp.asarray(d_source_segment_ids)
 
     # source_side: 1 for left, 2 for right
     d_source_side = cp.where(d_ids < left_count, cp.int8(1), cp.int8(2))
 
-    # Upload per-segment metadata lookup tables to device and
-    # build combined lookup tables (left then right) so a single
+    # Build combined lookup tables (left then right) so a single
     # gather with the raw source_segment_id works directly.
+    # Use device arrays directly when available (DeviceSegmentTable),
+    # upload from host only for legacy SegmentTable.
+    def _to_device(arr):
+        """Wrap a host or device array as a CuPy array."""
+        return cp.asarray(arr)
+
     d_all_row = cp.concatenate((
-        cp.asarray(left_segments.row_indices),
-        cp.asarray(right_segments.row_indices),
+        _to_device(left_segments.row_indices),
+        _to_device(right_segments.row_indices),
     ))
-    d_all_part = cp.concatenate((
-        cp.asarray(left_segments.part_indices),
-        cp.asarray(right_segments.part_indices),
-    ))
-    d_all_ring = cp.concatenate((
-        cp.asarray(left_segments.ring_indices),
-        cp.asarray(right_segments.ring_indices),
-    ))
+
+    left_has_parts = (
+        left_segments.part_indices is not None
+        if isinstance(left_segments, DeviceSegmentTable)
+        else hasattr(left_segments, "part_indices")
+    )
+    right_has_parts = (
+        right_segments.part_indices is not None
+        if isinstance(right_segments, DeviceSegmentTable)
+        else hasattr(right_segments, "part_indices")
+    )
+
+    if left_has_parts and right_has_parts:
+        d_all_part = cp.concatenate((
+            _to_device(left_segments.part_indices),
+            _to_device(right_segments.part_indices),
+        ))
+        d_all_ring = cp.concatenate((
+            _to_device(left_segments.ring_indices),
+            _to_device(right_segments.ring_indices),
+        ))
+    else:
+        # Fallback: zero-fill part/ring indices when not available
+        total = left_count + right_segments.count
+        d_all_part = cp.zeros(total, dtype=cp.int32)
+        d_all_ring = cp.zeros(total, dtype=cp.int32)
 
     # Right-side IDs are offset by left_count in the combined table,
     # which matches the segment numbering convention already.
@@ -3488,8 +3514,11 @@ def build_gpu_split_events(
 ) -> SplitEventTable:
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
-    left_segments = extract_segments(left)
-    right_segments = extract_segments(right)
+
+    # GPU-native segment extraction -- no CPU loop, no host round-trip.
+    left_segments = _extract_segments_gpu(left)
+    right_segments = _extract_segments_gpu(right)
+
     result = intersection_result or classify_segment_intersections(
         left,
         right,
@@ -3525,14 +3554,16 @@ def build_gpu_split_events(
     base_event_count = segment_total * 2
     kernels = _overlay_split_kernels()
 
-    left_x0 = runtime.from_host(left_segments.x0)
-    left_y0 = runtime.from_host(left_segments.y0)
-    left_x1 = runtime.from_host(left_segments.x1)
-    left_y1 = runtime.from_host(left_segments.y1)
-    right_x0 = runtime.from_host(right_segments.x0)
-    right_y0 = runtime.from_host(right_segments.y0)
-    right_x1 = runtime.from_host(right_segments.x1)
-    right_y1 = runtime.from_host(right_segments.y1)
+    # Segment coordinate arrays are already device-resident from
+    # _extract_segments_gpu -- use them directly, no from_host.
+    left_x0 = left_segments.x0
+    left_y0 = left_segments.y0
+    left_x1 = left_segments.x1
+    left_y1 = left_segments.y1
+    right_x0 = right_segments.x0
+    right_y0 = right_segments.y0
+    right_x1 = right_segments.x1
+    right_y1 = right_segments.y1
 
     endpoint_source_ids = runtime.allocate((base_event_count,), np.int32)
     endpoint_t = runtime.allocate((base_event_count,), np.float64)
@@ -3730,14 +3761,19 @@ def build_gpu_split_events(
             runtime.free(extra_y)
             runtime.free(extra_keys)
     finally:
-        runtime.free(left_x0)
-        runtime.free(left_y0)
-        runtime.free(left_x1)
-        runtime.free(left_y1)
-        runtime.free(right_x0)
-        runtime.free(right_y0)
-        runtime.free(right_x1)
-        runtime.free(right_y1)
+        # Free DeviceSegmentTable arrays (x0/y0/x1/y1 are aliases of
+        # left_x0 etc., plus row/segment/part/ring metadata).
+        for _dst in (left_segments, right_segments):
+            runtime.free(_dst.x0)
+            runtime.free(_dst.y0)
+            runtime.free(_dst.x1)
+            runtime.free(_dst.y1)
+            runtime.free(_dst.row_indices)
+            runtime.free(_dst.segment_indices)
+            if _dst.part_indices is not None:
+                runtime.free(_dst.part_indices)
+            if _dst.ring_indices is not None:
+                runtime.free(_dst.ring_indices)
         runtime.free(endpoint_source_ids)
         runtime.free(endpoint_t)
         runtime.free(endpoint_x)
@@ -4005,7 +4041,7 @@ def _overlay_owned(
     # inputs from pylibcudf I/O have structural metadata on host but empty
     # x/y stubs (host_materialized=False).  The overlay pipeline accesses
     # polygon_buffer.x/y on host in multiple places (rectangle detection,
-    # segment extraction via extract_segments).
+    # _extract_segments_gpu via device state).
     left._ensure_host_state()
     right._ensure_host_state()
 
@@ -4160,8 +4196,116 @@ def spatial_overlay_owned(
         )
         return result
 
-    left_indices = candidate_pairs.left_indices
-    right_indices = candidate_pairs.right_indices
+    # lyy.32: Keep spatial join pair indices on GPU when device-resident.
+    # When candidate_pairs has device indices (GPU spatial join), all sorting,
+    # grouping, and subset selection is done with CuPy on device.  Device
+    # index arrays are passed directly to take() which routes to device_take(),
+    # avoiding D->H->D round-trips.  When device indices are not available
+    # (CPU spatial join), falls back to the existing numpy path.
+    _pairs_on_device = (
+        cp is not None
+        and candidate_pairs.device_left_indices is not None
+        and candidate_pairs.device_right_indices is not None
+    )
+
+    if _pairs_on_device:
+        # Device path: all grouping operations stay on GPU.
+        d_left_indices = candidate_pairs.device_left_indices
+        d_right_indices = candidate_pairs.device_right_indices
+
+        # Ensure int64 for CuPy argsort stability and take() compatibility.
+        d_left_indices = d_left_indices.astype(cp.int64, copy=False)
+        d_right_indices = d_right_indices.astype(cp.int64, copy=False)
+
+        # Sort pairs by left index for grouping.  CuPy argsort is
+        # stable by default (mergesort), preserving relative order
+        # within each group.
+        d_sort_order = cp.argsort(d_left_indices)
+        d_left_indices = d_left_indices[d_sort_order]
+        d_right_indices = d_right_indices[d_sort_order]
+
+        d_unique_left, d_group_starts = cp.unique(d_left_indices, return_index=True)
+        d_group_ends = cp.append(d_group_starts[1:], cp.array([d_left_indices.size], dtype=d_group_starts.dtype))
+        d_unique_right = cp.unique(d_right_indices)
+
+        # take() with CuPy indices routes to device_take() — zero-copy.
+        left_subset = left.take(d_unique_left) if int(d_unique_left.size) < left.row_count else left
+        right_subset = right.take(d_unique_right) if int(d_unique_right.size) < right.row_count else right
+
+        # Remap right indices from original row space to right_subset row space.
+        d_right_remap = cp.empty(right.row_count, dtype=cp.int64)
+        d_right_remap[d_unique_right] = cp.arange(int(d_unique_right.size), dtype=cp.int64)
+        d_right_subset_indices = d_right_remap[d_right_indices]
+
+        # Materialize group_starts/group_ends to host for per-group loop
+        # iteration (small arrays — O(unique_left) scalars).  The actual
+        # index arrays used for take() stay on device.
+        group_starts = cp.asnumpy(d_group_starts)
+        group_ends = cp.asnumpy(d_group_ends)
+        unique_left = d_unique_left  # device array for take()
+        right_subset_indices = d_right_subset_indices  # device array for take()
+
+        # Host copies for Shapely fallback path (lazy — only materialised if
+        # owned-dispatch fails).  These are set after the owned-dispatch
+        # try/except block when needed.
+        left_indices = None  # deferred; materialised in fallback
+        right_indices = None
+    else:
+        # CPU path: pair indices are already on host.
+        left_indices = candidate_pairs.left_indices
+        right_indices = candidate_pairs.right_indices
+
+        # Sort pairs by left index for grouping.
+        sort_order = np.argsort(left_indices, kind="mergesort")
+        left_indices = left_indices[sort_order]
+        right_indices = right_indices[sort_order]
+
+        unique_left, group_starts = np.unique(left_indices, return_index=True)
+        group_ends = np.append(group_starts[1:], len(left_indices))
+
+        unique_right = np.unique(right_indices)
+
+        # take() operates at buffer level — no Shapely materialization.
+        left_subset = left.take(unique_left) if len(unique_left) < left.row_count else left
+        right_subset = right.take(unique_right) if len(unique_right) < right.row_count else right
+
+        # Remap right indices from original row space to right_subset row space.
+        right_remap = np.empty(right.row_count, dtype=np.intp)
+        right_remap[unique_right] = np.arange(len(unique_right))
+        right_subset_indices = right_remap[right_indices]
+
+    # Strategy detection: detect workload shape and select the overlay strategy.
+    # Currently all strategies fall through to the existing per-group path.
+    # Future beads (lyy.16, lyy.18, lyy.21) will add strategy-specific
+    # GPU implementations (containment bypass, batched SH clip, batched overlay).
+    from vibespatial.overlay.strategies import select_overlay_strategy
+
+    strategy = select_overlay_strategy(
+        left, right, how,
+        candidate_pair_count=candidate_pairs.count,
+    )
+
+    record_dispatch_event(
+        surface="geopandas.spatial_overlay",
+        operation=f"spatial_overlay_{how}",
+        implementation=f"spatial_overlay_{strategy.name}",
+        reason=strategy.reason,
+        detail=(
+            f"left={left.row_count}, right={right.row_count}, "
+            f"pairs={candidate_pairs.count}, strategy={strategy.name}"
+        ),
+        requested=requested,
+        selected=ExecutionMode.GPU if cp is not None else ExecutionMode.CPU,
+    )
+
+    # For now, all strategies use the existing per-group path.
+    # Future beads will add strategy-specific implementations:
+    if strategy.name == "broadcast_right":
+        # TODO(lyy.16): containment bypass
+        # TODO(lyy.18): batched SH clip
+        pass  # fall through to per_group
+    elif strategy.name == "broadcast_left":
+        pass  # fall through to per_group
 
     # Stage 2: Per-left-group processing.
     #
@@ -4184,25 +4328,6 @@ def spatial_overlay_owned(
     # take() subsets participating rows at buffer level — no Shapely
     # round-trip.  Per-group calls each handle O(1) segment pairs, giving
     # overall O(N) scaling instead of O(N**2).
-
-    # Sort pairs by left index for grouping.
-    sort_order = np.argsort(left_indices, kind="mergesort")
-    left_indices = left_indices[sort_order]
-    right_indices = right_indices[sort_order]
-
-    unique_left, group_starts = np.unique(left_indices, return_index=True)
-    group_ends = np.append(group_starts[1:], len(left_indices))
-
-    unique_right = np.unique(right_indices)
-
-    # take() operates at buffer level — no Shapely materialization.
-    left_subset = left.take(unique_left) if len(unique_left) < left.row_count else left
-    right_subset = right.take(unique_right) if len(unique_right) < right.row_count else right
-
-    # Remap right indices from original row space to right_subset row space.
-    right_remap = np.empty(right.row_count, dtype=np.intp)
-    right_remap[unique_right] = np.arange(len(unique_right))
-    right_subset_indices = right_remap[right_indices]
 
     # Remap left indices: unique_left[i] -> i (left_subset row space).
     # left_subset row i corresponds to unique_left[i] in the original array.
@@ -4236,6 +4361,9 @@ def spatial_overlay_owned(
             )
 
             # Build CSR-style group offsets for segmented_union_all.
+            # group_starts is always host numpy (materialised above for both
+            # device and host paths).  segmented_union_all converts to host
+            # internally via np.asarray.
             group_offsets = np.empty(len(group_starts) + 1, dtype=np.int64)
             group_offsets[:-1] = group_starts
             group_offsets[-1] = len(right_subset_indices)
@@ -4256,14 +4384,15 @@ def spatial_overlay_owned(
             # Processing per-group keeps segment sets isolated, avoiding
             # global O(n**2) cross-contamination.
             result_parts: list[OwnedGeometryArray] = []
+            _xp = cp if _pairs_on_device else np  # array module for index construction
             for grp_idx in range(len(unique_left)):
-                start, end = group_starts[grp_idx], group_ends[grp_idx]
+                start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
                 n_pairs = end - start
-                left_row = left_subset.take(np.array([grp_idx]))
+                left_row = left_subset.take(_xp.array([grp_idx], dtype=_xp.int64))
                 right_rows = right_subset.take(right_subset_indices[start:end])
                 # Replicate left row to match the number of right neighbours.
                 if n_pairs > 1:
-                    left_replicated = left_row.take(np.zeros(n_pairs, dtype=np.intp))
+                    left_replicated = left_row.take(_xp.zeros(n_pairs, dtype=_xp.int64))
                 else:
                     left_replicated = left_row
                 grp_result = binary_constructive_owned(
@@ -4300,6 +4429,18 @@ def spatial_overlay_owned(
         _used_owned_dispatch = False
 
     if not _used_owned_dispatch:
+        # lyy.32: When owned dispatch failed and pairs were on device,
+        # materialise grouping arrays to host for the Shapely fallback path.
+        # This D->H transfer is acceptable because the Shapely path already
+        # materialises the full geometries to host below.
+        if _pairs_on_device:
+            left_indices = cp.asnumpy(d_left_indices)
+            right_indices = cp.asnumpy(d_right_indices)
+            group_starts = cp.asnumpy(d_group_starts)
+            group_ends = cp.asnumpy(d_group_ends)
+            unique_left = cp.asnumpy(d_unique_left)
+            right_subset_indices = cp.asnumpy(d_right_subset_indices)
+
         # Phase 24: Record fallback event for spatial overlay CPU path.
         record_fallback_event(
             surface=f"geopandas.spatial_overlay.{how}",
