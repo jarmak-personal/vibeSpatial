@@ -108,7 +108,7 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
 
     Returns True if ALL pairs can be handled by the SH kernel.  Returns False if
     any pair exceeds the kernel's capabilities, in which case the caller should
-    fall through to the CPU/Shapely path.
+    fall through to the GPU overlay pipeline.
 
     Uses vectorized NumPy operations on offset arrays to avoid per-row Python
     loops (VPAT001 compliance).
@@ -120,7 +120,7 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
 
     for side_label, side in (("right", right), ("left", left)):
         side._ensure_host_state()
-        for family, buf in side.families.items():
+        for buf in side.families.values():
             if buf.row_count == 0:
                 continue
             geom_offsets = buf.geometry_offsets
@@ -508,33 +508,29 @@ def _binary_constructive_gpu(
             # and a per-thread workspace limit of _MAX_CLIP_VERTS.  Check
             # whether the inputs are within the kernel's capabilities before
             # calling it.  When they are not (e.g. complex polygons with
-            # holes or many vertices), return None immediately to trigger
-            # CPU/Shapely fallback which handles all cases correctly.
-            #
-            # We also skip the overlay pipeline fall-through in this case:
-            # the overlay pipeline builds a full topology graph per pair
-            # (~15s per pair), making it impractical for many-vs-one
-            # workloads (e.g. 1000 vegetation polygons vs 1 corridor).
-            # CPU/Shapely handles this in 0.06s for 1000 pairs.
-            if not _sh_kernel_can_handle(left, right):
+            # holes or many vertices), skip SH and fall through to the full
+            # GPU overlay pipeline which handles arbitrarily complex polygons
+            # (multi-ring, holes, high vertex counts) via 8-stage topology
+            # reconstruction.
+            if _sh_kernel_can_handle(left, right):
+                try:
+                    from vibespatial.kernels.constructive.polygon_intersection import (
+                        polygon_intersection,
+                    )
+
+                    result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
+                    if result.row_count == left.row_count:
+                        return result
+                except Exception:
+                    logger.debug(
+                        "polygon_intersection GPU kernel failed, trying overlay pipeline",
+                        exc_info=True,
+                    )
+            else:
                 logger.debug(
                     "polygon_intersection SH kernel skipped: input exceeds "
                     "kernel capabilities (holes or vertex count), falling "
-                    "back to CPU/Shapely",
-                )
-                return None
-            try:
-                from vibespatial.kernels.constructive.polygon_intersection import (
-                    polygon_intersection,
-                )
-
-                result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
-                if result.row_count == left.row_count:
-                    return result
-            except Exception:
-                logger.debug(
-                    "polygon_intersection GPU kernel failed, trying overlay pipeline",
-                    exc_info=True,
+                    "through to GPU overlay pipeline",
                 )
         elif op == "difference":
             try:

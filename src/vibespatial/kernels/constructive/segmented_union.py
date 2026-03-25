@@ -372,7 +372,6 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
     rest of the reduction proceeds entirely on CPU.
     """
     from vibespatial.geometry.owned import from_shapely_geometries
-
     from vibespatial.overlay.gpu import overlay_union_owned
 
     # Split into single-row OwnedGeometryArrays for pairwise reduction.

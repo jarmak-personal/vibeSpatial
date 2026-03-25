@@ -18232,11 +18232,13 @@
         "_generate_candidates_gpu",
         "_generate_distance_pairs_gpu",
         "_generate_distance_pairs_gpu_device",
+        "_count_candidates_gpu",
         "_generate_candidates_gpu_device",
         "_generate_candidates_morton_range_gpu"
       ],
       "tokens": [
         "candidates",
+        "count",
         "device",
         "distance",
         "generate",

@@ -27,6 +27,7 @@ from .query_box import (  # noqa: F401
     _query_regular_grid_rect_box_index,
 )
 from .query_candidates import (  # noqa: F401
+    _count_candidates_gpu,
     _generate_candidates_gpu,
     _generate_candidates_gpu_device,
     _generate_candidates_gpu_multi,
@@ -425,27 +426,29 @@ def query_spatial_index(
     else:
         # For count-only queries, skip full predicate refinement and return
         # the candidate pair count directly (ADR-0005: zero D→H transfer).
-        # The candidate count is known from the GPU kernel output without
-        # materializing the full index arrays.
+        # Use the count-only GPU kernel that runs only the bbox overlap
+        # count pass without materializing pair arrays or running the
+        # scatter kernel.  This avoids the Morton range path which has
+        # higher overhead at moderate N*M products (100K x 10K) where
+        # the brute-force count kernel is 20-30x faster.
         if output_format == "count":
-            _n_product = query_bounds.shape[0] * tree_bounds.shape[0]
-            if _n_product >= 100_000_000:
-                device_cands = _generate_candidates_morton_range_gpu(flat_index, query_bounds)
-            else:
-                device_cands = None
-            if device_cands is None:
-                device_cands = _generate_candidates_gpu_device(query_bounds, tree_bounds)
-            if device_cands is not None:
-                count = int(device_cands.total_pairs)
+            gpu_count = _count_candidates_gpu(query_bounds, tree_bounds)
+            if gpu_count is not None:
                 execution = SpatialQueryExecution(
                     requested=ExecutionMode.AUTO, selected=ExecutionMode.GPU,
                     implementation="owned_gpu_spatial_query",
-                    reason="count-only query: GPU candidate count returned without D→H index transfer",
+                    reason="count-only query: GPU count kernel returned without pair materialization",
                 )
-                return (count, execution) if return_metadata else count
+                return (gpu_count, execution) if return_metadata else gpu_count
             # CPU fallback
             pairs = generate_bounds_pairs(query_owned, flat_index.geometry_array)
             count = int(pairs.count)
+            execution = SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                implementation="owned_gpu_spatial_query",
+                reason="count-only query: GPU unavailable, CPU bbox pair count",
+            )
             return (count, execution) if return_metadata else count
 
         # GPU candidate generation: Morton range O(N*log(M)+K) for large

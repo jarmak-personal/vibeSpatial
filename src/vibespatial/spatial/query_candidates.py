@@ -248,6 +248,7 @@ def _generate_candidates_gpu_multi_device(
         np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
     )
     device_counts = runtime.allocate((query_count,), np.int32)
+    device_offsets = None
     try:
         kernels = _spatial_query_kernels()
         ptr = runtime.pointer
@@ -325,6 +326,7 @@ def _generate_candidates_gpu_multi_device(
         runtime.free(device_query_bounds)
         runtime.free(device_tree_bounds)
         runtime.free(device_counts)
+        runtime.free(device_offsets)
 
 
 def _generate_candidates_gpu(
@@ -389,6 +391,82 @@ def _generate_distance_pairs_gpu_device(
     """
     expanded = _expand_bounds(query_bounds, distances)
     return _generate_candidates_gpu_device(expanded, tree_bounds)
+
+
+def _count_candidates_gpu(
+    query_bounds: np.ndarray,
+    tree_bounds: np.ndarray,
+) -> int | None:
+    """Count bbox overlap candidates on GPU without materializing pairs.
+
+    Runs only the count kernel + exclusive sum, skipping the scatter pass
+    entirely.  Returns the total candidate pair count, or None if GPU
+    dispatch is skipped.  This is the optimal path for ``output_format="count"``
+    queries where the caller needs only the total, not the pair arrays.
+    """
+    if not has_gpu_runtime():
+        return None
+
+    query_count = query_bounds.shape[0]
+    tree_count = tree_bounds.shape[0]
+
+    if query_count == 0 or tree_count == 0:
+        return 0
+
+    plan = plan_kernel_dispatch(
+        kernel_name="bbox_overlap_candidates",
+        kernel_class=KernelClass.COARSE,
+        row_count=query_count * tree_count,
+        gpu_available=True,
+    )
+    if plan.dispatch_decision is not DispatchDecision.GPU:
+        return None
+
+    runtime = get_cuda_runtime()
+    device_query_bounds = runtime.from_host(
+        np.ascontiguousarray(query_bounds, dtype=np.float64).ravel()
+    )
+    device_tree_bounds = runtime.from_host(
+        np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
+    )
+    device_counts = runtime.allocate((query_count,), np.int32)
+    try:
+        kernels = _spatial_query_kernels()
+        ptr = runtime.pointer
+
+        count_kernel = kernels["bbox_overlap_multi_count"]
+        count_params = (
+            (
+                ptr(device_query_bounds),
+                ptr(device_tree_bounds),
+                query_count,
+                tree_count,
+                ptr(device_counts),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+            ),
+        )
+        count_grid, count_block = runtime.launch_config(count_kernel, query_count)
+        runtime.launch(
+            count_kernel, grid=count_grid, block=count_block, params=count_params,
+        )
+
+        device_offsets = exclusive_sum(device_counts)
+        try:
+            total_pairs = count_scatter_total(runtime, device_counts, device_offsets)
+            return total_pairs
+        finally:
+            runtime.free(device_offsets)
+    finally:
+        # LIFO deallocation order for optimal pool coalescing
+        runtime.free(device_counts)
+        runtime.free(device_tree_bounds)
+        runtime.free(device_query_bounds)
 
 
 def _generate_candidates_gpu_device(
