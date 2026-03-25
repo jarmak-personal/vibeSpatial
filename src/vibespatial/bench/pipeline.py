@@ -26,7 +26,6 @@ from vibespatial.constructive.point import (
     point_owned_from_xy as _point_owned_from_xy,
 )
 from vibespatial.constructive.polygon import polygon_centroids_owned
-from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import DiagnosticKind, OwnedGeometryArray, from_shapely_geometries
 from vibespatial.io.arrow import (
@@ -42,11 +41,6 @@ from vibespatial.kernels.predicates.point_in_polygon import (
     point_in_polygon,
 )
 from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, union_all_gpu_owned
-from vibespatial.overlay.gpu import (
-    overlay_difference_owned,
-    overlay_intersection_owned,
-    spatial_overlay_owned,
-)
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
@@ -1151,18 +1145,8 @@ def _profile_zero_transfer_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# Overlay fallback helpers
+# Overlay helpers
 # ---------------------------------------------------------------------------
-
-
-def _owned_to_shapely_gdf(owned: OwnedGeometryArray) -> geopandas.GeoDataFrame:
-    """Convert OwnedGeometryArray to a plain Shapely-backed GeoDataFrame for CPU fallback."""
-    geoms = np.asarray(list(geoseries_from_owned(owned, crs="EPSG:4326")), dtype=object)
-    return geopandas.GeoDataFrame(
-        {"geometry": geopandas.GeoSeries(geoms, crs="EPSG:4326")},
-        geometry="geometry",
-        crs="EPSG:4326",
-    )
 
 
 def _empty_owned_placeholder() -> OwnedGeometryArray:
@@ -1190,96 +1174,36 @@ def _from_shapely_safe(geoms: list) -> OwnedGeometryArray:
     return from_shapely_geometries(filtered)
 
 
-
-def _overlay_intersection_with_fallback(
+def _overlay_via_public_api(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-) -> tuple[OwnedGeometryArray, bool]:
-    """GPU-first overlay intersection with geopandas.overlay fallback.
+    how: str = "intersection",
+) -> OwnedGeometryArray:
+    """Run overlay through the public geopandas.overlay() API.
 
-    Returns (result, fell_back) tuple.  For many-vs-1 patterns (e.g. 100K
-    veg x 1 corridor), uses vectorized Shapely intersection with spatial
-    pre-filter, avoiding per-group Python loop overhead.
+    Builds GeoDataFrames from owned arrays (preserving owned backing for GPU
+    dispatch), calls the public overlay, and extracts the result as an
+    OwnedGeometryArray.  All dispatch/fallback decisions are handled inside
+    the public API — no benchmark-specific overlay logic.
     """
-    try:
-        _polygon_only = (
-            set(left.families) <= {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
-            and set(right.families) <= {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
-        )
-        if left.row_count != right.row_count:
-            # N-vs-M (including many-vs-one): spatial_overlay_owned handles
-            # strategy detection (containment bypass, batched SH, per-group overlay).
-            return spatial_overlay_owned(left, right, how="intersection"), False
-        if _polygon_only:
-            return overlay_intersection_owned(left, right), False
-        raise NotImplementedError("GPU overlay requires polygon/multipolygon inputs")
-    except Exception as exc:
-        import warnings
-        warnings.warn(f"[overlay_intersection fallback] {type(exc).__name__}: {exc}", stacklevel=1)
-        left_gdf = _owned_to_shapely_gdf(left)
-        right_gdf = _owned_to_shapely_gdf(right)
-        # Apply make_valid to both sides — dissolve and buffer can produce
-        # ring-edge artifacts that cause TopologyException or
-        # IllegalArgumentException ("Scale factor must be non-zero") in GEOS.
-        left_gdf["geometry"] = shapely.make_valid(left_gdf.geometry.values)
-        right_gdf["geometry"] = shapely.make_valid(right_gdf.geometry.values)
-        try:
-            result_gdf = geopandas.overlay(left_gdf, right_gdf, how="intersection")
-            return _from_shapely_safe(list(result_gdf.geometry)), True
-        except Exception as overlay_exc:
-            warnings.warn(
-                f"[overlay_intersection fallback failed] {type(overlay_exc).__name__}: {overlay_exc}",
-                stacklevel=1,
-            )
-            # Last resort: vectorized shapely.intersection
-            left_arr = np.asarray(left_gdf.geometry.values, dtype=object)
-            right_arr = np.asarray(right_gdf.geometry.values, dtype=object)
-            if left_arr.shape != right_arr.shape:
-                # Broadcast single-row side
-                if len(right_arr) == 1:
-                    right_arr = np.full(len(left_arr), right_arr[0], dtype=object)
-                elif len(left_arr) == 1:
-                    left_arr = np.full(len(right_arr), left_arr[0], dtype=object)
-            try:
-                intersected = shapely.intersection(left_arr, right_arr)
-                keep = ~shapely.is_empty(intersected) & ~shapely.is_missing(intersected)
-                results = list(intersected[keep])
-            except Exception:
-                results = []
-            if not results:
-                return _from_shapely_safe([shapely.Point(0, 0)]), True
-            return _from_shapely_safe(results), True
-
-
-def _overlay_difference_with_fallback(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-) -> tuple[OwnedGeometryArray, bool]:
-    """GPU-first overlay difference with geopandas.overlay fallback."""
-    try:
-        _polygon_only = (
-            set(left.families) <= {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
-            and set(right.families) <= {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
-        )
-        if left.row_count != right.row_count:
-            _REPLICATE_MAX = 100
-            if (_polygon_only
-                    and min(left.row_count, right.row_count) == 1
-                    and max(left.row_count, right.row_count) <= _REPLICATE_MAX):
-                if right.row_count == 1 and left.row_count > 1:
-                    right = right.take(np.zeros(left.row_count, dtype=np.intp))
-                elif left.row_count == 1 and right.row_count > 1:
-                    left = left.take(np.zeros(right.row_count, dtype=np.intp))
-                return overlay_difference_owned(left, right), False
-            return spatial_overlay_owned(left, right, how="difference"), False
-        if _polygon_only:
-            return overlay_difference_owned(left, right), False
-        raise NotImplementedError("GPU overlay requires polygon/multipolygon inputs")
-    except Exception:
-        left_gdf = _owned_to_shapely_gdf(left)
-        right_gdf = _owned_to_shapely_gdf(right)
-        result_gdf = geopandas.overlay(left_gdf, right_gdf, how="difference")
-        return _from_shapely_safe(list(result_gdf.geometry)), True
+    left_gdf = geopandas.GeoDataFrame(
+        {"geometry": geoseries_from_owned(left, crs="EPSG:4326")},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    right_gdf = geopandas.GeoDataFrame(
+        {"geometry": geoseries_from_owned(right, crs="EPSG:4326")},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    result_gdf = geopandas.overlay(left_gdf, right_gdf, how=how, make_valid=True)
+    # Extract owned backing from result; fall back to Shapely conversion
+    result_owned = getattr(result_gdf.geometry.values, "_owned", None)
+    if result_owned is None and len(result_gdf) > 0:
+        result_owned = from_shapely_geometries(list(result_gdf.geometry))
+    if result_owned is None:
+        result_owned = _empty_owned_placeholder()
+    return result_owned
 
 
 # ---------------------------------------------------------------------------
@@ -1635,10 +1559,9 @@ def _profile_vegetation_corridor_pipeline(
             rows_in=veg_owned.row_count,
             detail="intersect vegetation polygons with dissolved corridor boundary",
         ) as stage:
-            clipped_veg, overlay_fell_back = _overlay_intersection_with_fallback(veg_owned, corridor_owned)
+            clipped_veg = _overlay_via_public_api(veg_owned, corridor_owned, how="intersection")
             stage.rows_out = clipped_veg.row_count
-            stage.device = "cpu" if overlay_fell_back else (_selected_runtime_from_history(clipped_veg) or "cpu")
-            stage.metadata["overlay_fallback"] = overlay_fell_back
+            stage.device = _selected_runtime_from_history(clipped_veg) or "cpu"
             _record_stage_overheads(stage, audit, memory, clipped_veg)
 
         # Release vegetation and corridor (clipped_veg is the working set now)
@@ -1997,13 +1920,11 @@ def _profile_parcel_zoning_pipeline(
             detail="compute polygon overlay intersection of clipped parcels with zoning boundaries",
         ) as stage:
             try:
-                overlaid, overlay_fell_back = _overlay_intersection_with_fallback(clipped_owned, zones_owned)
+                overlaid = _overlay_via_public_api(clipped_owned, zones_owned, how="intersection")
             except (IndexError, ValueError):
                 overlaid = _empty_owned_placeholder()
-                overlay_fell_back = True
             stage.rows_out = overlaid.row_count
-            stage.device = "cpu" if overlay_fell_back else (_selected_runtime_from_history(overlaid) or "cpu")
-            stage.metadata["overlay_fallback"] = overlay_fell_back
+            stage.device = _selected_runtime_from_history(overlaid) or "cpu"
             _record_stage_overheads(stage, audit, memory, overlaid)
 
         output = geopandas.GeoDataFrame(
@@ -2556,10 +2477,9 @@ def _profile_network_service_area_pipeline(
             detail="clip dissolved service area to administrative boundary via overlay intersection",
         ) as stage:
             dissolved_owned = from_shapely_geometries(list(dissolved.geometry))
-            clipped, overlay_fell_back = _overlay_intersection_with_fallback(dissolved_owned, admin_owned)
+            clipped = _overlay_via_public_api(dissolved_owned, admin_owned, how="intersection")
             stage.rows_out = clipped.row_count
-            stage.device = "cpu" if overlay_fell_back else (_selected_runtime_from_history(clipped) or "cpu")
-            stage.metadata["overlay_fallback"] = overlay_fell_back
+            stage.device = _selected_runtime_from_history(clipped) or "cpu"
             _record_stage_overheads(stage, audit, memory, clipped)
 
         output = geopandas.GeoDataFrame(
@@ -2800,13 +2720,11 @@ def _profile_site_suitability_pipeline(
             detail="subtract environmental exclusion zones from candidate parcels",
         ) as stage:
             try:
-                suitable, overlay_fell_back = _overlay_difference_with_fallback(clipped_owned, exclusions_owned)
+                suitable = _overlay_via_public_api(clipped_owned, exclusions_owned, how="difference")
             except (IndexError, ValueError):
                 suitable = clipped_owned
-                overlay_fell_back = True
             stage.rows_out = suitable.row_count
-            stage.device = "cpu" if overlay_fell_back else (_selected_runtime_from_history(suitable) or "cpu")
-            stage.metadata["overlay_fallback"] = overlay_fell_back
+            stage.device = _selected_runtime_from_history(suitable) or "cpu"
             _record_stage_overheads(stage, audit, memory, suitable)
 
         # Guard: if overlay difference produced 0 rows, use clipped_owned
