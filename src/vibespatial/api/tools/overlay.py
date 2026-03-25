@@ -151,6 +151,301 @@ def _assemble_intersection_attributes(idx1, idx2, df1, df2):
     return result
 
 
+def _many_vs_one_intersection_owned(
+    left_sub,
+    right_owned,
+    unique_right_idx,
+    *,
+    _has_device_indices=False,
+    d_idx2=None,
+):
+    """Optimized many-vs-one intersection using containment bypass + SH batch clip.
+
+    When many left geometries are paired against a single right geometry (the
+    many-vs-one pattern), the three-tier strategy from ``spatial_overlay_owned``
+    dramatically reduces work:
+
+    1. **Containment bypass**: left polygons fully inside the right polygon
+       are returned as-is with zero overlay computation.
+    2. **SH batch clip**: simple boundary-crossing polygons are clipped in a
+       single batched GPU kernel launch.
+    3. **Element-wise overlay**: only the remaining complex polygons go through
+       the full ``binary_constructive_owned`` pipeline.
+
+    Parameters
+    ----------
+    left_sub : OwnedGeometryArray
+        Left geometries gathered by spatial-join index pairs (N rows).
+    right_owned : OwnedGeometryArray
+        Original right geometry array (from the input GeoDataFrame).
+    unique_right_idx : int
+        The single right-side row index that all pairs map to.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Result geometries in the same row order as *left_sub* (1:1 with the
+        spatial-join pairs).  Contained rows are pass-through; remainder rows
+        are clipped or overlaid.
+    """
+    from vibespatial.constructive.binary_constructive import (
+        binary_constructive_owned,
+    )
+
+    n_pairs = left_sub.row_count
+    _pairwise_mode = (
+        ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
+    )
+
+    # Build the single-row right OGA for containment bypass / SH clip.
+    right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
+
+    # ---- Tier 1: Containment bypass (GPU vertex-in-polygon) ----
+    # Identifies left polygons fully inside the right polygon.
+    _contained_result = None
+    _remainder_mask = None
+
+    try:
+        import cupy as _cp_local
+    except ModuleNotFoundError:
+        _cp_local = None
+
+    if _cp_local is not None:
+        try:
+            from vibespatial.overlay.gpu import _containment_bypass_gpu
+
+            _contained_result, _remainder_mask = _containment_bypass_gpu(
+                left_sub, right_one, "intersection",
+            )
+        except Exception:
+            _contained_result = None
+            _remainder_mask = None
+
+    if _contained_result is not None and _remainder_mask is None:
+        # All polygons are fully contained -- return left_sub as-is.
+        record_dispatch_event(
+            surface="geopandas.overlay.intersection",
+            operation="many_vs_one_containment_bypass",
+            implementation="gpu_containment_bypass_all",
+            reason=(
+                f"many-vs-one: all {n_pairs} polygons fully inside "
+                "right polygon (containment bypass)"
+            ),
+        )
+        return _contained_result
+
+    # Determine which rows are contained vs remainder.
+    if _remainder_mask is not None:
+        # _remainder_mask is a CuPy bool array: True = needs overlay.
+        h_remainder_mask = _cp_local.asnumpy(_remainder_mask)
+        contained_indices = np.flatnonzero(~h_remainder_mask)
+        remainder_indices = np.flatnonzero(h_remainder_mask)
+    else:
+        # No containment bypass (no GPU or bypass failed) -- all need overlay.
+        contained_indices = np.array([], dtype=np.intp)
+        remainder_indices = np.arange(n_pairs, dtype=np.intp)
+
+    n_contained = len(contained_indices)
+    n_remainder = len(remainder_indices)
+
+    record_dispatch_event(
+        surface="geopandas.overlay.intersection",
+        operation="many_vs_one_containment_bypass",
+        implementation=(
+            "gpu_containment_bypass" if n_contained > 0 else "skipped"
+        ),
+        reason=(
+            f"many-vs-one: {n_contained}/{n_pairs} polygons fully inside "
+            f"right polygon, {n_remainder} need overlay"
+        ),
+    )
+
+    if n_remainder == 0:
+        # Should not happen (handled above), but be safe.
+        return _contained_result
+
+    # Subset left_sub to remainder rows only.
+    if _cp_local is not None:
+        d_remainder = _cp_local.asarray(remainder_indices).astype(_cp_local.int64)
+        left_remainder = left_sub.take(d_remainder)
+    else:
+        left_remainder = left_sub.take(remainder_indices)
+
+    # ---- Tier 2: SH batch clip for simple boundary-crossing polygons ----
+    sh_clip_result = None
+    sh_eligible_mask = None
+    sh_remainder_indices_local = None  # indices into left_remainder
+
+    if _cp_local is not None and left_remainder.row_count > 0:
+        try:
+            from vibespatial.overlay.gpu import (
+                _batched_sh_clip,
+                _classify_remainder_sh_eligible,
+                _is_clip_polygon_sh_eligible,
+            )
+
+            clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_one)
+            if clip_eligible:
+                sh_eligible_mask_arr, _complex_mask = _classify_remainder_sh_eligible(
+                    left_remainder, clip_vert_count,
+                )
+                n_sh = int(sh_eligible_mask_arr.sum())
+                if n_sh > 0:
+                    sh_clip_result = _batched_sh_clip(
+                        left_remainder, right_one, sh_eligible_mask_arr,
+                    )
+                    if sh_clip_result is not None:
+                        sh_eligible_mask = sh_eligible_mask_arr
+                        sh_remainder_indices_local = np.flatnonzero(
+                            ~sh_eligible_mask_arr
+                        )
+        except Exception:
+            sh_clip_result = None
+            sh_eligible_mask = None
+
+    # ---- Tier 3: Overlay for remaining boundary-crossing polygons ----
+    # After containment bypass and SH batch clip, only a small number of
+    # complex polygons remain (those crossing the boundary with holes or
+    # high vertex counts).  For this small remainder, vectorized Shapely
+    # intersection is faster than launching the full GPU overlay pipeline
+    # (which has high fixed cost per kernel invocation for segment
+    # extraction, split-event classification, and face reconstruction).
+    # The crossover to GPU overlay is beneficial when the remainder set
+    # is large (>= 1000 rows) AND the clip polygon is moderately complex.
+    _GPU_REMAINDER_THRESHOLD = 1000
+
+    def _shapely_remainder_intersection(left_rem_oga, right_one_oga):
+        """Intersect remainder polygons via vectorized Shapely (CPU)."""
+        from vibespatial.geometry.owned import from_shapely_geometries
+
+        left_geoms = np.asarray(left_rem_oga.to_shapely(), dtype=object)
+        right_geom = right_one_oga.to_shapely()[0]
+        if right_geom is None or shapely.is_empty(right_geom):
+            empty = from_shapely_geometries([shapely.Point()])
+            return empty.take(np.asarray([], dtype=np.int64))
+        right_arr = np.full(len(left_geoms), right_geom, dtype=object)
+        raw = shapely.intersection(left_geoms, right_arr)
+        record_fallback_event(
+            surface="geopandas.overlay.intersection",
+            reason=(
+                "many-vs-one remainder: vectorized Shapely intersection "
+                f"for {len(left_geoms)} boundary-crossing polygons"
+            ),
+            detail=f"rows={len(left_geoms)}",
+            requested=_pairwise_mode,
+            selected=ExecutionMode.CPU,
+            pipeline="_many_vs_one_intersection_owned",
+            d2h_transfer=True,
+        )
+        return from_shapely_geometries(list(raw))
+
+    def _gpu_remainder_intersection(left_rem_oga, right_one_oga):
+        """Intersect remainder polygons via GPU overlay pipeline."""
+        right_rep = right_one_oga.take(
+            np.zeros(left_rem_oga.row_count, dtype=np.intp),
+        )
+        return binary_constructive_owned(
+            "intersection", left_rem_oga, right_rep,
+            dispatch_mode=_pairwise_mode,
+        )
+
+    if sh_clip_result is not None and sh_eligible_mask is not None:
+        # Some polygons were SH-clipped; overlay only the complex remainder.
+        if len(sh_remainder_indices_local) > 0:
+            if _cp_local is not None:
+                d_complex = _cp_local.asarray(
+                    sh_remainder_indices_local,
+                ).astype(_cp_local.int64)
+                left_complex = left_remainder.take(d_complex)
+            else:
+                left_complex = left_remainder.take(sh_remainder_indices_local)
+            if left_complex.row_count < _GPU_REMAINDER_THRESHOLD:
+                complex_result = _shapely_remainder_intersection(
+                    left_complex, right_one,
+                )
+            else:
+                try:
+                    complex_result = _gpu_remainder_intersection(
+                        left_complex, right_one,
+                    )
+                except (NotImplementedError, Exception):
+                    complex_result = _shapely_remainder_intersection(
+                        left_complex, right_one,
+                    )
+        else:
+            complex_result = None
+    else:
+        # No SH clip -- overlay all remainder rows.
+        if left_remainder.row_count < _GPU_REMAINDER_THRESHOLD:
+            complex_result = _shapely_remainder_intersection(
+                left_remainder, right_one,
+            )
+        else:
+            try:
+                complex_result = _gpu_remainder_intersection(
+                    left_remainder, right_one,
+                )
+            except (NotImplementedError, Exception):
+                complex_result = _shapely_remainder_intersection(
+                    left_remainder, right_one,
+                )
+
+    # ---- Reassemble results in original pair order ----
+    # Build a result array with one geometry per pair in the original order.
+    # contained_indices -> left_sub geometry (identity)
+    # remainder with SH clip -> sh_clip_result (in SH eligible order)
+    # remainder without SH clip -> complex_result (in complex order)
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    parts_to_concat: list[OwnedGeometryArray] = []
+    # Track (global_indices, oga) for each chunk to enable correct ordering.
+    index_oga_pairs: list[tuple[np.ndarray, OwnedGeometryArray]] = []
+
+    if n_contained > 0 and _contained_result is not None:
+        index_oga_pairs.append((contained_indices, _contained_result))
+
+    if sh_clip_result is not None and sh_eligible_mask is not None:
+        # SH clip results correspond to the SH-eligible rows of left_remainder.
+        sh_eligible_local = np.flatnonzero(sh_eligible_mask)
+        sh_global = remainder_indices[sh_eligible_local]
+        index_oga_pairs.append((sh_global, sh_clip_result))
+
+        if complex_result is not None and sh_remainder_indices_local is not None:
+            complex_global = remainder_indices[sh_remainder_indices_local]
+            index_oga_pairs.append((complex_global, complex_result))
+    elif complex_result is not None:
+        index_oga_pairs.append((remainder_indices, complex_result))
+
+    if not index_oga_pairs:
+        # Edge case: no results at all.
+        from vibespatial.geometry.owned import from_shapely_geometries
+
+        empty = from_shapely_geometries([shapely.Point()])
+        return empty.take(np.asarray([], dtype=np.int64))
+
+    if len(index_oga_pairs) == 1:
+        # Only one chunk -- check if it covers all pairs in order.
+        indices, oga = index_oga_pairs[0]
+        if len(indices) == n_pairs and np.array_equal(
+            indices, np.arange(n_pairs),
+        ):
+            return oga
+
+    # Multiple chunks or non-trivial ordering: concat and reorder.
+    # Build a permutation array: result[perm[i]] = concat_result[i].
+    all_indices = np.concatenate([idx for idx, _ in index_oga_pairs])
+    all_ogas = [oga for _, oga in index_oga_pairs]
+    concat_result = OwnedGeometryArray.concat(all_ogas)
+
+    # all_indices[i] is the target position in the output for concat row i.
+    # We need: output[all_indices[i]] = concat_result[i]
+    # Equivalently: output = concat_result.take(inverse_perm)
+    # where inverse_perm[all_indices[i]] = i.
+    inverse_perm = np.empty(n_pairs, dtype=np.intp)
+    inverse_perm[all_indices] = np.arange(len(all_indices), dtype=np.intp)
+    return concat_result.take(inverse_perm)
+
+
 def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
     """Overlay Intersection operation used in overlay function.
 
@@ -161,28 +456,91 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
     """
     # ADR-0036 boundary: spatial index produces index arrays only.
     # Phase 2: pass owned arrays to request device-resident index pairs.
-    index_result = _intersecting_index_pairs(
-        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    #
+    # When neither side has owned backing yet (plain Shapely GeoDataFrames),
+    # force the Shapely STRtree path to avoid the GPU spatial index which
+    # incurs ~6s of CUDA kernel compilation on first use.  The owned
+    # coercion happens AFTER the spatial join (see below), where it
+    # benefits the overlay kernels (containment bypass, SH batch clip)
+    # without penalizing the join.
+    _force_strtree = (
+        left_owned is None
+        and right_owned is None
+        and has_gpu_runtime()
     )
-
-    # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
-    if isinstance(index_result, DeviceSpatialJoinResult):
-        d_idx1 = index_result.d_left_idx
-        d_idx2 = index_result.d_right_idx
-        # Host arrays for attribute assembly (pandas needs numpy).
-        idx1, idx2 = index_result.to_host()
-        _has_device_indices = True
-    else:
-        if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
-            idx1, idx2 = index_result
-        else:
-            idx1, idx2 = index_result
+    if _force_strtree:
+        df2.sindex._ensure_strtree()
+        _raw_idx = df2.sindex._tree.query(
+            np.asarray(df1.geometry.array, dtype=object),
+            predicate="intersects",
+        )
+        idx1 = np.asarray(_raw_idx[0], dtype=np.int32)
+        idx2 = np.asarray(_raw_idx[1], dtype=np.int32)
+        order = np.argsort(idx1, kind="stable")
+        idx1, idx2 = idx1[order], idx2[order]
         d_idx1, d_idx2 = None, None
         _has_device_indices = False
+    else:
+        index_result = _intersecting_index_pairs(
+            df1, df2, left_owned=left_owned, right_owned=right_owned,
+        )
+
+        # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
+        if isinstance(index_result, DeviceSpatialJoinResult):
+            d_idx1 = index_result.d_left_idx
+            d_idx2 = index_result.d_right_idx
+            # Host arrays for attribute assembly (pandas needs numpy).
+            idx1, idx2 = index_result.to_host()
+            _has_device_indices = True
+        else:
+            if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+                idx1, idx2 = index_result
+            else:
+                idx1, idx2 = index_result
+            d_idx1, d_idx2 = None, None
+            _has_device_indices = False
 
     used_owned = False
     # Create pairs of geometries in both dataframes to be intersected
     if idx1.size > 0 and idx2.size > 0:
+        # Many-vs-one owned coercion: when the spatial join reveals a
+        # many-vs-one pattern (all pairs reference the same single right
+        # row) and neither side has owned backing, coerce to
+        # OwnedGeometryArray to enable the GPU containment bypass and SH
+        # batch clip.  This coercion is restricted to the many-vs-one
+        # pattern to avoid changing behavior for general N-vs-M overlay.
+        _unique_right_pre = np.unique(idx2)
+        _is_many_vs_one_pre = (
+            _unique_right_pre.size == 1 and idx1.size > 1
+        )
+        if (
+            _is_many_vs_one_pre
+            and (left_owned is None or right_owned is None)
+            and has_gpu_runtime()
+        ):
+            _both_polygon = (
+                df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
+                and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+            )
+            if _both_polygon:
+                from vibespatial.geometry.owned import from_shapely_geometries
+
+                if left_owned is None:
+                    try:
+                        left_owned = from_shapely_geometries(
+                            list(df1.geometry),
+                        )
+                    except (NotImplementedError, ValueError):
+                        left_owned = None
+
+                if right_owned is None:
+                    try:
+                        right_owned = from_shapely_geometries(
+                            list(df2.geometry),
+                        )
+                    except (NotImplementedError, ValueError):
+                        right_owned = None
+
         # Owned-path dispatch: OwnedGeometryArray.take() operates at buffer
         # level (no Shapely materialization), then binary_constructive_owned
         # routes to GPU when available.  GeoSeries.take() breaks the DGA chain
@@ -211,35 +569,95 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
             _pairwise_mode = (
                 ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
             )
-            try:
-                result_owned = binary_constructive_owned(
-                    "intersection", left_sub, right_sub,
-                    dispatch_mode=_pairwise_mode,
-                )
-                intersections = GeoSeries(
-                    GeometryArray.from_owned(result_owned, crs=df1.crs),
-                )
-                used_owned = True
-            except NotImplementedError:
-                # Phase 24: Guard — binary_constructive_owned raised
-                # NotImplementedError (e.g. GeometryCollection results).
-                # Record fallback event so this is never silent.
-                record_fallback_event(
-                    surface="geopandas.overlay.intersection",
-                    reason="binary_constructive_owned raised NotImplementedError",
-                    detail=f"rows={len(idx1)}, falling back to Shapely intersection",
-                    requested=_pairwise_mode,
-                    selected=ExecutionMode.CPU,
-                    pipeline="_overlay_intersection",
-                    d2h_transfer=True,
-                )
-                # CPU-only mode: Shapely intersection on already-gathered subsets
-                left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
-                right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
-                intersections = GeoSeries(
-                    shapely.intersection(left_shapely, right_shapely),  # CPU-only mode
-                    crs=df1.crs,
-                )
+
+            # ---- Many-vs-one fast path ----
+            # When all spatial-join pairs reference the same single right
+            # row, route through the three-tier strategy (containment
+            # bypass -> SH batch clip -> element-wise overlay) instead of
+            # running the full overlay pipeline on every pair.  This is
+            # the dominant pattern for clipping (e.g. 10K vegetation
+            # polygons vs 1 dissolved corridor).
+            _unique_right = np.unique(idx2)
+            _is_many_vs_one = (
+                _unique_right.size == 1 and left_sub.row_count > 1
+            )
+
+            if _is_many_vs_one:
+                try:
+                    result_owned = _many_vs_one_intersection_owned(
+                        left_sub,
+                        right_owned,
+                        int(_unique_right[0]),
+                        _has_device_indices=_has_device_indices,
+                        d_idx2=d_idx2,
+                    )
+                    intersections = GeoSeries(
+                        GeometryArray.from_owned(result_owned, crs=df1.crs),
+                    )
+                    used_owned = True
+                except Exception:
+                    # Fall through to standard element-wise path.
+                    intersections = None
+
+            if intersections is None and not _is_many_vs_one:
+                # Standard element-wise path for N-vs-M patterns.
+                try:
+                    result_owned = binary_constructive_owned(
+                        "intersection", left_sub, right_sub,
+                        dispatch_mode=_pairwise_mode,
+                    )
+                    intersections = GeoSeries(
+                        GeometryArray.from_owned(result_owned, crs=df1.crs),
+                    )
+                    used_owned = True
+                except NotImplementedError:
+                    # Phase 24: Guard — binary_constructive_owned raised
+                    # NotImplementedError (e.g. GeometryCollection results).
+                    # Record fallback event so this is never silent.
+                    record_fallback_event(
+                        surface="geopandas.overlay.intersection",
+                        reason="binary_constructive_owned raised NotImplementedError",
+                        detail=f"rows={len(idx1)}, falling back to Shapely intersection",
+                        requested=_pairwise_mode,
+                        selected=ExecutionMode.CPU,
+                        pipeline="_overlay_intersection",
+                        d2h_transfer=True,
+                    )
+                    # CPU-only mode: Shapely intersection on already-gathered subsets
+                    left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
+                    right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
+                    intersections = GeoSeries(
+                        shapely.intersection(left_shapely, right_shapely),  # CPU-only mode
+                        crs=df1.crs,
+                    )
+
+            if intersections is None and _is_many_vs_one:
+                # Many-vs-one fast path failed -- fall back to element-wise.
+                try:
+                    result_owned = binary_constructive_owned(
+                        "intersection", left_sub, right_sub,
+                        dispatch_mode=_pairwise_mode,
+                    )
+                    intersections = GeoSeries(
+                        GeometryArray.from_owned(result_owned, crs=df1.crs),
+                    )
+                    used_owned = True
+                except NotImplementedError:
+                    record_fallback_event(
+                        surface="geopandas.overlay.intersection",
+                        reason="binary_constructive_owned raised NotImplementedError",
+                        detail=f"rows={len(idx1)}, falling back to Shapely intersection",
+                        requested=_pairwise_mode,
+                        selected=ExecutionMode.CPU,
+                        pipeline="_overlay_intersection",
+                        d2h_transfer=True,
+                    )
+                    left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
+                    right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
+                    intersections = GeoSeries(
+                        shapely.intersection(left_shapely, right_shapely),
+                        crs=df1.crs,
+                    )
 
         if intersections is None:
             # ADR-0036 boundary: geometry operations on geometry arrays.

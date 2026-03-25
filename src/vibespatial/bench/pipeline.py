@@ -1190,120 +1190,6 @@ def _from_shapely_safe(geoms: list) -> OwnedGeometryArray:
     return from_shapely_geometries(filtered)
 
 
-def _batched_clip_many_vs_one(
-    many: OwnedGeometryArray,
-    one: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """Batched GPU clip: intersect N polygons against 1 polygon in GPU-sized batches.
-
-    Bypasses spatial_overlay_owned (spatial-join overhead).  Splits the
-    many-side into batches for GPU pairwise overlay, replicates the
-    single-row side per batch, and collects results.
-
-    Note: the former _GPU_OVERLAY_MAX_ROWS=10K limit was removed in Phase 20;
-    batching here is retained for memory management of very large arrays.
-
-    ADR-0005: keeps intermediate OwnedGeometryArrays device-resident within
-    each batch; materializes to Shapely only for the final merge.
-
-    Phase 25 memory: releases GPU pool memory between batches to prevent
-    accumulation from overlay intermediates (split events, half-edge graphs,
-    face tables) that are dead after each batch completes.
-    """
-    # Phase 25: reduced from 4096 to 1024 to lower peak GPU memory.
-    # Each batch of N pairs creates O(N * segments_per_geom) segment
-    # intersections; 4096 pairs exceeded 8GB peak memory on 24GB GPUs.
-    _BATCH_SIZE = 1024
-    result_parts: list[object] = []
-    for start in range(0, many.row_count, _BATCH_SIZE):
-        end = min(start + _BATCH_SIZE, many.row_count)
-        batch_indices = np.arange(start, end, dtype=np.intp)
-        left_batch = many.take(batch_indices)
-        right_batch = one.take(np.zeros(len(batch_indices), dtype=np.intp))
-        try:
-            batch_result = overlay_intersection_owned(left_batch, right_batch)
-            batch_geoms = batch_result.to_shapely()
-            for g in batch_geoms:
-                if g is not None and not shapely.is_empty(g):
-                    result_parts.append(g)
-        except Exception:
-            left_geoms = np.asarray(left_batch.to_shapely(), dtype=object)
-            right_geom = one.to_shapely()[0]
-            if right_geom is not None and not shapely.is_empty(right_geom):
-                clipped = shapely.intersection(
-                    left_geoms,
-                    np.full(len(left_geoms), right_geom, dtype=object),
-                )
-                for g in clipped:
-                    if g is not None and not shapely.is_empty(g):
-                        result_parts.append(g)
-        # Phase 25 memory: free batch intermediates promptly.
-        del left_batch, right_batch
-        _free_gpu_pool_memory()
-    if not result_parts:
-        empty = from_shapely_geometries([shapely.Point(0, 0)])
-        return empty.take(np.asarray([], dtype=np.int64))
-    return from_shapely_geometries(result_parts)
-
-
-def _vectorized_many_vs_one_intersection(
-    many: OwnedGeometryArray,
-    one: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """Fast many-vs-one polygon intersection using spatial filter + vectorized Shapely.
-
-    Avoids per-group Python loop overhead by:
-    1. Spatial filter: use bbox overlap to find candidate pairs.
-    2. Vectorized Shapely intersection on all candidates at once.
-    3. Filter empty/null results and build OwnedGeometryArray.
-
-    This is ~25x faster than spatial_overlay_owned for the many-vs-one pattern
-    because it eliminates the per-group overhead (take, dispatch check, CPU
-    fallback, from_shapely_geometries per pair).
-    """
-    from vibespatial.spatial.indexing import generate_bounds_pairs
-
-    # Stage 1: spatial filter
-    pairs = generate_bounds_pairs(many, one)
-    if pairs.count == 0:
-        empty = from_shapely_geometries([shapely.Point(0, 0)])
-        return empty.take(np.asarray([], dtype=np.int64))
-
-    # Get the candidate left indices (right is always index 0)
-    left_indices = np.unique(pairs.left_indices)
-
-    # Stage 2: materialize to Shapely for vectorized intersection
-    many_geoms = np.asarray(many.to_shapely(), dtype=object)
-    one_geom = one.to_shapely()[0]
-
-    if one_geom is None or shapely.is_empty(one_geom):
-        empty = from_shapely_geometries([shapely.Point(0, 0)])
-        return empty.take(np.asarray([], dtype=np.int64))
-
-    # Validate inputs (dissolve/buffer can produce invalid geometries)
-    if not shapely.is_valid(one_geom):
-        one_geom = shapely.make_valid(one_geom)
-    invalid_mask = ~np.array(shapely.is_valid(many_geoms[left_indices]), dtype=bool)
-    if np.any(invalid_mask):
-        many_geoms[left_indices[invalid_mask]] = shapely.make_valid(
-            many_geoms[left_indices[invalid_mask]],
-        )
-
-    # Stage 3: vectorized intersection on candidates only
-    candidate_left = many_geoms[left_indices]
-    candidate_right = np.full(len(left_indices), one_geom, dtype=object)
-    intersected = shapely.intersection(candidate_left, candidate_right)
-
-    # Filter out empty and null results
-    keep = ~shapely.is_empty(intersected) & ~shapely.is_missing(intersected)
-    results = list(intersected[keep])
-
-    if not results:
-        empty = from_shapely_geometries([shapely.Point(0, 0)])
-        return empty.take(np.asarray([], dtype=np.int64))
-
-    return from_shapely_geometries(results)
-
 
 def _overlay_intersection_with_fallback(
     left: OwnedGeometryArray,
@@ -1321,17 +1207,8 @@ def _overlay_intersection_with_fallback(
             and set(right.families) <= {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
         )
         if left.row_count != right.row_count:
-            # Many-vs-one fast path: vectorized Shapely intersection with
-            # spatial pre-filter.  This is ~25x faster than per-group overlay
-            # because it eliminates per-pair Python overhead.
-            if (_polygon_only
-                    and min(left.row_count, right.row_count) == 1):
-                if right.row_count == 1 and left.row_count > 1:
-                    return _vectorized_many_vs_one_intersection(left, right), False
-                elif left.row_count == 1 and right.row_count > 1:
-                    return _vectorized_many_vs_one_intersection(right, left), False
-            # General N-vs-M: use spatial_overlay_owned which does
-            # spatial-join + per-group overlay.
+            # N-vs-M (including many-vs-one): spatial_overlay_owned handles
+            # strategy detection (containment bypass, batched SH, per-group overlay).
             return spatial_overlay_owned(left, right, how="intersection"), False
         if _polygon_only:
             return overlay_intersection_owned(left, right), False
