@@ -140,6 +140,99 @@ class TestSpatialOverlaySymmetricDifference:
         assert abs(total_area - expected.area) < 1e-10
 
 
+class TestBatchedSHClip:
+    """Tests for lyy.18: batched SH clip for boundary-crossing simple polygons."""
+
+    def test_boundary_crossing_simple_clip(self):
+        """Boundary-crossing polygons clipped by a simple rectangle should
+        produce correct results via the batched SH path."""
+        # 6 polygons: 2 fully inside, 2 crossing boundary, 2 outside.
+        left_geoms = [
+            box(2, 1, 3, 2),    # fully inside [1, 0, 5, 4]
+            box(3, 2, 4, 3),    # fully inside
+            box(0, 1, 2, 3),    # crosses left boundary at x=1
+            box(4, 1, 6, 3),    # crosses right boundary at x=5
+            box(-2, 0, -1, 1),  # fully outside (left)
+            box(6, 0, 7, 1),    # fully outside (right)
+        ]
+        right_geoms = [box(1, 0, 5, 4)]  # simple rectangle clip
+
+        left = from_shapely_geometries(left_geoms)
+        right = from_shapely_geometries(right_geoms)
+
+        result = spatial_overlay_owned(left, right, how="intersection")
+        result_geoms = _non_empty_geoms(result)
+
+        # Expected: 4 results (2 fully inside + 2 boundary-crossing clipped).
+        # The 2 outside polygons should not appear.
+        assert len(result_geoms) == 4
+
+        # Verify each result is a valid intersection.
+        clip = right_geoms[0]
+        expected_areas = []
+        for lg in left_geoms:
+            inter = lg.intersection(clip)
+            if not inter.is_empty:
+                expected_areas.append(inter.area)
+        result_areas = sorted(g.area for g in result_geoms)
+        expected_areas.sort()
+        assert len(result_areas) == len(expected_areas)
+        for ra, ea in zip(result_areas, expected_areas):
+            assert abs(ra - ea) < 1e-10, f"Area mismatch: {ra} vs {ea}"
+
+    def test_all_boundary_crossing_simple_clip(self):
+        """When all polygons cross the boundary, all go through SH clip."""
+        left_geoms = [
+            box(0, 0, 2, 2),   # crosses at x=1
+            box(4, 0, 6, 2),   # crosses at x=5
+            box(1, -1, 3, 1),  # crosses at y=0
+            box(2, 3, 4, 5),   # crosses at y=4
+        ]
+        right_geoms = [box(1, 0, 5, 4)]  # simple rectangle
+
+        left = from_shapely_geometries(left_geoms)
+        right = from_shapely_geometries(right_geoms)
+
+        result = spatial_overlay_owned(left, right, how="intersection")
+        result_geoms = _non_empty_geoms(result)
+
+        # All 4 should produce non-empty intersections.
+        assert len(result_geoms) == 4
+
+        clip = right_geoms[0]
+        for g in result_geoms:
+            assert clip.contains(g) or g.within(clip)
+
+    def test_complex_clip_skips_sh(self):
+        """When the clip polygon has holes, SH tier should be skipped
+        and results should still be correct via overlay pipeline."""
+        # Clip polygon with a hole.
+        outer = box(0, 0, 10, 10)
+        inner = box(3, 3, 7, 7)
+        clip_with_hole = outer.difference(inner)
+
+        left_geoms = [box(1, 1, 5, 5), box(5, 5, 9, 9)]
+        right_geoms = [clip_with_hole]
+
+        left = from_shapely_geometries(left_geoms)
+        right = from_shapely_geometries(right_geoms)
+
+        result = spatial_overlay_owned(left, right, how="intersection")
+        result_geoms = _non_empty_geoms(result)
+
+        # Verify correctness against Shapely.
+        expected = []
+        for lg in left_geoms:
+            inter = lg.intersection(clip_with_hole)
+            if not inter.is_empty:
+                expected.append(inter.area)
+        result_areas = sorted(g.area for g in result_geoms)
+        expected.sort()
+        assert len(result_areas) == len(expected)
+        for ra, ea in zip(result_areas, expected):
+            assert abs(ra - ea) < 1e-6, f"Area mismatch: {ra} vs {ea}"
+
+
 class TestSpatialOverlayEdgeCases:
     """Edge cases and error handling."""
 

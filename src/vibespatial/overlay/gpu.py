@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 
 import numpy as np
@@ -66,6 +67,8 @@ try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
+
+logger = logging.getLogger(__name__)
 
 
 _OVERLAY_SPLIT_KERNEL_SOURCE = """
@@ -1036,6 +1039,263 @@ request_nvrtc_warmup([
     ("overlay-batch-pip", _BATCH_POINT_IN_RING_KERNEL_SOURCE, _BATCH_POINT_IN_RING_KERNEL_NAMES),
 ])
 
+# ---------------------------------------------------------------------------
+# Containment bypass kernel (lyy.16)
+# ---------------------------------------------------------------------------
+# Tests whether each vertex of N candidate polygons lies inside a single
+# corridor polygon (or multipolygon).  One thread per vertex.  The corridor
+# geometry is stored in standard GeoArrow columnar layout.
+#
+# Output: per-candidate int32 (1 = all vertices inside, 0 = not).
+# ---------------------------------------------------------------------------
+
+_CONTAINMENT_BYPASS_KERNEL_SOURCE = r"""
+// Device helper: even-odd ring containment test.
+extern "C" __device__ inline bool _cb_ring_contains(
+    double px, double py,
+    const double* __restrict__ rx, const double* __restrict__ ry,
+    int coord_start, int coord_end
+) {
+    bool inside = false;
+    if ((coord_end - coord_start) < 2) return false;
+    for (int c = coord_start + 1; c < coord_end; ++c) {
+        const double ax = rx[c - 1];
+        const double ay = ry[c - 1];
+        const double bx = rx[c];
+        const double by = ry[c];
+        if (((ay > py) != (by > py))) {
+            const double denom = by - ay;
+            if (denom != 0.0) {
+                const double x_int = (bx - ax) * (py - ay) / denom + ax;
+                if (px < x_int) {
+                    inside = !inside;
+                }
+            }
+        }
+    }
+    return inside;
+}
+
+// Device helper: polygon containment via even-odd rule across all rings.
+extern "C" __device__ inline bool _cb_polygon_contains(
+    double px, double py,
+    const double* __restrict__ rx, const double* __restrict__ ry,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int polygon_row
+) {
+    const int ring_start = corr_geom_offsets[polygon_row];
+    const int ring_end = corr_geom_offsets[polygon_row + 1];
+    bool inside = false;
+    for (int ring = ring_start; ring < ring_end; ++ring) {
+        const int cs = corr_ring_offsets[ring];
+        const int ce = corr_ring_offsets[ring + 1];
+        bool ring_inside = _cb_ring_contains(px, py, rx, ry, cs, ce);
+        if (ring_inside) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+// Device helper: multipolygon containment (any part polygon contains).
+extern "C" __device__ inline bool _cb_multipolygon_contains(
+    double px, double py,
+    const double* __restrict__ rx, const double* __restrict__ ry,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_part_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int multipolygon_row
+) {
+    const int poly_start = corr_geom_offsets[multipolygon_row];
+    const int poly_end = corr_geom_offsets[multipolygon_row + 1];
+    for (int polygon = poly_start; polygon < poly_end; ++polygon) {
+        const int ring_start = corr_part_offsets[polygon];
+        const int ring_end = corr_part_offsets[polygon + 1];
+        bool inside = false;
+        for (int ring = ring_start; ring < ring_end; ++ring) {
+            const int cs = corr_ring_offsets[ring];
+            const int ce = corr_ring_offsets[ring + 1];
+            bool ring_inside = _cb_ring_contains(px, py, rx, ry, cs, ce);
+            if (ring_inside) {
+                inside = !inside;
+            }
+        }
+        if (inside) return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------
+// Thread-per-polygon kernel: test all vertices of each candidate
+// polygon against the corridor.  Output 1 if ALL vertices are
+// inside, 0 otherwise.  Reads vertices directly from the source
+// family coordinate buffers using offset indirection -- no vertex
+// scatter required.
+// -----------------------------------------------------------------
+
+// Polygon candidates vs. polygon corridor.
+extern "C" __global__ void
+containment_poly_vs_poly(
+    const int* __restrict__ cand_family_rows,
+    int n_candidates,
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_ring_offsets,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row,
+    int* __restrict__ out
+) {
+    const int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cid >= n_candidates) return;
+    const int frow = cand_family_rows[cid];
+    const int first_ring = left_geom_offsets[frow];
+    const int last_ring = left_geom_offsets[frow + 1];
+    const int coord_start = left_ring_offsets[first_ring];
+    const int coord_end = left_ring_offsets[last_ring];
+    for (int v = coord_start; v < coord_end; ++v) {
+        if (!_cb_polygon_contains(
+                left_x[v], left_y[v],
+                corr_x, corr_y,
+                corr_geom_offsets, corr_ring_offsets, corr_row)) {
+            out[cid] = 0;
+            return;
+        }
+    }
+    out[cid] = 1;
+}
+
+// Polygon candidates vs. multipolygon corridor.
+extern "C" __global__ void
+containment_poly_vs_mpoly(
+    const int* __restrict__ cand_family_rows,
+    int n_candidates,
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_ring_offsets,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_part_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row,
+    int* __restrict__ out
+) {
+    const int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cid >= n_candidates) return;
+    const int frow = cand_family_rows[cid];
+    const int first_ring = left_geom_offsets[frow];
+    const int last_ring = left_geom_offsets[frow + 1];
+    const int coord_start = left_ring_offsets[first_ring];
+    const int coord_end = left_ring_offsets[last_ring];
+    for (int v = coord_start; v < coord_end; ++v) {
+        if (!_cb_multipolygon_contains(
+                left_x[v], left_y[v],
+                corr_x, corr_y,
+                corr_geom_offsets, corr_part_offsets,
+                corr_ring_offsets, corr_row)) {
+            out[cid] = 0;
+            return;
+        }
+    }
+    out[cid] = 1;
+}
+
+// MultiPolygon candidates vs. polygon corridor.
+extern "C" __global__ void
+containment_mpoly_vs_poly(
+    const int* __restrict__ cand_family_rows,
+    int n_candidates,
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_part_offsets,
+    const int* __restrict__ left_ring_offsets,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row,
+    int* __restrict__ out
+) {
+    const int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cid >= n_candidates) return;
+    const int frow = cand_family_rows[cid];
+    const int first_part = left_geom_offsets[frow];
+    const int last_part = left_geom_offsets[frow + 1];
+    const int first_ring = left_part_offsets[first_part];
+    const int last_ring = left_part_offsets[last_part];
+    const int coord_start = left_ring_offsets[first_ring];
+    const int coord_end = left_ring_offsets[last_ring];
+    for (int v = coord_start; v < coord_end; ++v) {
+        if (!_cb_polygon_contains(
+                left_x[v], left_y[v],
+                corr_x, corr_y,
+                corr_geom_offsets, corr_ring_offsets, corr_row)) {
+            out[cid] = 0;
+            return;
+        }
+    }
+    out[cid] = 1;
+}
+
+// MultiPolygon candidates vs. multipolygon corridor.
+extern "C" __global__ void
+containment_mpoly_vs_mpoly(
+    const int* __restrict__ cand_family_rows,
+    int n_candidates,
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_part_offsets,
+    const int* __restrict__ left_ring_offsets,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_part_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row,
+    int* __restrict__ out
+) {
+    const int cid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cid >= n_candidates) return;
+    const int frow = cand_family_rows[cid];
+    const int first_part = left_geom_offsets[frow];
+    const int last_part = left_geom_offsets[frow + 1];
+    const int first_ring = left_part_offsets[first_part];
+    const int last_ring = left_part_offsets[last_part];
+    const int coord_start = left_ring_offsets[first_ring];
+    const int coord_end = left_ring_offsets[last_ring];
+    for (int v = coord_start; v < coord_end; ++v) {
+        if (!_cb_multipolygon_contains(
+                left_x[v], left_y[v],
+                corr_x, corr_y,
+                corr_geom_offsets, corr_part_offsets,
+                corr_ring_offsets, corr_row)) {
+            out[cid] = 0;
+            return;
+        }
+    }
+    out[cid] = 1;
+}
+"""
+
+_CONTAINMENT_BYPASS_KERNEL_NAMES = (
+    "containment_poly_vs_poly",
+    "containment_poly_vs_mpoly",
+    "containment_mpoly_vs_poly",
+    "containment_mpoly_vs_mpoly",
+)
+
+request_nvrtc_warmup([
+    ("overlay-containment-bypass", _CONTAINMENT_BYPASS_KERNEL_SOURCE, _CONTAINMENT_BYPASS_KERNEL_NAMES),
+])
+
 
 def _overlay_split_kernels():
     return compile_kernel_group("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES)
@@ -1055,6 +1315,569 @@ def _overlay_face_assembly_kernels():
 
 def _batch_pip_kernels():
     return compile_kernel_group("overlay-batch-pip", _BATCH_POINT_IN_RING_KERNEL_SOURCE, _BATCH_POINT_IN_RING_KERNEL_NAMES)
+
+
+def _containment_bypass_kernels():
+    return compile_kernel_group(
+        "overlay-containment-bypass",
+        _CONTAINMENT_BYPASS_KERNEL_SOURCE,
+        _CONTAINMENT_BYPASS_KERNEL_NAMES,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Containment bypass: GPU-accelerated identification of polygons fully
+# inside the corridor, skipping overlay computation for those polygons.
+# ---------------------------------------------------------------------------
+
+
+def _containment_bypass_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    how: str,
+) -> tuple[OwnedGeometryArray | None, cp.ndarray | None]:
+    """Identify polygons in *left* that are fully contained in *right* (1 row).
+
+    Returns ``(contained, remainder_mask)`` where:
+
+    - *contained* is an OGA of polygons that are fully inside the corridor
+      (their intersection with the corridor IS themselves), or ``None`` if
+      no polygons are fully contained.
+    - *remainder_mask* is a device boolean mask (True = needs overlay) over
+      the rows of *left*, or ``None`` if all polygons are contained.
+
+    Algorithm
+    ---------
+    Stage 1: GPU bounds containment (cheapest filter).
+        Compare per-polygon MBR against corridor MBR -- CuPy element-wise.
+    Stage 2: GPU vertex-in-polygon (correct containment).
+        For polygons passing the bbox test, check that ALL vertices are
+        inside the corridor via thread-per-polygon NVRTC kernels that read
+        vertices directly from the source family buffers (no scatter).
+    Stage 3: Route results.
+        Fully-contained polygons pass through; remainder needs overlay.
+    """
+    if cp is None:
+        return None, None
+
+    runtime = get_cuda_runtime()
+    n_left = left.row_count
+
+    # Right must be a single row.
+    if right.row_count != 1:
+        return None, None
+
+    # Only applies to intersection.
+    if how != "intersection":
+        return None, None
+
+    # Ensure both sides are on device.
+    from vibespatial.runtime.residency import TransferTrigger
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="containment_bypass: move left to device",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="containment_bypass: move right to device",
+    )
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+
+    # Determine corridor geometry family (Polygon or MultiPolygon).
+    corr_family = None
+    corr_buffer = None
+    for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        if family in right_state.families:
+            d_buf = right_state.families[family]
+            if int(d_buf.geometry_offsets.size) >= 2:
+                corr_family = family
+                corr_buffer = d_buf
+                break
+
+    if corr_family is None:
+        # Corridor is not polygonal -- cannot do containment bypass.
+        return None, None
+
+    # ------------------------------------------------------------------
+    # Stage 1: GPU bounds containment
+    # ------------------------------------------------------------------
+    from vibespatial.kernels.core.geometry_analysis import (
+        _compute_geometry_bounds_gpu_impl,
+    )
+
+    # Ensure left has per-row device bounds.
+    if left_state.row_bounds is None:
+        _compute_geometry_bounds_gpu_impl(left, compute_type="double")
+    d_left_bounds = left_state.row_bounds  # shape (n_left, 4), fp64
+
+    # Compute corridor bounds (single row).
+    if right_state.row_bounds is None:
+        _compute_geometry_bounds_gpu_impl(right, compute_type="double")
+    d_right_bounds = right_state.row_bounds  # shape (1, 4), fp64
+
+    # CuPy element-wise bbox containment (Tier 2).
+    # Extract corridor bounds as device scalars -- stays on device.
+    d_corr_bounds = cp.asarray(d_right_bounds).ravel()
+    d_lb = cp.asarray(d_left_bounds).reshape(n_left, 4)
+    d_bbox_inside = (
+        (d_lb[:, 0] >= d_corr_bounds[0])
+        & (d_lb[:, 1] >= d_corr_bounds[1])
+        & (d_lb[:, 2] <= d_corr_bounds[2])
+        & (d_lb[:, 3] <= d_corr_bounds[3])
+    )
+
+    n_bbox_candidates = int(cp.sum(d_bbox_inside))
+    if n_bbox_candidates == 0:
+        d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
+        return None, d_remainder_mask
+
+    # ------------------------------------------------------------------
+    # Stage 2: GPU vertex-in-polygon (thread-per-polygon)
+    # ------------------------------------------------------------------
+    d_bbox_indices = cp.flatnonzero(d_bbox_inside).astype(cp.int64)
+
+    # Gather tags and family_row_offsets for bbox-candidate rows.
+    d_tags = cp.asarray(left_state.tags)
+    d_fro = cp.asarray(left_state.family_row_offsets)
+    d_cand_tags = d_tags[d_bbox_indices]
+    d_cand_fro = d_fro[d_bbox_indices]
+
+    # Per-candidate result: 1 = fully inside, 0 = not.
+    d_cand_result = cp.zeros(n_bbox_candidates, dtype=cp.int32)
+
+    kernels = _containment_bypass_kernels()
+    ptr = runtime.pointer
+    corr_row = 0  # corridor is always row 0 of its family buffer
+
+    # Process each left polygonal family against the corridor.
+    for left_family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        if left_family not in left_state.families:
+            continue
+        tag_val = FAMILY_TAGS[left_family]
+        d_family_mask = d_cand_tags == tag_val
+        n_family = int(cp.sum(d_family_mask))
+        if n_family == 0:
+            continue
+
+        d_family_rows = d_cand_fro[d_family_mask].astype(cp.int32)
+        left_buf = left_state.families[left_family]
+
+        # Select the kernel variant based on left family x corridor family.
+        if left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.POLYGON:
+            kernel = kernels["containment_poly_vs_poly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    corr_row,
+                    ptr(d_cand_result),  # temporary -- write to family slice below
+                ),
+                (
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
+                ),
+            )
+        elif left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.MULTIPOLYGON:
+            kernel = kernels["containment_poly_vs_mpoly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.part_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    corr_row,
+                    ptr(d_cand_result),
+                ),
+                (
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        elif left_family is GeometryFamily.MULTIPOLYGON and corr_family is GeometryFamily.POLYGON:
+            kernel = kernels["containment_mpoly_vs_poly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.part_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    corr_row,
+                    ptr(d_cand_result),
+                ),
+                (
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                ),
+            )
+        else:
+            # multipolygon vs multipolygon
+            kernel = kernels["containment_mpoly_vs_mpoly"]
+            params = (
+                (
+                    ptr(d_family_rows),
+                    n_family,
+                    ptr(left_buf.x),
+                    ptr(left_buf.y),
+                    ptr(left_buf.geometry_offsets),
+                    ptr(left_buf.part_offsets),
+                    ptr(left_buf.ring_offsets),
+                    ptr(corr_buffer.x),
+                    ptr(corr_buffer.y),
+                    ptr(corr_buffer.geometry_offsets),
+                    ptr(corr_buffer.part_offsets),
+                    ptr(corr_buffer.ring_offsets),
+                    corr_row,
+                    ptr(d_cand_result),
+                ),
+                (
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
+                ),
+            )
+
+        # The kernel writes to a flat output buffer indexed by thread id
+        # (0..n_family-1).  We need to write to the correct positions in
+        # d_cand_result.  Allocate a temporary per-family output, launch,
+        # then scatter back.
+        d_family_out = cp.empty(n_family, dtype=cp.int32)
+        # Fix params to point to family-local output.
+        params_vals = list(params[0])
+        params_vals[-1] = ptr(d_family_out)
+        params = (tuple(params_vals), params[1])
+
+        grid, block = runtime.launch_config(kernel, n_family)
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+
+        # Scatter family results back to candidate-wide array.
+        d_family_cand_positions = cp.flatnonzero(d_family_mask)
+        runtime.synchronize()
+        d_cand_result[d_family_cand_positions] = d_family_out
+
+    # ------------------------------------------------------------------
+    # Stage 3: Route results
+    # ------------------------------------------------------------------
+    d_cand_all_inside = d_cand_result == 1
+    n_contained = int(cp.sum(d_cand_all_inside))
+
+    if n_contained == 0:
+        d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
+        return None, d_remainder_mask
+
+    # Map contained candidates back to left-array row indices.
+    d_contained_cand_indices = cp.flatnonzero(d_cand_all_inside)
+    d_contained_rows = d_bbox_indices[d_contained_cand_indices].astype(cp.int64)
+
+    # Build contained OGA via device_take (zero-copy).
+    contained_oga = left.take(d_contained_rows)
+
+    # Build remainder mask.
+    d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
+    d_remainder_mask[d_contained_rows] = False
+
+    n_remainder = int(cp.sum(d_remainder_mask))
+
+    record_dispatch_event(
+        surface="geopandas.spatial_overlay",
+        operation="containment_bypass",
+        implementation="gpu_nvrtc_containment_bypass",
+        reason=(
+            f"lyy.16 containment bypass: {n_contained}/{n_left} polygons fully "
+            f"inside corridor, {n_remainder} need overlay"
+        ),
+        detail=(
+            f"bbox_candidates={n_bbox_candidates}, "
+            f"contained={n_contained}, remainder={n_remainder}"
+        ),
+        selected=ExecutionMode.GPU,
+    )
+
+    if n_remainder == 0:
+        return contained_oga, None
+
+    return contained_oga, d_remainder_mask
+
+
+# ---------------------------------------------------------------------------
+# Batched Sutherland-Hodgman clip for boundary-crossing simple polygons
+# (lyy.18)
+# ---------------------------------------------------------------------------
+# After containment bypass identifies remainder polygons (boundary-crossing),
+# this tier batches all SH-eligible remainder polygons into a SINGLE
+# polygon_intersection kernel launch, instead of N separate overlay pipeline
+# invocations.
+#
+# SH eligibility of the CLIP polygon (the corridor / right side):
+#   - Must be Polygon family (not MultiPolygon)
+#   - Must have exactly 1 ring (no holes)
+#   - Exterior ring vertex count recorded for workspace budget
+#
+# SH eligibility of each SUBJECT polygon (left side):
+#   - Must be Polygon family (not MultiPolygon)
+#   - Must have exactly 1 ring (no holes)
+#   - Exterior ring vertex count + clip vertex count <= MAX_CLIP_VERTS
+#
+# Non-eligible remainder polygons are routed to the per-group overlay.
+# ---------------------------------------------------------------------------
+
+
+def _is_clip_polygon_sh_eligible(
+    right: OwnedGeometryArray,
+) -> tuple[bool, int]:
+    """Check whether the single clip polygon is SH-eligible.
+
+    Returns ``(eligible, clip_vert_count)`` where *clip_vert_count* is the
+    number of exterior ring vertices (excluding the closing duplicate) when
+    eligible, or 0 when not eligible.
+
+    The check uses host-side metadata (offset arrays) which are small O(1)
+    for a single-row geometry.  No device transfer of coordinate data.
+    """
+    from vibespatial.kernels.constructive.polygon_intersection import _MAX_CLIP_VERTS
+
+    if right.row_count != 1:
+        return False, 0
+
+    # Must be Polygon family (not MultiPolygon).
+    right._ensure_host_state()
+    if GeometryFamily.POLYGON not in right.families:
+        return False, 0
+    poly_buf = right.families[GeometryFamily.POLYGON]
+    if poly_buf.row_count == 0:
+        return False, 0
+
+    # Check single ring (no holes).
+    geom_offsets = poly_buf.geometry_offsets
+    ring_count = int(geom_offsets[1] - geom_offsets[0])
+    if ring_count != 1:
+        logger.debug(
+            "SH batch clip: clip polygon has %d rings (holes) -- skipping SH tier",
+            ring_count,
+        )
+        return False, 0
+
+    # Count exterior ring vertices.
+    ring_offsets = poly_buf.ring_offsets
+    first_ring = int(geom_offsets[0])
+    n_verts = int(ring_offsets[first_ring + 1] - ring_offsets[first_ring])
+
+    # The kernel strips the closing vertex if last == first, so effective
+    # vertex count is n_verts - 1 for closed rings.  But this is a budget
+    # check -- be conservative and use the raw count.
+    if n_verts > _MAX_CLIP_VERTS:
+        logger.debug(
+            "SH batch clip: clip polygon has %d vertices (limit %d) -- skipping SH tier",
+            n_verts, _MAX_CLIP_VERTS,
+        )
+        return False, 0
+
+    return True, n_verts
+
+
+def _classify_remainder_sh_eligible(
+    left: OwnedGeometryArray,
+    clip_vert_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Classify remainder polygons into SH-eligible and complex sets.
+
+    Returns ``(sh_eligible_mask, complex_mask)`` as boolean numpy arrays
+    over the rows of *left*.  Uses host-side offset arrays (small metadata)
+    to classify without touching coordinate data.
+
+    A remainder polygon is SH-eligible if:
+    - It is Polygon family (not MultiPolygon)
+    - It has exactly 1 ring (no holes)
+    - Its exterior ring vertex count + clip_vert_count <= MAX_CLIP_VERTS
+
+    Parameters
+    ----------
+    left : OwnedGeometryArray
+        The remainder polygons (already filtered to boundary-crossing only).
+    clip_vert_count : int
+        Vertex count of the clip polygon's exterior ring.
+    """
+    from vibespatial.kernels.constructive.polygon_intersection import _MAX_CLIP_VERTS
+
+    n = left.row_count
+    sh_eligible = np.zeros(n, dtype=bool)
+
+    left._ensure_host_state()
+
+    # Only Polygon family rows can be SH-eligible (not MultiPolygon).
+    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    is_poly = left.tags == poly_tag
+
+    if not np.any(is_poly):
+        return sh_eligible, ~sh_eligible
+
+    poly_buf = left.families.get(GeometryFamily.POLYGON)
+    if poly_buf is None or poly_buf.row_count == 0:
+        return sh_eligible, ~sh_eligible
+
+    geom_offsets = poly_buf.geometry_offsets
+    ring_offsets = poly_buf.ring_offsets
+
+    # Vectorized: compute rings_per_row and vertex_count for all poly rows.
+    rings_per_row = np.diff(geom_offsets)  # shape (poly_buf.row_count,)
+    single_ring = rings_per_row == 1
+
+    # For single-ring polygons, compute exterior ring vertex count.
+    first_ring_idx = geom_offsets[:-1]
+    ext_verts = np.where(
+        single_ring,
+        ring_offsets[first_ring_idx + 1] - ring_offsets[first_ring_idx],
+        _MAX_CLIP_VERTS + 1,  # sentinel: exceeds limit
+    )
+
+    # SH-eligible: single ring AND combined verts fit in workspace.
+    poly_sh_ok = single_ring & (ext_verts + clip_vert_count <= _MAX_CLIP_VERTS)
+
+    # Map back from family-row space to global-row space.
+    poly_indices = np.flatnonzero(is_poly)
+    fro = left.family_row_offsets[poly_indices]  # family row offset per global row
+    sh_eligible[poly_indices] = poly_sh_ok[fro]
+
+    # Also require the row to be valid.
+    sh_eligible &= left.validity
+
+    return sh_eligible, ~sh_eligible
+
+
+def _batched_sh_clip(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    sh_eligible_mask: np.ndarray,
+) -> OwnedGeometryArray | None:
+    """Batch SH-eligible remainder polygons into a single polygon_intersection call.
+
+    Replicates *right* (the clip polygon, 1 row) to match the count of
+    SH-eligible *left* rows, then calls ``polygon_intersection`` for all
+    pairs in a single kernel launch.
+
+    Returns the clipped result OwnedGeometryArray, or ``None`` if the
+    kernel fails.
+
+    Parameters
+    ----------
+    left : OwnedGeometryArray
+        The remainder polygons (boundary-crossing).
+    right : OwnedGeometryArray
+        The single clip polygon (SH-eligible, verified by caller).
+    sh_eligible_mask : np.ndarray
+        Boolean mask over *left* rows, True = SH-eligible.
+    """
+    from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
+
+    n_eligible = int(sh_eligible_mask.sum())
+    if n_eligible == 0:
+        return None
+
+    # Subset left to SH-eligible rows only.
+    # Use device indices when available for zero-copy take().
+    if cp is not None:
+        d_eligible_indices = cp.asarray(np.flatnonzero(sh_eligible_mask)).astype(cp.int64)
+        left_eligible = left.take(d_eligible_indices)
+    else:
+        h_eligible_indices = np.flatnonzero(sh_eligible_mask).astype(np.int64)
+        left_eligible = left.take(h_eligible_indices)
+
+    # Replicate right (1 row) to match n_eligible rows.
+    if cp is not None:
+        d_rep_indices = cp.zeros(n_eligible, dtype=cp.int64)
+        right_replicated = right.take(d_rep_indices)
+    else:
+        h_rep_indices = np.zeros(n_eligible, dtype=np.int64)
+        right_replicated = right.take(h_rep_indices)
+
+    # Single batched kernel launch for all SH-eligible pairs.
+    result = polygon_intersection(
+        left_eligible,
+        right_replicated,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    record_dispatch_event(
+        surface="geopandas.spatial_overlay",
+        operation="batched_sh_clip",
+        implementation="gpu_polygon_intersection_batched",
+        reason=(
+            f"lyy.18 batched SH clip: {n_eligible} boundary-crossing polygons "
+            f"clipped in single kernel launch"
+        ),
+        detail=f"sh_eligible={n_eligible}, total_remainder={left.row_count}",
+        selected=ExecutionMode.GPU,
+    )
+
+    return result
+
+
+def _combine_bypass_results(
+    containment_result: OwnedGeometryArray | None,
+    sh_clip_result: OwnedGeometryArray | None,
+    overlay_result: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Combine containment-bypass, SH-clip, and overlay results into one OGA.
+
+    Order: containment-bypass, SH-clip, overlay remainder.  If only one part
+    is non-empty, returns it directly (no copy).
+    """
+    parts: list[OwnedGeometryArray] = []
+    if containment_result is not None:
+        parts.append(containment_result)
+    if sh_clip_result is not None:
+        parts.append(sh_clip_result)
+    if overlay_result.row_count > 0:
+        parts.append(overlay_result)
+    if len(parts) > 1:
+        return OwnedGeometryArray.concat(parts)
+    elif len(parts) == 1:
+        return parts[0]
+    # No parts -- return the (empty) overlay result as-is.
+    return overlay_result
 
 
 def _batch_point_in_ring_gpu(
@@ -4275,9 +5098,9 @@ def spatial_overlay_owned(
         right_subset_indices = right_remap[right_indices]
 
     # Strategy detection: detect workload shape and select the overlay strategy.
-    # Currently all strategies fall through to the existing per-group path.
-    # Future beads (lyy.16, lyy.18, lyy.21) will add strategy-specific
-    # GPU implementations (containment bypass, batched SH clip, batched overlay).
+    # broadcast_right + intersection: containment bypass (lyy.16) + batched SH
+    # clip (lyy.18) reduce work before per-group overlay.  Other strategies
+    # fall through to the existing per-group path.
     from vibespatial.overlay.strategies import select_overlay_strategy
 
     strategy = select_overlay_strategy(
@@ -4298,12 +5121,192 @@ def spatial_overlay_owned(
         selected=ExecutionMode.GPU if cp is not None else ExecutionMode.CPU,
     )
 
-    # For now, all strategies use the existing per-group path.
-    # Future beads will add strategy-specific implementations:
-    if strategy.name == "broadcast_right":
-        # TODO(lyy.16): containment bypass
-        # TODO(lyy.18): batched SH clip
-        pass  # fall through to per_group
+    # Strategy-specific implementations.
+    # lyy.16: containment bypass for broadcast_right intersection.
+    # lyy.18: batched SH clip for boundary-crossing simple polygons.
+    _containment_result: OwnedGeometryArray | None = None
+    _containment_remainder_mask: cp.ndarray | None = None  # type: ignore[name-defined]
+    _sh_clip_result: OwnedGeometryArray | None = None
+
+    if strategy.name == "broadcast_right" and how == "intersection" and cp is not None:
+        try:
+            _containment_result, _containment_remainder_mask = (
+                _containment_bypass_gpu(left_subset, right_subset, how)
+            )
+        except Exception:
+            # If containment bypass fails, fall through to per-group.
+            logger.debug(
+                "lyy.16 containment bypass failed, falling through to overlay",
+                exc_info=True,
+            )
+            _containment_result = None
+            _containment_remainder_mask = None
+
+        if _containment_remainder_mask is not None:
+            # Some polygons need overlay — filter left_subset to remainder only.
+            # Rebuild group structures for the remainder polygons.
+            d_remainder_indices = cp.flatnonzero(_containment_remainder_mask).astype(cp.int64)
+            left_subset = left_subset.take(d_remainder_indices)
+
+            # Rebuild pair grouping: filter pairs to only reference remainder rows.
+            # The remainder_mask is over the original left_subset row space.
+            # We need to remap unique_left, group_starts, group_ends to the
+            # filtered left_subset.
+            if _pairs_on_device:
+                # d_left_indices are in original left row space.  d_unique_left
+                # maps to left_subset row space (0..len(unique_left)-1).
+                # We need to filter to rows where remainder_mask is True.
+                #
+                # Approach: rebuild grouping from scratch for the filtered pairs.
+                # Only pairs whose left_subset row is in the remainder survive.
+
+                # Build a mapping: old left_subset row -> new left_subset row.
+                # _containment_remainder_mask is a bool mask over old left_subset.
+                d_old_to_new = cp.full(int(_containment_remainder_mask.size), -1, dtype=cp.int64)
+                d_old_to_new[d_remainder_indices] = cp.arange(int(d_remainder_indices.size), dtype=cp.int64)
+
+                # Filter groups: each group corresponds to one unique_left row
+                # in the old left_subset.  If that row is in the remainder, keep
+                # the group; remap its grp_idx to the new left_subset space.
+                # unique_left[grp_idx] is the original left row; grp_idx is
+                # the old left_subset row.
+                d_grp_mask = _containment_remainder_mask[
+                    cp.arange(len(group_starts), dtype=cp.int64)
+                ]
+                new_group_indices = cp.flatnonzero(d_grp_mask)
+                h_new_group_indices = cp.asnumpy(new_group_indices)
+
+                group_starts = group_starts[h_new_group_indices]
+                group_ends = group_ends[h_new_group_indices]
+                unique_left = unique_left[new_group_indices]
+
+                # right_subset_indices are unchanged — they reference right_subset
+                # rows which are not affected by left filtering.
+            else:
+                # CPU path: rebuild grouping.
+                h_remainder_mask = cp.asnumpy(_containment_remainder_mask) if cp is not None else _containment_remainder_mask
+                old_to_new = np.full(len(h_remainder_mask), -1, dtype=np.int64)
+                h_remainder_indices = np.flatnonzero(h_remainder_mask)
+                old_to_new[h_remainder_indices] = np.arange(len(h_remainder_indices), dtype=np.int64)
+
+                grp_mask = h_remainder_mask[np.arange(len(group_starts))]
+                new_grp_indices = np.flatnonzero(grp_mask)
+                group_starts = group_starts[new_grp_indices]
+                group_ends = group_ends[new_grp_indices]
+                unique_left = unique_left[new_grp_indices]
+
+        elif _containment_result is not None and _containment_remainder_mask is None:
+            # ALL polygons are fully contained — no overlay needed.
+            # Skip the entire per-group processing.
+            result = _containment_result
+            result.runtime_history.append(
+                RuntimeSelection(
+                    requested=requested,
+                    selected=ExecutionMode.GPU,
+                    reason=(
+                        f"spatial_overlay {how}: all {left_subset.row_count} "
+                        "polygons fully inside corridor (containment bypass)"
+                    ),
+                )
+            )
+            return result
+
+        # lyy.18: Batched SH clip for boundary-crossing simple polygons.
+        # After containment bypass, left_subset contains only remainder
+        # polygons.  Check if the clip polygon (right_subset) is SH-eligible.
+        # If so, batch-clip all SH-eligible remainder polygons in a single
+        # polygon_intersection kernel launch, further reducing the number of
+        # polygons that fall through to the expensive per-group overlay.
+        if left_subset.row_count > 0:
+            try:
+                clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_subset)
+                if clip_eligible:
+                    sh_eligible_mask, _complex_mask = _classify_remainder_sh_eligible(
+                        left_subset, clip_vert_count,
+                    )
+                    n_sh = int(sh_eligible_mask.sum())
+
+                    if n_sh > 0:
+                        _sh_clip_result = _batched_sh_clip(
+                            left_subset, right_subset, sh_eligible_mask,
+                        )
+
+                        if _sh_clip_result is not None and n_sh < left_subset.row_count:
+                            # Some polygons were SH-clipped; filter left_subset
+                            # and grouping structures to only the complex remainder.
+                            d_complex_indices = cp.asarray(
+                                np.flatnonzero(~sh_eligible_mask)
+                            ).astype(cp.int64)
+                            left_subset = left_subset.take(d_complex_indices)
+
+                            # Rebuild grouping for the reduced left_subset.
+                            if _pairs_on_device:
+                                # complex_mask[i] is True for old left_subset
+                                # rows that are NOT SH-eligible.  Rebuild the
+                                # old-to-new mapping for group filtering.
+                                d_old_to_new_sh = cp.full(
+                                    len(sh_eligible_mask), -1, dtype=cp.int64,
+                                )
+                                d_old_to_new_sh[d_complex_indices] = cp.arange(
+                                    int(d_complex_indices.size), dtype=cp.int64,
+                                )
+                                d_sh_grp_mask = cp.asarray(~sh_eligible_mask)[
+                                    cp.arange(len(group_starts), dtype=cp.int64)
+                                ]
+                                new_grp_sh = cp.flatnonzero(d_sh_grp_mask)
+                                h_new_grp_sh = cp.asnumpy(new_grp_sh)
+                                group_starts = group_starts[h_new_grp_sh]
+                                group_ends = group_ends[h_new_grp_sh]
+                                unique_left = unique_left[new_grp_sh]
+                            else:
+                                h_complex_mask = ~sh_eligible_mask
+                                old_to_new_sh = np.full(
+                                    len(sh_eligible_mask), -1, dtype=np.int64,
+                                )
+                                h_complex_indices = np.flatnonzero(h_complex_mask)
+                                old_to_new_sh[h_complex_indices] = np.arange(
+                                    len(h_complex_indices), dtype=np.int64,
+                                )
+                                grp_mask_sh = h_complex_mask[
+                                    np.arange(len(group_starts))
+                                ]
+                                new_grp_sh = np.flatnonzero(grp_mask_sh)
+                                group_starts = group_starts[new_grp_sh]
+                                group_ends = group_ends[new_grp_sh]
+                                unique_left = unique_left[new_grp_sh]
+
+                        elif _sh_clip_result is not None:
+                            # ALL remainder polygons were SH-clipped.
+                            # No overlay needed for any polygon.
+                            left_subset = left_subset.take(
+                                np.asarray([], dtype=np.int64)
+                            )
+                            group_starts = group_starts[:0]
+                            group_ends = group_ends[:0]
+                            if _pairs_on_device:
+                                unique_left = unique_left[:0]
+                            else:
+                                unique_left = unique_left[:0]
+
+                    else:
+                        logger.debug(
+                            "lyy.18 SH batch clip: clip polygon eligible but "
+                            "no remainder polygons qualify (all have holes or "
+                            "too many vertices)"
+                        )
+                else:
+                    logger.debug(
+                        "lyy.18 SH batch clip: clip polygon not SH-eligible "
+                        "(holes or >%d vertices) -- skipping SH tier",
+                        64,
+                    )
+            except Exception:
+                logger.debug(
+                    "lyy.18 SH batch clip failed, falling through to overlay",
+                    exc_info=True,
+                )
+                _sh_clip_result = None
+
     elif strategy.name == "broadcast_left":
         pass  # fall through to per_group
 
@@ -4424,6 +5427,12 @@ def spatial_overlay_owned(
             result = result.take(np.asarray([], dtype=np.int64))
         else:
             result = result_owned.take(keep_indices)
+
+        # lyy.16 + lyy.18: Combine bypass results with overlay results.
+        result = _combine_bypass_results(
+            _containment_result, _sh_clip_result, result,
+        )
+
         _used_owned_dispatch = True
     except (NotImplementedError, ImportError, ValueError):
         _used_owned_dispatch = False
@@ -4621,6 +5630,11 @@ def spatial_overlay_owned(
             result = result.take(np.asarray([], dtype=np.int64))
         else:
             result = from_shapely_geometries(valid_geoms)
+
+        # lyy.16 + lyy.18: Combine bypass results with Shapely fallback results.
+        result = _combine_bypass_results(
+            _containment_result, _sh_clip_result, result,
+        )
 
     result.runtime_history.append(
         RuntimeSelection(
