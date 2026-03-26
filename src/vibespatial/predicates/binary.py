@@ -30,6 +30,7 @@ from vibespatial.runtime.precision import (
 )
 from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
+from vibespatial.runtime.workload import WorkloadShape
 
 from .point_relations import (
     POINT_LOCATION_BOUNDARY,
@@ -137,28 +138,36 @@ def _coerce_right(
     values: object | PredicateInput,
     *,
     expected_len: int,
-) -> tuple[np.ndarray | object | None, bool, OwnedGeometryArray | None]:
+) -> tuple[np.ndarray | object | None, bool, OwnedGeometryArray | None, WorkloadShape]:
     if isinstance(values, OwnedGeometryArray):
+        if values.row_count == 1 and expected_len > 1:
+            return None, False, values, WorkloadShape.BROADCAST_RIGHT
         if values.row_count != expected_len:
             raise ValueError(
                 f"binary predicate inputs must be aligned; got {expected_len} and {values.row_count} rows"
             )
-        return None, False, values
+        return None, False, values, WorkloadShape.PAIRWISE
     if isinstance(values, np.ndarray):
         if values.ndim == 0:
-            return values.item(), True, None
+            return values.item(), True, None, WorkloadShape.SCALAR_RIGHT
+        if len(values) == 1 and expected_len > 1:
+            owned = from_shapely_geometries(list(values))
+            return None, False, owned, WorkloadShape.BROADCAST_RIGHT
         if len(values) != expected_len:
             raise ValueError(
                 f"binary predicate inputs must be aligned; got {expected_len} and {len(values)} rows"
             )
-        return np.asarray(values, dtype=object), False, None
+        return np.asarray(values, dtype=object), False, None, WorkloadShape.PAIRWISE
     if isinstance(values, (list, tuple)):
+        if len(values) == 1 and expected_len > 1:
+            owned = from_shapely_geometries(list(values))
+            return None, False, owned, WorkloadShape.BROADCAST_RIGHT
         if len(values) != expected_len:
             raise ValueError(
                 f"binary predicate inputs must be aligned; got {expected_len} and {len(values)} rows"
             )
-        return np.asarray(values, dtype=object), False, None
-    return values, True, None
+        return np.asarray(values, dtype=object), False, None, WorkloadShape.PAIRWISE
+    return values, True, None, WorkloadShape.SCALAR_RIGHT
 
 
 def _ensure_registered_kernel(
@@ -207,6 +216,42 @@ def _owned_from_values(
         return owned
     assert isinstance(values, np.ndarray)
     return from_shapely_geometries(values.tolist())
+
+
+def _broadcast_right_owned(
+    right_1row: OwnedGeometryArray,
+    n: int,
+) -> OwnedGeometryArray:
+    """Build an N-row OwnedGeometryArray that broadcasts a single right geometry.
+
+    The returned array has N-length ``validity``, ``tags``, and
+    ``family_row_offsets`` arrays (all constant, pointing to row 0 of the
+    single right geometry).  The underlying family coordinate buffers are
+    *shared* with *right_1row* -- no duplication of geometry data.
+
+    Memory cost: 6 bytes/row (1B bool + 1B int8 + 4B int32).  At 1M rows
+    this is 6 MB -- negligible compared to N-copying the geometry.
+
+    These synthetic arrays are NOT cached on the OwnedGeometryArray because
+    the broadcast length *n* depends on the left array and may differ
+    between calls.
+    """
+    assert right_1row.row_count == 1
+    src_validity = right_1row.validity
+    src_tags = right_1row.tags
+    src_offsets = right_1row.family_row_offsets
+
+    validity = np.full(n, src_validity[0], dtype=bool)
+    tags = np.full(n, src_tags[0], dtype=np.int8)
+    family_row_offsets = np.full(n, src_offsets[0], dtype=np.int32)
+
+    return OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=right_1row.families,
+        residency=right_1row.residency,
+    )
 
 
 def _materialize_shapely(values: np.ndarray | None, owned: OwnedGeometryArray | None) -> np.ndarray:
@@ -835,11 +880,26 @@ def evaluate_binary_predicate(
 
     left_values, left_owned = _coerce_array(left, arg_name="left")
     row_count = left_owned.row_count if left_owned is not None else len(left_values)
-    right_values, scalar_right, right_owned = _coerce_right(right, expected_len=row_count)
+    right_values, scalar_right, right_owned, workload_shape = _coerce_right(right, expected_len=row_count)
     requested_mode = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     normalized_null_behavior = (
         null_behavior if isinstance(null_behavior, NullBehavior) else NullBehavior(null_behavior)
     )
+
+    # --- Scalar-right promotion to broadcast-right ---
+    # When the right operand is a scalar geometry (not wrapped in an array),
+    # wrap it into a 1-row OwnedGeometryArray so the GPU path can handle it
+    # via synthetic indirection arrays.  A None scalar becomes a null-validity
+    # 1-row owned array.
+    _original_scalar_value = right_values  # stash for CPU fallback path
+    if workload_shape is WorkloadShape.SCALAR_RIGHT:
+        # Wrap the scalar (which may be None) into a 1-row owned array
+        right_owned = from_shapely_geometries([right_values])
+        right_values = None
+
+    # For broadcast-right, the right_owned is a 1-row array.  We will build
+    # the broadcast N-row view lazily when the GPU path needs it.
+    _is_broadcast = workload_shape in (WorkloadShape.BROADCAST_RIGHT, WorkloadShape.SCALAR_RIGHT)
 
     runtime_selection = _ensure_registered_kernel(predicate, requested_mode, row_count)
     if left_values is None:
@@ -847,8 +907,11 @@ def evaluate_binary_predicate(
         left_missing = ~left_owned.validity
     else:
         left_missing = shapely.is_missing(left_values)
-    if scalar_right:
-        right_missing = np.full(row_count, bool(right_values is None), dtype=bool)
+    if _is_broadcast:
+        # For broadcast/scalar-right, null status is uniform from the single row
+        assert right_owned is not None
+        right_is_null = not right_owned.validity[0]
+        right_missing = np.full(row_count, right_is_null, dtype=bool)
     elif right_values is None:
         assert right_owned is not None
         right_missing = ~right_owned.validity
@@ -862,63 +925,79 @@ def evaluate_binary_predicate(
     # vs polygon), we skip the expensive from_shapely_geometries entirely
     # and use shapely.bounds() for coarse filtering instead.
     left_gpu_owned: OwnedGeometryArray | None = left_owned
-    right_gpu_owned: OwnedGeometryArray | None = right_owned if not scalar_right else None
+    right_gpu_owned: OwnedGeometryArray | None = None
 
-    if (
-        runtime_selection.selected is ExecutionMode.GPU
-        and not scalar_right
-    ):
+    if runtime_selection.selected is ExecutionMode.GPU:
         # Point-region fast path requires owned arrays -- build them now
         # only for this check.
         left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
-        right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=scalar_right)
-        fast_path_result = _evaluate_gpu_point_region_fast_path(
-            predicate,
-            left=left_gpu_owned,
-            right=right_gpu_owned,
-            null_mask=null_mask,
-            null_behavior=normalized_null_behavior,
-            runtime_selection=runtime_selection,
-            precision=precision,
-        )
-        if fast_path_result is not None:
-            _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
-            return fast_path_result
+        if _is_broadcast and right_owned is not None:
+            # Build broadcast N-row view from the 1-row right owned array
+            right_gpu_owned = _broadcast_right_owned(right_owned, row_count)
+        elif not scalar_right:
+            right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=False)
 
-        # --- Fused device-resident pipeline for non-point pairs ---
-        # Keeps bounds, coarse filter, and candidate extraction on device.
-        # Only downloads the small candidate-count result at the end.
-        if (
-            not scalar_right
-            and left_gpu_owned is not None
-            and right_gpu_owned is not None
-            and not null_mask.any()
-        ):
-            fused = _fused_gpu_binary_predicate(predicate, left_gpu_owned, right_gpu_owned)
-            if fused is not None:
-                precision_plan = select_precision_plan(
-                    runtime_selection=runtime_selection,
-                    kernel_class=KernelClass.PREDICATE,
-                    requested=precision,
-                )
-                robustness_plan = select_robustness_plan(
-                    kernel_class=KernelClass.PREDICATE,
-                    precision_plan=precision_plan,
+        if left_gpu_owned is not None and right_gpu_owned is not None:
+            fast_path_result = _evaluate_gpu_point_region_fast_path(
+                predicate,
+                left=left_gpu_owned,
+                right=right_gpu_owned,
+                null_mask=null_mask,
+                null_behavior=normalized_null_behavior,
+                runtime_selection=runtime_selection,
+                precision=precision,
+            )
+            if fast_path_result is not None:
+                record_dispatch_event(
+                    surface="vibespatial.predicates.binary",
+                    operation=predicate,
+                    requested=requested_mode,
+                    selected=runtime_selection.selected,
+                    implementation="gpu_point_region_fast_path",
+                    reason=runtime_selection.reason,
+                    detail=f"workload_shape={workload_shape.value}",
                 )
                 _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
-                result_values = np.empty(row_count, dtype=object)
-                result_values[:] = fused
-                return BinaryPredicateResult(
-                    predicate=predicate,
-                    values=result_values,
-                    row_count=row_count,
-                    candidate_rows=np.flatnonzero(fused).astype(np.int32, copy=False),
-                    coarse_true_rows=np.empty(0, dtype=np.int32),
-                    coarse_false_rows=np.empty(0, dtype=np.int32),
-                    runtime_selection=runtime_selection,
-                    precision_plan=precision_plan,
-                    robustness_plan=robustness_plan,
-                )
+                return fast_path_result
+
+            # --- Fused device-resident pipeline for non-point pairs ---
+            # Keeps bounds, coarse filter, and candidate extraction on device.
+            # Only downloads the small candidate-count result at the end.
+            if not null_mask.any():
+                fused = _fused_gpu_binary_predicate(predicate, left_gpu_owned, right_gpu_owned)
+                if fused is not None:
+                    precision_plan = select_precision_plan(
+                        runtime_selection=runtime_selection,
+                        kernel_class=KernelClass.PREDICATE,
+                        requested=precision,
+                    )
+                    robustness_plan = select_robustness_plan(
+                        kernel_class=KernelClass.PREDICATE,
+                        precision_plan=precision_plan,
+                    )
+                    record_dispatch_event(
+                        surface="vibespatial.predicates.binary",
+                        operation=predicate,
+                        requested=requested_mode,
+                        selected=runtime_selection.selected,
+                        implementation="fused_gpu_binary_predicate",
+                        reason=runtime_selection.reason,
+                        detail=f"workload_shape={workload_shape.value}",
+                    )
+                    _record_runtime_selection(runtime_selection, (left_gpu_owned, right_gpu_owned))
+                    result_values = np.empty(row_count, dtype=object)
+                    result_values[:] = fused
+                    return BinaryPredicateResult(
+                        predicate=predicate,
+                        values=result_values,
+                        row_count=row_count,
+                        candidate_rows=np.flatnonzero(fused).astype(np.int32, copy=False),
+                        coarse_true_rows=np.empty(0, dtype=np.int32),
+                        coarse_false_rows=np.empty(0, dtype=np.int32),
+                        runtime_selection=runtime_selection,
+                        precision_plan=precision_plan,
+                        robustness_plan=robustness_plan,
+                    )
 
     # --- Bounds computation ---
     # Prefer shapely.bounds() (~1ms vectorized C) over compute_geometry_bounds(owned)
@@ -933,9 +1012,10 @@ def evaluate_binary_predicate(
         assert left_owned is not None
         left_bounds = compute_geometry_bounds(left_owned, dispatch_mode=ExecutionMode.CPU)
 
-    if scalar_right:
-        scalar_bounds = np.asarray(shapely.bounds(right_values), dtype=np.float64)
-        right_bounds = np.broadcast_to(scalar_bounds, (row_count, 4)).copy()
+    if _is_broadcast and right_owned is not None:
+        # Broadcast: compute bounds from the 1-row right, then broadcast to N rows
+        broadcast_bounds = compute_geometry_bounds(right_owned, dispatch_mode=ExecutionMode.CPU)
+        right_bounds = np.broadcast_to(broadcast_bounds, (row_count, 4)).copy()
     elif right_values is not None:
         right_bounds = np.asarray(shapely.bounds(right_values), dtype=np.float64)
     elif right_gpu_owned is not None:
@@ -972,37 +1052,24 @@ def evaluate_binary_predicate(
 
     # --- GPU refine viability check ---
     # Only build owned arrays and check candidate-pair support if GPU is
-    # selected.  If we already built them for the fast-path above, reuse.
-    # Skip owned creation entirely when scalar_right is True since GPU
-    # refine does not support scalar right-hand geometries.
+    # selected.  For broadcast/scalar-right, the broadcast owned array was
+    # already built above.
     if runtime_selection.selected is ExecutionMode.GPU:
-        gpu_reason = _unsupported_gpu_reason(predicate, scalar_right=scalar_right)
-        if scalar_right:
-            # GPU refine never supports scalar right -- skip owned conversion
-            if requested_mode is ExecutionMode.GPU:
-                raise NotImplementedError(gpu_reason)
-            runtime_selection = RuntimeSelection(
-                requested=requested_mode,
-                selected=ExecutionMode.CPU,
-                reason=f"{gpu_reason}; using explicit CPU fallback",
-            )
-        else:
-            # Ensure owned arrays exist for candidate-pair check
-            if left_gpu_owned is None or left_gpu_owned is left_owned:
-                left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
-            if right_gpu_owned is None or right_gpu_owned is right_owned:
-                right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=scalar_right)
+        gpu_reason = _unsupported_gpu_reason(predicate, scalar_right=False)
+        # Ensure owned arrays exist for candidate-pair check
+        if left_gpu_owned is None or left_gpu_owned is left_owned:
+            left_gpu_owned = _owned_from_values(left_values, owned=left_owned, scalar=False)
+        if right_gpu_owned is None:
+            if _is_broadcast and right_owned is not None:
+                right_gpu_owned = _broadcast_right_owned(right_owned, row_count)
+            elif not scalar_right:
+                right_gpu_owned = _owned_from_values(right_values, owned=right_owned, scalar=False)
 
+        if left_gpu_owned is not None and right_gpu_owned is not None:
             _cand = np.flatnonzero(candidate_mask & ~null_mask).astype(np.int32, copy=False)
-            _point_ok = (
-                left_gpu_owned is not None
-                and right_gpu_owned is not None
-                and _candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand)
-            )
+            _point_ok = _candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand)
             _de9im_ok = (
                 not _point_ok
-                and left_gpu_owned is not None
-                and right_gpu_owned is not None
                 and _de9im_candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand, predicate)
             )
             if not _point_ok and not _de9im_ok:
@@ -1013,6 +1080,15 @@ def evaluate_binary_predicate(
                     selected=ExecutionMode.CPU,
                     reason=f"{gpu_reason}; using explicit CPU fallback",
                 )
+        else:
+            # Cannot build owned arrays -- fall back to CPU
+            if requested_mode is ExecutionMode.GPU:
+                raise NotImplementedError(gpu_reason)
+            runtime_selection = RuntimeSelection(
+                requested=requested_mode,
+                selected=ExecutionMode.CPU,
+                reason=f"{gpu_reason}; using explicit CPU fallback",
+            )
 
     _record_runtime_selection(runtime_selection, (left_gpu_owned or left_owned, right_gpu_owned or right_owned))
     precision_plan = select_precision_plan(
@@ -1066,9 +1142,16 @@ def evaluate_binary_predicate(
                     predicate, left_gpu_owned, right_gpu_owned, de9im_rows,
                 )
                 result[de9im_rows] = de9im_values
-        elif scalar_right:
+        elif _is_broadcast:
+            # CPU fallback for scalar-right or broadcast-right: recover
+            # the single right geometry and broadcast against left candidates.
             left_shapely = _materialize_shapely(left_values, left_owned)
-            exact_values = getattr(shapely, spec.shapely_op)(left_shapely[candidate_rows], right_values, **kwargs)
+            if _original_scalar_value is not None:
+                scalar_geom = _original_scalar_value
+            else:
+                assert right_owned is not None
+                scalar_geom = right_owned.to_shapely()[0]
+            exact_values = getattr(shapely, spec.shapely_op)(left_shapely[candidate_rows], scalar_geom, **kwargs)
             result[candidate_rows] = _result_to_bool_array(exact_values, candidate_rows.size)
         else:
             left_shapely = _materialize_shapely(left_values, left_owned)
@@ -1079,6 +1162,19 @@ def evaluate_binary_predicate(
                 **kwargs,
             )
             result[candidate_rows] = _result_to_bool_array(exact_values, candidate_rows.size)
+
+    record_dispatch_event(
+        surface="vibespatial.predicates.binary",
+        operation=predicate,
+        requested=requested_mode,
+        selected=runtime_selection.selected,
+        implementation=(
+            "gpu_binary_predicate" if runtime_selection.selected is ExecutionMode.GPU
+            else "cpu_shapely_fallback"
+        ),
+        reason=runtime_selection.reason,
+        detail=f"workload_shape={workload_shape.value}",
+    )
 
     return BinaryPredicateResult(
         predicate=predicate,
