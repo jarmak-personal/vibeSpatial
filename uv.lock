@@ -2298,15 +2298,15 @@ wheels = [
 
 [[package]]
 name = "vibeproj"
-version = "0.1.5"
+version = "0.1.9"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "pyproj" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d6/c5/20d2cec69b238fb70f4a7e2895667fc7a59b2da90c497bd54fb06e83b463/vibeproj-0.1.5.tar.gz", hash = "sha256:976572f6f0b5c6e20ae414402a1fd740d411f2ee1eef2945aa0d3c3caa40889a", size = 112575, upload-time = "2026-03-19T16:41:20.618Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/df/6b/fcfa3f21e6dc4c727a1ea6a7e2198ebe9a9e9c416e32de819f58daf387a5/vibeproj-0.1.9.tar.gz", hash = "sha256:615c76d9c51974b26829f8f907e1cd7388fb17aa2abf72636b57484097a855c9", size = 175179, upload-time = "2026-03-26T02:20:39.564Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/45/b929dad9fbdc901bd6192ba4c2ed92942e140434333fb64525a89e8aaad1/vibeproj-0.1.5-py3-none-any.whl", hash = "sha256:7f6ba9512f577bc42f6e770b1b2bb375108843b7840b2d511add02acf0c23bd7", size = 79326, upload-time = "2026-03-19T16:41:18.824Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/c8/fdb505ce080496174babd19b8b17f24b2006b08ce79c8aef91b9020f14af/vibeproj-0.1.9-py3-none-any.whl", hash = "sha256:85c0a2777e7aeb1c2e0d043e434b7b5808164c0c074176261fe56a7a5efa26f3", size = 87921, upload-time = "2026-03-26T02:20:38.07Z" },
 ]
 
 [[package]]

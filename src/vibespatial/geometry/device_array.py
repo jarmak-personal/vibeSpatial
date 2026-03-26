@@ -262,10 +262,10 @@ class DeviceGeometryArray(ExtensionArray):
             x_center = (minx + maxx) / 2
             y_center = (miny + maxy) / 2
         else:
-            from pyproj import Transformer
+            from vibeproj import Transformer as _VibeTransformer
 
-            transformer = Transformer.from_crs(self._crs, "EPSG:4326", always_xy=True)
-            minx, miny, maxx, maxy = transformer.transform_bounds(
+            t = _VibeTransformer.from_crs(self._crs, "EPSG:4326", always_xy=True)
+            minx, miny, maxx, maxy = t.transform_bounds(
                 minx, miny, maxx, maxy
             )
             y_center = (miny + maxy) / 2

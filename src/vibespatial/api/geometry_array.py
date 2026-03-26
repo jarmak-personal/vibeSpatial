@@ -73,29 +73,20 @@ if HAS_PYPROJ:
 
     TransformerFromCRS = lru_cache(Transformer.from_crs)
 
-try:
-    from vibeproj import Transformer as _VibeTransformer
-
-    _HAS_VIBEPROJ = True
-except ModuleNotFoundError:
-    _HAS_VIBEPROJ = False
+from vibeproj import Transformer as _VibeTransformer
 
 
 def _make_transform_func(src_crs, dst_crs):
     """Return a coordinate transform callable, preferring vibeProj over pyproj."""
-    if _HAS_VIBEPROJ:
-        try:
-            t = _VibeTransformer.from_crs(src_crs, dst_crs, always_xy=True)
+    try:
+        t = _VibeTransformer.from_crs(src_crs, dst_crs, always_xy=True)
 
-            def _vibe_transform(x, y, z=None):
-                xo, yo = t.transform(x, y)
-                if z is not None:
-                    return xo, yo, z
-                return xo, yo
+        def _vibe_transform(x, y, z=None):
+            return t.transform(x, y, z=z)
 
-            return _vibe_transform
-        except Exception:
-            pass
+        return _vibe_transform
+    except Exception:
+        pass
     transformer = TransformerFromCRS(src_crs, dst_crs, always_xy=True)
     return transformer.transform
 
@@ -1865,8 +1856,8 @@ class GeometryArray(ExtensionArray):
             y_center = np.mean([miny, maxy])
         # ensure using geographic coordinates
         else:
-            transformer = TransformerFromCRS(self.crs, "EPSG:4326", always_xy=True)
-            minx, miny, maxx, maxy = transformer.transform_bounds(
+            t = _VibeTransformer.from_crs(self.crs, "EPSG:4326", always_xy=True)
+            minx, miny, maxx, maxy = t.transform_bounds(
                 minx, miny, maxx, maxy
             )
             y_center = np.mean([miny, maxy])
