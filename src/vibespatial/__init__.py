@@ -236,6 +236,7 @@ from .runtime.adaptive import (
     plan_kernel_dispatch,
 )
 from .runtime.crossover import (
+    DEFAULT_BROADCAST_CROSSOVER_POLICIES,
     DEFAULT_CROSSOVER_POLICIES,
     CrossoverPolicy,
     DispatchDecision,
@@ -383,6 +384,7 @@ __all__ = [
     "compute_offset_spans",
     "compute_total_bounds",
     "DEFAULT_CONSUMER_PROFILE",
+    "DEFAULT_BROADCAST_CROSSOVER_POLICIES",
     "DEFAULT_CROSSOVER_POLICIES",
     "DEFAULT_DATACENTER_PROFILE",
     "DETERMINISM_ENV_VAR",
