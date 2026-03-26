@@ -838,6 +838,16 @@ runtime.launch(scatter_kernel, ...)  # one launch for all geometries
 - Any Python `for` loop over device array elements = ping-pong
 - Any conditional allocation based on device-side values without
   `count_scatter_total()` = ping-pong
+- **numpy in GPU dispatch paths** = BLOCKING. Two cases:
+  1. **Device-resident data**: Using `np.*` on device-resident buffers forces
+     silent D→H transfer, CPU processing, then H→D transfer back.
+  2. **Precursor data**: Building arrays with `np.*` that will be uploaded to
+     GPU is also BLOCKING — construct them directly on device with `cp.*` to
+     avoid the H→D transfer entirely.
+  In both cases, MUST use `cp.*` (CuPy), custom NVRTC kernels, or CCCL
+  primitives instead. numpy is acceptable ONLY for data that genuinely stays
+  on host (e.g. parallelism control, host-side metadata for dispatch
+  decisions, or operations where GPU dispatch is not selected).
 
 ### 8.3 Unnecessary Copies Between CuPy and cuda-python
 

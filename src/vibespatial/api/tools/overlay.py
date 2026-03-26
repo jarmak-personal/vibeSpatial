@@ -570,14 +570,15 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 binary_constructive_owned,
             )
 
-            # Phase 2 zero-copy: pass CuPy device arrays directly to
-            # device_take() when available, eliminating H→D re-upload.
-            if _has_device_indices:
-                left_sub = left_owned.device_take(d_idx1)
-                right_sub = right_owned.device_take(d_idx2)
-            else:
-                left_sub = left_owned.take(np.asarray(idx1))
-                right_sub = right_owned.take(np.asarray(idx2))
+            # Free pool memory before device_take: spatial index and
+            # prior pipeline stages leave freed-but-cached blocks in
+            # the pool.  Forcing GC here ensures dead CuPy arrays
+            # return their blocks before the large gather allocation.
+            try:
+                from vibespatial.cuda._runtime import get_cuda_runtime
+                get_cuda_runtime().free_pool_memory()
+            except Exception:
+                pass
             # Force GPU dispatch when a GPU runtime is available: the
             # overlay pipeline has device-resident data and the 50K
             # CONSTRUCTIVE crossover threshold should not route small
@@ -586,19 +587,26 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
             )
 
-            # ---- Many-vs-one fast path ----
-            # When all spatial-join pairs reference the same single right
-            # row, route through the three-tier strategy (containment
-            # bypass -> SH batch clip -> element-wise overlay) instead of
-            # running the full overlay pipeline on every pair.  This is
-            # the dominant pattern for clipping (e.g. 10K vegetation
-            # polygons vs 1 dissolved corridor).
+            # ---- Many-vs-one detection ----
+            # Check BEFORE device_take: for many-vs-one (all pairs
+            # reference the same single right row), gathering the right
+            # side duplicates one polygon's ring data N times.  At 1M
+            # scale this can be 5+ GiB and exceed VRAM.  The many-vs-one
+            # fast path only needs left_sub gathered; right_owned is
+            # passed by reference.
             _unique_right = np.unique(idx2)
             _is_many_vs_one = (
-                _unique_right.size == 1 and left_sub.row_count > 1
+                _unique_right.size == 1 and idx1.size > 1
             )
 
             if _is_many_vs_one:
+                # Many-vs-one: only gather left side.
+                if _has_device_indices:
+                    left_sub = left_owned.device_take(d_idx1)
+                else:
+                    left_sub = left_owned.take(np.asarray(idx1))
+                right_sub = None  # deferred until fallback
+
                 try:
                     result_owned = _many_vs_one_intersection_owned(
                         left_sub,
@@ -612,8 +620,17 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                     )
                     used_owned = True
                 except Exception:
-                    # Fall through to standard element-wise path.
+                    # Fall through to element-wise fallback.
                     intersections = None
+            else:
+                # Phase 2 zero-copy: pass CuPy device arrays directly to
+                # device_take() when available, eliminating H->D re-upload.
+                if _has_device_indices:
+                    left_sub = left_owned.device_take(d_idx1)
+                    right_sub = right_owned.device_take(d_idx2)
+                else:
+                    left_sub = left_owned.take(np.asarray(idx1))
+                    right_sub = right_owned.take(np.asarray(idx2))
 
             if intersections is None and not _is_many_vs_one:
                 # Standard element-wise path for N-vs-M patterns.
@@ -649,6 +666,13 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
 
             if intersections is None and _is_many_vs_one:
                 # Many-vs-one fast path failed -- fall back to element-wise.
+                # Gather right side now (deferred from above to avoid OOM
+                # on the many-vs-one fast path).
+                if right_sub is None:
+                    if _has_device_indices:
+                        right_sub = right_owned.device_take(d_idx2)
+                    else:
+                        right_sub = right_owned.take(np.asarray(idx2))
                 try:
                     result_owned = binary_constructive_owned(
                         "intersection", left_sub, right_sub,
@@ -668,6 +692,11 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                         pipeline="_overlay_intersection",
                         d2h_transfer=True,
                     )
+                    if right_sub is None:
+                        if _has_device_indices:
+                            right_sub = right_owned.device_take(d_idx2)
+                        else:
+                            right_sub = right_owned.take(np.asarray(idx2))
                     left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
                     right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
                     intersections = GeoSeries(

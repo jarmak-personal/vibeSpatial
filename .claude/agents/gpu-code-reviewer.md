@@ -27,6 +27,12 @@ your reference for thresholds, anti-patterns, and hardware specs.
 - No Python loops over device array elements
 - All D2H transfers deferred to pipeline end
 - count_scatter_total() used instead of sequential .get() calls
+- **No numpy in GPU dispatch paths** — two violations:
+  (a) numpy on device-resident data forces D→H→CPU→H→D round-trips.
+  (b) numpy to build precursor arrays that will be uploaded to GPU —
+  construct directly on device with cupy instead.
+  numpy is acceptable ONLY for data that genuinely stays on host (dispatch
+  decisions, parallelism control, non-GPU-selected paths).
 
 **Pass 2: Synchronization (HIGH)**
 - No runtime.synchronize() between same-stream operations

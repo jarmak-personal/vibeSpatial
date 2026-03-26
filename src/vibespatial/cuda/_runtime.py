@@ -269,6 +269,12 @@ def _make_oom_callback(max_retries: int = 3):
             retry_state["count"] += 1
         import gc
         gc.collect()
+        # Also free pinned memory — pinned allocations can hold
+        # significant host+device resources.
+        try:
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
         return True  # tell RMM to retry the allocation
 
     return _callback
@@ -330,7 +336,19 @@ class CudaDriverRuntime:
         self._memory_backend = "cupy"
 
     def _configure_rmm_pool(self) -> None:
-        """Configure RMM tiered memory resource."""
+        """Configure RMM tiered memory resource.
+
+        Tier selection (highest priority first):
+
+        * **Tier C** — ``VIBESPATIAL_GPU_MANAGED_MEMORY=1``: bare managed
+          memory (automatic page migration, no pool).
+        * **Tier A** — ``VIBESPATIAL_GPU_OOM_SAFETY=0``: raw pool, no
+          failure callback.  Faster allocation but OOM is fatal.
+        * **Tier B** (default) — pool + ``FailureCallbackResourceAdaptor``
+          that runs ``gc.collect()`` on allocation failure, giving Python
+          a chance to free unreferenced CuPy arrays and return blocks to
+          the pool before the OOM propagates.
+        """
         pool_limit_str = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
         pool_limit = int(pool_limit_str) if pool_limit_str else None
         managed = os.environ.get("VIBESPATIAL_GPU_MANAGED_MEMORY", "").strip()
@@ -341,8 +359,18 @@ class CudaDriverRuntime:
             mr = rmm.mr.ManagedMemoryResource()
             self._memory_backend = "rmm-managed"
             logger.info("RMM memory backend: managed memory (Tier C)")
-        elif oom_safety in ("1", "true", "yes"):
-            # Tier B: pool + OOM callback
+        elif oom_safety in ("0", "false", "no"):
+            # Tier A: raw pool, no OOM callback (opt-in)
+            base = rmm.mr.CudaMemoryResource()
+            mr = rmm.mr.PoolMemoryResource(
+                base,
+                initial_pool_size=0,
+                maximum_pool_size=pool_limit if pool_limit else None,
+            )
+            self._memory_backend = "rmm-pool"
+            logger.info("RMM memory backend: pool without OOM safety (Tier A)")
+        else:
+            # Tier B: pool + OOM callback (default)
             base = rmm.mr.CudaMemoryResource()
             pool = rmm.mr.PoolMemoryResource(
                 base,
@@ -352,17 +380,7 @@ class CudaDriverRuntime:
             callback = _make_oom_callback(max_retries=3)
             mr = rmm.mr.FailureCallbackResourceAdaptor(pool, callback)
             self._memory_backend = "rmm-safe"
-            logger.info("RMM memory backend: pool with OOM safety (Tier B)")
-        else:
-            # Tier A: pool only (default)
-            base = rmm.mr.CudaMemoryResource()
-            mr = rmm.mr.PoolMemoryResource(
-                base,
-                initial_pool_size=0,
-                maximum_pool_size=pool_limit if pool_limit else None,
-            )
-            self._memory_backend = "rmm-pool"
-            logger.info("RMM memory backend: pool (Tier A)")
+            logger.info("RMM memory backend: pool with OOM safety (Tier B, default)")
 
         rmm.mr.set_current_device_resource(mr)
         cp.cuda.set_allocator(rmm_cupy_allocator)
@@ -412,12 +430,22 @@ class CudaDriverRuntime:
         """Release cached memory back to the device.
 
         With CuPy pool: releases all cached blocks to the CUDA driver.
-        With RMM pool: no-op for device memory (RMM coalesces internally).
+        With RMM pool: runs ``gc.collect()`` to ensure Python-side
+        references to dead CuPy arrays are cleaned up, returning their
+        underlying device blocks to the RMM pool for reuse.  The RMM
+        pool itself does not shrink, but freed blocks become available
+        for subsequent allocations.
         In both cases, clears the pinned memory pool if present.
         """
         if self._memory_backend == "cupy":
             if self._memory_pool is not None:
                 self._memory_pool.free_all_blocks()
+        elif self._memory_backend.startswith("rmm"):
+            # RMM pool coalesces freed blocks internally but Python GC
+            # must run first so that unreferenced CuPy arrays actually
+            # return their allocations to the pool.
+            import gc
+            gc.collect()
         # Clear pinned memory pool (separate from device pool)
         if cp is not None:
             try:

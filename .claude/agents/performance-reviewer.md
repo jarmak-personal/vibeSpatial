@@ -33,6 +33,10 @@ with fresh eyes.
 ### Host-Device Boundary
 - Unnecessary sync points in hot loops?
 - D/H transfers that could be deferred or eliminated?
+- **numpy in GPU dispatch paths?** Two violations:
+  (a) numpy on device-resident data → silent D→H→CPU→H→D round-trips.
+  (b) numpy building precursor arrays destined for GPU → unnecessary H→D.
+  Both BLOCKING. Must use cupy/NVRTC/CCCL. numpy OK only for data staying on host.
 
 ### Tier Compliance (ADR-0033)
 - New GPU primitives using the correct tier?

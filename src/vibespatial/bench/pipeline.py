@@ -261,8 +261,8 @@ def _free_gpu_pool_memory() -> None:
     """Release cached GPU memory between pipeline stages.
 
     With CuPy pool: returns cached blocks to the CUDA driver.
-    With RMM pool: no-op for device memory (RMM coalesces free
-    regions internally for efficient reuse).
+    With RMM pool: runs ``gc.collect()`` to ensure dead CuPy arrays
+    return their blocks to the pool for reuse.
     """
     if not has_gpu_runtime():
         return
@@ -1538,17 +1538,22 @@ def _profile_vegetation_corridor_pipeline(
         # buffer+dissolve can produce ring edge artifacts that cause
         # TopologyException or IllegalArgumentException in GEOS.
         try:
-            corridor_valid = make_valid_owned(owned=corridor_owned)
-            if corridor_valid.owned is not None:
-                corridor_owned = corridor_valid.owned
+            _corridor_valid = make_valid_owned(owned=corridor_owned)
+            if _corridor_valid.owned is not None:
+                corridor_owned = _corridor_valid.owned
+            del _corridor_valid
         except Exception:
             pass  # keep original corridor if make_valid fails
         try:
-            veg_valid = make_valid_owned(owned=veg_owned)
-            if veg_valid.owned is not None:
-                veg_owned = veg_valid.owned
+            _veg_valid = make_valid_owned(owned=veg_owned)
+            if _veg_valid.owned is not None:
+                veg_owned = _veg_valid.owned
+            del _veg_valid
         except Exception:
             pass  # keep original vegetation if make_valid fails
+        # Release make_valid intermediates before the overlay stage;
+        # overlay allocates large device buffers and needs headroom.
+        _free_gpu_pool_memory()
 
         with profiler.stage(
             "intersect_vegetation",
@@ -3274,6 +3279,9 @@ def benchmark_pipeline_suite(
                     )
                 else:
                     raise ValueError(f"Unsupported pipeline: {pipeline}")
+            # Release GPU pool memory between pipelines to prevent OOM
+            # from accumulated device allocations across pipeline runs.
+            _free_gpu_pool_memory()
             if pipeline == "raster-to-vector":
                 results.append(samples[0])
                 continue
