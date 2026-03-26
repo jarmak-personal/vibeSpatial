@@ -17962,6 +17962,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/runtime/workload.py",
+      "referenced_by": [],
+      "symbols": [
+        "WorkloadShape",
+        "detect_workload_shape"
+      ],
+      "tokens": [
+        "detect",
+        "py",
+        "runtime",
+        "shape",
+        "src",
+        "vibespatial",
+        "workload",
+        "workloadshape"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/spatial/__init__.py",
       "referenced_by": [],
       "symbols": [],
@@ -23123,6 +23142,26 @@
         "test",
         "tests",
         "upstream"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_workload_shape.py",
+      "referenced_by": [],
+      "symbols": [
+        "TestWorkloadShapeEnum",
+        "TestDetectWorkloadShape",
+        "TestImportFromRuntime"
+      ],
+      "tokens": [
+        "py",
+        "shape",
+        "test",
+        "testdetectworkloadshape",
+        "testimportfromruntime",
+        "tests",
+        "testworkloadshapeenum",
+        "workload"
       ]
     },
     {
