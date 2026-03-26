@@ -58,16 +58,6 @@ def bench_gpu_pip(
     polygons_owned, read_s2 = load_owned(polygons_spec, fmt)
     read_seconds = read_s1 + read_s2
 
-    # Resize polygons to match points scale
-    if polygons_owned.row_count < scale:
-        import numpy as np
-
-        from vibespatial.geometry.owned import from_shapely_geometries
-
-        shapely_polys = polygons_owned.to_shapely()
-        tiled = np.resize(np.asarray(shapely_polys, dtype=object), scale).tolist()
-        polygons_owned = from_shapely_geometries(tiled)
-
     # Baseline: Shapely
     baseline_timing = None
     speedup = None
