@@ -36,8 +36,14 @@ def bench_gpu_pip(
     from vibespatial import ExecutionMode, has_gpu_runtime
     from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
-    from vibespatial.geometry.owned import OwnedGeometryArray
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.geometry.owned import (
+        DeviceMetadataState,
+        OwnedGeometryArray,
+        OwnedGeometryDeviceState,
+    )
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+    from vibespatial.runtime.residency import Residency
 
     if not has_gpu_runtime():
         return BenchmarkResult(
@@ -70,13 +76,30 @@ def bench_gpu_pip(
         n = points_owned.row_count
         m = polygons_owned.row_count
         indices = np.arange(n, dtype=np.intp) % m
-        polygons_owned = OwnedGeometryArray(
-            validity=polygons_owned.validity[indices],
-            tags=polygons_owned.tags[indices],
-            family_row_offsets=polygons_owned.family_row_offsets[indices],
-            families=polygons_owned.families,
-            residency=polygons_owned.residency,
-        )
+        _validity = polygons_owned.validity[indices]
+        _tags = polygons_owned.tags[indices]
+        _fro = polygons_owned.family_row_offsets[indices]
+        if polygons_owned.device_state is not None:
+            runtime = get_cuda_runtime()
+            d_v = runtime.from_host(_validity)
+            d_t = runtime.from_host(_tags)
+            d_f = runtime.from_host(_fro)
+            d_meta = DeviceMetadataState(validity=d_v, tags=d_t, family_row_offsets=d_f)
+            d_state = OwnedGeometryDeviceState(
+                validity=d_v, tags=d_t, family_row_offsets=d_f,
+                families=dict(polygons_owned.device_state.families),
+            )
+            polygons_owned = OwnedGeometryArray(
+                validity=_validity, tags=_tags, family_row_offsets=_fro,
+                families=polygons_owned.families,
+                residency=Residency.DEVICE, device_state=d_state, device_metadata=d_meta,
+            )
+        else:
+            polygons_owned = OwnedGeometryArray(
+                validity=_validity, tags=_tags, family_row_offsets=_fro,
+                families=polygons_owned.families,
+                residency=Residency.HOST,
+            )
 
     # Baseline: Shapely
     baseline_timing = None

@@ -13,7 +13,9 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     TAG_FAMILIES,
+    DeviceMetadataState,
     OwnedGeometryArray,
+    OwnedGeometryDeviceState,
     from_shapely_geometries,
     unique_tag_pairs,
 )
@@ -245,12 +247,46 @@ def _broadcast_right_owned(
     tags = np.full(n, src_tags[0], dtype=np.int8)
     family_row_offsets = np.full(n, src_offsets[0], dtype=np.int32)
 
+    # When the source is device-resident, its host family buffers may be
+    # un-materialised stubs (empty x/y with host_materialized=False).
+    # We must NOT claim DEVICE residency without a device_state --
+    # _ensure_device_state() would re-upload the empty stubs as real data,
+    # causing CUDA_ERROR_ILLEGAL_ADDRESS.
+    #
+    # Instead, share the source's device-side family buffers and upload only
+    # the small new metadata arrays (6 bytes/row H->D).
+    if right_1row.device_state is not None:
+        runtime = get_cuda_runtime()
+        d_validity = runtime.from_host(validity)
+        d_tags = runtime.from_host(tags)
+        d_fro = runtime.from_host(family_row_offsets)
+        d_meta = DeviceMetadataState(
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_fro,
+        )
+        d_state = OwnedGeometryDeviceState(
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_fro,
+            families=dict(right_1row.device_state.families),
+        )
+        return OwnedGeometryArray(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=right_1row.families,
+            residency=Residency.DEVICE,
+            device_state=d_state,
+            device_metadata=d_meta,
+        )
+
     return OwnedGeometryArray(
         validity=validity,
         tags=tags,
         family_row_offsets=family_row_offsets,
         families=right_1row.families,
-        residency=right_1row.residency,
+        residency=Residency.HOST,
     )
 
 

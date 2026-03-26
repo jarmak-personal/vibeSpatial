@@ -2190,12 +2190,47 @@ def tile_single_row(
     tags = np.repeat(owned.tags, n)
     family_row_offsets = np.repeat(owned.family_row_offsets, n)
 
-    # Share the family coordinate/offset buffers -- no copy of x/y data.
-    result = OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families=owned.families,  # shared reference (read-only usage)
-        residency=owned.residency,
-    )
+    # When the source is device-resident, its host family buffers may be
+    # un-materialised stubs (empty x/y arrays with host_materialized=False).
+    # We must NOT construct an OwnedGeometryArray that claims DEVICE residency
+    # without a device_state -- _ensure_device_state() would re-upload the
+    # empty stubs as if they were real data, causing CUDA_ERROR_ILLEGAL_ADDRESS.
+    #
+    # Instead, when a device_state exists on the source, share its device-side
+    # family buffers directly and upload only the small new metadata arrays.
+    # This keeps coordinate data on-device (zero-copy for the expensive part)
+    # and only crosses the bus once for 6 bytes/row of metadata (H->D).
+    if owned.device_state is not None:
+        runtime = get_cuda_runtime()
+        d_validity = runtime.from_host(validity)
+        d_tags = runtime.from_host(tags)
+        d_fro = runtime.from_host(family_row_offsets)
+        d_meta = DeviceMetadataState(
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_fro,
+        )
+        d_state = OwnedGeometryDeviceState(
+            validity=d_validity,
+            tags=d_tags,
+            family_row_offsets=d_fro,
+            families=dict(owned.device_state.families),  # shared reference
+        )
+        result = OwnedGeometryArray(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=owned.families,  # shared reference (read-only usage)
+            residency=Residency.DEVICE,
+            device_state=d_state,
+            device_metadata=d_meta,
+        )
+    else:
+        result = OwnedGeometryArray(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=owned.families,  # shared reference (read-only usage)
+            residency=Residency.HOST,
+        )
     return result
