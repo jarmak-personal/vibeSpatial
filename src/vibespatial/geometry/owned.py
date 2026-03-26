@@ -414,6 +414,29 @@ class OwnedGeometryArray:
         runtime = get_cuda_runtime()
         if not runtime.available():
             raise RuntimeError("GPU execution was requested, but no CUDA device is available")
+        # Safety check: detect unmaterialised host stubs that would upload
+        # empty (size-0) coordinate buffers to the device.  When
+        # host_materialized=False and x.shape=(0,), the family was created
+        # as a lazy placeholder for a device-resident array whose
+        # device_state has since been lost.  Uploading the empty stubs
+        # causes kernels to read garbage from uninitialized GPU memory,
+        # producing denormalized-double coordinates (e.g. 8e-309) and
+        # downstream TopologyException / CUDA_ERROR_ILLEGAL_ADDRESS.
+        for family, buffer in self.families.items():
+            if (
+                not buffer.host_materialized
+                and buffer.row_count > 0
+                and buffer.x.shape[0] == 0
+            ):
+                raise RuntimeError(
+                    f"Cannot upload {family.value} family to device: host "
+                    f"buffers are unmaterialised stubs (x.shape={buffer.x.shape}, "
+                    f"host_materialized=False, row_count={buffer.row_count}). "
+                    f"This OwnedGeometryArray was constructed from a "
+                    f"device-resident source without propagating its "
+                    f"device_state.  Fix the call site to either share the "
+                    f"source's device_state or use residency=HOST."
+                )
         t0 = perf_counter()
         total_bytes = self.validity.nbytes + self.tags.nbytes + self.family_row_offsets.nbytes
         d_validity = runtime.from_host(self.validity)

@@ -582,3 +582,76 @@ class TestDeviceResidentConcat:
         shapely_result = result.to_shapely()
         assert shapely_result[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]))
         assert shapely_result[1].equals(Point(5, 5))
+
+
+class TestEnsureDeviceStateSafetyCheck:
+    """Verify that _ensure_device_state refuses to upload unmaterialised stubs.
+
+    When an OwnedGeometryArray has host_materialized=False stubs (empty
+    x/y arrays) AND no device_state, uploading those stubs creates
+    zero-length device buffers while metadata references rows that should
+    contain coordinates.  Kernels then read garbage from uninitialized GPU
+    memory, producing denormalized-double coordinates (e.g. 8e-309) and
+    downstream TopologyException crashes.
+    """
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+    def test_ensure_device_state_rejects_unmaterialised_stubs(self) -> None:
+        """_ensure_device_state raises RuntimeError for empty stubs without device_state."""
+        from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+        from vibespatial.geometry.owned import FamilyGeometryBuffer, OwnedGeometryArray
+
+        # Build an OGA that simulates the bug pattern:
+        # - residency=HOST (or DEVICE)
+        # - host families have host_materialized=False stubs
+        # - device_state is None (lost during incorrect construction)
+        polygon_stub = FamilyGeometryBuffer(
+            family=GeometryFamily.POLYGON,
+            schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
+            row_count=1,
+            x=np.empty(0, dtype=np.float64),
+            y=np.empty(0, dtype=np.float64),
+            geometry_offsets=np.empty(0, dtype=np.int32),
+            empty_mask=np.empty(0, dtype=np.bool_),
+            host_materialized=False,
+        )
+        from vibespatial.geometry.owned import FAMILY_TAGS
+
+        oga = OwnedGeometryArray(
+            validity=np.array([True], dtype=bool),
+            tags=np.array([FAMILY_TAGS[GeometryFamily.POLYGON]], dtype=np.int8),
+            family_row_offsets=np.array([0], dtype=np.int32),
+            families={GeometryFamily.POLYGON: polygon_stub},
+            residency=Residency.HOST,
+            device_state=None,
+        )
+
+        with pytest.raises(RuntimeError, match="unmaterialised stubs"):
+            oga._ensure_device_state()
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+    def test_ensure_device_state_succeeds_for_materialised_host(self) -> None:
+        """_ensure_device_state succeeds when host families are properly materialised."""
+        from vibespatial.geometry.buffers import GeometryFamily as GF
+
+        owned = from_shapely_geometries(
+            [Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])],
+            residency=Residency.HOST,
+        )
+        # This should succeed -- host families have real data
+        d_state = owned._ensure_device_state()
+        assert d_state is not None
+        assert GF.POLYGON in d_state.families
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+    def test_ensure_device_state_shortcircuits_when_device_state_exists(self) -> None:
+        """_ensure_device_state returns existing device_state without re-uploading."""
+        owned = _make_device_resident([
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+        ])
+        assert owned.device_state is not None
+
+        # Families are unmaterialised stubs, but device_state exists
+        # so _ensure_device_state should short-circuit and not hit the check
+        d_state = owned._ensure_device_state()
+        assert d_state is owned.device_state

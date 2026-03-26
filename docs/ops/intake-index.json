@@ -4370,6 +4370,24 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/03-26-2026-10am/bench-vs-baseline.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "10am",
+        "2026",
+        "26",
+        "baseline",
+        "bench",
+        "benchmark",
+        "json",
+        "results",
+        "vs"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-03-18-full-baseline/REPORT.md",
       "referenced_by": [],
       "symbols": [],
@@ -21945,7 +21963,8 @@
         "test_take_empty_indices",
         "test_compute_geometry_bounds_gpu_matches_cpu_reference",
         "_make_device_resident",
-        "TestDeviceResidentConcat"
+        "TestDeviceResidentConcat",
+        "TestEnsureDeviceStateSafetyCheck"
       ],
       "tokens": [
         "all",
@@ -22010,6 +22029,7 @@
         "take",
         "test",
         "testdeviceresidentconcat",
+        "testensuredevicestatesafetycheck",
         "tests",
         "total",
         "trip",
