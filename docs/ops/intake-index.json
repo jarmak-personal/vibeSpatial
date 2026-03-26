@@ -22992,7 +22992,9 @@
         "TestSpatialOverlayUnion",
         "TestSpatialOverlaySymmetricDifference",
         "TestBatchedSHClip",
-        "TestSpatialOverlayEdgeCases"
+        "TestSpatialOverlayEdgeCases",
+        "TestOverlayDispatchEventWorkloadShape",
+        "TestSelectOverlayStrategyWorkloadShape"
       ],
       "tokens": [
         "empty",
@@ -23003,7 +23005,9 @@
         "spatial",
         "test",
         "testbatchedshclip",
+        "testoverlaydispatcheventworkloadshape",
         "tests",
+        "testselectoverlaystrategyworkloadshape",
         "testspatialoverlaydifference",
         "testspatialoverlayedgecases",
         "testspatialoverlayintersection",

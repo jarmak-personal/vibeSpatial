@@ -10,6 +10,7 @@ import shapely
 from shapely.geometry import box
 
 from vibespatial import from_shapely_geometries, spatial_overlay_owned
+from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 
 
 def _non_empty_geoms(owned):
@@ -268,3 +269,101 @@ class TestSpatialOverlayEdgeCases:
 
         for i, g in enumerate(result_geoms):
             assert abs(g.area - left_geoms[i].area) < 1e-10
+
+
+class TestOverlayDispatchEventWorkloadShape:
+    """Verify dispatch events for overlay include workload_shape in detail (nsf.5)."""
+
+    def test_broadcast_right_dispatch_event_has_workload_shape(self):
+        """N-vs-1 pattern should record workload_shape=broadcast_right."""
+        left = from_shapely_geometries([box(i, 0, i + 0.5, 0.5) for i in range(5)])
+        right = from_shapely_geometries([box(0, 0, 10, 10)])
+
+        clear_dispatch_events()
+        spatial_overlay_owned(left, right, how="intersection")
+        events = get_dispatch_events(clear=True)
+
+        overlay_events = [
+            e for e in events if e.surface == "geopandas.spatial_overlay"
+        ]
+        assert overlay_events, "Expected at least one spatial_overlay dispatch event"
+        ev = overlay_events[0]
+        assert "workload_shape=broadcast_right" in ev.detail
+
+    def test_pairwise_dispatch_event_has_workload_shape(self):
+        """Row-matched case should record workload_shape=pairwise."""
+        left = from_shapely_geometries([box(0, 0, 2, 2)])
+        right = from_shapely_geometries([box(1, 1, 3, 3)])
+
+        clear_dispatch_events()
+        spatial_overlay_owned(left, right, how="intersection")
+        events = get_dispatch_events(clear=True)
+
+        overlay_events = [
+            e for e in events if e.surface == "geopandas.spatial_overlay"
+        ]
+        assert overlay_events, "Expected at least one spatial_overlay dispatch event"
+        ev = overlay_events[0]
+        assert "workload_shape=pairwise" in ev.detail
+
+    def test_n_vs_m_dispatch_event_has_workload_shape(self):
+        """N-vs-M case should record workload_shape=per_group (strategy name fallback)."""
+        left = from_shapely_geometries([box(i, 0, i + 0.9, 0.9) for i in range(4)])
+        right = from_shapely_geometries([box(0, 0, 2, 2), box(2, 0, 4, 2)])
+
+        clear_dispatch_events()
+        spatial_overlay_owned(left, right, how="intersection")
+        events = get_dispatch_events(clear=True)
+
+        overlay_events = [
+            e for e in events if e.surface == "geopandas.spatial_overlay"
+        ]
+        assert overlay_events, "Expected at least one spatial_overlay dispatch event"
+        ev = overlay_events[0]
+        assert "workload_shape=per_group" in ev.detail
+
+
+class TestSelectOverlayStrategyWorkloadShape:
+    """Unit tests for select_overlay_strategy WorkloadShape integration (nsf.5)."""
+
+    def test_broadcast_right_uses_shared_enum(self):
+        from vibespatial.overlay.strategies import select_overlay_strategy
+        from vibespatial.runtime.workload import WorkloadShape
+
+        left = from_shapely_geometries([box(i, 0, i + 1, 1) for i in range(5)])
+        right = from_shapely_geometries([box(0, 0, 10, 10)])
+
+        strategy = select_overlay_strategy(left, right, "intersection")
+        assert strategy.name == "broadcast_right"
+        assert strategy.workload_shape is WorkloadShape.BROADCAST_RIGHT
+
+    def test_broadcast_left_has_no_shared_enum(self):
+        from vibespatial.overlay.strategies import select_overlay_strategy
+
+        left = from_shapely_geometries([box(0, 0, 10, 10)])
+        right = from_shapely_geometries([box(i, 0, i + 1, 1) for i in range(5)])
+
+        strategy = select_overlay_strategy(left, right, "intersection")
+        assert strategy.name == "broadcast_left"
+        assert strategy.workload_shape is None
+
+    def test_pairwise_uses_shared_enum(self):
+        from vibespatial.overlay.strategies import select_overlay_strategy
+        from vibespatial.runtime.workload import WorkloadShape
+
+        left = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+        right = from_shapely_geometries([box(0, 0, 2, 2), box(2, 0, 4, 2)])
+
+        strategy = select_overlay_strategy(left, right, "intersection")
+        assert strategy.name == "per_group"
+        assert strategy.workload_shape is WorkloadShape.PAIRWISE
+
+    def test_n_vs_m_has_no_shared_enum(self):
+        from vibespatial.overlay.strategies import select_overlay_strategy
+
+        left = from_shapely_geometries([box(i, 0, i + 1, 1) for i in range(3)])
+        right = from_shapely_geometries([box(0, 0, 2, 2), box(2, 0, 4, 2)])
+
+        strategy = select_overlay_strategy(left, right, "intersection")
+        assert strategy.name == "per_group"
+        assert strategy.workload_shape is None

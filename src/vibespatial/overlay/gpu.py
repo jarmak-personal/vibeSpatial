@@ -5164,6 +5164,7 @@ def spatial_overlay_owned(
         candidate_pair_count=candidate_pairs.count,
     )
 
+    _ws_label = strategy.workload_shape.value if strategy.workload_shape is not None else strategy.name
     record_dispatch_event(
         surface="geopandas.spatial_overlay",
         operation=f"spatial_overlay_{how}",
@@ -5171,7 +5172,8 @@ def spatial_overlay_owned(
         reason=strategy.reason,
         detail=(
             f"left={left.row_count}, right={right.row_count}, "
-            f"pairs={candidate_pairs.count}, strategy={strategy.name}"
+            f"pairs={candidate_pairs.count}, strategy={strategy.name}, "
+            f"workload_shape={_ws_label}"
         ),
         requested=requested,
         selected=ExecutionMode.GPU if cp is not None else ExecutionMode.CPU,
