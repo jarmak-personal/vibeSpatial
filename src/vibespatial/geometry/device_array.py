@@ -1013,7 +1013,7 @@ class DeviceGeometryArray(ExtensionArray):
             return from_shapely_geometries(other._data.tolist())
         from shapely.geometry.base import BaseGeometry as _BG
         if isinstance(other, _BG):
-            return from_shapely_geometries([other] * len(self))
+            return from_shapely_geometries([other])
         if isinstance(other, np.ndarray) and other.dtype == object:
             if len(other) != len(self):
                 raise ValueError(

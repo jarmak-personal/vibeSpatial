@@ -1254,10 +1254,10 @@ class GeometryArray(ExtensionArray):
 
             # Coerce other to OwnedGeometryArray.
             if isinstance(other, BaseGeometry):
-                # Broadcast scalar to match array length.  This is O(N) in
-                # from_shapely_geometries; a future optimisation is kernel-
-                # level broadcasting so only one row needs to be stored.
-                other_owned = from_shapely_geometries([other] * len(self))
+                # Broadcast scalar: create a 1-row owned array.  The
+                # dispatch layer (binary_constructive_owned) handles
+                # broadcast-right semantics so only one row is stored.
+                other_owned = from_shapely_geometries([other])
             elif isinstance(other, GeometryArray):
                 other_owned = other.to_owned()
             else:

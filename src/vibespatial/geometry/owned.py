@@ -2142,3 +2142,60 @@ def build_device_resident_owned(
         visible=False,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Broadcast helper: tile a 1-row OwnedGeometryArray to N rows
+# ---------------------------------------------------------------------------
+
+def tile_single_row(
+    owned: OwnedGeometryArray,
+    n: int,
+) -> OwnedGeometryArray:
+    """Create an N-row owned array from a 1-row owned array.
+
+    The coordinate buffers (x, y) and offset arrays inside each
+    :class:`FamilyGeometryBuffer` are **shared** with the original -- only
+    the three routing metadata arrays (``validity``, ``tags``,
+    ``family_row_offsets``) are replicated.  This makes the operation O(N)
+    in tiny int8/int32/bool metadata, not O(N * vertex_count) in fp64
+    coordinates, eliminating the host-side materialization bottleneck for
+    scalar broadcast (nsf.3/nsf.4).
+
+    Parameters
+    ----------
+    owned
+        Must have ``row_count == 1``.
+    n
+        Desired number of output rows.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        An *n*-row array where every row references the same geometry as
+        the single input row.  The family buffers have ``row_count == 1``
+        and every row's ``family_row_offsets`` entry is ``0``.
+    """
+    if owned.row_count != 1:
+        raise ValueError(
+            f"tile_single_row expects a 1-row array, got {owned.row_count}"
+        )
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    if n == 1:
+        return owned
+
+    # Tile the three routing metadata arrays.
+    validity = np.repeat(owned.validity, n)
+    tags = np.repeat(owned.tags, n)
+    family_row_offsets = np.repeat(owned.family_row_offsets, n)
+
+    # Share the family coordinate/offset buffers -- no copy of x/y data.
+    result = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=owned.families,  # shared reference (read-only usage)
+        residency=owned.residency,
+    )
+    return result

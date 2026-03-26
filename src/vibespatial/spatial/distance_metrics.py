@@ -22,7 +22,7 @@ except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
     cp = None
 
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray
+from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, tile_single_row
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass
@@ -538,6 +538,18 @@ def _hausdorff_gpu(owned_a, owned_b):
 
     n = owned_a.row_count
 
+    # Broadcast-right: the tiled array shares the 1-row family buffer so
+    # d_offsets_b has 2 entries (1 geometry).  Build a constant-repeat
+    # offset array on device and tile the coordinates so the kernel can
+    # use standard CSR indexing.
+    d_bcast_x = None
+    d_bcast_y = None
+    if int(d_offsets_b.size) == 2 and n > 1:
+        k = int(d_offsets_b[1] - d_offsets_b[0])
+        d_offsets_b = cp.arange(0, (n + 1) * k, k, dtype=np.int32)
+        d_bcast_x = cp.tile(cp.asarray(buf_b.x), n)
+        d_bcast_y = cp.tile(cp.asarray(buf_b.y), n)
+
     # Precision plan: METRIC class, default fp64 (wire for observability)
     compute_type = "double"
     center_x, center_y = 0.0, 0.0
@@ -555,9 +567,11 @@ def _hausdorff_gpu(owned_a, owned_b):
     block = (256, 1, 1)
 
     ptr = runtime.pointer
+    bx = d_bcast_x if d_bcast_x is not None else buf_b.x
+    by = d_bcast_y if d_bcast_y is not None else buf_b.y
     params = (
         (ptr(buf_a.x), ptr(buf_a.y), ptr(d_offsets_a),
-         ptr(buf_b.x), ptr(buf_b.y), ptr(d_offsets_b),
+         ptr(bx), ptr(by), ptr(d_offsets_b),
          ptr(d_result), center_x, center_y, n),
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
@@ -603,6 +617,17 @@ def _frechet_gpu(owned_a, owned_b):
 
     n = owned_a.row_count
 
+    # Broadcast-right: the tiled array shares the 1-row family buffer so
+    # d_offsets_b has 2 entries (1 geometry).  Tile the coordinates on
+    # device and build monotonically increasing offsets.
+    d_bcast_x = None
+    d_bcast_y = None
+    if int(d_offsets_b.size) == 2 and n > 1:
+        k = int(d_offsets_b[1] - d_offsets_b[0])
+        d_offsets_b = cp.arange(0, (n + 1) * k, k, dtype=np.int32)
+        d_bcast_x = cp.tile(cp.asarray(buf_b.x), n)
+        d_bcast_y = cp.tile(cp.asarray(buf_b.y), n)
+
     # Compute max B geometry coord count on device, transfer single scalar
     if n > 0:
         d_lens_b = d_offsets_b[1:] - d_offsets_b[:-1]
@@ -632,9 +657,11 @@ def _frechet_gpu(owned_a, owned_b):
     grid, block = runtime.launch_config(kernel, n)
 
     ptr = runtime.pointer
+    bx = d_bcast_x if d_bcast_x is not None else buf_b.x
+    by = d_bcast_y if d_bcast_y is not None else buf_b.y
     params = (
         (ptr(buf_a.x), ptr(buf_a.y), ptr(d_offsets_a),
-         ptr(buf_b.x), ptr(buf_b.y), ptr(d_offsets_b),
+         ptr(bx), ptr(by), ptr(d_offsets_b),
          ptr(d_result), center_x, center_y, n, max_b_len),
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
@@ -779,11 +806,15 @@ def hausdorff_distance_owned(
     Works directly on OwnedGeometryArray coordinate buffers -- no Shapely
     round-trip.
     """
+    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+
     n = owned_a.row_count
-    if owned_b.row_count != n:
-        raise ValueError(
-            f"Lengths do not match: a={n}, b={owned_b.row_count}"
-        )
+    workload = detect_workload_shape(n, owned_b.row_count)
+
+    # Broadcast-right: tile the 1-row right to match left.
+    if workload is WorkloadShape.BROADCAST_RIGHT:
+        owned_b = tile_single_row(owned_b, n)
+
     if n == 0:
         return np.empty(0, dtype=np.float64)
 
@@ -805,7 +836,7 @@ def hausdorff_distance_owned(
                 operation="hausdorff_distance",
                 implementation="hausdorff_gpu_nvrtc",
                 reason=selection.reason,
-                detail=f"rows={n}",
+                detail=f"rows={n}, workload={workload.value}",
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )
@@ -817,7 +848,7 @@ def hausdorff_distance_owned(
         operation="hausdorff_distance",
         implementation="hausdorff_cpu_brute_force",
         reason="CPU fallback",
-        detail=f"rows={n}",
+        detail=f"rows={n}, workload={workload.value}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,
     )
@@ -841,11 +872,15 @@ def frechet_distance_owned(
     Works directly on OwnedGeometryArray coordinate buffers -- no Shapely
     round-trip.
     """
+    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+
     n = owned_a.row_count
-    if owned_b.row_count != n:
-        raise ValueError(
-            f"Lengths do not match: a={n}, b={owned_b.row_count}"
-        )
+    workload = detect_workload_shape(n, owned_b.row_count)
+
+    # Broadcast-right: tile the 1-row right to match left.
+    if workload is WorkloadShape.BROADCAST_RIGHT:
+        owned_b = tile_single_row(owned_b, n)
+
     if n == 0:
         return np.empty(0, dtype=np.float64)
 
@@ -867,7 +902,7 @@ def frechet_distance_owned(
                 operation="frechet_distance",
                 implementation="frechet_gpu_nvrtc",
                 reason=selection.reason,
-                detail=f"rows={n}",
+                detail=f"rows={n}, workload={workload.value}",
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )
@@ -879,7 +914,7 @@ def frechet_distance_owned(
         operation="frechet_distance",
         implementation="frechet_cpu_dp",
         reason="CPU fallback",
-        detail=f"rows={n}",
+        detail=f"rows={n}, workload={workload.value}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,
     )

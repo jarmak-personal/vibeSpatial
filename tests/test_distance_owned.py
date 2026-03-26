@@ -238,7 +238,7 @@ class TestNullEmpty:
     def test_length_mismatch_raises(self):
         left_owned = from_shapely_geometries([Point(0, 0)])
         right_owned = from_shapely_geometries([Point(1, 1), Point(2, 2)])
-        with pytest.raises(ValueError, match="Lengths do not match"):
+        with pytest.raises(ValueError, match="Incompatible lengths"):
             distance_owned(left_owned, right_owned)
 
 

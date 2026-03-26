@@ -37,6 +37,7 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
+    tile_single_row,
 )
 from vibespatial.runtime._runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -730,10 +731,16 @@ def binary_constructive_owned(
     if op not in _CONSTRUCTIVE_OPS:
         raise ValueError(f"unsupported constructive operation: {op}")
 
-    if left.row_count != right.row_count:
-        raise ValueError(
-            f"row count mismatch: left={left.row_count}, right={right.row_count}"
-        )
+    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+
+    workload = detect_workload_shape(left.row_count, right.row_count)
+
+    # Broadcast-right: tile the 1-row right to match left.  The tiling
+    # only replicates the tiny metadata arrays (validity, tags,
+    # family_row_offsets) and shares the coordinate buffers, so this is
+    # O(N) in int8/int32/bool, not O(N * vertex_count) in fp64.
+    if workload is WorkloadShape.BROADCAST_RIGHT:
+        right = tile_single_row(right, left.row_count)
 
     if left.row_count == 0:
         return from_shapely_geometries([])
@@ -773,7 +780,8 @@ def binary_constructive_owned(
                 reason=selection.reason,
                 detail=(
                     f"rows={left.row_count}, "
-                    f"precision={precision_plan.compute_precision.value}"
+                    f"precision={precision_plan.compute_precision.value}, "
+                    f"workload={workload.value}"
                 ),
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
@@ -802,7 +810,7 @@ def binary_constructive_owned(
     record_fallback_event(
         surface=f"geopandas.array.{op}",
         reason=fallback_reason,
-        detail=f"rows={left.row_count}, op={op}",
+        detail=f"rows={left.row_count}, op={op}, workload={workload.value}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,
         pipeline="binary_constructive_owned",
@@ -815,7 +823,7 @@ def binary_constructive_owned(
         operation=op,
         implementation="binary_constructive_cpu",
         reason=fallback_reason,
-        detail=f"rows={left.row_count}",
+        detail=f"rows={left.row_count}, workload={workload.value}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,
     )

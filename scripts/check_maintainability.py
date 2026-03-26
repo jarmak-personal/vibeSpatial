@@ -26,7 +26,7 @@ DECISIONS_INDEX = "docs/decisions/index.md"
 # Known pre-existing violations as of 2026-03-17.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 39  # +1: scripts/verify_degeneracy_corpus.py added by other agent
+_VIOLATION_BASELINE = 38  # +1: scripts/verify_degeneracy_corpus.py added by other agent
 
 # Modules that are intentionally not in intake (internal, generated, etc.).
 _INTAKE_EXEMPT_MODULES = {

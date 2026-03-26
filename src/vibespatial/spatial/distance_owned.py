@@ -22,6 +22,7 @@ from vibespatial.geometry.owned import (
     DiagnosticKind,
     OwnedGeometryArray,
     from_shapely_geometries,
+    tile_single_row,
     unique_tag_pairs,
 )
 from vibespatial.runtime import ExecutionMode
@@ -71,11 +72,16 @@ def distance_owned(
     On GPU: zero geometry H/D transfers.  Only small index arrays and the
     final float64 result cross the bus.
     """
+    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+
     n = left.row_count
-    if right.row_count != n:
-        raise ValueError(
-            f"Lengths do not match: left={n}, right={right.row_count}"
-        )
+    workload = detect_workload_shape(n, right.row_count)
+
+    # Broadcast-right: tile the 1-row right to match left.  Only the
+    # tiny metadata arrays are replicated; coordinate buffers are shared.
+    if workload is WorkloadShape.BROADCAST_RIGHT:
+        right = tile_single_row(right, n)
+
     if n == 0:
         return np.empty(0, dtype=np.float64)
 
@@ -97,7 +103,7 @@ def distance_owned(
                 operation="distance",
                 implementation="distance_owned_gpu",
                 reason="element-wise distance via owned GPU kernels",
-                detail=f"rows={n}, precision={precision.value if hasattr(precision, 'value') else precision}",
+                detail=f"rows={n}, precision={precision.value if hasattr(precision, 'value') else precision}, workload={workload.value}",
                 selected=ExecutionMode.GPU,
             )
             return result
@@ -176,10 +182,10 @@ def evaluate_geopandas_dwithin(
         if isinstance(right, OwnedGeometryArray):
             right_owned = right
         elif isinstance(right, BaseGeometry):
-            # Broadcast scalar geometry to N rows.  The DGA path has an
-            # optimized _dwithin_scalar that avoids this; this path is
-            # only reached from GeometryArray above the crossover threshold.
-            right_owned = from_shapely_geometries([right] * n)
+            # Broadcast scalar: create a 1-row owned array.  The
+            # dispatch layer (distance_owned / dwithin_owned) handles
+            # broadcast-right tiling so only one row is stored.
+            right_owned = from_shapely_geometries([right])
         elif isinstance(right, np.ndarray):
             right_owned = from_shapely_geometries(right.tolist())
         else:

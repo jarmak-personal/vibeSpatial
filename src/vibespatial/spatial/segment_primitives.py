@@ -687,6 +687,24 @@ class DeviceSegmentTable:
     part_indices: DeviceArray | None = None
     ring_indices: DeviceArray | None = None
 
+    def free(self) -> None:
+        """Release all device allocations held by this table.
+
+        Consolidates the 7--9 individual ``runtime.free()`` calls that
+        previously had to be duplicated at every cleanup site.
+        """
+        runtime = get_cuda_runtime()
+        runtime.free(self.x0)
+        runtime.free(self.y0)
+        runtime.free(self.x1)
+        runtime.free(self.y1)
+        runtime.free(self.row_indices)
+        runtime.free(self.segment_indices)
+        if self.part_indices is not None:
+            runtime.free(self.part_indices)
+        if self.ring_indices is not None:
+            runtime.free(self.ring_indices)
+
 
 @dataclass
 class SegmentIntersectionResult:
