@@ -21,6 +21,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_kernel_dispatch
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
@@ -1048,7 +1049,13 @@ def compute_geometry_bounds(
             )
             result = _compute_geometry_bounds_gpu(geometry_array, compute_type="double")
         except Exception:
-            pass  # fall through to CPU
+            record_fallback_event(
+                surface="geopandas.array.bounds",
+                reason="GPU bounds kernel failed; falling back to CPU vectorized bounds",
+                detail=f"rows={row_count}",
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.CPU,
+            )
         else:
             record_dispatch_event(
                 surface="geopandas.array.bounds",

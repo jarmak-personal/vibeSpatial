@@ -760,21 +760,45 @@ def _fused_gpu_binary_predicate(
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
         reason=f"fused GPU {predicate}: right geometry",
     )
+
+    # Compute bounds on device if not cached.
+    # compute_geometry_bounds(dispatch_mode=GPU) may silently fall back to
+    # CPU (its GPU path has a bare ``except Exception: pass``).  When that
+    # happens, the returned numpy bounds are correct but state.row_bounds
+    # remains None.  Recover by uploading the CPU-computed bounds to device
+    # so the rest of the fused pipeline can proceed without bailing out.
+    import cupy as cp
+
+    for arr, state_ref in ((left, "left"), (right, "right")):
+        state = arr._ensure_device_state()
+        if state.row_bounds is None:
+            host_bounds = compute_geometry_bounds(arr, dispatch_mode=ExecutionMode.GPU)
+            state = arr._ensure_device_state()
+            if state.row_bounds is None:
+                # GPU bounds failed; upload CPU-computed bounds to device.
+                # The CPU fallback in compute_geometry_bounds may have moved
+                # the array to HOST; restore DEVICE residency so the rest
+                # of the fused pipeline can proceed.
+                record_fallback_event(
+                    surface="vibespatial.predicates.binary._fused_gpu_binary_predicate",
+                    reason=f"GPU bounds kernel failed for {state_ref}; uploading CPU bounds to device",
+                    d2h_transfer=False,
+                )
+                arr.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason=f"fused GPU {predicate}: restore {state_ref} residency after bounds fallback",
+                )
+                state = arr._ensure_device_state()
+                state.row_bounds = cp.asarray(
+                    host_bounds.reshape(arr.row_count, 4),
+                    dtype=np.float64,
+                )
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
 
-    # Compute bounds on device if not cached.
-    if left_state.row_bounds is None:
-        compute_geometry_bounds(left, dispatch_mode=ExecutionMode.GPU)
-        left_state = left._ensure_device_state()
-    if right_state.row_bounds is None:
-        compute_geometry_bounds(right, dispatch_mode=ExecutionMode.GPU)
-        right_state = right._ensure_device_state()
-
     if left_state.row_bounds is None or right_state.row_bounds is None:
         return None
-
-    import cupy as cp
 
     n = left.row_count
     # All N-sized work stays on device (Tier 2 — CuPy element-wise).

@@ -31,9 +31,12 @@ def bench_gpu_pip(
 ) -> BenchmarkResult:
     from time import perf_counter
 
+    import numpy as np
+
     from vibespatial import ExecutionMode, has_gpu_runtime
     from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
+    from vibespatial.geometry.owned import OwnedGeometryArray
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
 
     if not has_gpu_runtime():
@@ -58,6 +61,23 @@ def bench_gpu_pip(
     polygons_owned, read_s2 = load_owned(polygons_spec, fmt)
     read_seconds = read_s1 + read_s2
 
+    # point_in_polygon requires pairwise-aligned inputs (equal row counts).
+    # When polygon count < point count, tile polygon metadata cyclically to
+    # match.  This duplicates only the 6-byte/row index arrays (validity,
+    # tags, family_row_offsets) while sharing the underlying coordinate
+    # buffers -- O(N) in int8/int32/bool, not O(N * vertices) in fp64.
+    if polygons_owned.row_count < points_owned.row_count:
+        n = points_owned.row_count
+        m = polygons_owned.row_count
+        indices = np.arange(n, dtype=np.intp) % m
+        polygons_owned = OwnedGeometryArray(
+            validity=polygons_owned.validity[indices],
+            tags=polygons_owned.tags[indices],
+            family_row_offsets=polygons_owned.family_row_offsets[indices],
+            families=polygons_owned.families,
+            residency=polygons_owned.residency,
+        )
+
     # Baseline: Shapely
     baseline_timing = None
     speedup = None
@@ -70,8 +90,6 @@ def bench_gpu_pip(
         points_arr = gdf_points.geometry.to_numpy()
         polys_arr = gdf_polys.geometry.to_numpy()
         if len(polys_arr) < scale:
-            import numpy as np
-
             polys_arr = np.resize(polys_arr, scale)
 
         shapely_times: list[float] = []
