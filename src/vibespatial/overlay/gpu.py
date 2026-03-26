@@ -4926,6 +4926,12 @@ def _overlay_owned(
     # float64 buffers (x, y, t, packed_keys, source_segment_ids) before
     # the half-edge graph and face table allocate more.
     _free_split_event_device_state(split_events)
+    # Return freed split-event blocks to the device so they can be reused
+    # by the half-edge graph and face table allocations that follow.
+    try:
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort cleanup
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
     # Phase 25 memory: atomic_edges device state arrays that are NOT
     # shared with half_edge_graph can be freed.  The HalfEdgeGraph keeps
@@ -4934,6 +4940,12 @@ def _overlay_owned(
     # AtomicEdgeDeviceState — but dst_x and dst_y are only needed during
     # build_gpu_half_edge_graph and can be freed now.
     _free_atomic_edge_excess(atomic_edges)
+    # Return freed atomic-edge excess blocks to the device before face
+    # table allocation.
+    try:
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort cleanup
     faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
     # Phase 13: Device-resident face selection — avoids triggering
     # _ensure_host() D->H on bounded_mask/left_covered/right_covered.
@@ -4994,6 +5006,13 @@ def _overlay_owned(
     # coordinate arrays; the half-edge graph, face table, and face indices
     # are no longer needed.
     del half_edge_graph, faces, d_selected_face_indices
+    # Return freed overlay structures to the device.  When _overlay_owned
+    # is called repeatedly (per-group loop in spatial_overlay_owned), this
+    # prevents pool-cached blocks from accumulating across iterations.
+    try:
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort cleanup
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,
@@ -5347,6 +5366,14 @@ def spatial_overlay_owned(
     elif strategy.name == "broadcast_left":
         pass  # fall through to per_group
 
+    # Release GPU pool memory after containment bypass and SH batch clip:
+    # bounds check, PIP, and clip kernels produce large intermediates that
+    # are no longer needed before the per-group overlay loop.
+    try:
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort cleanup
+
     # Stage 2: Per-left-group processing.
     #
     # Previous approach gathered ALL pairs into a single batch and ran one
@@ -5493,6 +5520,14 @@ def spatial_overlay_owned(
             else:
                 result_owned = from_shapely_geometries([shapely.Point()])
                 result_owned = result_owned.take(np.asarray([], dtype=np.int64))
+
+        # Release GPU pool memory after per-group overlay loop: each
+        # iteration's split events, half-edge graphs, and face tables
+        # leave freed-but-cached blocks in the CuPy pool.
+        try:
+            get_cuda_runtime().free_pool_memory()
+        except Exception:
+            pass  # best-effort cleanup
 
         # Filter empty/null using owned-level metadata (validity + empty_mask)
         # instead of to_shapely() — avoids D->H->D ping-pong.

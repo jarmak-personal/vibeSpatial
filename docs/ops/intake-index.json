@@ -4347,6 +4347,24 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/03-25-2026-2pm/bench-vs-baseline.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "25",
+        "2pm",
+        "baseline",
+        "bench",
+        "benchmark",
+        "json",
+        "results",
+        "vs"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-03-18-full-baseline/REPORT.md",
       "referenced_by": [],
       "symbols": [],

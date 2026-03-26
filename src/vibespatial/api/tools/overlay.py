@@ -260,6 +260,14 @@ def _many_vs_one_intersection_owned(
         ),
     )
 
+    # Release GPU pool memory after containment bypass: bounds check + PIP
+    # can produce large intermediates that are no longer needed.
+    try:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort cleanup
+
     if n_remainder == 0:
         # Should not happen (handled above), but be safe.
         return _contained_result
@@ -389,6 +397,14 @@ def _many_vs_one_intersection_owned(
                 complex_result = _shapely_remainder_intersection(
                     left_remainder, right_one,
                 )
+
+    # Release GPU pool memory after overlay on remainder polygons: SH clip
+    # and per-pair GPU overlay produce large intermediates that are dead now.
+    try:
+        from vibespatial.cuda._runtime import get_cuda_runtime
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass  # best-effort cleanup
 
     # ---- Reassemble results in original pair order ----
     # Build a result array with one geometry per pair in the original order.
