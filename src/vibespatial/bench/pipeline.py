@@ -258,13 +258,11 @@ class _DeviceMemoryMonitor:
 
 
 def _free_gpu_pool_memory() -> None:
-    """Release cached GPU memory back to the CUDA device.
+    """Release cached GPU memory between pipeline stages.
 
-    CuPy's default memory pool caches freed blocks for reuse.  In multi-stage
-    GPU pipelines this causes memory fragmentation: intermediate arrays are
-    freed by Python but the pool retains the blocks, preventing later stages
-    from allocating contiguous regions.  Calling this between pipeline stages
-    returns cached blocks to the CUDA driver so they can be re-allocated.
+    With CuPy pool: returns cached blocks to the CUDA driver.
+    With RMM pool: no-op for device memory (RMM coalesces free
+    regions internally for efficient reuse).
     """
     if not has_gpu_runtime():
         return

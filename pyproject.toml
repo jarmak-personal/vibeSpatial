@@ -61,6 +61,7 @@ cu12 = [
   "kvikio-cu12>=26.2",
   "nvidia-ml-py>=13.590.48",
   "pylibcudf-cu12>=26.2.1",
+  "rmm-cu12>=24.12",
 ]
 cu13 = [
   "cuda-python>=13",
@@ -70,6 +71,7 @@ cu13 = [
   "kvikio-cu13>=26.2",
   "nvidia-ml-py>=13.590.48",
   "pylibcudf-cu13>=26.2.1",
+  "rmm-cu13>=25.2",
 ]
 bench = [
   "rich>=13",

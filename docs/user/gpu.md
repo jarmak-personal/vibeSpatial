@@ -190,6 +190,8 @@ All `VIBESPATIAL_*` environment variables in one place:
 | `VIBESPATIAL_TRACE_WARNINGS` | disabled | Set `1` to emit warnings from execution traces |
 | `VIBESPATIAL_EVENT_LOG` | unset | Path to write structured dispatch/rewrite event log |
 | `VIBESPATIAL_GPU_POOL_LIMIT` | unset | Limit GPU memory pool size (bytes) |
+| `VIBESPATIAL_GPU_OOM_SAFETY` | disabled | Set `1` to enable Tier B: RMM pool with GC retry on OOM. Zero overhead on the happy path; ~5-50ms recovery on OOM. |
+| `VIBESPATIAL_GPU_MANAGED_MEMORY` | disabled | Set `1` to enable Tier C: CUDA managed memory. Datasets exceeding VRAM will run to completion (slowly) instead of crashing. Expect 2-10x slowdown when oversubscribed. |
 | `VIBESPATIAL_CCCL_CACHE` | enabled | Set `0` to disable the CCCL CUBIN disk cache |
 | `VIBESPATIAL_NVRTC_CACHE` | enabled | Set `0` to disable the NVRTC CUBIN disk cache |
 | `VIBESPATIAL_CCCL_CACHE_DIR` | `~/.cache/vibespatial/cccl` | Override CCCL cache directory |

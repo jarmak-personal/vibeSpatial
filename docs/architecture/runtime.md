@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 138/200 lines
+Body Budget: 166/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -22,7 +22,8 @@ Section Map (Body Lines)
 | 76-89 | Session Execution Mode Override |
 | 90-104 | Provenance Rewrite Override |
 | 105-132 | Index-Array Boundary Model (ADR-0036) |
-| 133-138 | Compatibility |
+| 133-160 | Memory Pool Tiers (ADR-0040) |
+| 161-166 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -154,6 +155,34 @@ Attribute assembly is always pandas on host.  GPU VRAM is reserved for geometry.
   defer `.to_pandas()` to the GeoDataFrame construction boundary.
 - Contract tests in `tests/test_index_array_boundary.py` validate the boundary
   invariants across spatial query, sjoin, overlay, dissolve, and clip.
+
+## Memory Pool Tiers (ADR-0040)
+
+Device memory allocation uses a tiered strategy built on RAPIDS RMM when
+available, with CuPy's built-in `MemoryPool` as the fallback.
+
+| Tier | Env Var | Allocator Stack | Default? |
+|------|---------|-----------------|----------|
+| A | *(none)* | `PoolMemoryResource` → `CudaMemoryResource` | Yes (when RMM installed) |
+| B | `VIBESPATIAL_GPU_OOM_SAFETY=1` | `FailureCallbackResourceAdaptor` → Pool → Cuda | No |
+| C | `VIBESPATIAL_GPU_MANAGED_MEMORY=1` | `ManagedMemoryResource` (bare) | No |
+| Fallback | *(RMM not installed)* | CuPy `MemoryPool` | Yes (without RMM) |
+
+- **Tier A** provides a coalescing pool with ~5-15% peak VRAM reduction over
+  CuPy's power-of-2 binning, at zero overhead.
+- **Tier B** adds a GC-retry callback on OOM (bounded to 3 retries per event).
+  Zero overhead on the happy path.
+- **Tier C** uses CUDA managed memory for datasets exceeding VRAM. Performance
+  degrades 2-10× under oversubscription due to PCIe page migration; the SoA
+  coordinate layout amplifies page faults.
+- **Deferred initialization**: RMM resources require a CUDA context, so
+  `_configure_rmm_pool()` runs inside `_ensure_context()` after the primary
+  context is retained.  If RMM setup fails, the runtime falls back to the
+  CuPy pool with a warning.
+- `VIBESPATIAL_GPU_POOL_LIMIT` maps to `maximum_pool_size` (Tiers A/B) and is
+  ignored for Tier C (managed memory uses OS overcommit semantics).
+- `_memory_backend` discriminator values: `"cupy"`, `"rmm-pool"`, `"rmm-safe"`,
+  `"rmm-managed"`, `"none"` (before context init).
 
 ## Compatibility
 

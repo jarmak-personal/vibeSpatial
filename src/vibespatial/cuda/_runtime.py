@@ -27,6 +27,14 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cu = None
     nvrtc = None
 
+try:
+    import rmm
+    import rmm.mr
+    from rmm.allocators.cupy import rmm_cupy_allocator
+except ImportError:
+    rmm = None
+    rmm_cupy_allocator = None
+
 
 def _require_bindings() -> None:
     if cu is None:
@@ -233,6 +241,39 @@ def _delete_cached_cubin(disk_key: str) -> None:
         pass
 
 
+def _make_oom_callback(max_retries: int = 3):
+    """Create a thread-safe OOM callback with bounded retry counter.
+
+    RMM's ``FailureCallbackResourceAdaptor`` calls this in a loop for a
+    single failing allocation.  The counter bounds retries *per allocation
+    attempt*.  A time-based reset ensures that independent OOM events
+    (separated by >1 s of successful allocations) each get the full retry
+    budget, preventing the counter from silently eroding over the lifetime
+    of the process.
+    """
+    import time as _time
+
+    lock = threading.Lock()
+    retry_state = {"count": 0, "last_ts": 0.0}
+
+    def _callback(nbytes: int) -> bool:
+        with lock:
+            now = _time.monotonic()
+            # Reset for a fresh OOM event (>1 s since last callback call)
+            if now - retry_state["last_ts"] > 1.0:
+                retry_state["count"] = 0
+            retry_state["last_ts"] = now
+            if retry_state["count"] >= max_retries:
+                retry_state["count"] = 0
+                return False  # give up, let OOM propagate
+            retry_state["count"] += 1
+        import gc
+        gc.collect()
+        return True  # tell RMM to retry the allocation
+
+    return _callback
+
+
 @dataclass(frozen=True, slots=True)
 class CudaStream:
     """Lightweight wrapper around a CUDA stream handle."""
@@ -262,34 +303,127 @@ class CudaDriverRuntime:
         self._module_cache_lock = threading.Lock()
         self._block_size_cache: dict[int, int] = {}
         self._memory_pool: Any | None = None
+        self._memory_backend: str = "none"
+        self._rmm_mr = None
+        self._rmm_configured: bool = False
         self._configure_memory_pool()
 
     def _configure_memory_pool(self) -> None:
-        """Configure CuPy memory pool for pipeline workloads."""
+        """Configure GPU memory pool. RMM setup is deferred until CUDA context exists."""
         if cp is None:
             return
+        if rmm is not None:
+            # Defer RMM setup — needs CUDA context (established in _ensure_context)
+            self._rmm_configured = False
+            return
+        # No RMM: use CuPy pool immediately (no CUDA context needed)
+        self._configure_cupy_pool()
+
+    def _configure_cupy_pool(self) -> None:
+        """Fallback: CuPy MemoryPool (current behavior)."""
         pool = cp.cuda.MemoryPool()
         pool_limit = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
         if pool_limit:
             pool.set_limit(size=int(pool_limit))
         cp.cuda.set_allocator(pool.malloc)
         self._memory_pool = pool
+        self._memory_backend = "cupy"
+
+    def _configure_rmm_pool(self) -> None:
+        """Configure RMM tiered memory resource."""
+        pool_limit_str = os.environ.get("VIBESPATIAL_GPU_POOL_LIMIT")
+        pool_limit = int(pool_limit_str) if pool_limit_str else None
+        managed = os.environ.get("VIBESPATIAL_GPU_MANAGED_MEMORY", "").strip()
+        oom_safety = os.environ.get("VIBESPATIAL_GPU_OOM_SAFETY", "").strip()
+
+        if managed in ("1", "true", "yes"):
+            # Tier C: bare managed memory (no pool wrapping)
+            mr = rmm.mr.ManagedMemoryResource()
+            self._memory_backend = "rmm-managed"
+            logger.info("RMM memory backend: managed memory (Tier C)")
+        elif oom_safety in ("1", "true", "yes"):
+            # Tier B: pool + OOM callback
+            base = rmm.mr.CudaMemoryResource()
+            pool = rmm.mr.PoolMemoryResource(
+                base,
+                initial_pool_size=0,
+                maximum_pool_size=pool_limit if pool_limit else None,
+            )
+            callback = _make_oom_callback(max_retries=3)
+            mr = rmm.mr.FailureCallbackResourceAdaptor(pool, callback)
+            self._memory_backend = "rmm-safe"
+            logger.info("RMM memory backend: pool with OOM safety (Tier B)")
+        else:
+            # Tier A: pool only (default)
+            base = rmm.mr.CudaMemoryResource()
+            mr = rmm.mr.PoolMemoryResource(
+                base,
+                initial_pool_size=0,
+                maximum_pool_size=pool_limit if pool_limit else None,
+            )
+            self._memory_backend = "rmm-pool"
+            logger.info("RMM memory backend: pool (Tier A)")
+
+        rmm.mr.set_current_device_resource(mr)
+        cp.cuda.set_allocator(rmm_cupy_allocator)
+        self._memory_pool = None  # CuPy pool is not used
+        self._rmm_mr = mr  # prevent GC of resource chain
 
     def memory_pool_stats(self) -> dict[str, int]:
-        """Return current memory pool statistics."""
-        if self._memory_pool is None:
+        """Return current memory pool statistics.
+
+        The returned dict always contains ``used_bytes`` and ``total_bytes``
+        when stats are available.  Additional backend-specific keys:
+
+        * CuPy pool: ``free_bytes``
+        * RMM backends: ``peak_bytes``, ``total_allocations``
+          (requires ``rmm.statistics.enable_statistics()`` to be active)
+        """
+        if self._memory_backend == "none":
             return {}
-        pool = self._memory_pool
-        return {
-            "used_bytes": pool.used_bytes(),
-            "total_bytes": pool.total_bytes(),
-            "free_bytes": pool.free_bytes(),
-        }
+        if self._memory_backend == "cupy":
+            if self._memory_pool is None:
+                return {}
+            pool = self._memory_pool
+            return {
+                "used_bytes": pool.used_bytes(),
+                "total_bytes": pool.total_bytes(),
+                "free_bytes": pool.free_bytes(),
+            }
+
+        if rmm is None:
+            return {}
+
+        stats: dict[str, int] = {}
+        try:
+            from rmm import statistics as rmm_stats
+            s = rmm_stats.get_statistics()
+            if s is not None:
+                stats["used_bytes"] = int(s.current_bytes)
+                stats["peak_bytes"] = int(s.peak_bytes)
+                stats["total_bytes"] = int(s.total_bytes)
+                stats["total_allocations"] = int(s.total_count)
+        except (ImportError, AttributeError):
+            pass
+
+        return stats
 
     def free_pool_memory(self) -> None:
-        """Release cached memory back to the device."""
-        if self._memory_pool is not None:
-            self._memory_pool.free_all_blocks()
+        """Release cached memory back to the device.
+
+        With CuPy pool: releases all cached blocks to the CUDA driver.
+        With RMM pool: no-op for device memory (RMM coalesces internally).
+        In both cases, clears the pinned memory pool if present.
+        """
+        if self._memory_backend == "cupy":
+            if self._memory_pool is not None:
+                self._memory_pool.free_all_blocks()
+        # Clear pinned memory pool (separate from device pool)
+        if cp is not None:
+            try:
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            except Exception:
+                pass
 
     def available(self) -> bool:
         return has_cuda_device() and cp is not None
@@ -360,6 +494,18 @@ class CudaDriverRuntime:
                         self._driver_cuda_version[0],
                         self._driver_cuda_version[1],
                     )
+
+            # Deferred RMM setup — requires active CUDA context
+            if rmm is not None and not self._rmm_configured:
+                try:
+                    self._configure_rmm_pool()
+                except Exception:
+                    logger.warning(
+                        "RMM pool setup failed; falling back to CuPy memory pool",
+                        exc_info=True,
+                    )
+                    self._configure_cupy_pool()
+                self._rmm_configured = True
 
             return self._context
 

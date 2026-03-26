@@ -5,7 +5,7 @@ Scope: Architecture decision log and index of accepted or superseded ADRs.
 Read If: You are resolving, revisiting, or querying a design decision.
 STOP IF: You already have the specific ADR open and do not need the index.
 Source Of Truth: Decision log for architecture choices.
-Body Budget: 78/220 lines
+Body Budget: 80/220 lines
 Document: docs/decisions/index.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 17-25 | Open First |
 | 26-30 | Verify |
 | 31-35 | Risks |
-| 36-78 | Decisions |
+| 36-80 | Decisions |
 DOC_HEADER:END -->
 
 Use this index to find accepted architecture decisions.
@@ -96,3 +96,5 @@ Track architecture decisions in a stable, agent-discoverable format.
 | `ADR-0036` | accepted | 2026-03-16 | [Index-Array Boundary Attribute Model](docs/decisions/0036-index-array-boundary-attribute-model.md) |
 | `ADR-0037` | deferred | 2026-03-16 | [ADR-0037: GPU Voronoi Diagram Kernel](docs/decisions/0037-gpu-voronoi-diagram-kernel.md) |
 | `ADR-0038` | accepted | 2026-03-17 | [ADR-0038: GPU Byte-Classification GeoJSON Parser](docs/decisions/0038-gpu-byte-classify-geojson-parser.md) |
+| `ADR-0039` | accepted | 2026-03-20 | [ADR-0039: Provenance Tagging and Rewrite System](docs/decisions/0039-provenance-tagging-rewrites.md) |
+| `ADR-0040` | accepted | 2026-03-25 | [ADR-0040: Tiered GPU Memory Pool (RMM)](docs/decisions/0040-tiered-gpu-memory-pool.md) |

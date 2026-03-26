@@ -44,4 +44,6 @@ context, the decision made, consequences, and alternatives considered.
 0036-index-array-boundary-attribute-model
 0037-gpu-voronoi-diagram-kernel
 0038-gpu-byte-classify-geojson-parser
+0039-provenance-tagging-rewrites
+0040-tiered-gpu-memory-pool
 ```
