@@ -363,7 +363,20 @@ def bench_gpu_dissolve(
         for _, positions in grouped.indices.items()
     ]
 
-    execute_grouped_box_union_gpu(values, group_positions)
+    warmup_result = execute_grouped_box_union_gpu(values, group_positions)
+    if warmup_result is None:
+        return BenchmarkResult(
+            operation="gpu-dissolve",
+            tier=1,
+            scale=scale,
+            geometry_type="polygon",
+            precision=precision,
+            status="skip",
+            status_reason="GPU runtime not available (CuPy not installed)",
+            timing=timing_from_samples([]),
+            input_format=input_format,
+            read_seconds=read_seconds,
+        )
 
     times: list[float] = []
     for _ in range(max(1, repeat)):

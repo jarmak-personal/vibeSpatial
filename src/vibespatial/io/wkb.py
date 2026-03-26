@@ -671,7 +671,11 @@ def _write_geoparquet_native_device(
 
     import pandas as pd
     import pyarrow as pa
-    import pylibcudf as plc
+
+    try:
+        import pylibcudf as plc
+    except ModuleNotFoundError:
+        return False
 
     from vibespatial.api.io.arrow import _create_metadata, _encode_metadata
 
