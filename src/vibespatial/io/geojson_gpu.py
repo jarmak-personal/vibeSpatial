@@ -627,8 +627,22 @@ def _launch_kernel(runtime, kernel, n, params):
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
 
-def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
+def read_geojson_gpu(
+    path: Path,
+    *,
+    target_crs: str | None = None,
+) -> GeoJSONGpuResult:
     """Parse a GeoJSON file using GPU byte-classification pipeline.
+
+    Parameters
+    ----------
+    path : Path
+        Path to the GeoJSON file.
+    target_crs : str, optional
+        Target CRS to reproject coordinates into (e.g. ``"EPSG:3857"``).
+        GeoJSON is EPSG:4326 by spec (RFC 7946).  When provided, a fused
+        GPU coordinate transform runs between parsing and geometry assembly,
+        with zero host round-trips.
 
     Returns a GeoJSONGpuResult with device-resident OwnedGeometryArray
     and host data for lazy CPU property extraction.
@@ -953,6 +967,14 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
 
     d_x = cp.ascontiguousarray(d_x)
     d_y = cp.ascontiguousarray(d_y)
+
+    # S6b: Fused CRS transform (device-only, no host round-trip).
+    # GeoJSON is EPSG:4326 per RFC 7946.  If target_crs is set and
+    # differs from 4326, transform in-place before assembly.
+    if target_crs is not None:
+        from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
+
+        transform_coordinates_inplace(d_x, d_y, src_crs="EPSG:4326", dst_crs=target_crs)
 
     # S8: Find feature boundaries for property extraction
     fb_kernels = _feature_boundary_kernels()

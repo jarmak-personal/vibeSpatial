@@ -16318,6 +16318,52 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/properties.py",
+      "referenced_by": [],
+      "symbols": [
+        "_classify_value_kernels",
+        "_extract_bool_kernels",
+        "_launch_kernel",
+        "_find_property_keys",
+        "_colon_positions_from_key_hits",
+        "_classify_values",
+        "_extract_numeric_column",
+        "_extract_boolean_column",
+        "infer_property_schema",
+        "extract_gpu_properties"
+      ],
+      "tokens": [
+        "bool",
+        "boolean",
+        "classify",
+        "colon",
+        "column",
+        "extract",
+        "find",
+        "gpu",
+        "hits",
+        "infer",
+        "io",
+        "kernel",
+        "kernels",
+        "key",
+        "keys",
+        "launch",
+        "numeric",
+        "parse",
+        "positions",
+        "properties",
+        "property",
+        "py",
+        "schema",
+        "src",
+        "value",
+        "values",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/io/gpu_parse/structural.py",
       "referenced_by": [],
       "symbols": [
@@ -16341,6 +16387,30 @@
         "source",
         "src",
         "structural",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/transform.py",
+      "referenced_by": [],
+      "symbols": [
+        "_transform_kernels",
+        "_normalize_crs",
+        "transform_coordinates_inplace"
+      ],
+      "tokens": [
+        "coordinates",
+        "crs",
+        "gpu",
+        "inplace",
+        "io",
+        "kernels",
+        "normalize",
+        "parse",
+        "py",
+        "src",
+        "transform",
         "vibespatial"
       ]
     },
@@ -20525,6 +20595,42 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_fused_reproject.py",
+      "referenced_by": [],
+      "symbols": [
+        "_wgs84_to_mercator_ref",
+        "_mercator_to_wgs84_ref",
+        "_get_device_coords",
+        "TestTransformCoordinatesInplace",
+        "_make_point_feature",
+        "_make_polygon_feature",
+        "_write_geojson",
+        "TestFusedGeojsonReproject"
+      ],
+      "tokens": [
+        "coords",
+        "device",
+        "feature",
+        "fused",
+        "geojson",
+        "get",
+        "make",
+        "mercator",
+        "point",
+        "polygon",
+        "py",
+        "ref",
+        "reproject",
+        "test",
+        "testfusedgeojsonreproject",
+        "tests",
+        "testtransformcoordinatesinplace",
+        "wgs84",
+        "write"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_fusion_policy.py",
       "referenced_by": [],
       "symbols": [
@@ -21358,6 +21464,51 @@
         "touching",
         "triangle",
         "wired"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_gpu_properties.py",
+      "referenced_by": [],
+      "symbols": [
+        "_to_device",
+        "_structural_arrays",
+        "_feature_boundaries",
+        "_build_feature_collection",
+        "_minimal_feature",
+        "TestFindPropertyKeys",
+        "TestColonPositions",
+        "TestClassifyValues",
+        "TestExtractBooleanColumn",
+        "TestBooleanExtractionWithTypeFilter",
+        "TestSchemaInference",
+        "TestExtractGpuProperties",
+        "TestFeatureBoundaryHelper",
+        "TestVtypeConstants"
+      ],
+      "tokens": [
+        "arrays",
+        "boundaries",
+        "build",
+        "collection",
+        "device",
+        "feature",
+        "gpu",
+        "minimal",
+        "properties",
+        "py",
+        "structural",
+        "test",
+        "testbooleanextractionwithtypefilter",
+        "testclassifyvalues",
+        "testcolonpositions",
+        "testextractbooleancolumn",
+        "testextractgpuproperties",
+        "testfeatureboundaryhelper",
+        "testfindpropertykeys",
+        "tests",
+        "testschemainference",
+        "testvtypeconstants"
       ]
     },
     {
