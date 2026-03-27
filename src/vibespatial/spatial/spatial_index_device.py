@@ -249,7 +249,7 @@ def _brute_force_scalar(
     d_tree_bounds = runtime.from_host(
         np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
     )
-    d_mask = runtime.allocate((tree_count,), np.uint8)
+    d_mask = runtime.allocate((tree_count,), cp.uint8)
     try:
         kernels = _spatial_query_kernels()
         kernel = kernels["bbox_overlap_tree_mask"]
@@ -310,7 +310,7 @@ def _brute_force_multi(
     d_tree_bounds = runtime.from_host(
         np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
     )
-    d_counts = runtime.allocate((query_count,), np.int32)
+    d_counts = runtime.allocate((query_count,), cp.int32)
     d_offsets = None
     try:
         kernels = _spatial_query_kernels()
@@ -461,9 +461,9 @@ def _morton_range_query(
     d_query_bounds = runtime.from_host(query_bounds_host.ravel())
     d_expanded_bounds = runtime.from_host(expanded_bounds_host.ravel())
     d_order = runtime.from_host(order_host)
-    d_range_low = runtime.allocate((query_count,), np.uint64)
-    d_range_high = runtime.allocate((query_count,), np.uint64)
-    d_counts = runtime.allocate((query_count,), np.int32)
+    d_range_low = runtime.allocate((query_count,), cp.uint64)
+    d_range_high = runtime.allocate((query_count,), cp.uint64)
+    d_counts = runtime.allocate((query_count,), cp.int32)
     d_starts = None
     d_ends = None
     d_offsets = None
@@ -554,8 +554,8 @@ def _morton_range_query(
             return None
 
         # Step 5: Scatter matching pairs.
-        d_left = cp.empty(total_pairs, dtype=np.int32)
-        d_right = cp.empty(total_pairs, dtype=np.int32)
+        d_left = cp.empty(total_pairs, dtype=cp.int32)
+        d_right = cp.empty(total_pairs, dtype=cp.int32)
         scatter_kernel = kernels["morton_range_scatter"]
         scatter_params = (
             (

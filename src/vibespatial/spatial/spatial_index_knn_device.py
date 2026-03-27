@@ -173,7 +173,7 @@ def _compute_pair_distances(
         return None
 
     runtime = get_cuda_runtime()
-    d_distances = runtime.allocate((pair_count,), np.float64)
+    d_distances = runtime.allocate((pair_count,), cp.float64)
 
     # Check if we need to reverse the query/tree for point-to-family distance.
     from .nearest import (
@@ -391,10 +391,12 @@ def spatial_index_knn_device(
     if max_distance is not None and np.isfinite(max_distance):
         effective_max_distance = float(max_distance)
     else:
-        # Compute bounding box diagonal of all valid geometry bounds.
-        all_bounds = np.vstack((query_bounds, tree_bounds))
-        valid_mask = ~np.isnan(all_bounds).any(axis=1)
-        if not valid_mask.any():
+        # Compute bounding box diagonal of all valid geometry bounds on device.
+        d_query_bounds = cp.asarray(query_bounds)
+        d_tree_bounds = cp.asarray(tree_bounds)
+        d_all_bounds = cp.vstack((d_query_bounds, d_tree_bounds))
+        d_valid_mask = ~cp.isnan(d_all_bounds).any(axis=1)
+        if not bool(d_valid_mask.any()):
             return DeviceKnnResult(
                 d_query_idx=cp.empty(0, dtype=cp.int32),
                 d_target_idx=cp.empty(0, dtype=cp.int32),
@@ -402,14 +404,16 @@ def spatial_index_knn_device(
                 total_pairs=0,
                 k=k,
             )
-        valid_bounds = all_bounds[valid_mask]
-        extent_dx = float(valid_bounds[:, 2].max() - valid_bounds[:, 0].min())
-        extent_dy = float(valid_bounds[:, 3].max() - valid_bounds[:, 1].min())
-        effective_max_distance = float(np.hypot(extent_dx, extent_dy)) * 1.01 + 1.0
+        d_valid_bounds = d_all_bounds[d_valid_mask]
+        extent_dx = float(d_valid_bounds[:, 2].max() - d_valid_bounds[:, 0].min())
+        extent_dy = float(d_valid_bounds[:, 3].max() - d_valid_bounds[:, 1].min())
+        effective_max_distance = float(cp.hypot(extent_dx, extent_dy)) * 1.01 + 1.0
 
     # --- Candidate generation ------------------------------------------------
     # Expand query bounds by effective_max_distance and find bbox overlaps.
     # Use the device-resident candidate generator to avoid D->H->D round-trip.
+    # NOTE: _expand_bounds and _generate_candidates_gpu_device expect host
+    # numpy arrays -- do not pass CuPy arrays to them.
     per_row_dist = np.full(n_queries, effective_max_distance, dtype=np.float64)
     expanded_bounds = _expand_bounds(query_bounds, per_row_dist)
 
