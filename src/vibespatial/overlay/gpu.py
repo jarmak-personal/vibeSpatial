@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections import defaultdict
 
@@ -69,6 +70,27 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
 logger = logging.getLogger(__name__)
+
+# lyy.22: Number of CUDA streams in the per-group overlay stream pool.
+# Each stream processes one overlay pair at a time.  Streams enable
+# deferred synchronization: results are collected after all pairs are
+# dispatched rather than synchronizing per pair.
+#
+# NOTE: non_blocking=False is required for correctness.  The overlay
+# pipeline interleaves CuPy operations (which respect the CuPy stream
+# context) with NVRTC kernel launches via runtime.launch() (which use
+# the null/default CUDA stream).  Non-blocking streams do NOT
+# synchronize with the null stream, which would allow CuPy ops on the
+# stream to race with NVRTC kernels on the null stream within a single
+# _overlay_owned call.  Blocking streams (the default) synchronize with
+# the null stream on every operation, maintaining correct ordering.
+#
+# The primary benefit of this pattern is structural: it provides a
+# framework for future stream-parallel execution once runtime.launch()
+# is plumbed with per-stream support.  In the current architecture,
+# GPU work is serialized by the null-stream NVRTC kernels regardless
+# of the CuPy stream assignment.
+_OVERLAY_STREAM_POOL_SIZE = 2
 
 
 _OVERLAY_SPLIT_KERNEL_SOURCE = """
@@ -1336,26 +1358,33 @@ def _containment_bypass_gpu(
     right: OwnedGeometryArray,
     how: str,
 ) -> tuple[OwnedGeometryArray | None, cp.ndarray | None]:
-    """Identify polygons in *left* that are fully contained in *right* (1 row).
+    """Identify polygons in *left* that can bypass full overlay via containment/disjointness.
 
-    Returns ``(contained, remainder_mask)`` where:
+    Returns ``(bypass_result, remainder_mask)`` where:
 
-    - *contained* is an OGA of polygons that are fully inside the corridor
-      (their intersection with the corridor IS themselves), or ``None`` if
-      no polygons are fully contained.
+    - *bypass_result* is an OGA of bypassed polygons, or ``None`` if none qualify.
     - *remainder_mask* is a device boolean mask (True = needs overlay) over
-      the rows of *left*, or ``None`` if all polygons are contained.
+      the rows of *left*, or ``None`` if all polygons were bypassed.
+
+    Semantics by operation
+    ----------------------
+    **intersection**: contained -> pass-through (L_i intersect R_j = L_i).
+        Disjoint -> excluded (empty result).
+    **difference**: contained -> excluded (L_i - R_j = empty).
+        Disjoint -> pass-through (L_i - R_j = L_i).
 
     Algorithm
     ---------
-    Stage 1: GPU bounds containment (cheapest filter).
+    Stage 1a: GPU bounds containment (cheapest filter).
         Compare per-polygon MBR against corridor MBR -- CuPy element-wise.
-    Stage 2: GPU vertex-in-polygon (correct containment).
-        For polygons passing the bbox test, check that ALL vertices are
-        inside the corridor via thread-per-polygon NVRTC kernels that read
+    Stage 1b: GPU bounds disjointness (for difference).
+        Polygons whose MBR does not overlap the corridor MBR are definitely
+        disjoint -- conservative but correct.
+    Stage 2: GPU vertex-in-polygon (correct containment for bbox candidates).
+        For polygons passing the bbox-contained test, check that ALL vertices
+        are inside the corridor via thread-per-polygon NVRTC kernels that read
         vertices directly from the source family buffers (no scatter).
-    Stage 3: Route results.
-        Fully-contained polygons pass through; remainder needs overlay.
+    Stage 3: Route results per operation semantics.
     """
     if cp is None:
         return None, None
@@ -1367,8 +1396,13 @@ def _containment_bypass_gpu(
     if right.row_count != 1:
         return None, None
 
-    # Only applies to intersection.
-    if how != "intersection":
+    # Supported operations: intersection, difference.
+    # - intersection: contained -> pass-through, disjoint -> skip (empty)
+    # - difference: contained -> empty (L-R=nothing), disjoint -> pass-through (L-R=L)
+    # symmetric_difference is NOT eligible: disjoint pairs produce L_i UNION R_j,
+    # and the bypass cannot correctly reconstruct R_j's contribution without
+    # duplicating R_j per disjoint pair.
+    if how not in ("intersection", "difference"):
         return None, None
 
     # Ensure both sides are on device.
@@ -1403,7 +1437,7 @@ def _containment_bypass_gpu(
         return None, None
 
     # ------------------------------------------------------------------
-    # Stage 1: GPU bounds containment
+    # Stage 1a: GPU bounds containment
     # ------------------------------------------------------------------
     from vibespatial.kernels.core.geometry_analysis import (
         _compute_geometry_bounds_gpu_impl,
@@ -1430,216 +1464,282 @@ def _containment_bypass_gpu(
         & (d_lb[:, 3] <= d_corr_bounds[3])
     )
 
+    # ------------------------------------------------------------------
+    # Stage 1b: GPU bounds disjointness (difference only)
+    # ------------------------------------------------------------------
+    # Two MBRs are disjoint when one is entirely left/right/above/below the
+    # other.  This is a conservative test: bbox-disjoint => definitely
+    # disjoint.  Polygons that are geometrically disjoint but bbox-overlapping
+    # will fall through to overlay (correct, just not bypassed).
+    d_bbox_disjoint: cp.ndarray | None = None  # type: ignore[name-defined]
+    if how == "difference":
+        d_bbox_disjoint = (
+            (d_lb[:, 2] < d_corr_bounds[0])   # L.xmax < R.xmin
+            | (d_lb[:, 0] > d_corr_bounds[2])  # L.xmin > R.xmax
+            | (d_lb[:, 3] < d_corr_bounds[1])  # L.ymax < R.ymin
+            | (d_lb[:, 1] > d_corr_bounds[3])  # L.ymin > R.ymax
+        )
+
     n_bbox_candidates = int(cp.sum(d_bbox_inside))
-    if n_bbox_candidates == 0:
+    n_bbox_disjoint = int(cp.sum(d_bbox_disjoint)) if d_bbox_disjoint is not None else 0
+
+    if n_bbox_candidates == 0 and n_bbox_disjoint == 0:
         d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
         return None, d_remainder_mask
 
     # ------------------------------------------------------------------
     # Stage 2: GPU vertex-in-polygon (thread-per-polygon)
     # ------------------------------------------------------------------
-    d_bbox_indices = cp.flatnonzero(d_bbox_inside).astype(cp.int64)
+    # Only needed when there are bbox-inside candidates (potential containment).
+    d_cand_result: cp.ndarray | None = None  # type: ignore[name-defined]
+    d_bbox_indices: cp.ndarray | None = None  # type: ignore[name-defined]
 
-    # Gather tags and family_row_offsets for bbox-candidate rows.
-    d_tags = cp.asarray(left_state.tags)
-    d_fro = cp.asarray(left_state.family_row_offsets)
-    d_cand_tags = d_tags[d_bbox_indices]
-    d_cand_fro = d_fro[d_bbox_indices]
+    if n_bbox_candidates > 0:
+        d_bbox_indices = cp.flatnonzero(d_bbox_inside).astype(cp.int64)
 
-    # Per-candidate result: 1 = fully inside, 0 = not.
-    d_cand_result = cp.zeros(n_bbox_candidates, dtype=cp.int32)
+        # Gather tags and family_row_offsets for bbox-candidate rows.
+        d_tags = cp.asarray(left_state.tags)
+        d_fro = cp.asarray(left_state.family_row_offsets)
+        d_cand_tags = d_tags[d_bbox_indices]
+        d_cand_fro = d_fro[d_bbox_indices]
 
-    kernels = _containment_bypass_kernels()
-    ptr = runtime.pointer
-    corr_row = 0  # corridor is always row 0 of its family buffer
+        # Per-candidate result: 1 = fully inside, 0 = not.
+        d_cand_result = cp.zeros(n_bbox_candidates, dtype=cp.int32)
 
-    # Process each left polygonal family against the corridor.
-    for left_family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        if left_family not in left_state.families:
-            continue
-        tag_val = FAMILY_TAGS[left_family]
-        d_family_mask = d_cand_tags == tag_val
-        n_family = int(cp.sum(d_family_mask))
-        if n_family == 0:
-            continue
+        kernels = _containment_bypass_kernels()
+        ptr = runtime.pointer
+        corr_row = 0  # corridor is always row 0 of its family buffer
 
-        d_family_rows = d_cand_fro[d_family_mask].astype(cp.int32)
-        left_buf = left_state.families[left_family]
+        # Process each left polygonal family against the corridor.
+        for left_family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+            if left_family not in left_state.families:
+                continue
+            tag_val = FAMILY_TAGS[left_family]
+            d_family_mask = d_cand_tags == tag_val
+            n_family = int(cp.sum(d_family_mask))
+            if n_family == 0:
+                continue
 
-        # Select the kernel variant based on left family x corridor family.
-        if left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.POLYGON:
-            kernel = kernels["containment_poly_vs_poly"]
-            params = (
-                (
-                    ptr(d_family_rows),
-                    n_family,
-                    ptr(left_buf.x),
-                    ptr(left_buf.y),
-                    ptr(left_buf.geometry_offsets),
-                    ptr(left_buf.ring_offsets),
-                    ptr(corr_buffer.x),
-                    ptr(corr_buffer.y),
-                    ptr(corr_buffer.geometry_offsets),
-                    ptr(corr_buffer.ring_offsets),
-                    corr_row,
-                    ptr(d_cand_result),  # temporary -- write to family slice below
-                ),
-                (
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
-                ),
-            )
-        elif left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.MULTIPOLYGON:
-            kernel = kernels["containment_poly_vs_mpoly"]
-            params = (
-                (
-                    ptr(d_family_rows),
-                    n_family,
-                    ptr(left_buf.x),
-                    ptr(left_buf.y),
-                    ptr(left_buf.geometry_offsets),
-                    ptr(left_buf.ring_offsets),
-                    ptr(corr_buffer.x),
-                    ptr(corr_buffer.y),
-                    ptr(corr_buffer.geometry_offsets),
-                    ptr(corr_buffer.part_offsets),
-                    ptr(corr_buffer.ring_offsets),
-                    corr_row,
-                    ptr(d_cand_result),
-                ),
-                (
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR,
-                ),
-            )
-        elif left_family is GeometryFamily.MULTIPOLYGON and corr_family is GeometryFamily.POLYGON:
-            kernel = kernels["containment_mpoly_vs_poly"]
-            params = (
-                (
-                    ptr(d_family_rows),
-                    n_family,
-                    ptr(left_buf.x),
-                    ptr(left_buf.y),
-                    ptr(left_buf.geometry_offsets),
-                    ptr(left_buf.part_offsets),
-                    ptr(left_buf.ring_offsets),
-                    ptr(corr_buffer.x),
-                    ptr(corr_buffer.y),
-                    ptr(corr_buffer.geometry_offsets),
-                    ptr(corr_buffer.ring_offsets),
-                    corr_row,
-                    ptr(d_cand_result),
-                ),
-                (
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR,
-                ),
-            )
-        else:
-            # multipolygon vs multipolygon
-            kernel = kernels["containment_mpoly_vs_mpoly"]
-            params = (
-                (
-                    ptr(d_family_rows),
-                    n_family,
-                    ptr(left_buf.x),
-                    ptr(left_buf.y),
-                    ptr(left_buf.geometry_offsets),
-                    ptr(left_buf.part_offsets),
-                    ptr(left_buf.ring_offsets),
-                    ptr(corr_buffer.x),
-                    ptr(corr_buffer.y),
-                    ptr(corr_buffer.geometry_offsets),
-                    ptr(corr_buffer.part_offsets),
-                    ptr(corr_buffer.ring_offsets),
-                    corr_row,
-                    ptr(d_cand_result),
-                ),
-                (
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
-                ),
-            )
+            d_family_rows = d_cand_fro[d_family_mask].astype(cp.int32)
+            left_buf = left_state.families[left_family]
 
-        # The kernel writes to a flat output buffer indexed by thread id
-        # (0..n_family-1).  We need to write to the correct positions in
-        # d_cand_result.  Allocate a temporary per-family output, launch,
-        # then scatter back.
-        d_family_out = cp.empty(n_family, dtype=cp.int32)
-        # Fix params to point to family-local output.
-        params_vals = list(params[0])
-        params_vals[-1] = ptr(d_family_out)
-        params = (tuple(params_vals), params[1])
+            # Select the kernel variant based on left family x corridor family.
+            if left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.POLYGON:
+                kernel = kernels["containment_poly_vs_poly"]
+                params = (
+                    (
+                        ptr(d_family_rows),
+                        n_family,
+                        ptr(left_buf.x),
+                        ptr(left_buf.y),
+                        ptr(left_buf.geometry_offsets),
+                        ptr(left_buf.ring_offsets),
+                        ptr(corr_buffer.x),
+                        ptr(corr_buffer.y),
+                        ptr(corr_buffer.geometry_offsets),
+                        ptr(corr_buffer.ring_offsets),
+                        corr_row,
+                        ptr(d_cand_result),  # temporary -- write to family slice below
+                    ),
+                    (
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
+                    ),
+                )
+            elif left_family is GeometryFamily.POLYGON and corr_family is GeometryFamily.MULTIPOLYGON:
+                kernel = kernels["containment_poly_vs_mpoly"]
+                params = (
+                    (
+                        ptr(d_family_rows),
+                        n_family,
+                        ptr(left_buf.x),
+                        ptr(left_buf.y),
+                        ptr(left_buf.geometry_offsets),
+                        ptr(left_buf.ring_offsets),
+                        ptr(corr_buffer.x),
+                        ptr(corr_buffer.y),
+                        ptr(corr_buffer.geometry_offsets),
+                        ptr(corr_buffer.part_offsets),
+                        ptr(corr_buffer.ring_offsets),
+                        corr_row,
+                        ptr(d_cand_result),
+                    ),
+                    (
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                    ),
+                )
+            elif left_family is GeometryFamily.MULTIPOLYGON and corr_family is GeometryFamily.POLYGON:
+                kernel = kernels["containment_mpoly_vs_poly"]
+                params = (
+                    (
+                        ptr(d_family_rows),
+                        n_family,
+                        ptr(left_buf.x),
+                        ptr(left_buf.y),
+                        ptr(left_buf.geometry_offsets),
+                        ptr(left_buf.part_offsets),
+                        ptr(left_buf.ring_offsets),
+                        ptr(corr_buffer.x),
+                        ptr(corr_buffer.y),
+                        ptr(corr_buffer.geometry_offsets),
+                        ptr(corr_buffer.ring_offsets),
+                        corr_row,
+                        ptr(d_cand_result),
+                    ),
+                    (
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                    ),
+                )
+            else:
+                # multipolygon vs multipolygon
+                kernel = kernels["containment_mpoly_vs_mpoly"]
+                params = (
+                    (
+                        ptr(d_family_rows),
+                        n_family,
+                        ptr(left_buf.x),
+                        ptr(left_buf.y),
+                        ptr(left_buf.geometry_offsets),
+                        ptr(left_buf.part_offsets),
+                        ptr(left_buf.ring_offsets),
+                        ptr(corr_buffer.x),
+                        ptr(corr_buffer.y),
+                        ptr(corr_buffer.geometry_offsets),
+                        ptr(corr_buffer.part_offsets),
+                        ptr(corr_buffer.ring_offsets),
+                        corr_row,
+                        ptr(d_cand_result),
+                    ),
+                    (
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32, KERNEL_PARAM_PTR,
+                    ),
+                )
 
-        grid, block = runtime.launch_config(kernel, n_family)
-        runtime.launch(kernel, grid=grid, block=block, params=params)
+            # The kernel writes to a flat output buffer indexed by thread id
+            # (0..n_family-1).  We need to write to the correct positions in
+            # d_cand_result.  Allocate a temporary per-family output, launch,
+            # then scatter back.
+            d_family_out = cp.empty(n_family, dtype=cp.int32)
+            # Fix params to point to family-local output.
+            params_vals = list(params[0])
+            params_vals[-1] = ptr(d_family_out)
+            params = (tuple(params_vals), params[1])
 
-        # Scatter family results back to candidate-wide array.
-        d_family_cand_positions = cp.flatnonzero(d_family_mask)
-        runtime.synchronize()
-        d_cand_result[d_family_cand_positions] = d_family_out
+            grid, block = runtime.launch_config(kernel, n_family)
+            runtime.launch(kernel, grid=grid, block=block, params=params)
+
+            # Scatter family results back to candidate-wide array.
+            d_family_cand_positions = cp.flatnonzero(d_family_mask)
+            runtime.synchronize()
+            d_cand_result[d_family_cand_positions] = d_family_out
 
     # ------------------------------------------------------------------
-    # Stage 3: Route results
+    # Stage 3: Route results by operation semantics
     # ------------------------------------------------------------------
-    d_cand_all_inside = d_cand_result == 1
-    n_contained = int(cp.sum(d_cand_all_inside))
+    # Determine which rows are contained (all vertices inside corridor).
+    n_contained = 0
+    d_contained_rows: cp.ndarray | None = None  # type: ignore[name-defined]
+    if d_cand_result is not None and d_bbox_indices is not None:
+        d_cand_all_inside = d_cand_result == 1
+        n_contained = int(cp.sum(d_cand_all_inside))
+        if n_contained > 0:
+            d_contained_cand_indices = cp.flatnonzero(d_cand_all_inside)
+            d_contained_rows = d_bbox_indices[d_contained_cand_indices].astype(cp.int64)
 
-    if n_contained == 0:
+    # Determine which rows are bbox-disjoint.
+    d_disjoint_rows: cp.ndarray | None = None  # type: ignore[name-defined]
+    if d_bbox_disjoint is not None and n_bbox_disjoint > 0:
+        d_disjoint_rows = cp.flatnonzero(d_bbox_disjoint).astype(cp.int64)
+
+    # --- Apply operation-specific routing ---
+    if how == "intersection":
+        # Contained -> pass-through; disjoint -> excluded (empty).
+        if n_contained == 0:
+            d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
+            return None, d_remainder_mask
+
+        bypass_oga = left.take(d_contained_rows)
         d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
-        return None, d_remainder_mask
+        d_remainder_mask[d_contained_rows] = False
+        n_remainder = int(cp.sum(d_remainder_mask))
+        n_bypassed = n_contained
 
-    # Map contained candidates back to left-array row indices.
-    d_contained_cand_indices = cp.flatnonzero(d_cand_all_inside)
-    d_contained_rows = d_bbox_indices[d_contained_cand_indices].astype(cp.int64)
+    elif how == "difference":
+        # Contained -> excluded (L-R = empty); disjoint -> pass-through (L-R = L).
+        # Both contained and disjoint rows are removed from the remainder.
+        d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
 
-    # Build contained OGA via device_take (zero-copy).
-    contained_oga = left.take(d_contained_rows)
+        # Exclude contained rows (result is empty -- don't include in output).
+        if d_contained_rows is not None:
+            d_remainder_mask[d_contained_rows] = False
 
-    # Build remainder mask.
-    d_remainder_mask = cp.ones(n_left, dtype=cp.bool_)
-    d_remainder_mask[d_contained_rows] = False
+        # Disjoint rows pass through as-is (L_i - R_j = L_i).
+        if d_disjoint_rows is not None:
+            d_remainder_mask[d_disjoint_rows] = False
 
-    n_remainder = int(cp.sum(d_remainder_mask))
+        n_bypassed = n_contained + n_bbox_disjoint
+
+        if n_bypassed == 0:
+            return None, d_remainder_mask
+
+        # Build bypass OGA: only disjoint rows (contained produce empty).
+        if d_disjoint_rows is not None and n_bbox_disjoint > 0:
+            bypass_oga = left.take(d_disjoint_rows)
+        else:
+            bypass_oga = None  # all bypassed rows were contained (empty result)
+
+        n_remainder = int(cp.sum(d_remainder_mask))
+
+    else:
+        # Should not reach here due to gate above.
+        return None, None
 
     record_dispatch_event(
         surface="geopandas.spatial_overlay",
         operation="containment_bypass",
         implementation="gpu_nvrtc_containment_bypass",
         reason=(
-            f"lyy.16 containment bypass: {n_contained}/{n_left} polygons fully "
-            f"inside corridor, {n_remainder} need overlay"
+            f"lyy.16 containment/disjointness bypass ({how}): "
+            f"{n_bypassed}/{n_left} polygons bypassed, "
+            f"{n_remainder} need overlay"
         ),
         detail=(
-            f"bbox_candidates={n_bbox_candidates}, "
-            f"contained={n_contained}, remainder={n_remainder}"
+            f"bbox_contained={n_bbox_candidates}, contained={n_contained}, "
+            f"bbox_disjoint={n_bbox_disjoint}, remainder={n_remainder}"
         ),
         selected=ExecutionMode.GPU,
     )
 
     if n_remainder == 0:
-        return contained_oga, None
+        if bypass_oga is None:
+            # All rows were contained in a difference -- empty result.
+            empty = from_shapely_geometries([shapely.Point()])
+            return empty.take(np.asarray([], dtype=np.int64)), None
+        return bypass_oga, None
 
-    return contained_oga, d_remainder_mask
+    return bypass_oga, d_remainder_mask
 
 
 # ---------------------------------------------------------------------------
@@ -5180,13 +5280,16 @@ def spatial_overlay_owned(
     )
 
     # Strategy-specific implementations.
-    # lyy.16: containment bypass for broadcast_right intersection.
+    # lyy.16/lyy.11: containment/disjointness bypass for broadcast_right.
+    #   intersection: contained -> pass-through, disjoint -> skip.
+    #   difference: contained -> empty, disjoint -> pass-through.
     # lyy.18: batched SH clip for boundary-crossing simple polygons.
     _containment_result: OwnedGeometryArray | None = None
     _containment_remainder_mask: cp.ndarray | None = None  # type: ignore[name-defined]
     _sh_clip_result: OwnedGeometryArray | None = None
 
-    if strategy.name == "broadcast_right" and how == "intersection" and cp is not None:
+    _bypass_eligible_ops = ("intersection", "difference")
+    if strategy.name == "broadcast_right" and how in _bypass_eligible_ops and cp is not None:
         try:
             _containment_result, _containment_remainder_mask = (
                 _containment_bypass_gpu(left_subset, right_subset, how)
@@ -5254,7 +5357,7 @@ def spatial_overlay_owned(
                 unique_left = unique_left[new_grp_indices]
 
         elif _containment_result is not None and _containment_remainder_mask is None:
-            # ALL polygons are fully contained — no overlay needed.
+            # ALL polygons were bypassed — no overlay needed.
             # Skip the entire per-group processing.
             result = _containment_result
             result.runtime_history.append(
@@ -5262,8 +5365,8 @@ def spatial_overlay_owned(
                     requested=requested,
                     selected=ExecutionMode.GPU,
                     reason=(
-                        f"spatial_overlay {how}: all {left_subset.row_count} "
-                        "polygons fully inside corridor (containment bypass)"
+                        f"spatial_overlay {how}: all polygons bypassed "
+                        f"(containment/disjointness bypass)"
                     ),
                 )
             )
@@ -5275,7 +5378,8 @@ def spatial_overlay_owned(
         # If so, batch-clip all SH-eligible remainder polygons in a single
         # polygon_intersection kernel launch, further reducing the number of
         # polygons that fall through to the expensive per-group overlay.
-        if left_subset.row_count > 0:
+        # SH clip is only applicable to intersection (clipping semantics).
+        if how == "intersection" and left_subset.row_count > 0:
             try:
                 clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_subset)
                 if clip_eligible:
@@ -5504,70 +5608,129 @@ def spatial_overlay_owned(
             # (L_i, R_0) pair.  Segments from pair i never interact with
             # segments from pair j.
             try:
-                if _is_broadcast_right_overlay and len(unique_left) > 0:
+                # lyy.22: Stream pool for per-group overlay.
+                #
+                # Create a bounded pool of CUDA streams and assign each
+                # overlay pair to a stream in round-robin order.  Each
+                # pair's GPU work (CuPy operations) is issued on its
+                # assigned stream.  Results are collected after all pairs
+                # are dispatched, with per-stream synchronization.
+                #
+                # IMPORTANT: non_blocking=False (default) is required.
+                # See _OVERLAY_STREAM_POOL_SIZE comment for rationale.
+                _n_groups = len(unique_left)
+                _pool_size = min(_OVERLAY_STREAM_POOL_SIZE, _n_groups)
+                _use_stream_pool = cp is not None and _n_groups > 1 and _pool_size > 0
+                if _use_stream_pool:
+                    _stream_pool = [
+                        cp.cuda.Stream(non_blocking=False)
+                        for _ in range(_pool_size)
+                    ]
+                    logger.debug(
+                        "lyy.22: created stream pool with %d streams "
+                        "for %d per-group iterations",
+                        len(_stream_pool), _n_groups,
+                    )
+                else:
+                    _stream_pool = None
+
+                if _is_broadcast_right_overlay and _n_groups > 0:
                     # Materialise right host state once outside the loop.
                     # _overlay_owned calls _ensure_host_state on both
                     # inputs; doing it here for right avoids N redundant
                     # no-op calls.
                     right_subset._ensure_host_state()
 
-                    for grp_idx in range(len(unique_left)):
+                    # lyy.22: Dispatch all pairs across the stream pool,
+                    # collecting (stream, result) futures for deferred
+                    # synchronization.
+                    _futures: list[tuple] = []
+                    for grp_idx in range(_n_groups):
                         start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
                         n_pairs = end - start
-                        left_row = left_subset.take(
-                            _xp.array([grp_idx], dtype=_xp.int64)
-                        )
-                        if n_pairs == 1:
-                            # Common case: one pair (L_i, R_0).
-                            # Call _overlay_owned directly, bypassing
-                            # binary_constructive_owned dispatch overhead.
-                            grp_result = _overlay_owned(
-                                left_row, right_subset,
-                                operation=how,
-                                dispatch_mode=_pairwise_mode,
-                                _cached_right_segments=_cached_right_segs,
+                        _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
+                        with (_stream if _stream is not None else contextlib.nullcontext()):
+                            left_row = left_subset.take(
+                                _xp.array([grp_idx], dtype=_xp.int64)
                             )
-                        else:
-                            # Multiple right neighbours: replicate left
-                            # row and use binary_constructive_owned for
-                            # the full dispatch (rare in broadcast_right).
+                            if n_pairs == 1:
+                                # Common case: one pair (L_i, R_0).
+                                # Call _overlay_owned directly, bypassing
+                                # binary_constructive_owned dispatch overhead.
+                                grp_result = _overlay_owned(
+                                    left_row, right_subset,
+                                    operation=how,
+                                    dispatch_mode=_pairwise_mode,
+                                    _cached_right_segments=_cached_right_segs,
+                                )
+                            else:
+                                # Multiple right neighbours: replicate left
+                                # row and use binary_constructive_owned for
+                                # the full dispatch (rare in broadcast_right).
+                                right_rows = right_subset.take(
+                                    right_subset_indices[start:end]
+                                )
+                                left_replicated = left_row.take(
+                                    _xp.zeros(n_pairs, dtype=_xp.int64)
+                                )
+                                grp_result = binary_constructive_owned(
+                                    how, left_replicated, right_rows,
+                                    dispatch_mode=_pairwise_mode,
+                                    _cached_right_segments=_cached_right_segs,
+                                )
+                            _futures.append((_stream, grp_result))
+
+                    # lyy.22: Synchronize per stream and collect results.
+                    # Each stream is synced at most once (the first time
+                    # we encounter a result from it), which guarantees
+                    # all prior work on that stream has completed.
+                    _synced_streams: set[int] = set()
+                    for _stream, grp_result in _futures:
+                        if _stream is not None:
+                            _sid = id(_stream)
+                            if _sid not in _synced_streams:
+                                _stream.synchronize()
+                                _synced_streams.add(_sid)
+                        result_parts.append(grp_result)
+
+                else:
+                    # General case: multiple right neighbours per group,
+                    # or non-broadcast_right strategy.
+                    _futures_gen: list[tuple] = []
+                    for grp_idx in range(_n_groups):
+                        start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
+                        n_pairs = end - start
+                        _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
+                        with (_stream if _stream is not None else contextlib.nullcontext()):
+                            left_row = left_subset.take(
+                                _xp.array([grp_idx], dtype=_xp.int64)
+                            )
                             right_rows = right_subset.take(
                                 right_subset_indices[start:end]
                             )
-                            left_replicated = left_row.take(
-                                _xp.zeros(n_pairs, dtype=_xp.int64)
-                            )
+                            # Replicate left row to match the number of
+                            # right neighbours.
+                            if n_pairs > 1:
+                                left_replicated = left_row.take(
+                                    _xp.zeros(n_pairs, dtype=_xp.int64)
+                                )
+                            else:
+                                left_replicated = left_row
                             grp_result = binary_constructive_owned(
                                 how, left_replicated, right_rows,
                                 dispatch_mode=_pairwise_mode,
                                 _cached_right_segments=_cached_right_segs,
                             )
-                        result_parts.append(grp_result)
-                else:
-                    # General case: multiple right neighbours per group,
-                    # or non-broadcast_right strategy.
-                    for grp_idx in range(len(unique_left)):
-                        start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
-                        n_pairs = end - start
-                        left_row = left_subset.take(
-                            _xp.array([grp_idx], dtype=_xp.int64)
-                        )
-                        right_rows = right_subset.take(
-                            right_subset_indices[start:end]
-                        )
-                        # Replicate left row to match the number of
-                        # right neighbours.
-                        if n_pairs > 1:
-                            left_replicated = left_row.take(
-                                _xp.zeros(n_pairs, dtype=_xp.int64)
-                            )
-                        else:
-                            left_replicated = left_row
-                        grp_result = binary_constructive_owned(
-                            how, left_replicated, right_rows,
-                            dispatch_mode=_pairwise_mode,
-                            _cached_right_segments=_cached_right_segs,
-                        )
+                            _futures_gen.append((_stream, grp_result))
+
+                    # lyy.22: Synchronize per stream and collect results.
+                    _synced_streams_gen: set[int] = set()
+                    for _stream, grp_result in _futures_gen:
+                        if _stream is not None:
+                            _sid = id(_stream)
+                            if _sid not in _synced_streams_gen:
+                                _stream.synchronize()
+                                _synced_streams_gen.add(_sid)
                         result_parts.append(grp_result)
             finally:
                 # lyy.15: Free cached right-side segments after all
@@ -5585,6 +5748,20 @@ def spatial_overlay_owned(
                     if _cached_right_segs.ring_indices is not None:
                         _rt.free(_cached_right_segs.ring_indices)
                     _cached_right_segs = None
+                # lyy.22: Destroy stream pool to avoid resource leaks.
+                # CuPy streams are lightweight (~1-2us each) but should
+                # still be cleaned up.
+                if _stream_pool is not None:
+                    for _s in _stream_pool:
+                        # CuPy streams do not require explicit destruction;
+                        # they are released when garbage collected.  We
+                        # synchronize each one to ensure all dispatched work
+                        # is complete before leaving the finally block.
+                        try:
+                            _s.synchronize()
+                        except Exception:
+                            pass
+                    _stream_pool = None
 
             if result_parts:
                 result_owned = OwnedGeometryArray.concat(result_parts)
