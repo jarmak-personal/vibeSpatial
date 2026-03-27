@@ -141,21 +141,18 @@ def disjoint_subset_union_all_owned(
                     selected=ExecutionMode.GPU,
                 )
                 return result
-            # Mixed families -- GPU path returns None, signal caller to
-            # fall back to Shapely.
-            record_fallback_event(
-                surface="constructive.disjoint_subset_union_all",
-                reason="mixed families not supported on GPU",
-                requested=dispatch_mode,
-                selected=ExecutionMode.CPU,
-                d2h_transfer=owned.residency is Residency.DEVICE,
-            )
-            return None
+            # Mixed families -- GPU path returns None; fall through to
+            # CPU path below.  Fallback event is recorded AFTER CPU
+            # execution succeeds, not before.
+            _gpu_fallback_reason = "mixed families not supported on GPU"
         except Exception:
             logger.debug(
                 "disjoint_subset_union_all GPU failed, falling back to CPU",
                 exc_info=True,
             )
+            _gpu_fallback_reason = "GPU exception"
+    else:
+        _gpu_fallback_reason = "GPU not selected"
 
     # CPU fallback -- try to assemble via host-side buffer concatenation.
     result = _disjoint_subset_union_all_cpu(owned)
@@ -170,7 +167,7 @@ def disjoint_subset_union_all_owned(
         )
         record_fallback_event(
             surface="constructive.disjoint_subset_union_all",
-            reason="CPU path used",
+            reason=_gpu_fallback_reason,
             requested=dispatch_mode,
             selected=ExecutionMode.CPU,
             d2h_transfer=owned.residency is Residency.DEVICE,

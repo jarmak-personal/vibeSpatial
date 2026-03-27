@@ -1217,11 +1217,10 @@ def _get_geometry_multipoint_gpu(
         d_eff_index = cp.full(n, eff_index, dtype=cp.int32)
 
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
-    valid_mask = cp.asnumpy(d_valid)
 
-    # For valid rows, extract the single coordinate
-    if not np.any(valid_mask):
-        # All out-of-bounds; return empty buffer
+    # Device-side early-exit check — avoid D2H transfer when all OOB
+    if not d_valid.any():
+        valid_mask = cp.asnumpy(d_valid)
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1247,6 +1246,9 @@ def _get_geometry_multipoint_gpu(
     # Build Point offsets: each point has exactly 1 coordinate
     d_out_geom_offsets = cp.arange(n_valid + 1, dtype=cp.int32)
     d_out_empty = cp.zeros(n_valid, dtype=cp.bool_)
+
+    # Transfer validity to host for caller's numpy indexing
+    valid_mask = cp.asnumpy(d_valid)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POINT,
@@ -1285,9 +1287,10 @@ def _get_geometry_multilinestring_gpu(
         d_eff_index = cp.full(n, eff_index, dtype=cp.int32)
 
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
-    valid_mask = cp.asnumpy(d_valid)
 
-    if not np.any(valid_mask):
+    # Device-side early-exit check — avoid D2H transfer when all OOB
+    if not d_valid.any():
+        valid_mask = cp.asnumpy(d_valid)
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1338,6 +1341,9 @@ def _get_geometry_multilinestring_gpu(
 
     d_out_empty = d_coord_lengths == 0
 
+    # Transfer validity to host for caller's numpy indexing
+    valid_mask = cp.asnumpy(d_valid)
+
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.LINESTRING,
         x=d_out_x,
@@ -1377,9 +1383,10 @@ def _get_geometry_multipolygon_gpu(
         d_eff_index = cp.full(n, eff_index, dtype=cp.int32)
 
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
-    valid_mask = cp.asnumpy(d_valid)
 
-    if not np.any(valid_mask):
+    # Device-side early-exit check — avoid D2H transfer when all OOB
+    if not d_valid.any():
+        valid_mask = cp.asnumpy(d_valid)
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1411,6 +1418,7 @@ def _get_geometry_multipolygon_gpu(
     total_rings = int(d_out_geom_offsets[-1])
 
     if total_rings == 0:
+        valid_mask = cp.asnumpy(d_valid)
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_out_ring_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1454,6 +1462,9 @@ def _get_geometry_multipolygon_gpu(
         d_out_y = device_buf.y[d_src_coord_indices]
 
     d_out_empty = d_ring_counts == 0
+
+    # Transfer validity to host for caller's numpy indexing
+    valid_mask = cp.asnumpy(d_valid)
 
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POLYGON,

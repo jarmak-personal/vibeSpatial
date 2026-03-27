@@ -300,7 +300,7 @@ def _launch_shortest_line_subgroup(
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
         "point", "linestring", "polygon",
-        "multipoint", "multilinestring", "multipolygon",
+        "multilinestring", "multipolygon",
     ),
     supports_mixed=True,
     tags=("cuda-python", "constructive", "shortest_line"),
@@ -361,11 +361,6 @@ def _shortest_line_gpu(
             all_ok = False
             continue
 
-        # MultiPoint not yet supported by the NVRTC kernel
-        if lf == GeometryFamily.MULTIPOINT or rf == GeometryFamily.MULTIPOINT:
-            all_ok = False
-            continue
-
         sub_mask = (valid_left_tags == lt) & (valid_right_tags == rt)
         sub_valid_pos = np.flatnonzero(sub_mask)
         sub_idx = valid_idx[sub_valid_pos]
@@ -415,21 +410,12 @@ def _shortest_line_gpu(
         runtime.free(d_idx)
 
     if not all_ok:
-        # Some family pairs weren't supported -- fall back to Shapely for
-        # those specific rows.
-        unsupported = np.isinf(out_ax) & both_valid
-        if np.any(unsupported):
-            unsup_idx = np.flatnonzero(unsupported)
-            left_shapely = np.asarray(left.to_shapely(), dtype=object)
-            right_shapely = np.asarray(right.to_shapely(), dtype=object)
-            for idx in unsup_idx:
-                sl = shapely.shortest_line(left_shapely[idx], right_shapely[idx])
-                if sl is not None and not sl.is_empty:
-                    coords = np.array(sl.coords)
-                    out_ax[idx] = coords[0, 0]
-                    out_ay[idx] = coords[0, 1]
-                    out_bx[idx] = coords[1, 0]
-                    out_by[idx] = coords[1, 1]
+        # Some family pairs were unsupported — reject the entire batch and
+        # let the dispatch system route to the CPU variant.
+        raise NotImplementedError(
+            "shortest_line GPU path encountered unsupported geometry families; "
+            "falling back to CPU variant"
+        )
 
     return _build_linestring_oga(out_ax, out_ay, out_bx, out_by, both_valid)
 

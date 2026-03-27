@@ -34,6 +34,25 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.residency import Residency
+
+# ---------------------------------------------------------------------------
+# Lightweight all-null OGA builder (no Shapely, no GPU required)
+# ---------------------------------------------------------------------------
+
+def _build_all_null_oga(row_count: int) -> OwnedGeometryArray:
+    """Build a host-resident OGA where every row is null.
+
+    No Shapely objects are created and no GPU allocation is needed.
+    """
+    return OwnedGeometryArray(
+        validity=np.zeros(row_count, dtype=bool),
+        tags=np.full(row_count, -1, dtype=np.int8),
+        family_row_offsets=np.full(row_count, -1, dtype=np.int32),
+        families={},
+        residency=Residency.HOST,
+    )
+
 
 # ---------------------------------------------------------------------------
 # GPU implementation — pure CuPy offset arithmetic (Tier 2)
@@ -348,12 +367,12 @@ def interiors_owned(
     """
     row_count = owned.row_count
     if row_count == 0:
-        return from_shapely_geometries([])
+        return _build_all_null_oga(0)
 
     # Short-circuit: no polygons means all-null output
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     if not np.any(owned.tags == poly_tag):
-        return from_shapely_geometries([None] * row_count)
+        return _build_all_null_oga(row_count)
 
     selection = plan_dispatch_selection(
         kernel_name="interior_rings",

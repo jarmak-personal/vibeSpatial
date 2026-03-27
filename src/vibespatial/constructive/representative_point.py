@@ -393,6 +393,107 @@ def _representative_point_kernels():
 _MAX_INTERSECTIONS_DEFAULT = 256
 
 
+def _build_point_oga_metadata(
+    row_count: int,
+    validity: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build tags and family_row_offsets arrays for a Point OGA."""
+    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
+    out_tags[~validity] = -1
+    out_family_row_offsets = np.arange(row_count, dtype=np.int32)
+    out_family_row_offsets[~validity] = -1
+    return out_tags, out_family_row_offsets
+
+
+def _build_device_resident_point_output_from_device(
+    d_cx,  # cupy device array
+    d_cy,  # cupy device array
+    validity: np.ndarray,
+) -> OwnedGeometryArray:
+    """Build a device-resident Point OGA from CuPy device coordinate arrays.
+
+    Zero D2H transfer — device arrays are used directly.
+    """
+    import cupy as cp
+
+    from vibespatial.geometry.owned import (
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+
+    row_count = int(d_cx.size)
+    d_geom_offsets = cp.arange(row_count + 1, dtype=cp.int32)
+    d_empty = cp.zeros(row_count, dtype=cp.uint8)
+
+    out_tags, out_family_row_offsets = _build_point_oga_metadata(
+        row_count, validity,
+    )
+
+    device_families = {
+        GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.POINT,
+            x=d_cx,
+            y=d_cy,
+            geometry_offsets=d_geom_offsets,
+            empty_mask=d_empty,
+        ),
+    }
+
+    return build_device_resident_owned(
+        device_families=device_families,
+        row_count=row_count,
+        tags=out_tags,
+        validity=validity.copy(),
+        family_row_offsets=out_family_row_offsets,
+    )
+
+
+def _build_device_resident_point_output_from_host(
+    cx: np.ndarray,
+    cy: np.ndarray,
+    validity: np.ndarray,
+) -> OwnedGeometryArray:
+    """Build a device-resident Point OGA by uploading host coordinate arrays.
+
+    Used when GPU is selected but the coordinates were computed on host
+    (e.g. point-only or linestring-only inputs with no polygon rows).
+    """
+    import cupy as cp
+
+    from vibespatial.geometry.owned import (
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+
+    row_count = len(cx)
+    device_x = cp.asarray(cx)
+    device_y = cp.asarray(cy)
+    d_geom_offsets = cp.arange(row_count + 1, dtype=cp.int32)
+    d_empty = cp.zeros(row_count, dtype=cp.uint8)
+
+    out_tags, out_family_row_offsets = _build_point_oga_metadata(
+        row_count, validity,
+    )
+
+    device_families = {
+        GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.POINT,
+            x=device_x,
+            y=device_y,
+            geometry_offsets=d_geom_offsets,
+            empty_mask=d_empty,
+        ),
+    }
+
+    return build_device_resident_owned(
+        device_families=device_families,
+        row_count=row_count,
+        tags=out_tags,
+        validity=validity.copy(),
+        family_row_offsets=out_family_row_offsets,
+    )
+
+
 def representative_point_owned(
     owned: OwnedGeometryArray,
     *,
@@ -410,6 +511,9 @@ def representative_point_owned(
        is outside (concave polygons), a GPU horizontal-ray-intersection
        kernel finds an interior point on-device without any Shapely
        fallback or D2H transfer.
+
+    When the GPU path is active, the output OGA is device-resident — no
+    D2H transfer occurs for the coordinate data.
     """
     from vibespatial.runtime import has_gpu_runtime
     from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -442,14 +546,9 @@ def representative_point_owned(
     _fill_linestring_representatives(owned, tags, family_row_offsets, cx, cy)
 
     # --- Polygons / MultiPolygons: centroid + PIP + ray fallback ---
-    _fill_polygon_representatives(
+    device_result = _fill_polygon_representatives(
         owned, tags, family_row_offsets, cx, cy, use_gpu=use_gpu,
     )
-
-    # Handle null rows (validity=False)
-    null_mask = ~owned.validity
-    cx[null_mask] = np.nan
-    cy[null_mask] = np.nan
 
     selected = ExecutionMode.GPU if use_gpu else ExecutionMode.CPU
     record_dispatch_event(
@@ -461,6 +560,33 @@ def representative_point_owned(
         selected=selected,
     )
 
+    if use_gpu and device_result is not None:
+        # GPU path produced device arrays that already contain all rows
+        # (point/linestring values from the host upload, polygon values
+        # from the kernel).  Apply null masking on device and build
+        # device-resident output — zero D2H transfer.
+        import cupy as cp
+
+        d_cx, d_cy = device_result
+        null_mask = ~owned.validity
+        if null_mask.any():
+            d_null = cp.asarray(null_mask)
+            d_cx[d_null] = cp.nan
+            d_cy[d_null] = cp.nan
+        return _build_device_resident_point_output_from_device(
+            d_cx, d_cy, owned.validity,
+        )
+
+    # CPU path or GPU path without polygon rows: host arrays are authoritative
+    null_mask = ~owned.validity
+    cx[null_mask] = np.nan
+    cy[null_mask] = np.nan
+
+    if use_gpu:
+        # GPU was selected but no polygon rows — still build device-resident
+        return _build_device_resident_point_output_from_host(
+            cx, cy, owned.validity,
+        )
     return point_owned_from_xy(cx, cy)
 
 
@@ -537,15 +663,24 @@ def _fill_polygon_representatives(
     cy: np.ndarray,
     *,
     use_gpu: bool = False,
-) -> None:
-    """Polygons: GPU centroid + GPU PIP check + GPU ray-intersection fallback."""
+) -> tuple | None:
+    """Polygons: GPU centroid + GPU PIP check + GPU ray-intersection fallback.
+
+    When *use_gpu* is True and the GPU kernel runs, returns ``(d_cx, d_cy)``
+    — CuPy device arrays containing the final representative-point
+    coordinates for ALL rows (point/linestring values come from the host
+    upload, polygon values from the kernel).  The caller should build the
+    output OGA directly from these device arrays to avoid a D2H round-trip.
+
+    Returns ``None`` on the CPU path or when there are no polygon rows.
+    """
     from .polygon import polygon_centroids_owned
 
     poly_tag = FAMILY_TAGS.get(GeometryFamily.POLYGON)
     mpoly_tag = FAMILY_TAGS.get(GeometryFamily.MULTIPOLYGON)
     poly_mask = np.isin(tags, [t for t in [poly_tag, mpoly_tag] if t is not None])
     if not np.any(poly_mask):
-        return
+        return None
 
     # Step 1: Compute centroids (reuses existing GPU kernel when available)
     centroid_cx, centroid_cy = polygon_centroids_owned(owned)
@@ -558,9 +693,10 @@ def _fill_polygon_representatives(
     # Step 3: PIP check + ray-intersection fallback for concave polygons.
     # The NVRTC kernel handles both PIP and fallback in a single launch.
     if use_gpu:
-        _fill_polygon_representatives_gpu(owned, tags, family_row_offsets, cx, cy)
+        return _fill_polygon_representatives_gpu(owned, tags, family_row_offsets, cx, cy)
     else:
         _fill_polygon_representatives_cpu(owned, tags, family_row_offsets, cx, cy)
+        return None
 
 
 def _fill_polygon_representatives_gpu(
@@ -569,8 +705,14 @@ def _fill_polygon_representatives_gpu(
     family_row_offsets: np.ndarray,
     cx: np.ndarray,
     cy: np.ndarray,
-) -> None:
-    """GPU path: NVRTC kernel for PIP check + ray-intersection fallback."""
+) -> tuple:
+    """GPU path: NVRTC kernel for PIP check + ray-intersection fallback.
+
+    Returns ``(d_cx, d_cy)`` — CuPy device arrays with final coordinates.
+    The host arrays ``cx``/``cy`` (with point/linestring/centroid values)
+    are uploaded to device; the kernel modifies polygon rows in-place.
+    The device arrays are returned without copying back to host.
+    """
     import cupy as cp
 
     from vibespatial.cuda._runtime import (
@@ -731,9 +873,9 @@ def _fill_polygon_representatives_gpu(
                     shared_mem_bytes=shared_mem_bytes,
                 )
 
-    # Copy results back from device
-    cp.asnumpy(d_cx, out=cx)
-    cp.asnumpy(d_cy, out=cy)
+    # Return device arrays — caller builds device-resident OGA directly.
+    # No D2H transfer: the kernel-modified d_cx/d_cy stay on device.
+    return d_cx, d_cy
 
 
 def _compute_max_intersections(ring_offsets: np.ndarray) -> int:

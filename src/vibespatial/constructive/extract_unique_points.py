@@ -358,21 +358,19 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # --- Build output MultiPoint OGA ---
     # Output geometry_offsets: prefix sums of unique counts per valid row,
     # but we need offsets for ALL rows (including nulls).
-    # Build full-size geometry offsets: null/invalid rows get zero-length spans.
-    h_unique_counts = cp.asnumpy(d_unique_counts)
+    # Build full-size geometry offsets on device: null/invalid rows get
+    # zero-length spans.  No D2H round-trip.
+    d_valid_rows = cp.asarray(valid_rows_host)
+    d_full_counts = cp.zeros(row_count + 1, dtype=cp.int32)
+    d_full_counts[d_valid_rows + 1] = d_unique_counts
+    cp.cumsum(d_full_counts, out=d_full_counts)
+    d_out_geom_offsets = d_full_counts
 
-    out_geom_offsets = np.zeros(row_count + 1, dtype=np.int32)
-    out_geom_offsets[valid_rows_host + 1] = h_unique_counts
-    np.cumsum(out_geom_offsets, out=out_geom_offsets)
-
-    d_out_geom_offsets = runtime.from_host(out_geom_offsets)
-
-    # Empty mask: rows with zero unique coords are empty
-    mp_empty = np.zeros(row_count, dtype=np.uint8)
-    zero_count_mask = h_unique_counts == 0
-    if zero_count_mask.any():
-        mp_empty[valid_rows_host[zero_count_mask]] = 1
-    d_mp_empty = runtime.from_host(mp_empty)
+    # Empty mask on device: rows with zero unique coords are empty
+    d_mp_empty = cp.zeros(row_count, dtype=cp.uint8)
+    d_zero_count = d_unique_counts == 0
+    if int(d_zero_count.any()):
+        d_mp_empty[d_valid_rows[d_zero_count]] = 1
 
     # Build output metadata arrays
     out_validity = validity.copy()

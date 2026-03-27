@@ -416,27 +416,12 @@ def _shared_paths_gpu(
             results[row_idx] = GeometryCollection([fwd, bwd])
 
     if not all_ok:
-        # Some rows had unsupported family pairs -- fall back to Shapely
-        unsupported_mask = np.zeros(n, dtype=bool)
-        for i in valid_idx:
-            lt_val = left_tags[i]
-            rt_val = right_tags[i]
-            lf = TAG_FAMILIES[lt_val] if lt_val in TAG_FAMILIES else None
-            rf = TAG_FAMILIES[rt_val] if rt_val in TAG_FAMILIES else None
-            if lf not in (_LS, _MLS) or rf not in (_LS, _MLS):
-                unsupported_mask[i] = True
-
-        if np.any(unsupported_mask):
-            unsup_idx = np.flatnonzero(unsupported_mask)
-            left_shapely = np.asarray(left.to_shapely(), dtype=object)
-            right_shapely = np.asarray(right.to_shapely(), dtype=object)
-            for idx in unsup_idx:
-                try:
-                    sp = shapely.shared_paths(left_shapely[idx], right_shapely[idx])
-                    if sp is not None:
-                        results[idx] = sp
-                except Exception:
-                    pass  # Keep empty GC
+        # Some rows had unsupported family pairs — reject the entire batch
+        # and let the dispatch system route to the CPU variant.
+        raise NotImplementedError(
+            "shared_paths GPU path encountered unsupported geometry families; "
+            "falling back to CPU variant"
+        )
 
     return results
 

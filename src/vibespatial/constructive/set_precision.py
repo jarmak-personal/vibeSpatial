@@ -152,9 +152,14 @@ def _set_precision_gpu(owned: OwnedGeometryArray, grid_size: float, mode: str):
     mv_result = make_valid_owned(owned=deduped, dispatch_mode=ExecutionMode.GPU)
     if mv_result.owned is not None:
         return mv_result.owned
-    # Fallback: make_valid returned Shapely geometries (shouldn't happen for
-    # device-resident input, but handle gracefully)
-    return from_shapely_geometries(list(mv_result.geometries))
+    # make_valid should always produce OGA for device-resident input.
+    # If it returns Shapely objects, that indicates a bug in the pipeline --
+    # raise instead of silently ingesting a D2H+H2D roundtrip.
+    raise RuntimeError(
+        "make_valid_owned returned Shapely objects for device-resident input "
+        "in set_precision GPU path; this is unexpected and indicates a "
+        "pipeline bug"
+    )
 
 
 # ---------------------------------------------------------------------------
