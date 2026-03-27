@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import numbers
 import operator
 import typing
@@ -74,6 +75,8 @@ if HAS_PYPROJ:
     TransformerFromCRS = lru_cache(Transformer.from_crs)
 
 from vibeproj import Transformer as _VibeTransformer
+
+logger = logging.getLogger(__name__)
 
 
 def _make_transform_func(src_crs, dst_crs):
@@ -1078,6 +1081,13 @@ class GeometryArray(ExtensionArray):
         return GeometryArray(shapely.point_on_surface(self._data), crs=self.crs)
 
     def minimum_bounding_circle(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.minimum_bounding_circle import (
+                minimum_bounding_circle_owned,
+            )
+
+            result_owned = minimum_bounding_circle_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.minimum_bounding_circle(self._data), crs=self.crs)
 
     def maximum_inscribed_circle(self, tolerance) -> GeometryArray:
@@ -1087,6 +1097,12 @@ class GeometryArray(ExtensionArray):
         )
 
     def minimum_bounding_radius(self):
+        if self._owned is not None:
+            from vibespatial.constructive.minimum_bounding_circle import (
+                minimum_bounding_radius_owned,
+            )
+
+            return minimum_bounding_radius_owned(self._owned)
         return shapely.minimum_bounding_radius(self._data)
 
     def minimum_clearance(self):
@@ -1393,6 +1409,23 @@ class GeometryArray(ExtensionArray):
         )
 
     def snap(self, other, tolerance) -> GeometryArray:
+        if self._owned is not None and isinstance(other, GeometryArray):
+            if len(self) != len(other):
+                msg = (
+                    "Lengths of inputs do not match. "
+                    f"Left: {len(self)}, Right: {len(other)}"
+                )
+                raise ValueError(msg)
+            if not _check_crs(self, other):
+                _crs_mismatch_warn(self, other, stacklevel=7)
+            from vibespatial.constructive.snap import snap_owned
+
+            other_owned = other.to_owned()
+            result = snap_owned(self._owned, other_owned, tolerance)
+            if isinstance(result, OwnedGeometryArray):
+                return GeometryArray.from_owned(result, crs=self.crs)
+            # CPU path returns numpy array of Shapely objects
+            return GeometryArray(result, crs=self.crs)
         return GeometryArray(
             self._binary_method("snap", self, other, tolerance=tolerance), crs=self.crs
         )
@@ -1656,6 +1689,25 @@ class GeometryArray(ExtensionArray):
         return shapely.line_locate_point(self._data, other, normalized=normalized)
 
     def relate(self, other):
+        if self._owned is not None:
+            from vibespatial.predicates.relate import relate_de9im
+
+            if isinstance(other, GeometryArray):
+                other_owned = other.to_owned()
+            else:
+                other_owned = from_shapely_geometries(
+                    list(other) if isinstance(other, np.ndarray) else [other]
+                )
+
+            if other_owned is not None:
+                try:
+                    return relate_de9im(self._owned, other_owned)
+                except Exception:
+                    logger.debug(
+                        "GPU relate_de9im failed, falling back to Shapely",
+                        exc_info=True,
+                    )
+
         if isinstance(other, GeometryArray):
             other = other._data
         return shapely.relate(self._data, other)
