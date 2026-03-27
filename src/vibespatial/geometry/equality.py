@@ -189,9 +189,9 @@ def _geom_equals_exact_gpu(
         if d_family_rows.shape[0] == 0:
             continue
 
-        # Get device buffers for this family
-        left_buf = left_state.families.get(family_key)
-        right_buf = right_state.families.get(family_key)
+        # Get device buffers for this family (dict lookup, not CuPy .get())
+        left_buf = left_state.families[family_key] if family_key in left_state.families else None
+        right_buf = right_state.families[family_key] if family_key in right_state.families else None
         if left_buf is None or right_buf is None:
             continue
 
@@ -237,9 +237,24 @@ def geom_equals_owned(
 ) -> np.ndarray:
     """Element-wise topological geometry equality.
 
-    Normalizes both inputs then compares with tolerance 1e-12.
-    Returns a bool array of shape (row_count,).
+    Topological equality = structural equality after normalization.
+    Composes ``normalize_owned`` + ``geom_equals_exact_owned(tolerance=1e-12)``.
+
+    Both sub-operations have GPU paths, so the full pipeline runs on device
+    when GPU is available.  Zero D2H transfers until the final bool array
+    is returned by ``geom_equals_exact_owned``.
+
+    Returns a bool array of shape (row_count,).  Null geometries always
+    compare as False (Shapely convention).
     """
+    row_count = left.row_count
+    if row_count != right.row_count:
+        raise ValueError(
+            f"left and right must have same row count, got {row_count} vs {right.row_count}"
+        )
+    if row_count == 0:
+        return np.empty(0, dtype=bool)
+
     from vibespatial.constructive.normalize import normalize_owned
 
     left_norm = normalize_owned(left, dispatch_mode=dispatch_mode)

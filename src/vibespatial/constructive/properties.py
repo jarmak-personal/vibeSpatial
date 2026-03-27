@@ -840,6 +840,196 @@ def is_closed_owned(owned: OwnedGeometryArray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# is_ring_owned — fused closure + simplicity test (Tier 2: composition)
+# ---------------------------------------------------------------------------
+
+
+def is_ring_owned(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> np.ndarray:
+    """Check if geometries are valid rings (closed AND simple).
+
+    A geometry is a ring if it is a closed, simple LineString.
+    Non-LineString types (Point, Polygon, Multi*) always return False,
+    matching Shapely semantics.
+
+    Algorithm:
+    1. Check closure via ``is_closed_owned`` (first == last coordinate).
+    2. For closed LineStrings only, check simplicity with ring-aware
+       adjacency (``is_ring=1``): the first and last segments share an
+       endpoint by definition, so they are treated as adjacent and not
+       flagged as a self-intersection.
+    3. ``is_ring = is_closed AND is_simple_ring_aware`` for LineStrings;
+       False for all other families.
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        The geometry array to check.
+    dispatch_mode : ExecutionMode or str
+        GPU/CPU/AUTO execution mode.
+    precision : PrecisionMode or str
+        Precision dispatch mode (ADR-0002). PREDICATE class defaults to fp64.
+
+    Returns
+    -------
+    np.ndarray of bool
+        Per-geometry ring flags. True only for closed, simple LineStrings.
+    """
+    row_count = owned.row_count
+    if row_count == 0:
+        return np.array([], dtype=bool)
+
+    selection = plan_dispatch_selection(
+        kernel_name="is_ring",
+        kernel_class=KernelClass.PREDICATE,
+        row_count=row_count,
+        requested_mode=dispatch_mode,
+    )
+
+    # Start with all False -- only closed, simple LineStrings become True.
+    result = np.zeros(row_count, dtype=bool)
+
+    tags = owned.tags
+    linestring_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
+    linestring_mask = tags == linestring_tag
+
+    # Fast exit: no LineStrings in the array -> all False.
+    if not np.any(linestring_mask):
+        record_dispatch_event(
+            surface="geopandas.array.is_ring",
+            operation="is_ring",
+            requested=dispatch_mode,
+            selected=selection.selected,
+            implementation="is_ring_composed",
+            reason=selection.reason,
+            detail="no linestrings -- all False",
+        )
+        return result
+
+    # Step 1: closure check (reuse existing GPU/CPU kernel).
+    closed = is_closed_owned(owned)
+
+    # Candidate rows: LineStrings that are closed AND valid.
+    candidates = linestring_mask & closed & owned.validity
+    if not np.any(candidates):
+        record_dispatch_event(
+            surface="geopandas.array.is_ring",
+            operation="is_ring",
+            requested=dispatch_mode,
+            selected=selection.selected,
+            implementation="is_ring_composed",
+            reason=selection.reason,
+            detail="no closed linestrings -- all False",
+        )
+        return result
+
+    # Step 2: ring-aware simplicity check for closed LineStrings.
+    # Uses is_ring=1 so first-last segment adjacency is skipped.
+    family = GeometryFamily.LINESTRING
+    buf = owned.families[family]
+    family_row_offsets_arr = owned.family_row_offsets
+
+    global_rows = np.flatnonzero(candidates)
+    family_rows = family_row_offsets_arr[global_rows]
+
+    actually_used_gpu = False
+    use_gpu = (
+        selection.selected is ExecutionMode.GPU
+        and cp is not None
+        and owned.device_state is not None
+        and family in owned.device_state.families
+    )
+
+    if use_gpu:
+        try:
+            from vibespatial.constructive.validity import (
+                _launch_is_simple_kernel,
+            )
+
+            d_buf = owned.device_state.families[family]
+            runtime = get_cuda_runtime()
+            total_spans = int(d_buf.geometry_offsets.shape[0]) - 1
+
+            if total_spans > 0:
+                # Launch simplicity kernel with is_ring=1 for ring-aware
+                # adjacency (first-last segment pair treated as adjacent).
+                d_span_result = _launch_is_simple_kernel(
+                    runtime,
+                    d_buf.x,
+                    d_buf.y,
+                    d_buf.geometry_offsets,
+                    total_spans,
+                    is_ring=1,
+                )
+                try:
+                    d_family_rows = cp.asarray(family_rows)
+                    d_span_result_cp = cp.asarray(d_span_result)
+                    h_result = cp.asnumpy(
+                        d_span_result_cp[d_family_rows]
+                    ).astype(bool)
+                    result[global_rows] = h_result
+                finally:
+                    runtime.free(d_span_result)
+            else:
+                result[global_rows] = True
+
+            actually_used_gpu = True
+        except Exception:
+            actually_used_gpu = False  # fall through to CPU
+
+    if not actually_used_gpu:
+        # CPU fallback: ring-aware simplicity check.
+        from vibespatial.constructive.validity import (
+            _linestring_self_intersects,
+        )
+
+        x = buf.x
+        y = buf.y
+        offsets = buf.geometry_offsets
+        for gi, fr in zip(global_rows, family_rows):
+            start = int(offsets[fr])
+            end = int(offsets[fr + 1])
+            if start == end:
+                result[gi] = True
+                continue
+            # is_ring=True: treat first-last as adjacent (closure endpoint).
+            if not _linestring_self_intersects(
+                x, y, start, end, is_ring=True
+            ):
+                result[gi] = True
+
+        if selection.selected is ExecutionMode.GPU:
+            record_fallback_event(
+                surface="geopandas.array.is_ring",
+                reason="GPU simplicity kernel failed, fell back to CPU",
+                d2h_transfer=True,
+            )
+
+    impl = (
+        "is_ring_gpu_composed"
+        if actually_used_gpu
+        else "is_ring_cpu_composed"
+    )
+    record_dispatch_event(
+        surface="geopandas.array.is_ring",
+        operation="is_ring",
+        requested=dispatch_mode,
+        selected=(
+            ExecutionMode.GPU if actually_used_gpu else ExecutionMode.CPU
+        ),
+        implementation=impl,
+        reason=selection.reason,
+        detail="fused is_closed + ring-aware is_simple composition",
+    )
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # is_ccw_owned (Tier 1: NVRTC kernel)
 # ---------------------------------------------------------------------------
 

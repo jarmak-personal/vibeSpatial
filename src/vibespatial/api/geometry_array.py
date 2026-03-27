@@ -774,6 +774,10 @@ class GeometryArray(ExtensionArray):
 
     @property
     def is_ring(self):
+        if self._owned is not None:
+            from vibespatial.constructive.properties import is_ring_owned
+
+            return is_ring_owned(self._owned)
         return shapely.is_ring(self._data)
 
     @property
@@ -1059,6 +1063,11 @@ class GeometryArray(ExtensionArray):
         )
 
     def representative_point(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.representative_point import representative_point_owned
+
+            result_owned = representative_point_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.point_on_surface(self._data), crs=self.crs)
 
     def minimum_bounding_circle(self) -> GeometryArray:

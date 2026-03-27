@@ -377,14 +377,10 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def is_ring(self) -> np.ndarray:
-        import shapely
+        """Ring test — GPU-accelerated from owned coordinate buffers, no Shapely."""
+        from vibespatial.constructive.properties import is_ring_owned
 
-        self._owned._record(
-            DiagnosticKind.MATERIALIZATION,
-            "DeviceGeometryArray.is_ring: Shapely materialization required",
-            visible=True,
-        )
-        return shapely.is_ring(self._ensure_shapely_cache())
+        return is_ring_owned(self._owned)
 
     @property
     def is_closed(self) -> np.ndarray:

@@ -109,11 +109,11 @@ _DE9IM_TAGS = _LINE_TAGS + _REGION_TAGS
 _DE9IM_PREDICATES = frozenset({
     "intersects", "contains", "within", "touches",
     "covers", "covered_by", "overlaps", "disjoint",
-    "contains_properly", "equals",
+    "contains_properly",
 })
 
 
-_SPECIAL_PREDICATES = frozenset({"equals_exact", "equals_identical"})
+_SPECIAL_PREDICATES = frozenset({"equals", "equals_exact", "equals_identical"})
 
 
 def supports_binary_predicate(name: str) -> bool:
@@ -1249,6 +1249,77 @@ def evaluate_binary_predicate(
     )
 
 
+def _evaluate_geopandas_equals(
+    left: np.ndarray | OwnedGeometryArray,
+    right: object | np.ndarray | OwnedGeometryArray,
+    **kwargs: Any,
+) -> np.ndarray:
+    """Dispatch topological equals through the normalize-then-compare path.
+
+    Topological equality = structural equality after normalization.  Both
+    normalize and equals_exact already have GPU paths.  This function
+    composes them: normalize both inputs, then compare with tolerance 1e-12.
+
+    For scalar right operands, falls back to Shapely's vectorized C path
+    to avoid O(N) Python-side geometry duplication.
+    """
+    from vibespatial.geometry.equality import geom_equals_owned
+    from vibespatial.runtime import get_requested_mode
+
+    # Scalar right: fall back to Shapely vectorized equals which
+    # handles scalar broadcasting natively in C, avoiding O(N) Python-side
+    # geometry duplication.
+    is_scalar = not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple))
+    if is_scalar:
+        left_shapely = (
+            np.asarray(left.to_shapely(), dtype=object)
+            if isinstance(left, OwnedGeometryArray)
+            else np.asarray(left, dtype=object)
+        )
+        result = shapely.equals(left_shapely, right)
+        record_dispatch_event(
+            surface="geopandas.array.equals",
+            operation="equals",
+            implementation="shapely_scalar_broadcast",
+            reason="scalar right-hand operand; Shapely vectorized C path",
+            detail=f"rows={len(left_shapely)}",
+            selected=ExecutionMode.CPU,
+        )
+        record_fallback_event(
+            surface="geopandas.array.equals",
+            reason="scalar right-hand operand requires Shapely broadcast",
+            detail=f"rows={len(left_shapely)}",
+            pipeline="predicate",
+            d2h_transfer=isinstance(left, OwnedGeometryArray),
+        )
+        return result.astype(bool, copy=False)
+
+    # Coerce inputs to OwnedGeometryArray.
+    if isinstance(left, OwnedGeometryArray):
+        left_owned = left
+    else:
+        left_owned = from_shapely_geometries(list(left) if not isinstance(left, list) else left)
+
+    if isinstance(right, OwnedGeometryArray):
+        right_owned = right
+    else:
+        right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
+
+    dispatch_mode = get_requested_mode()
+    result = geom_equals_owned(
+        left_owned, right_owned, dispatch_mode=dispatch_mode,
+    )
+    record_dispatch_event(
+        surface="geopandas.array.equals",
+        operation="equals",
+        implementation="geom_equals_owned",
+        reason="normalize-then-compare composition for topological equality",
+        detail=f"rows={left_owned.row_count}",
+        selected=dispatch_mode,
+    )
+    return result.astype(bool, copy=False)
+
+
 def _evaluate_geopandas_equals_exact(
     left: np.ndarray | OwnedGeometryArray,
     right: object | np.ndarray | OwnedGeometryArray,
@@ -1391,6 +1462,12 @@ def evaluate_geopandas_binary_predicate(
                 pipeline="predicate",
             )
             return None
+
+        # --- equals (topological) special path ---
+        # Topological equality = structural equality after normalization.
+        # Routes to normalize-then-compare composition in equality.py.
+        if predicate == "equals":
+            return _evaluate_geopandas_equals(left, right, **kwargs)
 
         # --- equals_exact special path ---
         # Tolerance invalidates the standard bbox coarse filter (two
