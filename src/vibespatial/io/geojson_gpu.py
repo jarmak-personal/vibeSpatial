@@ -8,6 +8,12 @@ design per vibeSpatial GPU memory policy).
 Supports homogeneous and mixed Point, LineString, and Polygon files.
 Multi-geometry types (MultiPoint, MultiLineString, MultiPolygon) and
 chunked processing for files exceeding GPU memory are deferred.
+
+Shared parsing primitives (quote parity, bracket depth, number boundary
+detection, ASCII float parsing, span masking) are imported from
+``vibespatial.io.gpu_parse``.  GeoJSON-specific kernels (coordinate key
+search, type detection, ring counting, offset scattering, feature
+boundaries) remain in this module.
 """
 from __future__ import annotations
 
@@ -31,6 +37,13 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     _device_gather_offset_slices,
 )
+from vibespatial.io.gpu_parse.numeric import (
+    extract_number_positions,
+    number_boundaries,
+    parse_ascii_floats,
+)
+from vibespatial.io.gpu_parse.pattern import mark_spans
+from vibespatial.io.gpu_parse.structural import bracket_depth, quote_parity
 
 from .pylibcudf import _build_device_mixed_owned, _build_device_single_family_owned
 
@@ -43,86 +56,8 @@ except ModuleNotFoundError:  # pragma: no cover
 KERNEL_PARAM_I64 = ctypes.c_longlong
 
 # ---------------------------------------------------------------------------
-# Kernel sources (all Tier 1 NVRTC)
+# GeoJSON-specific kernel sources (Tier 1 NVRTC)
 # ---------------------------------------------------------------------------
-
-_CLASSIFY_SOURCE = r"""
-extern "C" __global__ void classify_bytes(
-    const unsigned char* __restrict__ input,
-    unsigned char* __restrict__ output,
-    long long n
-) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    unsigned char b = input[idx];
-    unsigned char cls;
-
-    switch (b) {
-        case '{': cls = 1; break;
-        case '}': cls = 2; break;
-        case '[': cls = 3; break;
-        case ']': cls = 4; break;
-        case '"': cls = 5; break;
-        case ':': cls = 6; break;
-        case ',': cls = 7; break;
-        case '-': case '+': case '.':
-        case 'e': case 'E':
-        case '0': case '1': case '2': case '3': case '4':
-        case '5': case '6': case '7': case '8': case '9':
-            cls = 8; break;
-        default: cls = 0; break;
-    }
-    output[idx] = cls;
-}
-"""
-
-_DEPTH_DELTAS_SOURCE = r"""
-extern "C" __global__ void compute_depth_deltas(
-    const unsigned char* __restrict__ input,
-    const unsigned char* __restrict__ quote_parity,
-    signed char* __restrict__ deltas,
-    long long n
-) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    signed char d = 0;
-    if (quote_parity[idx] == 0) {
-        unsigned char b = input[idx];
-        if (b == '{' || b == '[') d = 1;
-        else if (b == '}' || b == ']') d = -1;
-    }
-    deltas[idx] = d;
-}
-"""
-
-_QUOTE_SOURCE = r"""
-extern "C" __global__ void quote_toggle(
-    const unsigned char* __restrict__ input,
-    unsigned char* __restrict__ output,
-    long long n
-) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) {
-        return;
-    }
-    unsigned char b = input[idx];
-    if (b != '"') {
-        output[idx] = 0;
-        return;
-    }
-    // Check for backslash escape: count consecutive backslashes before this quote
-    int backslash_count = 0;
-    long long j = idx - 1;
-    while (j >= 0 && input[j] == '\\') {
-        backslash_count++;
-        j--;
-    }
-    // Quote is escaped if preceded by odd number of backslashes
-    output[idx] = (backslash_count % 2 == 0) ? 1 : 0;
-}
-"""
 
 _COORD_KEY_SOURCE = r"""
 extern "C" __global__ void find_coord_key(
@@ -153,104 +88,6 @@ extern "C" __global__ void find_coord_key(
         match = 0;
     }
     hits[idx] = match;
-}
-"""
-
-_NUM_BOUNDS_SOURCE = r"""
-extern "C" __global__ void find_number_boundaries(
-    const unsigned char* __restrict__ input,
-    const unsigned char* __restrict__ quote_parity,
-    unsigned char* __restrict__ is_start,
-    unsigned char* __restrict__ is_end,
-    long long n
-) {
-    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    // Skip bytes inside string values (odd parity)
-    if (quote_parity[idx] != 0) {
-        is_start[idx] = 0;
-        is_end[idx] = 0;
-        return;
-    }
-
-    unsigned char c = input[idx];
-    unsigned char prev = (idx > 0) ? input[idx - 1] : '[';
-    unsigned char next = (idx < n - 1) ? input[idx + 1] : ']';
-
-    // Number starts: first char of a number, preceded by separator
-    // Space included because json.dumps uses ", " as separator
-    unsigned char is_first_digit = (c >= '0' && c <= '9') || c == '-' || c == '+';
-    unsigned char is_sep_before = (prev == ',' || prev == '[' || prev == ' '
-                                   || prev == '\n' || prev == '\r' || prev == '\t');
-    is_start[idx] = is_first_digit && is_sep_before;
-
-    // Number ends: last numeric char followed by separator
-    // Space/newline included because GDAL/OGR writes "0.0 ]" with
-    // whitespace between the last coordinate value and closing bracket.
-    unsigned char is_numeric = (c >= '0' && c <= '9') || c == '.' ||
-                               c == 'e' || c == 'E' || c == '-' || c == '+';
-    unsigned char is_sep_after = (next == ',' || next == ']' || next == ' '
-                                  || next == '\n' || next == '\r' || next == '\t');
-    is_end[idx] = is_numeric && is_sep_after;
-}
-"""
-
-_PARSE_FLOAT_SOURCE = r"""
-extern "C" __global__ void parse_ascii_floats(
-    const unsigned char* __restrict__ input,
-    const long long* __restrict__ coord_starts,
-    const long long* __restrict__ coord_ends,
-    double* __restrict__ output,
-    int n
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-
-    long long start = coord_starts[idx];
-    long long end = coord_ends[idx];
-
-    double result = 0.0;
-    double frac_mult = 0.0;
-    int negative = 0;
-    int in_exponent = 0;
-    int exp_val = 0;
-    int exp_negative = 0;
-
-    for (long long i = start; i < end; ++i) {
-        unsigned char c = input[i];
-        if (c == '-') {
-            if (in_exponent) exp_negative = 1;
-            else negative = 1;
-        } else if (c == '+') {
-            // skip
-        } else if (c == '.') {
-            frac_mult = 0.1;
-        } else if (c == 'e' || c == 'E') {
-            in_exponent = 1;
-        } else if (c >= '0' && c <= '9') {
-            int d = c - '0';
-            if (in_exponent) {
-                exp_val = exp_val * 10 + d;
-            } else if (frac_mult > 0.0) {
-                result += d * frac_mult;
-                frac_mult *= 0.1;
-            } else {
-                result = result * 10.0 + d;
-            }
-        }
-    }
-
-    if (negative) result = -result;
-
-    if (in_exponent) {
-        double exp_mult = 1.0;
-        for (int e = 0; e < exp_val; ++e) exp_mult *= 10.0;
-        if (exp_negative) result /= exp_mult;
-        else result *= exp_mult;
-    }
-
-    output[idx] = result;
 }
 """
 
@@ -410,24 +247,6 @@ extern "C" __global__ void find_feature_boundaries(
 }
 """
 
-_MARK_COORD_SPANS_SOURCE = r"""
-extern "C" __global__ void mark_coord_spans(
-    const long long* __restrict__ coord_positions,
-    const long long* __restrict__ coord_ends,
-    unsigned char* __restrict__ mask,
-    int n_features
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_features) return;
-
-    long long start = coord_positions[idx] + 14;
-    long long end = coord_ends[idx];
-    for (long long i = start; i < end; i++) {
-        mask[i] = 1;
-    }
-}
-"""
-
 _TYPE_KEY_SOURCE = r"""
 extern "C" __global__ void find_type_key(
     const unsigned char* __restrict__ input,
@@ -520,69 +339,40 @@ extern "C" __global__ void classify_type_value(
 }
 """
 
-# Kernel name tuples
-_DEPTH_DELTAS_NAMES = ("compute_depth_deltas",)
-_CLASSIFY_NAMES = ("classify_bytes",)
-_QUOTE_NAMES = ("quote_toggle",)
+# GeoJSON-specific kernel name tuples
 _COORD_KEY_NAMES = ("find_coord_key",)
-_NUM_BOUNDS_NAMES = ("find_number_boundaries",)
-_PARSE_FLOAT_NAMES = ("parse_ascii_floats",)
 _COORD_SPAN_END_NAMES = ("coord_span_end",)
 _RING_COUNT_NAMES = ("count_rings_and_coords",)
 _SCATTER_COORDS_NAMES = ("scatter_ring_offsets",)
 _FEATURE_BOUNDARY_NAMES = ("find_feature_boundaries",)
-_MARK_COORD_SPANS_NAMES = ("mark_coord_spans",)
 _TYPE_KEY_NAMES = ("find_type_key",)
 _CLASSIFY_TYPE_NAMES = ("classify_type_value",)
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034 Level 2)
 # ---------------------------------------------------------------------------
+# Only GeoJSON-specific kernels are warmed up here.  Shared primitives
+# (quote parity, bracket depth, number boundaries, float parsing, span
+# marking) register their own warmup in their respective gpu_parse modules.
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
-    ("geojson-depth-deltas", _DEPTH_DELTAS_SOURCE, _DEPTH_DELTAS_NAMES),
-    ("geojson-classify", _CLASSIFY_SOURCE, _CLASSIFY_NAMES),
-    ("geojson-quote", _QUOTE_SOURCE, _QUOTE_NAMES),
     ("geojson-coord-key", _COORD_KEY_SOURCE, _COORD_KEY_NAMES),
-    ("geojson-num-bounds", _NUM_BOUNDS_SOURCE, _NUM_BOUNDS_NAMES),
-    ("geojson-parse-float", _PARSE_FLOAT_SOURCE, _PARSE_FLOAT_NAMES),
     ("geojson-coord-span-end", _COORD_SPAN_END_SOURCE, _COORD_SPAN_END_NAMES),
     ("geojson-ring-count", _RING_COUNT_SOURCE, _RING_COUNT_NAMES),
     ("geojson-scatter-coords", _SCATTER_COORDS_SOURCE, _SCATTER_COORDS_NAMES),
     ("geojson-feature-boundary", _FEATURE_BOUNDARY_SOURCE, _FEATURE_BOUNDARY_NAMES),
-    ("geojson-mark-spans", _MARK_COORD_SPANS_SOURCE, _MARK_COORD_SPANS_NAMES),
     ("geojson-type-key", _TYPE_KEY_SOURCE, _TYPE_KEY_NAMES),
     ("geojson-classify-type", _CLASSIFY_TYPE_SOURCE, _CLASSIFY_TYPE_NAMES),
 ])
 
 
 # ---------------------------------------------------------------------------
-# Kernel compilation helpers
+# GeoJSON-specific kernel compilation helpers
 # ---------------------------------------------------------------------------
-
-def _depth_deltas_kernels():
-    return compile_kernel_group("geojson-depth-deltas", _DEPTH_DELTAS_SOURCE, _DEPTH_DELTAS_NAMES)
-
-
-def _classify_kernels():
-    return compile_kernel_group("geojson-classify", _CLASSIFY_SOURCE, _CLASSIFY_NAMES)
-
-
-def _quote_kernels():
-    return compile_kernel_group("geojson-quote", _QUOTE_SOURCE, _QUOTE_NAMES)
-
 
 def _coord_key_kernels():
     return compile_kernel_group("geojson-coord-key", _COORD_KEY_SOURCE, _COORD_KEY_NAMES)
-
-
-def _num_bounds_kernels():
-    return compile_kernel_group("geojson-num-bounds", _NUM_BOUNDS_SOURCE, _NUM_BOUNDS_NAMES)
-
-
-def _parse_float_kernels():
-    return compile_kernel_group("geojson-parse-float", _PARSE_FLOAT_SOURCE, _PARSE_FLOAT_NAMES)
 
 
 def _coord_span_end_kernels():
@@ -599,10 +389,6 @@ def _scatter_coords_kernels():
 
 def _feature_boundary_kernels():
     return compile_kernel_group("geojson-feature-boundary", _FEATURE_BOUNDARY_SOURCE, _FEATURE_BOUNDARY_NAMES)
-
-
-def _mark_coord_spans_kernels():
-    return compile_kernel_group("geojson-mark-spans", _MARK_COORD_SPANS_SOURCE, _MARK_COORD_SPANS_NAMES)
 
 
 def _type_key_kernels():
@@ -708,29 +494,11 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     n_i64 = np.int64(n)
     ptr = runtime.pointer
 
-    # S1b: Quote toggle → uint8 cumsum → parity (0=outside, 1=inside string)
-    # Uses uint8 cumsum (2.16 GB) instead of int32 (8.64 GB). Parity is
-    # correct after overflow because 256 is even.
-    quote_kernels = _quote_kernels()
-    d_quote_toggle = cp.empty(n, dtype=cp.uint8)
-    _launch_kernel(runtime, quote_kernels["quote_toggle"], n, (
-        (ptr(d_bytes), ptr(d_quote_toggle), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
-    d_quote_parity = cp.cumsum(d_quote_toggle, dtype=cp.uint8) & np.uint8(1)
-    del d_quote_toggle
+    # S1b: Quote parity (0=outside, 1=inside string) via gpu_parse primitive.
+    d_quote_parity = quote_parity(d_bytes)
 
-    # S2: Nesting depth via fused kernel + prefix sum.
-    # Single kernel outputs int8 deltas (+1/-1/0), filtering out brackets
-    # inside strings. Avoids materializing d_classes and boolean intermediates.
-    dd_kernels = _depth_deltas_kernels()
-    d_deltas = cp.empty(n, dtype=cp.int8)
-    _launch_kernel(runtime, dd_kernels["compute_depth_deltas"], n, (
-        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_deltas), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
-    d_depth = cp.cumsum(d_deltas, dtype=cp.int32)
-    del d_deltas
+    # S2: Nesting depth via gpu_parse primitive (delta kernel + prefix sum).
+    d_depth = bracket_depth(d_bytes, d_quote_parity)
 
     # S3: Find "coordinates": positions (with quote-state filter)
     coord_kernels = _coord_key_kernels()
@@ -885,41 +653,24 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
         ))
         del d_pair_offset_starts, d_ring_scatter_starts
 
-    # S4: Find all number boundaries (with quote-state filter)
-    nb_kernels = _num_bounds_kernels()
-    d_is_start = cp.zeros(n, dtype=cp.uint8)
-    d_is_end = cp.zeros(n, dtype=cp.uint8)
-    _launch_kernel(runtime, nb_kernels["find_number_boundaries"], n, (
-        (ptr(d_bytes), ptr(d_quote_parity), ptr(d_is_start), ptr(d_is_end), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
+    # S4: Find all number boundaries (with quote-state filter) via gpu_parse.
+    d_is_start, d_is_end = number_boundaries(d_bytes, d_quote_parity)
     del d_quote_parity
 
-    # Filter numbers to only those inside coordinate spans
-    mark_kernels = _mark_coord_spans_kernels()
-    d_in_coords = cp.zeros(n, dtype=cp.uint8)
-    _launch_kernel(runtime, mark_kernels["mark_coord_spans"], n_features, (
-        (ptr(d_coord_positions), ptr(d_coord_ends), ptr(d_in_coords), np.int32(n_features)),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-    ))
-    d_is_start = d_is_start * d_in_coords
-    d_is_end = d_is_end * d_in_coords
-    del d_in_coords
+    # Filter numbers to only those inside coordinate spans via gpu_parse.
+    # The original GeoJSON kernel added +14 internally for the
+    # "coordinates": key length; here we pass pre-computed starts.
+    d_coord_span_starts = (d_coord_positions + 14).astype(cp.int64)
+    d_in_coords = mark_spans(d_coord_span_starts, d_coord_ends, n)
+    del d_coord_span_starts
 
-    d_starts = cp.flatnonzero(d_is_start).astype(cp.int64)
-    d_ends = cp.flatnonzero(d_is_end).astype(cp.int64) + 1
-    del d_is_start, d_is_end
+    # Extract number positions filtered to coordinate spans and convert
+    # to compact start/end arrays (half-open convention).
+    d_starts, d_ends = extract_number_positions(d_is_start, d_is_end, d_in_coords)
+    del d_is_start, d_is_end, d_in_coords
 
-    n_nums = int(len(d_starts))
-
-    # S5: Parse ASCII floats
-    pf_kernels = _parse_float_kernels()
-    d_coords = cp.empty(n_nums, dtype=cp.float64)
-    if n_nums > 0:
-        _launch_kernel(runtime, pf_kernels["parse_ascii_floats"], n_nums, (
-            (ptr(d_bytes), ptr(d_starts), ptr(d_ends), ptr(d_coords), np.int32(n_nums)),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        ))
+    # S5: Parse ASCII floats via gpu_parse.
+    d_coords = parse_ascii_floats(d_bytes, d_starts, d_ends)
     del d_starts, d_ends
 
     # S6: Split into x, y (zero-copy views)
