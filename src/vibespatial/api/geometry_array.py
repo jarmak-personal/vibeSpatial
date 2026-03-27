@@ -1099,6 +1099,13 @@ class GeometryArray(ExtensionArray):
         return shapely.minimum_clearance(self._data)
 
     def minimum_clearance_line(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.minimum_clearance import (
+                minimum_clearance_line_owned,
+            )
+
+            result_owned = minimum_clearance_line_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.minimum_clearance_line(self._data), crs=self.crs)
 
     def normalize(self) -> GeometryArray:
@@ -1391,6 +1398,21 @@ class GeometryArray(ExtensionArray):
         )
 
     def shared_paths(self, other) -> GeometryArray:
+        if self._owned is not None and isinstance(other, GeometryArray):
+            if len(self) != len(other):
+                msg = (
+                    "Lengths of inputs do not match. "
+                    f"Left: {len(self)}, Right: {len(other)}"
+                )
+                raise ValueError(msg)
+            if not _check_crs(self, other):
+                _crs_mismatch_warn(self, other, stacklevel=7)
+            from vibespatial.constructive.shared_paths import shared_paths_owned
+
+            other_owned = other.to_owned()
+            result = shared_paths_owned(self._owned, other_owned)
+            # shared_paths returns numpy array of Shapely GeometryCollection objects
+            return GeometryArray(result, crs=self.crs)
         return GeometryArray(
             self._binary_method("shared_paths", self, other), crs=self.crs
         )
