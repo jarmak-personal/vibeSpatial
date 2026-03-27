@@ -932,6 +932,13 @@ class GeometryArray(ExtensionArray):
 
     def minimum_rotated_rectangle(self):
         """Return the minimum rotated rectangle of the geometries in this array."""
+        if self._owned is not None:
+            from vibespatial.constructive.minimum_rotated_rectangle import (
+                minimum_rotated_rectangle_owned,
+            )
+
+            result_owned = minimum_rotated_rectangle_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.oriented_envelope(self._data), crs=self.crs)
 
     @property
@@ -1083,6 +1090,12 @@ class GeometryArray(ExtensionArray):
         return shapely.minimum_bounding_radius(self._data)
 
     def minimum_clearance(self):
+        if self._owned is not None:
+            from vibespatial.constructive.minimum_clearance import (
+                minimum_clearance_owned,
+            )
+
+            return minimum_clearance_owned(self._owned)
         return shapely.minimum_clearance(self._data)
 
     def minimum_clearance_line(self) -> GeometryArray:
@@ -1351,6 +1364,23 @@ class GeometryArray(ExtensionArray):
         )
 
     def shortest_line(self, other) -> GeometryArray:
+        if self._owned is not None and isinstance(other, GeometryArray):
+            if len(self) != len(other):
+                msg = (
+                    "Lengths of inputs do not match. "
+                    f"Left: {len(self)}, Right: {len(other)}"
+                )
+                raise ValueError(msg)
+            if not _check_crs(self, other):
+                _crs_mismatch_warn(self, other, stacklevel=7)
+            from vibespatial.constructive.shortest_line import shortest_line_owned
+
+            other_owned = other.to_owned()
+            result = shortest_line_owned(self._owned, other_owned)
+            if isinstance(result, OwnedGeometryArray):
+                return GeometryArray.from_owned(result, crs=self.crs)
+            # CPU path returns numpy array of Shapely objects
+            return GeometryArray(result, crs=self.crs)
         return GeometryArray(
             self._binary_method("shortest_line", self, other), crs=self.crs
         )
