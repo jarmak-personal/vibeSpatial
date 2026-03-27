@@ -5,7 +5,7 @@ Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented out
 Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
 STOP IF: You already have the reconstruction planner open and only need local implementation detail.
 Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-Body Budget: 92/220 lines
+Body Budget: 98/220 lines
 Document: docs/architecture/overlay-reconstruction.md
 
 Section Map (Body Lines)
@@ -20,7 +20,7 @@ Section Map (Body Lines)
 | 37-46 | Options Considered |
 | 47-60 | Decision |
 | 61-74 | CCCL Mapping |
-| 75-92 | Consequences |
+| 75-98 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
@@ -113,3 +113,9 @@ overlay operations.
   mixed-family constructive overlay stays explicitly unsupported until a later
   a later change widens the kernel contract
 - later GPU overlay work has an explicit CCCL-friendly assembly seam
+- many-vs-one (N-vs-1) overlay uses a three-tier strategy that bypasses the
+  full reconstruction graph for the common broadcast_right workload shape:
+  (1) containment bypass identifies polygons fully inside the clip polygon
+  and returns them unchanged, (2) batched Sutherland-Hodgman clip handles
+  boundary-crossing simple polygons on GPU, (3) only complex remainder
+  polygons fall through to the full per-group overlay pipeline

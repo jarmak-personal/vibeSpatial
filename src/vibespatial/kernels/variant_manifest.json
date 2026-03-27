@@ -191,5 +191,18 @@
       "gpu-overlay-tree-reduce",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "spatial_overlay_many_vs_one",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 3,
+    "variants": [
+      "gpu-three-tier",
+      "cpu"
+    ]
   }
 ]

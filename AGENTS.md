@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 233/260 lines
+Body Budget: 242/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -19,12 +19,12 @@ Section Map (Body Lines)
 | 33-38 | Risks |
 | 39-47 | Mission |
 | 48-57 | Startup |
-| 58-70 | Routing |
-| 71-96 | Project Shape |
-| 97-114 | Execution Model |
-| 115-126 | Test Strategy |
-| 127-136 | Build And Tooling |
-| 137-154 | Verification |
+| 58-79 | Routing |
+| 80-105 | Project Shape |
+| 106-123 | Execution Model |
+| 124-135 | Test Strategy |
+| 136-145 | Build And Tooling |
+| 146-163 | Verification |
 | ... | (4 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -95,6 +95,15 @@ Use `docs/ops/intake.md` as the source of truth for:
 Generated headers and `docs/ops/intake-index.json` turn those docs into
 machine-readable routing input. Do not front-load full-repo reads. Route,
 inspect the local area, then expand.
+
+### Many-vs-One Overlay (N-vs-1 Pattern)
+
+When a task involves N-vs-1 overlay patterns (e.g., clipping many features
+against a single corridor or boundary polygon), route to:
+
+- `src/vibespatial/overlay/strategies.py` -- strategy detection (broadcast_right workload shape)
+- `src/vibespatial/overlay/gpu.py` -- three-tier GPU dispatch: (1) containment bypass for polygons fully inside the clip polygon, (2) batched Sutherland-Hodgman clip for boundary-crossing simple polygons, (3) per-group overlay for complex remainder
+- `src/vibespatial/kernels/predicates/point_in_polygon.py` -- GPU bulk vertex-in-polygon used by containment bypass
 
 ## Project Shape
 
