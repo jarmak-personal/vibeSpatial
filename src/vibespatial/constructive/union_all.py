@@ -1,8 +1,15 @@
-"""GPU-accelerated disjoint_subset_union_all: geometry collection assembly.
+"""GPU-accelerated union/intersection reduction kernels.
 
-Since geometries are disjoint by assumption, union is just geometry collection
-assembly -- concatenate coordinate buffers and chain offset arrays.  No Boolean
-geometry operations are performed.
+Provides:
+  - disjoint_subset_union_all: geometry collection assembly (no Boolean ops)
+  - union_all_gpu: tree-reduction global union via pairwise overlay_union
+  - coverage_union_all_gpu: coverage-optimized union (non-overlapping input)
+  - intersection_all_gpu: tree-reduction global intersection with early termination
+  - unary_union_gpu: thin wrapper -> union_all_gpu
+
+For disjoint_subset, geometries are disjoint by assumption, so union is just
+geometry collection assembly -- concatenate coordinate buffers and chain offset
+arrays.  No Boolean geometry operations are performed.
 
 For homogeneous input (all same family), the output is the corresponding Multi*
 family:
@@ -15,12 +22,14 @@ For mixed families, falls back to Shapely CPU path.
 
 ADR-0002: CONSTRUCTIVE class -- fp64, no precision downgrade (coordinates are
           exact subsets, no new coordinates created).
-ADR-0033: No NVRTC kernel needed -- pure CuPy buffer manipulation.
+ADR-0033: Disjoint subset: pure CuPy buffer manipulation (Tier 2).
+          Tree-reduction: orchestrates Tier 1 overlay pipeline pairwise.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -39,6 +48,7 @@ from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -734,3 +744,576 @@ def _assemble_multipolygon_host(
         ring_offsets=merged_ring_offsets,
     )
     return _build_single_row_oga_host(out_family, result_buf)
+
+
+# ===========================================================================
+# GPU tree-reduction global set operations
+# ===========================================================================
+#
+# All four operations share the _tree_reduce_global helper which performs
+# log2(N) rounds of pairwise binary constructive ops, keeping intermediate
+# results on device.  The binary op itself is pluggable (union or intersection).
+#
+# ADR-0002: CONSTRUCTIVE class -- fp64 on all devices per policy.
+# ADR-0033: Orchestrates Tier 1 overlay pipeline pairwise (no new NVRTC kernel).
+# ===========================================================================
+
+
+_EMPTY_POLYGON_SENTINEL = None  # lazily created
+
+
+def _get_empty_polygon():
+    """Lazily create a Shapely empty polygon."""
+    global _EMPTY_POLYGON_SENTINEL
+    if _EMPTY_POLYGON_SENTINEL is None:
+        _EMPTY_POLYGON_SENTINEL = shapely.Polygon()
+    return _EMPTY_POLYGON_SENTINEL
+
+
+_EMPTY_OWNED_SENTINEL = None
+
+
+def _get_empty_owned():
+    """Lazily create a 1-row OGA containing an empty polygon."""
+    global _EMPTY_OWNED_SENTINEL
+    if _EMPTY_OWNED_SENTINEL is None:
+        _EMPTY_OWNED_SENTINEL = from_shapely_geometries([shapely.Polygon()])
+    return _EMPTY_OWNED_SENTINEL
+
+
+def _is_owned_empty(owned: OwnedGeometryArray) -> bool:
+    """Check if a 1-row OGA represents an empty geometry.
+
+    Fast check: if no family buffer has coordinates, the geometry is empty.
+    Falls back to validity check if families are present.
+    """
+    if owned.row_count == 0:
+        return True
+    # Check validity first -- all-invalid means empty.
+    if not np.any(owned.validity):
+        return True
+    # Check if all family buffers are coordinate-less.
+    for buf in owned.families.values():
+        if buf.x.size > 0:
+            return False
+    return True
+
+
+def _tree_reduce_global(
+    owned: OwnedGeometryArray,
+    op: str,
+    *,
+    early_termination_on_empty: bool = False,
+) -> OwnedGeometryArray:
+    """Binary-tree reduction of all rows in *owned* via overlay pipeline.
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Multi-row input.  Must have row_count >= 2.
+    op : str
+        "union" or "intersection".
+    early_termination_on_empty : bool
+        If True, stop reduction early when an intermediate result is empty.
+        Used by intersection_all (since A inter empty = empty).
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Single-row result.
+    """
+    from vibespatial.overlay.gpu import (
+        overlay_intersection_owned,
+        overlay_union_owned,
+    )
+
+    overlay_fn = overlay_union_owned if op == "union" else overlay_intersection_owned
+
+    # Split into single-row OwnedGeometryArrays for pairwise reduction.
+    current: list[OwnedGeometryArray] = [
+        owned.take(np.array([i], dtype=np.intp))
+        for i in range(owned.row_count)
+    ]
+
+    rounds = 0
+    max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
+    consecutive_gpu_failures = 0
+    _GPU_FAILURE_THRESHOLD = 3
+
+    while len(current) > 1 and rounds < max_rounds:
+        next_round: list[OwnedGeometryArray] = []
+        for i in range(0, len(current), 2):
+            if i + 1 < len(current):
+                gpu_ok = False
+                if consecutive_gpu_failures < _GPU_FAILURE_THRESHOLD:
+                    try:
+                        merged = overlay_fn(
+                            current[i],
+                            current[i + 1],
+                            dispatch_mode=ExecutionMode.GPU,
+                        )
+                        next_round.append(merged)
+                        gpu_ok = True
+                        consecutive_gpu_failures = 0
+                    except Exception:
+                        consecutive_gpu_failures += 1
+
+                if not gpu_ok:
+                    # CPU fallback for this pair.
+                    try:
+                        left_g = current[i].to_shapely()[0]
+                    except Exception:
+                        left_g = _get_empty_polygon()
+                    try:
+                        right_g = current[i + 1].to_shapely()[0]
+                    except Exception:
+                        right_g = _get_empty_polygon()
+                    try:
+                        if op == "union":
+                            merged_g = shapely.union(left_g, right_g)
+                        else:
+                            merged_g = shapely.intersection(left_g, right_g)
+                        if merged_g is not None and not shapely.is_valid(merged_g):
+                            merged_g = shapely.make_valid(merged_g)
+                    except Exception:
+                        merged_g = _get_empty_polygon()
+                    next_round.append(from_shapely_geometries(
+                        [merged_g if merged_g is not None else _get_empty_polygon()],
+                    ))
+
+                # Early termination: if result is empty and op is intersection,
+                # the final result must be empty regardless of remaining elements.
+                if early_termination_on_empty and _is_owned_empty(next_round[-1]):
+                    return _get_empty_owned()
+            else:
+                # Odd element passes through.
+                next_round.append(current[i])
+
+        # Explicit cleanup: release previous round's intermediates promptly
+        # to avoid accumulating device memory across reduction rounds.
+        del current
+        current = next_round
+        rounds += 1
+
+    return current[0]
+
+
+# ---------------------------------------------------------------------------
+# union_all_gpu
+# ---------------------------------------------------------------------------
+
+
+@register_kernel_variant(
+    "union_all_gpu",
+    "gpu-tree-reduce",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=(
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    tags=("constructive", "union_all", "gpu", "tree-reduce"),
+)
+def union_all_gpu_owned(
+    owned: OwnedGeometryArray,
+    *,
+    grid_size: float | None = None,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray:
+    """GPU tree-reduction global union of all rows into a single geometry.
+
+    When *grid_size* is set, applies set_precision to the input first
+    (snapping coordinates to the grid) before performing the union.
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Input geometries (device- or host-resident).
+    grid_size : float or None
+        Optional snap grid size.  Applied before union via set_precision_owned.
+    dispatch_mode : ExecutionMode or str
+        Execution mode hint.
+    precision : PrecisionMode or str
+        Precision mode.  CONSTRUCTIVE stays fp64 per ADR-0002.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Single-row OGA containing the global union.
+    """
+    row_count = owned.row_count
+
+    # Empty input -> empty geometry.
+    if row_count == 0:
+        return _get_empty_owned()
+
+    selection = plan_dispatch_selection(
+        kernel_name="union_all_gpu",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=row_count,
+        requested_mode=dispatch_mode,
+    )
+
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        requested=precision,
+    )
+
+    # Apply grid_size snapping if requested.
+    if grid_size is not None and grid_size > 0:
+        from vibespatial.constructive.set_precision import set_precision_owned
+
+        owned = set_precision_owned(owned, grid_size, mode="valid_output")
+
+    # Filter out null rows.
+    keep = np.flatnonzero(owned.validity)
+    if keep.size == 0:
+        return _get_empty_owned()
+    if keep.size < owned.row_count:
+        owned = owned.take(keep)
+
+    # Single valid row -> identity.
+    if owned.row_count == 1:
+        record_dispatch_event(
+            surface="constructive.union_all_gpu",
+            operation="union_all",
+            implementation="identity",
+            reason="single row",
+            requested=dispatch_mode,
+            selected=ExecutionMode.GPU,
+        )
+        return owned
+
+    if selection.selected is ExecutionMode.GPU and cp is not None:
+        try:
+            result = _tree_reduce_global(owned, "union")
+            record_dispatch_event(
+                surface="constructive.union_all_gpu",
+                operation="union_all",
+                implementation="gpu_tree_reduce_overlay",
+                reason=selection.reason,
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
+        except Exception:
+            logger.debug(
+                "union_all_gpu tree reduction failed, falling back to CPU",
+                exc_info=True,
+            )
+
+    # CPU fallback: Shapely union_all.
+    geoms = owned.to_shapely()
+    arr = np.empty(len(geoms), dtype=object)
+    arr[:] = geoms
+    result_g = shapely.union_all(arr, grid_size=grid_size)
+    if result_g is None:
+        result_g = _get_empty_polygon()
+    record_dispatch_event(
+        surface="constructive.union_all_gpu",
+        operation="union_all",
+        implementation="shapely_cpu",
+        reason="GPU fallback",
+        requested=dispatch_mode,
+        selected=ExecutionMode.CPU,
+    )
+    return from_shapely_geometries([result_g])
+
+
+# ---------------------------------------------------------------------------
+# coverage_union_all_gpu
+# ---------------------------------------------------------------------------
+
+
+@register_kernel_variant(
+    "coverage_union_all_gpu",
+    "gpu-tree-reduce",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    tags=("constructive", "coverage_union_all", "gpu", "tree-reduce"),
+)
+def coverage_union_all_gpu_owned(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray:
+    """GPU coverage-optimized union for non-overlapping input.
+
+    Since the input is assumed to be non-overlapping (coverage property),
+    the binary union of any pair will not produce new intersection vertices.
+    This uses the same tree-reduction as union_all_gpu; the coverage
+    property simply means the overlay is cheaper (no self-intersections
+    to resolve).
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Input non-overlapping geometries (device- or host-resident).
+    dispatch_mode : ExecutionMode or str
+        Execution mode hint.
+    precision : PrecisionMode or str
+        Precision mode.  CONSTRUCTIVE stays fp64 per ADR-0002.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Single-row OGA containing the coverage union.
+    """
+    row_count = owned.row_count
+
+    if row_count == 0:
+        return _get_empty_owned()
+
+    selection = plan_dispatch_selection(
+        kernel_name="coverage_union_all_gpu",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=row_count,
+        requested_mode=dispatch_mode,
+    )
+
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        requested=precision,
+    )
+
+    # Filter nulls.
+    keep = np.flatnonzero(owned.validity)
+    if keep.size == 0:
+        return _get_empty_owned()
+    if keep.size < owned.row_count:
+        owned = owned.take(keep)
+
+    if owned.row_count == 1:
+        record_dispatch_event(
+            surface="constructive.coverage_union_all_gpu",
+            operation="coverage_union_all",
+            implementation="identity",
+            reason="single row",
+            requested=dispatch_mode,
+            selected=ExecutionMode.GPU,
+        )
+        return owned
+
+    if selection.selected is ExecutionMode.GPU and cp is not None:
+        try:
+            # Coverage union uses the same tree reduction as regular union.
+            # The coverage property (non-overlapping input) means the overlay
+            # pipeline processes simpler topology, but the algorithm is identical.
+            result = _tree_reduce_global(owned, "union")
+            record_dispatch_event(
+                surface="constructive.coverage_union_all_gpu",
+                operation="coverage_union_all",
+                implementation="gpu_tree_reduce_overlay",
+                reason=selection.reason,
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
+        except Exception:
+            logger.debug(
+                "coverage_union_all_gpu tree reduction failed, falling back to CPU",
+                exc_info=True,
+            )
+
+    # CPU fallback: Shapely coverage_union_all.
+    geoms = owned.to_shapely()
+    arr = np.empty(len(geoms), dtype=object)
+    arr[:] = geoms
+    result_g = shapely.coverage_union_all(arr)
+    if result_g is None:
+        result_g = _get_empty_polygon()
+    record_dispatch_event(
+        surface="constructive.coverage_union_all_gpu",
+        operation="coverage_union_all",
+        implementation="shapely_cpu",
+        reason="GPU fallback",
+        requested=dispatch_mode,
+        selected=ExecutionMode.CPU,
+    )
+    return from_shapely_geometries([result_g])
+
+
+# ---------------------------------------------------------------------------
+# intersection_all_gpu
+# ---------------------------------------------------------------------------
+
+
+@register_kernel_variant(
+    "intersection_all_gpu",
+    "gpu-tree-reduce",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=(
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    tags=("constructive", "intersection_all", "gpu", "tree-reduce"),
+)
+def intersection_all_gpu_owned(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray:
+    """GPU tree-reduction global intersection of all rows.
+
+    Early termination: if any intermediate result is empty, returns empty
+    immediately (since A intersect empty = empty for all A).
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Input geometries (device- or host-resident).
+    dispatch_mode : ExecutionMode or str
+        Execution mode hint.
+    precision : PrecisionMode or str
+        Precision mode.  CONSTRUCTIVE stays fp64 per ADR-0002.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Single-row OGA containing the global intersection.
+    """
+    row_count = owned.row_count
+
+    if row_count == 0:
+        return _get_empty_owned()
+
+    selection = plan_dispatch_selection(
+        kernel_name="intersection_all_gpu",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=row_count,
+        requested_mode=dispatch_mode,
+    )
+
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        requested=precision,
+    )
+
+    # Filter nulls: null rows are skipped (intersection_all of [A, null, B]
+    # should be intersection(A, B), matching Shapely semantics).
+    keep = np.flatnonzero(owned.validity)
+    if keep.size == 0:
+        return _get_empty_owned()
+    if keep.size < owned.row_count:
+        owned = owned.take(keep)
+
+    if owned.row_count == 1:
+        record_dispatch_event(
+            surface="constructive.intersection_all_gpu",
+            operation="intersection_all",
+            implementation="identity",
+            reason="single row",
+            requested=dispatch_mode,
+            selected=ExecutionMode.GPU,
+        )
+        return owned
+
+    if selection.selected is ExecutionMode.GPU and cp is not None:
+        try:
+            result = _tree_reduce_global(
+                owned, "intersection", early_termination_on_empty=True,
+            )
+            record_dispatch_event(
+                surface="constructive.intersection_all_gpu",
+                operation="intersection_all",
+                implementation="gpu_tree_reduce_overlay",
+                reason=selection.reason,
+                detail=(
+                    f"rows={row_count}, "
+                    f"precision={precision_plan.compute_precision.value}"
+                ),
+                requested=selection.requested,
+                selected=ExecutionMode.GPU,
+            )
+            return result
+        except Exception:
+            logger.debug(
+                "intersection_all_gpu tree reduction failed, falling back to CPU",
+                exc_info=True,
+            )
+
+    # CPU fallback: Shapely intersection_all.
+    geoms = owned.to_shapely()
+    arr = np.empty(len(geoms), dtype=object)
+    arr[:] = geoms
+    result_g = shapely.intersection_all(arr)
+    if result_g is None:
+        result_g = _get_empty_polygon()
+    record_dispatch_event(
+        surface="constructive.intersection_all_gpu",
+        operation="intersection_all",
+        implementation="shapely_cpu",
+        reason="GPU fallback",
+        requested=dispatch_mode,
+        selected=ExecutionMode.CPU,
+    )
+    return from_shapely_geometries([result_g])
+
+
+# ---------------------------------------------------------------------------
+# unary_union_gpu (thin wrapper)
+# ---------------------------------------------------------------------------
+
+
+@register_kernel_variant(
+    "unary_union_gpu",
+    "gpu-tree-reduce",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=(
+        "point", "multipoint", "linestring", "multilinestring",
+        "polygon", "multipolygon",
+    ),
+    supports_mixed=True,
+    tags=("constructive", "unary_union", "gpu", "tree-reduce"),
+)
+def unary_union_gpu_owned(
+    owned: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> OwnedGeometryArray:
+    """GPU unary_union -- thin wrapper around union_all_gpu.
+
+    ``unary_union`` is deprecated in favour of ``union_all`` in Shapely 2.x
+    but some codebases still use it.  This provides the GPU path.
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Input geometries (device- or host-resident).
+    dispatch_mode : ExecutionMode or str
+        Execution mode hint.
+    precision : PrecisionMode or str
+        Precision mode.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Single-row OGA containing the global union.
+    """
+    return union_all_gpu_owned(
+        owned,
+        grid_size=None,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )

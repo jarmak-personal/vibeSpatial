@@ -1759,14 +1759,33 @@ class GeometryArray(ExtensionArray):
             DeprecationWarning,
             stacklevel=2,
         )
+        # GPU path: delegate to unary_union_gpu if owned data is available.
+        if self._owned is not None:
+            result = self._try_gpu_reduction("unary_union")
+            if result is not None:
+                return result
         return self.union_all()
 
     def union_all(self, method="unary", grid_size=None):
         if method != "unary" and grid_size is not None:
             raise ValueError(f"grid_size is not supported for method '{method}'.")
         if method == "coverage":
+            # GPU path: coverage_union_all_gpu.
+            if self._owned is not None:
+                result = self._try_gpu_reduction(
+                    "coverage_union_all",
+                )
+                if result is not None:
+                    return result
             return shapely.coverage_union_all(self._data)
         elif method == "unary":
+            # GPU path: union_all_gpu with optional grid_size.
+            if self._owned is not None:
+                result = self._try_gpu_reduction(
+                    "union_all", grid_size=grid_size,
+                )
+                if result is not None:
+                    return result
             return shapely.union_all(self._data, grid_size=grid_size)
         elif method == "disjoint_subset":
             if self._owned is not None:
@@ -1794,7 +1813,46 @@ class GeometryArray(ExtensionArray):
             )
 
     def intersection_all(self):
+        # GPU path: intersection_all_gpu.
+        if self._owned is not None:
+            result = self._try_gpu_reduction("intersection_all")
+            if result is not None:
+                return result
         return shapely.intersection_all(self._data)
+
+    def _try_gpu_reduction(self, op: str, **kwargs):
+        """Attempt a GPU global reduction, returning a Shapely geometry or None.
+
+        Imports and calls the appropriate GPU reduction function from
+        vibespatial.constructive.union_all.  Returns None if the GPU
+        path is unavailable or fails, signalling the caller to fall
+        through to the Shapely CPU path.
+        """
+        try:
+            from vibespatial.constructive.union_all import (
+                coverage_union_all_gpu_owned,
+                intersection_all_gpu_owned,
+                unary_union_gpu_owned,
+                union_all_gpu_owned,
+            )
+
+            dispatch = {
+                "union_all": union_all_gpu_owned,
+                "coverage_union_all": coverage_union_all_gpu_owned,
+                "intersection_all": intersection_all_gpu_owned,
+                "unary_union": unary_union_gpu_owned,
+            }
+            fn = dispatch.get(op)
+            if fn is None:
+                return None
+            result_owned = fn(self._owned, **kwargs)
+            if result_owned is not None:
+                result_geoms = result_owned.to_shapely()
+                if result_geoms:
+                    return result_geoms[0]
+        except Exception:
+            pass
+        return None
 
     #
     # Affinity operations
@@ -2095,7 +2153,7 @@ class GeometryArray(ExtensionArray):
         try:
             return CRS.from_epsg(utm_crs_list[0].code)
         except IndexError:
-            raise RuntimeError("Unable to determine UTM CRS")
+            raise RuntimeError("Unable to determine UTM CRS") from None
 
     #
     # Coordinate related properties
