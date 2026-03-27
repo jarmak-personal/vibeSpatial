@@ -56,6 +56,7 @@ _KERNEL_CROSSOVER_OVERRIDES: dict[str, int] = {
     "segment_classify": 4_096,
     "flat_index_build": 0,
     "bbox_overlap_candidates": 0,
+    "spatial_index_knn": 0,
     "make_valid_repair": 2_000,
     "polygon_centroid": 500,
     "geometry_area": 500,

@@ -2407,6 +2407,37 @@ def nearest_spatial_index(
     query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
     tree_bounds = compute_geometry_bounds(tree_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
 
+    # --- Try device-side k-NN query (vibeSpatial-247.7.2) ---------------------
+    # Unified GPU pipeline: candidate generation -> exact distance -> top-k.
+    if has_gpu_runtime():
+        from .spatial_index_knn_device import spatial_index_knn_device
+
+        knn_result = spatial_index_knn_device(
+            query_owned,
+            tree_owned,
+            query_bounds,
+            tree_bounds,
+            k=1,
+            max_distance=max_distance,
+            exclusive=exclusive,
+            return_all=return_all,
+        )
+        if knn_result is not None and knn_result.total_pairs > 0:
+            runtime = get_cuda_runtime()
+            h_left = runtime.copy_device_to_host(
+                knn_result.d_query_idx,
+            ).astype(np.intp, copy=False)
+            h_right = runtime.copy_device_to_host(
+                knn_result.d_target_idx,
+            ).astype(np.intp, copy=False)
+            indices = np.vstack((h_left, h_right))
+            if return_distance:
+                h_dist = runtime.copy_device_to_host(
+                    knn_result.d_distances,
+                ).astype(np.float64, copy=False)
+                return (indices, h_dist), "owned_gpu_nearest"
+            return indices, "owned_gpu_nearest"
+
     # --- Effective max_distance -----------------------------------------------
     # When max_distance is None (unbounded nearest) compute an effective ceiling
     # from the data extent so the bounded candidate-generation pipeline produces
