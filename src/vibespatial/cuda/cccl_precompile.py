@@ -174,6 +174,66 @@ def _get_h_init(op_name: str, dtype: np.dtype[Any]) -> np.ndarray | None:
 
 
 # ---------------------------------------------------------------------------
+# CCCL warning suppression
+# ---------------------------------------------------------------------------
+
+
+_SUPPRESS_CCCL_STDERR = os.environ.get(
+    "VIBESPATIAL_SUPPRESS_CCCL_WARNINGS", "1",
+).lower() not in {"0", "false", "off", "no"}
+"""Suppress CCCL deprecation warnings on stderr during JIT compilation.
+
+CCCL emits #1444-D (double4 deprecated) warnings to C-level stderr that
+cannot be caught by Python.  We redirect fd 2 to /dev/null during
+compilation.  Set VIBESPATIAL_SUPPRESS_CCCL_WARNINGS=0 to disable.
+"""
+
+_stderr_lock = threading.Lock()
+_stderr_refcount = 0
+_stderr_saved_fd: int | None = None
+
+
+def _suppress_cccl_warnings(
+    compiler: Any, spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
+) -> PrecompiledPrimitive:
+    """Run a CCCL make_* compiler with C-level stderr suppressed.
+
+    Uses reference counting so multiple background threads can compile in
+    parallel (CCCL releases the GIL) while fd 2 stays redirected to
+    /dev/null for the entire duration.  The first thread to enter saves
+    fd 2 and redirects; the last thread to leave restores it.
+    """
+    global _stderr_refcount, _stderr_saved_fd
+
+    if not _SUPPRESS_CCCL_STDERR:
+        return compiler(spec, cp_module, algorithms)
+
+    # --- acquire: redirect fd 2 on first entrant ---
+    with _stderr_lock:
+        _stderr_refcount += 1
+        if _stderr_refcount == 1:
+            try:
+                _stderr_saved_fd = os.dup(2)
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 2)
+                os.close(devnull)
+            except OSError:
+                _stderr_saved_fd = None
+                _stderr_refcount -= 1
+                return compiler(spec, cp_module, algorithms)
+    try:
+        return compiler(spec, cp_module, algorithms)
+    finally:
+        # --- release: restore fd 2 when last thread exits ---
+        with _stderr_lock:
+            _stderr_refcount -= 1
+            if _stderr_refcount == 0 and _stderr_saved_fd is not None:
+                os.dup2(_stderr_saved_fd, 2)
+                os.close(_stderr_saved_fd)
+                _stderr_saved_fd = None
+
+
+# ---------------------------------------------------------------------------
 # Compilation helpers (one per algorithm family)
 # ---------------------------------------------------------------------------
 
@@ -805,7 +865,7 @@ class CCCLPrecompiler:
         # --- Standard CCCL build (cache miss or cache disabled) ---
         t0 = perf_counter()
         try:
-            result = compiler(spec, cp_module, algorithms)
+            result = _suppress_cccl_warnings(compiler, spec, cp_module, algorithms)
             self._cache[spec.name] = result
             elapsed = (perf_counter() - t0) * 1000.0
             result.warmup_ms = elapsed
@@ -947,7 +1007,7 @@ class CCCLPrecompiler:
             if compiler is None:
                 return None
             try:
-                result = compiler(spec, cp_module, algorithms)
+                result = _suppress_cccl_warnings(compiler, spec, cp_module, algorithms)
                 self._cache[name] = result
                 elapsed = (perf_counter() - t0) * 1000.0
                 result.warmup_ms = elapsed

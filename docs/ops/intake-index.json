@@ -15865,6 +15865,7 @@
         "_build_spec_registry",
         "_get_op",
         "_get_h_init",
+        "_suppress_cccl_warnings",
         "_compile_exclusive_scan",
         "_compile_select",
         "_compile_reduce_into",
@@ -15879,8 +15880,7 @@
         "_query_cached_temp",
         "CCCLPrecompiler",
         "request_warmup",
-        "precompile_status",
-        "ensure_pipelines_warm"
+        "precompile_status"
       ],
       "tokens": [
         "algorithmfamily",
@@ -15894,7 +15894,6 @@
         "compile",
         "cuda",
         "enabled",
-        "ensure",
         "exclusive",
         "get",
         "init",
@@ -15902,7 +15901,6 @@
         "lower",
         "merge",
         "op",
-        "pipelines",
         "precompile",
         "precompiledprimitive",
         "py",
@@ -15918,13 +15916,14 @@
         "spec",
         "src",
         "status",
+        "suppress",
         "temp",
         "unique",
         "upper",
         "vibespatial",
-        "warm",
         "warmup",
-        "warmupdiagnostic"
+        "warmupdiagnostic",
+        "warnings"
       ]
     },
     {
