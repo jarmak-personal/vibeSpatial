@@ -1201,6 +1201,13 @@ class GeometryArray(ExtensionArray):
         )
 
     def set_precision(self, grid_size: float, mode="valid_output"):
+        if self._owned is not None:
+            from vibespatial.constructive.set_precision import set_precision_owned
+
+            result_owned = set_precision_owned(
+                self._owned, grid_size=grid_size, mode=mode,
+            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.set_precision(self._data, grid_size=grid_size, mode=mode),
             crs=self.crs,
