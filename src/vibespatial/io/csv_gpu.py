@@ -1,7 +1,10 @@
-"""GPU CSV reader -- structural analysis stage.
+"""GPU CSV reader -- structural analysis and spatial geometry extraction.
 
-GPU-accelerated CSV structural analysis.  Given a device-resident byte
-array containing a CSV file, this module performs:
+GPU-accelerated CSV reader with two stages:
+
+**Stage 1: Structural Analysis** (``csv_structural_analysis``)
+
+Given a device-resident byte array containing a CSV file, identifies:
 
 1. **Quote parity** -- a CSV-specific quote toggle kernel that emits 1 at
    each ``"`` character without backslash-escape checking (CSV uses ``""``
@@ -23,9 +26,20 @@ array containing a CSV file, this module performs:
    that splits the first row by delimiter to extract column names and
    identify spatial columns by name heuristics.
 
+**Stage 2: Spatial Column Extraction** (``read_csv_gpu``)
+
+Given the structural analysis result, extracts spatial geometry:
+
+- **Lat/lon mode**: extracts numeric lat/lon columns, parses with
+  ``parse_ascii_floats``, assembles as Point OwnedGeometryArray.
+- **WKT mode**: extracts WKT column, concatenates with newline separators,
+  delegates to ``read_wkt_gpu``.
+
 All structural kernels are integer-only byte classification (no
 floating-point computation), so no PrecisionPlan is needed per ADR-0002
--- same rationale as ``gpu_parse/structural.py``.
+-- same rationale as ``gpu_parse/structural.py``.  Coordinate parsing
+delegates to ``parse_ascii_floats`` which always produces fp64 -- storage
+precision is always fp64 per ADR-0002.
 
 Tier classification (ADR-0033):
     - Quote toggle: Tier 1 (custom NVRTC -- byte classification)
@@ -35,6 +49,11 @@ Tier classification (ADR-0033):
     - Position extraction: Tier 2 (CuPy flatnonzero)
     - Column count verification: Tier 2 (CuPy element-wise)
     - Header parsing: CPU (small data, one-time)
+    - Field span extraction: Tier 2 (CuPy index arithmetic)
+    - Quote stripping: Tier 2 (CuPy element-wise byte comparison)
+    - Numeric parsing: delegates to gpu_parse.parse_ascii_floats (Tier 1)
+    - WKT field concatenation: Tier 2 (CuPy scatter/copy)
+    - WKT parsing: delegates to wkt_gpu.read_wkt_gpu
 """
 from __future__ import annotations
 
@@ -50,6 +69,9 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import OwnedGeometryArray
+from vibespatial.io.gpu_parse.numeric import parse_ascii_floats
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -531,3 +553,503 @@ def csv_structural_analysis(
         column_names=column_names,
         spatial_columns=spatial_columns,
     )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Spatial column extraction and geometry assembly
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CsvGpuResult:
+    """Result of GPU CSV spatial reading.
+
+    Attributes
+    ----------
+    geometry : OwnedGeometryArray
+        Device-resident geometry array.  For lat/lon mode, contains
+        Point geometries.  For WKT mode, contains whatever types
+        were in the WKT column.
+    n_rows : int
+        Number of data rows read.
+    """
+
+    geometry: OwnedGeometryArray
+    n_rows: int
+
+
+def _extract_field_spans(
+    d_bytes: cp.ndarray,
+    structural: CsvStructuralResult,
+    col_idx: int,
+    has_header: bool,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Extract per-row byte spans for a specific column.
+
+    Given the structural analysis result, computes (field_starts,
+    field_ends) byte offset arrays for column ``col_idx`` across all
+    data rows.  All computation is device-resident (Tier 2 CuPy).
+
+    The returned spans are half-open: ``[field_starts[i], field_ends[i])``.
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full CSV file.
+    structural : CsvStructuralResult
+        Result from ``csv_structural_analysis``.
+    col_idx : int
+        0-based column index to extract.
+    has_header : bool
+        Whether the CSV has a header row (affects row/delimiter indexing).
+
+    Returns
+    -------
+    d_field_starts : cp.ndarray
+        int64 byte offsets of field start (inclusive), shape ``(n_rows,)``.
+    d_field_ends : cp.ndarray
+        int64 byte offsets of field end (exclusive), shape ``(n_rows,)``.
+    """
+    n_rows = structural.n_rows
+    n_columns = structural.n_columns
+    d_row_ends = structural.d_row_ends
+    d_delimiters = structural.d_delimiters
+    delims_per_row = n_columns - 1
+
+    if n_rows == 0:
+        return cp.empty(0, dtype=cp.int64), cp.empty(0, dtype=cp.int64)
+
+    # Row indices into d_row_ends for data rows.
+    # When has_header=True, data rows are d_row_ends[1..n_rows_total-1],
+    # so data row i corresponds to d_row_ends index (i + 1).
+    # When has_header=False, data row i corresponds to d_row_ends index i.
+    row_offset = 1 if has_header else 0
+
+    # Build data row indices: [0, 1, ..., n_rows - 1]
+    d_data_idx = cp.arange(n_rows, dtype=cp.int64)
+
+    # Row start byte positions (byte after previous row's \n)
+    if has_header:
+        # Data row i: row starts at d_row_ends[i] + 1  (prev row is i in d_row_ends)
+        d_row_starts = d_row_ends[d_data_idx] + 1
+    else:
+        # Data row 0: starts at byte 0
+        # Data row i > 0: starts at d_row_ends[i - 1] + 1
+        d_row_starts = cp.empty(n_rows, dtype=cp.int64)
+        if n_rows > 0:
+            d_row_starts[0] = 0
+        if n_rows > 1:
+            d_row_starts[1:] = d_row_ends[d_data_idx[1:] - 1] + 1
+
+    # Row end byte positions -- used as exclusive field end for the last column.
+    # d_row_ends stores the position of \n for normal rows, but for the
+    # virtual EOF row end (file not ending with \n), it stores the index
+    # of the last content byte.  We need exclusive ends, so: if the byte
+    # at the row end position is \n, use that position as the exclusive end
+    # (field content stops before the \n).  If it is NOT \n (EOF case),
+    # use position + 1 (the byte IS part of the field content).
+    d_raw_row_ends = d_row_ends[d_data_idx + row_offset]
+    d_byte_at_end = d_bytes[d_raw_row_ends]
+    d_is_newline = d_byte_at_end == np.uint8(ord("\n"))
+    d_row_end_positions = cp.where(d_is_newline, d_raw_row_ends, d_raw_row_ends + 1)
+
+    if delims_per_row == 0:
+        # Single-column file: field = entire row (up to \n or EOF+1)
+        return d_row_starts, d_row_end_positions
+
+    # Delimiter base index for each data row.
+    # Delimiter array is flat across ALL rows (including header).
+    # Row r (0-based in d_row_ends) has delimiters at indices
+    # [r * delims_per_row, (r + 1) * delims_per_row).
+    # For data row i, row r = row_offset + i.
+    d_delim_base = (d_data_idx + np.int64(row_offset)) * np.int64(delims_per_row)
+
+    # Field start
+    if col_idx == 0:
+        d_field_starts = d_row_starts
+    else:
+        # Start = delimiter[delim_base + col_idx - 1] + 1
+        d_field_starts = d_delimiters[d_delim_base + np.int64(col_idx - 1)] + 1
+
+    # Field end (exclusive)
+    if col_idx == n_columns - 1:
+        d_field_ends = d_row_end_positions
+    else:
+        # End = delimiter[delim_base + col_idx]
+        d_field_ends = d_delimiters[d_delim_base + np.int64(col_idx)]
+
+    return d_field_starts, d_field_ends
+
+
+def _strip_quotes_from_spans(
+    d_bytes: cp.ndarray,
+    d_starts: cp.ndarray,
+    d_ends: cp.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Strip surrounding double-quote characters from field spans.
+
+    If a field starts with ``"`` and ends with ``"`` (the byte before the
+    exclusive end), the span is narrowed by one byte on each side.
+    Fields that are not quoted or are too short to be quoted (< 2 bytes)
+    are left unchanged.  All computation is device-resident (Tier 2 CuPy).
+
+    Also strips ``\\r`` from the end of fields (Windows line endings).
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full CSV file.
+    d_starts : cp.ndarray
+        int64 field start positions (inclusive), shape ``(n,)``.
+    d_ends : cp.ndarray
+        int64 field end positions (exclusive), shape ``(n,)``.
+
+    Returns
+    -------
+    d_starts_out : cp.ndarray
+        Adjusted int64 start positions, shape ``(n,)``.
+    d_ends_out : cp.ndarray
+        Adjusted int64 end positions, shape ``(n,)``.
+    """
+    if d_starts.size == 0:
+        return d_starts, d_ends
+
+    # Strip trailing \r (Windows line endings: field end may point at \r)
+    # Check byte at d_ends - 1 (last byte of field)
+    d_last_valid = d_ends - 1
+    # Clamp to valid range
+    d_last_valid_clamped = cp.maximum(d_last_valid, d_starts)
+    d_is_cr = d_bytes[d_last_valid_clamped] == ord("\r")
+    # Only strip if field is non-empty after stripping
+    d_can_strip_cr = d_is_cr & (d_ends - 1 > d_starts)
+    d_ends_stripped = cp.where(d_can_strip_cr, d_ends - 1, d_ends)
+
+    # Now strip surrounding quotes.
+    # Check if first byte is " and last byte (in stripped range) is "
+    d_field_len = d_ends_stripped - d_starts
+    d_long_enough = d_field_len >= 2
+
+    # Get first and last bytes (safe: only access when long_enough)
+    d_first_byte = d_bytes[d_starts]
+    d_last_byte_pos = cp.maximum(d_ends_stripped - 1, d_starts)
+    d_last_byte = d_bytes[d_last_byte_pos]
+
+    d_is_quoted = (
+        d_long_enough
+        & (d_first_byte == ord('"'))
+        & (d_last_byte == ord('"'))
+    )
+
+    d_starts_out = cp.where(d_is_quoted, d_starts + 1, d_starts)
+    d_ends_out = cp.where(d_is_quoted, d_ends_stripped - 1, d_ends_stripped)
+
+    return d_starts_out, d_ends_out
+
+
+def _assemble_point_geometry(
+    d_lon: cp.ndarray,
+    d_lat: cp.ndarray,
+    n_rows: int,
+) -> OwnedGeometryArray:
+    """Assemble lat/lon arrays into a Point OwnedGeometryArray.
+
+    GIS convention: x = longitude, y = latitude.
+
+    Parameters
+    ----------
+    d_lon : cp.ndarray
+        Device-resident float64 longitude values, shape ``(n_rows,)``.
+    d_lat : cp.ndarray
+        Device-resident float64 latitude values, shape ``(n_rows,)``.
+    n_rows : int
+        Number of points.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Device-resident Point geometry array.
+    """
+    from vibespatial.io.pylibcudf import _build_device_single_family_owned
+
+    # All rows are valid points (no null handling in lat/lon mode)
+    d_validity = cp.ones(n_rows, dtype=cp.bool_)
+    d_empty_mask = cp.zeros(n_rows, dtype=cp.bool_)
+
+    # Point geometry_offsets: identity [0, 1, 2, ..., n_rows]
+    d_geom_offsets = cp.arange(n_rows + 1, dtype=cp.int32)
+
+    return _build_device_single_family_owned(
+        family=GeometryFamily.POINT,
+        validity_device=d_validity,
+        x_device=d_lon,
+        y_device=d_lat,
+        geometry_offsets_device=d_geom_offsets,
+        empty_mask_device=d_empty_mask,
+        detail="GPU CSV parse (lat/lon -> Point)",
+    )
+
+
+def _extract_wkt_and_parse(
+    d_bytes: cp.ndarray,
+    d_starts: cp.ndarray,
+    d_ends: cp.ndarray,
+) -> OwnedGeometryArray:
+    """Extract WKT field bytes and delegate to read_wkt_gpu.
+
+    Concatenates per-row WKT fields with newline separators into a
+    single device byte array, then delegates to the WKT GPU parser.
+    All intermediate work is device-resident (Tier 2 CuPy scatter/copy).
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full CSV file.
+    d_starts : cp.ndarray
+        int64 field start positions (inclusive), shape ``(n_rows,)``.
+    d_ends : cp.ndarray
+        int64 field end positions (exclusive), shape ``(n_rows,)``.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Device-resident geometry array from WKT parsing.
+    """
+    from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+    n_rows = d_starts.shape[0]
+
+    if n_rows == 0:
+        # Empty input: create empty WKT bytes and delegate
+        return read_wkt_gpu(cp.empty(0, dtype=cp.uint8))
+
+    # Compute per-field lengths
+    d_field_lens = (d_ends - d_starts).astype(cp.int64)
+
+    # Total output size: sum of field lengths + n_rows newlines (one per row)
+    # Using int64 to handle large files safely.
+    total_field_bytes = int(d_field_lens.sum())
+    total_output_bytes = total_field_bytes + n_rows
+
+    # Build output offsets: where each field's bytes start in the output.
+    # Each entry in the output is: field_bytes + \n
+    # So entry i starts at cumsum of (field_lens[0..i-1] + 1 each).
+    d_entry_lens = d_field_lens + 1  # +1 for the \n separator
+    d_output_offsets = cp.zeros(n_rows + 1, dtype=cp.int64)
+    cp.cumsum(d_entry_lens, out=d_output_offsets[1:])
+
+    # Allocate output buffer
+    d_output = cp.empty(total_output_bytes, dtype=cp.uint8)
+
+    # Copy each field's bytes to the output using a vectorized approach.
+    # For each byte position in the output, we need to determine which
+    # field it belongs to and what source byte to copy.
+    #
+    # Strategy: build a flat index map.  For each field i, bytes go to
+    # output[d_output_offsets[i]:d_output_offsets[i] + d_field_lens[i]]
+    # from source d_bytes[d_starts[i]:d_ends[i]], then a \n at the end.
+    #
+    # We generate flat source indices and scatter them.
+    # This avoids a Python loop over rows.
+
+    # For each field i, we need d_field_lens[i] source byte copies + 1 newline.
+    # Total operations = total_output_bytes (one per output byte).
+
+    # Build per-output-byte metadata using searchsorted to map output
+    # positions back to field indices.
+    d_out_positions = cp.arange(total_output_bytes, dtype=cp.int64)
+    # Which field does each output byte belong to?
+    d_field_idx = cp.searchsorted(d_output_offsets[1:], d_out_positions, side="right")
+    # d_field_idx[pos] is the index of the field that output byte `pos` belongs to.
+
+    # Position within the field's output chunk:
+    # local_pos = pos - d_output_offsets[d_field_idx]
+    d_local_pos = d_out_positions - d_output_offsets[d_field_idx]
+
+    # A byte is a newline separator if local_pos == d_field_lens[d_field_idx]
+    # (i.e., it's the last byte of the entry, after the field content).
+    d_is_newline = d_local_pos >= d_field_lens[d_field_idx]
+
+    # Source byte position: d_starts[d_field_idx] + local_pos
+    d_src_pos = d_starts[d_field_idx] + d_local_pos
+
+    # Clamp source positions to valid range for the newline bytes
+    # (they won't be used because we overwrite with \n, but we need
+    # valid indices for the gather operation).
+    d_src_pos_safe = cp.minimum(d_src_pos, np.int64(d_bytes.shape[0] - 1))
+
+    # Gather source bytes
+    d_output[:] = d_bytes[d_src_pos_safe]
+
+    # Overwrite newline positions
+    d_output[d_is_newline] = ord("\n")
+
+    return read_wkt_gpu(d_output)
+
+
+def read_csv_gpu(
+    d_bytes: cp.ndarray,
+    *,
+    delimiter: str = ",",
+    lat_col: str | None = None,
+    lon_col: str | None = None,
+    geom_col: str | None = None,
+) -> CsvGpuResult:
+    """Read a CSV file on GPU and extract spatial geometry.
+
+    Performs structural analysis followed by spatial column extraction
+    and geometry assembly.  Supports two modes:
+
+    1. **Lat/lon mode**: When ``lat_col`` and ``lon_col`` are specified
+       (or auto-detected), extracts numeric latitude and longitude
+       columns and assembles them as Point geometries.
+
+    2. **WKT mode**: When ``geom_col`` is specified (or auto-detected),
+       extracts the WKT geometry column and delegates to the GPU WKT
+       parser.
+
+    All computation is device-resident.  The only D->H transfers are
+    the small header row (for column name extraction) and the structural
+    metadata in the OwnedGeometryArray (offsets, validity -- KB-scale).
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 array of raw CSV file bytes, shape ``(n,)``.
+    delimiter : str, default ``","``
+        Single-character field delimiter.
+    lat_col : str or None, default None
+        Name of the latitude column.  If None, auto-detected from
+        header names.
+    lon_col : str or None, default None
+        Name of the longitude column.  If None, auto-detected from
+        header names.
+    geom_col : str or None, default None
+        Name of the WKT geometry column.  If None, auto-detected from
+        header names.
+
+    Returns
+    -------
+    CsvGpuResult
+        Frozen dataclass with ``geometry`` (OwnedGeometryArray) and
+        ``n_rows`` (int).
+
+    Raises
+    ------
+    ValueError
+        If no spatial columns can be identified (neither lat/lon pair
+        nor WKT geometry column), or if specified column names are not
+        found in the header.
+
+    Notes
+    -----
+    GIS convention: x = longitude, y = latitude.  The Point geometry
+    array stores longitude in the x coordinate and latitude in y.
+
+    Examples
+    --------
+    >>> import cupy as cp
+    >>> csv_bytes = b'name,lat,lon\\nAlice,40.7,-74.0\\nBob,34.0,-118.2\\n'
+    >>> d_bytes = cp.frombuffer(csv_bytes, dtype=cp.uint8)
+    >>> result = read_csv_gpu(d_bytes)
+    >>> result.n_rows
+    2
+    >>> result.geometry.row_count
+    2
+    """
+    # ------------------------------------------------------------------
+    # Stage 1: Structural analysis
+    # ------------------------------------------------------------------
+    structural = csv_structural_analysis(d_bytes, delimiter=delimiter, has_header=True)
+
+    if structural.n_rows == 0:
+        # No data rows -- return empty geometry
+        from vibespatial.io.pylibcudf import _build_device_single_family_owned
+
+        d_validity = cp.empty(0, dtype=cp.bool_)
+        d_x = cp.empty(0, dtype=cp.float64)
+        d_y = cp.empty(0, dtype=cp.float64)
+        d_geom_offsets = cp.zeros(1, dtype=cp.int32)
+        d_empty_mask = cp.empty(0, dtype=cp.bool_)
+        geometry = _build_device_single_family_owned(
+            family=GeometryFamily.POINT,
+            validity_device=d_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_geom_offsets,
+            empty_mask_device=d_empty_mask,
+            detail="GPU CSV parse (empty)",
+        )
+        return CsvGpuResult(geometry=geometry, n_rows=0)
+
+    # ------------------------------------------------------------------
+    # Stage 2: Resolve spatial columns
+    # ------------------------------------------------------------------
+    spatial = dict(structural.spatial_columns)  # mutable copy
+    column_names = structural.column_names
+
+    # User overrides: look up column indices by name
+    if geom_col is not None:
+        if geom_col not in column_names:
+            raise ValueError(
+                f"Geometry column {geom_col!r} not found in header. "
+                f"Available columns: {column_names}"
+            )
+        spatial = {"geom": column_names.index(geom_col)}
+    elif lat_col is not None or lon_col is not None:
+        if lat_col is None or lon_col is None:
+            raise ValueError(
+                "Both lat_col and lon_col must be specified together, "
+                f"got lat_col={lat_col!r}, lon_col={lon_col!r}"
+            )
+        if lat_col not in column_names:
+            raise ValueError(
+                f"Latitude column {lat_col!r} not found in header. "
+                f"Available columns: {column_names}"
+            )
+        if lon_col not in column_names:
+            raise ValueError(
+                f"Longitude column {lon_col!r} not found in header. "
+                f"Available columns: {column_names}"
+            )
+        spatial = {
+            "lat": column_names.index(lat_col),
+            "lon": column_names.index(lon_col),
+        }
+
+    if not spatial:
+        raise ValueError(
+            "No spatial columns detected or specified.  Provide "
+            "lat_col/lon_col or geom_col, or use column names that "
+            "match spatial heuristics (e.g., 'lat', 'lon', 'geometry')."
+        )
+
+    # ------------------------------------------------------------------
+    # Stage 3: Extract geometry
+    # ------------------------------------------------------------------
+    if "geom" in spatial:
+        # WKT mode
+        geom_idx = spatial["geom"]
+        d_starts, d_ends = _extract_field_spans(d_bytes, structural, geom_idx, has_header=True)
+        d_starts, d_ends = _strip_quotes_from_spans(d_bytes, d_starts, d_ends)
+        geometry = _extract_wkt_and_parse(d_bytes, d_starts, d_ends)
+        return CsvGpuResult(geometry=geometry, n_rows=structural.n_rows)
+
+    # Lat/lon mode
+    lat_idx = spatial["lat"]
+    lon_idx = spatial["lon"]
+
+    # Extract lat field spans
+    d_lat_starts, d_lat_ends = _extract_field_spans(d_bytes, structural, lat_idx, has_header=True)
+    d_lat_starts, d_lat_ends = _strip_quotes_from_spans(d_bytes, d_lat_starts, d_lat_ends)
+
+    # Extract lon field spans
+    d_lon_starts, d_lon_ends = _extract_field_spans(d_bytes, structural, lon_idx, has_header=True)
+    d_lon_starts, d_lon_ends = _strip_quotes_from_spans(d_bytes, d_lon_starts, d_lon_ends)
+
+    # Parse numeric values (delegates to gpu_parse NVRTC kernel)
+    d_lat = parse_ascii_floats(d_bytes, d_lat_starts, d_lat_ends)
+    d_lon = parse_ascii_floats(d_bytes, d_lon_starts, d_lon_ends)
+
+    # Assemble Point geometry: x = longitude, y = latitude (GIS convention)
+    geometry = _assemble_point_geometry(d_lon, d_lat, structural.n_rows)
+    return CsvGpuResult(geometry=geometry, n_rows=structural.n_rows)

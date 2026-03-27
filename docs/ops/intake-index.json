@@ -10305,6 +10305,22 @@
     },
     {
       "kind": "doc",
+      "path": "docs/decisions/0041-gpu-text-parsing-framework.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "0041",
+        "decisions",
+        "docs",
+        "framework",
+        "gpu",
+        "md",
+        "parsing",
+        "text"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/decisions/adr-index.md",
       "referenced_by": [],
       "symbols": [],
@@ -15788,16 +15804,27 @@
         "_detect_spatial_columns",
         "_parse_header_row",
         "CsvStructuralResult",
-        "csv_structural_analysis"
+        "csv_structural_analysis",
+        "CsvGpuResult",
+        "_extract_field_spans",
+        "_strip_quotes_from_spans",
+        "_assemble_point_geometry",
+        "_extract_wkt_and_parse",
+        "read_csv_gpu"
       ],
       "tokens": [
         "analysis",
+        "assemble",
         "columns",
         "csv",
+        "csvgpuresult",
         "csvstructuralresult",
         "delimiter",
         "detect",
         "end",
+        "extract",
+        "field",
+        "geometry",
         "gpu",
         "header",
         "io",
@@ -15805,14 +15832,20 @@
         "kernels",
         "launch",
         "parse",
+        "point",
         "py",
         "quote",
+        "quotes",
+        "read",
         "row",
+        "spans",
         "spatial",
         "src",
+        "strip",
         "structural",
         "toggle",
-        "vibespatial"
+        "vibespatial",
+        "wkt"
       ]
     },
     {
@@ -16308,6 +16341,47 @@
         "source",
         "src",
         "structural",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/kml_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_assign_geom_type_kernels",
+        "_launch_kernel",
+        "_find_tag_positions",
+        "_build_comment_mask",
+        "_pair_open_close_tags",
+        "KmlStructuralResult",
+        "kml_structural_analysis"
+      ],
+      "tokens": [
+        "analysis",
+        "assign",
+        "build",
+        "close",
+        "comment",
+        "find",
+        "geom",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "kml",
+        "kmlstructuralresult",
+        "launch",
+        "mask",
+        "open",
+        "pair",
+        "positions",
+        "py",
+        "src",
+        "structural",
+        "tag",
+        "tags",
+        "type",
         "vibespatial"
       ]
     },
