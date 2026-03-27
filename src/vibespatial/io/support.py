@@ -9,7 +9,9 @@ class IOFormat(StrEnum):
     GEOPARQUET = "geoparquet"
     WKB = "wkb"
     WKT = "wkt"
+    CSV = "csv"
     GEOJSON = "geojson"
+    KML = "kml"
     SHAPEFILE = "shapefile"
     GDAL_LEGACY = "gdal-legacy"
 
@@ -80,6 +82,14 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         canonical_gpu=False,
         reason="WKT read uses GPU byte-classification and coordinate extraction; write stays fallback (no GPU WKT serializer yet).",
     ),
+    IOFormat.CSV: IOSupportEntry(
+        format=IOFormat.CSV,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="CSV read uses GPU byte-classification for structural analysis and coordinate extraction; write stays fallback (no GPU CSV serializer).",
+    ),
     IOFormat.GEOJSON: IOSupportEntry(
         format=IOFormat.GEOJSON,
         default_path=IOPathKind.HYBRID,
@@ -87,6 +97,14 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         write_path=IOPathKind.HYBRID,
         canonical_gpu=False,
         reason="GeoJSON parsing and serialization can stage GPU geometry work, but text tokenization still makes this a hybrid path.",
+    ),
+    IOFormat.KML: IOSupportEntry(
+        format=IOFormat.KML,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="KML read uses GPU byte-classification for structural analysis and coordinate extraction; write stays fallback (no GPU KML serializer).",
     ),
     IOFormat.SHAPEFILE: IOSupportEntry(
         format=IOFormat.SHAPEFILE,

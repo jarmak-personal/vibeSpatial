@@ -161,6 +161,9 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         ".shp": "ESRI Shapefile",
         ".dbf": "ESRI Shapefile",
         ".wkt": "WKT",
+        ".csv": "CSV",
+        ".tsv": "CSV",
+        ".kml": "KML",
     }
     return mapping.get(suffix, "GDAL-legacy")
 
@@ -185,6 +188,14 @@ def plan_vector_file_io(
         io_format = IOFormat.WKT
         implementation = "wkt_gpu_hybrid_adapter"
         reason = "WKT uses GPU byte-classification for geometry parsing with host fallback."
+    elif normalized_driver == "CSV":
+        io_format = IOFormat.CSV
+        implementation = "csv_gpu_hybrid_adapter"
+        reason = "CSV uses GPU byte-classification for structural analysis and coordinate extraction with host fallback."
+    elif normalized_driver == "KML":
+        io_format = IOFormat.KML
+        implementation = "kml_gpu_hybrid_adapter"
+        reason = "KML uses GPU byte-classification for structural analysis and coordinate extraction with host fallback."
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"
