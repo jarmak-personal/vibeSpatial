@@ -16503,6 +16503,33 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/wkt_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_classify_type_kernels",
+        "_launch_kernel",
+        "WktStructuralResult",
+        "wkt_structural_analysis"
+      ],
+      "tokens": [
+        "analysis",
+        "classify",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "launch",
+        "py",
+        "src",
+        "structural",
+        "type",
+        "vibespatial",
+        "wkt",
+        "wktstructuralresult"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/kernels/__init__.py",
       "referenced_by": [],
       "symbols": [],
@@ -20955,6 +20982,42 @@
         "union",
         "variants",
         "works"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_gpu_parse.py",
+      "referenced_by": [],
+      "symbols": [
+        "_to_device",
+        "TestQuoteParity",
+        "TestBracketDepth",
+        "TestNumberBoundaries",
+        "TestParseAsciiFloats",
+        "TestParseAsciiInts",
+        "TestExtractNumberPositions",
+        "TestPatternMatch",
+        "TestSpanBoundaries",
+        "TestMarkSpans",
+        "TestFullPipeline"
+      ],
+      "tokens": [
+        "device",
+        "gpu",
+        "parse",
+        "py",
+        "test",
+        "testbracketdepth",
+        "testextractnumberpositions",
+        "testfullpipeline",
+        "testmarkspans",
+        "testnumberboundaries",
+        "testparseasciifloats",
+        "testparseasciiints",
+        "testpatternmatch",
+        "testquoteparity",
+        "tests",
+        "testspanboundaries"
       ]
     },
     {
