@@ -443,3 +443,137 @@ def relate_de9im(
         _evaluate_cpu_relate(left, right, cpu_rows, out)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pattern matching helpers
+# ---------------------------------------------------------------------------
+
+# Valid pattern characters per the OGC DE-9IM specification.
+_VALID_PATTERN_CHARS = frozenset("TF*012")
+
+
+def _validate_pattern(pattern: str) -> None:
+    """Validate a DE-9IM pattern string.
+
+    Raises
+    ------
+    ValueError
+        If the pattern is not exactly 9 characters or contains invalid chars.
+    """
+    if len(pattern) != 9:
+        raise ValueError(
+            f"DE-9IM pattern must be exactly 9 characters, got {len(pattern)}: {pattern!r}"
+        )
+    for i, ch in enumerate(pattern):
+        if ch not in _VALID_PATTERN_CHARS:
+            raise ValueError(
+                f"Invalid character {ch!r} at position {i} in DE-9IM pattern {pattern!r}. "
+                f"Valid characters are: T, F, *, 0, 1, 2"
+            )
+
+
+def _match_de9im_char(matrix_char: str, pattern_char: str) -> bool:
+    """Check if a single DE-9IM matrix character matches a pattern character.
+
+    Rules:
+        '*' matches any matrix character.
+        'T' matches '0', '1', or '2' (any non-F dimension).
+        'F' matches 'F' only.
+        '0', '1', '2' match the exact dimension character.
+    """
+    if pattern_char == "*":
+        return True
+    if pattern_char == "T":
+        return matrix_char in ("0", "1", "2")
+    # 'F', '0', '1', '2' — exact match.
+    return matrix_char == pattern_char
+
+
+def _match_de9im_string(matrix: str, pattern: str) -> bool:
+    """Check if a full 9-char DE-9IM string matches a pattern."""
+    for mc, pc in zip(matrix, pattern, strict=True):
+        if not _match_de9im_char(mc, pc):
+            return False
+    return True
+
+
+def _match_pattern_bulk(de9im_strings: np.ndarray, pattern: str) -> np.ndarray:
+    """Match a DE-9IM pattern against an array of DE-9IM strings.
+
+    Parameters
+    ----------
+    de9im_strings : np.ndarray
+        Object array from ``relate_de9im``.  Elements are 9-char strings
+        or None (for null geometry pairs).
+    pattern : str
+        9-character DE-9IM pattern with characters from {T, F, *, 0, 1, 2}.
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array.  None entries in *de9im_strings* produce False.
+    """
+    n = len(de9im_strings)
+    result = np.zeros(n, dtype=bool)
+    for i in range(n):
+        s = de9im_strings[i]
+        if s is not None and isinstance(s, str) and len(s) == 9:
+            result[i] = _match_de9im_string(s, pattern)
+    return result
+
+
+@register_kernel_variant(
+    "relate_pattern",
+    "gpu-cuda-python",
+    kernel_class=KernelClass.PREDICATE,
+    execution_modes=(ExecutionMode.GPU,),
+    precision_modes=(PrecisionMode.AUTO, PrecisionMode.FP32, PrecisionMode.FP64),
+    preferred_residency=Residency.DEVICE,
+)
+def relate_pattern_match(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    pattern: str,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+) -> np.ndarray:
+    """Check if the DE-9IM relationship matches a pattern for each pair.
+
+    This is the GPU-accelerated equivalent of ``shapely.relate_pattern()``.
+    It computes the full DE-9IM matrix via ``relate_de9im`` and then applies
+    the pattern match on the resulting strings.
+
+    Parameters
+    ----------
+    left, right : OwnedGeometryArray
+        Pairwise-aligned geometry arrays.  Must have the same ``row_count``.
+    pattern : str
+        9-character DE-9IM pattern.  Valid characters are:
+        ``T`` (matches 0, 1, 2), ``F`` (matches F), ``*`` (matches any),
+        ``0``, ``1``, ``2`` (exact dimension match).
+    dispatch_mode : ExecutionMode
+        Requested execution mode (AUTO, GPU, CPU).
+    precision : PrecisionMode
+        Precision mode for GPU kernels (AUTO, FP32, FP64).
+
+    Returns
+    -------
+    np.ndarray
+        Boolean array of shape ``(row_count,)``.  True where the DE-9IM
+        string matches the pattern, False otherwise.  Null geometry pairs
+        produce False.
+    """
+    _validate_pattern(pattern)
+
+    # Compute DE-9IM strings via the existing relate_de9im infrastructure.
+    de9im_strings = relate_de9im(
+        left, right,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+    )
+
+    # Pattern match on host.  The DE-9IM strings are already host-resident
+    # (object dtype), so no device transfer is needed.
+    return _match_pattern_bulk(de9im_strings, pattern)

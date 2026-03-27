@@ -14637,6 +14637,34 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/line_merge.py",
+      "referenced_by": [],
+      "symbols": [
+        "_compile_kernels",
+        "_line_merge_gpu",
+        "_build_empty_output",
+        "_line_merge_cpu",
+        "line_merge_owned"
+      ],
+      "tokens": [
+        "build",
+        "compile",
+        "constructive",
+        "cpu",
+        "empty",
+        "gpu",
+        "kernels",
+        "line",
+        "merge",
+        "output",
+        "owned",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/linear_ref.py",
       "referenced_by": [],
       "symbols": [
@@ -17237,6 +17265,26 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/kernels/constructive/line_merge.py",
+      "referenced_by": [],
+      "symbols": [
+        "_get_kernel_names"
+      ],
+      "tokens": [
+        "constructive",
+        "get",
+        "kernel",
+        "kernels",
+        "line",
+        "merge",
+        "names",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/kernels/constructive/make_valid.py",
       "referenced_by": [],
       "symbols": [
@@ -18290,9 +18338,16 @@
         "_classify_gpu_rows",
         "_evaluate_gpu_relate",
         "_evaluate_cpu_relate",
-        "relate_de9im"
+        "relate_de9im",
+        "_validate_pattern",
+        "_match_de9im_char",
+        "_match_de9im_string",
+        "_match_pattern_bulk",
+        "relate_pattern_match"
       ],
       "tokens": [
+        "bulk",
+        "char",
         "classify",
         "cpu",
         "de9im",
@@ -18300,6 +18355,8 @@
         "gpu",
         "line",
         "location",
+        "match",
+        "pattern",
         "point",
         "polygon",
         "predicates",
@@ -18309,6 +18366,7 @@
         "src",
         "string",
         "transpose",
+        "validate",
         "vibespatial"
       ]
     },
@@ -22922,6 +22980,55 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_line_merge_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_compare_line_merge",
+        "_extract_all_coords",
+        "_simple_connected_mls",
+        "_three_segment_chain",
+        "_disconnected_mls",
+        "_ring_mls",
+        "_single_linestring",
+        "_single_segment_mls",
+        "_directed_connected",
+        "_directed_not_connected",
+        "TestLineMergeUndirected",
+        "TestLineMergeDirected",
+        "TestLineMergeEdgeCases",
+        "TestLineMergeDispatch"
+      ],
+      "tokens": [
+        "all",
+        "chain",
+        "compare",
+        "connected",
+        "coords",
+        "directed",
+        "disconnected",
+        "extract",
+        "gpu",
+        "line",
+        "linestring",
+        "merge",
+        "mls",
+        "not",
+        "py",
+        "ring",
+        "segment",
+        "simple",
+        "single",
+        "test",
+        "testlinemergedirected",
+        "testlinemergedispatch",
+        "testlinemergeedgecases",
+        "testlinemergeundirected",
+        "tests",
+        "three"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_linestring_constructive.py",
       "referenced_by": [],
       "symbols": [
@@ -24458,6 +24565,43 @@
         "testpointpolygonrelate",
         "testpolygonpointrelate",
         "tests"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_relate_pattern_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_assert_pattern_matches_shapely",
+        "TestPatternCharacters",
+        "TestStandardPredicatePatterns",
+        "TestFamilyCombinations",
+        "TestNullHandling",
+        "TestEdgeCases",
+        "TestPatternValidation",
+        "TestGeometryArrayWiring",
+        "TestBatchRelatePattern",
+        "TestExplicitGPUDispatch"
+      ],
+      "tokens": [
+        "assert",
+        "gpu",
+        "matches",
+        "pattern",
+        "py",
+        "relate",
+        "shapely",
+        "test",
+        "testbatchrelatepattern",
+        "testedgecases",
+        "testexplicitgpudispatch",
+        "testfamilycombinations",
+        "testgeometryarraywiring",
+        "testnullhandling",
+        "testpatterncharacters",
+        "testpatternvalidation",
+        "tests",
+        "teststandardpredicatepatterns"
       ]
     },
     {

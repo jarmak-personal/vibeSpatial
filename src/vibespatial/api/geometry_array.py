@@ -1191,6 +1191,11 @@ class GeometryArray(ExtensionArray):
         )
 
     def line_merge(self, directed: bool = False) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.line_merge import line_merge_owned
+
+            result_owned = line_merge_owned(self._owned, directed=directed)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.line_merge(self._data, directed=directed), crs=self.crs
         )
@@ -1713,6 +1718,25 @@ class GeometryArray(ExtensionArray):
         return shapely.relate(self._data, other)
 
     def relate_pattern(self, other, pattern):
+        if self._owned is not None:
+            from vibespatial.predicates.relate import relate_pattern_match
+
+            if isinstance(other, GeometryArray):
+                other_owned = other.to_owned()
+            else:
+                other_owned = from_shapely_geometries(
+                    list(other) if isinstance(other, np.ndarray) else [other]
+                )
+
+            if other_owned is not None:
+                try:
+                    return relate_pattern_match(self._owned, other_owned, pattern)
+                except Exception:
+                    logger.debug(
+                        "GPU relate_pattern_match failed, falling back to Shapely",
+                        exc_info=True,
+                    )
+
         if isinstance(other, GeometryArray):
             other = other._data
         return shapely.relate_pattern(self._data, other, pattern)
