@@ -940,6 +940,13 @@ class GeometryArray(ExtensionArray):
         return GeometryArray(shapely.get_exterior_ring(self._data), crs=self.crs)
 
     def extract_unique_points(self) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.extract_unique_points import (
+                extract_unique_points_owned,
+            )
+
+            result_owned = extract_unique_points_owned(self._owned)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(shapely.extract_unique_points(self._data), crs=self.crs)
 
     def offset_curve(self, distance, quad_segs=8, join_style="round", mitre_limit=5.0):
@@ -1005,6 +1012,15 @@ class GeometryArray(ExtensionArray):
         return data
 
     def remove_repeated_points(self, tolerance=0.0) -> GeometryArray:
+        if self._owned is not None:
+            from vibespatial.constructive.remove_repeated_points import (
+                remove_repeated_points_owned,
+            )
+
+            result_owned = remove_repeated_points_owned(
+                self._owned, tolerance,
+            )
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
         return GeometryArray(
             shapely.remove_repeated_points(self._data, tolerance=tolerance),
             crs=self.crs,
