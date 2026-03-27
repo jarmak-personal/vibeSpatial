@@ -367,18 +367,21 @@ def _find_property_keys(
     colon_offset = len(pattern) - 1
     n = d_bytes.shape[0]
 
-    # Build depth mask: check depth at the colon position of each hit.
-    # We shift the depth array and multiply with hits to keep only
-    # hits at the correct depth.  For positions where colon_offset
-    # would go out of bounds, hits are already 0 (pattern_match handles that).
-    d_depth_at_colon = cp.zeros(n, dtype=cp.int32)
-    if colon_offset < n:
-        d_depth_at_colon[:n - colon_offset] = d_depth[colon_offset:]
-    d_depth_ok = (d_depth_at_colon == property_depth).view(cp.uint8)
-    d_filtered = d_hits * d_depth_ok
+    # Compact gather: extract hit positions first (tiny array), then
+    # check depth only at those positions.  Avoids allocating a full
+    # n-element shifted depth array (4n bytes).
+    d_hit_positions = cp.flatnonzero(d_hits).astype(cp.int64)
+    del d_hits
+    if d_hit_positions.shape[0] == 0:
+        return d_hit_positions
 
-    d_positions = cp.flatnonzero(d_filtered).astype(cp.int64)
-    return d_positions
+    d_colon_positions = d_hit_positions + colon_offset
+    # Clamp to valid range (pattern_match already zeroes near-end
+    # hits, but guard against edge cases)
+    d_colon_positions = cp.minimum(d_colon_positions, cp.int64(n - 1))
+    d_depth_at_hits = d_depth[d_colon_positions]
+    d_depth_ok = d_depth_at_hits == property_depth
+    return d_hit_positions[d_depth_ok]
 
 
 def _colon_positions_from_key_hits(

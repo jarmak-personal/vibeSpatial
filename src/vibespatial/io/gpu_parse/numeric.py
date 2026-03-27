@@ -500,6 +500,9 @@ def extract_number_positions(
     >>> # Result: d_starts=[3, 7], d_ends=[6, 11]
     """
     if d_mask is not None:
+        # WARNING: When d_mask is provided, multiplication creates temporary
+        # arrays. For memory-critical callers, apply mask in-place BEFORE
+        # calling this function: d_is_start *= d_mask; d_is_end *= d_mask
         d_is_start = d_is_start * d_mask
         d_is_end = d_is_end * d_mask
 

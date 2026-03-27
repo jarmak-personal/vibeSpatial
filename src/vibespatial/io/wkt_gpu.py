@@ -1304,6 +1304,7 @@ def _extract_wkt_coordinates(
     # Convert boundary masks to compact position arrays
     d_num_starts = cp.flatnonzero(d_is_num_start).astype(cp.int64)
     d_num_ends = cp.flatnonzero(d_is_num_end).astype(cp.int64) + 1  # half-open
+    del d_is_num_end  # no longer needed; saves 1*n bytes through counting stages
 
     # ------------------------------------------------------------------
     # Stage 3: Parse numeric values

@@ -400,9 +400,9 @@ def _find_tag_positions(
     if combined_hits is None:
         return cp.empty(0, dtype=cp.int64)
 
-    # Suppress matches inside XML comments
+    # Suppress matches inside XML comments (in-place, no temporary for ~mask)
     if d_comment_mask is not None:
-        combined_hits = combined_hits & (~d_comment_mask)
+        combined_hits[d_comment_mask.view(cp.bool_)] = 0
 
     d_positions = cp.flatnonzero(combined_hits).astype(cp.int64)
     del combined_hits
@@ -1179,9 +1179,10 @@ def _extract_kml_coordinates(
         d_y = d_values[1::3].copy()  # latitude
         n_coords = d_x.shape[0]
     else:
-        # [lon0, lat0, lon1, lat1, ...]
-        d_x = d_values[0::2].copy()  # longitude
-        d_y = d_values[1::2].copy()  # latitude
+        # [lon0, lat0, lon1, lat1, ...] -- zero-copy strided views;
+        # assembly calls cp.ascontiguousarray later when needed.
+        d_x = d_values[0::2]  # longitude
+        d_y = d_values[1::2]  # latitude
         n_coords = d_x.shape[0]
     del d_values
 
