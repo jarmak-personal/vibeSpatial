@@ -10442,6 +10442,21 @@
     },
     {
       "kind": "doc",
+      "path": "docs/proposals/voronoi_tensor_core_hybrid.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "core",
+        "docs",
+        "hybrid",
+        "md",
+        "proposals",
+        "tensor",
+        "voronoi"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/testing/contract-promotion.md",
       "referenced_by": [
         "docs/testing/contract-promotion.md"
@@ -16150,6 +16165,122 @@
         "src",
         "summary",
         "vectorized",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/__init__.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "gpu",
+        "init",
+        "io",
+        "parse",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/numeric.py",
+      "referenced_by": [],
+      "symbols": [
+        "_num_bounds_kernels",
+        "_parse_float_kernels",
+        "_parse_int_kernels",
+        "_launch_kernel",
+        "number_boundaries",
+        "parse_ascii_floats",
+        "parse_ascii_ints",
+        "extract_number_positions"
+      ],
+      "tokens": [
+        "ascii",
+        "boundaries",
+        "bounds",
+        "extract",
+        "float",
+        "floats",
+        "gpu",
+        "int",
+        "ints",
+        "io",
+        "kernel",
+        "kernels",
+        "launch",
+        "num",
+        "number",
+        "numeric",
+        "parse",
+        "positions",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/pattern.py",
+      "referenced_by": [],
+      "symbols": [
+        "_generate_pattern_match_source",
+        "_compile_pattern_match",
+        "_span_boundaries_kernels",
+        "_mark_spans_kernels",
+        "_launch_kernel",
+        "pattern_match",
+        "span_boundaries",
+        "mark_spans"
+      ],
+      "tokens": [
+        "boundaries",
+        "compile",
+        "generate",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "launch",
+        "mark",
+        "match",
+        "parse",
+        "pattern",
+        "py",
+        "source",
+        "span",
+        "spans",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/structural.py",
+      "referenced_by": [],
+      "symbols": [
+        "_build_depth_source",
+        "_get_depth_kernels",
+        "quote_parity",
+        "bracket_depth"
+      ],
+      "tokens": [
+        "bracket",
+        "build",
+        "depth",
+        "get",
+        "gpu",
+        "io",
+        "kernels",
+        "parity",
+        "parse",
+        "py",
+        "quote",
+        "source",
+        "src",
+        "structural",
         "vibespatial"
       ]
     },
