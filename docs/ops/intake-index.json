@@ -16323,7 +16323,9 @@
       "symbols": [
         "_classify_value_kernels",
         "_extract_bool_kernels",
+        "_property_num_bounds_kernels",
         "_launch_kernel",
+        "_property_number_boundaries",
         "_find_property_keys",
         "_colon_positions_from_key_hits",
         "_classify_values",
@@ -16335,6 +16337,8 @@
       "tokens": [
         "bool",
         "boolean",
+        "boundaries",
+        "bounds",
         "classify",
         "colon",
         "column",
@@ -16349,6 +16353,8 @@
         "key",
         "keys",
         "launch",
+        "num",
+        "number",
         "numeric",
         "parse",
         "positions",
