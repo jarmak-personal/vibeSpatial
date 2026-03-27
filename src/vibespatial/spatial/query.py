@@ -69,6 +69,9 @@ from .query_utils import (  # noqa: F401
     _to_owned,
     supports_owned_spatial_input,
 )
+from .spatial_index_device import (
+    spatial_index_device_query,
+)
 
 
 def query_spatial_index(
@@ -383,8 +386,8 @@ def query_spatial_index(
             if per_row_distance.shape != (query_size_for_dist,):
                 raise ValueError("distance array must be broadcastable to the geometry input")
         # Try GPU candidate generation first (device-resident), then GPU refinement.
-        device_dist_cands = _generate_distance_pairs_gpu_device(
-            query_bounds, tree_bounds, per_row_distance,
+        device_dist_cands, _dwithin_exec = spatial_index_device_query(
+            flat_index, query_bounds, distance=per_row_distance,
         )
         if device_dist_cands is not None:
             gpu_candidate_gen = True
@@ -451,23 +454,19 @@ def query_spatial_index(
             )
             return (count, execution) if return_metadata else count
 
-        # GPU candidate generation: Morton range O(N*log(M)+K) for large
-        # inputs, brute-force O(N*M) for small inputs.  Morton range has
-        # higher per-call overhead (6 kernel launches vs 2) but scales
-        # better — crossover is around N*M ≈ 10 billion (≈100K×100K).
+        # GPU candidate generation via unified spatial_index_device_query.
+        # Automatically selects Morton range O(N*log(M)+K) for large inputs
+        # and brute-force O(N*M) for small inputs.  Crossover is at ~1M
+        # (lowered from 100M for ADR-0034 warm kernels).
         # Falls back to CPU generate_bounds_pairs when GPU is unavailable.
         #
         # Predicate refinement uses indexed access into original owned arrays
         # (no buffer copy via .take()).  When device-resident candidates are
         # available, sub-arrays are extracted on-device via CuPy fancy indexing
         # to avoid redundant host→device transfers.
-        _n_product = query_bounds.shape[0] * tree_bounds.shape[0]
-        if _n_product >= 100_000_000:  # ~10K×10K crossover (lowered from 10B for ADR-0034 warm kernels)
-            device_cands = _generate_candidates_morton_range_gpu(flat_index, query_bounds)
-        else:
-            device_cands = None
-        if device_cands is None:
-            device_cands = _generate_candidates_gpu_device(query_bounds, tree_bounds)
+        device_cands, _sidq_exec = spatial_index_device_query(
+            flat_index, query_bounds,
+        )
         if device_cands is not None:
             gpu_candidate_gen = True
             # Pass None for host indices — _filter_predicate_pairs_owned will
