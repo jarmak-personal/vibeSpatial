@@ -930,6 +930,25 @@ def read_geojson_gpu(
         del d_mp_part_psum, d_mp_ring_psum
         del d_mp_part_offset_starts, d_mp_ring_offset_starts, d_mp_pair_offset_starts
 
+    # S8: Find feature boundaries for property extraction.
+    # Moved before S4 so that d_depth (n*4 bytes = 8.6 GB for a 2 GB file)
+    # can be freed before the memory-intensive number extraction stage.
+    fb_kernels = _feature_boundary_kernels()
+    d_feat_start = cp.zeros(n, dtype=cp.uint8)
+    d_feat_end = cp.zeros(n, dtype=cp.uint8)
+    _launch_kernel(runtime, fb_kernels["find_feature_boundaries"], n, (
+        (ptr(d_bytes), ptr(d_depth), ptr(d_feat_start), ptr(d_feat_end), n_i64),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+    ))
+    d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
+    d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1
+    del d_feat_start, d_feat_end
+
+    # Free d_depth early: it is the single largest allocation (n*4 bytes,
+    # ~8.6 GB for a 2 GB input file).  All consumers (type detection, span
+    # end, ring counting, mpoly scatter, feature boundaries) have finished.
+    del d_depth
+
     # S4: Find all number boundaries (with quote-state filter) via gpu_parse.
     d_is_start, d_is_end = number_boundaries(d_bytes, d_quote_parity)
     del d_quote_parity
@@ -941,10 +960,17 @@ def read_geojson_gpu(
     d_in_coords = mark_spans(d_coord_span_starts, d_coord_ends, n)
     del d_coord_span_starts
 
-    # Extract number positions filtered to coordinate spans and convert
-    # to compact start/end arrays (half-open convention).
-    d_starts, d_ends = extract_number_positions(d_is_start, d_is_end, d_in_coords)
-    del d_is_start, d_is_end, d_in_coords
+    # Apply the coordinate-span mask in-place to minimise peak GPU memory.
+    # The old code did this inline; extract_number_positions(d_mask=...)
+    # would create temporaries while the caller still holds references to
+    # the originals, adding ~4 GB peak overhead on a 2 GB file.
+    d_is_start *= d_in_coords
+    d_is_end *= d_in_coords
+    del d_in_coords
+
+    # Extract number positions (compact start/end arrays, half-open).
+    d_starts, d_ends = extract_number_positions(d_is_start, d_is_end)
+    del d_is_start, d_is_end
 
     # S5: Parse ASCII floats via gpu_parse.
     d_coords = parse_ascii_floats(d_bytes, d_starts, d_ends)
@@ -976,18 +1002,7 @@ def read_geojson_gpu(
 
         transform_coordinates_inplace(d_x, d_y, src_crs="EPSG:4326", dst_crs=target_crs)
 
-    # S8: Find feature boundaries for property extraction
-    fb_kernels = _feature_boundary_kernels()
-    d_feat_start = cp.zeros(n, dtype=cp.uint8)
-    d_feat_end = cp.zeros(n, dtype=cp.uint8)
-    _launch_kernel(runtime, fb_kernels["find_feature_boundaries"], n, (
-        (ptr(d_bytes), ptr(d_depth), ptr(d_feat_start), ptr(d_feat_end), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
-    d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
-    d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1
-
-    del d_bytes, d_depth, d_feat_start, d_feat_end, d_coord_positions, d_coord_ends
+    del d_bytes, d_coord_positions, d_coord_ends
     del d_coords
 
     h_feat_starts = cp.asnumpy(d_feat_start_pos)
