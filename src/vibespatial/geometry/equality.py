@@ -4,6 +4,9 @@ geom_equals_exact: element-wise coordinate comparison with tolerance.
     Tier 1 NVRTC kernel for per-pair coordinate comparison (ADR-0033).
     ADR-0002: PREDICATE class, dual fp32/fp64 via PrecisionPlan.
 
+geom_equals_identical: strict byte-level coordinate equality (tolerance=0).
+    Delegates to geom_equals_exact with tolerance=0 — no separate kernel.
+
 geom_equals: normalize-then-compare (composes normalize + equals_exact).
     Inherits dual-precision from both operations.
 """
@@ -79,6 +82,23 @@ def geom_equals_exact_owned(
             logger.debug("equals_exact GPU path failed, falling back to CPU", exc_info=True)
 
     return _geom_equals_exact_cpu(left, right, tolerance)
+
+
+def geom_equals_identical_owned(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+) -> np.ndarray:
+    """Element-wise strict geometry identity (bitwise coordinate equality).
+
+    Equivalent to ``geom_equals_exact(..., tolerance=0)`` — delegates to the
+    same NVRTC kernel infrastructure with zero tolerance.
+
+    Returns a bool array of shape (row_count,).  Null geometries always
+    compare as False (Shapely convention).
+    """
+    return geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=dispatch_mode)
 
 
 def _geom_equals_exact_cpu(

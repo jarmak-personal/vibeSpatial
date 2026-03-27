@@ -988,9 +988,19 @@ class DeviceGeometryArray(ExtensionArray):
             "DeviceGeometryArray.geom_equals_exact: Shapely fallback for non-DGA other",
             visible=True,
         )
-        if isinstance(other, DeviceGeometryArray):
-            other = other._ensure_shapely_cache()
         return shapely.equals_exact(self._ensure_shapely_cache(), other, tolerance=tolerance)
+
+    def geom_equals_identical(self, other):
+        if isinstance(other, DeviceGeometryArray):
+            from .equality import geom_equals_identical_owned
+            return geom_equals_identical_owned(self._owned, other._owned)
+        import shapely
+        self._owned._record(
+            DiagnosticKind.MATERIALIZATION,
+            "DeviceGeometryArray.geom_equals_identical: Shapely fallback for non-DGA other",
+            visible=True,
+        )
+        return shapely.equals_exact(self._ensure_shapely_cache(), other, tolerance=0.0)
 
     def _coerce_other_to_owned(self, other) -> OwnedGeometryArray | None:
         """Try to convert *other* to an OwnedGeometryArray for owned-path ops.

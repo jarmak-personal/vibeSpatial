@@ -113,7 +113,7 @@ _DE9IM_PREDICATES = frozenset({
 })
 
 
-_SPECIAL_PREDICATES = frozenset({"equals_exact"})
+_SPECIAL_PREDICATES = frozenset({"equals_exact", "equals_identical"})
 
 
 def supports_binary_predicate(name: str) -> bool:
@@ -1312,6 +1312,67 @@ def _evaluate_geopandas_equals_exact(
     return result.astype(bool, copy=False)
 
 
+def _evaluate_geopandas_equals_identical(
+    left: np.ndarray | OwnedGeometryArray,
+    right: object | np.ndarray | OwnedGeometryArray,
+    **kwargs: Any,
+) -> np.ndarray:
+    """Dispatch equals_identical through the coordinate-comparison path.
+
+    equals_identical is semantically equals_exact(tolerance=0) for 2D
+    coordinate data.  Delegates to geom_equals_identical_owned which in
+    turn calls geom_equals_exact_owned with tolerance=0.
+    """
+    from vibespatial.geometry.equality import geom_equals_identical_owned
+    from vibespatial.runtime import get_requested_mode
+
+    # Scalar right: fall back to Shapely vectorized equals_identical which
+    # handles scalar broadcasting natively in C, avoiding O(N) Python-side
+    # geometry duplication.
+    is_scalar = not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple))
+    if is_scalar:
+        left_shapely = (
+            np.asarray(left.to_shapely(), dtype=object)
+            if isinstance(left, OwnedGeometryArray)
+            else np.asarray(left, dtype=object)
+        )
+        result = shapely.equals_exact(left_shapely, right, tolerance=0.0)
+        record_dispatch_event(
+            surface="geopandas.array.equals_identical",
+            operation="equals_identical",
+            implementation="shapely_scalar_broadcast",
+            reason="scalar right-hand operand; Shapely vectorized C path",
+            detail=f"rows={len(left_shapely)}, tolerance=0.0",
+            selected=ExecutionMode.CPU,
+        )
+        return result.astype(bool, copy=False)
+
+    # Coerce inputs to OwnedGeometryArray.
+    if isinstance(left, OwnedGeometryArray):
+        left_owned = left
+    else:
+        left_owned = from_shapely_geometries(list(left) if not isinstance(left, list) else left)
+
+    if isinstance(right, OwnedGeometryArray):
+        right_owned = right
+    else:
+        right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
+
+    dispatch_mode = get_requested_mode()
+    result = geom_equals_identical_owned(
+        left_owned, right_owned, dispatch_mode=dispatch_mode,
+    )
+    record_dispatch_event(
+        surface="geopandas.array.equals_identical",
+        operation="equals_identical",
+        implementation="geom_equals_identical_owned",
+        reason="dedicated coordinate-comparison dispatch for equals_identical (tolerance=0)",
+        detail=f"rows={left_owned.row_count}, tolerance=0.0",
+        selected=dispatch_mode,
+    )
+    return result.astype(bool, copy=False)
+
+
 def evaluate_geopandas_binary_predicate(
     predicate: str,
     left: np.ndarray | OwnedGeometryArray,
@@ -1338,6 +1399,12 @@ def evaluate_geopandas_binary_predicate(
         # comparison dispatch in geometry/equality.py.
         if predicate == "equals_exact":
             return _evaluate_geopandas_equals_exact(left, right, **kwargs)
+
+        # --- equals_identical special path ---
+        # Strict coordinate-level identity (tolerance=0).  Routes through
+        # the same NVRTC kernel infrastructure as equals_exact.
+        if predicate == "equals_identical":
+            return _evaluate_geopandas_equals_identical(left, right, **kwargs)
 
         left_coerced = left if isinstance(left, OwnedGeometryArray) else np.asarray(left, dtype=object)
         if isinstance(right, OwnedGeometryArray) or np.isscalar(right) or right is None:

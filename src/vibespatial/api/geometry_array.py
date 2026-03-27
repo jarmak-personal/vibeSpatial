@@ -988,6 +988,38 @@ class GeometryArray(ExtensionArray):
 
     @property
     def interiors(self) -> np.ndarray:
+        if self._owned is not None:
+            from vibespatial.constructive.interiors import interiors_owned
+
+            result_owned = interiors_owned(self._owned)
+            # Convert MultiLineString OGA to the GeoPandas-expected format:
+            # np.ndarray of object, each element is a list of LinearRings
+            # (or None for non-polygon / null rows).
+            result_geoms = result_owned.to_shapely()
+            from shapely.geometry import LinearRing
+
+            has_non_poly = False
+            inner_rings = []
+            for g in result_geoms:
+                if g is None:
+                    has_non_poly = True
+                    inner_rings.append(None)
+                elif hasattr(g, "geoms"):
+                    # MultiLineString parts -> LinearRings
+                    inner_rings.append(
+                        [LinearRing(part.coords) for part in g.geoms]
+                    )
+                else:
+                    inner_rings.append([])
+            if has_non_poly:
+                warnings.warn(
+                    "Only Polygon objects have interior rings. For other "
+                    "geometry types, None is returned.",
+                    stacklevel=2,
+                )
+            data = np.empty(len(inner_rings), dtype=object)
+            data[:] = inner_rings
+            return data
         # no GeometryArray as result
         has_non_poly = False
         inner_rings = []
