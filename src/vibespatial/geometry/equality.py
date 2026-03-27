@@ -1,8 +1,8 @@
 """GPU-accelerated geometry equality operations.
 
 geom_equals_exact: element-wise coordinate comparison with tolerance.
-    Tier 2 CuPy for coordinate diff + Tier 3a CCCL segmented reduce.
-    ADR-0002: PREDICATE class, dual fp32/fp64 with coordinate centering.
+    Tier 1 NVRTC kernel for per-pair coordinate comparison (ADR-0033).
+    ADR-0002: PREDICATE class, dual fp32/fp64 via PrecisionPlan.
 
 geom_equals: normalize-then-compare (composes normalize + equals_exact).
     Inherits dual-precision from both operations.
@@ -10,18 +10,26 @@ geom_equals: normalize-then-compare (composes normalize + equals_exact).
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import (
+    KernelClass,
+    PrecisionMode,
+    select_precision_plan,
+)
 
 from .buffers import GeometryFamily
 from .owned import (
     FAMILY_TAGS,
     OwnedGeometryArray,
 )
+
+logger = logging.getLogger(__name__)
 
 _EQUALS_EXACT_GPU_THRESHOLD = 1000
 
@@ -56,19 +64,19 @@ def geom_equals_exact_owned(
 
     if selection.selected is ExecutionMode.GPU and row_count >= _EQUALS_EXACT_GPU_THRESHOLD:
         try:
-            result = _geom_equals_exact_gpu(left, right, tolerance)
+            result = _geom_equals_exact_gpu(left, right, tolerance, selection)
             if result is not None:
                 record_dispatch_event(
                     surface="geom_equals_exact",
                     operation="geom_equals_exact",
-                    implementation="gpu_buffer_compare",
-                    reason="coordinate buffer comparison on device",
+                    implementation="gpu_nvrtc_equals_exact",
+                    reason="NVRTC kernel coordinate comparison on device",
                     detail=f"rows={row_count}, tolerance={tolerance}",
                     selected=ExecutionMode.GPU,
                 )
                 return result
         except Exception:
-            pass
+            logger.debug("equals_exact GPU path failed, falling back to CPU", exc_info=True)
 
     return _geom_equals_exact_cpu(left, right, tolerance)
 
@@ -98,214 +106,107 @@ def _geom_equals_exact_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     tolerance: float,
+    runtime_selection: RuntimeSelection,
 ) -> np.ndarray | None:
-    """GPU path: structure check then coordinate buffer comparison.
+    """GPU path: NVRTC kernel coordinate comparison per geometry pair.
 
-    Returns None if GPU comparison is not feasible (e.g., incompatible
-    family layouts), triggering CPU fallback.
+    Zero D2H transfers during computation.  Tag comparison, null masking,
+    and per-family kernel launches all happen on device.  A single D2H
+    transfer at the end returns the final bool array.
+
+    Returns None if GPU comparison is not feasible, triggering CPU fallback.
     """
     try:
-        import cupy as cp  # noqa: F401 — used below for GPU buffer ops
+        import cupy as cp
     except ImportError:
         return None
 
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.kernels.predicates.equals_exact import launch_equals_exact_family
     from vibespatial.runtime import has_gpu_runtime
+
     if not has_gpu_runtime():
         return None
 
+    runtime = get_cuda_runtime()
     row_count = left.row_count
-    result = np.zeros(row_count, dtype=bool)
 
-    # Step 1: Tag comparison — different geometry types are never equal
-    if not np.array_equal(left.tags, right.tags):
-        tag_match = left.tags == right.tags
-    else:
-        tag_match = np.ones(row_count, dtype=bool)
+    # --- ADR-0002: select precision plan ---
+    precision_plan = select_precision_plan(
+        runtime_selection=runtime_selection,
+        kernel_class=KernelClass.PREDICATE,
+        requested=PrecisionMode.AUTO,
+    )
+    compute_type = (
+        "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"
+    )
 
-    # Null rows: null != anything (including null)
-    null_mask = (~left.validity) | (~right.validity)
-    tag_match[null_mask] = False
+    # Ensure both arrays have device state
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
 
-    candidate_rows = np.flatnonzero(tag_match)
-    if candidate_rows.size == 0:
-        return result
+    # --- Step 1: Tag + validity filtering on device (CuPy Tier 2) ---
+    # All operations use device arrays — zero D2H transfers.
+    d_left_tags = left_state.tags       # int8 device array
+    d_right_tags = right_state.tags     # int8 device array
+    d_left_validity = left_state.validity   # bool device array
+    d_right_validity = right_state.validity  # bool device array
 
-    # Step 2: Per-family structure + coordinate comparison
+    # tag_match: True where both are valid and same family tag
+    d_tag_match = (d_left_tags == d_right_tags) & d_left_validity & d_right_validity
+
+    # Allocate output on device — zero-filled (False by default)
+    d_result = runtime.allocate((row_count,), np.int32, zero=True)
+
+    # --- Step 2: Per-family kernel dispatch ---
     for family_key in GeometryFamily:
         tag = FAMILY_TAGS[family_key]
-        family_mask = tag_match & (left.tags == tag)
-        family_rows = np.flatnonzero(family_mask)
-        if family_rows.size == 0:
+
+        # Find rows matching this family on device (CuPy)
+        d_family_mask = d_tag_match & (d_left_tags == np.int8(tag))
+        d_family_rows = cp.flatnonzero(d_family_mask).astype(cp.int32)
+
+        if d_family_rows.shape[0] == 0:
             continue
 
-        left_buf = left.families.get(family_key)
-        right_buf = right.families.get(family_key)
+        # Get device buffers for this family
+        left_buf = left_state.families.get(family_key)
+        right_buf = right_state.families.get(family_key)
         if left_buf is None or right_buf is None:
             continue
 
-        family_equal = _compare_family_buffers(
-            left, right, left_buf, right_buf, family_rows, family_key, tolerance
-        )
-        result[family_rows] = family_equal
-
-    return result
-
-
-def _compare_family_buffers(
-    left_owned: OwnedGeometryArray,
-    right_owned: OwnedGeometryArray,
-    left_buf,
-    right_buf,
-    global_rows: np.ndarray,
-    family: GeometryFamily,
-    tolerance: float,
-) -> np.ndarray:
-    """Compare coordinate buffers for a single geometry family.
-
-    Returns a bool array of length len(global_rows).
-    """
-    try:
-        import cupy as cp  # noqa: F401 — used below for GPU buffer ops
-    except ImportError:
-        return np.zeros(len(global_rows), dtype=bool)
-
-    n = len(global_rows)
-    result = np.ones(n, dtype=bool)
-
-    left_fro = left_owned.family_row_offsets[global_rows]
-    right_fro = right_owned.family_row_offsets[global_rows]
-
-    # Per-row: compare coordinate spans
-    for i in range(n):
-        lfr = int(left_fro[i])
-        rfr = int(right_fro[i])
-
-        # Get coordinate ranges for this row
-        l_start, l_end = _coord_range(left_buf, lfr, family)
-        r_start, r_end = _coord_range(right_buf, rfr, family)
-
-        l_count = l_end - l_start
-        r_count = r_end - r_start
-
-        # Different coordinate counts → not equal
-        if l_count != r_count:
-            result[i] = False
-            continue
-
-        if l_count == 0:
-            # Both empty
-            continue
-
-        # Also check ring structure for polygons
-        if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-            if not _ring_structure_matches(left_buf, right_buf, lfr, rfr, family):
-                result[i] = False
-                continue
-
-        # Compare coordinates with tolerance
-        lx = left_buf.x[l_start:l_end]
-        ly = left_buf.y[l_start:l_end]
-        rx = right_buf.x[r_start:r_end]
-        ry = right_buf.y[r_start:r_end]
-
-        if not (np.all(np.abs(lx - rx) <= tolerance) and np.all(np.abs(ly - ry) <= tolerance)):
-            result[i] = False
-
-    return result
-
-
-def _coord_range(buf, family_row: int, family: GeometryFamily) -> tuple[int, int]:
-    """Get the full coordinate range [start, end) for a geometry row."""
-    go = buf.geometry_offsets
-
-    if family in (GeometryFamily.POINT, GeometryFamily.MULTIPOINT):
-        return int(go[family_row]), int(go[family_row + 1])
-
-    if family in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING):
-        if buf.part_offsets is not None:
-            # Multi: geometry_offsets → part_offsets → coordinates
-            part_start = int(go[family_row])
-            part_end = int(go[family_row + 1])
-            if part_start >= part_end:
-                return 0, 0
-            return int(buf.part_offsets[part_start]), int(buf.part_offsets[part_end])
-        else:
-            return int(go[family_row]), int(go[family_row + 1])
-
-    if family == GeometryFamily.POLYGON:
-        # geometry_offsets → ring_offsets → coordinates
-        ring_start = int(go[family_row])
-        ring_end = int(go[family_row + 1])
-        if ring_start >= ring_end or buf.ring_offsets is None:
-            return 0, 0
-        return int(buf.ring_offsets[ring_start]), int(buf.ring_offsets[ring_end])
-
-    if family == GeometryFamily.MULTIPOLYGON:
-        # geometry_offsets → part_offsets → ring_offsets → coordinates
-        part_start = int(go[family_row])
-        part_end = int(go[family_row + 1])
-        if part_start >= part_end or buf.part_offsets is None or buf.ring_offsets is None:
-            return 0, 0
-        ring_start = int(buf.part_offsets[part_start])
-        ring_end = int(buf.part_offsets[part_end])
-        if ring_start >= ring_end:
-            return 0, 0
-        return int(buf.ring_offsets[ring_start]), int(buf.ring_offsets[ring_end])
-
-    return 0, 0
-
-
-def _ring_structure_matches(
-    left_buf, right_buf, left_fr: int, right_fr: int, family: GeometryFamily
-) -> bool:
-    """Check that two geometries have the same ring/part offset structure."""
-    lgo = left_buf.geometry_offsets
-    rgo = right_buf.geometry_offsets
-
-    if family == GeometryFamily.POLYGON:
-        l_ring_count = int(lgo[left_fr + 1]) - int(lgo[left_fr])
-        r_ring_count = int(rgo[right_fr + 1]) - int(rgo[right_fr])
-        if l_ring_count != r_ring_count:
-            return False
-        # Check ring sizes match
-        if left_buf.ring_offsets is None or right_buf.ring_offsets is None:
-            return l_ring_count == 0
-        l_ring_start = int(lgo[left_fr])
-        r_ring_start = int(rgo[right_fr])
-        for r in range(l_ring_count):
-            l_size = int(left_buf.ring_offsets[l_ring_start + r + 1]) - int(left_buf.ring_offsets[l_ring_start + r])
-            r_size = int(right_buf.ring_offsets[r_ring_start + r + 1]) - int(right_buf.ring_offsets[r_ring_start + r])
-            if l_size != r_size:
-                return False
-        return True
-
-    if family == GeometryFamily.MULTIPOLYGON:
-        l_part_count = int(lgo[left_fr + 1]) - int(lgo[left_fr])
-        r_part_count = int(rgo[right_fr + 1]) - int(rgo[right_fr])
-        if l_part_count != r_part_count:
-            return False
-        if left_buf.part_offsets is None or right_buf.part_offsets is None:
-            return l_part_count == 0
-        l_part_start = int(lgo[left_fr])
-        r_part_start = int(rgo[right_fr])
-        for p in range(l_part_count):
-            l_ring_count = int(left_buf.part_offsets[l_part_start + p + 1]) - int(left_buf.part_offsets[l_part_start + p])
-            r_ring_count = int(right_buf.part_offsets[r_part_start + p + 1]) - int(right_buf.part_offsets[r_part_start + p])
-            if l_ring_count != r_ring_count:
-                return False
-            # Check ring sizes
+        # Check that required offset buffers are present
+        if family_key == GeometryFamily.POLYGON:
             if left_buf.ring_offsets is None or right_buf.ring_offsets is None:
                 continue
-            l_rs = int(left_buf.part_offsets[l_part_start + p])
-            r_rs = int(right_buf.part_offsets[r_part_start + p])
-            for r in range(l_ring_count):
-                l_size = int(left_buf.ring_offsets[l_rs + r + 1]) - int(left_buf.ring_offsets[l_rs + r])
-                r_size = int(right_buf.ring_offsets[r_rs + r + 1]) - int(right_buf.ring_offsets[r_rs + r])
-                if l_size != r_size:
-                    return False
-        return True
+        elif family_key == GeometryFamily.MULTILINESTRING:
+            if left_buf.part_offsets is None or right_buf.part_offsets is None:
+                continue
+        elif family_key == GeometryFamily.MULTIPOLYGON:
+            if (left_buf.part_offsets is None or right_buf.part_offsets is None
+                    or left_buf.ring_offsets is None or right_buf.ring_offsets is None):
+                continue
 
-    return True
+        # Launch per-family NVRTC kernel — returns device int32 array
+        d_family_result = launch_equals_exact_family(
+            left_state=left_state,
+            right_state=right_state,
+            left_buf=left_buf,
+            right_buf=right_buf,
+            family=family_key,
+            row_indices_device=d_family_rows,
+            tolerance=tolerance,
+            compute_type=compute_type,
+        )
+
+        # Scatter results back into the full output buffer on device
+        if d_family_result is not None and d_family_result.shape[0] > 0:
+            d_result[d_family_rows] = d_family_result
+
+    # --- Step 3: Single D2H transfer for final result ---
+    runtime.synchronize()
+    result_host = runtime.copy_device_to_host(d_result)
+    return result_host.astype(bool, copy=False)
 
 
 def geom_equals_owned(

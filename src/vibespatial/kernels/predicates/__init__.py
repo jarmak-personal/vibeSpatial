@@ -12,6 +12,7 @@ from .binary_refine import (
     touches_exact,
     within_exact,
 )
+from .equals_exact import launch_equals_exact_family
 from .point_bounds import point_bounds
 from .point_in_polygon import point_in_polygon
 from .point_within_bounds import point_within_bounds
@@ -24,6 +25,7 @@ __all__ = [
     "crosses_exact",
     "disjoint_exact",
     "intersects_exact",
+    "launch_equals_exact_family",
     "overlaps_exact",
     "point_bounds",
     "point_in_polygon",

@@ -868,7 +868,12 @@ class GeometryArray(ExtensionArray):
         return shapely.get_precision(self._data)
 
     def get_geometry(self, index):
-        return shapely.get_geometry(self._data, index=index)
+        if self._owned is not None:
+            from vibespatial.constructive.properties import get_geometry_owned
+
+            result_owned = get_geometry_owned(self._owned, index)
+            return GeometryArray.from_owned(result_owned, crs=self.crs)
+        return GeometryArray(shapely.get_geometry(self._data, index=index), crs=self.crs)
 
     #
     # Unary operations that return new geometries
@@ -1572,6 +1577,19 @@ class GeometryArray(ExtensionArray):
         elif method == "unary":
             return shapely.union_all(self._data, grid_size=grid_size)
         elif method == "disjoint_subset":
+            if self._owned is not None:
+                from vibespatial.constructive.union_all import (
+                    disjoint_subset_union_all_owned,
+                )
+
+                result_owned = disjoint_subset_union_all_owned(self._owned)
+                if result_owned is not None:
+                    # union_all returns a single Shapely geometry, so
+                    # materialise the 1-row OGA to Shapely for API compat.
+                    result_geoms = result_owned.to_shapely()
+                    if result_geoms:
+                        return result_geoms[0]
+                # None return means mixed families -- fall through to Shapely.
             if not GEOS_GE_312:
                 raise ImportError(
                     "Method 'disjoin_subset' requires shapely>=2.1 and GEOS>=3.12."
