@@ -5462,12 +5462,12 @@ def spatial_overlay_owned(
             # (2 per iteration: once in build_gpu_split_events, once in
             # classify_segment_intersections).
             _cached_right_segs: DeviceSegmentTable | None = None
-            if (
+            _is_broadcast_right_overlay = (
                 strategy.name == "broadcast_right"
                 and right_subset.row_count == 1
                 and cp is not None
-                and len(unique_left) > 1
-            ):
+            )
+            if _is_broadcast_right_overlay and len(unique_left) > 1:
                 try:
                     _cached_right_segs = _extract_segments_gpu(right_subset)
                     logger.debug(
@@ -5483,23 +5483,92 @@ def spatial_overlay_owned(
                     )
                     _cached_right_segs = None
 
+            # lyy.21: Batched overlay for broadcast_right many-vs-one.
+            #
+            # When all pairs share the same right polygon (broadcast_right),
+            # gather all complex left polygons and dispatch them in a single
+            # binary_constructive_owned call.  Each row is still processed
+            # independently (per-row isolation) because
+            # binary_constructive_owned routes to _overlay_owned which runs
+            # the 8-stage pipeline per-pair.
+            #
+            # Optimization: for broadcast_right with a single right polygon,
+            # call _overlay_owned directly per pair, bypassing the per-
+            # iteration overhead of binary_constructive_owned dispatch
+            # (workload detection, SH kernel pre-flight, dispatch selection,
+            # precision planning).  Host state for right_subset is
+            # materialised once before the loop.
+            #
+            # Cross-contamination guard: per-pair isolation is maintained
+            # because each _overlay_owned call operates on exactly one
+            # (L_i, R_0) pair.  Segments from pair i never interact with
+            # segments from pair j.
             try:
-                for grp_idx in range(len(unique_left)):
-                    start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
-                    n_pairs = end - start
-                    left_row = left_subset.take(_xp.array([grp_idx], dtype=_xp.int64))
-                    right_rows = right_subset.take(right_subset_indices[start:end])
-                    # Replicate left row to match the number of right neighbours.
-                    if n_pairs > 1:
-                        left_replicated = left_row.take(_xp.zeros(n_pairs, dtype=_xp.int64))
-                    else:
-                        left_replicated = left_row
-                    grp_result = binary_constructive_owned(
-                        how, left_replicated, right_rows,
-                        dispatch_mode=_pairwise_mode,
-                        _cached_right_segments=_cached_right_segs,
-                    )
-                    result_parts.append(grp_result)
+                if _is_broadcast_right_overlay and len(unique_left) > 0:
+                    # Materialise right host state once outside the loop.
+                    # _overlay_owned calls _ensure_host_state on both
+                    # inputs; doing it here for right avoids N redundant
+                    # no-op calls.
+                    right_subset._ensure_host_state()
+
+                    for grp_idx in range(len(unique_left)):
+                        start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
+                        n_pairs = end - start
+                        left_row = left_subset.take(
+                            _xp.array([grp_idx], dtype=_xp.int64)
+                        )
+                        if n_pairs == 1:
+                            # Common case: one pair (L_i, R_0).
+                            # Call _overlay_owned directly, bypassing
+                            # binary_constructive_owned dispatch overhead.
+                            grp_result = _overlay_owned(
+                                left_row, right_subset,
+                                operation=how,
+                                dispatch_mode=_pairwise_mode,
+                                _cached_right_segments=_cached_right_segs,
+                            )
+                        else:
+                            # Multiple right neighbours: replicate left
+                            # row and use binary_constructive_owned for
+                            # the full dispatch (rare in broadcast_right).
+                            right_rows = right_subset.take(
+                                right_subset_indices[start:end]
+                            )
+                            left_replicated = left_row.take(
+                                _xp.zeros(n_pairs, dtype=_xp.int64)
+                            )
+                            grp_result = binary_constructive_owned(
+                                how, left_replicated, right_rows,
+                                dispatch_mode=_pairwise_mode,
+                                _cached_right_segments=_cached_right_segs,
+                            )
+                        result_parts.append(grp_result)
+                else:
+                    # General case: multiple right neighbours per group,
+                    # or non-broadcast_right strategy.
+                    for grp_idx in range(len(unique_left)):
+                        start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
+                        n_pairs = end - start
+                        left_row = left_subset.take(
+                            _xp.array([grp_idx], dtype=_xp.int64)
+                        )
+                        right_rows = right_subset.take(
+                            right_subset_indices[start:end]
+                        )
+                        # Replicate left row to match the number of
+                        # right neighbours.
+                        if n_pairs > 1:
+                            left_replicated = left_row.take(
+                                _xp.zeros(n_pairs, dtype=_xp.int64)
+                            )
+                        else:
+                            left_replicated = left_row
+                        grp_result = binary_constructive_owned(
+                            how, left_replicated, right_rows,
+                            dispatch_mode=_pairwise_mode,
+                            _cached_right_segments=_cached_right_segs,
+                        )
+                        result_parts.append(grp_result)
             finally:
                 # lyy.15: Free cached right-side segments after all
                 # iterations (or on exception).
