@@ -160,6 +160,7 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         ".geojson": "GeoJSON",
         ".shp": "ESRI Shapefile",
         ".dbf": "ESRI Shapefile",
+        ".wkt": "WKT",
     }
     return mapping.get(suffix, "GDAL-legacy")
 
@@ -180,6 +181,10 @@ def plan_vector_file_io(
         io_format = IOFormat.SHAPEFILE
         implementation = "shapefile_hybrid_adapter"
         reason = "Shapefile stays an explicit hybrid path because the container remains host-oriented."
+    elif normalized_driver == "WKT":
+        io_format = IOFormat.WKT
+        implementation = "wkt_gpu_hybrid_adapter"
+        reason = "WKT uses GPU byte-classification for geometry parsing with host fallback."
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"

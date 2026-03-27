@@ -15778,6 +15778,45 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/csv_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_quote_toggle_kernels",
+        "_row_end_kernels",
+        "_delimiter_kernels",
+        "_launch_kernel",
+        "_detect_spatial_columns",
+        "_parse_header_row",
+        "CsvStructuralResult",
+        "csv_structural_analysis"
+      ],
+      "tokens": [
+        "analysis",
+        "columns",
+        "csv",
+        "csvstructuralresult",
+        "delimiter",
+        "detect",
+        "end",
+        "gpu",
+        "header",
+        "io",
+        "kernel",
+        "kernels",
+        "launch",
+        "parse",
+        "py",
+        "quote",
+        "row",
+        "spatial",
+        "src",
+        "structural",
+        "toggle",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/io/file.py",
       "referenced_by": [
         "docs/architecture/io-acceleration.md",
@@ -15994,6 +16033,8 @@
         "_coord_key_kernels",
         "_coord_span_end_kernels",
         "_ring_count_kernels",
+        "_mpoly_count_kernels",
+        "_mpoly_scatter_kernels",
         "_scatter_coords_kernels",
         "_feature_boundary_kernels",
         "_type_key_kernels",
@@ -16026,6 +16067,7 @@
         "key",
         "launch",
         "mixed",
+        "mpoly",
         "properties",
         "py",
         "read",
@@ -19864,6 +19906,35 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_csv_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_to_device_bytes",
+        "TestCsvStructuralBasic",
+        "TestCsvQuoting",
+        "TestCsvSpatialDetection",
+        "TestCsvDeviceArrays",
+        "TestCsvValidation",
+        "TestCsvQuoteParity"
+      ],
+      "tokens": [
+        "bytes",
+        "csv",
+        "device",
+        "gpu",
+        "py",
+        "test",
+        "testcsvdevicearrays",
+        "testcsvquoteparity",
+        "testcsvquoting",
+        "testcsvspatialdetection",
+        "testcsvstructuralbasic",
+        "testcsvvalidation",
+        "tests"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_cudf_pandas_compat.py",
       "referenced_by": [],
       "symbols": [
@@ -23621,6 +23692,52 @@
         "test",
         "tests",
         "upstream"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_wkt_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_to_device_bytes",
+        "_get_device_coords",
+        "TestWktStructuralAnalysis",
+        "TestReadWktGpuPoint",
+        "TestReadWktGpuLineString",
+        "TestReadWktGpuPolygon",
+        "TestReadWktGpuMultiGeometries",
+        "TestMultiLineInput",
+        "TestEmptyGeometries",
+        "TestEdgeCases",
+        "TestStructuralMultiGeometry",
+        "TestShapelyComparison",
+        "TestOwnedStructure",
+        "TestWktStructuralResult",
+        "TestIODispatchWiring"
+      ],
+      "tokens": [
+        "bytes",
+        "coords",
+        "device",
+        "get",
+        "gpu",
+        "py",
+        "test",
+        "testedgecases",
+        "testemptygeometries",
+        "testiodispatchwiring",
+        "testmultilineinput",
+        "testownedstructure",
+        "testreadwktgpulinestring",
+        "testreadwktgpumultigeometries",
+        "testreadwktgpupoint",
+        "testreadwktgpupolygon",
+        "tests",
+        "testshapelycomparison",
+        "teststructuralmultigeometry",
+        "testwktstructuralanalysis",
+        "testwktstructuralresult",
+        "wkt"
       ]
     },
     {

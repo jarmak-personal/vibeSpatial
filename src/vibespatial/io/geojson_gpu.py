@@ -5,9 +5,9 @@ byte classification, structural scanning, coordinate extraction, and
 ASCII-to-float64 parsing.  Property extraction stays on CPU (hybrid
 design per vibeSpatial GPU memory policy).
 
-Supports homogeneous and mixed Point, LineString, and Polygon files.
-Multi-geometry types (MultiPoint, MultiLineString, MultiPolygon) and
-chunked processing for files exceeding GPU memory are deferred.
+Supports homogeneous and mixed Point, LineString, Polygon, MultiPoint,
+MultiLineString, and MultiPolygon files.  GeometryCollection and chunked
+processing for files exceeding GPU memory are deferred.
 
 Shared parsing primitives (quote parity, bracket depth, number boundary
 detection, ASCII float parsing, span masking) are imported from
@@ -52,8 +52,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
-# ctypes for int64 kernel params (not in cuda_runtime.py which only has i32)
+# ctypes for kernel params not in cuda_runtime.py
 KERNEL_PARAM_I64 = ctypes.c_longlong
+KERNEL_PARAM_I8 = ctypes.c_int8
 
 # ---------------------------------------------------------------------------
 # GeoJSON-specific kernel sources (Tier 1 NVRTC)
@@ -176,6 +177,130 @@ extern "C" __global__ void count_rings_and_coords(
 
     ring_counts[idx] = rings;
     coord_pair_counts[idx] = pairs;
+}
+"""
+
+_MPOLY_COUNT_SOURCE = r"""
+extern "C" __global__ void count_mpoly_levels(
+    const unsigned char* __restrict__ input,
+    const int* __restrict__ depth,
+    const long long* __restrict__ coord_starts,
+    const long long* __restrict__ coord_ends,
+    const signed char* __restrict__ family_tags,
+    int* __restrict__ part_counts,
+    int* __restrict__ ring_counts,
+    int* __restrict__ coord_pair_counts,
+    int n_features,
+    signed char mpoly_tag
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_features) return;
+
+    // Only process MultiPolygon features
+    if (family_tags[idx] != mpoly_tag) {
+        part_counts[idx] = 0;
+        ring_counts[idx] = 0;
+        coord_pair_counts[idx] = 0;
+        return;
+    }
+
+    long long start = coord_starts[idx] + 14;
+    long long end = coord_ends[idx];
+    if (start >= end) {
+        part_counts[idx] = 0;
+        ring_counts[idx] = 0;
+        coord_pair_counts[idx] = 0;
+        return;
+    }
+
+    while (start < end && input[start] != '[') start++;
+    if (start >= end) {
+        part_counts[idx] = 0;
+        ring_counts[idx] = 0;
+        coord_pair_counts[idx] = 0;
+        return;
+    }
+    int coord_depth = depth[start];
+
+    // MultiPolygon: coordinates is [[[[x,y], ...], ...], ...]
+    // coord_depth = depth at outermost '['
+    // polygon-part-closing ']' has depth = coord_depth
+    // ring-closing ']' has depth = coord_depth + 1
+    // pair-closing ']' has depth = coord_depth + 2
+    int parts = 0;
+    int rings = 0;
+    int pairs = 0;
+
+    for (long long i = start + 1; i < end; i++) {
+        unsigned char c = input[i];
+        int d = depth[i];
+        if (c == ']') {
+            if (d == coord_depth) parts++;
+            else if (d == coord_depth + 1) rings++;
+            else if (d == coord_depth + 2) pairs++;
+        }
+    }
+
+    part_counts[idx] = parts;
+    ring_counts[idx] = rings;
+    coord_pair_counts[idx] = pairs;
+}
+"""
+
+_MPOLY_SCATTER_SOURCE = r"""
+extern "C" __global__ void scatter_mpoly_offsets(
+    const unsigned char* __restrict__ input,
+    const int* __restrict__ depth,
+    const long long* __restrict__ coord_starts,
+    const long long* __restrict__ coord_ends,
+    const signed char* __restrict__ family_tags,
+    const int* __restrict__ part_offset_starts,
+    const int* __restrict__ ring_offset_starts,
+    const int* __restrict__ pair_offset_starts,
+    int* __restrict__ part_offsets,
+    int* __restrict__ ring_offsets,
+    int n_features,
+    signed char mpoly_tag
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_features) return;
+
+    // Only process MultiPolygon features
+    if (family_tags[idx] != mpoly_tag) return;
+
+    long long start = coord_starts[idx] + 14;
+    long long end = coord_ends[idx];
+    int part_out = part_offset_starts[idx];
+    int ring_out = ring_offset_starts[idx];
+    int pair_out = pair_offset_starts[idx];
+
+    while (start < end && input[start] != '[') start++;
+    if (start >= end) return;
+    int coord_depth = depth[start];
+
+    // Write starting offsets
+    part_offsets[part_out] = ring_out;
+    ring_offsets[ring_out] = pair_out;
+
+    int parts_seen = 0;
+    int rings_seen = 0;
+    int pairs_seen = 0;
+
+    for (long long i = start + 1; i < end; i++) {
+        unsigned char c = input[i];
+        int d = depth[i];
+        if (c == ']' && d == coord_depth + 2) {
+            pairs_seen++;
+        }
+        if (c == ']' && d == coord_depth + 1) {
+            rings_seen++;
+            ring_offsets[ring_out + rings_seen] = pair_out + pairs_seen;
+        }
+        if (c == ']' && d == coord_depth) {
+            parts_seen++;
+            part_offsets[part_out + parts_seen] = ring_out + rings_seen;
+        }
+    }
 }
 """
 
@@ -330,7 +455,34 @@ extern "C" __global__ void classify_type_value(
             family_tags[idx] = -2;
         }
     } else if (input[pos] == 'M') {
-        family_tags[idx] = -2;  // Multi* types, unsupported
+        // Multi* types: "MultiPoint", "MultiLineString", "MultiPolygon"
+        // After 'M' expect "ulti" then discriminate on next char.
+        if (pos + 5 < n_bytes
+            && input[pos + 1] == 'u' && input[pos + 2] == 'l'
+            && input[pos + 3] == 't' && input[pos + 4] == 'i') {
+            unsigned char mc = input[pos + 5];
+            if (mc == 'P') {
+                // "MultiPoint" vs "MultiPolygon": check pos+6
+                if (pos + 6 < n_bytes && input[pos + 6] == 'o') {
+                    // "MultiPo..." — check pos+7 for 'i'(int) vs 'l'(ygon)
+                    if (pos + 7 < n_bytes && input[pos + 7] == 'i') {
+                        family_tags[idx] = 3;  // MultiPoint
+                    } else if (pos + 7 < n_bytes && input[pos + 7] == 'l') {
+                        family_tags[idx] = 5;  // MultiPolygon
+                    } else {
+                        family_tags[idx] = -2;
+                    }
+                } else {
+                    family_tags[idx] = -2;
+                }
+            } else if (mc == 'L') {
+                family_tags[idx] = 4;  // MultiLineString
+            } else {
+                family_tags[idx] = -2;
+            }
+        } else {
+            family_tags[idx] = -2;
+        }
     } else if (input[pos] == 'G') {
         family_tags[idx] = -2;  // GeometryCollection, unsupported
     } else {
@@ -343,6 +495,8 @@ extern "C" __global__ void classify_type_value(
 _COORD_KEY_NAMES = ("find_coord_key",)
 _COORD_SPAN_END_NAMES = ("coord_span_end",)
 _RING_COUNT_NAMES = ("count_rings_and_coords",)
+_MPOLY_COUNT_NAMES = ("count_mpoly_levels",)
+_MPOLY_SCATTER_NAMES = ("scatter_mpoly_offsets",)
 _SCATTER_COORDS_NAMES = ("scatter_ring_offsets",)
 _FEATURE_BOUNDARY_NAMES = ("find_feature_boundaries",)
 _TYPE_KEY_NAMES = ("find_type_key",)
@@ -360,6 +514,8 @@ request_nvrtc_warmup([
     ("geojson-coord-key", _COORD_KEY_SOURCE, _COORD_KEY_NAMES),
     ("geojson-coord-span-end", _COORD_SPAN_END_SOURCE, _COORD_SPAN_END_NAMES),
     ("geojson-ring-count", _RING_COUNT_SOURCE, _RING_COUNT_NAMES),
+    ("geojson-mpoly-count", _MPOLY_COUNT_SOURCE, _MPOLY_COUNT_NAMES),
+    ("geojson-mpoly-scatter", _MPOLY_SCATTER_SOURCE, _MPOLY_SCATTER_NAMES),
     ("geojson-scatter-coords", _SCATTER_COORDS_SOURCE, _SCATTER_COORDS_NAMES),
     ("geojson-feature-boundary", _FEATURE_BOUNDARY_SOURCE, _FEATURE_BOUNDARY_NAMES),
     ("geojson-type-key", _TYPE_KEY_SOURCE, _TYPE_KEY_NAMES),
@@ -381,6 +537,14 @@ def _coord_span_end_kernels():
 
 def _ring_count_kernels():
     return compile_kernel_group("geojson-ring-count", _RING_COUNT_SOURCE, _RING_COUNT_NAMES)
+
+
+def _mpoly_count_kernels():
+    return compile_kernel_group("geojson-mpoly-count", _MPOLY_COUNT_SOURCE, _MPOLY_COUNT_NAMES)
+
+
+def _mpoly_scatter_kernels():
+    return compile_kernel_group("geojson-mpoly-scatter", _MPOLY_SCATTER_SOURCE, _MPOLY_SCATTER_NAMES)
 
 
 def _scatter_coords_kernels():
@@ -556,14 +720,13 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     ))
     del d_type_positions
 
-    # Check for unsupported types
+    # Check for unsupported types (only GeometryCollection now)
     unsupported_mask = d_family_tags < 0
     if cp.any(unsupported_mask):
         n_unsupported = int(cp.sum(unsupported_mask))
         raise NotImplementedError(
             f"GPU GeoJSON parser: {n_unsupported} features have unsupported "
-            f"geometry types (MultiPoint, MultiLineString, MultiPolygon, or "
-            f"GeometryCollection)"
+            f"geometry types (GeometryCollection)"
         )
 
     # Determine if homogeneous or mixed
@@ -571,7 +734,9 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     is_homogeneous = len(unique_tags) == 1
     single_tag = int(unique_tags[0]) if is_homogeneous else None
     pg_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    mpoly_tag = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
     has_polygons = bool(cp.any(unique_tags == pg_tag))
+    has_multipolygons = bool(cp.any(unique_tags == mpoly_tag))
 
     # S3b: Find coordinate span ends
     span_kernels = _coord_span_end_kernels()
@@ -584,18 +749,31 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
     ))
 
     # S3c: Count rings and coordinate pairs per feature.
-    # The kernel output has different semantics per type (see plan).
+    # The kernel output has different semantics per type:
+    #   LineString/MultiPoint:       ring_counts = coord pairs
+    #   Polygon/MultiLineString:     ring_counts = rings/parts, pair_counts = coord pairs
+    #   MultiPolygon:                needs 3-level kernel (part/ring/pair counts)
     # For homogeneous Point we skip it entirely.
     d_ring_counts = None
     d_pair_counts = None
-    d_all_geometry_offsets = None  # Polygon ring-level offsets
+    d_all_geometry_offsets = None  # Polygon/MultiLineString ring/part-level offsets
     d_ring_offsets = None
+    # MultiPolygon-specific arrays
+    d_mpoly_part_counts = None
+    d_mpoly_ring_counts = None
+    d_mpoly_pair_counts = None
+    d_mpoly_geom_offsets = None
+    d_mpoly_part_offsets = None
+    d_mpoly_ring_offsets = None
 
     if single_tag == FAMILY_TAGS[GeometryFamily.POINT]:
         # Point: every feature has exactly 1 coordinate pair
         d_effective_pairs = cp.ones(n_features, dtype=cp.int32)
     else:
-        # Run counting kernel for LineString, Polygon, or mixed
+        # Run counting kernel for all non-Point types.
+        # The 2-level kernel produces correct results for LineString,
+        # Polygon, MultiPoint, and MultiLineString.  Its output for
+        # MultiPolygon features is ignored (overridden by mpoly kernel).
         ring_kernels = _ring_count_kernels()
         d_ring_counts = cp.empty(n_features, dtype=cp.int32)
         d_pair_counts = cp.empty(n_features, dtype=cp.int32)
@@ -606,27 +784,57 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
         ))
 
+        # Run 3-level counting kernel for MultiPolygon features
+        if has_multipolygons:
+            mpoly_kernels = _mpoly_count_kernels()
+            d_mpoly_part_counts = cp.zeros(n_features, dtype=cp.int32)
+            d_mpoly_ring_counts = cp.zeros(n_features, dtype=cp.int32)
+            d_mpoly_pair_counts = cp.zeros(n_features, dtype=cp.int32)
+            _launch_kernel(runtime, mpoly_kernels["count_mpoly_levels"], n_features, (
+                (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
+                 ptr(d_family_tags),
+                 ptr(d_mpoly_part_counts), ptr(d_mpoly_ring_counts),
+                 ptr(d_mpoly_pair_counts), np.int32(n_features), mpoly_tag),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I8),
+            ))
+
         # S3d: Compute effective pair counts per feature based on type.
-        # Point: 1, LineString: ring_count, Polygon: pair_count
+        # Point: 1
+        # LineString/MultiPoint: ring_counts (2-level kernel)
+        # Polygon/MultiLineString: pair_counts (2-level kernel)
+        # MultiPolygon: mpoly_pair_counts (3-level kernel)
         pt_tag = np.int8(FAMILY_TAGS[GeometryFamily.POINT])
         ls_tag = np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING])
+        mpt_tag = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOINT])
         d_effective_pairs = cp.where(
             d_family_tags == pt_tag,
             np.int32(1),
             cp.where(
-                d_family_tags == ls_tag,
+                (d_family_tags == ls_tag) | (d_family_tags == mpt_tag),
                 d_ring_counts,
                 d_pair_counts,
             ),
         )
+        # Override for MultiPolygon if present
+        if has_multipolygons:
+            d_effective_pairs = cp.where(
+                d_family_tags == mpoly_tag,
+                d_mpoly_pair_counts,
+                d_effective_pairs,
+            )
 
     # Compute per-feature coordinate offsets in flat x/y
     d_feature_coord_offsets = cp.zeros(n_features + 1, dtype=cp.int32)
     cp.cumsum(d_effective_pairs, out=d_feature_coord_offsets[1:])
     total_pairs = int(d_feature_coord_offsets[-1].get())
 
-    # S3e: Polygon ring offsets (only when polygons are present)
-    if has_polygons and d_ring_counts is not None:
+    # S3e: Polygon/MultiLineString ring offsets (when polygons or mls present)
+    mls_tag_val = np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
+    has_ring_types = has_polygons or bool(cp.any(unique_tags == mls_tag_val))
+    if has_ring_types and d_ring_counts is not None:
         d_pair_offset_starts = cp.empty(n_features, dtype=cp.int32)
         cp.cumsum(d_pair_counts, out=d_pair_offset_starts)
         d_pair_offset_starts = cp.concatenate(
@@ -652,6 +860,61 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
              KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
         ))
         del d_pair_offset_starts, d_ring_scatter_starts
+
+    # S3f: MultiPolygon 3-level offset scatter
+    if has_multipolygons and d_mpoly_part_counts is not None:
+        # Compute prefix sums for part/ring counts (mpoly-local space)
+        d_mp_part_psum = cp.empty(n_features, dtype=cp.int32)
+        cp.cumsum(d_mpoly_part_counts, out=d_mp_part_psum)
+        d_mp_part_offset_starts = cp.concatenate(
+            [cp.zeros(1, dtype=cp.int32), d_mp_part_psum[:-1]]
+        )
+        total_mpoly_parts = int(d_mp_part_psum[-1])
+
+        d_mp_ring_psum = cp.empty(n_features, dtype=cp.int32)
+        cp.cumsum(d_mpoly_ring_counts, out=d_mp_ring_psum)
+        d_mp_ring_offset_starts = cp.concatenate(
+            [cp.zeros(1, dtype=cp.int32), d_mp_ring_psum[:-1]]
+        )
+        total_mpoly_rings = int(d_mp_ring_psum[-1])
+
+        # For pair offset starts, use the GLOBAL feature coord offsets so that
+        # ring_offsets index into the global flat coordinate array.  This is
+        # critical for mixed-type files where MultiPolygon coordinates don't
+        # start at index 0 in the flat array.
+        d_mp_pair_offset_starts = d_feature_coord_offsets[:n_features].copy()
+
+        # Geometry offsets: per-feature part count prefix sums
+        d_mpoly_geom_offsets = cp.empty(n_features + 1, dtype=cp.int32)
+        d_mpoly_geom_offsets[0] = 0
+        d_mpoly_geom_offsets[1:] = d_mp_part_psum
+
+        # Allocate part and ring offset arrays
+        d_mpoly_part_offsets = cp.empty(total_mpoly_parts + 1, dtype=cp.int32)
+        d_mpoly_ring_offsets = cp.empty(total_mpoly_rings + 1, dtype=cp.int32)
+        # Write sentinel end values
+        if total_mpoly_parts > 0:
+            d_mpoly_part_offsets[-1] = total_mpoly_rings
+        if total_mpoly_rings > 0:
+            d_mpoly_ring_offsets[-1] = int(d_feature_coord_offsets[n_features])
+
+        # Scatter offsets
+        mpoly_scatter_k = _mpoly_scatter_kernels()
+        _launch_kernel(runtime, mpoly_scatter_k["scatter_mpoly_offsets"], n_features, (
+            (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
+             ptr(d_family_tags),
+             ptr(d_mp_part_offset_starts), ptr(d_mp_ring_offset_starts),
+             ptr(d_mp_pair_offset_starts),
+             ptr(d_mpoly_part_offsets), ptr(d_mpoly_ring_offsets),
+             np.int32(n_features), mpoly_tag),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_I32, KERNEL_PARAM_I8),
+        ))
+        del d_mp_part_psum, d_mp_ring_psum
+        del d_mp_part_offset_starts, d_mp_ring_offset_starts, d_mp_pair_offset_starts
 
     # S4: Find all number boundaries (with quote-state filter) via gpu_parse.
     d_is_start, d_is_end = number_boundaries(d_bytes, d_quote_parity)
@@ -715,6 +978,9 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
             single_tag, n_features, d_x, d_y,
             d_effective_pairs, d_feature_coord_offsets,
             d_ring_counts, d_all_geometry_offsets, d_ring_offsets,
+            d_mpoly_geom_offsets=d_mpoly_geom_offsets,
+            d_mpoly_part_offsets=d_mpoly_part_offsets,
+            d_mpoly_ring_offsets=d_mpoly_ring_offsets,
         )
     else:
         owned = _assemble_mixed(
@@ -722,6 +988,11 @@ def read_geojson_gpu(path: Path) -> GeoJSONGpuResult:
             d_effective_pairs, d_feature_coord_offsets,
             d_ring_counts, d_pair_counts,
             d_all_geometry_offsets, d_ring_offsets,
+            d_mpoly_part_counts=d_mpoly_part_counts,
+            d_mpoly_ring_counts=d_mpoly_ring_counts,
+            d_mpoly_geom_offsets=d_mpoly_geom_offsets,
+            d_mpoly_part_offsets=d_mpoly_part_offsets,
+            d_mpoly_ring_offsets=d_mpoly_ring_offsets,
         )
 
     return GeoJSONGpuResult(
@@ -737,6 +1008,8 @@ def _assemble_homogeneous(
     tag, n_features, d_x, d_y,
     d_effective_pairs, d_feature_coord_offsets,
     d_ring_counts, d_all_geometry_offsets, d_ring_offsets,
+    *, d_mpoly_geom_offsets=None, d_mpoly_part_offsets=None,
+    d_mpoly_ring_offsets=None,
 ):
     """Build single-family OwnedGeometryArray for homogeneous files."""
     d_empty_mask = (d_effective_pairs == 0)
@@ -765,19 +1038,67 @@ def _assemble_homogeneous(
             detail="GPU byte-classification GeoJSON parse (LineString)",
         )
 
-    # Polygon — use ring offsets
-    d_pg_empty = (d_all_geometry_offsets[1:] == d_all_geometry_offsets[:-1])
-    d_pg_validity = ~d_pg_empty
-    return _build_device_single_family_owned(
-        family=GeometryFamily.POLYGON,
-        validity_device=d_pg_validity,
-        x_device=d_x,
-        y_device=d_y,
-        geometry_offsets_device=d_all_geometry_offsets,
-        empty_mask_device=d_pg_empty,
-        ring_offsets_device=d_ring_offsets,
-        detail="GPU byte-classification GeoJSON parse (Polygon)",
-    )
+    if tag == FAMILY_TAGS[GeometryFamily.POLYGON]:
+        d_pg_empty = (d_all_geometry_offsets[1:] == d_all_geometry_offsets[:-1])
+        d_pg_validity = ~d_pg_empty
+        return _build_device_single_family_owned(
+            family=GeometryFamily.POLYGON,
+            validity_device=d_pg_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_all_geometry_offsets,
+            empty_mask_device=d_pg_empty,
+            ring_offsets_device=d_ring_offsets,
+            detail="GPU byte-classification GeoJSON parse (Polygon)",
+        )
+
+    if tag == FAMILY_TAGS[GeometryFamily.MULTIPOINT]:
+        # MultiPoint: geometry_offsets = per-feature coord count (same as LineString layout)
+        return _build_device_single_family_owned(
+            family=GeometryFamily.MULTIPOINT,
+            validity_device=d_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_feature_coord_offsets,
+            empty_mask_device=d_empty_mask,
+            detail="GPU byte-classification GeoJSON parse (MultiPoint)",
+        )
+
+    if tag == FAMILY_TAGS[GeometryFamily.MULTILINESTRING]:
+        # MultiLineString: same nesting as Polygon.
+        # d_all_geometry_offsets = per-feature part count prefix sums (into ring_offsets)
+        # d_ring_offsets = per-part coord count prefix sums (into x/y)
+        # For MultiLineString: geometry_offsets -> parts, part_offsets -> coords
+        d_mls_empty = (d_all_geometry_offsets[1:] == d_all_geometry_offsets[:-1])
+        d_mls_validity = ~d_mls_empty
+        return _build_device_single_family_owned(
+            family=GeometryFamily.MULTILINESTRING,
+            validity_device=d_mls_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_all_geometry_offsets,
+            empty_mask_device=d_mls_empty,
+            part_offsets_device=d_ring_offsets,
+            detail="GPU byte-classification GeoJSON parse (MultiLineString)",
+        )
+
+    if tag == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]:
+        # MultiPolygon: 3-level offsets
+        d_mp_empty = (d_mpoly_geom_offsets[1:] == d_mpoly_geom_offsets[:-1])
+        d_mp_validity = ~d_mp_empty
+        return _build_device_single_family_owned(
+            family=GeometryFamily.MULTIPOLYGON,
+            validity_device=d_mp_validity,
+            x_device=d_x,
+            y_device=d_y,
+            geometry_offsets_device=d_mpoly_geom_offsets,
+            empty_mask_device=d_mp_empty,
+            part_offsets_device=d_mpoly_part_offsets,
+            ring_offsets_device=d_mpoly_ring_offsets,
+            detail="GPU byte-classification GeoJSON parse (MultiPolygon)",
+        )
+
+    raise ValueError(f"Unsupported family tag {tag} in homogeneous assembly")
 
 
 def _assemble_mixed(
@@ -785,18 +1106,24 @@ def _assemble_mixed(
     d_effective_pairs, d_feature_coord_offsets,
     d_ring_counts, d_pair_counts,
     d_all_geometry_offsets, d_ring_offsets,
+    *, d_mpoly_part_counts=None, d_mpoly_ring_counts=None,
+    d_mpoly_geom_offsets=None, d_mpoly_part_offsets=None,
+    d_mpoly_ring_offsets=None,
 ):
     """Build multi-family OwnedGeometryArray for mixed-type files."""
     # Partition features by family
     family_devices = {}
-    partitions = {}  # tag_val → rows (cached for reuse in tag assignment)
+    partitions = {}  # tag_val -> rows (cached for reuse in tag assignment)
     tag_map = [
         (FAMILY_TAGS[GeometryFamily.POINT], GeometryFamily.POINT),
         (FAMILY_TAGS[GeometryFamily.LINESTRING], GeometryFamily.LINESTRING),
         (FAMILY_TAGS[GeometryFamily.POLYGON], GeometryFamily.POLYGON),
+        (FAMILY_TAGS[GeometryFamily.MULTIPOINT], GeometryFamily.MULTIPOINT),
+        (FAMILY_TAGS[GeometryFamily.MULTILINESTRING], GeometryFamily.MULTILINESTRING),
+        (FAMILY_TAGS[GeometryFamily.MULTIPOLYGON], GeometryFamily.MULTIPOLYGON),
     ]
 
-    # Pre-compute coords_2d once for LineString/Polygon gather operations
+    # Pre-compute coords_2d once for gather operations
     coords_2d = cp.column_stack([d_x, d_y]) if d_x.size > 0 else cp.empty((0, 2), dtype=cp.float64)
 
     for tag_val, family in tag_map:
@@ -847,6 +1174,68 @@ def _assemble_mixed(
                 geometry_offsets=pg_geom_offsets,
                 empty_mask=(pg_geom_offsets[1:] == pg_geom_offsets[:-1]),
                 ring_offsets=pg_ring_offsets,
+            )
+
+        elif family == GeometryFamily.MULTIPOINT:
+            # MultiPoint: same layout as LineString (geometry_offsets -> coords)
+            gathered, mp_geom_offsets = _device_gather_offset_slices(
+                coords_2d, d_feature_coord_offsets, rows,
+            )
+            family_devices[family] = DeviceFamilyGeometryBuffer(
+                family=family,
+                x=cp.ascontiguousarray(gathered[:, 0]) if gathered.size else cp.empty(0, dtype=cp.float64),
+                y=cp.ascontiguousarray(gathered[:, 1]) if gathered.size else cp.empty(0, dtype=cp.float64),
+                geometry_offsets=mp_geom_offsets,
+                empty_mask=(mp_geom_offsets[1:] == mp_geom_offsets[:-1]),
+            )
+
+        elif family == GeometryFamily.MULTILINESTRING:
+            # MultiLineString: same nesting as Polygon.
+            # d_all_geometry_offsets indexes ring/part counts, d_ring_offsets indexes coords.
+            # For MLS: geometry_offsets -> parts, part_offsets -> coords
+            part_indices, mls_geom_offsets = _device_gather_offset_slices(
+                cp.arange(d_ring_offsets.size, dtype=cp.int32),
+                d_all_geometry_offsets,
+                rows,
+            )
+            mls_coords, mls_part_offsets = _device_gather_offset_slices(
+                coords_2d, d_ring_offsets, part_indices,
+            )
+            family_devices[family] = DeviceFamilyGeometryBuffer(
+                family=family,
+                x=cp.ascontiguousarray(mls_coords[:, 0]) if mls_coords.size else cp.empty(0, dtype=cp.float64),
+                y=cp.ascontiguousarray(mls_coords[:, 1]) if mls_coords.size else cp.empty(0, dtype=cp.float64),
+                geometry_offsets=mls_geom_offsets,
+                empty_mask=(mls_geom_offsets[1:] == mls_geom_offsets[:-1]),
+                part_offsets=mls_part_offsets,
+            )
+
+        elif family == GeometryFamily.MULTIPOLYGON:
+            # MultiPolygon: 3-level offsets (geometry -> parts -> rings -> coords)
+            # Gather part indices for these rows
+            part_indices, mpg_geom_offsets = _device_gather_offset_slices(
+                cp.arange(d_mpoly_part_offsets.size, dtype=cp.int32),
+                d_mpoly_geom_offsets,
+                rows,
+            )
+            # Gather ring indices for these parts
+            ring_indices, mpg_part_offsets = _device_gather_offset_slices(
+                cp.arange(d_mpoly_ring_offsets.size, dtype=cp.int32),
+                d_mpoly_part_offsets,
+                part_indices,
+            )
+            # Gather coords for these rings
+            mpg_coords, mpg_ring_offsets = _device_gather_offset_slices(
+                coords_2d, d_mpoly_ring_offsets, ring_indices,
+            )
+            family_devices[family] = DeviceFamilyGeometryBuffer(
+                family=family,
+                x=cp.ascontiguousarray(mpg_coords[:, 0]) if mpg_coords.size else cp.empty(0, dtype=cp.float64),
+                y=cp.ascontiguousarray(mpg_coords[:, 1]) if mpg_coords.size else cp.empty(0, dtype=cp.float64),
+                geometry_offsets=mpg_geom_offsets,
+                empty_mask=(mpg_geom_offsets[1:] == mpg_geom_offsets[:-1]),
+                part_offsets=mpg_part_offsets,
+                ring_offsets=mpg_ring_offsets,
             )
 
     # Build tags and family_row_offsets (reuse cached partitions)

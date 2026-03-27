@@ -586,10 +586,10 @@ def test_type_in_property_string(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Test 21: Unsupported MultiPoint raises error
+# Test 21: MultiPoint — now supported (was unsupported)
 # ---------------------------------------------------------------------------
 @needs_gpu
-def test_unsupported_multipoint(tmp_path):
+def test_multipoint(tmp_path):
     fc = {
         "type": "FeatureCollection",
         "features": [
@@ -606,5 +606,322 @@ def test_unsupported_multipoint(tmp_path):
     path = tmp_path / "multipoint.geojson"
     _write_geojson(path, fc)
 
-    with pytest.raises(NotImplementedError, match="unsupported geometry types"):
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.MULTIPOINT in owned.families
+    assert owned.families[GeometryFamily.MULTIPOINT].row_count == 1
+
+    dev_buf = owned.device_state.families[GeometryFamily.MULTIPOINT]
+    gpu_x = cp.asnumpy(dev_buf.x)
+    gpu_y = cp.asnumpy(dev_buf.y)
+    np.testing.assert_allclose(gpu_x, [0.0, 1.0], atol=1e-10)
+    np.testing.assert_allclose(gpu_y, [0.0, 1.0], atol=1e-10)
+
+    # geometry_offsets: 1 feature with 2 points
+    geom_off = cp.asnumpy(dev_buf.geometry_offsets)
+    assert geom_off[0] == 0
+    assert geom_off[1] == 2
+
+
+# ---------------------------------------------------------------------------
+# Test 22: MultiLineString
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_multilinestring(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "MultiLineString",
+                    "coordinates": [
+                        [[0, 0], [1, 1]],
+                        [[2, 2], [3, 3]],
+                    ],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "multilinestring.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.MULTILINESTRING in owned.families
+    assert owned.families[GeometryFamily.MULTILINESTRING].row_count == 1
+
+    dev_buf = owned.device_state.families[GeometryFamily.MULTILINESTRING]
+    gpu_x = cp.asnumpy(dev_buf.x)
+    gpu_y = cp.asnumpy(dev_buf.y)
+    np.testing.assert_allclose(gpu_x, [0.0, 1.0, 2.0, 3.0], atol=1e-10)
+    np.testing.assert_allclose(gpu_y, [0.0, 1.0, 2.0, 3.0], atol=1e-10)
+
+    # geometry_offsets: 1 feature with 2 parts
+    geom_off = cp.asnumpy(dev_buf.geometry_offsets)
+    assert geom_off[0] == 0
+    assert geom_off[1] == 2
+
+    # part_offsets: part 0 = coords 0..2, part 1 = coords 2..4
+    part_off = cp.asnumpy(dev_buf.part_offsets)
+    assert part_off[0] == 0
+    assert part_off[1] == 2
+    assert part_off[2] == 4
+
+
+# ---------------------------------------------------------------------------
+# Test 23: MultiPolygon
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_multipolygon(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+                    ],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "multipolygon.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.MULTIPOLYGON in owned.families
+    assert owned.families[GeometryFamily.MULTIPOLYGON].row_count == 1
+
+    dev_buf = owned.device_state.families[GeometryFamily.MULTIPOLYGON]
+    gpu_x = cp.asnumpy(dev_buf.x)
+    gpu_y = cp.asnumpy(dev_buf.y)
+    np.testing.assert_allclose(gpu_x, [0.0, 1.0, 1.0, 0.0], atol=1e-10)
+    np.testing.assert_allclose(gpu_y, [0.0, 0.0, 1.0, 0.0], atol=1e-10)
+
+    # geometry_offsets: 1 feature with 1 polygon part
+    geom_off = cp.asnumpy(dev_buf.geometry_offsets)
+    assert geom_off[0] == 0
+    assert geom_off[1] == 1
+
+    # part_offsets: 1 polygon part with 1 ring
+    part_off = cp.asnumpy(dev_buf.part_offsets)
+    assert part_off[0] == 0
+    assert part_off[1] == 1
+
+    # ring_offsets: 1 ring with 4 coords
+    ring_off = cp.asnumpy(dev_buf.ring_offsets)
+    assert ring_off[0] == 0
+    assert ring_off[1] == 4
+
+
+# ---------------------------------------------------------------------------
+# Test 24: MultiPolygon with multiple polygon parts
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_multipolygon_two_parts(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "MultiPolygon",
+                    "coordinates": [
+                        [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+                        [[[10, 10], [11, 10], [11, 11], [10, 10]]],
+                    ],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "multipolygon2.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.MULTIPOLYGON in owned.families
+
+    dev_buf = owned.device_state.families[GeometryFamily.MULTIPOLYGON]
+    gpu_x = cp.asnumpy(dev_buf.x)
+    gpu_y = cp.asnumpy(dev_buf.y)
+    np.testing.assert_allclose(gpu_x, [0, 1, 1, 0, 10, 11, 11, 10], atol=1e-10)
+    np.testing.assert_allclose(gpu_y, [0, 0, 1, 0, 10, 10, 11, 10], atol=1e-10)
+
+    # 1 feature, 2 polygon parts
+    geom_off = cp.asnumpy(dev_buf.geometry_offsets)
+    assert list(geom_off) == [0, 2]
+
+    # 2 parts, 1 ring each
+    part_off = cp.asnumpy(dev_buf.part_offsets)
+    assert list(part_off) == [0, 1, 2]
+
+    # 2 rings, 4 coords each
+    ring_off = cp.asnumpy(dev_buf.ring_offsets)
+    assert list(ring_off) == [0, 4, 8]
+
+
+# ---------------------------------------------------------------------------
+# Test 25: Mixed Point + MultiPolygon
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_mixed_point_multipolygon(tmp_path):
+    features = [
+        _make_point_feature([5.0, 6.0]),
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "MultiPolygon",
+                "coordinates": [
+                    [[[0, 0], [1, 0], [1, 1], [0, 0]]],
+                ],
+            },
+        },
+        _make_point_feature([7.0, 8.0]),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "mixed_pt_mpg.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+
+    assert GeometryFamily.POINT in owned.families
+    assert GeometryFamily.MULTIPOLYGON in owned.families
+    assert owned.families[GeometryFamily.POINT].row_count == 2
+    assert owned.families[GeometryFamily.MULTIPOLYGON].row_count == 1
+
+    # Check Point coordinates
+    dev_pt = owned.device_state.families[GeometryFamily.POINT]
+    pt_x = cp.asnumpy(dev_pt.x)
+    pt_y = cp.asnumpy(dev_pt.y)
+    np.testing.assert_allclose(pt_x, [5.0, 7.0], atol=1e-10)
+    np.testing.assert_allclose(pt_y, [6.0, 8.0], atol=1e-10)
+
+    # Check MultiPolygon coordinates
+    dev_mp = owned.device_state.families[GeometryFamily.MULTIPOLYGON]
+    mp_x = cp.asnumpy(dev_mp.x)
+    mp_y = cp.asnumpy(dev_mp.y)
+    np.testing.assert_allclose(mp_x, [0.0, 1.0, 1.0, 0.0], atol=1e-10)
+    np.testing.assert_allclose(mp_y, [0.0, 0.0, 1.0, 0.0], atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Test 26: Unsupported GeometryCollection still raises error
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_unsupported_geometry_collection(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {},
+                "geometry": {
+                    "type": "GeometryCollection",
+                    "geometries": [
+                        {"type": "Point", "coordinates": [0, 0]},
+                    ],
+                },
+            }
+        ],
+    }
+    path = tmp_path / "geomcoll.geojson"
+    _write_geojson(path, fc)
+
+    with pytest.raises((NotImplementedError, ValueError)):
         read_geojson_owned(path, prefer="gpu-byte-classify")
+
+
+# ---------------------------------------------------------------------------
+# Test 27: Multiple MultiPoints in homogeneous file
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_homogeneous_multipoints(tmp_path):
+    features = []
+    for i in range(10):
+        features.append({
+            "type": "Feature",
+            "properties": {"id": i},
+            "geometry": {
+                "type": "MultiPoint",
+                "coordinates": [[i, i + 0.5], [i + 1, i + 1.5]],
+            },
+        })
+    fc = _make_feature_collection(features)
+    path = tmp_path / "multipoints.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+    assert GeometryFamily.MULTIPOINT in owned.families
+    assert owned.families[GeometryFamily.MULTIPOINT].row_count == 10
+
+    dev_buf = owned.device_state.families[GeometryFamily.MULTIPOINT]
+    gpu_x = cp.asnumpy(dev_buf.x)
+    # 10 features x 2 points each = 20 coords total
+    assert len(gpu_x) == 20
+    # Check first feature coords
+    np.testing.assert_allclose(gpu_x[:2], [0.0, 1.0], atol=1e-10)
+
+
+# ---------------------------------------------------------------------------
+# Test 28: Mixed all six types
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_mixed_all_six_types(tmp_path):
+    features = [
+        _make_point_feature([1.0, 2.0]),
+        _make_linestring_feature([[3.0, 4.0], [5.0, 6.0]]),
+        _make_polygon_feature(_simple_square(0.0, 0.0)),
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "MultiPoint",
+                "coordinates": [[10, 10], [11, 11]],
+            },
+        },
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "MultiLineString",
+                "coordinates": [[[20, 20], [21, 21]]],
+            },
+        },
+        {
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "MultiPolygon",
+                "coordinates": [[[[30, 30], [31, 30], [31, 31], [30, 30]]]],
+            },
+        },
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "mixed_all6.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    owned = batch.geometry
+
+    assert GeometryFamily.POINT in owned.families
+    assert GeometryFamily.LINESTRING in owned.families
+    assert GeometryFamily.POLYGON in owned.families
+    assert GeometryFamily.MULTIPOINT in owned.families
+    assert GeometryFamily.MULTILINESTRING in owned.families
+    assert GeometryFamily.MULTIPOLYGON in owned.families
+    assert owned.families[GeometryFamily.POINT].row_count == 1
+    assert owned.families[GeometryFamily.LINESTRING].row_count == 1
+    assert owned.families[GeometryFamily.POLYGON].row_count == 1
+    assert owned.families[GeometryFamily.MULTIPOINT].row_count == 1
+    assert owned.families[GeometryFamily.MULTILINESTRING].row_count == 1
+    assert owned.families[GeometryFamily.MULTIPOLYGON].row_count == 1

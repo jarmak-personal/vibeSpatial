@@ -8,6 +8,7 @@ class IOFormat(StrEnum):
     GEOARROW = "geoarrow"
     GEOPARQUET = "geoparquet"
     WKB = "wkb"
+    WKT = "wkt"
     GEOJSON = "geojson"
     SHAPEFILE = "shapefile"
     GDAL_LEGACY = "gdal-legacy"
@@ -70,6 +71,14 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         write_path=IOPathKind.HYBRID,
         canonical_gpu=False,
         reason="WKB is a compatibility bridge format; decode and encode should be GPU-accelerated but are not the preferred storage layout.",
+    ),
+    IOFormat.WKT: IOSupportEntry(
+        format=IOFormat.WKT,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="WKT read uses GPU byte-classification and coordinate extraction; write stays fallback (no GPU WKT serializer yet).",
     ),
     IOFormat.GEOJSON: IOSupportEntry(
         format=IOFormat.GEOJSON,
