@@ -270,6 +270,83 @@ docs for parameter details.
 |--------|-------------|
 | {py:attr}`~vibespatial.api.geo_base.GeoPandasBase.sindex` | Spatial index (STRtree) |
 | {py:attr}`~vibespatial.api.geo_base.GeoPandasBase.has_sindex` | Whether spatial index is built |
+| `.gpu_spatial_index` | GPU-resident Hilbert R-tree (built via `read_file(..., build_index=True)`) |
+
+## GPU-Accelerated File Reading
+
+`read_file()` automatically routes to GPU-accelerated parsers when a GPU is
+available. No code changes are required — GPU acceleration is transparent.
+
+### Supported Formats
+
+| Format | Extension | GPU Condition | Fallback |
+|--------|-----------|---------------|----------|
+| GeoJSON | `.geojson`, `.json` | File > 10 MB | pyogrio |
+| Shapefile | `.shp` | File > 10 MB | pyogrio |
+| CSV/TSV | `.csv`, `.tsv` | File > 10 MB | pyogrio |
+| KML | `.kml` | File > 10 MB | pyogrio |
+| WKT | `.wkt` | Always | None (GPU-only) |
+| OSM PBF | `.pbf`, `.osm.pbf` | Always | None (GPU-only) |
+| GeoParquet | `.parquet` | Always | pyarrow |
+
+### CSV Spatial Column Auto-Detection
+
+When reading CSV files, vibeSpatial auto-detects spatial columns by header
+name (case-insensitive). You can also specify columns explicitly.
+
+**Latitude columns** (any of):
+`latitude`, `lat`, `y`, `lat_y`, `point_y`
+
+**Longitude columns** (any of):
+`longitude`, `lon`, `lng`, `x`, `long`, `lon_x`, `point_x`
+
+**Geometry columns** (WKT text or hex-encoded WKB, any of):
+`geometry`, `geom`, `wkt`, `the_geom`, `shape`, `wkb`
+
+```python
+# Auto-detected from column names
+gdf = gpd.read_file("data.csv")
+
+# Explicit column override
+gdf = gpd.read_file("data.csv", lat_col="custom_lat", lon_col="custom_lon")
+```
+
+When a geometry column is detected, vibeSpatial peeks at the first value to
+determine the encoding:
+
+- **Hex WKB**: starts with `00` or `01` (byte-order marker), even length,
+  all hex digits → decoded via GPU WKB pipeline
+- **WKT text**: everything else → parsed via GPU WKT pipeline
+
+### Fused Pipelines
+
+```python
+# Reproject during parse (zero extra passes over coordinate data)
+gdf = gpd.read_file("data.geojson", target_crs="EPSG:3857")
+
+# Build GPU Hilbert R-tree spatial index during parse
+gdf = gpd.read_file("data.geojson", build_index=True)
+gdf.gpu_spatial_index  # → GpuSpatialIndex or None
+```
+
+### Parameters That Disable GPU
+
+The GPU fast path is bypassed when any of these are specified:
+`bbox`, `columns`, `rows`, `mask`, or `engine`.
+
+### Direct GPU Reader Access
+
+Power users can import GPU readers directly for fine-grained control:
+
+```python
+from vibespatial.io import (
+    read_wkt_gpu,        # WKT bytes → OwnedGeometryArray
+    read_csv_gpu,        # CSV bytes → CsvGpuResult
+    read_kml_gpu,        # KML bytes → OwnedGeometryArray
+    read_osm_pbf_nodes,  # PBF path → OsmGpuResult
+    build_spatial_index,  # Coordinates → GpuSpatialIndex
+)
+```
 
 ## Execution Modes
 
