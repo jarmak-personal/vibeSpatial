@@ -604,6 +604,22 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
                 "to set the active geometry column."
             )
 
+    @property
+    def gpu_spatial_index(self):
+        """GPU-resident Hilbert R-tree spatial index, or None if not built.
+
+        Built automatically when ``read_file(..., build_index=True)`` is used.
+        Can also be built manually via
+        ``vibespatial.io.gpu_parse.build_spatial_index()``.
+
+        Returns
+        -------
+        GpuSpatialIndex or None
+            The packed Hilbert R-tree spatial index attached to this
+            GeoDataFrame, or ``None`` if no index has been built.
+        """
+        return getattr(self, "_gpu_spatial_index", None)
+
     @crs.setter
     def crs(self, value) -> None:
         """Set the value of the crs."""

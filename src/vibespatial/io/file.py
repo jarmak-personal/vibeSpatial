@@ -164,6 +164,7 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         ".csv": "CSV",
         ".tsv": "CSV",
         ".kml": "KML",
+        ".pbf": "OSM-PBF",
     }
     return mapping.get(suffix, "GDAL-legacy")
 
@@ -196,6 +197,10 @@ def plan_vector_file_io(
         io_format = IOFormat.KML
         implementation = "kml_gpu_hybrid_adapter"
         reason = "KML uses GPU byte-classification for structural analysis and coordinate extraction with host fallback."
+    elif normalized_driver == "OSM-PBF":
+        io_format = IOFormat.OSM_PBF
+        implementation = "osm_pbf_gpu_hybrid_adapter"
+        reason = "OSM PBF uses CPU protobuf parsing with GPU varint decoding and coordinate assembly."
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"
@@ -514,6 +519,51 @@ def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
+def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
+    """Try to read an OSM PBF file using the GPU hybrid pipeline.
+
+    OSM PBF files contain DenseNodes extracted via CPU protobuf parsing
+    with GPU varint decoding and coordinate assembly.  Returns a
+    GeoDataFrame with Point geometry and an ``osm_node_id`` column, or
+    None on failure.
+    """
+    try:
+        from .arrow import geoseries_from_owned
+        from .osm_gpu import read_osm_pbf_nodes
+
+        osm_result = read_osm_pbf_nodes(filename)
+        if osm_result.nodes is None or osm_result.n_nodes == 0:
+            return None
+
+        # OSM PBF has no embedded CRS; coordinates are WGS84 by definition.
+        crs = target_crs if target_crs is not None else "EPSG:4326"
+        geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
+
+        import vibespatial.api as geopandas
+
+        # Attach node IDs as a column if available.
+        data: dict[str, object] = {}
+        if osm_result.node_ids is not None:
+            import cupy as _cp
+
+            data["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
+
+        gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="osm_pbf_gpu_hybrid_adapter",
+            reason=(
+                "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
+                "decoding and coordinate assembly into Point OwnedGeometryArray."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
 # Minimum file size (in bytes) for GPU fast-path routing.
 # Below this threshold, let the CPU handle it -- kernel launch overhead
 # dominates for small files.
@@ -564,6 +614,13 @@ def _try_gpu_read_file(
         # WKT: always route to GPU (pyogrio/GDAL does not support raw WKT)
         if plan.format is IOFormat.WKT:
             gdf = _try_wkt_gpu_read(filename, target_crs=target_crs)
+            if gdf is not None and build_index:
+                _attach_gpu_spatial_index(gdf)
+            return gdf
+
+        # OSM PBF: always route to GPU (pyogrio/GDAL does not support PBF)
+        if plan.format is IOFormat.OSM_PBF:
+            gdf = _try_osm_pbf_gpu_read(filename, target_crs=target_crs)
             if gdf is not None and build_index:
                 _attach_gpu_spatial_index(gdf)
             return gdf
@@ -732,10 +789,20 @@ def read_vector_file(
 ):
     """Read a vector file into a GeoDataFrame.
 
-    Supports Shapefile, GeoPackage, GeoJSON, WKT, CSV, KML, and any
-    format readable by pyogrio/fiona.  For GeoJSON, Shapefile, WKT, CSV,
-    and KML inputs the reader attempts a GPU-accelerated owned path first;
-    other formats fall back to pyogrio.
+    Supports Shapefile, GeoPackage, GeoJSON, WKT, CSV, KML, OSM PBF,
+    and any format readable by pyogrio/fiona.
+
+    GPU acceleration is automatic for GeoJSON, Shapefile, WKT, CSV, KML,
+    and OSM PBF formats.  For CSV, KML, GeoJSON, and Shapefile, GPU
+    acceleration activates only for files larger than 10 MB (below this
+    threshold, CPU is faster due to kernel launch overhead).  WKT and
+    OSM PBF always use the GPU path -- there is no CPU fallback for
+    these formats (pyogrio/GDAL does not support them).
+
+    The GPU fast path is disabled when any of ``bbox``, ``columns``,
+    ``rows``, or ``mask`` parameters are specified, or when ``engine``
+    is explicitly set.  In those cases the reader falls through to the
+    CPU pyogrio/fiona path.
 
     Aliased as ``vibespatial.read_file()``.
 
@@ -744,25 +811,28 @@ def read_vector_file(
     filename : str or Path
         Path to the vector file.
     bbox : tuple of (minx, miny, maxx, maxy), optional
-        Spatial filter bounding box.
+        Spatial filter bounding box.  Disables the GPU fast path.
     mask : Geometry or GeoDataFrame, optional
-        Spatial filter mask geometry.
+        Spatial filter mask geometry.  Disables the GPU fast path.
     columns : list of str, optional
-        Subset of columns to read.
+        Subset of columns to read.  Disables the GPU fast path.
     rows : int or slice, optional
-        Subset of rows to read.
+        Subset of rows to read.  Disables the GPU fast path.
     engine : str, optional
         Force a specific I/O engine (``"pyogrio"`` or ``"fiona"``).
+        Disables GPU auto-routing.
     target_crs : str, optional
         Target CRS to reproject coordinates into (e.g. ``"EPSG:3857"``).
         When the GPU path is used, the reprojection is fused with ingest
-        (no separate pass required).  When the CPU path is used, the
-        result is reprojected via ``gdf.to_crs()`` as a post-read step.
+        via vibeProj GPU transform (no separate pass required).  When the
+        CPU path is used, the result is reprojected via ``gdf.to_crs()``
+        as a post-read step.  For formats without an embedded CRS (WKT,
+        CSV, KML, OSM PBF), the target CRS is set as a label without
+        reprojection.
     build_index : bool, default False
         When True and the GPU path is used, build a GPU-resident packed
         Hilbert R-tree spatial index fused with ingest.  The index is
-        attached to the resulting GeoDataFrame as a ``_gpu_spatial_index``
-        attribute.
+        accessible via the ``GeoDataFrame.gpu_spatial_index`` property.
     **kwargs
         Passed through to the underlying engine.
 
@@ -779,6 +849,7 @@ def read_vector_file(
         IOFormat.WKT,
         IOFormat.CSV,
         IOFormat.KML,
+        IOFormat.OSM_PBF,
     }
     if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         gpu_result = _try_gpu_read_file(
@@ -801,6 +872,14 @@ def read_vector_file(
             f"Cannot read WKT file '{filename}': GPU runtime is required for raw "
             "WKT files (pyogrio/GDAL does not support this format). Ensure a CUDA "
             "GPU is available and CuPy is installed."
+        )
+
+    # OSM PBF files have no CPU fallback (pyogrio/GDAL does not support PBF).
+    if plan.format is IOFormat.OSM_PBF:
+        raise RuntimeError(
+            f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
+            "OSM PBF files (pyogrio/GDAL does not support this format). Ensure a "
+            "CUDA GPU is available and CuPy is installed."
         )
 
     record_dispatch_event(

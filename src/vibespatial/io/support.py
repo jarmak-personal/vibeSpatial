@@ -13,6 +13,7 @@ class IOFormat(StrEnum):
     GEOJSON = "geojson"
     KML = "kml"
     SHAPEFILE = "shapefile"
+    OSM_PBF = "osm-pbf"
     GDAL_LEGACY = "gdal-legacy"
 
 
@@ -113,6 +114,14 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         write_path=IOPathKind.HYBRID,
         canonical_gpu=False,
         reason="Shapefile should use an explicit hybrid pipeline because the container and sidecar files are legacy host-oriented structures.",
+    ),
+    IOFormat.OSM_PBF: IOSupportEntry(
+        format=IOFormat.OSM_PBF,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="OSM PBF read uses CPU protobuf parsing with GPU varint decoding and coordinate assembly; write is not supported.",
     ),
     IOFormat.GDAL_LEGACY: IOSupportEntry(
         format=IOFormat.GDAL_LEGACY,

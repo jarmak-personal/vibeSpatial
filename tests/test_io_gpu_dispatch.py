@@ -1,14 +1,17 @@
-"""Integration tests for GPU dispatch of WKT, CSV, and KML via read_file().
+"""Integration tests for GPU dispatch of WKT, CSV, KML, and OSM PBF via read_file().
 
 Verifies the full chain: write test file -> read_file() -> GeoDataFrame
 with correct geometries, correct dispatch events, and proper fallback
 behavior.  Also tests fused ingest+reproject (target_crs) and fused
-ingest+spatial-index (build_index) pipelines.
+ingest+spatial-index (build_index) pipelines, the public gpu_spatial_index
+property, and import accessibility of GPU reader functions.
 """
 from __future__ import annotations
 
 import json
 import math
+import struct
+import zlib
 
 import numpy as np
 import pytest
@@ -488,3 +491,274 @@ class TestFusedBuildIndex:
         assert hasattr(result, "_gpu_spatial_index")
         assert result._gpu_spatial_index is not None
         assert result._gpu_spatial_index.n_features == 2
+
+
+# ---------------------------------------------------------------------------
+# OSM PBF helpers (inline to avoid modifying test_osm_gpu.py)
+# ---------------------------------------------------------------------------
+
+
+def _encode_varint(value: int) -> bytes:
+    result = bytearray()
+    while value > 0x7F:
+        result.append((value & 0x7F) | 0x80)
+        value >>= 7
+    result.append(value & 0x7F)
+    return bytes(result)
+
+
+def _encode_zigzag(value: int) -> int:
+    return (value << 1) ^ (value >> 63) if value >= 0 else ((-value - 1) << 1) | 1
+
+
+def _encode_sint64(value: int) -> bytes:
+    return _encode_varint(_encode_zigzag(value))
+
+
+def _encode_field_tag(field_number: int, wire_type: int) -> bytes:
+    return _encode_varint((field_number << 3) | wire_type)
+
+
+def _encode_length_delimited(field_number: int, data: bytes) -> bytes:
+    return _encode_field_tag(field_number, 2) + _encode_varint(len(data)) + data
+
+
+def _encode_varint_field(field_number: int, value: int) -> bytes:
+    return _encode_field_tag(field_number, 0) + _encode_varint(value)
+
+
+def _encode_packed_sint64(values: list[int]) -> bytes:
+    result = bytearray()
+    for v in values:
+        result.extend(_encode_sint64(v))
+    return bytes(result)
+
+
+def _build_dense_nodes(id_deltas, lat_deltas, lon_deltas) -> bytes:
+    return (
+        _encode_length_delimited(1, _encode_packed_sint64(id_deltas))
+        + _encode_length_delimited(8, _encode_packed_sint64(lat_deltas))
+        + _encode_length_delimited(9, _encode_packed_sint64(lon_deltas))
+    )
+
+
+def _build_test_pbf(
+    id_deltas: list[int],
+    lat_deltas: list[int],
+    lon_deltas: list[int],
+    granularity: int = 100,
+) -> bytes:
+    dense = _build_dense_nodes(id_deltas, lat_deltas, lon_deltas)
+    group = _encode_length_delimited(2, dense)  # PrimitiveGroup.dense
+    stringtable = _encode_length_delimited(1, b"")
+    pblock = (
+        stringtable
+        + _encode_length_delimited(2, group)
+        + _encode_varint_field(17, granularity)
+    )
+    # Build Blob (zlib compressed)
+    compressed = zlib.compress(pblock)
+    blob = (
+        _encode_varint_field(2, len(pblock))
+        + _encode_length_delimited(3, compressed)
+    )
+    # Build BlobHeader for OSMData
+    blob_header = (
+        _encode_length_delimited(1, b"OSMData")
+        + _encode_varint_field(3, len(blob))
+    )
+    data_block = struct.pack(">I", len(blob_header)) + blob_header + blob
+
+    # Build OSMHeader block
+    header_payload = _encode_length_delimited(4, b"OsmSchema-V0.6")
+    h_compressed = zlib.compress(header_payload)
+    h_blob = (
+        _encode_varint_field(2, len(header_payload))
+        + _encode_length_delimited(3, h_compressed)
+    )
+    h_blob_header = (
+        _encode_length_delimited(1, b"OSMHeader")
+        + _encode_varint_field(3, len(h_blob))
+    )
+    header_block = struct.pack(">I", len(h_blob_header)) + h_blob_header + h_blob
+
+    return header_block + data_block
+
+
+# ---------------------------------------------------------------------------
+# OSM PBF tests
+# ---------------------------------------------------------------------------
+
+
+class TestOsmPbfGpuDispatch:
+    """OSM PBF files must always route through GPU (no pyogrio fallback)."""
+
+    @needs_gpu
+    def test_read_pbf_point_file(self, tmp_path) -> None:
+        """read_file on a .pbf file with three nodes returns correct GeoDataFrame."""
+        pbf_path = tmp_path / "nodes.pbf"
+        # Three nodes: id=100,101,102 at lat=40.0,40.1,40.3 lon=-74.0,-74.01,-74.03
+        pbf_data = _build_test_pbf(
+            id_deltas=[100, 1, 1],
+            lat_deltas=[400000000, 1000000, 2000000],
+            lon_deltas=[-740000000, -100000, -200000],
+        )
+        pbf_path.write_bytes(pbf_data)
+
+        geopandas.clear_dispatch_events()
+        result = geopandas.read_file(pbf_path)
+
+        assert len(result) == 3
+        assert result.geometry.iloc[0].geom_type == "Point"
+
+        # Verify coordinates
+        np.testing.assert_allclose(result.geometry.iloc[0].y, 40.0, rtol=1e-9)
+        np.testing.assert_allclose(result.geometry.iloc[0].x, -74.0, rtol=1e-9)
+
+        # Verify node IDs column
+        assert "osm_node_id" in result.columns
+        np.testing.assert_array_equal(result["osm_node_id"].values, [100, 101, 102])
+
+        events = geopandas.get_dispatch_events(clear=True)
+        impl_names = [e.implementation for e in events]
+        assert "osm_pbf_gpu_hybrid_adapter" in impl_names
+
+    @needs_gpu
+    def test_read_osm_pbf_extension(self, tmp_path) -> None:
+        """read_file on a .osm.pbf file routes correctly."""
+        pbf_path = tmp_path / "data.osm.pbf"
+        pbf_data = _build_test_pbf(
+            id_deltas=[1],
+            lat_deltas=[515000000],
+            lon_deltas=[-1000000],
+        )
+        pbf_path.write_bytes(pbf_data)
+
+        result = geopandas.read_file(pbf_path)
+
+        assert len(result) == 1
+        assert result.geometry.iloc[0].geom_type == "Point"
+        np.testing.assert_allclose(result.geometry.iloc[0].y, 51.5, rtol=1e-9)
+        np.testing.assert_allclose(result.geometry.iloc[0].x, -0.1, rtol=1e-9)
+
+    def test_pbf_extension_detected(self) -> None:
+        """plan_vector_file_io correctly identifies .pbf as OSM_PBF."""
+        from vibespatial.io.file import plan_vector_file_io
+        from vibespatial.io.support import IOOperation
+
+        plan = plan_vector_file_io("data.pbf", operation=IOOperation.READ)
+        assert plan.format is IOFormat.OSM_PBF
+
+    def test_osm_pbf_extension_detected(self) -> None:
+        """plan_vector_file_io correctly identifies .osm.pbf as OSM_PBF."""
+        from vibespatial.io.file import plan_vector_file_io
+        from vibespatial.io.support import IOOperation
+
+        plan = plan_vector_file_io("data.osm.pbf", operation=IOOperation.READ)
+        assert plan.format is IOFormat.OSM_PBF
+
+    def test_read_pbf_without_gpu_raises(self, tmp_path, monkeypatch) -> None:
+        """PBF files must raise a clear error when GPU is not available."""
+        pbf_path = tmp_path / "nogpu.pbf"
+        pbf_path.write_bytes(_build_test_pbf(
+            id_deltas=[1], lat_deltas=[0], lon_deltas=[0],
+        ))
+
+        from vibespatial.io import file as io_file
+
+        monkeypatch.setattr(io_file, "_try_osm_pbf_gpu_read", lambda *a, **kw: None)
+        monkeypatch.setattr(io_file, "_try_gpu_read_file", lambda *a, **kw: None)
+
+        with pytest.raises(RuntimeError, match="GPU runtime is required"):
+            geopandas.read_file(pbf_path)
+
+
+# ---------------------------------------------------------------------------
+# gpu_spatial_index property tests
+# ---------------------------------------------------------------------------
+
+
+class TestGpuSpatialIndexProperty:
+    """Test the public GeoDataFrame.gpu_spatial_index property."""
+
+    def test_no_index_returns_none(self) -> None:
+        """gpu_spatial_index returns None when build_index not used."""
+        gdf = geopandas.GeoDataFrame(
+            {"geometry": [Point(0, 0), Point(1, 1)]},
+        )
+        assert gdf.gpu_spatial_index is None
+
+    @needs_gpu
+    def test_index_present_after_build(self, tmp_path) -> None:
+        """gpu_spatial_index returns GpuSpatialIndex when build_index=True."""
+        path = tmp_path / "index_test.geojson"
+        _write_geojson(path, [
+            _point_feature(0.0, 0.0),
+            _point_feature(1.0, 1.0),
+            _point_feature(2.0, 2.0),
+        ])
+
+        result = geopandas.read_file(path, build_index=True)
+
+        idx = result.gpu_spatial_index
+        assert idx is not None
+        assert idx.n_features == 3
+
+    @needs_gpu
+    def test_property_matches_private_attr(self, tmp_path) -> None:
+        """gpu_spatial_index property returns the same object as _gpu_spatial_index."""
+        path = tmp_path / "prop_test.geojson"
+        _write_geojson(path, [_point_feature(0.0, 0.0)])
+
+        result = geopandas.read_file(path, build_index=True)
+
+        assert result.gpu_spatial_index is result._gpu_spatial_index
+
+
+# ---------------------------------------------------------------------------
+# Import accessibility tests
+# ---------------------------------------------------------------------------
+
+
+class TestImportAccessibility:
+    """Verify that GPU readers are importable from vibespatial.io."""
+
+    def test_import_read_wkt_gpu(self) -> None:
+        from vibespatial.io import read_wkt_gpu
+
+        assert callable(read_wkt_gpu)
+
+    def test_import_read_csv_gpu(self) -> None:
+        from vibespatial.io import read_csv_gpu
+
+        assert callable(read_csv_gpu)
+
+    def test_import_read_kml_gpu(self) -> None:
+        from vibespatial.io import read_kml_gpu
+
+        assert callable(read_kml_gpu)
+
+    def test_import_read_geojson_gpu(self) -> None:
+        from vibespatial.io import read_geojson_gpu
+
+        assert callable(read_geojson_gpu)
+
+    def test_import_read_dbf_gpu(self) -> None:
+        from vibespatial.io import read_dbf_gpu
+
+        assert callable(read_dbf_gpu)
+
+    def test_import_read_osm_pbf_nodes(self) -> None:
+        from vibespatial.io import read_osm_pbf_nodes
+
+        assert callable(read_osm_pbf_nodes)
+
+    def test_import_build_spatial_index(self) -> None:
+        from vibespatial.io import build_spatial_index
+
+        assert callable(build_spatial_index)
+
+    def test_import_gpu_spatial_index_class(self) -> None:
+        from vibespatial.io import GpuSpatialIndex
+
+        assert isinstance(GpuSpatialIndex, type)
