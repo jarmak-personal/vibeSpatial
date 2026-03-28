@@ -1499,11 +1499,11 @@ def _profile_vegetation_corridor_pipeline(
         ) as stage:
             try:
                 valid_result = make_valid_owned(owned=buffered_lines)
-                if valid_result.repaired_rows.size == 0 and valid_result.owned is not None:
-                    # Zero-transfer fast path: all valid, stay on device.
+                if valid_result.owned is not None:
+                    # Device-resident path: stay on device (ADR-0005).
                     corridor_owned = union_all_gpu_owned(valid_result.owned)
                 else:
-                    # Repairs needed: fall through to Shapely path.
+                    # CPU fallback: materialize to Shapely.
                     valid_geoms = _extract_polygonal_components(valid_result.geometries)
                     valid_owned = from_shapely_geometries(valid_geoms)
                     corridor_owned = union_all_gpu_owned(valid_owned)
@@ -2141,9 +2141,10 @@ def _profile_flood_exposure_pipeline(
                 stage.metadata["gpu_fast_path"] = True
             else:
                 # Some rows failed GPU check or GPU unavailable — full path
-                building_geoms = np.asarray(buildings_owned.to_shapely(), dtype=object)
-                valid_result = make_valid_owned(building_geoms, owned=buildings_owned)
-                if valid_result.repaired_rows.size > 0:
+                valid_result = make_valid_owned(owned=buildings_owned)
+                if valid_result.owned is not None:
+                    buildings_valid = valid_result.owned
+                elif valid_result.repaired_rows.size > 0:
                     buildings_valid = from_shapely_geometries(list(valid_result.geometries))
                 else:
                     buildings_valid = buildings_owned

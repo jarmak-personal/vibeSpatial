@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -191,6 +192,18 @@ compilation.  Set VIBESPATIAL_SUPPRESS_CCCL_WARNINGS=0 to disable.
 _stderr_lock = threading.Lock()
 _stderr_refcount = 0
 _stderr_saved_fd: int | None = None
+_stderr_saved_file: Any = None  # Python file wrapping the real stderr fd
+
+
+def get_real_stderr():
+    """Return a file object that writes to the real stderr, even when
+    fd 2 is temporarily redirected to /dev/null for CCCL warning
+    suppression.  Falls back to sys.stderr when no redirect is active."""
+    with _stderr_lock:
+        f = _stderr_saved_file
+        if f is not None and not f.closed:
+            return f
+    return sys.stderr
 
 
 def _suppress_cccl_warnings(
@@ -202,8 +215,11 @@ def _suppress_cccl_warnings(
     parallel (CCCL releases the GIL) while fd 2 stays redirected to
     /dev/null for the entire duration.  The first thread to enter saves
     fd 2 and redirects; the last thread to leave restores it.
+
+    Other code that needs to write to the real stderr during suppression
+    (e.g. progress output) should use ``get_real_stderr()``.
     """
-    global _stderr_refcount, _stderr_saved_fd
+    global _stderr_refcount, _stderr_saved_fd, _stderr_saved_file
 
     if not _SUPPRESS_CCCL_STDERR:
         return compiler(spec, cp_module, algorithms)
@@ -214,11 +230,15 @@ def _suppress_cccl_warnings(
         if _stderr_refcount == 1:
             try:
                 _stderr_saved_fd = os.dup(2)
+                _stderr_saved_file = os.fdopen(
+                    os.dup(_stderr_saved_fd), "w", closefd=True,
+                )
                 devnull = os.open(os.devnull, os.O_WRONLY)
                 os.dup2(devnull, 2)
                 os.close(devnull)
             except OSError:
                 _stderr_saved_fd = None
+                _stderr_saved_file = None
                 _stderr_refcount -= 1
                 return compiler(spec, cp_module, algorithms)
     try:
@@ -231,6 +251,9 @@ def _suppress_cccl_warnings(
                 os.dup2(_stderr_saved_fd, 2)
                 os.close(_stderr_saved_fd)
                 _stderr_saved_fd = None
+                if _stderr_saved_file is not None:
+                    _stderr_saved_file.close()
+                    _stderr_saved_file = None
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +913,7 @@ class CCCLPrecompiler:
     ) -> PrecompiledPrimitive | None:
         """Try to load a cached CUBIN and construct a _Cached* callable."""
         try:
-            from vibespatial import cccl_cubin_cache
+            from vibespatial.cuda import cccl_cubin_cache
 
             entry = cccl_cubin_cache.try_load_cached(spec.name, spec.family)
             if entry is None:
@@ -926,10 +949,10 @@ class CCCLPrecompiler:
                 spec.name, elapsed,
             )
             return result
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
             logger.debug(
-                "CCCL cache: hit but load failed for %s, falling back",
-                spec.name, exc_info=True,
+                "CCCL cache: hit but load failed for %s, falling back: %s",
+                spec.name, exc,
             )
             return None
 
@@ -938,13 +961,13 @@ class CCCLPrecompiler:
     ) -> None:
         """Save a freshly built result to disk cache."""
         try:
-            from vibespatial import cccl_cubin_cache
+            from vibespatial.cuda import cccl_cubin_cache
             cccl_cubin_cache.save_after_build(
                 spec.name, spec.family, result.make_callable,
             )
-        except Exception:
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
             logger.debug(
-                "CCCL cache: save failed for %s", spec.name, exc_info=True,
+                "CCCL cache: save failed for %s: %s", spec.name, exc,
             )
 
     def get_compiled(

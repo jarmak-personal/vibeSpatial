@@ -3318,110 +3318,108 @@ def _build_device_resident_polygon_output(
     """Build device-resident OwnedGeometryArray from GPU face assembly results.
 
     Accepts GPU-computed ring grouping (Phase 12 sibling hole nesting) and
-    builds GeoArrow offset arrays on host (they are small), then gathers
+    builds GeoArrow offset arrays on host via vectorised NumPy, then gathers
     coordinates on device via CuPy fancy indexing.
 
     Phase 14 (ADR-0005): eliminates dominant D->H coordinate transfer.
+    Phase 26: Vectorised output assembly -- eliminates per-row and per-ring
+    Python loops that dominated wall time for large polygon counts.
     """
     runtime = get_cuda_runtime()
 
-    # --- Build per-row polygon/multipolygon structure on host ---
-    # Use the GPU-computed grouping arrays to reconstruct row_exteriors.
-    # Each polygon's rings are already ordered [exterior, hole_0, hole_1, ...]
-    # by the Phase 12 GPU sort.
-    # row_exteriors: source_row -> list of (ext_ring_idx, [hole_ring_idx, ...])
-    row_exteriors: dict[int, list[tuple[int, list[int]]]] = {}
-    poly_cursor = 0
-    for row_idx in range(n_output_rows):
-        source_row = int(h_row_source_ids[row_idx])
-        n_polys = int(h_polys_per_row[row_idx])
-        for _ in range(n_polys):
-            n_rings = int(h_rings_per_poly[poly_cursor])
-            ring_start = int(h_poly_starts[poly_cursor])
-            ext_idx = int(h_sorted_output_ids[ring_start])
-            holes = [
-                int(h_sorted_output_ids[ring_start + r])
-                for r in range(1, n_rings)
-            ]
-            row_exteriors.setdefault(source_row, []).append((ext_idx, holes))
-            poly_cursor += 1
-
-    if not row_exteriors:
+    # --- Vectorised classification: polygon vs multipolygon per row ---
+    # A row with exactly 1 polygon is a POLYGON; otherwise MULTIPOLYGON.
+    is_polygon_row = h_polys_per_row == 1
+    output_row_count = n_output_rows
+    if output_row_count == 0:
         return _empty_polygon_output(runtime_selection)
 
-    ordered_rows = sorted(row_exteriors)
-    output_row_count = len(ordered_rows)
     validity = np.ones(output_row_count, dtype=bool)
     tags = np.full(output_row_count, -1, dtype=np.int8)
     family_row_offsets = np.full(output_row_count, -1, dtype=np.int32)
 
-    # Separate into POLYGON (single exterior per row) and MULTIPOLYGON rows.
-    # For each family, build GeoArrow offset arrays and a coordinate gather
-    # plan (ordered list of ring indices whose coordinates are concatenated).
-    polygon_ring_order: list[int] = []        # ring indices in output order
-    polygon_ring_offsets: list[int] = [0]     # cumulative coord count
-    polygon_geometry_offsets: list[int] = [0]  # cumulative ring count per geometry
-    polygon_count = 0
+    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
 
-    multipolygon_ring_order: list[int] = []
-    multipolygon_ring_offsets: list[int] = [0]
-    multipolygon_part_offsets: list[int] = [0]
-    multipolygon_geometry_offsets: list[int] = [0]
-    multipolygon_count = 0
+    # Total polygon count: sum of polys_per_row for polygon-type rows (== 1).
+    # Total multipolygon count: number of multipolygon rows.
+    n_total_polys = int(h_rings_per_poly.size)  # total output polygons
 
-    for output_row, source_row in enumerate(ordered_rows):
-        exteriors = row_exteriors[source_row]
-        if len(exteriors) == 1:
-            # Single polygon row
-            tags[output_row] = FAMILY_TAGS[GeometryFamily.POLYGON]
-            family_row_offsets[output_row] = polygon_count
-            polygon_count += 1
-            ext_idx, holes = exteriors[0]
-            # Exterior ring + hole rings
-            for ring_idx in [ext_idx, *holes]:
-                polygon_ring_order.append(ring_idx)
-                n_coords = int(h_all_edge_counts[ring_idx]) + 1
-                polygon_ring_offsets.append(polygon_ring_offsets[-1] + n_coords)
-            polygon_geometry_offsets.append(len(polygon_ring_offsets) - 1)
-        else:
-            # Multi-polygon row
-            tags[output_row] = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
-            family_row_offsets[output_row] = multipolygon_count
-            multipolygon_count += 1
-            for ext_idx, holes in exteriors:
-                for ring_idx in [ext_idx, *holes]:
-                    multipolygon_ring_order.append(ring_idx)
-                    n_coords = int(h_all_edge_counts[ring_idx]) + 1
-                    multipolygon_ring_offsets.append(
-                        multipolygon_ring_offsets[-1] + n_coords,
-                    )
-                # Record end of this polygon part's rings
-                multipolygon_part_offsets.append(len(multipolygon_ring_offsets) - 1)
-            multipolygon_geometry_offsets.append(len(multipolygon_part_offsets) - 1)
+    # Expand polygon index -> its output rings (all sorted_output_ids entries
+    # are already in [exterior, hole0, hole1, ...] order from GPU sort).
+    # Flat ring order for ALL polygons (both POLYGON and MULTIPOLYGON families):
+    # ring_indices[i] = the i-th ring in output order across all polygons.
+    # Use vectorised expansion: repeat each polygon's ring range.
+    ring_counts_per_poly = h_rings_per_poly.astype(np.int32)
+    total_output_rings = int(ring_counts_per_poly.sum())
+    if total_output_rings == 0:
+        return _empty_polygon_output(runtime_selection)
 
-    # --- Build coordinate gather indices and execute on device ---
-    def _gather_coords_on_device(
-        ring_order: list[int],
-    ) -> tuple[cp.ndarray, cp.ndarray]:
-        """Build coordinate gather indices on host, execute gather on device."""
-        if not ring_order:
-            return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
-        # Build flat array of source coordinate indices for each ring
-        gather_chunks: list[np.ndarray] = []
-        for ring_idx in ring_order:
-            cs = int(h_all_coord_offsets[ring_idx])
-            n = int(h_all_edge_counts[ring_idx]) + 1
-            gather_chunks.append(np.arange(cs, cs + n, dtype=np.int64))
-        h_gather = np.concatenate(gather_chunks)
-        d_gather = cp.asarray(h_gather)
-        return d_all_x[d_gather], d_all_y[d_gather]
+    # Build per-polygon -> row mapping: polygon p belongs to the row
+    # determined by cumulative polys_per_row.
+    # poly_to_row[p] = which output row polygon p belongs to.
+    poly_to_row = np.repeat(np.arange(output_row_count, dtype=np.int32), h_polys_per_row)
+
+    # For each polygon, the rings in sorted_output_ids
+    # are at positions [poly_starts[p], poly_starts[p]+rings_per_poly[p]).
+    # Vectorised expansion: for each ring slot, compute which polygon it
+    # belongs to and its offset within that polygon's ring list.
+    ring_poly_ids = np.repeat(np.arange(n_total_polys, dtype=np.int32), ring_counts_per_poly)
+    poly_ring_offsets_prefix = np.zeros(n_total_polys + 1, dtype=np.int32)
+    np.cumsum(ring_counts_per_poly, out=poly_ring_offsets_prefix[1:])
+    ring_local_offsets = np.arange(total_output_rings, dtype=np.int32) - poly_ring_offsets_prefix[ring_poly_ids]
+    # Global ring indices in the all-rings coordinate arrays
+    all_ring_order = h_sorted_output_ids[h_poly_starts[ring_poly_ids] + ring_local_offsets]
+
+    # Coord counts per ring: edge_count + 1
+    all_ring_coord_counts = h_all_edge_counts[all_ring_order].astype(np.int32) + 1
+
+    # --- Separate POLYGON and MULTIPOLYGON families ---
+    # Polygon family: rows with exactly 1 polygon
+    poly_row_mask = is_polygon_row
+    mpoly_row_mask = ~is_polygon_row
+
+    # Map rows to polygon indices (within poly_to_row)
+    # A polygon belongs to the polygon family if its row is a polygon row.
+    poly_mask_per_polygon = poly_row_mask[poly_to_row]
+    mpoly_mask_per_polygon = mpoly_row_mask[poly_to_row]
+
+    # Ring-level masks: a ring belongs to the polygon family if its polygon does.
+    ring_is_poly = poly_mask_per_polygon[ring_poly_ids]
+    ring_is_mpoly = mpoly_mask_per_polygon[ring_poly_ids]
+
+    # Assign family tags and family_row_offsets (vectorised, no Python loop)
+    tags[poly_row_mask] = poly_tag
+    tags[mpoly_row_mask] = mpoly_tag
+    polygon_count = int(poly_row_mask.sum())
+    multipolygon_count = int(mpoly_row_mask.sum())
+    # Family-local sequential index: polygon rows get 0..polygon_count-1,
+    # multipolygon rows get 0..multipolygon_count-1.
+    if polygon_count > 0:
+        family_row_offsets[poly_row_mask] = np.arange(polygon_count, dtype=np.int32)
+    if multipolygon_count > 0:
+        family_row_offsets[mpoly_row_mask] = np.arange(multipolygon_count, dtype=np.int32)
 
     device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
 
     if polygon_count > 0:
-        d_poly_x, d_poly_y = _gather_coords_on_device(polygon_ring_order)
-        h_poly_geom_offsets = np.asarray(polygon_geometry_offsets, dtype=np.int32)
-        h_poly_ring_offsets = np.asarray(polygon_ring_offsets, dtype=np.int32)
+        # Extract polygon rings
+        poly_ring_indices = np.flatnonzero(ring_is_poly)
+        poly_ring_order = all_ring_order[poly_ring_indices]
+        poly_coord_counts = all_ring_coord_counts[poly_ring_indices]
+        # Ring offsets = cumulative coord counts
+        h_poly_ring_offsets = np.zeros(len(poly_ring_indices) + 1, dtype=np.int32)
+        np.cumsum(poly_coord_counts, out=h_poly_ring_offsets[1:])
+        # Geometry offsets: each polygon has rings_per_poly rings.
+        # Since polygon rows have exactly 1 polygon each, geometry offsets
+        # are just the cumulative ring-per-polygon counts for polygon family.
+        rings_per_family_poly = ring_counts_per_poly[poly_mask_per_polygon]
+        h_poly_geom_offsets = np.zeros(polygon_count + 1, dtype=np.int32)
+        np.cumsum(rings_per_family_poly, out=h_poly_geom_offsets[1:])
+        # Vectorised coordinate gather
+        d_poly_x, d_poly_y = _gather_coords_vectorised(
+            d_all_x, d_all_y, h_all_coord_offsets, poly_ring_order, poly_coord_counts,
+        )
         device_families[GeometryFamily.POLYGON] = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
             x=d_poly_x,
@@ -3433,10 +3431,33 @@ def _build_device_resident_polygon_output(
         )
 
     if multipolygon_count > 0:
-        d_mpoly_x, d_mpoly_y = _gather_coords_on_device(multipolygon_ring_order)
-        h_mpoly_geom_offsets = np.asarray(multipolygon_geometry_offsets, dtype=np.int32)
-        h_mpoly_part_offsets = np.asarray(multipolygon_part_offsets, dtype=np.int32)
-        h_mpoly_ring_offsets = np.asarray(multipolygon_ring_offsets, dtype=np.int32)
+        # Extract multipolygon rings
+        mpoly_ring_indices = np.flatnonzero(ring_is_mpoly)
+        mpoly_ring_order = all_ring_order[mpoly_ring_indices]
+        mpoly_coord_counts = all_ring_coord_counts[mpoly_ring_indices]
+        # Ring offsets
+        h_mpoly_ring_offsets = np.zeros(len(mpoly_ring_indices) + 1, dtype=np.int32)
+        np.cumsum(mpoly_coord_counts, out=h_mpoly_ring_offsets[1:])
+        # Part offsets: each polygon (part) within a multipolygon
+        # has rings_per_poly rings. Cumulative within each multipolygon row.
+        mpoly_polygons = np.flatnonzero(mpoly_mask_per_polygon)
+        rings_per_mpoly_part = ring_counts_per_poly[mpoly_polygons]
+        h_mpoly_part_offsets = np.zeros(len(mpoly_polygons) + 1, dtype=np.int32)
+        np.cumsum(rings_per_mpoly_part, out=h_mpoly_part_offsets[1:])
+        # Geometry offsets: parts per multipolygon row
+        mpoly_row_indices = poly_to_row[mpoly_polygons]
+        # Map row indices to family-local multipolygon index
+        mpoly_row_to_family = np.full(output_row_count, -1, dtype=np.int32)
+        mpoly_rows = np.flatnonzero(mpoly_row_mask)
+        mpoly_row_to_family[mpoly_rows] = np.arange(multipolygon_count, dtype=np.int32)
+        mpoly_family_ids = mpoly_row_to_family[mpoly_row_indices]
+        parts_per_geom = np.bincount(mpoly_family_ids, minlength=multipolygon_count).astype(np.int32)
+        h_mpoly_geom_offsets = np.zeros(multipolygon_count + 1, dtype=np.int32)
+        np.cumsum(parts_per_geom, out=h_mpoly_geom_offsets[1:])
+        # Vectorised coordinate gather
+        d_mpoly_x, d_mpoly_y = _gather_coords_vectorised(
+            d_all_x, d_all_y, h_all_coord_offsets, mpoly_ring_order, mpoly_coord_counts,
+        )
         device_families[GeometryFamily.MULTIPOLYGON] = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.MULTIPOLYGON,
             x=d_mpoly_x,
@@ -3459,6 +3480,34 @@ def _build_device_resident_polygon_output(
     )
     result.runtime_history.append(runtime_selection)
     return result
+
+
+def _gather_coords_vectorised(
+    d_all_x: cp.ndarray,
+    d_all_y: cp.ndarray,
+    h_all_coord_offsets: np.ndarray,
+    ring_order: np.ndarray,
+    coord_counts: np.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Vectorised coordinate gather: build flat index array without Python loops.
+
+    For each ring in ring_order, gathers coord_counts[i] consecutive
+    coordinates starting at h_all_coord_offsets[ring_order[i]].
+    """
+    if ring_order.size == 0:
+        return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
+    total_coords = int(coord_counts.sum())
+    # Build per-ring start positions in source coordinate array
+    ring_starts = h_all_coord_offsets[ring_order].astype(np.int64)
+    # Expand: for each coordinate slot, compute source index.
+    # slot_ring[i] = which ring does coordinate slot i belong to?
+    ring_offsets = np.zeros(len(ring_order) + 1, dtype=np.int64)
+    np.cumsum(coord_counts, out=ring_offsets[1:])
+    slot_ring = np.repeat(np.arange(len(ring_order), dtype=np.int32), coord_counts)
+    slot_local = np.arange(total_coords, dtype=np.int64) - ring_offsets[slot_ring]
+    h_gather = ring_starts[slot_ring] + slot_local
+    d_gather = cp.asarray(h_gather)
+    return d_all_x[d_gather], d_all_y[d_gather]
 
 
 def _build_polygon_output_from_faces(

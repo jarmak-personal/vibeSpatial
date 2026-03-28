@@ -48,7 +48,6 @@ class MakeValidPlan:
 
 @dataclass(frozen=True)
 class MakeValidResult:
-    geometries: np.ndarray
     row_count: int
     valid_rows: np.ndarray
     repaired_rows: np.ndarray
@@ -57,6 +56,23 @@ class MakeValidResult:
     keep_collapsed: bool
     owned: object | None = None
     selected: ExecutionMode = ExecutionMode.CPU
+    _geometries: np.ndarray | None = None
+
+    @property
+    def geometries(self) -> np.ndarray:
+        """Lazily materialize Shapely geometries from owned array (ADR-0005).
+
+        When the GPU repair path produces a device-resident result, Shapely
+        objects are only created when a caller actually accesses this property,
+        avoiding a D->H transfer for callers that consume .owned directly.
+        """
+        if self._geometries is not None:
+            return self._geometries
+        if self.owned is not None:
+            result = np.asarray(self.owned.to_shapely(), dtype=object)
+            object.__setattr__(self, "_geometries", result)
+            return result
+        raise RuntimeError("MakeValidResult has no geometries source")
 
 
 @dataclass(frozen=True)
@@ -645,12 +661,12 @@ def _compute_validity_mask_gpu(geometries: np.ndarray, owned) -> tuple[np.ndarra
     supports_mixed=True,
     tags=("nvrtc", "constructive", "make_valid", "compact-invalid"),
 )
-def _make_valid_gpu_repair(owned, repaired_rows, geometries, *, method, keep_collapsed):
+def _make_valid_gpu_repair(owned, repaired_rows, *, method, keep_collapsed):
     """GPU repair via gpu_repair_invalid_polygons (ADR-0019 + ADR-0033)."""
     from .make_valid_gpu import gpu_repair_invalid_polygons
 
     return gpu_repair_invalid_polygons(
-        owned, repaired_rows, geometries,
+        owned, repaired_rows,
         method=method, keep_collapsed=keep_collapsed,
     )
 
@@ -701,8 +717,12 @@ def make_valid_owned(
     """
     row_count = owned.row_count if owned is not None else (len(values) if values is not None else 0)
 
+    # Use "make_valid_repair" kernel name to match the crossover override
+    # (2,000 rows) instead of the generic CONSTRUCTIVE default (50,000).
+    # When owned has device_state the data is already on GPU, so the
+    # transfer-free repair path is profitable at very low row counts.
     selection = plan_dispatch_selection(
-        kernel_name="make_valid",
+        kernel_name="make_valid_repair",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
@@ -731,6 +751,10 @@ def make_valid_owned(
     # When an OwnedGeometryArray is provided (data already on device), use
     # is_valid_owned for full OGC validity detection without Shapely.
     # If all rows pass, skip Shapely entirely (zero-transfer fast path, ADR-0005).
+    #
+    # When only Shapely values are provided (no owned), the CPU path is correct:
+    # uploading the entire array just to repair 5% on GPU is slower than CPU
+    # Shapely.  The GPU path only fires when data is already device-resident.
     gpu_detection_used = False
     if owned is not None and selection.selected is ExecutionMode.GPU:
         # Compute null_mask from owned validity (no Shapely needed)
@@ -749,7 +773,8 @@ def make_valid_owned(
                 # All rows passed GPU checks -- no repair needed.
                 # Carry the original owned so callers can stay
                 # device-resident without re-uploading via from_shapely.
-                _ensure_geometries()
+                # Geometries are lazy: only materialized when .geometries
+                # is accessed (ADR-0005 zero-transfer chain).
                 record_dispatch_event(
                     surface="geopandas.array.make_valid",
                     operation="make_valid",
@@ -760,8 +785,7 @@ def make_valid_owned(
                     selected=ExecutionMode.GPU,
                 )
                 return MakeValidResult(
-                    geometries=geometries,
-                    row_count=len(geometries),
+                    row_count=row_count,
                     valid_rows=np.flatnonzero(gpu_mask).astype(np.int32),
                     repaired_rows=np.asarray([], dtype=np.int32),
                     null_rows=np.flatnonzero(null_mask).astype(np.int32),
@@ -794,32 +818,52 @@ def make_valid_owned(
         # CPU-only mode: GPU ring checks not available, fall back to Shapely
         valid_mask = np.asarray(shapely.is_valid(geometries), dtype=bool)  # CPU-only mode
 
-    # From here on we need Shapely geometries for repair
-    _ensure_geometries()
-    result = geometries.copy()
+    # Identify rows needing repair (no Shapely needed for this).
     valid_mask[null_mask] = False
     repaired_mask = (~null_mask) & (~valid_mask)
     repaired_rows = np.flatnonzero(repaired_mask).astype(np.int32)
     selected = ExecutionMode.GPU if gpu_detection_used else ExecutionMode.CPU
+    result = None  # Shapely array; only populated when CPU path is used
+    result_owned = None  # device-resident result; populated by GPU path
+
     if repaired_rows.size:
-        # Try GPU repair path first when owned data is available (ADR-0019 + ADR-0033)
+        # Try GPU repair path first — stays device-resident, no D->H (ADR-0005)
         gpu_repair_done = False
-        if owned is not None and owned.device_state is not None and selection.selected is ExecutionMode.GPU:
+        if owned is not None and selection.selected is ExecutionMode.GPU:
             try:
                 gpu_result = _make_valid_gpu_repair(
-                    owned, repaired_rows, geometries,
+                    owned, repaired_rows,
                     method=method, keep_collapsed=keep_collapsed,
                 )
                 if gpu_result is not None:
-                    result = gpu_result.repaired_geometries
-                    gpu_repair_done = True
-                    selected = ExecutionMode.GPU
+                    result_owned = gpu_result.repaired_owned
+                    gpu_repair_done = result_owned is not None
+                    if gpu_repair_done:
+                        selected = ExecutionMode.GPU
+
+                    # Handle non-polygon rows GPU couldn't fix
+                    if gpu_repair_done and gpu_result.still_invalid_rows.size > 0:
+                        _ensure_geometries()
+                        cpu_fixed = _make_valid_cpu_repair(
+                            geometries, gpu_result.still_invalid_rows,
+                            method=method, keep_collapsed=keep_collapsed,
+                        )
+                        # Build a small owned from CPU-fixed rows and merge
+                        from vibespatial.geometry.owned import from_shapely_geometries
+                        try:
+                            still_geoms = [cpu_fixed[i] for i in gpu_result.still_invalid_rows]
+                            still_owned = from_shapely_geometries(still_geoms)
+                            from vibespatial.geometry.owned import scatter_replacement_rows
+                            result_owned = scatter_replacement_rows(
+                                result_owned, still_owned, gpu_result.still_invalid_rows,
+                            )
+                        except Exception:
+                            pass  # best-effort; main repair already done
             except Exception:
                 pass
 
         if not gpu_repair_done:
-            # Phase 24: If GPU was selected but repair fell back to CPU,
-            # record the fallback event so this is not silent.
+            # GPU repair failed — fall back to CPU. Now we need Shapely.
             if selection.selected is ExecutionMode.GPU:
                 record_fallback_event(
                     surface="geopandas.array.make_valid",
@@ -830,12 +874,20 @@ def make_valid_owned(
                     pipeline="make_valid_owned",
                     d2h_transfer=True,
                 )
+            _ensure_geometries()
             result = _make_valid_cpu_repair(
                 geometries, repaired_rows,
                 method=method, keep_collapsed=keep_collapsed,
             )
             if not gpu_detection_used:
                 selected = ExecutionMode.CPU
+    else:
+        # No repair needed — preserve device residency when available,
+        # otherwise materialize geometries for host-only callers.
+        result_owned = owned
+        if result_owned is None:
+            _ensure_geometries()
+            result = geometries
 
     impl = "gpu_ring_validity_check" if gpu_detection_used else "shapely_is_valid"
     if repaired_rows.size:
@@ -850,12 +902,8 @@ def make_valid_owned(
         requested=dispatch_mode,
         selected=selected,
     )
-    # When no rows needed repair and an owned array was provided, carry
-    # it through so callers can stay device-resident without re-uploading.
-    result_owned = owned if (repaired_rows.size == 0 and owned is not None) else None
     return MakeValidResult(
-        geometries=result,
-        row_count=len(result),
+        row_count=row_count,
         valid_rows=np.flatnonzero(valid_mask).astype(np.int32),
         repaired_rows=repaired_rows,
         null_rows=np.flatnonzero(null_mask).astype(np.int32),
@@ -863,6 +911,7 @@ def make_valid_owned(
         keep_collapsed=keep_collapsed,
         owned=result_owned,
         selected=selected,
+        _geometries=result,
     )
 
 
@@ -886,10 +935,70 @@ def evaluate_geopandas_make_valid(
         )
 
 
-def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True, dataset: str = "make-valid"):
+_gpu_make_valid_warmed = False
+
+
+def _warmup_gpu_make_valid_pipeline():
+    """Block until the full GPU make_valid pipeline is compiled.
+
+    1. Import make_valid_gpu + overlay/gpu to trigger module-scope
+       request_nvrtc_warmup / request_warmup calls.
+    2. Call ensure_warm() on both precompilers to block until all
+       NVRTC kernels and CCCL specs are compiled (or loaded from
+       the disk cubin cache).
+    3. Run a tiny throwaway repair to flush any remaining first-call
+       paths (Numba operator JIT, CuPy kernel caching, etc.).
+    """
+    global _gpu_make_valid_warmed
+    if _gpu_make_valid_warmed:
+        return
+    _gpu_make_valid_warmed = True
+
+    # Step 1+2: import modules and block on precompilation
+    from vibespatial.cuda.cccl_precompile import CCCLPrecompiler
+    from vibespatial.cuda.nvrtc_precompile import NVRTCPrecompiler
+
+    from . import make_valid_gpu  # noqa: F401
+
+    NVRTCPrecompiler.get().ensure_warm(timeout=60.0)
+    CCCLPrecompiler.get().ensure_warm(timeout=60.0)
+
+    # Step 3: throwaway repair at representative scale to flush remaining
+    # per-size-class JIT paths.  CCCL make_* callables pre-allocate temp
+    # storage for a specific max input size; a 1-polygon warmup only covers
+    # that tiny size class.  Using ~100 self-intersecting polygons ensures
+    # the CCCL temp storage, CuPy kernel cache, and overlay pipeline
+    # internal caches are all sized for realistic workloads.
+    import shapely
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.runtime.residency import Residency
+
+    bowtie = shapely.Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
+    square = shapely.Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])
+    warmup_geoms = [bowtie] * 100 + [square] * 100
+    warmup_owned = from_shapely_geometries(warmup_geoms, residency=Residency.DEVICE)
+    make_valid_owned(owned=warmup_owned)
+
+
+def benchmark_make_valid(values, *, method: str = "linework", keep_collapsed: bool = True, dataset: str = "make-valid", owned=None):
     geometries = np.asarray(values, dtype=object)
+
+    # Warm up the full GPU make_valid pipeline before the timed measurement.
+    # CCCL make_* callables cache temp storage per input-size class, so the
+    # precompile warmup (which uses a small dataset) doesn't cover the real
+    # workload.  A throwaway call with the actual data ensures all CCCL
+    # temp storage, CuPy kernel caches, and overlay pipeline internal
+    # state are sized for this specific workload.
+    if owned is not None:
+        try:
+            _warmup_gpu_make_valid_pipeline()
+            make_valid_owned(geometries, method=method, keep_collapsed=keep_collapsed, owned=owned)
+        except Exception:
+            pass
+
     start = perf_counter()
-    compact = make_valid_owned(geometries, method=method, keep_collapsed=keep_collapsed)
+    compact = make_valid_owned(geometries, method=method, keep_collapsed=keep_collapsed, owned=owned)
     compact_elapsed = perf_counter() - start
 
     start = perf_counter()

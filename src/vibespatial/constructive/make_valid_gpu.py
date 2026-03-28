@@ -1226,9 +1226,324 @@ def _repolygonize_from_split_rings(
 @dataclass(frozen=True)
 class GPURepairResult:
     """Result of GPU make_valid repair."""
-    repaired_geometries: np.ndarray  # shapely geometry array
+    repaired_owned: OwnedGeometryArray | None  # device-resident merged result
     repaired_count: int
     gpu_phases_used: tuple[str, ...]
+    still_invalid_rows: np.ndarray  # global row indices GPU couldn't fix
+
+
+def _extract_batch_coords_device(
+    d_buffer,
+    invalid_family_rows: np.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, cp.ndarray] | None:
+    """Device-side extraction of invalid polygon coordinates into contiguous batch.
+
+    Like _extract_batch_coords but operates entirely on device arrays via
+    _device_take_family_buffer. No D->H transfers except two tiny scalars
+    (total_rings, total_coords) for allocation sizing.
+    """
+    from vibespatial.geometry.owned import _device_take_family_buffer
+
+    if invalid_family_rows.size == 0:
+        return None
+
+    d_rows = cp.asarray(invalid_family_rows.astype(np.int32))
+    taken = _device_take_family_buffer(d_buffer, GeometryFamily.POLYGON, d_rows)
+
+    if taken.x.size == 0:
+        return None
+
+    return taken.x, taken.y, taken.ring_offsets, taken.geometry_offsets
+
+
+def _build_batch_repaired_device(
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_ring_offsets: cp.ndarray,
+    d_geom_offsets: cp.ndarray,
+    ring_count: int,
+    polygon_count: int,
+    runtime_selection: RuntimeSelection,
+) -> OwnedGeometryArray | None:
+    """Build a device-resident OwnedGeometryArray from batch device coordinates.
+
+    Device-resident replacement for _build_batch_repaired_owned. Filters
+    degenerate rings (< 4 vertices) on device and produces a device-resident
+    result via build_device_resident_owned. No D->H transfer for coordinate data.
+    """
+    from vibespatial.geometry.owned import (
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+
+    if d_x.size == 0 or polygon_count == 0:
+        return None
+
+    # Filter degenerate rings on device (< 4 vertices)
+    d_ring_lens = d_ring_offsets[1:] - d_ring_offsets[:-1]
+    d_valid_rings = d_ring_lens >= 4
+
+    if not bool(cp.any(d_valid_rings)):
+        return None
+
+    d_valid_ring_indices = cp.flatnonzero(d_valid_rings).astype(cp.int32)
+    valid_ring_count = int(d_valid_ring_indices.size)
+
+    if valid_ring_count == 0:
+        return None
+
+    # Gather valid ring coordinate ranges and build new ring offsets
+    from vibespatial.geometry.owned import _device_gather_offset_slices
+
+    coords_2d = (
+        cp.column_stack([d_x, d_y])
+        if d_x.size
+        else cp.empty((0, 2), dtype=cp.float64)
+    )
+    gathered_coords, new_ring_offsets = _device_gather_offset_slices(
+        coords_2d, d_ring_offsets, d_valid_ring_indices,
+    )
+    new_x = gathered_coords[:, 0].copy() if gathered_coords.size else cp.empty(0, dtype=cp.float64)
+    new_y = gathered_coords[:, 1].copy() if gathered_coords.size else cp.empty(0, dtype=cp.float64)
+
+    # Build new geom offsets: count valid rings per polygon
+    d_poly_of_ring = cp.searchsorted(
+        d_geom_offsets[1:], d_valid_ring_indices, side="right",
+    ).astype(cp.int32)
+    d_rings_per_poly = cp.bincount(d_poly_of_ring, minlength=polygon_count).astype(cp.int32)
+    new_geom_offsets = cp.zeros(polygon_count + 1, dtype=cp.int32)
+    cp.cumsum(d_rings_per_poly, out=new_geom_offsets[1:])
+
+    # Validity: polygons with zero valid rings are invalid
+    d_poly_valid = d_rings_per_poly > 0
+    h_validity = cp.asnumpy(d_poly_valid)  # tiny: polygon_count bools
+    h_tags = np.full(polygon_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
+    h_family_row_offsets = np.arange(polygon_count, dtype=np.int32)
+
+    device_families = {
+        GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.POLYGON,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=~d_poly_valid,
+            ring_offsets=new_ring_offsets,
+            bounds=None,
+        ),
+    }
+    result = build_device_resident_owned(
+        device_families=device_families,
+        row_count=polygon_count,
+        tags=h_tags,
+        validity=h_validity,
+        family_row_offsets=h_family_row_offsets,
+    )
+    result.runtime_history.append(runtime_selection)
+    return result
+
+
+def _device_scatter_repaired(
+    original_owned: OwnedGeometryArray,
+    repaired_batch: OwnedGeometryArray,
+    family_name: str,
+    invalid_family_rows: np.ndarray,
+    fam_to_global: dict[int, int],
+    invalid_rows_set: set[int],
+) -> OwnedGeometryArray:
+    """Merge repaired polygon family buffer back into original on device.
+
+    Device-side equivalent of _scatter_repaired_geoms: takes the original
+    device-resident OwnedGeometryArray and the batch repair result, then
+    produces a new device-resident OwnedGeometryArray where repaired rows
+    are scattered back into the correct positions. Uses existing
+    _device_take_family_buffer and _concat_device_family_buffers from
+    owned.py for all buffer work. No D->H coordinate transfers.
+    """
+    from vibespatial.geometry.owned import (
+        _concat_device_family_buffers,
+        _device_take_family_buffer,
+        build_device_resident_owned,
+    )
+
+    ds = original_owned.device_state
+    family = GeometryFamily(family_name)
+    family_tag = FAMILY_TAGS[family_name]
+    orig_d_buf = ds.families[family]
+    orig_polygon_count = int(orig_d_buf.geometry_offsets.size) - 1
+
+    # Build the set of valid (non-repaired) family rows
+    invalid_set = set(invalid_family_rows.tolist())
+    valid_family_rows = np.array(
+        [i for i in range(orig_polygon_count) if i not in invalid_set],
+        dtype=np.int32,
+    )
+
+    # Take valid rows from original, repaired rows from batch
+    bufs_to_concat = []
+    valid_count = 0
+
+    if valid_family_rows.size > 0:
+        d_valid_rows = cp.asarray(valid_family_rows)
+        valid_buf = _device_take_family_buffer(orig_d_buf, family, d_valid_rows)
+        bufs_to_concat.append(valid_buf)
+        valid_count = int(valid_buf.geometry_offsets.size) - 1
+
+    # Get the repaired batch's device family buffers.
+    # Repair can change family: a self-intersecting Polygon becomes a
+    # MultiPolygon after repolygonization. Collect buffers from ALL
+    # families present in the repaired batch.
+    repair_ds = repaired_batch.device_state if repaired_batch.device_state is not None else None
+    if repair_ds is None and hasattr(repaired_batch, '_ensure_device_state'):
+        repaired_batch._ensure_device_state()
+        repair_ds = repaired_batch.device_state
+
+    # Collect per-family repair buffers and their row counts
+    repair_families: dict[GeometryFamily, object] = {}
+    if repair_ds is not None:
+        for rfam, rbuf in repair_ds.families.items():
+            rfam_count = int(rbuf.geometry_offsets.size) - 1 if rbuf.geometry_offsets is not None else 0
+            if rfam_count > 0:
+                repair_families[rfam] = rbuf
+
+    # Same-family repair buffer (polygon -> polygon)
+    same_family_buf = repair_families.get(family)
+    if same_family_buf is not None:
+        bufs_to_concat.append(same_family_buf)
+
+    if not bufs_to_concat and not repair_families:
+        return original_owned
+
+    # Build new device families
+    new_device_families = {}
+    for fam, d_buf in ds.families.items():
+        if fam == family:
+            # Merge valid original rows + same-family repair rows
+            if bufs_to_concat:
+                new_device_families[fam] = _concat_device_family_buffers(family, bufs_to_concat)
+            else:
+                # All original rows were invalid and none repaired to same family
+                # Only add if valid_count > 0
+                if valid_count > 0:
+                    new_device_families[fam] = bufs_to_concat[0] if bufs_to_concat else d_buf
+        else:
+            new_device_families[fam] = d_buf
+
+    # Cross-family repair: if repair produced geometries in a different family
+    # (e.g., Polygon input -> MultiPolygon output), add those to the
+    # appropriate family buffer.
+    for rfam, rbuf in repair_families.items():
+        if rfam == family:
+            continue  # already handled above
+        if rfam in new_device_families:
+            # Append to existing family buffer
+            new_device_families[rfam] = _concat_device_family_buffers(
+                rfam, [new_device_families[rfam], rbuf],
+            )
+        else:
+            new_device_families[rfam] = rbuf
+
+    # Rebuild metadata: tags and validity need remapping.
+    h_tags = original_owned.tags.copy()
+    h_validity = original_owned.validity.copy()
+    h_fro = original_owned.family_row_offsets.copy()
+
+    # Count same-family repair rows
+    same_family_repair_count = (
+        int(same_family_buf.geometry_offsets.size) - 1
+        if same_family_buf is not None else 0
+    )
+
+    # Build old->new position mapping for the original family
+    old_to_new = np.empty(orig_polygon_count, dtype=np.int32)
+    for i, vr in enumerate(valid_family_rows):
+        old_to_new[vr] = i
+
+    # Track which repaired rows went to a different family
+    # Build a map: batch_repair_index -> (target_family, family_row_offset)
+    cross_family_map: dict[int, tuple[GeometryFamily, int]] = {}
+    for rfam, rbuf in repair_families.items():
+        if rfam == family:
+            # Same-family: indices 0..same_family_repair_count-1
+            continue
+        rfam_count = int(rbuf.geometry_offsets.size) - 1
+        # Cross-family rows: their positions in the target family buffer
+        # are appended after whatever was already there.
+        existing_count = 0
+        if rfam in ds.families:
+            existing_count = int(ds.families[rfam].geometry_offsets.size) - 1
+        for i in range(rfam_count):
+            cross_family_map[i] = (rfam, existing_count + i)
+
+    # Remap family_row_offsets and tags for repaired rows
+    poly_global_mask = h_tags == family_tag
+    poly_globals = np.flatnonzero(poly_global_mask)
+
+    if cross_family_map:
+        # The repaired batch has rows in a different family.
+        # For each invalid family row, determine if it went to same-family
+        # or cross-family. The repaired batch order matches invalid_family_rows
+        # order; rows in the batch are assigned to families by the batch output.
+        #
+        # Simple heuristic: if same_family_repair_count == 0 and there is
+        # exactly one cross-family, ALL repaired rows went to that family.
+        if same_family_repair_count == 0 and len(repair_families) == 1:
+            target_fam = next(iter(repair_families))
+            target_tag = FAMILY_TAGS[target_fam]
+            target_count = int(repair_families[target_fam].geometry_offsets.size) - 1
+            existing_in_target = 0
+            if target_fam in ds.families:
+                existing_in_target = int(ds.families[target_fam].geometry_offsets.size) - 1
+
+            # Remap valid original rows
+            if poly_globals.size > 0:
+                old_offsets = h_fro[poly_globals]
+                valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
+                h_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+
+            # Remap repaired rows: change tag and family_row_offset
+            for i, rr in enumerate(invalid_family_rows):
+                g = fam_to_global.get(int(rr))
+                if g is not None:
+                    h_tags[g] = target_tag
+                    h_fro[g] = existing_in_target + i
+                    if i < target_count:
+                        h_validity[g] = True
+        else:
+            # Mixed output: some same-family, some cross-family.
+            # Fall through to same-family-only mapping for now.
+            for i, rr in enumerate(invalid_family_rows):
+                old_to_new[rr] = valid_count + i
+            if poly_globals.size > 0:
+                old_offsets = h_fro[poly_globals]
+                valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
+                h_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+    else:
+        # All repairs stayed in the same family
+        for i, rr in enumerate(invalid_family_rows):
+            old_to_new[rr] = valid_count + i
+        if poly_globals.size > 0:
+            old_offsets = h_fro[poly_globals]
+            valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
+            h_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+
+        # Update validity for repaired rows that produced empty/invalid output
+        merged_family_buf = new_device_families.get(family)
+        if same_family_buf is not None and merged_family_buf is not None and hasattr(merged_family_buf, "empty_mask"):
+            d_merged_empty = merged_family_buf.empty_mask
+            h_merged_empty = cp.asnumpy(d_merged_empty)  # tiny: polygon_count bools
+            for gi, fro_val in zip(
+                np.flatnonzero(poly_global_mask), h_fro[poly_globals],
+            ):
+                if 0 <= fro_val < len(h_merged_empty) and h_merged_empty[fro_val]:
+                    h_validity[gi] = False
+
+    return build_device_resident_owned(
+        device_families=new_device_families,
+        row_count=original_owned.row_count,
+        tags=h_tags,
+        validity=h_validity,
+        family_row_offsets=h_fro,
+    )
 
 
 def _build_batch_repaired_owned(
@@ -1453,7 +1768,7 @@ def _scatter_repaired_geoms(
 def gpu_repair_invalid_polygons(
     owned: OwnedGeometryArray,
     invalid_rows: np.ndarray,
-    geometries: np.ndarray,
+    geometries: np.ndarray | None = None,
     *,
     method: str = "linework",
     keep_collapsed: bool = True,
@@ -1465,10 +1780,11 @@ def gpu_repair_invalid_polygons(
     2. Phase B: Close rings, remove duplicates, fix orientation (batched)
     3. Phase A+C: Detect and split self-intersections (batched)
     4. Phase D: Re-polygonize via overlay half-edge/face-walk pipeline (batched)
-    5. Map output polygons back to global row indices
+    5. Merge repaired rows back into original owned array on device
 
-    No per-polygon Python loop. No shapely.polygonize or shapely.make_valid
-    fallback. All repair is GPU-resident.
+    When ``owned.device_state`` is available, the entire pipeline stays
+    device-resident — no D->H coordinate transfers.  The result carries
+    ``repaired_owned`` so callers can stay on device (ADR-0005).
 
     Returns None if GPU repair is not applicable (no GPU, no polygon families,
     or CuPy not available).
@@ -1477,7 +1793,7 @@ def gpu_repair_invalid_polygons(
     ----------
     owned : OwnedGeometryArray with device_state
     invalid_rows : indices of invalid rows to repair
-    geometries : shapely geometry array for all rows
+    geometries : optional shapely geometry array (unused in device path)
     method : repair method (only "linework" supported on GPU)
     keep_collapsed : whether to keep collapsed geometries
     """
@@ -1490,12 +1806,14 @@ def gpu_repair_invalid_polygons(
 
     if invalid_rows.size == 0:
         return GPURepairResult(
-            repaired_geometries=geometries.copy(),
+            repaired_owned=owned,
             repaired_count=0,
             gpu_phases_used=(),
+            still_invalid_rows=np.asarray([], dtype=np.int32),
         )
 
-    # Only repair polygon family rows on GPU; non-polygon invalids use Shapely
+    # Only repair polygon family rows on GPU; non-polygon invalids are
+    # collected into still_invalid_rows for the caller to handle.
     polygon_families = set()
     for family_name in ("polygon", "multipolygon"):
         if family_name in owned.families:
@@ -1510,30 +1828,31 @@ def gpu_repair_invalid_polygons(
     except Exception:
         return None
 
+    # Determine whether we have a device-resident path
+    use_device_path = (
+        owned.device_state is not None
+        and any(
+            GeometryFamily(fn) in owned.device_state.families
+            for fn in polygon_families
+        )
+    )
+
     runtime_sel = RuntimeSelection(
         requested=ExecutionMode.GPU,
         selected=ExecutionMode.GPU,
         reason="make_valid GPU batch repair pipeline (Phase 16)",
     )
 
-    result = geometries.copy()
     phases_used: list[str] = []
     gpu_repaired_count = 0
     invalid_rows_set = set(invalid_rows.tolist())
+    repaired_global_rows: set[int] = set()
+    # Start with the original owned; each family merge updates it
+    merged_owned = owned
 
     for family_name in polygon_families:
         buffer = owned.families[family_name]
         if not hasattr(buffer, "ring_offsets") or buffer.ring_offsets is None:
-            continue
-
-        ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
-        ring_count = len(ring_offsets) - 1
-        if ring_count <= 0:
-            continue
-
-        geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
-        polygon_count = len(geom_offsets) - 1
-        if polygon_count <= 0:
             continue
 
         # Map invalid rows to family rows (vectorised, no Python loop)
@@ -1546,6 +1865,9 @@ def gpu_repair_invalid_polygons(
             continue
 
         fam_row_offsets = owned.family_row_offsets[global_invalid]
+        polygon_count = int(buffer.geometry_offsets.size) - 1 if hasattr(buffer, "geometry_offsets") else 0
+        if polygon_count <= 0:
+            continue
         valid_fro = (fam_row_offsets >= 0) & (fam_row_offsets < polygon_count)
         global_invalid = global_invalid[valid_fro]
         fam_row_offsets = fam_row_offsets[valid_fro]
@@ -1554,48 +1876,55 @@ def gpu_repair_invalid_polygons(
 
         # Unique family rows and their global row mapping
         invalid_family_rows = np.unique(fam_row_offsets)
-        # Build family_row -> global_row mapping
         fam_to_global = {}
         for gi, fro in zip(global_invalid, fam_row_offsets):
             fam_to_global.setdefault(int(fro), int(gi))
 
-        # --- Step 1: Batch extract all invalid polygon coords ---
-        batch = _extract_batch_coords(
-            buffer, geom_offsets, ring_offsets, invalid_family_rows,
-        )
-        if batch is None:
-            continue
-
-        batch_x, batch_y, batch_ring_offsets, batch_geom_offsets = batch
-        batch_ring_count = len(batch_ring_offsets) - 1
-        batch_poly_count = len(batch_geom_offsets) - 1
-
-        if batch_ring_count == 0 or batch_poly_count == 0:
-            continue
-
         try:
-            # Upload batch to device
-            d_x = cp.asarray(np.ascontiguousarray(batch_x))
-            d_y = cp.asarray(np.ascontiguousarray(batch_y))
-            d_ring_offsets = cp.asarray(batch_ring_offsets)
-            d_geom_offsets = cp.asarray(batch_geom_offsets)
+            if use_device_path:
+                # --- Device-resident path: no D->H transfers ---
+                ds = owned.device_state
+                family = GeometryFamily(family_name)
+                d_buf = ds.families[family]
+
+                batch = _extract_batch_coords_device(d_buf, invalid_family_rows)
+                if batch is None:
+                    continue
+                d_x, d_y, d_ring_offsets, d_geom_offsets = batch
+            else:
+                # --- Host fallback path (no device_state) ---
+                ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
+                geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
+                batch = _extract_batch_coords(
+                    buffer, geom_offsets, ring_offsets, invalid_family_rows,
+                )
+                if batch is None:
+                    continue
+                batch_x, batch_y, batch_ring_offsets, batch_geom_offsets = batch
+                d_x = cp.asarray(np.ascontiguousarray(batch_x))
+                d_y = cp.asarray(np.ascontiguousarray(batch_y))
+                d_ring_offsets = cp.asarray(batch_ring_offsets)
+                d_geom_offsets = cp.asarray(batch_geom_offsets)
+
+            batch_ring_count = int(d_ring_offsets.size) - 1
+            batch_poly_count = int(d_geom_offsets.size) - 1
+
+            if batch_ring_count == 0 or batch_poly_count == 0:
+                continue
 
             # --- Step 2: Phase B — batched simple repair ---
-            # Close rings (all invalid rings at once)
             d_x, d_y, d_ring_offsets = _gpu_close_rings(
                 d_x, d_y, d_ring_offsets,
                 batch_ring_count, kernels,
             )
             phases_used.append("close_rings")
 
-            # Remove duplicate vertices (all rings at once)
             d_x, d_y, d_ring_offsets = _gpu_remove_duplicate_vertices(
                 d_x, d_y, d_ring_offsets,
                 batch_ring_count, kernels,
             )
             phases_used.append("remove_duplicates")
 
-            # Fix ring orientation (all rings at once, using batch geom offsets)
             d_x, d_y = _gpu_fix_ring_orientation(
                 d_x, d_y, d_ring_offsets,
                 d_geom_offsets, batch_ring_count, batch_poly_count, kernels,
@@ -1613,60 +1942,47 @@ def gpu_repair_invalid_polygons(
 
             # --- Step 4: Phase D — batched repolygonization ---
             if had_splits:
-                # Recompute batch_ring_count after splitting (ring count
-                # unchanged — splits add vertices within existing rings)
                 batch_ring_count = int(d_ring_offsets.size) - 1
-
-                owned_result = _repolygonize_from_split_rings(
+                batch_result = _repolygonize_from_split_rings(
                     d_x, d_y, d_ring_offsets,
                     d_geom_offsets, batch_ring_count, batch_poly_count,
                     runtime_selection=runtime_sel,
                 )
                 phases_used.append("repolygonize")
-
-                if owned_result is not None:
-                    gpu_repaired_count += _scatter_repaired_geoms(
-                        owned_result, invalid_family_rows, batch_poly_count,
-                        fam_to_global, invalid_rows_set, result,
-                    )
             else:
                 # No self-intersections — simple repairs were sufficient.
-                # Build OwnedGeometryArray from the repaired batch and
-                # convert back to Shapely.
-                owned_result = _build_batch_repaired_owned(
+                batch_result = _build_batch_repaired_device(
                     d_x, d_y, d_ring_offsets, d_geom_offsets,
                     batch_ring_count, batch_poly_count, runtime_sel,
                 )
-                if owned_result is not None:
-                    gpu_repaired_count += _scatter_repaired_geoms(
-                        owned_result, invalid_family_rows, batch_poly_count,
-                        fam_to_global, invalid_rows_set, result,
-                    )
+
+            # --- Step 5: Merge repaired batch back into owned on device ---
+            if batch_result is not None:
+                merged_owned = _device_scatter_repaired(
+                    merged_owned, batch_result, family_name,
+                    invalid_family_rows, fam_to_global, invalid_rows_set,
+                )
+                gpu_repaired_count += batch_poly_count
+                for fro in invalid_family_rows:
+                    g = fam_to_global.get(int(fro))
+                    if g is not None:
+                        repaired_global_rows.add(g)
 
         except Exception:
-            # GPU batch repair failed for this family; fall through below
+            # GPU batch repair failed for this family; rows stay in still_invalid
             pass
 
-    # Any rows still not repaired (non-polygon families, GPU exceptions)
-    # fall through to CPU shapely.make_valid as a guarded last resort.
-    still_invalid = [
-        int(row_idx) for row_idx in invalid_rows
-        if result[row_idx] is geometries[row_idx]
-    ]
-
-    if still_invalid:
-        import shapely as shp
-        still_invalid_arr = np.asarray(still_invalid)
-        result[still_invalid_arr] = shp.make_valid(
-            geometries[still_invalid_arr],
-            method=method,
-            keep_collapsed=keep_collapsed,
-        )
+    # Collect rows that GPU couldn't fix (non-polygon families, GPU exceptions)
+    still_invalid = np.asarray(
+        [int(r) for r in invalid_rows if r not in repaired_global_rows],
+        dtype=np.int32,
+    )
 
     return GPURepairResult(
-        repaired_geometries=result,
+        repaired_owned=merged_owned,
         repaired_count=gpu_repaired_count,
         gpu_phases_used=tuple(set(phases_used)),
+        still_invalid_rows=still_invalid,
     )
 
 

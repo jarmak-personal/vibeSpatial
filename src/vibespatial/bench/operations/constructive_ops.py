@@ -287,17 +287,25 @@ def bench_make_valid(
     **kwargs: Any,
 ) -> BenchmarkResult:
     from vibespatial import benchmark_make_valid
-    from vibespatial.bench.fixture_loader import load_geodataframe
+    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import InputFormat, ensure_invalids_fixture
 
     fmt = InputFormat(input_format)
     spec, _ = ensure_invalids_fixture(scale, fmt=fmt)
 
-    # Load via GeoDataFrame since benchmark_make_valid expects Shapely list
+    # Load device-resident owned array via vibespatial IO (the real user path).
+    # Also load the GeoDataFrame for the Shapely baseline comparison.
     gdf, read_seconds = load_geodataframe(spec, fmt)
     values = gdf.geometry.tolist()
 
-    result = benchmark_make_valid(values)
+    owned = None
+    try:
+        owned_arr, _ = load_owned(spec, fmt)
+        owned = owned_arr
+    except Exception:
+        pass
+
+    result = benchmark_make_valid(values, owned=owned)
 
     timing = timing_from_samples([result.compact_elapsed_seconds])
     baseline_timing = timing_from_samples([result.baseline_elapsed_seconds])

@@ -491,9 +491,21 @@ def lower_bound(
     out = cp_module.empty(int(query_values.size), dtype=np.uintp)
     if int(query_values.size) == 0:
         return out
+    n_sorted = int(sorted_data.size)
+    n_query = int(query_values.size)
+    # make_* fast path (ADR-0034)
+    precompiled = _get_precompiled(f"lower_bound_{_dtype_suffix(sorted_data.dtype)}")
+    if precompiled is not None:
+        temp = _ensure_temp(precompiled, n_sorted + n_query,
+            lambda: precompiled.make_callable(
+                None, sorted_data, query_values, out, n_sorted, n_query))
+        precompiled.make_callable(temp, sorted_data, query_values, out, n_sorted, n_query)
+        if synchronize:
+            cp_module.cuda.Stream.null.synchronize()
+        return out
+    # Fallback: one-shot API
     cccl_algorithms.lower_bound(
-        sorted_data, query_values, out,
-        int(sorted_data.size), int(query_values.size),
+        sorted_data, query_values, out, n_sorted, n_query,
     )
     if synchronize:
         cp_module.cuda.Stream.null.synchronize()
@@ -516,9 +528,21 @@ def upper_bound(
     out = cp_module.empty(int(query_values.size), dtype=np.uintp)
     if int(query_values.size) == 0:
         return out
+    n_sorted = int(sorted_data.size)
+    n_query = int(query_values.size)
+    # make_* fast path (ADR-0034)
+    precompiled = _get_precompiled(f"upper_bound_{_dtype_suffix(sorted_data.dtype)}")
+    if precompiled is not None:
+        temp = _ensure_temp(precompiled, n_sorted + n_query,
+            lambda: precompiled.make_callable(
+                None, sorted_data, query_values, out, n_sorted, n_query))
+        precompiled.make_callable(temp, sorted_data, query_values, out, n_sorted, n_query)
+        if synchronize:
+            cp_module.cuda.Stream.null.synchronize()
+        return out
+    # Fallback: one-shot API
     cccl_algorithms.upper_bound(
-        sorted_data, query_values, out,
-        int(sorted_data.size), int(query_values.size),
+        sorted_data, query_values, out, n_sorted, n_query,
     )
     if synchronize:
         cp_module.cuda.Stream.null.synchronize()
@@ -615,6 +639,26 @@ def unique_sorted_pairs(keys: DeviceArray, values: DeviceArray) -> UniqueByKeyRe
         return UniqueByKeyResult(keys=out_keys, values=out_values, count=0)
 
     out_count = cp_module.empty((1,), dtype=cp_module.int32)
+    # make_* fast path (ADR-0034)
+    key_suffix = _dtype_suffix(keys.dtype)
+    val_suffix = _dtype_suffix(values.dtype)
+    precompiled = _get_precompiled(f"unique_by_key_{key_suffix}_{val_suffix}")
+    if precompiled is not None:
+        temp = _ensure_temp(precompiled, item_count,
+            lambda: precompiled.make_callable(
+                None, keys, values, out_keys, out_values,
+                out_count, _equal_to, item_count))
+        precompiled.make_callable(
+            temp, keys, values, out_keys, out_values,
+            out_count, _equal_to, item_count)
+        cp_module.cuda.Stream.null.synchronize()
+        selected_count = int(out_count.item())
+        return UniqueByKeyResult(
+            keys=out_keys[:selected_count],
+            values=out_values[:selected_count],
+            count=selected_count,
+        )
+    # Fallback: one-shot API
     cccl_algorithms.unique_by_key(
         keys,
         values,

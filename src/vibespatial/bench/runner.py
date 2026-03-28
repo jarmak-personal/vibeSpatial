@@ -245,7 +245,13 @@ def _fmt_time(seconds: float) -> str:
 
 
 def _progress(result: BenchmarkResult, *, idx: int, total: int) -> None:
-    """Print a single-line progress update to stderr."""
+    """Print a single-line progress update to stderr.
+
+    Uses ``get_real_stderr()`` so output is visible even while CCCL
+    background threads have fd 2 redirected to /dev/null.
+    """
+    from vibespatial.cuda.cccl_precompile import get_real_stderr
+
     status = {"pass": "\033[32mPASS\033[0m", "fail": "\033[31mFAIL\033[0m",
               "error": "\033[31mERR\033[0m", "skip": "\033[90mSKIP\033[0m"}.get(
         result.status, result.status)
@@ -254,7 +260,7 @@ def _progress(result: BenchmarkResult, *, idx: int, total: int) -> None:
     print(
         f"  [{idx}/{total}] {status} {result.operation:<22} "
         f"scale={_fmt_scale(result.scale):<4} {time_str:>8}{speedup}",
-        file=sys.stderr,
+        file=get_real_stderr(),
         flush=True,
     )
 

@@ -51,10 +51,14 @@ def _make_valid_geoseries(gs):
 
         mv_result = make_valid_owned(owned=owned)
         if mv_result.repaired_rows.size > 0:
-            # Repair happened — rebuild GeoSeries from repaired geometries.
-            # Preserve device residency via from_owned when possible; fall
-            # back to a plain GeometryArray when repair produced types that
-            # OwnedGeometryArray cannot represent (e.g. GeometryCollection).
+            # Repair happened — prefer device-resident .owned to avoid D->H.
+            if mv_result.owned is not None:
+                try:
+                    new_ga = GeometryArray.from_owned(mv_result.owned, crs=ga.crs)
+                    return GeoSeries(new_ga, index=gs.index)
+                except (NotImplementedError, Exception):
+                    pass  # fall through to Shapely materialization
+            # Fallback: rebuild from Shapely geometries
             try:
                 from vibespatial.geometry.owned import from_shapely_geometries
 
@@ -1183,27 +1187,32 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
 
                 mv_result = make_valid_owned(owned=owned)
                 if mv_result.repaired_rows.size > 0:
-                    # Repair happened — rebuild geometry column from result.
-                    # make_valid may change geometry type (e.g. Polygon →
-                    # GeometryCollection), so we must go through Shapely
-                    # to honour _collection_extract downstream.  Fall back
-                    # to a plain GeometryArray when result contains types
-                    # that OwnedGeometryArray cannot represent.
-                    try:
-                        from vibespatial.geometry.owned import (
-                            from_shapely_geometries,
-                        )
+                    # Repair happened — prefer device-resident .owned
+                    # to avoid D->H transfer.
+                    new_ga = None
+                    if mv_result.owned is not None:
+                        try:
+                            new_ga = GeometryArray.from_owned(
+                                mv_result.owned, crs=df.crs,
+                            )
+                        except (NotImplementedError, Exception):
+                            pass
+                    if new_ga is None:
+                        try:
+                            from vibespatial.geometry.owned import (
+                                from_shapely_geometries,
+                            )
 
-                        new_owned = from_shapely_geometries(
-                            list(mv_result.geometries),
-                        )
-                        new_ga = GeometryArray.from_owned(
-                            new_owned, crs=df.crs,
-                        )
-                    except NotImplementedError:
-                        new_ga = GeometryArray(
-                            mv_result.geometries, crs=df.crs,
-                        )
+                            new_owned = from_shapely_geometries(
+                                list(mv_result.geometries),
+                            )
+                            new_ga = GeometryArray.from_owned(
+                                new_owned, crs=df.crs,
+                            )
+                        except NotImplementedError:
+                            new_ga = GeometryArray(
+                                mv_result.geometries, crs=df.crs,
+                            )
                     col = df._geometry_column_name
                     df[col] = GeoSeries(new_ga)
                     df = _collection_extract(
