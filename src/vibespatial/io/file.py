@@ -211,7 +211,129 @@ def plan_vector_file_io(
     )
 
 
-def _try_wkt_gpu_read(filename) -> object | None:
+def _reproject_owned_inplace(
+    owned: OwnedGeometryArray,
+    *,
+    src_crs: str,
+    dst_crs: str,
+) -> None:
+    """Transform all coordinate arrays in an OwnedGeometryArray in-place on device.
+
+    Iterates over each geometry family's device coordinate buffers and
+    applies ``transform_coordinates_inplace`` from the GPU transform stage.
+    No host round-trip occurs.
+
+    Parameters
+    ----------
+    owned : OwnedGeometryArray
+        Geometry array with device-resident coordinate buffers.
+    src_crs : str
+        Source CRS identifier.
+    dst_crs : str
+        Destination CRS identifier.
+    """
+    if src_crs == dst_crs:
+        return
+
+    from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
+
+    device_state = owned._ensure_device_state()
+    for dbuf in device_state.families.values():
+        if dbuf.x.size == 0:
+            continue
+        transform_coordinates_inplace(dbuf.x, dbuf.y, src_crs=src_crs, dst_crs=dst_crs)
+        # Invalidate cached bounds since coordinates changed.
+        dbuf.bounds = None
+
+
+def _reproject_gdf_gpu(gdf, target_crs: str) -> None:
+    """Reproject a GPU-backed GeoDataFrame in-place via to_crs.
+
+    This is used for GPU paths (e.g. Shapefile DBF) where the
+    OwnedGeometryArray is already wrapped in a GeoDataFrame and the
+    source CRS is known.
+    """
+    if gdf.crs is not None:
+        gdf_new = gdf.to_crs(target_crs)
+        # Replace geometry in-place by updating the backing column.
+        gdf[gdf.geometry.name] = gdf_new.geometry
+        gdf.crs = gdf_new.crs
+
+
+def _attach_gpu_spatial_index(gdf) -> None:
+    """Build a GPU spatial index and attach it to the GeoDataFrame.
+
+    The index is stored as a ``_gpu_spatial_index`` attribute on the
+    GeoDataFrame.  This is a ``GpuSpatialIndex`` (packed Hilbert R-tree)
+    built entirely on the GPU from the geometry column's device-resident
+    coordinate buffers.
+
+    If the geometry column does not have an OwnedGeometryArray backing
+    (e.g. CPU fallback), this is a no-op.
+    """
+    try:
+        import cupy as _cp
+
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.io.gpu_parse.indexing import build_spatial_index
+
+        geom_values = gdf.geometry.values
+        # Unwrap DeviceGeometryArray to get the OwnedGeometryArray.
+        if isinstance(geom_values, DeviceGeometryArray):
+            owned = geom_values._owned
+        elif hasattr(geom_values, "_owned") and geom_values._owned is not None:
+            owned = geom_values._owned
+        else:
+            return  # No owned backing -- cannot build GPU index.
+
+        device_state = owned._ensure_device_state()
+
+        # Collect all coordinate arrays across families and build a
+        # unified geometry_offsets array for the spatial index.
+        all_x = []
+        all_y = []
+        all_offsets = []
+        coord_offset = 0
+        for family in sorted(device_state.families.keys(), key=lambda f: f.value):
+            dbuf = device_state.families[family]
+            n_coords = int(dbuf.x.size)
+            if n_coords == 0:
+                continue
+            all_x.append(dbuf.x)
+            all_y.append(dbuf.y)
+            # geometry_offsets for this family, shifted by cumulative coord count.
+            offsets = dbuf.geometry_offsets
+            if coord_offset > 0:
+                offsets = offsets + coord_offset
+            all_offsets.append(offsets)
+            coord_offset += n_coords
+
+        if not all_x:
+            return  # No coordinates -- nothing to index.
+
+        d_x = _cp.concatenate(all_x) if len(all_x) > 1 else all_x[0]
+        d_y = _cp.concatenate(all_y) if len(all_y) > 1 else all_y[0]
+
+        # Build a single merged offset array.  Each family's offsets end
+        # at the start of the next family, so we take the first element of
+        # each offset array except the first, then append the final element.
+        if len(all_offsets) == 1:
+            geometry_offsets = all_offsets[0]
+        else:
+            parts = [all_offsets[0]]
+            for off in all_offsets[1:]:
+                # Skip the leading 0 of subsequent offset arrays (already
+                # covered by the previous array's last element).
+                parts.append(off[1:])
+            geometry_offsets = _cp.concatenate(parts)
+
+        gpu_index = build_spatial_index(d_x, d_y, geometry_offsets)
+        gdf._gpu_spatial_index = gpu_index
+    except Exception:
+        pass  # Best-effort; do not fail the read.
+
+
+def _try_wkt_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read a WKT file using the GPU byte-classification pipeline.
 
     WKT files contain one geometry per line with no attribute columns.
@@ -229,7 +351,12 @@ def _try_wkt_gpu_read(filename) -> object | None:
         from .wkt_gpu import read_wkt_gpu
 
         owned = read_wkt_gpu(d_bytes)
-        geom_series = geoseries_from_owned(owned, name="geometry")
+
+        # WKT has no embedded CRS.  When target_crs is requested, set it
+        # as the CRS label on the output (no reprojection possible without
+        # a known source CRS).
+        crs = target_crs if target_crs is not None else None
+        geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
 
         import vibespatial.api as geopandas
 
@@ -249,7 +376,7 @@ def _try_wkt_gpu_read(filename) -> object | None:
         return None
 
 
-def _try_csv_gpu_read(filename) -> object | None:
+def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read a CSV file using the GPU byte-classification pipeline.
 
     Performs GPU structural analysis to find lat/lon or WKT geometry
@@ -268,7 +395,11 @@ def _try_csv_gpu_read(filename) -> object | None:
         from .csv_gpu import read_csv_gpu
 
         csv_result = read_csv_gpu(d_bytes)
-        geom_series = geoseries_from_owned(csv_result.geometry, name="geometry")
+
+        # CSV has no embedded CRS.  When target_crs is requested, set it
+        # as the CRS label on the output.
+        crs = target_crs if target_crs is not None else None
+        geom_series = geoseries_from_owned(csv_result.geometry, name="geometry", crs=crs)
 
         import vibespatial.api as geopandas
 
@@ -341,7 +472,7 @@ def _try_shapefile_dbf_gpu_read(filename) -> object | None:
         return None
 
 
-def _try_kml_gpu_read(filename) -> object | None:
+def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read a KML file using the GPU byte-classification pipeline.
 
     KML files are XML-based with Placemark elements containing geometry.
@@ -359,7 +490,11 @@ def _try_kml_gpu_read(filename) -> object | None:
         from .kml_gpu import read_kml_gpu
 
         owned = read_kml_gpu(d_bytes)
-        geom_series = geoseries_from_owned(owned, name="geometry")
+
+        # KML has no embedded CRS.  When target_crs is requested, set it
+        # as the CRS label on the output.
+        crs = target_crs if target_crs is not None else None
+        geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
 
         import vibespatial.api as geopandas
 
@@ -385,7 +520,17 @@ def _try_kml_gpu_read(filename) -> object | None:
 _GPU_MIN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
-def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
+def _try_gpu_read_file(
+    filename,
+    *,
+    plan,
+    bbox,
+    columns,
+    rows,
+    target_crs: str | None = None,
+    build_index: bool = False,
+    **kwargs,
+):
     """Try to read a vector file using the GPU-dominant owned path.
 
     Uses pyogrio.read_arrow() for container parsing, then GPU WKB decode
@@ -418,19 +563,26 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
 
         # WKT: always route to GPU (pyogrio/GDAL does not support raw WKT)
         if plan.format is IOFormat.WKT:
-            return _try_wkt_gpu_read(filename)
+            gdf = _try_wkt_gpu_read(filename, target_crs=target_crs)
+            if gdf is not None and build_index:
+                _attach_gpu_spatial_index(gdf)
+            return gdf
 
         # CSV: route to GPU for files above size threshold
         if plan.format is IOFormat.CSV and file_size > _GPU_MIN_FILE_SIZE:
-            gpu_result = _try_csv_gpu_read(filename)
+            gpu_result = _try_csv_gpu_read(filename, target_crs=target_crs)
             if gpu_result is not None:
+                if build_index:
+                    _attach_gpu_spatial_index(gpu_result)
                 return gpu_result
             # fall through to pyogrio CPU path
 
         # KML: route to GPU for files above size threshold
         if plan.format is IOFormat.KML and file_size > _GPU_MIN_FILE_SIZE:
-            gpu_result = _try_kml_gpu_read(filename)
+            gpu_result = _try_kml_gpu_read(filename, target_crs=target_crs)
             if gpu_result is not None:
+                if build_index:
+                    _attach_gpu_spatial_index(gpu_result)
                 return gpu_result
             # fall through to pyogrio CPU path
 
@@ -438,6 +590,10 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
         if plan.format is IOFormat.SHAPEFILE and file_size > _GPU_MIN_FILE_SIZE:
             gpu_result = _try_shapefile_dbf_gpu_read(filename)
             if gpu_result is not None:
+                if target_crs is not None:
+                    _reproject_gdf_gpu(gpu_result, target_crs)
+                if build_index:
+                    _attach_gpu_spatial_index(gpu_result)
                 return gpu_result
             # fall through to pyogrio CPU path
 
@@ -447,10 +603,12 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
             try:
                 from .geojson_gpu import read_geojson_gpu
 
-                gpu_result = read_geojson_gpu(file_path)
-                # GeoJSON is EPSG:4326 by spec (RFC 7946)
+                gpu_result = read_geojson_gpu(file_path, target_crs=target_crs)
+                # GeoJSON is EPSG:4326 by spec (RFC 7946).  If target_crs
+                # was set, coordinates are already reprojected.
+                effective_crs = target_crs if target_crs is not None else "EPSG:4326"
                 geom_series = geoseries_from_owned(
-                    gpu_result.owned, name="geometry", crs="EPSG:4326",
+                    gpu_result.owned, name="geometry", crs=effective_crs,
                 )
                 props_df = gpu_result.extract_properties_dataframe()
                 import vibespatial.api as geopandas
@@ -466,6 +624,8 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
                     ),
                     selected=ExecutionMode.GPU,
                 )
+                if build_index:
+                    _attach_gpu_spatial_index(gdf)
                 return gdf
             except Exception:
                 pass  # fall through to pyogrio GPU WKB path
@@ -500,14 +660,19 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
         # Try GPU WKB decode.
         owned = decode_wkb_arrow_array_owned(geom_column)
 
-        # Extract CRS from metadata.
-        crs = metadata.get("crs")
+        # Fused reproject: transform on device before GeoSeries assembly.
+        source_crs = metadata.get("crs")
+        if target_crs is not None and source_crs is not None:
+            _reproject_owned_inplace(owned, src_crs=source_crs, dst_crs=target_crs)
+            effective_crs = target_crs
+        else:
+            effective_crs = source_crs
 
         # Build GeoSeries from owned geometry.
         geom_series = geoseries_from_owned(
             owned,
             name=table.schema.field(geom_idx).name,
-            crs=crs,
+            crs=effective_crs,
         )
 
         # ADR-0036 boundary: keep Arrow table through intermediate processing;
@@ -546,6 +711,8 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
             ),
             selected=ExecutionMode.GPU,
         )
+        if build_index:
+            _attach_gpu_spatial_index(gdf)
         return gdf
     except Exception:
         return None
@@ -558,6 +725,9 @@ def read_vector_file(
     columns=None,
     rows=None,
     engine=None,
+    *,
+    target_crs: str | None = None,
+    build_index: bool = False,
     **kwargs,
 ):
     """Read a vector file into a GeoDataFrame.
@@ -583,6 +753,16 @@ def read_vector_file(
         Subset of rows to read.
     engine : str, optional
         Force a specific I/O engine (``"pyogrio"`` or ``"fiona"``).
+    target_crs : str, optional
+        Target CRS to reproject coordinates into (e.g. ``"EPSG:3857"``).
+        When the GPU path is used, the reprojection is fused with ingest
+        (no separate pass required).  When the CPU path is used, the
+        result is reprojected via ``gdf.to_crs()`` as a post-read step.
+    build_index : bool, default False
+        When True and the GPU path is used, build a GPU-resident packed
+        Hilbert R-tree spatial index fused with ingest.  The index is
+        attached to the resulting GeoDataFrame as a ``_gpu_spatial_index``
+        attribute.
     **kwargs
         Passed through to the underlying engine.
 
@@ -602,7 +782,14 @@ def read_vector_file(
     }
     if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         gpu_result = _try_gpu_read_file(
-            filename, plan=plan, bbox=bbox, columns=columns, rows=rows, **kwargs
+            filename,
+            plan=plan,
+            bbox=bbox,
+            columns=columns,
+            rows=rows,
+            target_crs=target_crs,
+            build_index=build_index,
+            **kwargs,
         )
         if gpu_result is not None:
             return gpu_result
@@ -628,7 +815,7 @@ def read_vector_file(
         chosen_engine = "pyogrio"
     from vibespatial.api.io.file import _read_file
 
-    return _read_file(
+    gdf = _read_file(
         filename,
         bbox=bbox,
         mask=mask,
@@ -637,6 +824,16 @@ def read_vector_file(
         engine=chosen_engine,
         **kwargs,
     )
+
+    # CPU post-read: reproject if target_crs was requested.
+    if target_crs is not None and gdf.crs is not None:
+        gdf = gdf.to_crs(target_crs)
+    elif target_crs is not None and gdf.crs is None:
+        # No source CRS known; set the target CRS directly (user asserts
+        # the data is already in target_crs).
+        gdf = gdf.set_crs(target_crs)
+
+    return gdf
 
 
 def write_vector_file(

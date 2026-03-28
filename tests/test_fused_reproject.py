@@ -211,15 +211,41 @@ class TestTransformCoordinatesInplace:
         with pytest.raises(ValueError, match="equal length"):
             transform_coordinates_inplace(d_x, d_y, "EPSG:4326", "EPSG:3857")
 
-    def test_unsupported_crs_raises(self):
-        """Unsupported CRS identifier raises ValueError."""
+    def test_unsupported_crs_raises_without_vibeproj(self):
+        """Without vibeProj, unsupported CRS pair raises ValueError."""
+        from vibespatial.io.gpu_parse.transform import _HAS_VIBEPROJ
+
+        if _HAS_VIBEPROJ:
+            pytest.skip("vibeProj is installed; arbitrary CRS pairs are supported")
+
         from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
 
         d_x = cp.array([1.0], dtype=cp.float64)
         d_y = cp.array([1.0], dtype=cp.float64)
 
-        with pytest.raises(ValueError, match="Unsupported CRS"):
+        with pytest.raises(ValueError, match="NVRTC fallback"):
             transform_coordinates_inplace(d_x, d_y, "EPSG:4326", "EPSG:32632")
+
+    def test_arbitrary_crs_with_vibeproj(self):
+        """With vibeProj, arbitrary CRS pairs are supported."""
+        from vibespatial.io.gpu_parse.transform import _HAS_VIBEPROJ
+
+        if not _HAS_VIBEPROJ:
+            pytest.skip("vibeProj not installed")
+
+        from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
+
+        # WGS84 -> UTM zone 32N (EPSG:32632): a CRS pair not supported by
+        # the NVRTC fallback, but handled by vibeProj.
+        d_x = cp.array([9.0], dtype=cp.float64)   # 9 deg E longitude
+        d_y = cp.array([48.0], dtype=cp.float64)   # 48 deg N latitude
+        transform_coordinates_inplace(d_x, d_y, "EPSG:4326", "EPSG:32632")
+
+        # UTM zone 32N: x should be near 500000 (central meridian at 9 deg)
+        result_x = float(d_x[0])
+        result_y = float(d_y[0])
+        assert 400_000 < result_x < 600_000, f"UTM easting {result_x} out of range"
+        assert 5_000_000 < result_y < 6_000_000, f"UTM northing {result_y} out of range"
 
     def test_crs_alias_normalization(self):
         """CRS aliases (WGS84, OGC:CRS84) are accepted."""

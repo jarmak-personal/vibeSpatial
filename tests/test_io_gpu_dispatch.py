@@ -2,10 +2,15 @@
 
 Verifies the full chain: write test file -> read_file() -> GeoDataFrame
 with correct geometries, correct dispatch events, and proper fallback
-behavior.
+behavior.  Also tests fused ingest+reproject (target_crs) and fused
+ingest+spatial-index (build_index) pipelines.
 """
 from __future__ import annotations
 
+import json
+import math
+
+import numpy as np
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
@@ -321,3 +326,165 @@ class TestExistingFormatsUnbroken:
         assert any(
             "shapefile" in e.implementation for e in events
         )
+
+
+# ---------------------------------------------------------------------------
+# Fused ingest+reproject (target_crs) tests
+# ---------------------------------------------------------------------------
+
+# Reference values for WGS84 -> Web Mercator reprojection.
+_SEMI_CIRC = 20037508.342789244
+
+
+def _wgs84_to_mercator_ref(lon: float, lat: float) -> tuple[float, float]:
+    """Pure-Python reference WGS84 -> Web Mercator."""
+    x = lon * _SEMI_CIRC / 180.0
+    lat_rad = lat * math.pi / 180.0
+    y = math.log(math.tan(math.pi / 4.0 + lat_rad / 2.0)) * _SEMI_CIRC / math.pi
+    return x, y
+
+
+def _write_geojson(path, features: list[dict]) -> None:
+    fc = {"type": "FeatureCollection", "features": features}
+    path.write_text(json.dumps(fc), encoding="utf-8")
+
+
+def _point_feature(lon: float, lat: float) -> dict:
+    return {
+        "type": "Feature",
+        "properties": {},
+        "geometry": {"type": "Point", "coordinates": [lon, lat]},
+    }
+
+
+class TestFusedReprojectReadFile:
+    """Test target_crs parameter through the public read_file() API."""
+
+    @needs_gpu
+    def test_geojson_target_crs_reprojects(self, tmp_path) -> None:
+        """read_file with target_crs on GeoJSON produces reprojected coords."""
+        path = tmp_path / "reproject.geojson"
+        _write_geojson(path, [
+            _point_feature(0.0, 0.0),
+            _point_feature(-74.006, 40.7128),
+        ])
+
+        result = geopandas.read_file(path, target_crs="EPSG:3857")
+
+        # CRS should be set to target.
+        assert result.crs is not None
+        assert result.crs.to_epsg() == 3857
+
+        # Origin maps to ~(0, 0) in Mercator.
+        pt0 = result.geometry.iloc[0]
+        np.testing.assert_allclose(pt0.x, 0.0, atol=1.0)
+        np.testing.assert_allclose(pt0.y, 0.0, atol=1.0)
+
+        # NYC: verify against reference.
+        ref_x, ref_y = _wgs84_to_mercator_ref(-74.006, 40.7128)
+        pt1 = result.geometry.iloc[1]
+        np.testing.assert_allclose(pt1.x, ref_x, rtol=1e-6)
+        np.testing.assert_allclose(pt1.y, ref_y, rtol=1e-6)
+
+    @needs_gpu
+    def test_geojson_target_crs_same_is_noop(self, tmp_path) -> None:
+        """read_file with target_crs=EPSG:4326 on GeoJSON is a no-op."""
+        path = tmp_path / "noop.geojson"
+        _write_geojson(path, [_point_feature(10.0, 20.0)])
+
+        result = geopandas.read_file(path, target_crs="EPSG:4326")
+
+        assert result.crs is not None
+        assert result.crs.to_epsg() == 4326
+        pt = result.geometry.iloc[0]
+        np.testing.assert_allclose(pt.x, 10.0, atol=1e-9)
+        np.testing.assert_allclose(pt.y, 20.0, atol=1e-9)
+
+    @needs_gpu
+    def test_wkt_target_crs_sets_crs_label(self, tmp_path) -> None:
+        """read_file on WKT with target_crs sets CRS on output.
+
+        WKT has no embedded CRS, so target_crs sets the CRS label
+        without reprojecting coordinates.
+        """
+        wkt_path = tmp_path / "points.wkt"
+        wkt_path.write_text("POINT (1 2)\nPOINT (3 4)\n")
+
+        result = geopandas.read_file(wkt_path, target_crs="EPSG:3857")
+
+        assert result.crs is not None
+        assert result.crs.to_epsg() == 3857
+        # Coordinates should be unchanged (no reprojection).
+        assert result.geometry.iloc[0].equals(Point(1, 2))
+        assert result.geometry.iloc[1].equals(Point(3, 4))
+
+
+# ---------------------------------------------------------------------------
+# Fused ingest+spatial-index (build_index) tests
+# ---------------------------------------------------------------------------
+
+
+class TestFusedBuildIndex:
+    """Test build_index parameter through the public read_file() API."""
+
+    @needs_gpu
+    def test_geojson_build_index(self, tmp_path) -> None:
+        """read_file with build_index=True attaches a GPU spatial index."""
+        path = tmp_path / "indexed.geojson"
+        _write_geojson(path, [
+            _point_feature(0.0, 0.0),
+            _point_feature(1.0, 1.0),
+            _point_feature(2.0, 2.0),
+        ])
+
+        result = geopandas.read_file(path, build_index=True)
+
+        assert len(result) == 3
+        # Verify that the GPU spatial index was attached.
+        assert hasattr(result, "_gpu_spatial_index")
+        gpu_index = result._gpu_spatial_index
+        assert gpu_index is not None
+        assert gpu_index.n_features == 3
+
+    @needs_gpu
+    def test_geojson_no_build_index_default(self, tmp_path) -> None:
+        """read_file without build_index does not attach a GPU spatial index."""
+        path = tmp_path / "no_index.geojson"
+        _write_geojson(path, [_point_feature(0.0, 0.0)])
+
+        result = geopandas.read_file(path)
+
+        assert not hasattr(result, "_gpu_spatial_index") or result._gpu_spatial_index is None
+
+    @needs_gpu
+    def test_wkt_build_index(self, tmp_path) -> None:
+        """read_file on WKT with build_index=True attaches a GPU spatial index."""
+        wkt_path = tmp_path / "indexed.wkt"
+        wkt_path.write_text("POINT (1 2)\nPOINT (3 4)\nPOINT (5 6)\n")
+
+        result = geopandas.read_file(wkt_path, build_index=True)
+
+        assert len(result) == 3
+        assert hasattr(result, "_gpu_spatial_index")
+        gpu_index = result._gpu_spatial_index
+        assert gpu_index is not None
+        assert gpu_index.n_features == 3
+
+    @needs_gpu
+    def test_build_index_with_target_crs(self, tmp_path) -> None:
+        """read_file with both target_crs and build_index works together."""
+        path = tmp_path / "both.geojson"
+        _write_geojson(path, [
+            _point_feature(0.0, 0.0),
+            _point_feature(1.0, 1.0),
+        ])
+
+        result = geopandas.read_file(
+            path, target_crs="EPSG:3857", build_index=True,
+        )
+
+        assert result.crs is not None
+        assert result.crs.to_epsg() == 3857
+        assert hasattr(result, "_gpu_spatial_index")
+        assert result._gpu_spatial_index is not None
+        assert result._gpu_spatial_index.n_features == 2
