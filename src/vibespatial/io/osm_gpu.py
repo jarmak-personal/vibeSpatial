@@ -1,7 +1,7 @@
 """GPU-accelerated reader for OpenStreetMap PBF files.
 
-Extracts DenseNodes (Points) and Ways (LineStrings/Polygons) from OSM PBF
-files using a hybrid CPU/GPU pipeline:
+Extracts DenseNodes (Points), Ways (LineStrings/Polygons), and Relations
+(MultiPolygons) from OSM PBF files using a hybrid CPU/GPU pipeline:
 
 **Nodes pipeline:**
 
@@ -38,6 +38,19 @@ files using a hybrid CPU/GPU pipeline:
 5. **Assembly** -- build separate device-resident LineString and Polygon
    OwnedGeometryArrays, then combine into a mixed OwnedGeometryArray.
 
+**Relations pipeline (MultiPolygon assembly):**
+
+1. **Relation field extraction** (CPU) -- parse Relation messages from
+   each PrimitiveGroup to extract relation IDs, member IDs/types/roles.
+2. **Way lookup** (CPU) -- build a Way ID -> node refs dict from parsed
+   Way data so Relations can resolve their Way members.
+3. **Way chaining** (CPU, per-relation) -- for each MultiPolygon relation,
+   chain outer and inner Way members into closed rings by endpoint matching.
+4. **Coordinate gathering** (GPU, Tier 1 NVRTC) -- reuse the existing
+   binary-search kernel to resolve all ring node refs to coordinates.
+5. **MultiPolygon assembly** -- build device-resident MultiPolygon
+   OwnedGeometryArray with geometry/part/ring offset hierarchy.
+
 Tier classification (ADR-0033):
     - Block parsing: CPU (sequential metadata, not parallelizable)
     - Decompression: CPU (zlib)
@@ -49,6 +62,8 @@ Tier classification (ADR-0033):
     - Node lookup sort: Tier 2 (CuPy argsort)
     - Way classification: Tier 2 (CuPy element-wise comparison)
     - Offset construction: Tier 2 (CuPy)
+    - Way chaining: CPU (small graph traversal, <10 ways per ring)
+    - Relation coordinate gathering: Tier 1 (reuse NVRTC binary search)
 
 Precision (ADR-0002):
     The varint decode and coordinate gather kernels are integer-only
@@ -289,6 +304,7 @@ _PRIMITIVEBLOCK_LON_OFFSET_FIELD = 20     # int64, default 0
 # PrimitiveGroup fields
 _PRIMITIVEGROUP_DENSE_FIELD = 2           # DenseNodes
 _PRIMITIVEGROUP_WAYS_FIELD = 3            # repeated Way
+_PRIMITIVEGROUP_RELATIONS_FIELD = 4       # repeated Relation
 
 # DenseNodes fields
 _DENSENODES_ID_FIELD = 1         # packed sint64 (ZigZag + delta)
@@ -300,6 +316,19 @@ _WAY_ID_FIELD = 1                # int64 (varint)
 _WAY_KEYS_FIELD = 2              # packed uint32
 _WAY_VALS_FIELD = 3              # packed uint32
 _WAY_REFS_FIELD = 8              # packed sint64 (ZigZag + delta)
+
+# Relation fields
+_RELATION_ID_FIELD = 1           # int64 (varint)
+_RELATION_KEYS_FIELD = 2         # packed uint32
+_RELATION_VALS_FIELD = 3         # packed uint32
+_RELATION_ROLES_SID_FIELD = 8    # packed int32 (stringtable indices for member roles)
+_RELATION_MEMIDS_FIELD = 9       # packed sint64 (delta-encoded member IDs)
+_RELATION_TYPES_FIELD = 10       # packed int32 (MemberType enum: 0=NODE, 1=WAY, 2=RELATION)
+
+# Relation MemberType enum
+_MEMBER_TYPE_NODE = 0
+_MEMBER_TYPE_WAY = 1
+_MEMBER_TYPE_RELATION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +369,27 @@ class WayBlock:
 
 
 @dataclass(frozen=True)
+class RelationMember:
+    """A single member of an OSM Relation."""
+
+    member_id: int      # absolute ID of the referenced element
+    member_type: int    # 0=Node, 1=Way, 2=Relation
+    role: str           # "outer", "inner", etc.
+
+
+@dataclass(frozen=True)
+class RelationBlock:
+    """Extracted data for Relations within one PrimitiveBlock."""
+
+    relation_ids: list[int]                           # absolute relation IDs
+    members_per_relation: list[list[RelationMember]]   # parsed members
+    stringtable: list[bytes]                          # block's string table
+    granularity: int
+    lat_offset: int
+    lon_offset: int
+
+
+@dataclass(frozen=True)
 class OsmGpuResult:
     """Result of GPU-accelerated OSM PBF reading.
 
@@ -362,6 +412,14 @@ class OsmGpuResult:
         ways geometry array.  ``None`` if no ways were found.
     n_ways
         Total number of ways extracted.
+    relations
+        MultiPolygon OwnedGeometryArray from Relation assembly.
+        ``None`` if no multipolygon relations were found.
+    relation_ids
+        Device-resident int64 array of OSM Relation IDs, parallel to
+        the relations geometry array.  ``None`` if no relations found.
+    n_relations
+        Total number of multipolygon relations extracted.
     """
 
     nodes: OwnedGeometryArray | None
@@ -370,6 +428,9 @@ class OsmGpuResult:
     ways: OwnedGeometryArray | None = None
     way_ids: cp.ndarray | None = None
     n_ways: int = 0
+    relations: OwnedGeometryArray | None = None
+    relation_ids: cp.ndarray | None = None
+    n_relations: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +881,448 @@ def _extract_way_blocks(raw_blocks: list[bytes]) -> list[WayBlock]:
             ))
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# CPU: Protobuf field extraction -- locate Relations within PrimitiveBlock
+# ---------------------------------------------------------------------------
+
+def _parse_single_relation(
+    relation_data: bytes,
+    stringtable: list[bytes],
+) -> tuple[int, list[RelationMember]]:
+    """Parse a single Relation message.
+
+    Returns (relation_id, members).
+    """
+    relation_id = 0
+    roles_sid_bytes = b""
+    memids_bytes = b""
+    types_bytes = b""
+
+    pos = 0
+    while pos < len(relation_data):
+        field_num, wire_type, consumed = _parse_field_tag(relation_data, pos)
+        pos += consumed
+
+        if field_num == _RELATION_ID_FIELD and wire_type == _WIRE_VARINT:
+            relation_id, consumed = _decode_varint(relation_data, pos)
+            pos += consumed
+        elif wire_type == _WIRE_LENGTH_DELIMITED:
+            length, consumed = _decode_varint(relation_data, pos)
+            pos += consumed
+            payload = bytes(relation_data[pos : pos + length])
+            pos += length
+            if field_num == _RELATION_ROLES_SID_FIELD:
+                roles_sid_bytes = payload
+            elif field_num == _RELATION_MEMIDS_FIELD:
+                memids_bytes = payload
+            elif field_num == _RELATION_TYPES_FIELD:
+                types_bytes = payload
+        else:
+            pos = _skip_field(relation_data, pos, wire_type)
+
+    # Decode member fields
+    # memids: packed sint64, delta-encoded -> absolute member IDs
+    member_ids = _decode_packed_sint64_cpu(memids_bytes) if memids_bytes else []
+    # types: packed uint32 -> MemberType enum values
+    member_types = _decode_packed_uint32(types_bytes) if types_bytes else []
+    # roles_sid: packed uint32 -> stringtable indices
+    roles_sid = _decode_packed_uint32(roles_sid_bytes) if roles_sid_bytes else []
+
+    # Build member list -- all three arrays must be parallel
+    n_members = min(len(member_ids), len(member_types), len(roles_sid))
+    members: list[RelationMember] = []
+    for i in range(n_members):
+        sid = roles_sid[i]
+        role = ""
+        if sid < len(stringtable):
+            role = stringtable[sid].decode("utf-8", errors="replace")
+        members.append(RelationMember(
+            member_id=member_ids[i],
+            member_type=member_types[i],
+            role=role,
+        ))
+
+    return relation_id, members
+
+
+def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
+    """Extract Relation data from decompressed PrimitiveBlocks.
+
+    For each PrimitiveBlock, locates Relation messages in PrimitiveGroups
+    and extracts relation IDs and member lists (IDs, types, roles).
+    """
+    results: list[RelationBlock] = []
+
+    for block_data in raw_blocks:
+        stringtable: list[bytes] = []
+        primitive_groups: list[tuple[int, int]] = []
+        st_start = -1
+        st_length = 0
+        granularity = 100
+        lat_offset = 0
+        lon_offset = 0
+
+        # Parse PrimitiveBlock top-level fields
+        pos = 0
+        while pos < len(block_data):
+            field_num, wire_type, consumed = _parse_field_tag(block_data, pos)
+            pos += consumed
+
+            if wire_type == _WIRE_LENGTH_DELIMITED:
+                length, consumed = _decode_varint(block_data, pos)
+                pos += consumed
+                if field_num == _PRIMITIVEBLOCK_STRINGTABLE_FIELD:
+                    st_start = pos
+                    st_length = length
+                elif field_num == _PRIMITIVEBLOCK_PRIMITIVEGROUP_FIELD:
+                    primitive_groups.append((pos, length))
+                pos += length
+            elif wire_type == _WIRE_VARINT:
+                value, consumed = _decode_varint(block_data, pos)
+                pos += consumed
+                if field_num == _PRIMITIVEBLOCK_GRANULARITY_FIELD:
+                    granularity = value
+                elif field_num == _PRIMITIVEBLOCK_LAT_OFFSET_FIELD:
+                    lat_offset = (value >> 1) ^ -(value & 1)
+                elif field_num == _PRIMITIVEBLOCK_LON_OFFSET_FIELD:
+                    lon_offset = (value >> 1) ^ -(value & 1)
+            else:
+                pos = _skip_field(block_data, pos, wire_type)
+
+        if st_start >= 0:
+            stringtable = _parse_stringtable(block_data, st_start, st_length)
+
+        # Parse each PrimitiveGroup looking for Relations (field 4)
+        block_relation_ids: list[int] = []
+        block_members: list[list[RelationMember]] = []
+
+        for group_start, group_length in primitive_groups:
+            pos = group_start
+            end = group_start + group_length
+
+            while pos < end:
+                field_num, wire_type, consumed = _parse_field_tag(block_data, pos)
+                pos += consumed
+
+                if field_num == _PRIMITIVEGROUP_RELATIONS_FIELD and wire_type == _WIRE_LENGTH_DELIMITED:
+                    length, consumed = _decode_varint(block_data, pos)
+                    pos += consumed
+                    relation_data = block_data[pos : pos + length]
+                    pos += length
+
+                    rel_id, members = _parse_single_relation(
+                        relation_data, stringtable,
+                    )
+                    if members:  # Skip relations with no members
+                        block_relation_ids.append(rel_id)
+                        block_members.append(members)
+                else:
+                    pos = _skip_field(block_data, pos, wire_type)
+
+        if block_relation_ids:
+            results.append(RelationBlock(
+                relation_ids=block_relation_ids,
+                members_per_relation=block_members,
+                stringtable=stringtable,
+                granularity=granularity,
+                lat_offset=lat_offset,
+                lon_offset=lon_offset,
+            ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CPU: Way chaining for MultiPolygon assembly
+# ---------------------------------------------------------------------------
+
+def _build_way_id_to_refs(
+    way_blocks: list[WayBlock],
+) -> dict[int, list[int]]:
+    """Build a Way ID -> node refs lookup from parsed WayBlocks.
+
+    This is CPU-side since it builds a dict from already-parsed Way data.
+    """
+    lookup: dict[int, list[int]] = {}
+    for wb in way_blocks:
+        for way_id, refs in zip(wb.way_ids, wb.refs_per_way):
+            lookup[way_id] = refs  # noqa: PERF403 – nested loop across blocks
+    return lookup
+
+
+def _chain_ways_to_rings(way_ref_lists: list[list[int]]) -> list[list[int]]:
+    """Chain multiple open Ways into closed rings by matching endpoints.
+
+    Algorithm:
+    1. Start with any unused Way.  current_ring = way_refs.copy()
+    2. While ring is not closed (first != last):
+       a. Find a Way whose first_ref == current_ring[-1] -> append (same direction)
+       b. Or whose last_ref == current_ring[-1] -> append reversed
+       c. If no match found, close the ring forcibly and start a new one
+    3. Return list of closed rings.
+
+    This is O(ways_per_ring^2) worst case but typically < 10 Ways per ring.
+    """
+    if not way_ref_lists:
+        return []
+
+    # Filter out single-ref ways (degenerate)
+    ways = [refs[:] for refs in way_ref_lists if len(refs) >= 2]
+    if not ways:
+        return []
+
+    rings: list[list[int]] = []
+    used = [False] * len(ways)
+
+    while True:
+        # Find the first unused Way to start a new ring
+        start_idx = -1
+        for i, u in enumerate(used):
+            if not u:
+                start_idx = i
+                break
+        if start_idx == -1:
+            break  # All ways consumed
+
+        used[start_idx] = True
+        ring = ways[start_idx][:]
+
+        # Check if this single Way is already closed
+        if ring[0] == ring[-1] and len(ring) >= 4:
+            rings.append(ring)
+            continue
+
+        # Try to extend the ring by matching endpoints
+        changed = True
+        while changed and ring[0] != ring[-1]:
+            changed = False
+            for i, w in enumerate(ways):
+                if used[i]:
+                    continue
+                if w[0] == ring[-1]:
+                    # Same direction: append without duplicating the junction node
+                    ring.extend(w[1:])
+                    used[i] = True
+                    changed = True
+                    break
+                elif w[-1] == ring[-1]:
+                    # Reversed direction: append reversed without duplicating
+                    ring.extend(reversed(w[:-1]))
+                    used[i] = True
+                    changed = True
+                    break
+
+        # Force-close if still open (degenerate data)
+        if ring[0] != ring[-1]:
+            ring.append(ring[0])
+
+        if len(ring) >= 4:
+            rings.append(ring)
+
+    return rings
+
+
+# ---------------------------------------------------------------------------
+# GPU: Relation (MultiPolygon) processing pipeline
+# ---------------------------------------------------------------------------
+
+def _process_relations_gpu(
+    relation_blocks: list[RelationBlock],
+    way_blocks: list[WayBlock],
+    d_node_ids: cp.ndarray,
+    d_lon: cp.ndarray,
+    d_lat: cp.ndarray,
+) -> tuple[OwnedGeometryArray | None, cp.ndarray | None, int]:
+    """Process all extracted Relations into device-resident MultiPolygon geometries.
+
+    1. Build Way ID -> node refs lookup from WayBlocks
+    2. For each multipolygon Relation, chain Way members into closed rings
+    3. Flatten all rings' node refs, resolve coordinates via GPU binary search
+    4. Build MultiPolygon OwnedGeometryArray with geometry/part/ring offsets
+
+    Returns (relations_owned, d_relation_ids, n_relations).
+    """
+    # Collect all relations across blocks
+    all_relation_ids: list[int] = []
+    all_members: list[list[RelationMember]] = []
+
+    for rb in relation_blocks:
+        all_relation_ids.extend(rb.relation_ids)
+        all_members.extend(rb.members_per_relation)
+
+    if not all_relation_ids:
+        return None, None, 0
+
+    # Build Way ID -> node refs lookup
+    way_lookup = _build_way_id_to_refs(way_blocks)
+
+    # Filter to multipolygon relations (those with Way members that have
+    # outer/inner/"" roles).  Also skip relations that reference other
+    # relations (recursive -- too complex for this pipeline).
+    #
+    # For each multipolygon relation, produce:
+    #   - List of outer rings (each a list of node refs)
+    #   - List of inner rings (each a list of node refs)
+    #
+    # Then flatten into the MultiPolygon offset hierarchy:
+    #   geometry_offsets: row -> polygon part count (one polygon per outer ring)
+    #   part_offsets: polygon -> ring count (1 outer + N inner rings)
+    #   ring_offsets: ring -> coordinate count
+
+    valid_relation_ids: list[int] = []
+    # Per-relation list of (outer_rings, inner_rings) where each ring is a list of node refs
+    relation_ring_data: list[tuple[list[list[int]], list[list[int]]]] = []
+
+    for rel_id, members in zip(all_relation_ids, all_members):
+        # Collect Way members by role
+        outer_way_refs: list[list[int]] = []
+        inner_way_refs: list[list[int]] = []
+
+        for m in members:
+            if m.member_type == _MEMBER_TYPE_RELATION:
+                # Skip recursive relation references
+                continue
+            if m.member_type != _MEMBER_TYPE_WAY:
+                continue
+
+            refs = way_lookup.get(m.member_id)
+            if refs is None:
+                logger.debug(
+                    "Relation %d: Way member %d not found in dataset, skipping",
+                    rel_id, m.member_id,
+                )
+                continue
+
+            role = m.role.strip().lower()
+            if role == "outer" or role == "":
+                # Empty role defaults to "outer" per OSM convention
+                outer_way_refs.append(refs)
+            elif role == "inner":
+                inner_way_refs.append(refs)
+            # Other roles (e.g., "subarea") are skipped
+
+        if not outer_way_refs:
+            # No outer rings -- skip this relation
+            continue
+
+        # Chain Ways into closed rings
+        outer_rings = _chain_ways_to_rings(outer_way_refs)
+        inner_rings = _chain_ways_to_rings(inner_way_refs) if inner_way_refs else []
+
+        if not outer_rings:
+            continue
+
+        valid_relation_ids.append(rel_id)
+        relation_ring_data.append((outer_rings, inner_rings))
+
+    n_relations = len(valid_relation_ids)
+    if n_relations == 0:
+        return None, None, 0
+
+    # Build the MultiPolygon offset hierarchy and flatten all node refs.
+    #
+    # MultiPolygon layout: row -> polygon parts -> rings -> coordinates
+    # - geometry_offsets[i] = start index into part_offsets for relation i
+    # - part_offsets[j] = start index into ring_offsets for polygon j
+    # - ring_offsets[k] = start index into x/y for ring k
+    #
+    # For each relation:
+    #   - Each outer ring starts a new "part" (polygon)
+    #   - Inner rings are assigned to the most recent outer ring
+    #     (correct for well-formed OSM data where inners follow their outer)
+
+    geom_offsets_list = [0]  # row -> polygon part count
+    part_offsets_list = [0]  # polygon -> ring count
+    ring_offsets_list = [0]  # ring -> coordinate count
+    all_ring_refs: list[list[int]] = []  # flat list of all rings' node refs
+
+    for outer_rings, inner_rings in relation_ring_data:
+        n_parts = len(outer_rings)
+        geom_offsets_list.append(geom_offsets_list[-1] + n_parts)
+
+        # Simple assignment: each outer ring is a part, all inner rings
+        # go to the last outer ring.  This is correct for the vast majority
+        # of OSM multipolygon data where a single outer + multiple inners
+        # is the dominant pattern.
+        for oi, outer_ring in enumerate(outer_rings):
+            if oi == len(outer_rings) - 1:
+                # Last outer ring gets all inner rings
+                n_rings = 1 + len(inner_rings)
+            else:
+                n_rings = 1
+            part_offsets_list.append(part_offsets_list[-1] + n_rings)
+
+            # Outer ring
+            ring_offsets_list.append(ring_offsets_list[-1] + len(outer_ring))
+            all_ring_refs.append(outer_ring)
+
+            # Inner rings (attached to last outer only)
+            if oi == len(outer_rings) - 1:
+                for inner_ring in inner_rings:
+                    ring_offsets_list.append(ring_offsets_list[-1] + len(inner_ring))
+                    all_ring_refs.append(inner_ring)
+
+    # Flatten all ring refs into a single array
+    flat_refs: list[int] = []
+    for ring_refs in all_ring_refs:
+        flat_refs.extend(ring_refs)
+
+    total_coords = len(flat_refs)
+    if total_coords == 0:
+        return None, None, 0
+
+    # Build node lookup table on GPU (Tier 2 CuPy)
+    d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(
+        d_node_ids, d_lon, d_lat,
+    )
+
+    # Upload flat refs to GPU and resolve coordinates via binary search
+    h_flat_refs = np.array(flat_refs, dtype=np.int64)
+    d_refs = cp.asarray(h_flat_refs)
+
+    d_out_x, d_out_y = _gpu_gather_way_coords(
+        d_sorted_ids, d_sorted_x, d_sorted_y, d_refs,
+    )
+
+    # Build offset arrays on GPU (Tier 2 CuPy)
+    h_geom_offsets = np.array(geom_offsets_list, dtype=np.int32)
+    h_part_offsets = np.array(part_offsets_list, dtype=np.int32)
+    h_ring_offsets = np.array(ring_offsets_list, dtype=np.int32)
+
+    d_geom_offsets = cp.asarray(h_geom_offsets)
+    d_part_offsets = cp.asarray(h_part_offsets)
+    d_ring_offsets = cp.asarray(h_ring_offsets)
+
+    # Build relation IDs on device
+    h_relation_ids = np.array(valid_relation_ids, dtype=np.int64)
+    d_relation_ids = cp.asarray(h_relation_ids)
+
+    # Assemble MultiPolygon OwnedGeometryArray
+    from vibespatial.io.pylibcudf import _build_device_single_family_owned
+
+    d_validity = cp.ones(n_relations, dtype=cp.bool_)
+    d_empty_mask = cp.zeros(n_relations, dtype=cp.bool_)
+
+    owned = _build_device_single_family_owned(
+        family=GeometryFamily.MULTIPOLYGON,
+        validity_device=d_validity,
+        x_device=d_out_x,
+        y_device=d_out_y,
+        geometry_offsets_device=d_geom_offsets,
+        empty_mask_device=d_empty_mask,
+        part_offsets_device=d_part_offsets,
+        ring_offsets_device=d_ring_offsets,
+        detail=f"osm_gpu: {n_relations} MultiPolygon Relations from PBF",
+    )
+
+    logger.info(
+        "OSM PBF: assembled %d MultiPolygon relations (%d total rings, %d coordinates)",
+        n_relations, len(all_ring_refs), total_coords,
+    )
+
+    return owned, d_relation_ids, n_relations
 
 
 # ---------------------------------------------------------------------------
@@ -1550,14 +2053,15 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
 
 
 def read_osm_pbf(path: str | Path) -> OsmGpuResult:
-    """Extract nodes and ways from an OSM PBF file.
+    """Extract nodes, ways, and relations from an OSM PBF file.
 
     Uses a hybrid CPU/GPU pipeline to extract:
     - **Nodes** as Point geometries (same pipeline as ``read_osm_pbf_nodes``)
     - **Ways** as LineString (open) or Polygon (closed ring) geometries
+    - **Relations** as MultiPolygon geometries (assembled from Way members)
 
-    Way coordinate resolution uses a GPU binary-search kernel against a
-    sorted node lookup table built from the extracted DenseNodes.
+    Way and relation coordinate resolution uses a GPU binary-search kernel
+    against a sorted node lookup table built from the extracted DenseNodes.
 
     Parameters
     ----------
@@ -1567,8 +2071,8 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     Returns
     -------
     OsmGpuResult
-        Contains device-resident Point, LineString, and Polygon
-        OwnedGeometryArrays with corresponding OSM IDs.
+        Contains device-resident Point, LineString, Polygon, and
+        MultiPolygon OwnedGeometryArrays with corresponding OSM IDs.
     """
     path = Path(path)
     if not path.exists():
@@ -1594,6 +2098,14 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     way_blocks = _extract_way_blocks(raw_blocks)
     total_ways = sum(len(wb.way_ids) for wb in way_blocks)
     logger.info("OSM PBF: found %d Way blocks (%d ways)", len(way_blocks), total_ways)
+
+    # Phase 3c: CPU -- extract Relation data
+    relation_blocks = _extract_relation_blocks(raw_blocks)
+    total_relations = sum(len(rb.relation_ids) for rb in relation_blocks)
+    logger.info(
+        "OSM PBF: found %d Relation blocks (%d relations)",
+        len(relation_blocks), total_relations,
+    )
 
     # Phase 4-5: GPU -- node varint decode + delta decode + scale
     nodes_result = _gpu_delta_decode_and_scale(dense_blocks) if dense_blocks else None
@@ -1625,6 +2137,27 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
             "with geometry" if ways_owned is not None else "no resolved geometry",
         )
 
+    # Phase 7: GPU -- resolve Relation Way members and assemble MultiPolygons
+    relations_owned: OwnedGeometryArray | None = None
+    d_relation_ids: cp.ndarray | None = None
+    n_relations = 0
+
+    if (
+        relation_blocks
+        and way_blocks
+        and d_node_ids is not None
+        and d_lon is not None
+        and d_lat is not None
+    ):
+        relations_owned, d_relation_ids, n_relations = _process_relations_gpu(
+            relation_blocks, way_blocks, d_node_ids, d_lon, d_lat,
+        )
+        logger.info(
+            "OSM PBF: assembled %d relations (%s)",
+            n_relations,
+            "with geometry" if relations_owned is not None else "no resolved geometry",
+        )
+
     return OsmGpuResult(
         nodes=nodes_owned,
         node_ids=d_node_ids,
@@ -1632,4 +2165,7 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
         ways=ways_owned,
         way_ids=d_way_ids,
         n_ways=n_ways,
+        relations=relations_owned,
+        relation_ids=d_relation_ids,
+        n_relations=n_relations,
     )

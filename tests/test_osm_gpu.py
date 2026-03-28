@@ -1410,3 +1410,776 @@ class TestReadOsmPbf:
             assert 888 in way_ids
         finally:
             path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Relation protobuf building helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_relation(
+    relation_id: int,
+    members: list[tuple[int, int, int]],  # (absolute_id, member_type, role_sid)
+    keys: list[int] | None = None,
+    vals: list[int] | None = None,
+) -> bytes:
+    """Build a Relation protobuf message.
+
+    Parameters
+    ----------
+    relation_id
+        The Relation ID.
+    members
+        List of (absolute_member_id, member_type, role_sid) tuples.
+        member_type: 0=NODE, 1=WAY, 2=RELATION
+        role_sid: stringtable index for the role string
+    keys, vals
+        Optional stringtable indices for tags.
+    """
+    result = _encode_varint_field(1, relation_id)  # field 1: id
+    if keys:
+        result += _encode_length_delimited(2, _encode_packed_uint32(keys))
+    if vals:
+        result += _encode_length_delimited(3, _encode_packed_uint32(vals))
+
+    # Build delta-encoded member IDs (sint64)
+    if members:
+        # roles_sid (field 8): packed uint32
+        roles = [m[2] for m in members]
+        result += _encode_length_delimited(8, _encode_packed_uint32(roles))
+
+        # memids (field 9): packed sint64, delta-encoded
+        absolute_ids = [m[0] for m in members]
+        deltas = [absolute_ids[0]]
+        for i in range(1, len(absolute_ids)):
+            deltas.append(absolute_ids[i] - absolute_ids[i - 1])
+        result += _encode_length_delimited(9, _encode_packed_sint64(deltas))
+
+        # types (field 10): packed int32
+        types = [m[1] for m in members]
+        result += _encode_length_delimited(10, _encode_packed_uint32(types))
+
+    return result
+
+
+def _build_primitive_group_with_relations(relations_bytes: list[bytes]) -> bytes:
+    """Build a PrimitiveGroup containing Relation messages."""
+    result = b""
+    for rel_data in relations_bytes:
+        result += _encode_length_delimited(4, rel_data)  # field 4: relations
+    return result
+
+
+def _build_test_pbf_with_relations(
+    node_id_deltas: list[int],
+    node_lat_deltas: list[int],
+    node_lon_deltas: list[int],
+    ways: list[tuple[int, list[int]]],
+    relations: list[tuple[int, list[tuple[int, int, int]]]],
+    stringtable_entries: list[bytes] | None = None,
+    granularity: int = 100,
+    compress: bool = True,
+) -> bytes:
+    """Build a PBF file with DenseNodes, Ways, and Relations.
+
+    Parameters
+    ----------
+    ways
+        List of (way_id, absolute_refs) tuples.
+    relations
+        List of (relation_id, [(member_id, member_type, role_sid), ...]) tuples.
+    stringtable_entries
+        The string table entries for the block. Must include role strings
+        (e.g., b"outer", b"inner") at the indices referenced by role_sid.
+    """
+    header = _build_osm_header()
+
+    # Build DenseNodes group
+    dense = _build_dense_nodes(node_id_deltas, node_lat_deltas, node_lon_deltas)
+    dense_group = _build_primitive_group(dense)
+
+    # Build Ways group: convert absolute refs to delta-encoded
+    way_messages = []
+    for way_id, absolute_refs in ways:
+        ref_deltas = [absolute_refs[0]]
+        for i in range(1, len(absolute_refs)):
+            ref_deltas.append(absolute_refs[i] - absolute_refs[i - 1])
+        way_messages.append(_build_way(way_id, ref_deltas))
+    ways_group = _build_primitive_group_with_ways(way_messages)
+
+    # Build Relations group
+    relation_messages = []
+    for rel_id, members in relations:
+        relation_messages.append(_build_relation(rel_id, members))
+    relations_group = _build_primitive_group_with_relations(relation_messages)
+
+    primitive_block = _build_primitive_block_with_stringtable(
+        [dense_group, ways_group, relations_group],
+        stringtable_entries=stringtable_entries,
+        granularity=granularity,
+    )
+    data_block = _build_pbf_block("OSMData", primitive_block, compress=compress)
+
+    return header + data_block
+
+
+# ---------------------------------------------------------------------------
+# Tests: CPU Relation field extraction
+# ---------------------------------------------------------------------------
+
+
+class TestRelationExtraction:
+    """Test CPU-side Relation field extraction from PrimitiveBlocks."""
+
+    def test_single_relation_extraction(self):
+        """Extract a single Relation with Way members."""
+        from vibespatial.io.osm_gpu import _extract_relation_blocks
+
+        # stringtable: [b"", b"outer", b"inner", b"type", b"multipolygon"]
+        st = [b"", b"outer", b"inner", b"type", b"multipolygon"]
+
+        # Relation 5000 with two Way members (outer and inner)
+        rel = _build_relation(5000, [
+            (100, 1, 1),  # Way 100, role "outer" (st index 1)
+            (200, 1, 2),  # Way 200, role "inner" (st index 2)
+        ])
+        group = _build_primitive_group_with_relations([rel])
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=st,
+        )
+
+        results = _extract_relation_blocks([pblock])
+        assert len(results) == 1
+        rb = results[0]
+        assert rb.relation_ids == [5000]
+        assert len(rb.members_per_relation) == 1
+        members = rb.members_per_relation[0]
+        assert len(members) == 2
+        assert members[0].member_id == 100
+        assert members[0].member_type == 1  # WAY
+        assert members[0].role == "outer"
+        assert members[1].member_id == 200
+        assert members[1].member_type == 1  # WAY
+        assert members[1].role == "inner"
+
+    def test_multiple_relations(self):
+        """Extract multiple Relations from a single block."""
+        from vibespatial.io.osm_gpu import _extract_relation_blocks
+
+        st = [b"", b"outer", b"inner"]
+
+        rel1 = _build_relation(1000, [(10, 1, 1)])
+        rel2 = _build_relation(2000, [(20, 1, 1), (30, 1, 2)])
+        group = _build_primitive_group_with_relations([rel1, rel2])
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=st,
+        )
+
+        results = _extract_relation_blocks([pblock])
+        assert len(results) == 1
+        rb = results[0]
+        assert rb.relation_ids == [1000, 2000]
+        assert len(rb.members_per_relation[0]) == 1
+        assert len(rb.members_per_relation[1]) == 2
+
+    def test_delta_encoded_memids(self):
+        """Verify delta decoding of member IDs."""
+        from vibespatial.io.osm_gpu import _extract_relation_blocks
+
+        st = [b"", b"outer"]
+
+        # Members: Way 100, Way 300, Way 250 (delta: 100, 200, -50)
+        rel = _build_relation(42, [
+            (100, 1, 1),
+            (300, 1, 1),
+            (250, 1, 1),
+        ])
+        group = _build_primitive_group_with_relations([rel])
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=st,
+        )
+
+        results = _extract_relation_blocks([pblock])
+        rb = results[0]
+        members = rb.members_per_relation[0]
+        assert members[0].member_id == 100
+        assert members[1].member_id == 300
+        assert members[2].member_id == 250
+
+    def test_no_relations_in_block(self):
+        """Block with only DenseNodes produces no RelationBlocks."""
+        from vibespatial.io.osm_gpu import _extract_relation_blocks
+
+        dense = _build_dense_nodes([1, 1], [100, 200], [300, 400])
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block(group)
+
+        results = _extract_relation_blocks([pblock])
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: Way chaining for MultiPolygon assembly
+# ---------------------------------------------------------------------------
+
+
+class TestWayChaining:
+    """Test CPU-side Way chaining into closed rings."""
+
+    def test_single_closed_way(self):
+        """A single closed Way produces one ring."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        # Already closed
+        rings = _chain_ways_to_rings([[1, 2, 3, 4, 1]])
+        assert len(rings) == 1
+        assert rings[0][0] == rings[0][-1]
+        assert rings[0] == [1, 2, 3, 4, 1]
+
+    def test_two_ways_forming_one_ring(self):
+        """Two open Ways whose endpoints match form one closed ring."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        # Way A: [1, 2, 3], Way B: [3, 4, 1]
+        rings = _chain_ways_to_rings([[1, 2, 3], [3, 4, 1]])
+        assert len(rings) == 1
+        assert rings[0][0] == rings[0][-1]
+        assert len(rings[0]) == 5  # [1, 2, 3, 4, 1]
+
+    def test_reversed_way_direction(self):
+        """Two Ways that need direction reversal to form a ring."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        # Way A: [1, 2, 3], Way B: [1, 4, 3] (reversed: [3, 4, 1])
+        rings = _chain_ways_to_rings([[1, 2, 3], [1, 4, 3]])
+        assert len(rings) == 1
+        assert rings[0][0] == rings[0][-1]
+
+    def test_three_ways_forming_one_ring(self):
+        """Three open Ways chain into one closed ring."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        # Way A: [1, 2], Way B: [2, 3], Way C: [3, 1]
+        rings = _chain_ways_to_rings([[1, 2], [2, 3], [3, 1]])
+        assert len(rings) == 1
+        assert rings[0][0] == rings[0][-1]
+        assert len(rings[0]) == 4  # [1, 2, 3, 1]
+
+    def test_two_separate_closed_rings(self):
+        """Two separate closed Ways produce two rings."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        rings = _chain_ways_to_rings([
+            [1, 2, 3, 1],
+            [10, 20, 30, 10],
+        ])
+        assert len(rings) == 2
+        assert rings[0][0] == rings[0][-1]
+        assert rings[1][0] == rings[1][-1]
+
+    def test_empty_input(self):
+        """Empty input produces no rings."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        assert _chain_ways_to_rings([]) == []
+
+    def test_multiple_outer_rings_from_open_ways(self):
+        """Multiple disjoint open Way groups produce multiple rings."""
+        from vibespatial.io.osm_gpu import _chain_ways_to_rings
+
+        # Group 1: [1, 2] + [2, 1] -> ring [1, 2, 1]
+        # Group 2: [10, 20] + [20, 10] -> ring [10, 20, 10]
+        # But these need 4 vertices minimum for valid ring; let's use bigger
+        # Group 1: [1, 2, 3] + [3, 4, 1] -> ring [1, 2, 3, 4, 1]
+        # Group 2: [10, 20, 30] + [30, 40, 10] -> ring [10, 20, 30, 40, 10]
+        rings = _chain_ways_to_rings([
+            [1, 2, 3], [3, 4, 1],
+            [10, 20, 30], [30, 40, 10],
+        ])
+        assert len(rings) == 2
+        for ring in rings:
+            assert ring[0] == ring[-1]
+            assert len(ring) >= 4
+
+
+# ---------------------------------------------------------------------------
+# Tests: GPU Relation MultiPolygon assembly
+# ---------------------------------------------------------------------------
+
+
+class TestRelationMultiPolygon:
+    """Test GPU-side MultiPolygon assembly from Relations."""
+
+    @needs_gpu
+    def test_simple_multipolygon_one_outer(self):
+        """A relation with one closed outer Way produces a single-part MultiPolygon."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 4 nodes forming a square
+        # Node 1: lat=0, lon=0; Node 2: lat=0, lon=1
+        # Node 3: lat=1, lon=1; Node 4: lat=1, lon=0
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        # Way 100: closed ring [1, 2, 3, 4, 1]
+        ways = [(100, [1, 2, 3, 4, 1])]
+
+        # Relation 5000: Way 100 as outer
+        # stringtable: [b"", b"outer", b"inner", b"type", b"multipolygon"]
+        st = [b"", b"outer", b"inner", b"type", b"multipolygon"]
+        relations = [(5000, [(100, 1, 1)])]  # Way 100, type=WAY(1), role_sid=1("outer")
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+            assert result.relations is not None
+            assert result.relation_ids is not None
+
+            rel_ids = cp.asnumpy(result.relation_ids)
+            assert rel_ids[0] == 5000
+
+            ds = result.relations.device_state
+            assert ds is not None
+            assert GeometryFamily.MULTIPOLYGON in ds.families
+
+            mpoly_buf = ds.families[GeometryFamily.MULTIPOLYGON]
+
+            # geometry_offsets: [0, 1] (one polygon part)
+            geom_offsets = cp.asnumpy(mpoly_buf.geometry_offsets)
+            assert geom_offsets[0] == 0
+            assert geom_offsets[1] == 1
+
+            # part_offsets: [0, 1] (one ring in the one part)
+            part_offsets = cp.asnumpy(mpoly_buf.part_offsets)
+            assert part_offsets[0] == 0
+            assert part_offsets[1] == 1
+
+            # ring_offsets: [0, 5] (5 coordinates: 4 vertices + closing point)
+            ring_offsets = cp.asnumpy(mpoly_buf.ring_offsets)
+            assert ring_offsets[0] == 0
+            assert ring_offsets[1] == 5
+
+            # Verify coordinates
+            x = cp.asnumpy(mpoly_buf.x)
+            y = cp.asnumpy(mpoly_buf.y)
+            assert len(x) == 5
+            # First and last should match (closed ring)
+            np.testing.assert_allclose(x[0], x[4], atol=1e-12)
+            np.testing.assert_allclose(y[0], y[4], atol=1e-12)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multipolygon_with_inner_ring(self):
+        """A relation with outer + inner Way produces a polygon with hole."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Outer: large square, nodes 1-4
+        # Inner: small square, nodes 5-8
+        node_id_deltas = [1, 1, 1, 1, 1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 100000000, 100000000,
+                           10000000, 10000000, 30000000, 30000000]
+        node_lon_deltas = [0, 100000000, 100000000, 0,
+                           10000000, 30000000, 30000000, 10000000]
+
+        ways = [
+            (100, [1, 2, 3, 4, 1]),  # outer ring
+            (200, [5, 6, 7, 8, 5]),  # inner ring (hole)
+        ]
+
+        st = [b"", b"outer", b"inner"]
+        relations = [(9000, [
+            (100, 1, 1),  # Way 100 as outer
+            (200, 1, 2),  # Way 200 as inner
+        ])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+
+            ds = result.relations.device_state
+            mpoly_buf = ds.families[GeometryFamily.MULTIPOLYGON]
+
+            # 1 geometry, 1 part (polygon), 2 rings (outer + inner)
+            geom_offsets = cp.asnumpy(mpoly_buf.geometry_offsets)
+            part_offsets = cp.asnumpy(mpoly_buf.part_offsets)
+            ring_offsets = cp.asnumpy(mpoly_buf.ring_offsets)
+
+            assert geom_offsets[-1] == 1  # 1 polygon part
+            assert part_offsets[-1] == 2  # 2 rings total
+            assert len(ring_offsets) == 3  # [0, 5, 10]
+
+            # Each ring has 5 coordinates
+            assert ring_offsets[1] - ring_offsets[0] == 5
+            assert ring_offsets[2] - ring_offsets[1] == 5
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multipolygon_two_outer_rings(self):
+        """A relation with two outer Ways produces a 2-part MultiPolygon."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Two separate triangles
+        node_id_deltas = [1, 1, 1, 1, 1, 1]
+        # Triangle 1: (0,0), (0,1), (1,0)
+        # Triangle 2: (10,10), (10,11), (11,10)
+        node_lat_deltas = [0, 0, 10000000,
+                           90000000, 0, 10000000]
+        node_lon_deltas = [0, 10000000, 0,
+                           90000000, 10000000, 0]
+
+        ways = [
+            (100, [1, 2, 3, 1]),  # triangle 1
+            (200, [4, 5, 6, 4]),  # triangle 2
+        ]
+
+        st = [b"", b"outer"]
+        relations = [(7000, [
+            (100, 1, 1),  # outer
+            (200, 1, 1),  # outer
+        ])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+
+            ds = result.relations.device_state
+            mpoly_buf = ds.families[GeometryFamily.MULTIPOLYGON]
+
+            geom_offsets = cp.asnumpy(mpoly_buf.geometry_offsets)
+            part_offsets = cp.asnumpy(mpoly_buf.part_offsets)
+
+            # 2 polygon parts
+            assert geom_offsets[-1] == 2
+
+            # Each part has 1 ring
+            ring_count_part1 = part_offsets[1] - part_offsets[0]
+            ring_count_part2 = part_offsets[2] - part_offsets[1]
+            assert ring_count_part1 == 1
+            assert ring_count_part2 == 1
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multipolygon_chained_ways(self):
+        """A relation whose outer ring is split across two Ways."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 4 nodes forming a square
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        # Two open ways that together form a closed ring:
+        # Way 100: [1, 2, 3] (half the square)
+        # Way 200: [3, 4, 1] (other half)
+        ways = [
+            (100, [1, 2, 3]),
+            (200, [3, 4, 1]),
+        ]
+
+        st = [b"", b"outer"]
+        relations = [(8000, [
+            (100, 1, 1),  # outer
+            (200, 1, 1),  # outer
+        ])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+
+            ds = result.relations.device_state
+            mpoly_buf = ds.families[GeometryFamily.MULTIPOLYGON]
+
+            # Should have chained into one ring with 5 coordinates
+            ring_offsets = cp.asnumpy(mpoly_buf.ring_offsets)
+            total_coords = ring_offsets[-1]
+            assert total_coords == 5  # [1, 2, 3, 4, 1]
+
+            # Verify the ring is closed
+            x = cp.asnumpy(mpoly_buf.x)
+            y = cp.asnumpy(mpoly_buf.y)
+            np.testing.assert_allclose(x[0], x[4], atol=1e-12)
+            np.testing.assert_allclose(y[0], y[4], atol=1e-12)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multipolygon_reversed_way(self):
+        """A relation whose outer ring needs Way direction reversal."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 4 nodes forming a square
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        # Way 100: [1, 2, 3] (forward)
+        # Way 200: [1, 4, 3] (reversed -- last ref matches Way 100 last ref)
+        ways = [
+            (100, [1, 2, 3]),
+            (200, [1, 4, 3]),
+        ]
+
+        st = [b"", b"outer"]
+        relations = [(8001, [
+            (100, 1, 1),
+            (200, 1, 1),
+        ])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+
+            ds = result.relations.device_state
+            mpoly_buf = ds.families[GeometryFamily.MULTIPOLYGON]
+
+            # Should have 5 coordinates (closed ring)
+            ring_offsets = cp.asnumpy(mpoly_buf.ring_offsets)
+            total_coords = ring_offsets[-1]
+            assert total_coords == 5
+
+            x = cp.asnumpy(mpoly_buf.x)
+            y = cp.asnumpy(mpoly_buf.y)
+            np.testing.assert_allclose(x[0], x[4], atol=1e-12)
+            np.testing.assert_allclose(y[0], y[4], atol=1e-12)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multipolygon_coordinate_correctness(self):
+        """Verify exact coordinates in a MultiPolygon from a Relation."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Node 1: lat=40.0, lon=-74.0  (nanodeg: 400000000, -740000000)
+        # Node 2: lat=40.0, lon=-73.0  (nanodeg delta: 0, 10000000)
+        # Node 3: lat=41.0, lon=-73.0  (nanodeg delta: 10000000, 0)
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [400000000, 0, 10000000]
+        node_lon_deltas = [-740000000, 10000000, 0]
+
+        ways = [(100, [1, 2, 3, 1])]
+
+        st = [b"", b"outer"]
+        relations = [(6000, [(100, 1, 1)])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+
+            ds = result.relations.device_state
+            mpoly_buf = ds.families[GeometryFamily.MULTIPOLYGON]
+
+            x = cp.asnumpy(mpoly_buf.x)  # longitude
+            y = cp.asnumpy(mpoly_buf.y)  # latitude
+
+            np.testing.assert_allclose(y, [40.0, 40.0, 41.0, 40.0], rtol=1e-9)
+            np.testing.assert_allclose(x, [-74.0, -73.0, -73.0, -74.0], rtol=1e-9)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_empty_role_defaults_to_outer(self):
+        """Members with empty role ('') are treated as outer."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        ways = [(100, [1, 2, 3, 4, 1])]
+
+        # stringtable: [b""] -- index 0 is empty string
+        st = [b""]
+        # role_sid=0 maps to "" which defaults to "outer"
+        relations = [(5500, [(100, 1, 0)])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_missing_way_member_skipped(self):
+        """Relation referencing a Way not in the dataset skips that member."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        # Only Way 100 exists, not Way 999
+        ways = [(100, [1, 2, 3, 4, 1])]
+
+        st = [b"", b"outer"]
+        # Relation references Way 100 (exists) and Way 999 (missing)
+        relations = [(5001, [
+            (100, 1, 1),
+            (999, 1, 1),  # missing Way
+        ])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            # Should still produce a valid relation from Way 100
+            assert result.n_relations == 1
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_relation_referencing_relation_skipped(self):
+        """Relation members of type RELATION are skipped (recursive)."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        ways = [(100, [1, 2, 3, 4, 1])]
+
+        st = [b"", b"outer"]
+        # Way 100 outer + Relation 9999 (type=2=RELATION, should be skipped)
+        relations = [(5002, [
+            (100, 1, 1),    # Way 100, outer
+            (9999, 2, 1),   # Relation 9999, should be skipped
+        ])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 1
+        finally:
+            path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Tests: End-to-end PBF with nodes + ways + relations
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEndWithRelations:
+    """End-to-end test: PBF with all three element types."""
+
+    @needs_gpu
+    def test_nodes_ways_relations(self):
+        """read_osm_pbf returns nodes, ways, and relations."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 4 nodes forming a square + 2 extra for a linestring
+        node_id_deltas = [1, 1, 1, 1, 1, 1]
+        node_lat_deltas = [0, 10000, 10000, 10000, 10000, 10000]
+        node_lon_deltas = [0, 10000, 10000, 10000, 10000, 10000]
+
+        # Way 100: closed ring -> Polygon when standalone
+        # Way 200: open linestring [5, 6]
+        ways = [
+            (100, [1, 2, 3, 4, 1]),
+            (200, [5, 6]),
+        ]
+
+        st = [b"", b"outer"]
+        # Relation 9000: Way 100 as outer
+        relations = [(9000, [(100, 1, 1)])]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+
+            # Should have nodes, ways, and relations
+            assert result.n_nodes == 6
+            assert result.nodes is not None
+
+            assert result.n_ways == 2
+            assert result.ways is not None
+
+            assert result.n_relations == 1
+            assert result.relations is not None
+            assert result.relation_ids is not None
+
+            rel_ids = cp.asnumpy(result.relation_ids)
+            assert rel_ids[0] == 9000
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_no_relations_returns_zero(self):
+        """PBF without relations has n_relations=0."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        pbf = _build_test_pbf(
+            id_deltas=[1, 1],
+            lat_deltas=[100, 200],
+            lon_deltas=[300, 400],
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations == 0
+            assert result.relations is None
+            assert result.relation_ids is None
+        finally:
+            path.unlink()

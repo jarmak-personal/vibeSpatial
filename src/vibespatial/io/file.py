@@ -522,11 +522,11 @@ def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | No
 def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read an OSM PBF file using the GPU hybrid pipeline.
 
-    OSM PBF files contain DenseNodes (Points) and Ways (LineStrings,
-    Polygons) extracted via CPU protobuf parsing with GPU varint decoding,
-    coordinate assembly, and binary-search-based coordinate resolution.
-    Returns a GeoDataFrame with mixed geometry types and OSM ID columns,
-    or None on failure.
+    OSM PBF files contain DenseNodes (Points), Ways (LineStrings, Polygons),
+    and Relations (MultiPolygons) extracted via CPU protobuf parsing with
+    GPU varint decoding, coordinate assembly, and binary-search-based
+    coordinate resolution.  Returns a GeoDataFrame with mixed geometry
+    types and OSM ID columns, or None on failure.
     """
     try:
         from .arrow import geoseries_from_owned
@@ -535,8 +535,9 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
         osm_result = read_osm_pbf(filename)
         has_nodes = osm_result.nodes is not None and osm_result.n_nodes > 0
         has_ways = osm_result.ways is not None and osm_result.n_ways > 0
+        has_relations = osm_result.relations is not None and osm_result.n_relations > 0
 
-        if not has_nodes and not has_ways:
+        if not has_nodes and not has_ways and not has_relations:
             return None
 
         # OSM PBF has no embedded CRS; coordinates are WGS84 by definition.
@@ -546,39 +547,59 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
 
         import vibespatial.api as geopandas
 
-        if has_nodes and not has_ways:
-            # Nodes only -- single family Point geometry
-            geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
-            data: dict[str, object] = {}
-            if osm_result.node_ids is not None:
-                data["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
-            gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
-        elif has_ways and not has_nodes:
-            # Ways only -- LineString/Polygon geometry
-            geom_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
-            data = {}
-            if osm_result.way_ids is not None:
-                data["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
-            gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+        # Count how many element types we have -- if only one, return a
+        # simple single-type GeoDataFrame; if multiple, concatenate with
+        # osm_element / osm_id columns.
+        n_types = int(has_nodes) + int(has_ways) + int(has_relations)
+
+        if n_types == 1:
+            if has_nodes:
+                geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
+                data: dict[str, object] = {}
+                if osm_result.node_ids is not None:
+                    data["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
+                gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+            elif has_ways:
+                geom_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
+                data = {}
+                if osm_result.way_ids is not None:
+                    data["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
+                gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+            else:
+                geom_series = geoseries_from_owned(osm_result.relations, name="geometry", crs=crs)
+                data = {}
+                if osm_result.relation_ids is not None:
+                    data["osm_relation_id"] = _cp.asnumpy(osm_result.relation_ids)
+                gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
         else:
-            # Both nodes and ways -- build node and way GeoDataFrames
-            # and concatenate.  Each gets its own ID column.
+            # Multiple element types -- build per-type GeoDataFrames and concatenate.
             import pandas as pd
 
-            node_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
-            node_data: dict[str, object] = {"osm_element": "node"}
-            if osm_result.node_ids is not None:
-                node_data["osm_id"] = _cp.asnumpy(osm_result.node_ids)
-            node_gdf = geopandas.GeoDataFrame(node_data, geometry=node_series)
+            frames = []
 
-            way_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
-            way_data: dict[str, object] = {"osm_element": "way"}
-            if osm_result.way_ids is not None:
-                way_data["osm_id"] = _cp.asnumpy(osm_result.way_ids)
-            way_gdf = geopandas.GeoDataFrame(way_data, geometry=way_series)
+            if has_nodes:
+                node_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
+                node_data: dict[str, object] = {"osm_element": "node"}
+                if osm_result.node_ids is not None:
+                    node_data["osm_id"] = _cp.asnumpy(osm_result.node_ids)
+                frames.append(geopandas.GeoDataFrame(node_data, geometry=node_series))
+
+            if has_ways:
+                way_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
+                way_data: dict[str, object] = {"osm_element": "way"}
+                if osm_result.way_ids is not None:
+                    way_data["osm_id"] = _cp.asnumpy(osm_result.way_ids)
+                frames.append(geopandas.GeoDataFrame(way_data, geometry=way_series))
+
+            if has_relations:
+                rel_series = geoseries_from_owned(osm_result.relations, name="geometry", crs=crs)
+                rel_data: dict[str, object] = {"osm_element": "relation"}
+                if osm_result.relation_ids is not None:
+                    rel_data["osm_id"] = _cp.asnumpy(osm_result.relation_ids)
+                frames.append(geopandas.GeoDataFrame(rel_data, geometry=rel_series))
 
             gdf = geopandas.GeoDataFrame(
-                pd.concat([node_gdf, way_gdf], ignore_index=True),
+                pd.concat(frames, ignore_index=True),
             )
 
         record_dispatch_event(
@@ -587,8 +608,9 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
             implementation="osm_pbf_gpu_hybrid_adapter",
             reason=(
                 "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
-                "decoding, coordinate assembly, and Way coordinate resolution "
-                "via binary-search kernel."
+                "decoding, coordinate assembly, Way/Relation coordinate "
+                "resolution via binary-search kernel, and MultiPolygon "
+                "assembly from Relation Way members."
             ),
             selected=ExecutionMode.GPU,
         )
