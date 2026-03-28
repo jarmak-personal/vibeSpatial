@@ -40,7 +40,11 @@ def main(argv: list[str] | None = None) -> int:
     from vibespatial.runtime import ExecutionMode
     from vibespatial.testing.synthetic import SyntheticSpec, generate_lines
 
-    base = list(generate_lines(SyntheticSpec("line", "grid", count=args.scale, seed=0)).geometries)
+    # Use random-walk (not grid) — grid creates full-extent lines whose
+    # x-ranges all overlap, producing O(n^2) candidate pairs that exceed
+    # any GPU at >=10k scale.  Random-walk produces spatially-local
+    # multi-segment lines with realistic candidate counts at all scales.
+    base = list(generate_lines(SyntheticSpec("line", "random-walk", count=args.scale, seed=0)).geometries)
     shifted = [translate(g, xoff=0.5, yoff=0.5) for g in base]
     left = from_shapely_geometries(base)
     right = from_shapely_geometries(shifted)

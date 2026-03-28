@@ -211,32 +211,11 @@ class TestTransformCoordinatesInplace:
         with pytest.raises(ValueError, match="equal length"):
             transform_coordinates_inplace(d_x, d_y, "EPSG:4326", "EPSG:3857")
 
-    def test_unsupported_crs_raises_without_vibeproj(self):
-        """Without vibeProj, unsupported CRS pair raises ValueError."""
-        from vibespatial.io.gpu_parse.transform import _HAS_VIBEPROJ
-
-        if _HAS_VIBEPROJ:
-            pytest.skip("vibeProj is installed; arbitrary CRS pairs are supported")
-
+    def test_arbitrary_crs_pair(self):
+        """Arbitrary CRS pairs are supported via vibeProj."""
         from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
 
-        d_x = cp.array([1.0], dtype=cp.float64)
-        d_y = cp.array([1.0], dtype=cp.float64)
-
-        with pytest.raises(ValueError, match="NVRTC fallback"):
-            transform_coordinates_inplace(d_x, d_y, "EPSG:4326", "EPSG:32632")
-
-    def test_arbitrary_crs_with_vibeproj(self):
-        """With vibeProj, arbitrary CRS pairs are supported."""
-        from vibespatial.io.gpu_parse.transform import _HAS_VIBEPROJ
-
-        if not _HAS_VIBEPROJ:
-            pytest.skip("vibeProj not installed")
-
-        from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
-
-        # WGS84 -> UTM zone 32N (EPSG:32632): a CRS pair not supported by
-        # the NVRTC fallback, but handled by vibeProj.
+        # WGS84 -> UTM zone 32N (EPSG:32632)
         d_x = cp.array([9.0], dtype=cp.float64)   # 9 deg E longitude
         d_y = cp.array([48.0], dtype=cp.float64)   # 48 deg N latitude
         transform_coordinates_inplace(d_x, d_y, "EPSG:4326", "EPSG:32632")
