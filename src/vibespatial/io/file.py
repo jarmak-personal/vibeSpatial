@@ -522,40 +522,73 @@ def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | No
 def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read an OSM PBF file using the GPU hybrid pipeline.
 
-    OSM PBF files contain DenseNodes extracted via CPU protobuf parsing
-    with GPU varint decoding and coordinate assembly.  Returns a
-    GeoDataFrame with Point geometry and an ``osm_node_id`` column, or
-    None on failure.
+    OSM PBF files contain DenseNodes (Points) and Ways (LineStrings,
+    Polygons) extracted via CPU protobuf parsing with GPU varint decoding,
+    coordinate assembly, and binary-search-based coordinate resolution.
+    Returns a GeoDataFrame with mixed geometry types and OSM ID columns,
+    or None on failure.
     """
     try:
         from .arrow import geoseries_from_owned
-        from .osm_gpu import read_osm_pbf_nodes
+        from .osm_gpu import read_osm_pbf
 
-        osm_result = read_osm_pbf_nodes(filename)
-        if osm_result.nodes is None or osm_result.n_nodes == 0:
+        osm_result = read_osm_pbf(filename)
+        has_nodes = osm_result.nodes is not None and osm_result.n_nodes > 0
+        has_ways = osm_result.ways is not None and osm_result.n_ways > 0
+
+        if not has_nodes and not has_ways:
             return None
 
         # OSM PBF has no embedded CRS; coordinates are WGS84 by definition.
         crs = target_crs if target_crs is not None else "EPSG:4326"
-        geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
+
+        import cupy as _cp
 
         import vibespatial.api as geopandas
 
-        # Attach node IDs as a column if available.
-        data: dict[str, object] = {}
-        if osm_result.node_ids is not None:
-            import cupy as _cp
+        if has_nodes and not has_ways:
+            # Nodes only -- single family Point geometry
+            geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
+            data: dict[str, object] = {}
+            if osm_result.node_ids is not None:
+                data["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
+            gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+        elif has_ways and not has_nodes:
+            # Ways only -- LineString/Polygon geometry
+            geom_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
+            data = {}
+            if osm_result.way_ids is not None:
+                data["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
+            gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+        else:
+            # Both nodes and ways -- build node and way GeoDataFrames
+            # and concatenate.  Each gets its own ID column.
+            import pandas as pd
 
-            data["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
+            node_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
+            node_data: dict[str, object] = {"osm_element": "node"}
+            if osm_result.node_ids is not None:
+                node_data["osm_id"] = _cp.asnumpy(osm_result.node_ids)
+            node_gdf = geopandas.GeoDataFrame(node_data, geometry=node_series)
 
-        gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+            way_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
+            way_data: dict[str, object] = {"osm_element": "way"}
+            if osm_result.way_ids is not None:
+                way_data["osm_id"] = _cp.asnumpy(osm_result.way_ids)
+            way_gdf = geopandas.GeoDataFrame(way_data, geometry=way_series)
+
+            gdf = geopandas.GeoDataFrame(
+                pd.concat([node_gdf, way_gdf], ignore_index=True),
+            )
+
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
             implementation="osm_pbf_gpu_hybrid_adapter",
             reason=(
                 "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
-                "decoding and coordinate assembly into Point OwnedGeometryArray."
+                "decoding, coordinate assembly, and Way coordinate resolution "
+                "via binary-search kernel."
             ),
             selected=ExecutionMode.GPU,
         )

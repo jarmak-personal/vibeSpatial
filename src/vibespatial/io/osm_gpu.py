@@ -1,6 +1,9 @@
 """GPU-accelerated reader for OpenStreetMap PBF files.
 
-Extracts DenseNodes from OSM PBF files using a hybrid CPU/GPU pipeline:
+Extracts DenseNodes (Points) and Ways (LineStrings/Polygons) from OSM PBF
+files using a hybrid CPU/GPU pipeline:
+
+**Nodes pipeline:**
 
 1. **Block index parsing** (CPU) -- parse BlobHeader/Blob pairs sequentially
    to build a block index with offsets and types.
@@ -19,23 +22,40 @@ Extracts DenseNodes from OSM PBF files using a hybrid CPU/GPU pipeline:
    integer representation to fp64 degrees.
 7. **Assembly** -- build device-resident Point OwnedGeometryArray.
 
+**Ways pipeline:**
+
+1. **Way field extraction** (CPU) -- parse Way messages from each
+   PrimitiveGroup to extract way IDs, delta-encoded node refs, and
+   tag key/value pairs.  Delta decoding of refs happens on CPU since
+   each Way has a small number of refs.
+2. **Node lookup table** (GPU, Tier 2 CuPy) -- sort extracted node IDs
+   by value to enable binary search.
+3. **Coordinate gathering** (GPU, Tier 1 NVRTC) -- for each node ref
+   in each Way, binary-search the sorted node table to resolve
+   lon/lat coordinates.
+4. **Way classification** (GPU, Tier 2 CuPy) -- classify closed Ways
+   (first ref == last ref) as Polygon, open Ways as LineString.
+5. **Assembly** -- build separate device-resident LineString and Polygon
+   OwnedGeometryArrays, then combine into a mixed OwnedGeometryArray.
+
 Tier classification (ADR-0033):
     - Block parsing: CPU (sequential metadata, not parallelizable)
     - Decompression: CPU (zlib)
     - Protobuf field location: CPU (sequential proto traversal, small data)
     - Varint decoding: Tier 1 (custom NVRTC -- binary format-specific)
+    - Way coordinate gathering: Tier 1 (custom NVRTC -- binary search)
     - Delta decode (cumsum): Tier 2 (CuPy cumsum)
     - Coordinate scaling: Tier 2 (CuPy element-wise)
+    - Node lookup sort: Tier 2 (CuPy argsort)
+    - Way classification: Tier 2 (CuPy element-wise comparison)
     - Offset construction: Tier 2 (CuPy)
 
 Precision (ADR-0002):
-    The varint decode kernel is integer-only -- no floating-point
-    computation, so no PrecisionPlan is needed.  Coordinate storage
-    is always fp64 per ADR-0002 (same rationale as csv_gpu.py,
-    kml_gpu.py, and all other IO readers).
-
-Way extraction (Phase 2) is deferred -- DenseNodes contain ~99% of all
-OSM nodes and are the primary parallelizable target.
+    The varint decode and coordinate gather kernels are integer-only
+    or use fp64 storage directly -- no floating-point computation that
+    benefits from precision dispatch.  Coordinate storage is always
+    fp64 per ADR-0002 (same rationale as csv_gpu.py, kml_gpu.py, and
+    all other IO readers).
 """
 from __future__ import annotations
 
@@ -82,6 +102,65 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # NVRTC kernel source (Tier 1) -- integer-only varint decoding
 # ---------------------------------------------------------------------------
+
+_WAY_COORD_GATHER_SOURCE = r"""
+// Way coordinate gatherer -- each thread resolves one node reference
+// by binary-searching a sorted node ID table and writing the
+// corresponding lon/lat to the output arrays.
+//
+// Input:
+//   sorted_node_ids[] -- device-resident int64, sorted ascending
+//   sorted_x[]        -- fp64 longitudes parallel to sorted_node_ids
+//   sorted_y[]        -- fp64 latitudes parallel to sorted_node_ids
+//   way_refs[]        -- flat int64 array of all node refs across all ways
+//   n_refs            -- total number of refs
+//   n_nodes           -- size of the sorted node table
+// Output:
+//   out_x[]           -- fp64 longitudes for each ref (NaN if not found)
+//   out_y[]           -- fp64 latitudes for each ref (NaN if not found)
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+osm_gather_way_coords(
+    const long long* __restrict__ sorted_node_ids,
+    const double* __restrict__ sorted_x,
+    const double* __restrict__ sorted_y,
+    const long long* __restrict__ way_refs,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    int n_refs,
+    long long n_nodes
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_refs) return;
+
+    long long target = way_refs[idx];
+
+    // Binary search for target in sorted_node_ids[0..n_nodes)
+    long long lo = 0;
+    long long hi = n_nodes;
+    while (lo < hi) {
+        long long mid = lo + ((hi - lo) >> 1);
+        if (sorted_node_ids[mid] < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    if (lo < n_nodes && sorted_node_ids[lo] == target) {
+        out_x[idx] = sorted_x[lo];
+        out_y[idx] = sorted_y[lo];
+    } else {
+        // Node not found -- write NaN so downstream can detect missing refs
+        out_x[idx] = __longlong_as_double(0x7FF8000000000000LL);
+        out_y[idx] = __longlong_as_double(0x7FF8000000000000LL);
+    }
+}
+"""
+
+_WAY_COORD_GATHER_NAMES: tuple[str, ...] = (
+    "osm_gather_way_coords",
+)
 
 _VARINT_DECODE_SOURCE = r"""
 // Protobuf varint decoder -- each thread decodes one varint at a known
@@ -178,6 +257,7 @@ _VARINT_DECODE_NAMES: tuple[str, ...] = (
 # Register for NVRTC precompilation (ADR-0034)
 request_nvrtc_warmup([
     ("osm-varint-decode", _VARINT_DECODE_SOURCE, _VARINT_DECODE_NAMES),
+    ("osm-way-coord-gather", _WAY_COORD_GATHER_SOURCE, _WAY_COORD_GATHER_NAMES),
 ])
 
 
@@ -208,11 +288,18 @@ _PRIMITIVEBLOCK_LON_OFFSET_FIELD = 20     # int64, default 0
 
 # PrimitiveGroup fields
 _PRIMITIVEGROUP_DENSE_FIELD = 2           # DenseNodes
+_PRIMITIVEGROUP_WAYS_FIELD = 3            # repeated Way
 
 # DenseNodes fields
 _DENSENODES_ID_FIELD = 1         # packed sint64 (ZigZag + delta)
 _DENSENODES_LAT_FIELD = 8        # packed sint64 (ZigZag + delta)
 _DENSENODES_LON_FIELD = 9        # packed sint64 (ZigZag + delta)
+
+# Way fields
+_WAY_ID_FIELD = 1                # int64 (varint)
+_WAY_KEYS_FIELD = 2              # packed uint32
+_WAY_VALS_FIELD = 3              # packed uint32
+_WAY_REFS_FIELD = 8              # packed sint64 (ZigZag + delta)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +329,17 @@ class DenseNodesBlock:
 
 
 @dataclass(frozen=True)
+class WayBlock:
+    """Extracted data for Ways within one PrimitiveBlock."""
+
+    way_ids: list[int]                    # absolute Way IDs
+    refs_per_way: list[list[int]]         # absolute node refs per Way (delta-decoded on CPU)
+    tag_keys_per_way: list[list[int]]     # stringtable indices per Way
+    tag_vals_per_way: list[list[int]]     # stringtable indices per Way
+    stringtable: list[bytes]              # block's string table
+
+
+@dataclass(frozen=True)
 class OsmGpuResult:
     """Result of GPU-accelerated OSM PBF reading.
 
@@ -255,11 +353,23 @@ class OsmGpuResult:
         geometry array.  ``None`` if no nodes were found.
     n_nodes
         Total number of nodes extracted.
+    ways
+        Mixed LineString/Polygon OwnedGeometryArray containing all
+        extracted Ways.  ``None`` if no ways were found or no nodes
+        available for coordinate resolution.
+    way_ids
+        Device-resident int64 array of OSM Way IDs, parallel to the
+        ways geometry array.  ``None`` if no ways were found.
+    n_ways
+        Total number of ways extracted.
     """
 
     nodes: OwnedGeometryArray | None
     node_ids: cp.ndarray | None
     n_nodes: int
+    ways: OwnedGeometryArray | None = None
+    way_ids: cp.ndarray | None = None
+    n_ways: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +654,175 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
 
 
 # ---------------------------------------------------------------------------
+# CPU: Protobuf field extraction -- locate Ways within PrimitiveBlock
+# ---------------------------------------------------------------------------
+
+def _parse_stringtable(block_data: bytes, st_start: int, st_length: int) -> list[bytes]:
+    """Parse a StringTable message and return the list of byte strings."""
+    strings: list[bytes] = []
+    pos = st_start
+    end = st_start + st_length
+    while pos < end:
+        field_num, wire_type, consumed = _parse_field_tag(block_data, pos)
+        pos += consumed
+        if field_num == 1 and wire_type == _WIRE_LENGTH_DELIMITED:
+            length, consumed = _decode_varint(block_data, pos)
+            pos += consumed
+            strings.append(bytes(block_data[pos : pos + length]))
+            pos += length
+        else:
+            pos = _skip_field(block_data, pos, wire_type)
+    return strings
+
+
+def _decode_packed_uint32(data: bytes) -> list[int]:
+    """Decode a packed repeated uint32 field from raw bytes."""
+    result: list[int] = []
+    pos = 0
+    while pos < len(data):
+        val, consumed = _decode_varint(data, pos)
+        result.append(val)
+        pos += consumed
+    return result
+
+
+def _decode_packed_sint64_cpu(data: bytes) -> list[int]:
+    """Decode a packed repeated sint64 (ZigZag) field, returning absolute values after delta decode."""
+    deltas: list[int] = []
+    pos = 0
+    while pos < len(data):
+        raw, consumed = _decode_varint(data, pos)
+        decoded = (raw >> 1) ^ -(raw & 1)
+        deltas.append(decoded)
+        pos += consumed
+    # Delta decode (cumulative sum)
+    absolute: list[int] = []
+    acc = 0
+    for d in deltas:
+        acc += d
+        absolute.append(acc)
+    return absolute
+
+
+def _parse_single_way(way_data: bytes) -> tuple[int, list[int], list[int], list[int]]:
+    """Parse a single Way message.
+
+    Returns (way_id, refs, tag_keys, tag_vals).
+    """
+    way_id = 0
+    refs_bytes = b""
+    keys_bytes = b""
+    vals_bytes = b""
+
+    pos = 0
+    while pos < len(way_data):
+        field_num, wire_type, consumed = _parse_field_tag(way_data, pos)
+        pos += consumed
+
+        if field_num == _WAY_ID_FIELD and wire_type == _WIRE_VARINT:
+            way_id, consumed = _decode_varint(way_data, pos)
+            pos += consumed
+        elif wire_type == _WIRE_LENGTH_DELIMITED:
+            length, consumed = _decode_varint(way_data, pos)
+            pos += consumed
+            payload = bytes(way_data[pos : pos + length])
+            pos += length
+            if field_num == _WAY_KEYS_FIELD:
+                keys_bytes = payload
+            elif field_num == _WAY_VALS_FIELD:
+                vals_bytes = payload
+            elif field_num == _WAY_REFS_FIELD:
+                refs_bytes = payload
+        else:
+            pos = _skip_field(way_data, pos, wire_type)
+
+    refs = _decode_packed_sint64_cpu(refs_bytes) if refs_bytes else []
+    tag_keys = _decode_packed_uint32(keys_bytes) if keys_bytes else []
+    tag_vals = _decode_packed_uint32(vals_bytes) if vals_bytes else []
+
+    return way_id, refs, tag_keys, tag_vals
+
+
+def _extract_way_blocks(raw_blocks: list[bytes]) -> list[WayBlock]:
+    """Extract Way data from decompressed PrimitiveBlocks.
+
+    For each PrimitiveBlock, locates Way messages in PrimitiveGroups
+    and extracts way IDs, node refs (delta-decoded on CPU), and tags.
+    """
+    results: list[WayBlock] = []
+
+    for block_data in raw_blocks:
+        stringtable: list[bytes] = []
+        primitive_groups: list[tuple[int, int]] = []
+        st_start = -1
+        st_length = 0
+
+        # Parse PrimitiveBlock top-level fields
+        pos = 0
+        while pos < len(block_data):
+            field_num, wire_type, consumed = _parse_field_tag(block_data, pos)
+            pos += consumed
+
+            if wire_type == _WIRE_LENGTH_DELIMITED:
+                length, consumed = _decode_varint(block_data, pos)
+                pos += consumed
+                if field_num == _PRIMITIVEBLOCK_STRINGTABLE_FIELD:
+                    st_start = pos
+                    st_length = length
+                elif field_num == _PRIMITIVEBLOCK_PRIMITIVEGROUP_FIELD:
+                    primitive_groups.append((pos, length))
+                pos += length
+            elif wire_type == _WIRE_VARINT:
+                _, consumed = _decode_varint(block_data, pos)
+                pos += consumed
+            else:
+                pos = _skip_field(block_data, pos, wire_type)
+
+        if st_start >= 0:
+            stringtable = _parse_stringtable(block_data, st_start, st_length)
+
+        # Parse each PrimitiveGroup looking for Ways (field 3)
+        block_way_ids: list[int] = []
+        block_refs: list[list[int]] = []
+        block_tag_keys: list[list[int]] = []
+        block_tag_vals: list[list[int]] = []
+
+        for group_start, group_length in primitive_groups:
+            pos = group_start
+            end = group_start + group_length
+
+            while pos < end:
+                field_num, wire_type, consumed = _parse_field_tag(block_data, pos)
+                pos += consumed
+
+                if field_num == _PRIMITIVEGROUP_WAYS_FIELD and wire_type == _WIRE_LENGTH_DELIMITED:
+                    length, consumed = _decode_varint(block_data, pos)
+                    pos += consumed
+                    way_data = block_data[pos : pos + length]
+                    pos += length
+
+                    way_id, refs, tag_keys, tag_vals = _parse_single_way(way_data)
+                    if refs:  # Skip ways with no refs
+                        block_way_ids.append(way_id)
+                        block_refs.append(refs)
+                        block_tag_keys.append(tag_keys)
+                        block_tag_vals.append(tag_vals)
+                else:
+                    pos = _skip_field(block_data, pos, wire_type)
+
+        if block_way_ids:
+            results.append(WayBlock(
+                way_ids=block_way_ids,
+                refs_per_way=block_refs,
+                tag_keys_per_way=block_tag_keys,
+                tag_vals_per_way=block_tag_vals,
+                stringtable=stringtable,
+            ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # CPU: Count varints in a packed byte array
 # ---------------------------------------------------------------------------
 
@@ -764,6 +1043,364 @@ def _gpu_delta_decode_and_scale(
 
 
 # ---------------------------------------------------------------------------
+# GPU: Node lookup table for Way coordinate resolution
+# ---------------------------------------------------------------------------
+
+def _build_node_lookup(
+    d_node_ids: cp.ndarray,
+    d_lon: cp.ndarray,
+    d_lat: cp.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray]:
+    """Build a sorted node ID -> coordinate lookup table on GPU.
+
+    Returns (d_sorted_ids, d_sorted_x, d_sorted_y) sorted by node ID
+    for binary search lookup by the Way coordinate gather kernel.
+
+    All operations are device-side (Tier 2 CuPy argsort + fancy indexing).
+    """
+    d_order = cp.argsort(d_node_ids)
+    d_sorted_ids = d_node_ids[d_order]
+    d_sorted_x = d_lon[d_order]
+    d_sorted_y = d_lat[d_order]
+    return d_sorted_ids, d_sorted_x, d_sorted_y
+
+
+# ---------------------------------------------------------------------------
+# GPU: Way coordinate gathering via NVRTC binary search kernel
+# ---------------------------------------------------------------------------
+
+def _compile_way_coord_gather_kernel():
+    """Compile the Way coordinate gather NVRTC kernel (cached)."""
+    return compile_kernel_group(
+        "osm-way-coord-gather",
+        _WAY_COORD_GATHER_SOURCE,
+        _WAY_COORD_GATHER_NAMES,
+    )
+
+
+def _gpu_gather_way_coords(
+    d_sorted_ids: cp.ndarray,
+    d_sorted_x: cp.ndarray,
+    d_sorted_y: cp.ndarray,
+    d_way_refs: cp.ndarray,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Resolve Way node references to coordinates using GPU binary search.
+
+    Parameters
+    ----------
+    d_sorted_ids
+        Device int64 array of node IDs sorted ascending.
+    d_sorted_x, d_sorted_y
+        Device fp64 coordinate arrays parallel to d_sorted_ids.
+    d_way_refs
+        Device int64 flat array of all node refs across all Ways.
+
+    Returns
+    -------
+    (d_out_x, d_out_y) -- device fp64 arrays of resolved coordinates.
+    Unresolved refs get NaN.
+    """
+    n_refs = int(d_way_refs.shape[0])
+    if n_refs == 0:
+        return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
+
+    n_nodes = int(d_sorted_ids.shape[0])
+    runtime = get_cuda_runtime()
+    kernels = _compile_way_coord_gather_kernel()
+
+    d_out_x = cp.empty(n_refs, dtype=cp.float64)
+    d_out_y = cp.empty(n_refs, dtype=cp.float64)
+
+    kernel = kernels["osm_gather_way_coords"]
+    grid, block = runtime.launch_config(kernel, n_refs)
+
+    ptr = runtime.pointer
+    params = (
+        (ptr(d_sorted_ids), ptr(d_sorted_x), ptr(d_sorted_y),
+         ptr(d_way_refs), ptr(d_out_x), ptr(d_out_y),
+         ctypes.c_int(n_refs), ctypes.c_longlong(n_nodes)),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_I32, KERNEL_PARAM_I64),
+    )
+
+    runtime.launch(kernel, grid=grid, block=block, params=params)
+    # No sync needed -- subsequent CuPy ops on same stream will observe writes
+    return d_out_x, d_out_y
+
+
+# ---------------------------------------------------------------------------
+# GPU: Way processing pipeline
+# ---------------------------------------------------------------------------
+
+def _process_ways_gpu(
+    way_blocks: list[WayBlock],
+    d_node_ids: cp.ndarray,
+    d_lon: cp.ndarray,
+    d_lat: cp.ndarray,
+) -> tuple[OwnedGeometryArray | None, cp.ndarray | None, int]:
+    """Process all extracted Ways into device-resident geometries.
+
+    1. Build sorted node lookup table on GPU
+    2. Flatten all Way refs and upload to GPU
+    3. Binary search to resolve coordinates
+    4. Classify Ways as LineString (open) or Polygon (closed)
+    5. Assemble OwnedGeometryArray(s)
+
+    Returns (ways_owned, d_way_ids, n_ways).
+    """
+    # Collect all ways across blocks
+    all_way_ids: list[int] = []
+    all_refs: list[list[int]] = []
+
+    for wb in way_blocks:
+        all_way_ids.extend(wb.way_ids)
+        all_refs.extend(wb.refs_per_way)
+
+    n_ways = len(all_way_ids)
+    if n_ways == 0:
+        return None, None, 0
+
+    # Build node lookup table on GPU (Tier 2 CuPy)
+    d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(
+        d_node_ids, d_lon, d_lat,
+    )
+
+    # Flatten refs into a single array and compute per-way offsets (CPU,
+    # small data -- list of ints from protobuf parsing)
+    ref_counts = [len(refs) for refs in all_refs]
+    flat_refs: list[int] = []
+    for refs in all_refs:
+        flat_refs.extend(refs)
+
+    total_refs = len(flat_refs)
+    if total_refs == 0:
+        return None, None, 0
+
+    # Upload flat refs to GPU
+    h_flat_refs = np.array(flat_refs, dtype=np.int64)
+    d_way_refs = cp.asarray(h_flat_refs)
+
+    # Resolve coordinates on GPU via binary search (Tier 1 NVRTC)
+    d_out_x, d_out_y = _gpu_gather_way_coords(
+        d_sorted_ids, d_sorted_x, d_sorted_y, d_way_refs,
+    )
+
+    # Compute per-way offsets on GPU (Tier 2 CuPy)
+    h_ref_counts = np.array(ref_counts, dtype=np.int32)
+    d_ref_counts = cp.asarray(h_ref_counts)
+    d_way_offsets = cp.zeros(n_ways + 1, dtype=cp.int32)
+    cp.cumsum(d_ref_counts, out=d_way_offsets[1:])
+
+    # Classify: closed Way (first_ref == last_ref) -> Polygon, else LineString
+    # Compare first and last ref per way on device (Tier 2 CuPy)
+    d_first_ref = d_way_refs[d_way_offsets[:-1].astype(cp.int64)]
+    d_last_ref = d_way_refs[(d_way_offsets[1:] - 1).astype(cp.int64)]
+    d_is_polygon = d_first_ref == d_last_ref
+
+    # Way IDs to device
+    h_way_ids = np.array(all_way_ids, dtype=np.int64)
+    d_way_ids = cp.asarray(h_way_ids)
+
+    # Split into LineString and Polygon groups
+    d_poly_mask = d_is_polygon
+    d_line_mask = ~d_is_polygon
+
+    n_poly = int(cp.sum(d_poly_mask))
+    n_line = int(cp.sum(d_line_mask))
+
+    if n_poly == 0 and n_line == 0:
+        return None, None, 0
+
+    # Build the OwnedGeometryArray -- use _build_device_single_family_owned
+    # for single-family results or _build_device_mixed_owned for mixed.
+    from vibespatial.io.pylibcudf import _build_device_mixed_owned
+
+    if n_poly == 0:
+        # All LineStrings
+        owned = _assemble_linestring_ways(
+            d_out_x, d_out_y, d_way_offsets, n_line,
+        )
+        return owned, d_way_ids, n_ways
+
+    if n_line == 0:
+        # All Polygons
+        owned = _assemble_polygon_ways(
+            d_out_x, d_out_y, d_way_offsets, n_poly,
+        )
+        return owned, d_way_ids, n_ways
+
+    # Mixed: split coordinates by classification and build mixed owned
+    # Reorder ways so LineStrings come first, then Polygons
+    d_line_indices = cp.flatnonzero(d_line_mask).astype(cp.int32)
+    d_poly_indices = cp.flatnonzero(d_poly_mask).astype(cp.int32)
+    d_reorder = cp.concatenate([d_line_indices, d_poly_indices])
+
+    # Reorder way IDs
+    d_way_ids = d_way_ids[d_reorder]
+
+    # Extract per-family coordinate slices
+    d_line_offsets_raw = d_way_offsets[:-1][d_line_indices]
+    d_line_counts = d_ref_counts[d_line_indices]
+    d_poly_offsets_raw = d_way_offsets[:-1][d_poly_indices]
+    d_poly_counts = d_ref_counts[d_poly_indices]
+
+    # Build LineString family buffers
+    d_line_geom_offsets = cp.zeros(n_line + 1, dtype=cp.int32)
+    cp.cumsum(d_line_counts, out=d_line_geom_offsets[1:])
+    total_line_coords = int(d_line_geom_offsets[-1])
+
+    # Gather LineString coordinates
+    d_line_coord_indices = _expand_offsets_to_indices(
+        d_line_offsets_raw, d_line_counts, total_line_coords,
+    )
+    d_line_x = d_out_x[d_line_coord_indices]
+    d_line_y = d_out_y[d_line_coord_indices]
+    d_line_empty = cp.zeros(n_line, dtype=cp.bool_)
+
+    line_buf = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.LINESTRING,
+        x=d_line_x,
+        y=d_line_y,
+        geometry_offsets=d_line_geom_offsets,
+        empty_mask=d_line_empty,
+        part_offsets=None,
+        ring_offsets=None,
+        bounds=None,
+    )
+
+    # Build Polygon family buffers
+    # Polygon: geometry_offsets (row -> ring), ring_offsets (ring -> coord)
+    # Each OSM Way polygon is a single exterior ring, so 1 ring per polygon
+    d_poly_geom_offsets = cp.arange(n_poly + 1, dtype=cp.int32)  # each polygon has 1 ring
+    d_poly_ring_offsets = cp.zeros(n_poly + 1, dtype=cp.int32)
+    cp.cumsum(d_poly_counts, out=d_poly_ring_offsets[1:])
+    total_poly_coords = int(d_poly_ring_offsets[-1])
+
+    # Gather Polygon coordinates
+    d_poly_coord_indices = _expand_offsets_to_indices(
+        d_poly_offsets_raw, d_poly_counts, total_poly_coords,
+    )
+    d_poly_x = d_out_x[d_poly_coord_indices]
+    d_poly_y = d_out_y[d_poly_coord_indices]
+    d_poly_empty = cp.zeros(n_poly, dtype=cp.bool_)
+
+    poly_buf = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.POLYGON,
+        x=d_poly_x,
+        y=d_poly_y,
+        geometry_offsets=d_poly_geom_offsets,
+        empty_mask=d_poly_empty,
+        part_offsets=None,
+        ring_offsets=d_poly_ring_offsets,
+        bounds=None,
+    )
+
+    # Build mixed validity/tags/family_row_offsets
+    total_rows = n_line + n_poly
+    d_validity = cp.ones(total_rows, dtype=cp.bool_)
+    d_tags = cp.empty(total_rows, dtype=cp.int8)
+    d_tags[:n_line] = FAMILY_TAGS[GeometryFamily.LINESTRING]
+    d_tags[n_line:] = FAMILY_TAGS[GeometryFamily.POLYGON]
+
+    # family_row_offsets: for each row, the index within its family
+    d_family_row_offsets = cp.empty(total_rows, dtype=cp.int32)
+    d_family_row_offsets[:n_line] = cp.arange(n_line, dtype=cp.int32)
+    d_family_row_offsets[n_line:] = cp.arange(n_poly, dtype=cp.int32)
+
+    owned = _build_device_mixed_owned(
+        validity_device=d_validity,
+        tags_device=d_tags,
+        family_row_offsets_device=d_family_row_offsets,
+        family_devices={
+            GeometryFamily.LINESTRING: line_buf,
+            GeometryFamily.POLYGON: poly_buf,
+        },
+        detail=f"osm_gpu: {n_line} LineString + {n_poly} Polygon Ways from PBF",
+    )
+    return owned, d_way_ids, n_ways
+
+
+def _expand_offsets_to_indices(
+    d_starts: cp.ndarray,
+    d_counts: cp.ndarray,
+    total: int,
+) -> cp.ndarray:
+    """Expand (start, count) pairs into a flat index array on GPU.
+
+    For starts=[5, 10] counts=[3, 2], produces [5, 6, 7, 10, 11].
+    All operations are Tier 2 CuPy -- no host round-trips.
+    """
+    if total == 0:
+        return cp.empty(0, dtype=cp.int64)
+
+    # Build offsets within the output array
+    d_out_offsets = cp.zeros(d_counts.shape[0] + 1, dtype=cp.int32)
+    cp.cumsum(d_counts, out=d_out_offsets[1:])
+
+    # For each output position, determine which segment it belongs to
+    d_segment_ids = cp.searchsorted(d_out_offsets[1:], cp.arange(total, dtype=cp.int32), side="right")
+    # Local offset within segment
+    d_local = cp.arange(total, dtype=cp.int64) - d_out_offsets[:-1][d_segment_ids].astype(cp.int64)
+    # Global index
+    d_indices = d_starts[d_segment_ids].astype(cp.int64) + d_local
+    return d_indices
+
+
+def _assemble_linestring_ways(
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_way_offsets: cp.ndarray,
+    n_ways: int,
+) -> OwnedGeometryArray:
+    """Build a device-resident LineString OwnedGeometryArray from Way data."""
+    from vibespatial.io.pylibcudf import _build_device_single_family_owned
+
+    d_validity = cp.ones(n_ways, dtype=cp.bool_)
+    d_empty_mask = cp.zeros(n_ways, dtype=cp.bool_)
+
+    return _build_device_single_family_owned(
+        family=GeometryFamily.LINESTRING,
+        validity_device=d_validity,
+        x_device=d_x,
+        y_device=d_y,
+        geometry_offsets_device=d_way_offsets,
+        empty_mask_device=d_empty_mask,
+        detail=f"osm_gpu: {n_ways} LineString Ways from PBF",
+    )
+
+
+def _assemble_polygon_ways(
+    d_x: cp.ndarray,
+    d_y: cp.ndarray,
+    d_way_offsets: cp.ndarray,
+    n_ways: int,
+) -> OwnedGeometryArray:
+    """Build a device-resident Polygon OwnedGeometryArray from Way data.
+
+    Each OSM Way polygon is a single closed ring (no holes), so:
+    - geometry_offsets: [0, 1, 2, ..., n] (1 ring per polygon)
+    - ring_offsets: way_offsets (ring -> coordinate)
+    """
+    from vibespatial.io.pylibcudf import _build_device_single_family_owned
+
+    d_validity = cp.ones(n_ways, dtype=cp.bool_)
+    d_empty_mask = cp.zeros(n_ways, dtype=cp.bool_)
+    d_geom_offsets = cp.arange(n_ways + 1, dtype=cp.int32)  # 1 ring per polygon
+
+    return _build_device_single_family_owned(
+        family=GeometryFamily.POLYGON,
+        validity_device=d_validity,
+        x_device=d_x,
+        y_device=d_y,
+        geometry_offsets_device=d_geom_offsets,
+        empty_mask_device=d_empty_mask,
+        ring_offsets_device=d_way_offsets,
+        detail=f"osm_gpu: {n_ways} Polygon Ways from PBF",
+    )
+
+
+# ---------------------------------------------------------------------------
 # GPU: OwnedGeometryArray assembly for Points
 # ---------------------------------------------------------------------------
 
@@ -868,6 +1505,7 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
     OsmGpuResult
         Contains a device-resident Point OwnedGeometryArray (``nodes``),
         device-resident int64 node IDs (``node_ids``), and total count.
+        Way fields are ``None`` / 0.
     """
     path = Path(path)
     if not path.exists():
@@ -908,4 +1546,90 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
         nodes=owned,
         node_ids=d_node_ids,
         n_nodes=n_nodes,
+    )
+
+
+def read_osm_pbf(path: str | Path) -> OsmGpuResult:
+    """Extract nodes and ways from an OSM PBF file.
+
+    Uses a hybrid CPU/GPU pipeline to extract:
+    - **Nodes** as Point geometries (same pipeline as ``read_osm_pbf_nodes``)
+    - **Ways** as LineString (open) or Polygon (closed ring) geometries
+
+    Way coordinate resolution uses a GPU binary-search kernel against a
+    sorted node lookup table built from the extracted DenseNodes.
+
+    Parameters
+    ----------
+    path
+        Path to the ``.osm.pbf`` file.
+
+    Returns
+    -------
+    OsmGpuResult
+        Contains device-resident Point, LineString, and Polygon
+        OwnedGeometryArrays with corresponding OSM IDs.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"PBF file not found: {path}")
+
+    # Phase 1: CPU -- parse block index
+    block_index = _parse_block_index(path)
+    logger.info(
+        "OSM PBF: %d blocks (%d OSMData)",
+        len(block_index),
+        sum(1 for b in block_index if b.block_type == "OSMData"),
+    )
+
+    # Phase 2: CPU -- decompress all OSMData blocks
+    raw_blocks = _read_and_decompress_blocks(path, block_index)
+    logger.info("OSM PBF: decompressed %d data blocks", len(raw_blocks))
+
+    # Phase 3a: CPU -- extract DenseNodes field byte ranges
+    dense_blocks = _extract_dense_nodes_blocks(raw_blocks)
+    logger.info("OSM PBF: found %d DenseNodes blocks", len(dense_blocks))
+
+    # Phase 3b: CPU -- extract Way data
+    way_blocks = _extract_way_blocks(raw_blocks)
+    total_ways = sum(len(wb.way_ids) for wb in way_blocks)
+    logger.info("OSM PBF: found %d Way blocks (%d ways)", len(way_blocks), total_ways)
+
+    # Phase 4-5: GPU -- node varint decode + delta decode + scale
+    nodes_result = _gpu_delta_decode_and_scale(dense_blocks) if dense_blocks else None
+
+    d_node_ids: cp.ndarray | None = None
+    d_lat: cp.ndarray | None = None
+    d_lon: cp.ndarray | None = None
+    n_nodes = 0
+    nodes_owned: OwnedGeometryArray | None = None
+
+    if nodes_result is not None:
+        d_node_ids, d_lat, d_lon = nodes_result
+        n_nodes = int(d_node_ids.shape[0])
+        logger.info("OSM PBF: extracted %d nodes", n_nodes)
+        nodes_owned = _assemble_point_geometry(d_lon, d_lat, n_nodes)
+
+    # Phase 6: GPU -- resolve Way coordinates and assemble
+    ways_owned: OwnedGeometryArray | None = None
+    d_way_ids: cp.ndarray | None = None
+    n_ways = 0
+
+    if way_blocks and d_node_ids is not None and d_lon is not None and d_lat is not None:
+        ways_owned, d_way_ids, n_ways = _process_ways_gpu(
+            way_blocks, d_node_ids, d_lon, d_lat,
+        )
+        logger.info(
+            "OSM PBF: assembled %d ways (%s)",
+            n_ways,
+            "with geometry" if ways_owned is not None else "no resolved geometry",
+        )
+
+    return OsmGpuResult(
+        nodes=nodes_owned,
+        node_ids=d_node_ids,
+        n_nodes=n_nodes,
+        ways=ways_owned,
+        way_ids=d_way_ids,
+        n_ways=n_ways,
     )

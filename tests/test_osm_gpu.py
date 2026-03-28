@@ -8,6 +8,10 @@ Tests cover:
 - End-to-end: minimal PBF file -> Point OwnedGeometryArray
 - Block index parsing
 - Blob decompression (raw and zlib)
+- Way extraction: CPU field parsing, GPU coordinate gathering
+- Way classification: open -> LineString, closed -> Polygon
+- Mixed nodes + ways in single PBF file
+- End-to-end: read_osm_pbf() returns both nodes and ways
 
 Test data is constructed programmatically as raw protobuf bytes -- no
 external dependencies (osmium, etc.) required.
@@ -79,6 +83,14 @@ def _encode_packed_sint64(values: list[int]) -> bytes:
     result = bytearray()
     for v in values:
         result.extend(_encode_sint64(v))
+    return bytes(result)
+
+
+def _encode_packed_uint32(values: list[int]) -> bytes:
+    """Encode a packed repeated uint32 field (just the packed bytes, no tag)."""
+    result = bytearray()
+    for v in values:
+        result.extend(_encode_varint(v))
     return bytes(result)
 
 
@@ -169,6 +181,66 @@ def _build_osm_header() -> bytes:
     return _build_pbf_block("OSMHeader", header_block)
 
 
+def _build_way(
+    way_id: int,
+    ref_deltas: list[int],
+    keys: list[int] | None = None,
+    vals: list[int] | None = None,
+) -> bytes:
+    """Build a Way protobuf message.
+
+    Parameters
+    ----------
+    way_id
+        The Way ID.
+    ref_deltas
+        Delta-encoded sint64 node references.
+    keys, vals
+        Optional stringtable indices for tags.
+    """
+    result = _encode_varint_field(1, way_id)  # field 1: id
+    if keys:
+        result += _encode_length_delimited(2, _encode_packed_uint32(keys))
+    if vals:
+        result += _encode_length_delimited(3, _encode_packed_uint32(vals))
+    result += _encode_length_delimited(8, _encode_packed_sint64(ref_deltas))
+    return result
+
+
+def _build_primitive_group_with_ways(ways_bytes: list[bytes]) -> bytes:
+    """Build a PrimitiveGroup containing Way messages."""
+    result = b""
+    for way_data in ways_bytes:
+        result += _encode_length_delimited(3, way_data)  # field 3: ways
+    return result
+
+
+def _build_primitive_block_with_stringtable(
+    primitive_groups: list[bytes],
+    stringtable_entries: list[bytes] | None = None,
+    granularity: int = 100,
+    lat_offset: int = 0,
+    lon_offset: int = 0,
+) -> bytes:
+    """Build a PrimitiveBlock with an explicit stringtable and multiple groups."""
+    # Build stringtable
+    st_content = b""
+    if stringtable_entries:
+        for entry in stringtable_entries:
+            st_content += _encode_length_delimited(1, entry)  # field 1: s (repeated)
+    stringtable = _encode_length_delimited(1, st_content)
+
+    result = stringtable
+    for group in primitive_groups:
+        result += _encode_length_delimited(2, group)
+    result += _encode_varint_field(17, granularity)
+    if lat_offset != 0:
+        result += _encode_varint_field(19, _encode_zigzag(lat_offset))
+    if lon_offset != 0:
+        result += _encode_varint_field(20, _encode_zigzag(lon_offset))
+    return result
+
+
 def _build_test_pbf(
     id_deltas: list[int],
     lat_deltas: list[int],
@@ -190,6 +262,48 @@ def _build_test_pbf(
         granularity=granularity,
         lat_offset=lat_offset,
         lon_offset=lon_offset,
+    )
+    data_block = _build_pbf_block("OSMData", primitive_block, compress=compress)
+
+    return header + data_block
+
+
+def _build_test_pbf_with_ways(
+    node_id_deltas: list[int],
+    node_lat_deltas: list[int],
+    node_lon_deltas: list[int],
+    ways: list[tuple[int, list[int]]],
+    stringtable_entries: list[bytes] | None = None,
+    granularity: int = 100,
+    compress: bool = True,
+) -> bytes:
+    """Build a PBF file with both DenseNodes and Ways.
+
+    Parameters
+    ----------
+    ways
+        List of (way_id, absolute_refs) tuples.  Refs are converted to
+        delta encoding automatically.
+    """
+    header = _build_osm_header()
+
+    # Build DenseNodes group
+    dense = _build_dense_nodes(node_id_deltas, node_lat_deltas, node_lon_deltas)
+    dense_group = _build_primitive_group(dense)
+
+    # Build Ways group: convert absolute refs to delta-encoded
+    way_messages = []
+    for way_id, absolute_refs in ways:
+        ref_deltas = [absolute_refs[0]]
+        for i in range(1, len(absolute_refs)):
+            ref_deltas.append(absolute_refs[i] - absolute_refs[i - 1])
+        way_messages.append(_build_way(way_id, ref_deltas))
+    ways_group = _build_primitive_group_with_ways(way_messages)
+
+    primitive_block = _build_primitive_block_with_stringtable(
+        [dense_group, ways_group],
+        stringtable_entries=stringtable_entries,
+        granularity=granularity,
     )
     data_block = _build_pbf_block("OSMData", primitive_block, compress=compress)
 
@@ -816,3 +930,483 @@ class TestVarintPositionLocator:
         assert n == 0
         positions = _locate_varint_positions(b"", 0)
         assert len(positions) == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: CPU Way field extraction
+# ---------------------------------------------------------------------------
+
+
+class TestWayExtraction:
+    """Test CPU-side Way field extraction from PrimitiveBlocks."""
+
+    def test_single_way_extraction(self):
+        """Extract a single Way with known refs and tags."""
+        from vibespatial.io.osm_gpu import _extract_way_blocks
+
+        # Build a Way: id=1000, refs=[10, 20, 30] (deltas: 10, 10, 10)
+        way = _build_way(1000, [10, 10, 10])
+        group = _build_primitive_group_with_ways([way])
+        pblock = _build_primitive_block_with_stringtable([group])
+
+        results = _extract_way_blocks([pblock])
+        assert len(results) == 1
+        wb = results[0]
+        assert wb.way_ids == [1000]
+        assert wb.refs_per_way == [[10, 20, 30]]
+
+    def test_multiple_ways(self):
+        """Extract multiple Ways from a single PrimitiveBlock."""
+        from vibespatial.io.osm_gpu import _extract_way_blocks
+
+        # Way 1: refs [10, 20] (deltas: 10, 10)
+        # Way 2: refs [30, 40, 50] (deltas: 30, 10, 10)
+        way1 = _build_way(100, [10, 10])
+        way2 = _build_way(200, [30, 10, 10])
+        group = _build_primitive_group_with_ways([way1, way2])
+        pblock = _build_primitive_block_with_stringtable([group])
+
+        results = _extract_way_blocks([pblock])
+        assert len(results) == 1
+        wb = results[0]
+        assert wb.way_ids == [100, 200]
+        assert wb.refs_per_way == [[10, 20], [30, 40, 50]]
+
+    def test_way_with_tags(self):
+        """Extract Way tags (keys/vals are stringtable indices)."""
+        from vibespatial.io.osm_gpu import _extract_way_blocks
+
+        way = _build_way(500, [1, 1], keys=[1, 2], vals=[3, 4])
+        group = _build_primitive_group_with_ways([way])
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=[b"", b"highway", b"building", b"residential", b"yes"],
+        )
+
+        results = _extract_way_blocks([pblock])
+        assert len(results) == 1
+        wb = results[0]
+        assert wb.tag_keys_per_way == [[1, 2]]
+        assert wb.tag_vals_per_way == [[3, 4]]
+        assert wb.stringtable[1] == b"highway"
+        assert wb.stringtable[4] == b"yes"
+
+    def test_way_delta_decoding(self):
+        """Verify delta decoding of Way node refs on CPU."""
+        from vibespatial.io.osm_gpu import _extract_way_blocks
+
+        # Absolute refs: [100, 105, 110, 100] (closed ring)
+        # Deltas: [100, 5, 5, -10]
+        way = _build_way(42, [100, 5, 5, -10])
+        group = _build_primitive_group_with_ways([way])
+        pblock = _build_primitive_block_with_stringtable([group])
+
+        results = _extract_way_blocks([pblock])
+        wb = results[0]
+        assert wb.refs_per_way == [[100, 105, 110, 100]]
+
+    def test_no_ways_in_block(self):
+        """Block with only DenseNodes produces no WayBlocks."""
+        from vibespatial.io.osm_gpu import _extract_way_blocks
+
+        dense = _build_dense_nodes([1, 1], [100, 200], [300, 400])
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block(group)
+
+        results = _extract_way_blocks([pblock])
+        assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Tests: GPU node lookup table
+# ---------------------------------------------------------------------------
+
+
+class TestNodeLookup:
+    """Test GPU-side node lookup table construction."""
+
+    @needs_gpu
+    def test_sorted_by_id(self):
+        """Node lookup table is sorted by node ID."""
+        from vibespatial.io.osm_gpu import _build_node_lookup
+
+        # Unsorted node IDs
+        d_ids = cp.array([30, 10, 20], dtype=cp.int64)
+        d_x = cp.array([3.0, 1.0, 2.0], dtype=cp.float64)
+        d_y = cp.array([33.0, 11.0, 22.0], dtype=cp.float64)
+
+        d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(d_ids, d_x, d_y)
+
+        sorted_ids = cp.asnumpy(d_sorted_ids)
+        sorted_x = cp.asnumpy(d_sorted_x)
+        sorted_y = cp.asnumpy(d_sorted_y)
+
+        np.testing.assert_array_equal(sorted_ids, [10, 20, 30])
+        np.testing.assert_array_equal(sorted_x, [1.0, 2.0, 3.0])
+        np.testing.assert_array_equal(sorted_y, [11.0, 22.0, 33.0])
+
+
+# ---------------------------------------------------------------------------
+# Tests: GPU Way coordinate gathering
+# ---------------------------------------------------------------------------
+
+
+class TestWayCoordGathering:
+    """Test GPU binary search kernel for Way coordinate resolution."""
+
+    @needs_gpu
+    def test_basic_gathering(self):
+        """Binary search resolves known node refs to coordinates."""
+        from vibespatial.io.osm_gpu import _gpu_gather_way_coords
+
+        # Sorted node table
+        d_sorted_ids = cp.array([10, 20, 30, 40, 50], dtype=cp.int64)
+        d_sorted_x = cp.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=cp.float64)
+        d_sorted_y = cp.array([11.0, 22.0, 33.0, 44.0, 55.0], dtype=cp.float64)
+
+        # Way refs: look up nodes 20, 40, 10
+        d_refs = cp.array([20, 40, 10], dtype=cp.int64)
+
+        d_out_x, d_out_y = _gpu_gather_way_coords(
+            d_sorted_ids, d_sorted_x, d_sorted_y, d_refs,
+        )
+
+        out_x = cp.asnumpy(d_out_x)
+        out_y = cp.asnumpy(d_out_y)
+
+        np.testing.assert_array_equal(out_x, [2.0, 4.0, 1.0])
+        np.testing.assert_array_equal(out_y, [22.0, 44.0, 11.0])
+
+    @needs_gpu
+    def test_missing_node_produces_nan(self):
+        """Node ref not in lookup table produces NaN."""
+        from vibespatial.io.osm_gpu import _gpu_gather_way_coords
+
+        d_sorted_ids = cp.array([10, 20, 30], dtype=cp.int64)
+        d_sorted_x = cp.array([1.0, 2.0, 3.0], dtype=cp.float64)
+        d_sorted_y = cp.array([11.0, 22.0, 33.0], dtype=cp.float64)
+
+        # Ref 99 does not exist
+        d_refs = cp.array([20, 99], dtype=cp.int64)
+
+        d_out_x, d_out_y = _gpu_gather_way_coords(
+            d_sorted_ids, d_sorted_x, d_sorted_y, d_refs,
+        )
+
+        out_x = cp.asnumpy(d_out_x)
+        out_y = cp.asnumpy(d_out_y)
+
+        np.testing.assert_equal(out_x[0], 2.0)
+        assert np.isnan(out_x[1])
+        assert np.isnan(out_y[1])
+
+    @needs_gpu
+    def test_empty_refs(self):
+        """Empty ref array produces empty output."""
+        from vibespatial.io.osm_gpu import _gpu_gather_way_coords
+
+        d_sorted_ids = cp.array([10], dtype=cp.int64)
+        d_sorted_x = cp.array([1.0], dtype=cp.float64)
+        d_sorted_y = cp.array([11.0], dtype=cp.float64)
+        d_refs = cp.empty(0, dtype=cp.int64)
+
+        d_out_x, d_out_y = _gpu_gather_way_coords(
+            d_sorted_ids, d_sorted_x, d_sorted_y, d_refs,
+        )
+        assert d_out_x.shape[0] == 0
+        assert d_out_y.shape[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: Way classification (LineString vs Polygon)
+# ---------------------------------------------------------------------------
+
+
+class TestWayClassification:
+    """Test Way classification into LineString and Polygon."""
+
+    @needs_gpu
+    def test_closed_way_is_polygon(self):
+        """Closed Way (first ref == last ref) classified as Polygon."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 4 nodes forming a square
+        # Node 1: id=1, lat=0, lon=0
+        # Node 2: id=2, lat=0, lon=1
+        # Node 3: id=3, lat=1, lon=1
+        # Node 4: id=4, lat=1, lon=0
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000, 10000000]
+        node_lon_deltas = [0, 10000000, 10000000, 0]
+
+        # Way refs: [1, 2, 3, 4, 1] (closed ring)
+        ways = [(100, [1, 2, 3, 4, 1])]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+            assert result.ways is not None
+
+            # Should be classified as Polygon
+            ds = result.ways.device_state
+            assert ds is not None
+            assert GeometryFamily.POLYGON in ds.families
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_open_way_is_linestring(self):
+        """Open Way (first ref != last ref) classified as LineString."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 3 nodes forming a line
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [0, 10000000, 20000000]
+        node_lon_deltas = [0, 10000000, 20000000]
+
+        # Way refs: [1, 2, 3] (open)
+        ways = [(100, [1, 2, 3])]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+            assert result.ways is not None
+
+            # Should be classified as LineString
+            ds = result.ways.device_state
+            assert ds is not None
+            assert GeometryFamily.LINESTRING in ds.families
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_mixed_open_and_closed_ways(self):
+        """PBF with both open and closed ways produces mixed geometry."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 5 nodes
+        node_id_deltas = [1, 1, 1, 1, 1]
+        node_lat_deltas = [0, 10000000, 20000000, 30000000, 40000000]
+        node_lon_deltas = [0, 10000000, 20000000, 30000000, 40000000]
+
+        ways = [
+            (100, [1, 2, 3]),       # open -> LineString
+            (200, [1, 2, 3, 1]),    # closed -> Polygon
+        ]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 2
+            assert result.ways is not None
+
+            ds = result.ways.device_state
+            assert ds is not None
+            # Mixed: should have both families
+            assert GeometryFamily.LINESTRING in ds.families
+            assert GeometryFamily.POLYGON in ds.families
+        finally:
+            path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Tests: End-to-end read_osm_pbf (nodes + ways)
+# ---------------------------------------------------------------------------
+
+
+class TestReadOsmPbf:
+    """End-to-end tests for the combined nodes + ways reader."""
+
+    @needs_gpu
+    def test_nodes_and_ways(self):
+        """read_osm_pbf returns both nodes and ways."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 4 nodes at known coordinates
+        # lat = delta * 100 * 1e-9
+        # Node 1: lat=0.0, lon=0.0
+        # Node 2: lat=0.001, lon=0.001
+        # Node 3: lat=0.002, lon=0.002
+        # Node 4: lat=0.003, lon=0.003
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 10000, 10000, 10000]
+        node_lon_deltas = [0, 10000, 10000, 10000]
+
+        # One open way: [1, 2, 3]
+        ways = [(500, [1, 2, 3])]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+
+            # Nodes
+            assert result.n_nodes == 4
+            assert result.nodes is not None
+            assert result.node_ids is not None
+
+            # Ways
+            assert result.n_ways == 1
+            assert result.ways is not None
+            assert result.way_ids is not None
+            way_ids = cp.asnumpy(result.way_ids)
+            assert way_ids[0] == 500
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_way_coordinates_match_nodes(self):
+        """Way coordinates are correctly resolved from the node table."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Node 10: lat=40.0, lon=-74.0
+        # Node 20: lat=41.0, lon=-73.0
+        # Node 30: lat=42.0, lon=-72.0
+        node_id_deltas = [10, 10, 10]
+        node_lat_deltas = [400000000, 10000000, 10000000]
+        node_lon_deltas = [-740000000, 10000000, 10000000]
+
+        # Way uses nodes [10, 20, 30]
+        ways = [(1000, [10, 20, 30])]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+
+            ds = result.ways.device_state
+            line_buf = ds.families[GeometryFamily.LINESTRING]
+            x = cp.asnumpy(line_buf.x)
+            y = cp.asnumpy(line_buf.y)
+
+            # x = longitude, y = latitude
+            np.testing.assert_allclose(y, [40.0, 41.0, 42.0], rtol=1e-9)
+            np.testing.assert_allclose(x, [-74.0, -73.0, -72.0], rtol=1e-9)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_polygon_way_coordinates(self):
+        """Closed Way produces Polygon with correct ring coordinates."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Triangle: nodes 1, 2, 3 at known positions, closed ring [1, 2, 3, 1]
+        # Node 1: lat=0.0, lon=0.0
+        # Node 2: lat=0.0, lon=1.0
+        # Node 3: lat=1.0, lon=0.0
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [0, 0, 10000000]
+        node_lon_deltas = [0, 10000000, 0]
+
+        ways = [(42, [1, 2, 3, 1])]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+
+            ds = result.ways.device_state
+            poly_buf = ds.families[GeometryFamily.POLYGON]
+            x = cp.asnumpy(poly_buf.x)
+            y = cp.asnumpy(poly_buf.y)
+
+            # 4 coordinates (closed ring: first == last)
+            assert len(x) == 4
+            np.testing.assert_allclose(x[0], x[3], atol=1e-12)
+            np.testing.assert_allclose(y[0], y[3], atol=1e-12)
+
+            # ring_offsets should be [0, 4]
+            ring_offsets = cp.asnumpy(poly_buf.ring_offsets)
+            np.testing.assert_array_equal(ring_offsets, [0, 4])
+
+            # geometry_offsets (1 ring per polygon): [0, 1]
+            geom_offsets = cp.asnumpy(poly_buf.geometry_offsets)
+            np.testing.assert_array_equal(geom_offsets, [0, 1])
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_nodes_only_no_ways(self):
+        """PBF with only nodes produces None for ways."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        pbf = _build_test_pbf(
+            id_deltas=[1, 1],
+            lat_deltas=[100, 200],
+            lon_deltas=[300, 400],
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_nodes == 2
+            assert result.nodes is not None
+            assert result.n_ways == 0
+            assert result.ways is None
+            assert result.way_ids is None
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_file_not_found_read_osm_pbf(self):
+        """read_osm_pbf raises FileNotFoundError for missing files."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        with pytest.raises(FileNotFoundError):
+            read_osm_pbf("/nonexistent/path.osm.pbf")
+
+    @needs_gpu
+    def test_way_ids_on_device(self):
+        """Way IDs are device-resident int64 arrays."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [0, 10000, 20000]
+        node_lon_deltas = [0, 10000, 20000]
+
+        ways = [
+            (777, [1, 2, 3]),
+            (888, [1, 3, 2, 1]),
+        ]
+
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.way_ids is not None
+
+            way_ids = cp.asnumpy(result.way_ids)
+            # In mixed mode, LineStrings come first then Polygons
+            # Way 777 is open (LineString), Way 888 is closed (Polygon)
+            assert 777 in way_ids
+            assert 888 in way_ids
+        finally:
+            path.unlink()
