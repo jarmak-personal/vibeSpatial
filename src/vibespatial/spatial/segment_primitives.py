@@ -24,6 +24,7 @@ request_warmup([
 ])
 from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_I32,
+    KERNEL_PARAM_I64,
     KERNEL_PARAM_PTR,
     DeviceArray,
     compile_kernel_group,
@@ -967,7 +968,7 @@ def _format_classify_source(compute_type: str = "double") -> str:
 _CANDIDATE_SCATTER_KERNEL_SOURCE = """
 extern "C" __global__ void __launch_bounds__(256, 4)
 scatter_candidate_pairs(
-    const int* __restrict__ cand_offsets,
+    const long long* __restrict__ cand_offsets,
     const int* __restrict__ range_start,
     const int* __restrict__ range_end,
     const int* __restrict__ sorted_right_idx,
@@ -980,7 +981,7 @@ scatter_candidate_pairs(
 
     const int rs = range_start[i];
     const int re = range_end[i];
-    int write_pos = cand_offsets[i];
+    int write_pos = (int)cand_offsets[i];
 
     for (int j = rs; j < re; ++j) {
         out_left[write_pos] = i;
@@ -993,7 +994,7 @@ scatter_candidate_pairs(
 // Write positions are shifted by -offset_base so output starts at index 0.
 extern "C" __global__ void __launch_bounds__(256, 4)
 scatter_candidate_pairs_batch(
-    const int* __restrict__ cand_offsets,
+    const long long* __restrict__ cand_offsets,
     const int* __restrict__ range_start,
     const int* __restrict__ range_end,
     const int* __restrict__ sorted_right_idx,
@@ -1001,7 +1002,7 @@ scatter_candidate_pairs_batch(
     int* __restrict__ out_right,
     const int left_start,
     const int batch_size,
-    const int offset_base
+    const long long offset_base
 ) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= batch_size) return;
@@ -1009,7 +1010,7 @@ scatter_candidate_pairs_batch(
     const int i = left_start + tid;
     const int rs = range_start[i];
     const int re = range_end[i];
-    int write_pos = cand_offsets[i] - offset_base;
+    int write_pos = (int)(cand_offsets[i] - offset_base);
 
     for (int j = rs; j < re; ++j) {
         out_left[write_pos] = i;
@@ -1319,33 +1320,46 @@ def _extract_segments_gpu(
 #   8 x float64 gathered bounds = 64 bytes
 #   1 x bool overlap mask = 1 byte
 #   1 x uint8 cast = 1 byte
-# Total ~74 bytes.  Use 80 for safety headroom.
-_BYTES_PER_RAW_PAIR = 80
+#   ~8 bytes CuPy temporaries during boolean expression evaluation
+#   ~4 bytes compact_indices output (worst case)
+# Total ~86 bytes.  Use 120 for safety headroom and pool fragmentation.
+_BYTES_PER_RAW_PAIR = 120
 
 # Absolute floor: never create batches smaller than 1M pairs.
 _MIN_BATCH_PAIRS = 1 * 1024 * 1024
 
 
+_MAX_BATCH_PAIRS_CAP = 8 * 1024 * 1024  # 8M pairs hard cap (~960 MB peak)
+
+
 def _compute_max_batch_pairs() -> int:
     """Return the maximum number of raw candidate pairs per batch.
 
-    Uses 50% of currently-free device VRAM divided by the peak per-pair
-    memory cost during the scatter+filter phase.  Falls back to 16M pairs
-    (~1.2 GB peak) if the VRAM query fails.
+    Uses actual RMM/CuPy pool free blocks when available, falling back
+    to CUDA mem_info.  Applies a hard cap of 8M pairs to prevent OOM
+    from pool fragmentation and CuPy advanced-indexing temporaries.
     """
     import cupy as cp
 
-    try:
-        free_bytes, _total_bytes = cp.cuda.Device().mem_info
-    except Exception:
-        # Fallback: conservative 16M pairs (~1.2 GB)
-        return 16 * 1024 * 1024
+    from vibespatial.cuda._runtime import get_cuda_runtime
 
-    # Use 50% of free VRAM for candidate pair processing.
-    usable_bytes = free_bytes // 2
+    # Try to get actual pool-level free memory (more accurate than CUDA mem_info
+    # because RMM reserves large blocks from CUDA up front).
+    try:
+        runtime = get_cuda_runtime()
+        stats = runtime.memory_pool_stats()
+        if "free_bytes" in stats:
+            free_bytes = stats["free_bytes"]
+        else:
+            free_bytes, _ = cp.cuda.Device().mem_info
+    except Exception:
+        return _MAX_BATCH_PAIRS_CAP
+
+    # Use 25% of available pool memory, capped at _MAX_BATCH_PAIRS_CAP.
+    usable_bytes = free_bytes // 4
     max_pairs = usable_bytes // _BYTES_PER_RAW_PAIR
 
-    return max(max_pairs, _MIN_BATCH_PAIRS)
+    return min(max(max_pairs, _MIN_BATCH_PAIRS), _MAX_BATCH_PAIRS_CAP)
 
 
 def _main_sweep_scatter_and_filter(
@@ -1429,9 +1443,10 @@ def _main_sweep_scatter_and_filter(
 
     batch_boundaries.append(n_left)
 
-    # Process each batch, collecting surviving pairs.
-    result_left_parts = []
-    result_right_parts = []
+    # Process each batch, collecting surviving pairs on HOST to prevent
+    # accumulated device results from consuming all VRAM.
+    result_left_parts: list[np.ndarray] = []
+    result_right_parts: list[np.ndarray] = []
 
     for b in range(len(batch_boundaries) - 1):
         b_lo = batch_boundaries[b]
@@ -1447,6 +1462,9 @@ def _main_sweep_scatter_and_filter(
 
         if b_raw_count == 0:
             continue
+
+        # Release pool fragmentation between batches.
+        runtime.free_pool_memory()
 
         b_left, b_right = _scatter_and_filter_single(
             runtime=runtime,
@@ -1470,14 +1488,19 @@ def _main_sweep_scatter_and_filter(
             batch_raw_count=b_raw_count,
         )
         if b_left.size > 0:
-            result_left_parts.append(b_left)
-            result_right_parts.append(b_right)
+            # Transfer to host immediately to free GPU memory for next batch.
+            result_left_parts.append(cp.asnumpy(b_left))
+            result_right_parts.append(cp.asnumpy(b_right))
+            del b_left, b_right
 
     if not result_left_parts:
         return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
     if len(result_left_parts) == 1:
-        return result_left_parts[0], result_right_parts[0]
-    return cp.concatenate(result_left_parts), cp.concatenate(result_right_parts)
+        return cp.asarray(result_left_parts[0]), cp.asarray(result_right_parts[0])
+    return (
+        cp.asarray(np.concatenate(result_left_parts)),
+        cp.asarray(np.concatenate(result_right_parts)),
+    )
 
 
 def _scatter_and_filter_single(
@@ -1551,7 +1574,7 @@ def _scatter_and_filter_single(
                  left_start, batch_size, offset_base),
                 (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                  KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
+                 KERNEL_PARAM_I32, KERNEL_PARAM_I32, KERNEL_PARAM_I64),
             ),
         )
 
@@ -1569,12 +1592,17 @@ def _scatter_and_filter_single(
         (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
         (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
     )
+    # Free gathered bounds immediately — they dominate per-batch memory
+    # (8 × batch_raw_count × 8 bytes) and are no longer needed.
+    del d_lminx, d_lmaxx, d_lminy, d_lmaxy
+    del d_rminx, d_rmaxx, d_rminy, d_rmaxy
     # Exclude outlier right segments from main results to prevent
     # duplicates with the outlier pass.  Outlier rights will be
     # handled exclusively by the brute-force MBR pass below.
     if outlier_mask_bool is not None:
         main_overlap &= ~outlier_mask_bool[d_right_pair]
     main_overlap_u8 = main_overlap.astype(cp.uint8)
+    del main_overlap
 
     main_compact = compact_indices(main_overlap_u8)
     if main_compact.count > 0:
@@ -1683,12 +1711,30 @@ def _generate_candidates_gpu(
     range_start = lower_bound(sorted_right_xmid, search_lo, synchronize=False)
     range_end = upper_bound(sorted_right_xmid, search_hi, synchronize=False)
 
-    # Two-pass: count candidates per left, prefix-sum, scatter
-    d_cand_counts = cp.asarray(range_end, dtype=cp.int32) - cp.asarray(range_start, dtype=cp.int32)
+    # Two-pass: count candidates per left, prefix-sum, scatter.
+    # Use int64 for counts/offsets: at 100k+ segments, total candidates can
+    # exceed int32 max (~2.1B), causing prefix-sum overflow and negative batch sizes.
+    d_cand_counts = cp.asarray(range_end, dtype=cp.int64) - cp.asarray(range_start, dtype=cp.int64)
     d_cand_counts = cp.maximum(d_cand_counts, 0)  # clamp negatives
 
     d_cand_offsets = exclusive_sum(d_cand_counts, synchronize=False)
     total_raw_candidates = count_scatter_total(runtime, d_cand_counts, d_cand_offsets)
+
+    # Guard: if total raw candidates exceed what the GPU can classify
+    # (each surviving pair requires ~49 bytes of output arrays), raise early
+    # instead of crashing mid-way through batched scatter.
+    try:
+        free_bytes, _ = cp.cuda.Device().mem_info
+    except Exception:
+        free_bytes = 8 * 1024**3  # conservative 8 GB
+    # 49 bytes per pair for classification output + 8 bytes for candidate indices
+    max_feasible_pairs = free_bytes // 57
+    if total_raw_candidates > max_feasible_pairs:
+        raise MemoryError(
+            f"Segment intersection candidate count ({total_raw_candidates:,}) exceeds "
+            f"GPU memory capacity ({free_bytes / 1e9:.1f} GB free, max ~{max_feasible_pairs:,} "
+            f"feasible pairs). Reduce input scale or use CPU dispatch."
+        )
 
     if total_raw_candidates > 0:
         main_final_left, main_final_right = _main_sweep_scatter_and_filter(

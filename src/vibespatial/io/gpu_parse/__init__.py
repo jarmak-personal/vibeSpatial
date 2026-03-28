@@ -61,6 +61,9 @@ from vibespatial.io.gpu_parse.structural import (
     quote_parity,
 )
 
+# Lazy import to avoid GPU init at package import time for indexing
+# (it registers NVRTC warmup at module scope)
+
 __all__ = [
     # structural
     "quote_parity",
@@ -74,4 +77,24 @@ __all__ = [
     "pattern_match",
     "span_boundaries",
     "mark_spans",
+    # indexing
+    "build_spatial_index",
+    "build_index_from_reader",
+    "GpuSpatialIndex",
 ]
+
+
+def __getattr__(name: str):
+    if name in ("build_spatial_index", "build_index_from_reader", "GpuSpatialIndex"):
+        from vibespatial.io.gpu_parse.indexing import (
+            GpuSpatialIndex,
+            build_index_from_reader,
+            build_spatial_index,
+        )
+        _exports = {
+            "build_spatial_index": build_spatial_index,
+            "build_index_from_reader": build_index_from_reader,
+            "GpuSpatialIndex": GpuSpatialIndex,
+        }
+        return _exports[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

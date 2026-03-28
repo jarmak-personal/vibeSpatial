@@ -1,0 +1,724 @@
+"""GPU DBF (dBASE III) reader -- fixed-width record parsing on GPU.
+
+Parses the attribute table component of ESRI Shapefiles entirely on the
+GPU for numeric columns, keeping device-resident arrays that can feed
+directly into GPU analytics without a host round-trip.
+
+DBF is a fixed-width binary format:
+
+1. **32-byte main header** -- record count, header length, record length.
+2. **Field descriptors** (32 bytes each) until 0x0D terminator -- column
+   names, types, widths, offsets.
+3. **Fixed-width records** starting at ``header_length`` -- each record
+   has a 1-byte deletion flag followed by concatenated field values,
+   right-padded with spaces.
+
+Because records are fixed-width, field indexing is pure arithmetic:
+``record_i_field_j = header_length + i * record_length + field_offset_j``.
+No search/scan kernels are needed.
+
+Column extraction strategy by DBF field type:
+
+- **Numeric ('N', 'F')**: Tier 1 NVRTC kernel (``dbf_extract_numeric``)
+  parses fixed-width ASCII at known byte offsets to float64 on GPU.
+  Each thread handles one record for one field. Output stays device-resident.
+- **Date ('D')**: Tier 1 NVRTC kernel (``dbf_extract_date``) parses
+  YYYYMMDD to int32 on GPU. Output stays device-resident.
+- **Logical ('L')**: Tier 2 CuPy element-wise byte comparison at known
+  offsets. Output stays device-resident.
+- **Character ('C')**: D->H copy of column bytes, strip trailing spaces
+  on CPU. Returns numpy string array (string data has no GPU use case).
+
+All structural parsing (header, field descriptors) is CPU-side because
+the header is typically < 4 KB. No PrecisionPlan is needed because
+this is I/O parsing: integer-only byte classification and ASCII-to-number
+conversion that always produces fp64 storage. Same rationale as
+``csv_gpu.py`` and ``gpu_parse/numeric.py``.
+
+Tier classification (ADR-0033):
+    - Header parsing: CPU (small data, one-time)
+    - Numeric field extraction: Tier 1 (custom NVRTC -- ASCII-to-float64)
+    - Date field extraction: Tier 1 (custom NVRTC -- ASCII-to-int32)
+    - Logical field extraction: Tier 2 (CuPy element-wise)
+    - Deletion flag: Tier 2 (CuPy element-wise)
+    - Character field extraction: CPU (string data)
+"""
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import numpy as np
+
+from vibespatial.cuda._runtime import (
+    KERNEL_PARAM_I32,
+    KERNEL_PARAM_PTR,
+    compile_kernel_group,
+    get_cuda_runtime,
+)
+
+if TYPE_CHECKING:
+    import cupy as cp
+
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover
+    cp = None
+
+# ---------------------------------------------------------------------------
+# NVRTC kernel sources (Tier 1)
+# ---------------------------------------------------------------------------
+
+# Numeric field extraction: each thread parses one (record, field) pair.
+# The field's byte span is at a fixed offset within each record, so
+# indexing is pure arithmetic with no search.  The ASCII-to-float64
+# state machine is the same approach as gpu_parse/numeric.py.
+_DBF_EXTRACT_NUMERIC_SOURCE = r"""
+extern "C" __global__ void __launch_bounds__(256, 4)
+dbf_extract_numeric(
+    const unsigned char* __restrict__ data,
+    double*              __restrict__ output,
+    const int record_count,
+    const int record_length,
+    const int field_offset,
+    const int field_length,
+    const int header_length
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= record_count) return;
+
+    // +1 skips the deletion flag byte at the start of each record
+    int start = header_length + idx * record_length + field_offset + 1;
+    int end   = start + field_length;
+
+    // Strip leading spaces and trailing spaces
+    while (start < end && data[start] == ' ') start++;
+    while (end > start && data[end - 1] == ' ') end--;
+
+    // Empty or all-spaces field -> NaN
+    if (start >= end) {
+        output[idx] = __longlong_as_double(0x7FF8000000000000LL); // NaN
+        return;
+    }
+
+    // Check for '*' fill (null indicator in some DBF writers)
+    if (data[start] == '*') {
+        output[idx] = __longlong_as_double(0x7FF8000000000000LL); // NaN
+        return;
+    }
+
+    double result = 0.0;
+    double frac_mult = 0.0;
+    int negative = 0;
+    int in_exponent = 0;
+    int exp_val = 0;
+    int exp_negative = 0;
+
+    for (int i = start; i < end; ++i) {
+        unsigned char c = data[i];
+        if (c == '-') {
+            if (in_exponent) exp_negative = 1;
+            else negative = 1;
+        } else if (c == '+') {
+            // skip
+        } else if (c == '.') {
+            frac_mult = 0.1;
+        } else if (c == 'e' || c == 'E') {
+            in_exponent = 1;
+        } else if (c >= '0' && c <= '9') {
+            int d = c - '0';
+            if (in_exponent) {
+                exp_val = exp_val * 10 + d;
+            } else if (frac_mult > 0.0) {
+                result += d * frac_mult;
+                frac_mult *= 0.1;
+            } else {
+                result = result * 10.0 + d;
+            }
+        }
+        // Skip any other characters (e.g., commas in some locales)
+    }
+
+    if (negative) result = -result;
+
+    if (in_exponent) {
+        double exp_mult = 1.0;
+        for (int e = 0; e < exp_val; ++e) exp_mult *= 10.0;
+        if (exp_negative) result /= exp_mult;
+        else result *= exp_mult;
+    }
+
+    output[idx] = result;
+}
+"""
+
+# Date field extraction: YYYYMMDD (8 bytes fixed) -> int32 as YYYYMMDD integer.
+# Each thread handles one record.
+_DBF_EXTRACT_DATE_SOURCE = r"""
+extern "C" __global__ void __launch_bounds__(256, 4)
+dbf_extract_date(
+    const unsigned char* __restrict__ data,
+    int*                 __restrict__ output,
+    const int record_count,
+    const int record_length,
+    const int field_offset,
+    const int header_length
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= record_count) return;
+
+    // +1 skips the deletion flag byte
+    int start = header_length + idx * record_length + field_offset + 1;
+
+    // Read 8 ASCII digits: YYYYMMDD
+    int value = 0;
+    int all_spaces = 1;
+    for (int i = 0; i < 8; ++i) {
+        unsigned char c = data[start + i];
+        if (c != ' ' && c != 0) all_spaces = 0;
+        if (c >= '0' && c <= '9') {
+            value = value * 10 + (c - '0');
+        }
+        // Non-digit, non-space: treat as null
+    }
+
+    // Empty date field -> 0 (sentinel for null)
+    output[idx] = all_spaces ? 0 : value;
+}
+"""
+
+_DBF_NUMERIC_NAMES = ("dbf_extract_numeric",)
+_DBF_DATE_NAMES = ("dbf_extract_date",)
+
+# ---------------------------------------------------------------------------
+# NVRTC warmup (ADR-0034 Level 2)
+# ---------------------------------------------------------------------------
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+
+request_nvrtc_warmup([
+    ("dbf-extract-numeric", _DBF_EXTRACT_NUMERIC_SOURCE, _DBF_NUMERIC_NAMES),
+    ("dbf-extract-date", _DBF_EXTRACT_DATE_SOURCE, _DBF_DATE_NAMES),
+])
+
+
+# ---------------------------------------------------------------------------
+# Kernel compilation helpers
+# ---------------------------------------------------------------------------
+
+def _numeric_kernels():
+    return compile_kernel_group(
+        "dbf-extract-numeric", _DBF_EXTRACT_NUMERIC_SOURCE, _DBF_NUMERIC_NAMES,
+    )
+
+
+def _date_kernels():
+    return compile_kernel_group(
+        "dbf-extract-date", _DBF_EXTRACT_DATE_SOURCE, _DBF_DATE_NAMES,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class DbfFieldDescriptor:
+    """Metadata for one DBF field (column)."""
+    name: str
+    field_type: str       # 'C', 'N', 'F', 'D', 'L'
+    length: int           # total field width in bytes
+    decimal_count: int    # decimals for N/F types
+    offset: int           # byte offset within the record (excluding deletion flag)
+
+
+@dataclass(frozen=True)
+class DbfHeader:
+    """Parsed DBF file header."""
+    version: int
+    record_count: int
+    header_length: int
+    record_length: int
+    fields: list[DbfFieldDescriptor]
+
+
+@dataclass(frozen=True)
+class DbfColumn:
+    """One parsed column from a DBF file.
+
+    Attributes
+    ----------
+    name : str
+        Column name from the DBF field descriptor.
+    dtype : str
+        Logical type: 'float64', 'int32', 'string', 'bool'.
+    data : cp.ndarray | np.ndarray
+        Parsed column data. Device-resident (CuPy) for numeric, date,
+        and logical columns. Host-resident (numpy) for string columns.
+    null_mask : cp.ndarray | np.ndarray | None
+        Optional boolean mask where True = null/missing value.
+        Device-resident for GPU columns, host-resident for string columns.
+    """
+    name: str
+    dtype: str
+    data: object  # cp.ndarray | np.ndarray
+    null_mask: object | None = None  # cp.ndarray | np.ndarray | None
+
+
+@dataclass(frozen=True)
+class DbfGpuResult:
+    """Result of GPU DBF parsing.
+
+    Attributes
+    ----------
+    columns : dict[str, DbfColumn]
+        Column name -> parsed column mapping.
+    n_records : int
+        Number of records in the DBF file.
+    active_mask : cp.ndarray
+        Device-resident uint8 array, shape ``(n_records,)``.
+        1 = active record, 0 = deleted (marked with ``*``).
+    header : DbfHeader
+        Parsed header metadata.
+    """
+    columns: dict[str, DbfColumn]
+    n_records: int
+    active_mask: object  # cp.ndarray
+    header: DbfHeader
+
+
+# ---------------------------------------------------------------------------
+# Header parsing (CPU -- small, one-time)
+# ---------------------------------------------------------------------------
+
+def _parse_header(raw: bytes) -> DbfHeader:
+    """Parse DBF header and field descriptors from raw bytes.
+
+    Parameters
+    ----------
+    raw : bytes
+        At least the first ``header_length`` bytes of the DBF file.
+
+    Returns
+    -------
+    DbfHeader
+        Parsed header with field descriptors.
+    """
+    if len(raw) < 32:
+        raise ValueError(f"DBF header too short: {len(raw)} bytes (need >= 32)")
+
+    version = raw[0]
+    record_count = struct.unpack_from("<I", raw, 4)[0]
+    header_length = struct.unpack_from("<H", raw, 8)[0]
+    record_length = struct.unpack_from("<H", raw, 10)[0]
+
+    # Parse field descriptors starting at byte 32, each 32 bytes,
+    # until we hit the 0x0D terminator byte.
+    fields: list[DbfFieldDescriptor] = []
+    offset_in_record = 0  # cumulative offset within record (excluding deletion flag)
+    pos = 32
+
+    while pos < header_length - 1:
+        if raw[pos] == 0x0D:
+            break
+        if pos + 32 > len(raw):
+            break
+
+        field_raw = raw[pos : pos + 32]
+
+        # Field name: 11 bytes, null-terminated ASCII
+        name_bytes = field_raw[0:11]
+        name = name_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace").strip()
+
+        field_type = chr(field_raw[11])
+        field_length = field_raw[16]
+        decimal_count = field_raw[17]
+
+        fields.append(DbfFieldDescriptor(
+            name=name,
+            field_type=field_type,
+            length=field_length,
+            decimal_count=decimal_count,
+            offset=offset_in_record,
+        ))
+
+        offset_in_record += field_length
+        pos += 32
+
+    return DbfHeader(
+        version=version,
+        record_count=record_count,
+        header_length=header_length,
+        record_length=record_length,
+        fields=fields,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Field extraction functions
+# ---------------------------------------------------------------------------
+
+def _extract_numeric_field(
+    d_data: cp.ndarray,
+    header: DbfHeader,
+    field: DbfFieldDescriptor,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Extract a numeric (N/F) field using the GPU NVRTC kernel.
+
+    Returns (values, null_mask) both device-resident.
+    """
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    n = header.record_count
+
+    d_output = cp.empty(n, dtype=cp.float64)
+
+    if n > 0:
+        kernels = _numeric_kernels()
+        kernel = kernels["dbf_extract_numeric"]
+        grid, block = runtime.launch_config(kernel, n)
+        params = (
+            (
+                ptr(d_data),
+                ptr(d_output),
+                np.int32(n),
+                np.int32(header.record_length),
+                np.int32(field.offset),
+                np.int32(field.length),
+                np.int32(header.header_length),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+
+    # NaN values indicate nulls
+    d_null_mask = cp.isnan(d_output)
+    return d_output, d_null_mask
+
+
+def _extract_date_field(
+    d_data: cp.ndarray,
+    header: DbfHeader,
+    field: DbfFieldDescriptor,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Extract a date (D) field using the GPU NVRTC kernel.
+
+    Returns (values, null_mask) both device-resident.
+    Values are int32 encoding YYYYMMDD as an integer (e.g., 20260326).
+    Null dates have value 0.
+    """
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    n = header.record_count
+
+    d_output = cp.empty(n, dtype=cp.int32)
+
+    if n > 0:
+        kernels = _date_kernels()
+        kernel = kernels["dbf_extract_date"]
+        grid, block = runtime.launch_config(kernel, n)
+        params = (
+            (
+                ptr(d_data),
+                ptr(d_output),
+                np.int32(n),
+                np.int32(header.record_length),
+                np.int32(field.offset),
+                np.int32(header.header_length),
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+
+    # Value 0 indicates null date
+    d_null_mask = d_output == 0
+    return d_output, d_null_mask
+
+
+def _extract_logical_field(
+    d_data: cp.ndarray,
+    header: DbfHeader,
+    field: DbfFieldDescriptor,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Extract a logical (L) field using CuPy element-wise ops.
+
+    Tier 2 (CuPy) -- simple byte comparison at known offsets.
+    Returns (values, null_mask) both device-resident.
+    """
+    n = header.record_count
+    if n == 0:
+        return cp.empty(0, dtype=cp.uint8), cp.empty(0, dtype=cp.bool_)
+
+    # Build index array for the logical field byte in each record.
+    # +1 for deletion flag byte.
+    record_starts = cp.arange(n, dtype=cp.int64) * header.record_length + header.header_length
+    field_positions = record_starts + field.offset + 1
+
+    # Extract single byte per record
+    d_bytes = d_data[field_positions]
+
+    # T/t/Y/y = True, F/f/N/n = False, ? or space = null
+    d_true = (
+        (d_bytes == ord('T')) | (d_bytes == ord('t')) |
+        (d_bytes == ord('Y')) | (d_bytes == ord('y'))
+    )
+    d_null = (d_bytes == ord('?')) | (d_bytes == ord(' ')) | (d_bytes == 0)
+    d_values = d_true.astype(cp.uint8)
+
+    return d_values, d_null
+
+
+def _extract_character_field(
+    d_data: cp.ndarray,
+    header: DbfHeader,
+    field: DbfFieldDescriptor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract a character (C) field: D->H copy, strip trailing spaces on CPU.
+
+    Returns (values, null_mask) both host-resident numpy arrays.
+    String data has no GPU use case, so we bring it to host.
+    """
+    n = header.record_count
+    if n == 0:
+        return np.array([], dtype=object), np.zeros(0, dtype=np.bool_)
+
+    # Build gather indices for the field bytes across all records.
+    # Each record's field is field.length bytes starting at
+    # header_length + i * record_length + field.offset + 1.
+    #
+    # We gather all bytes at once using CuPy fancy indexing (Tier 2),
+    # then do the D->H transfer as one bulk copy, and finally reshape
+    # and decode on CPU.
+    record_starts = (
+        cp.arange(n, dtype=cp.int64) * header.record_length
+        + header.header_length
+        + field.offset
+        + 1
+    )
+    # Expand to (n, field_length) index grid
+    byte_offsets = cp.arange(field.length, dtype=cp.int64)
+    # Outer addition: (n, 1) + (field_length,) -> (n, field_length)
+    all_indices = record_starts[:, None] + byte_offsets[None, :]
+
+    # Single bulk gather on GPU, then one D->H transfer
+    d_field_bytes = d_data[all_indices.ravel()]
+
+    # D->H: one bulk transfer
+    h_field_bytes = cp.asnumpy(d_field_bytes).reshape(n, field.length)
+
+    # Decode and strip on CPU
+    values = np.empty(n, dtype=object)
+    null_mask = np.zeros(n, dtype=np.bool_)
+    for i in range(n):
+        raw = bytes(h_field_bytes[i])
+        # Strip trailing spaces and null bytes
+        text = raw.rstrip(b" \x00").decode("latin-1", errors="replace")
+        values[i] = text
+        if not text:
+            null_mask[i] = True
+
+    return values, null_mask
+
+
+def _extract_deletion_flags(
+    d_data: cp.ndarray,
+    header: DbfHeader,
+) -> cp.ndarray:
+    """Extract the deletion flag byte from each record.
+
+    Returns device-resident uint8 array: 1 = active, 0 = deleted.
+    Tier 2 (CuPy element-wise).
+    """
+    n = header.record_count
+    if n == 0:
+        return cp.empty(0, dtype=cp.uint8)
+
+    # First byte of each record is the deletion flag
+    flag_positions = (
+        cp.arange(n, dtype=cp.int64) * header.record_length
+        + header.header_length
+    )
+    d_flags = d_data[flag_positions]
+
+    # ' ' (0x20) = active, '*' (0x2A) = deleted
+    d_active = (d_flags != ord('*')).astype(cp.uint8)
+    return d_active
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def read_dbf_gpu(
+    path: Path | str,
+    *,
+    columns: list[str] | None = None,
+) -> DbfGpuResult:
+    """Parse a DBF file on GPU.
+
+    Numeric columns are parsed entirely on GPU and stay device-resident.
+    Character columns are copied to host and returned as numpy string arrays.
+
+    Parameters
+    ----------
+    path : Path or str
+        Path to the .dbf file.
+    columns : list of str, optional
+        Subset of column names to read. If None, all columns are read.
+
+    Returns
+    -------
+    DbfGpuResult
+        Parsed result with column data, record count, active mask, and header.
+
+    Notes
+    -----
+    The header (< 4 KB) is parsed on CPU. Record data is transferred to
+    the GPU via kvikio (if available) or CuPy, and numeric fields are
+    parsed in parallel by NVRTC kernels.
+    """
+    if cp is None:
+        raise ImportError("CuPy is required for read_dbf_gpu")
+
+    path = Path(path)
+    file_size = path.stat().st_size
+
+    if file_size < 32:
+        raise ValueError(f"DBF file too small: {file_size} bytes")
+
+    # ---- Step 1: Read header on CPU (small, one-time) ----
+    with open(path, "rb") as f:
+        header_peek = f.read(min(file_size, 65536))  # 64 KB is more than enough for any header
+
+    header = _parse_header(header_peek)
+
+    if header.record_count == 0:
+        return DbfGpuResult(
+            columns={},
+            n_records=0,
+            active_mask=cp.empty(0, dtype=cp.uint8),
+            header=header,
+        )
+
+    # ---- Step 2: Transfer file to device ----
+    from vibespatial.io.kvikio_reader import read_file_to_device
+
+    file_result = read_file_to_device(path, file_size)
+    d_data = file_result.device_bytes
+
+    # ---- Step 3: Determine which fields to extract ----
+    fields_to_extract = header.fields
+    if columns is not None:
+        col_set = set(columns)
+        fields_to_extract = [f for f in header.fields if f.name in col_set]
+
+    # ---- Step 4: Extract deletion flags ----
+    d_active = _extract_deletion_flags(d_data, header)
+
+    # ---- Step 5: Extract each field by type ----
+    result_columns: dict[str, DbfColumn] = {}
+
+    for field in fields_to_extract:
+        if field.field_type in ("N", "F"):
+            data, null_mask = _extract_numeric_field(d_data, header, field)
+            result_columns[field.name] = DbfColumn(
+                name=field.name,
+                dtype="float64",
+                data=data,
+                null_mask=null_mask,
+            )
+        elif field.field_type == "D":
+            data, null_mask = _extract_date_field(d_data, header, field)
+            result_columns[field.name] = DbfColumn(
+                name=field.name,
+                dtype="int32",
+                data=data,
+                null_mask=null_mask,
+            )
+        elif field.field_type == "L":
+            data, null_mask = _extract_logical_field(d_data, header, field)
+            result_columns[field.name] = DbfColumn(
+                name=field.name,
+                dtype="bool",
+                data=data,
+                null_mask=null_mask,
+            )
+        elif field.field_type == "C":
+            data, null_mask = _extract_character_field(d_data, header, field)
+            result_columns[field.name] = DbfColumn(
+                name=field.name,
+                dtype="string",
+                data=data,
+                null_mask=null_mask,
+            )
+        else:
+            # Unknown field type -- treat as character
+            data, null_mask = _extract_character_field(d_data, header, field)
+            result_columns[field.name] = DbfColumn(
+                name=field.name,
+                dtype="string",
+                data=data,
+                null_mask=null_mask,
+            )
+
+    return DbfGpuResult(
+        columns=result_columns,
+        n_records=header.record_count,
+        active_mask=d_active,
+        header=header,
+    )
+
+
+def dbf_result_to_dataframe(result: DbfGpuResult, *, include_deleted: bool = False):
+    """Convert a DbfGpuResult to a pandas DataFrame.
+
+    Parameters
+    ----------
+    result : DbfGpuResult
+        Output of ``read_dbf_gpu``.
+    include_deleted : bool, default False
+        If False, filter out records marked as deleted in the DBF.
+
+    Returns
+    -------
+    pandas.DataFrame
+    """
+    import pandas as pd
+
+    data = {}
+    for name, col in result.columns.items():
+        if col.dtype == "string":
+            values = col.data
+        elif col.dtype == "float64":
+            values = cp.asnumpy(col.data)
+        elif col.dtype == "int32":
+            values = cp.asnumpy(col.data)
+        elif col.dtype == "bool":
+            values = cp.asnumpy(col.data).astype(bool)
+        else:
+            values = cp.asnumpy(col.data) if hasattr(col.data, "get") else col.data
+        data[name] = values
+
+    df = pd.DataFrame(data)
+
+    if not include_deleted and result.n_records > 0:
+        active = cp.asnumpy(result.active_mask).astype(bool)
+        df = df.loc[active].reset_index(drop=True)
+
+    return df

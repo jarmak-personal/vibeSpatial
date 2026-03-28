@@ -204,5 +204,16 @@
       "gpu-three-tier",
       "cpu"
     ]
+  },
+  {
+    "geom_types": [
+      "point"
+    ],
+    "kernel": "osm_varint_decode",
+    "module": "vibespatial.io.osm_gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-cuda-python"
+    ]
   }
 ]

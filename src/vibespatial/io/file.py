@@ -288,6 +288,59 @@ def _try_csv_gpu_read(filename) -> object | None:
         return None
 
 
+def _try_shapefile_dbf_gpu_read(filename) -> object | None:
+    """Try to read a Shapefile with GPU DBF attribute parsing.
+
+    Uses pyogrio.read_arrow() for geometry (via GPU WKB decode) and
+    the GPU DBF reader for attributes, bypassing the Arrow->pandas
+    attribute conversion for numeric columns. Falls back to None on
+    failure.
+    """
+    try:
+        import pyogrio
+
+        from .arrow import decode_wkb_arrow_array_owned, geoseries_from_owned
+        from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+
+        file_path = Path(filename)
+        dbf_path = file_path.with_suffix(".dbf")
+        if not dbf_path.exists():
+            return None
+
+        # Read geometry via pyogrio Arrow + GPU WKB decode
+        metadata, table = pyogrio.read_arrow(filename)
+        geom_idx, _ = _select_arrow_geometry_column(table, metadata)
+        geom_column = table.column(geom_idx).combine_chunks()
+        owned = decode_wkb_arrow_array_owned(geom_column)
+        crs = metadata.get("crs")
+        geom_series = geoseries_from_owned(
+            owned,
+            name=table.schema.field(geom_idx).name,
+            crs=crs,
+        )
+
+        # Read attributes via GPU DBF parser
+        dbf_result = read_dbf_gpu(dbf_path)
+        attrs_df = dbf_result_to_dataframe(dbf_result)
+
+        import vibespatial.api as geopandas
+
+        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="shapefile_gpu_dbf_adapter",
+            reason=(
+                "GPU-dominant Shapefile read: pyogrio Arrow for geometry with "
+                "GPU WKB decode, GPU DBF parser for numeric attributes."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
 def _try_kml_gpu_read(filename) -> object | None:
     """Try to read a KML file using the GPU byte-classification pipeline.
 
@@ -377,6 +430,13 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
         # KML: route to GPU for files above size threshold
         if plan.format is IOFormat.KML and file_size > _GPU_MIN_FILE_SIZE:
             gpu_result = _try_kml_gpu_read(filename)
+            if gpu_result is not None:
+                return gpu_result
+            # fall through to pyogrio CPU path
+
+        # Shapefile: route to GPU DBF parser for attributes (large files)
+        if plan.format is IOFormat.SHAPEFILE and file_size > _GPU_MIN_FILE_SIZE:
+            gpu_result = _try_shapefile_dbf_gpu_read(filename)
             if gpu_result is not None:
                 return gpu_result
             # fall through to pyogrio CPU path

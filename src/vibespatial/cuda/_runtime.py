@@ -1043,4 +1043,5 @@ def nvrtc_cache_stats() -> dict[str, int | str]:
 
 KERNEL_PARAM_PTR = ctypes.c_void_p
 KERNEL_PARAM_I32 = ctypes.c_int
+KERNEL_PARAM_I64 = ctypes.c_longlong
 KERNEL_PARAM_F64 = ctypes.c_double

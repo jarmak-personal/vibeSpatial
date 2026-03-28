@@ -1750,6 +1750,7 @@ def _extract_polygon_rings_single_family(
             import cupy as cp
             ring_x = cp.asarray(device_buffer.x)
             ring_y = cp.asarray(device_buffer.y)
+            ring_offsets_out = cp.asarray(ring_offsets_out, dtype=cp.int32)
         else:
             ring_x = np.asarray(buffer.x, dtype=np.float64)
             ring_y = np.asarray(buffer.y, dtype=np.float64)
@@ -1788,6 +1789,7 @@ def _extract_polygon_rings_single_family(
             d_gather = cp.asarray(coord_gather.astype(np.int64))
             ring_x = cp.asarray(device_buffer.x)[d_gather]
             ring_y = cp.asarray(device_buffer.y)[d_gather]
+            ring_offsets_out = cp.asarray(ring_offsets_out, dtype=cp.int32)
         else:
             ring_x = np.asarray(buffer.x, dtype=np.float64)[coord_gather]
             ring_y = np.asarray(buffer.y, dtype=np.float64)[coord_gather]
