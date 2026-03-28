@@ -211,6 +211,127 @@ def plan_vector_file_io(
     )
 
 
+def _try_wkt_gpu_read(filename) -> object | None:
+    """Try to read a WKT file using the GPU byte-classification pipeline.
+
+    WKT files contain one geometry per line with no attribute columns.
+    Returns a GeoDataFrame with a geometry column only, or None on failure.
+    """
+    try:
+        from .arrow import geoseries_from_owned
+        from .kvikio_reader import read_file_to_device
+
+        file_path = Path(filename)
+        file_size = file_path.stat().st_size
+        result = read_file_to_device(file_path, file_size)
+        d_bytes = result.device_bytes
+
+        from .wkt_gpu import read_wkt_gpu
+
+        owned = read_wkt_gpu(d_bytes)
+        geom_series = geoseries_from_owned(owned, name="geometry")
+
+        import vibespatial.api as geopandas
+
+        gdf = geopandas.GeoDataFrame(geometry=geom_series)
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="wkt_gpu_byte_classify_adapter",
+            reason=(
+                "GPU byte-classification: direct GPU parsing of WKT with "
+                "NVRTC kernels, one geometry per line."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
+def _try_csv_gpu_read(filename) -> object | None:
+    """Try to read a CSV file using the GPU byte-classification pipeline.
+
+    Performs GPU structural analysis to find lat/lon or WKT geometry
+    columns, then extracts spatial data and assembles a GeoDataFrame.
+    Returns None on failure to fall through to CPU.
+    """
+    try:
+        from .arrow import geoseries_from_owned
+        from .kvikio_reader import read_file_to_device
+
+        file_path = Path(filename)
+        file_size = file_path.stat().st_size
+        result = read_file_to_device(file_path, file_size)
+        d_bytes = result.device_bytes
+
+        from .csv_gpu import read_csv_gpu
+
+        csv_result = read_csv_gpu(d_bytes)
+        geom_series = geoseries_from_owned(csv_result.geometry, name="geometry")
+
+        import vibespatial.api as geopandas
+
+        gdf = geopandas.GeoDataFrame(geometry=geom_series)
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="csv_gpu_byte_classify_adapter",
+            reason=(
+                "GPU byte-classification: GPU structural analysis and "
+                "coordinate extraction for CSV spatial data."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
+def _try_kml_gpu_read(filename) -> object | None:
+    """Try to read a KML file using the GPU byte-classification pipeline.
+
+    KML files are XML-based with Placemark elements containing geometry.
+    Returns a GeoDataFrame with a geometry column only, or None on failure.
+    """
+    try:
+        from .arrow import geoseries_from_owned
+        from .kvikio_reader import read_file_to_device
+
+        file_path = Path(filename)
+        file_size = file_path.stat().st_size
+        result = read_file_to_device(file_path, file_size)
+        d_bytes = result.device_bytes
+
+        from .kml_gpu import read_kml_gpu
+
+        owned = read_kml_gpu(d_bytes)
+        geom_series = geoseries_from_owned(owned, name="geometry")
+
+        import vibespatial.api as geopandas
+
+        gdf = geopandas.GeoDataFrame(geometry=geom_series)
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="kml_gpu_byte_classify_adapter",
+            reason=(
+                "GPU byte-classification: direct GPU parsing of KML with "
+                "NVRTC kernels, XML structural analysis and coordinate extraction."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
+# Minimum file size (in bytes) for GPU fast-path routing.
+# Below this threshold, let the CPU handle it -- kernel launch overhead
+# dominates for small files.
+_GPU_MIN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
 def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
     """Try to read a vector file using the GPU-dominant owned path.
 
@@ -233,18 +354,39 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
     if not runtime.available():
         return None
 
-    # GeoJSON GPU byte-classify fast path: direct GPU parsing of the entire file,
-    # bypassing pyogrio entirely. Only for unfiltered reads of files > 10 MB.
-    if (
-        plan.format is IOFormat.GEOJSON
-        and bbox is None
-        and columns is None
-        and rows is None
-    ):
+    # Format-specific GPU fast paths: direct GPU parsing of the entire file,
+    # bypassing pyogrio entirely.  Only for unfiltered reads.
+    if bbox is None and columns is None and rows is None:
+        file_path = Path(filename)
         try:
-            file_path = Path(filename)
-            if file_path.stat().st_size > 10 * 1024 * 1024:
+            file_size = file_path.stat().st_size
+        except OSError:
+            file_size = 0
+
+        # WKT: always route to GPU (pyogrio/GDAL does not support raw WKT)
+        if plan.format is IOFormat.WKT:
+            return _try_wkt_gpu_read(filename)
+
+        # CSV: route to GPU for files above size threshold
+        if plan.format is IOFormat.CSV and file_size > _GPU_MIN_FILE_SIZE:
+            gpu_result = _try_csv_gpu_read(filename)
+            if gpu_result is not None:
+                return gpu_result
+            # fall through to pyogrio CPU path
+
+        # KML: route to GPU for files above size threshold
+        if plan.format is IOFormat.KML and file_size > _GPU_MIN_FILE_SIZE:
+            gpu_result = _try_kml_gpu_read(filename)
+            if gpu_result is not None:
+                return gpu_result
+            # fall through to pyogrio CPU path
+
+        # GeoJSON GPU byte-classify fast path: direct GPU parsing of the
+        # entire file for files > 10 MB.
+        if plan.format is IOFormat.GEOJSON and file_size > _GPU_MIN_FILE_SIZE:
+            try:
                 from .geojson_gpu import read_geojson_gpu
+
                 gpu_result = read_geojson_gpu(file_path)
                 # GeoJSON is EPSG:4326 by spec (RFC 7946)
                 geom_series = geoseries_from_owned(
@@ -252,6 +394,7 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
                 )
                 props_df = gpu_result.extract_properties_dataframe()
                 import vibespatial.api as geopandas
+
                 gdf = geopandas.GeoDataFrame(props_df, geometry=geom_series)
                 record_dispatch_event(
                     surface="geopandas.read_file",
@@ -264,8 +407,8 @@ def _try_gpu_read_file(filename, *, plan, bbox, columns, rows, **kwargs):
                     selected=ExecutionMode.GPU,
                 )
                 return gdf
-        except Exception:
-            pass  # fall through to pyogrio GPU WKB path
+            except Exception:
+                pass  # fall through to pyogrio GPU WKB path
 
     try:
         skip_features, max_features = _normalize_feature_window(rows)
@@ -359,9 +502,10 @@ def read_vector_file(
 ):
     """Read a vector file into a GeoDataFrame.
 
-    Supports Shapefile, GeoPackage, GeoJSON, and any format readable by
-    pyogrio/fiona.  For GeoJSON and Shapefile inputs the reader attempts a
-    GPU-accelerated owned path first; other formats fall back to pyogrio.
+    Supports Shapefile, GeoPackage, GeoJSON, WKT, CSV, KML, and any
+    format readable by pyogrio/fiona.  For GeoJSON, Shapefile, WKT, CSV,
+    and KML inputs the reader attempts a GPU-accelerated owned path first;
+    other formats fall back to pyogrio.
 
     Aliased as ``vibespatial.read_file()``.
 
@@ -388,13 +532,29 @@ def read_vector_file(
     """
     plan = plan_vector_file_io(filename, operation=IOOperation.READ)
 
-    # Try GPU-dominant owned path for GeoJSON and Shapefile.
-    if plan.format in {IOFormat.GEOJSON, IOFormat.SHAPEFILE} and mask is None and engine is None:
+    # Try GPU-dominant owned path for supported formats.
+    _GPU_DISPATCH_FORMATS = {
+        IOFormat.GEOJSON,
+        IOFormat.SHAPEFILE,
+        IOFormat.WKT,
+        IOFormat.CSV,
+        IOFormat.KML,
+    }
+    if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         gpu_result = _try_gpu_read_file(
             filename, plan=plan, bbox=bbox, columns=columns, rows=rows, **kwargs
         )
         if gpu_result is not None:
             return gpu_result
+
+    # WKT files have no CPU fallback (pyogrio/GDAL does not support raw WKT).
+    # If the GPU path returned None, raise an informative error.
+    if plan.format is IOFormat.WKT:
+        raise RuntimeError(
+            f"Cannot read WKT file '{filename}': GPU runtime is required for raw "
+            "WKT files (pyogrio/GDAL does not support this format). Ensure a CUDA "
+            "GPU is available and CuPy is installed."
+        )
 
     record_dispatch_event(
         surface="geopandas.read_file",

@@ -4406,6 +4406,25 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/03-27-2026-gpu-parse-epic/full-suite.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "27",
+        "benchmark",
+        "epic",
+        "full",
+        "gpu",
+        "json",
+        "parse",
+        "results",
+        "suite"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-03-18-full-baseline/REPORT.md",
       "referenced_by": [],
       "symbols": [],
@@ -16322,6 +16341,9 @@
         "read_shapefile_owned",
         "_normalize_driver",
         "plan_vector_file_io",
+        "_try_wkt_gpu_read",
+        "_try_csv_gpu_read",
+        "_try_kml_gpu_read",
         "_try_gpu_read_file",
         "read_vector_file",
         "write_vector_file",
@@ -16331,12 +16353,14 @@
         "arrow",
         "benchmark",
         "column",
+        "csv",
         "driver",
         "feature",
         "geometry",
         "gpu",
         "ingest",
         "io",
+        "kml",
         "normalize",
         "owned",
         "plan",
@@ -16353,6 +16377,7 @@
         "vectorfileplan",
         "vibespatial",
         "window",
+        "wkt",
         "write"
       ]
     },
@@ -22898,6 +22923,31 @@
         "tokenizer",
         "uses",
         "wkb"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_io_gpu_dispatch.py",
+      "referenced_by": [],
+      "symbols": [
+        "TestWktGpuDispatch",
+        "TestCsvGpuDispatch",
+        "TestKmlGpuDispatch",
+        "TestFormatDetection",
+        "TestExistingFormatsUnbroken"
+      ],
+      "tokens": [
+        "dispatch",
+        "gpu",
+        "io",
+        "py",
+        "test",
+        "testcsvgpudispatch",
+        "testexistingformatsunbroken",
+        "testformatdetection",
+        "testkmlgpudispatch",
+        "tests",
+        "testwktgpudispatch"
       ]
     },
     {
