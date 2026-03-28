@@ -2232,3 +2232,333 @@ class TestEndToEndWithRelations:
             assert result.relation_ids is None
         finally:
             path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Multi-block PBF builder helpers (for streaming pipeline tests)
+# ---------------------------------------------------------------------------
+
+
+def _build_multi_block_pbf(
+    blocks_data: list[tuple[list[int], list[int], list[int], int]],
+    compress: bool = True,
+) -> bytes:
+    """Build a PBF file with multiple OSMData blocks.
+
+    Each entry in *blocks_data* is
+    ``(id_deltas, lat_deltas, lon_deltas, granularity)``.
+    Each produces a separate OSMData block in the file, so the streaming
+    pipeline must process them in separate batches.
+    """
+    header = _build_osm_header()
+    result = header
+
+    for id_deltas, lat_deltas, lon_deltas, granularity in blocks_data:
+        dense = _build_dense_nodes(id_deltas, lat_deltas, lon_deltas)
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block(group, granularity=granularity)
+        data_block = _build_pbf_block("OSMData", pblock, compress=compress)
+        result += data_block
+
+    return result
+
+
+def _build_multi_block_pbf_with_ways(
+    node_blocks: list[tuple[list[int], list[int], list[int]]],
+    way_block_data: list[tuple[list[tuple[int, list[int]]], list[bytes] | None]],
+    granularity: int = 100,
+    compress: bool = True,
+) -> bytes:
+    """Build a PBF file with multiple OSMData blocks containing nodes and ways.
+
+    *node_blocks*: list of (id_deltas, lat_deltas, lon_deltas) per block.
+    *way_block_data*: list of (ways, stringtable_entries) per block.
+      Each ``ways`` is a list of (way_id, absolute_refs) tuples.
+    Nodes and ways are interleaved into separate blocks.
+    """
+    header = _build_osm_header()
+    result = header
+
+    # Emit node-only blocks first
+    for id_deltas, lat_deltas, lon_deltas in node_blocks:
+        dense = _build_dense_nodes(id_deltas, lat_deltas, lon_deltas)
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block(group, granularity=granularity)
+        data_block = _build_pbf_block("OSMData", pblock, compress=compress)
+        result += data_block
+
+    # Emit way-only blocks
+    for ways, st_entries in way_block_data:
+        way_messages = []
+        for way_id, absolute_refs in ways:
+            ref_deltas = [absolute_refs[0]]
+            for i in range(1, len(absolute_refs)):
+                ref_deltas.append(absolute_refs[i] - absolute_refs[i - 1])
+            way_messages.append(_build_way(way_id, ref_deltas))
+        ways_group = _build_primitive_group_with_ways(way_messages)
+        pblock = _build_primitive_block_with_stringtable(
+            [ways_group],
+            stringtable_entries=st_entries,
+            granularity=granularity,
+        )
+        data_block = _build_pbf_block("OSMData", pblock, compress=compress)
+        result += data_block
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Tests: Streaming block pipeline
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingPipeline:
+    """Tests for the streaming block decode pipeline.
+
+    Verifies that processing blocks in small batches produces identical
+    results to processing them all at once, and that the pipeline
+    handles multi-block PBF files correctly.
+    """
+
+    @needs_gpu
+    def test_multi_block_nodes_match_single_block(self):
+        """Multiple blocks produce the same result as one combined block."""
+        from vibespatial.io.osm_gpu import read_osm_pbf_nodes
+
+        # Block 1: nodes 100, 101 at (40.0, -74.0), (40.1, -74.01)
+        # Block 2: nodes 200, 201 at (50.0, -60.0), (50.2, -59.97)
+        multi_pbf = _build_multi_block_pbf([
+            ([100, 1], [400000000, 1000000], [-740000000, -100000], 100),
+            ([200, 1], [500000000, 2000000], [-600000000, 300000], 100),
+        ])
+        multi_path = _write_temp_pbf(multi_pbf)
+
+        try:
+            result = read_osm_pbf_nodes(multi_path)
+
+            assert result.n_nodes == 4
+
+            ids = cp.asnumpy(result.node_ids)
+            np.testing.assert_array_equal(ids, [100, 101, 200, 201])
+
+            ds = result.nodes.device_state
+            pt = ds.families[GeometryFamily.POINT]
+            y = cp.asnumpy(pt.y)  # latitude
+            x = cp.asnumpy(pt.x)  # longitude
+
+            # Block 1 coordinates
+            np.testing.assert_allclose(y[:2], [40.0, 40.1], rtol=1e-10)
+            np.testing.assert_allclose(x[:2], [-74.0, -74.01], rtol=1e-10)
+
+            # Block 2 coordinates (independent delta reset)
+            np.testing.assert_allclose(y[2:], [50.0, 50.2], rtol=1e-10)
+            np.testing.assert_allclose(x[2:], [-60.0, -59.97], rtol=1e-10)
+        finally:
+            multi_path.unlink()
+
+    @needs_gpu
+    def test_three_blocks_with_varying_sizes(self):
+        """Three blocks with 1, 2, and 3 nodes respectively."""
+        from vibespatial.io.osm_gpu import read_osm_pbf_nodes
+
+        multi_pbf = _build_multi_block_pbf([
+            # Block 1: 1 node (id=10, lat=1.0, lon=2.0)
+            ([10], [10000000], [20000000], 100),
+            # Block 2: 2 nodes (id=20, 21, lat=3.0, 3.1, lon=4.0, 4.1)
+            ([20, 1], [30000000, 1000000], [40000000, 1000000], 100),
+            # Block 3: 3 nodes (id=30, 31, 32)
+            ([30, 1, 1], [50000000, 100000, 200000], [60000000, 100000, 200000], 100),
+        ])
+        path = _write_temp_pbf(multi_pbf)
+
+        try:
+            result = read_osm_pbf_nodes(path)
+            assert result.n_nodes == 6
+
+            ids = cp.asnumpy(result.node_ids)
+            np.testing.assert_array_equal(ids, [10, 20, 21, 30, 31, 32])
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_single_block_unchanged(self):
+        """Single-block PBF is handled identically by the streaming pipeline."""
+        from vibespatial.io.osm_gpu import read_osm_pbf_nodes
+
+        pbf = _build_test_pbf(
+            id_deltas=[42, 1, 1],
+            lat_deltas=[400000000, 1000000, 2000000],
+            lon_deltas=[-740000000, -100000, -200000],
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf_nodes(path)
+            assert result.n_nodes == 3
+
+            ids = cp.asnumpy(result.node_ids)
+            np.testing.assert_array_equal(ids, [42, 43, 44])
+
+            ds = result.nodes.device_state
+            pt = ds.families[GeometryFamily.POINT]
+            y = cp.asnumpy(pt.y)
+            np.testing.assert_allclose(y, [40.0, 40.1, 40.3], rtol=1e-10)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multi_block_read_osm_pbf_with_ways(self):
+        """read_osm_pbf works correctly when nodes and ways are in separate blocks."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Build a multi-block PBF:
+        # Block 1: 3 nodes (id=1,2,3 at known positions)
+        # Block 2: 1 way referencing those nodes
+        node_blocks = [
+            ([1, 1, 1], [0, 10000000, 20000000], [0, 10000000, 20000000]),
+        ]
+        way_block_data = [
+            ([(500, [1, 2, 3])], None),
+        ]
+
+        pbf = _build_multi_block_pbf_with_ways(node_blocks, way_block_data)
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+
+            assert result.n_nodes == 3
+            assert result.nodes is not None
+
+            assert result.n_ways == 1
+            assert result.ways is not None
+            assert result.way_ids is not None
+
+            way_ids = cp.asnumpy(result.way_ids)
+            assert way_ids[0] == 500
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_batch_size_boundary(self):
+        """5 blocks exercises batch boundary (batch_size=4: 4+1 blocks)."""
+        from vibespatial.io.osm_gpu import _STREAM_BATCH_SIZE, read_osm_pbf_nodes
+
+        # Create exactly _STREAM_BATCH_SIZE + 1 blocks
+        n_blocks = _STREAM_BATCH_SIZE + 1
+        blocks_data = []
+        expected_ids = []
+        base_id = 100
+        for i in range(n_blocks):
+            node_id = base_id + i * 100
+            expected_ids.append(node_id)
+            blocks_data.append(
+                ([node_id], [10000000 * (i + 1)], [20000000 * (i + 1)], 100),
+            )
+
+        multi_pbf = _build_multi_block_pbf(blocks_data)
+        path = _write_temp_pbf(multi_pbf)
+
+        try:
+            result = read_osm_pbf_nodes(path)
+            assert result.n_nodes == n_blocks
+
+            ids = cp.asnumpy(result.node_ids)
+            np.testing.assert_array_equal(ids, expected_ids)
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_empty_blocks_skipped(self):
+        """Blocks with no DenseNodes are gracefully skipped."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Build a PBF with:
+        # Block 1: nodes only (id=1)
+        # Block 2: ways only (no nodes) -- the streaming node pipeline skips it
+        node_blocks = [
+            ([1, 1, 1], [0, 10000000, 20000000], [0, 10000000, 20000000]),
+        ]
+        way_block_data = [
+            ([(100, [1, 2, 3])], None),
+        ]
+
+        pbf = _build_multi_block_pbf_with_ways(node_blocks, way_block_data)
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_nodes == 3
+            assert result.n_ways == 1
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multi_block_different_granularities(self):
+        """Blocks with different granularities are scaled correctly."""
+        from vibespatial.io.osm_gpu import read_osm_pbf_nodes
+
+        # Block 1: granularity=100, delta=10000000 -> lat = 10000000 * 100 * 1e-9 = 1.0
+        # Block 2: granularity=1000, delta=1000000 -> lat = 1000000 * 1000 * 1e-9 = 1.0
+        # Both should produce lat=1.0 despite different granularities
+        multi_pbf = _build_multi_block_pbf([
+            ([1], [10000000], [20000000], 100),
+            ([2], [1000000], [2000000], 1000),
+        ])
+        path = _write_temp_pbf(multi_pbf)
+
+        try:
+            result = read_osm_pbf_nodes(path)
+            assert result.n_nodes == 2
+
+            ds = result.nodes.device_state
+            pt = ds.families[GeometryFamily.POINT]
+            y = cp.asnumpy(pt.y)
+            x = cp.asnumpy(pt.x)
+
+            # Both blocks produce the same lat/lon
+            np.testing.assert_allclose(y, [1.0, 1.0], rtol=1e-10)
+            np.testing.assert_allclose(x, [2.0, 2.0], rtol=1e-10)
+        finally:
+            path.unlink()
+
+    def test_read_and_decompress_batch(self):
+        """_read_and_decompress_batch reads only specified blocks."""
+        from vibespatial.io.osm_gpu import (
+            _parse_block_index,
+            _read_and_decompress_batch,
+        )
+
+        # Build a multi-block PBF with 3 data blocks
+        multi_pbf = _build_multi_block_pbf([
+            ([1], [100], [200], 100),
+            ([2], [300], [400], 100),
+            ([3], [500], [600], 100),
+        ])
+        path = _write_temp_pbf(multi_pbf)
+
+        try:
+            block_index = _parse_block_index(path)
+            data_blocks = [bi for bi in block_index if bi.block_type == "OSMData"]
+            assert len(data_blocks) == 3
+
+            # Read only the first block
+            batch1 = _read_and_decompress_batch(path, data_blocks[:1])
+            assert len(batch1) == 1
+
+            # Read blocks 2 and 3
+            batch23 = _read_and_decompress_batch(path, data_blocks[1:])
+            assert len(batch23) == 2
+
+            # Each should be non-empty decompressed data
+            assert all(len(b) > 0 for b in batch1)
+            assert all(len(b) > 0 for b in batch23)
+        finally:
+            path.unlink()
+
+    def test_stream_batch_size_is_positive(self):
+        """Smoke test: _STREAM_BATCH_SIZE is a positive integer."""
+        from vibespatial.io.osm_gpu import _STREAM_BATCH_SIZE
+
+        assert isinstance(_STREAM_BATCH_SIZE, int)
+        assert _STREAM_BATCH_SIZE >= 1

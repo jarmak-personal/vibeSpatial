@@ -615,6 +615,114 @@ def _read_and_decompress_blocks(
     return results
 
 
+def _read_and_decompress_batch(
+    path: Path,
+    blocks: list[BlockInfo],
+) -> list[bytes]:
+    """Read and decompress a specific batch of OSMData blocks.
+
+    Unlike ``_read_and_decompress_blocks`` which reads all OSMData blocks,
+    this reads only the blocks in *blocks* (which must already be filtered
+    to OSMData).  Used by the streaming pipeline to limit peak host memory.
+    """
+    results: list[bytes] = []
+    with open(path, "rb") as f:
+        for info in blocks:
+            blob_offset = info.offset + 4 + info.blob_header_size
+            f.seek(blob_offset)
+            blob_data = f.read(info.blob_size)
+            results.append(_decompress_blob(blob_data))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Streaming block pipeline
+# ---------------------------------------------------------------------------
+
+_STREAM_BATCH_SIZE = 4  # blocks per batch -- balances memory vs. overhead
+
+
+def _stream_decode_nodes(
+    path: Path,
+    block_index: list[BlockInfo],
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray] | None:
+    """Stream-decode DenseNodes from PBF blocks in batches.
+
+    Processes blocks in groups of ``_STREAM_BATCH_SIZE`` to bound peak host
+    memory.  Each batch is decompressed, parsed for DenseNodes, varint-decoded
+    on GPU, delta-decoded (cumsum), and scaled.  Results are accumulated as
+    device-resident CuPy array chunks and concatenated at the end.
+
+    Returns ``(d_all_ids, d_all_lat, d_all_lon)`` -- concatenated device
+    arrays -- or ``None`` if no nodes were found.
+    """
+    data_blocks = [bi for bi in block_index if bi.block_type == "OSMData"]
+
+    id_chunks: list[cp.ndarray] = []
+    lat_chunks: list[cp.ndarray] = []
+    lon_chunks: list[cp.ndarray] = []
+
+    for batch_start in range(0, len(data_blocks), _STREAM_BATCH_SIZE):
+        batch = data_blocks[batch_start : batch_start + _STREAM_BATCH_SIZE]
+
+        # Read + decompress this batch only
+        raw_blocks = _read_and_decompress_batch(path, batch)
+
+        # Extract DenseNodes fields (CPU protobuf parsing)
+        dense_blocks = _extract_dense_nodes_blocks(raw_blocks)
+        del raw_blocks  # free decompressed memory immediately
+
+        if not dense_blocks:
+            continue
+
+        # GPU varint decode + per-block cumsum + scale
+        result = _gpu_delta_decode_and_scale(dense_blocks)
+        if result is not None:
+            d_ids, d_lat, d_lon = result
+            id_chunks.append(d_ids)
+            lat_chunks.append(d_lat)
+            lon_chunks.append(d_lon)
+
+    if not id_chunks:
+        return None
+
+    # Concatenate all batch results (Tier 2 CuPy -- device-only)
+    d_all_ids = cp.concatenate(id_chunks) if len(id_chunks) > 1 else id_chunks[0]
+    d_all_lat = cp.concatenate(lat_chunks) if len(lat_chunks) > 1 else lat_chunks[0]
+    d_all_lon = cp.concatenate(lon_chunks) if len(lon_chunks) > 1 else lon_chunks[0]
+
+    return d_all_ids, d_all_lat, d_all_lon
+
+
+def _stream_extract_ways_and_relations(
+    path: Path,
+    block_index: list[BlockInfo],
+) -> tuple[list[WayBlock], list[RelationBlock]]:
+    """Stream-extract Way and Relation data from PBF blocks in batches.
+
+    Way and Relation data is typically much smaller than DenseNodes (~10%
+    and ~1% of file data respectively), so results are accumulated as
+    CPU-side lists.  Decompressed block bytes are freed between batches.
+
+    Returns ``(all_way_blocks, all_relation_blocks)``.
+    """
+    data_blocks = [bi for bi in block_index if bi.block_type == "OSMData"]
+
+    all_way_blocks: list[WayBlock] = []
+    all_relation_blocks: list[RelationBlock] = []
+
+    for batch_start in range(0, len(data_blocks), _STREAM_BATCH_SIZE):
+        batch = data_blocks[batch_start : batch_start + _STREAM_BATCH_SIZE]
+
+        raw_blocks = _read_and_decompress_batch(path, batch)
+
+        all_way_blocks.extend(_extract_way_blocks(raw_blocks))
+        all_relation_blocks.extend(_extract_relation_blocks(raw_blocks))
+        del raw_blocks  # free decompressed memory
+
+    return all_way_blocks, all_relation_blocks
+
+
 # ---------------------------------------------------------------------------
 # CPU: Protobuf field extraction -- locate DenseNodes within PrimitiveBlock
 # ---------------------------------------------------------------------------
@@ -2089,31 +2197,20 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
     if not path.exists():
         raise FileNotFoundError(f"PBF file not found: {path}")
 
-    # Phase 1: CPU -- parse block index
+    # Phase 1: CPU -- parse block index (lightweight, sequential)
     block_index = _parse_block_index(path)
-    logger.info(
-        "OSM PBF: %d blocks (%d OSMData)",
-        len(block_index),
-        sum(1 for b in block_index if b.block_type == "OSMData"),
-    )
+    n_data = sum(1 for b in block_index if b.block_type == "OSMData")
+    logger.info("OSM PBF: %d blocks (%d OSMData)", len(block_index), n_data)
 
-    # Phase 2: CPU -- decompress all OSMData blocks
-    raw_blocks = _read_and_decompress_blocks(path, block_index)
-    logger.info("OSM PBF: decompressed %d data blocks", len(raw_blocks))
+    # Phase 2-5: Streaming decode -- process blocks in batches of
+    # _STREAM_BATCH_SIZE to bound peak host memory.  Each batch is
+    # decompressed, parsed, GPU-decoded, and freed before the next.
+    nodes_result = _stream_decode_nodes(path, block_index)
 
-    # Phase 3: CPU -- extract DenseNodes field byte ranges
-    dense_blocks = _extract_dense_nodes_blocks(raw_blocks)
-    logger.info("OSM PBF: found %d DenseNodes blocks", len(dense_blocks))
-
-    if not dense_blocks:
+    if nodes_result is None:
         return OsmGpuResult(nodes=None, node_ids=None, n_nodes=0)
 
-    # Phase 4-5: GPU -- varint decode + delta decode + scale
-    result = _gpu_delta_decode_and_scale(dense_blocks)
-    if result is None:
-        return OsmGpuResult(nodes=None, node_ids=None, n_nodes=0)
-
-    d_node_ids, d_lat, d_lon = result
+    d_node_ids, d_lat, d_lon = nodes_result
     n_nodes = int(d_node_ids.shape[0])
     logger.info("OSM PBF: extracted %d nodes", n_nodes)
 
@@ -2130,10 +2227,14 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
 def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     """Extract nodes, ways, and relations from an OSM PBF file.
 
-    Uses a hybrid CPU/GPU pipeline to extract:
+    Uses a hybrid CPU/GPU streaming pipeline to extract:
     - **Nodes** as Point geometries (same pipeline as ``read_osm_pbf_nodes``)
     - **Ways** as LineString (open) or Polygon (closed ring) geometries
     - **Relations** as MultiPolygon geometries (assembled from Way members)
+
+    Blocks are processed in batches of ``_STREAM_BATCH_SIZE`` to bound
+    peak host memory.  A 10 GB PBF file that would previously decompress
+    to 40-80 GB in host RAM now peaks at ~128 MB per batch.
 
     Way and relation coordinate resolution uses a GPU binary-search kernel
     against a sorted node lookup table built from the extracted DenseNodes.
@@ -2153,37 +2254,13 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     if not path.exists():
         raise FileNotFoundError(f"PBF file not found: {path}")
 
-    # Phase 1: CPU -- parse block index
+    # Phase 1: CPU -- parse block index (lightweight, sequential)
     block_index = _parse_block_index(path)
-    logger.info(
-        "OSM PBF: %d blocks (%d OSMData)",
-        len(block_index),
-        sum(1 for b in block_index if b.block_type == "OSMData"),
-    )
+    n_data = sum(1 for b in block_index if b.block_type == "OSMData")
+    logger.info("OSM PBF: %d blocks (%d OSMData)", len(block_index), n_data)
 
-    # Phase 2: CPU -- decompress all OSMData blocks
-    raw_blocks = _read_and_decompress_blocks(path, block_index)
-    logger.info("OSM PBF: decompressed %d data blocks", len(raw_blocks))
-
-    # Phase 3a: CPU -- extract DenseNodes field byte ranges
-    dense_blocks = _extract_dense_nodes_blocks(raw_blocks)
-    logger.info("OSM PBF: found %d DenseNodes blocks", len(dense_blocks))
-
-    # Phase 3b: CPU -- extract Way data
-    way_blocks = _extract_way_blocks(raw_blocks)
-    total_ways = sum(len(wb.way_ids) for wb in way_blocks)
-    logger.info("OSM PBF: found %d Way blocks (%d ways)", len(way_blocks), total_ways)
-
-    # Phase 3c: CPU -- extract Relation data
-    relation_blocks = _extract_relation_blocks(raw_blocks)
-    total_relations = sum(len(rb.relation_ids) for rb in relation_blocks)
-    logger.info(
-        "OSM PBF: found %d Relation blocks (%d relations)",
-        len(relation_blocks), total_relations,
-    )
-
-    # Phase 4-5: GPU -- node varint decode + delta decode + scale
-    nodes_result = _gpu_delta_decode_and_scale(dense_blocks) if dense_blocks else None
+    # Phase 2-5: Streaming node decode -- batched decompression + GPU decode
+    nodes_result = _stream_decode_nodes(path, block_index)
 
     d_node_ids: cp.ndarray | None = None
     d_lat: cp.ndarray | None = None
@@ -2197,7 +2274,19 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
         logger.info("OSM PBF: extracted %d nodes", n_nodes)
         nodes_owned = _assemble_point_geometry(d_lon, d_lat, n_nodes)
 
-    # Phase 6: GPU -- resolve Way coordinates and assemble
+    # Phase 6: Streaming Way + Relation extraction -- batched decompression,
+    # CPU protobuf parsing, decompressed memory freed per-batch.
+    way_blocks, relation_blocks = _stream_extract_ways_and_relations(
+        path, block_index,
+    )
+    total_ways = sum(len(wb.way_ids) for wb in way_blocks)
+    total_relations = sum(len(rb.relation_ids) for rb in relation_blocks)
+    logger.info(
+        "OSM PBF: found %d Way blocks (%d ways), %d Relation blocks (%d relations)",
+        len(way_blocks), total_ways, len(relation_blocks), total_relations,
+    )
+
+    # Phase 7: GPU -- resolve Way coordinates and assemble
     ways_owned: OwnedGeometryArray | None = None
     d_way_ids: cp.ndarray | None = None
     n_ways = 0
@@ -2212,7 +2301,7 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
             "with geometry" if ways_owned is not None else "no resolved geometry",
         )
 
-    # Phase 7: GPU -- resolve Relation Way members and assemble MultiPolygons
+    # Phase 8: GPU -- resolve Relation Way members and assemble MultiPolygons
     relations_owned: OwnedGeometryArray | None = None
     d_relation_ids: cp.ndarray | None = None
     n_relations = 0
