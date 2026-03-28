@@ -753,11 +753,6 @@ _HEX_CHARS: frozenset[int] = frozenset(
     b"0123456789abcdefABCDEF"
 )
 
-# WKT geometry type prefixes (first character of the type name).
-_WKT_LEAD_CHARS: frozenset[int] = frozenset(
-    b"PLMGplmg"  # Point, LineString, MultiPoint, Polygon, GeometryCollection, etc.
-)
-
 
 def _detect_geom_format(
     d_bytes: cp.ndarray,
@@ -807,18 +802,23 @@ def _detect_geom_format(
     if not stripped:
         return "wkt"
 
-    first_char = stripped[0]
-
-    # If the first character is a WKT type-name leader, it is WKT.
-    if first_char in _WKT_LEAD_CHARS:
-        return "wkt"
-
-    # If all non-whitespace characters in the sample are hex digits, treat
-    # the field as hex-encoded WKB.
-    if all(b in _HEX_CHARS for b in stripped):
+    # WKB detection: hex-encoded WKB always starts with byte-order marker
+    # "00" (big-endian) or "01" (little-endian), has even length (two hex
+    # chars per byte), and the rest must be hex digits.  This is much more
+    # specific than "starts with a hex digit" — it rules out city names,
+    # IDs, or other hex-ish strings in a geometry column.
+    if (
+        len(stripped) >= 10  # minimum WKB point is 42 hex chars; 10 is generous floor
+        and stripped[0:2] in (b"00", b"01")
+        and len(stripped) % 2 == 0
+        and all(b in _HEX_CHARS for b in stripped)
+    ):
         return "wkb"
 
-    # Default: backwards-compatible WKT.
+    # Otherwise assume WKT (backwards-compatible default).
+    # This handles: POINT(...), LINESTRING(...), POLYGON(...), etc.
+    # as well as any unrecognized format (will fail at parse time with
+    # a clear error from the WKT parser).
     return "wkt"
 
 
