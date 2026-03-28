@@ -2080,8 +2080,8 @@ class TestRelationMultiPolygon:
             path.unlink()
 
     @needs_gpu
-    def test_relation_referencing_relation_skipped(self):
-        """Relation members of type RELATION are skipped (recursive)."""
+    def test_relation_referencing_missing_relation_still_resolves(self):
+        """A parent relation with an unresolvable child still resolves from its Way members."""
         from vibespatial.io.osm_gpu import read_osm_pbf
 
         node_id_deltas = [1, 1, 1, 1]
@@ -2091,10 +2091,10 @@ class TestRelationMultiPolygon:
         ways = [(100, [1, 2, 3, 4, 1])]
 
         st = [b"", b"outer"]
-        # Way 100 outer + Relation 9999 (type=2=RELATION, should be skipped)
+        # Way 100 outer + Relation 9999 (not in dataset -- gracefully skipped)
         relations = [(5002, [
             (100, 1, 1),    # Way 100, outer
-            (9999, 2, 1),   # Relation 9999, should be skipped
+            (9999, 2, 1),   # Relation 9999, not found -- skipped
         ])]
 
         pbf = _build_test_pbf_with_relations(
@@ -2106,6 +2106,55 @@ class TestRelationMultiPolygon:
         try:
             result = read_osm_pbf(path)
             assert result.n_relations == 1
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_recursive_relation_resolved(self):
+        """A parent relation referencing a child relation merges child's rings."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 8 nodes forming two separate squares:
+        # Square 1 (child): nodes 1-4 at (0,0),(1,0),(1,1),(0,1)
+        # Square 2 (parent's own): nodes 5-8 at (2,0),(3,0),(3,1),(2,1)
+        node_id_deltas = [1, 1, 1, 1, 1, 1, 1, 1]
+        # lat in nanodegrees/granularity: 0, 0, 10M, 10M, 0, 0, 10M, 10M
+        node_lat_deltas = [0, 0, 10000000, 0, -10000000, 0, 10000000, 0]
+        # lon: 0, 10M, 0, -10M, 10M, 10M, 0, -10M  (= 0,1,1,0, 2,3,3,2)
+        node_lon_deltas = [0, 10000000, 0, -10000000, 20000000, 10000000, 0, -10000000]
+
+        # Way 100 = closed ring for square 1: nodes 1->2->3->4->1
+        # Way 200 = closed ring for square 2: nodes 5->6->7->8->5
+        ways = [
+            (100, [1, 2, 3, 4, 1]),
+            (200, [5, 6, 7, 8, 5]),
+        ]
+
+        st = [b"", b"outer"]
+        # Child relation 5001: outer = Way 100 (square 1)
+        # Parent relation 5002: outer = Way 200 (square 2) + outer = Relation 5001
+        relations = [
+            (5001, [(100, 1, 1)]),              # child: Way 100 as outer
+            (5002, [(200, 1, 1), (5001, 2, 1)]),  # parent: Way 200 + child Relation 5001
+        ]
+
+        pbf = _build_test_pbf_with_relations(
+            node_id_deltas, node_lat_deltas, node_lon_deltas,
+            ways, relations, stringtable_entries=st,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            # Both relations should resolve
+            assert result.n_relations == 2
+
+            # Parent relation (5002) should be a MultiPolygon with 2 outer parts
+            # (one from Way 200, one from child Relation 5001's Way 100)
+            rel_ids = cp.asnumpy(result.relation_ids)
+            # Check both relation IDs are present
+            assert 5001 in rel_ids
+            assert 5002 in rel_ids
         finally:
             path.unlink()
 

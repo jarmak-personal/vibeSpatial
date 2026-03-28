@@ -1124,6 +1124,36 @@ def _chain_ways_to_rings(way_ref_lists: list[list[int]]) -> list[list[int]]:
     return rings
 
 
+def _collect_way_refs(
+    rel_id: int,
+    members: list[RelationMember],
+    way_lookup: dict[int, list[int]],
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Collect outer/inner Way ref lists for a relation's Way-type members."""
+    outer_way_refs: list[list[int]] = []
+    inner_way_refs: list[list[int]] = []
+
+    for m in members:
+        if m.member_type != _MEMBER_TYPE_WAY:
+            continue
+
+        refs = way_lookup.get(m.member_id)
+        if refs is None:
+            logger.debug(
+                "Relation %d: Way member %d not found in dataset, skipping",
+                rel_id, m.member_id,
+            )
+            continue
+
+        role = m.role.strip().lower()
+        if role == "outer" or role == "":
+            outer_way_refs.append(refs)
+        elif role == "inner":
+            inner_way_refs.append(refs)
+
+    return outer_way_refs, inner_way_refs
+
+
 # ---------------------------------------------------------------------------
 # GPU: Relation (MultiPolygon) processing pipeline
 # ---------------------------------------------------------------------------
@@ -1158,64 +1188,109 @@ def _process_relations_gpu(
     # Build Way ID -> node refs lookup
     way_lookup = _build_way_id_to_refs(way_blocks)
 
-    # Filter to multipolygon relations (those with Way members that have
-    # outer/inner/"" roles).  Also skip relations that reference other
-    # relations (recursive -- too complex for this pipeline).
+    # Resolve relations in two passes:
     #
-    # For each multipolygon relation, produce:
+    # Pass 1: Resolve relations whose members are all Ways (no recursion).
+    #   This handles ~99.5% of multipolygon relations.
+    #
+    # Pass 2: Resolve relations that reference other relations (type=2).
+    #   Look up the already-resolved child relation's rings from pass 1
+    #   and merge them into the parent.  This handles administrative
+    #   boundaries and other "super-relations" (single level of recursion).
+    #
+    # For each resolved relation, produce:
     #   - List of outer rings (each a list of node refs)
     #   - List of inner rings (each a list of node refs)
-    #
-    # Then flatten into the MultiPolygon offset hierarchy:
-    #   geometry_offsets: row -> polygon part count (one polygon per outer ring)
-    #   part_offsets: polygon -> ring count (1 outer + N inner rings)
-    #   ring_offsets: ring -> coordinate count
 
-    valid_relation_ids: list[int] = []
-    # Per-relation list of (outer_rings, inner_rings) where each ring is a list of node refs
-    relation_ring_data: list[tuple[list[list[int]], list[list[int]]]] = []
+    # Index for quick lookup: relation_id -> index in all_relation_ids
+    rel_id_to_idx = {rid: i for i, rid in enumerate(all_relation_ids)}
 
+    # Resolved ring data keyed by relation ID (populated in pass 1, read in pass 2)
+    resolved_rings: dict[int, tuple[list[list[int]], list[list[int]]]] = {}
+
+    # Track which relations have sub-relation members (need pass 2)
+    has_sub_relations: list[int] = []  # relation IDs needing pass 2
+
+    # ------------------------------------------------------------------
+    # Pass 1: Resolve Way-only relations
+    # ------------------------------------------------------------------
     for rel_id, members in zip(all_relation_ids, all_members):
-        # Collect Way members by role
-        outer_way_refs: list[list[int]] = []
-        inner_way_refs: list[list[int]] = []
+        has_type2 = any(m.member_type == _MEMBER_TYPE_RELATION for m in members)
+        if has_type2:
+            has_sub_relations.append(rel_id)
+            continue  # defer to pass 2
 
+        outer_way_refs, inner_way_refs = _collect_way_refs(
+            rel_id, members, way_lookup,
+        )
+
+        if not outer_way_refs:
+            continue
+
+        outer_rings = _chain_ways_to_rings(outer_way_refs)
+        inner_rings = _chain_ways_to_rings(inner_way_refs) if inner_way_refs else []
+
+        if outer_rings:
+            resolved_rings[rel_id] = (outer_rings, inner_rings)
+
+    # ------------------------------------------------------------------
+    # Pass 2: Resolve relations with sub-relation members
+    # ------------------------------------------------------------------
+    for rel_id in has_sub_relations:
+        idx = rel_id_to_idx[rel_id]
+        members = all_members[idx]
+
+        # Start with Way members (same as pass 1)
+        outer_way_refs, inner_way_refs = _collect_way_refs(
+            rel_id, members, way_lookup,
+        )
+
+        # Merge rings from resolved child relations
         for m in members:
-            if m.member_type == _MEMBER_TYPE_RELATION:
-                # Skip recursive relation references
-                continue
-            if m.member_type != _MEMBER_TYPE_WAY:
+            if m.member_type != _MEMBER_TYPE_RELATION:
                 continue
 
-            refs = way_lookup.get(m.member_id)
-            if refs is None:
+            child_rings = resolved_rings.get(m.member_id)
+            if child_rings is None:
                 logger.debug(
-                    "Relation %d: Way member %d not found in dataset, skipping",
+                    "Relation %d: child relation %d not resolved "
+                    "(missing or deeper recursion), skipping",
                     rel_id, m.member_id,
                 )
                 continue
 
+            child_outer, child_inner = child_rings
             role = m.role.strip().lower()
             if role == "outer" or role == "":
-                # Empty role defaults to "outer" per OSM convention
-                outer_way_refs.append(refs)
+                # Child's outer rings become outer rings of the parent
+                for ring in child_outer:
+                    outer_way_refs.append(ring)  # already closed rings, no chaining needed
+                for ring in child_inner:
+                    inner_way_refs.append(ring)
             elif role == "inner":
-                inner_way_refs.append(refs)
-            # Other roles (e.g., "subarea") are skipped
+                # Child's outer rings become inner rings of the parent
+                for ring in child_outer:
+                    inner_way_refs.append(ring)
 
         if not outer_way_refs:
-            # No outer rings -- skip this relation
             continue
 
-        # Chain Ways into closed rings
+        # Chain any unchained Way refs; already-closed rings from children
+        # pass through _chain_ways_to_rings unchanged (they're already closed).
         outer_rings = _chain_ways_to_rings(outer_way_refs)
         inner_rings = _chain_ways_to_rings(inner_way_refs) if inner_way_refs else []
 
-        if not outer_rings:
-            continue
+        if outer_rings:
+            resolved_rings[rel_id] = (outer_rings, inner_rings)
 
-        valid_relation_ids.append(rel_id)
-        relation_ring_data.append((outer_rings, inner_rings))
+    # Build the final output from all resolved relations
+    valid_relation_ids: list[int] = []
+    relation_ring_data: list[tuple[list[list[int]], list[list[int]]]] = []
+
+    for rel_id in all_relation_ids:
+        if rel_id in resolved_rings:
+            valid_relation_ids.append(rel_id)
+            relation_ring_data.append(resolved_rings[rel_id])
 
     n_relations = len(valid_relation_ids)
     if n_relations == 0:

@@ -10916,255 +10916,6 @@
     },
     {
       "kind": "script",
-      "path": "scripts/_e2e_make_valid_bench.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "main"
-      ],
-      "tokens": [
-        "bench",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "shapely",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_bench2.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "main"
-      ],
-      "tokens": [
-        "bench2",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "shapely",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_bench3.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "main"
-      ],
-      "tokens": [
-        "bench3",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "shapely",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_benchmark.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "main"
-      ],
-      "tokens": [
-        "benchmark",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "shapely",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_benchmark2.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "main"
-      ],
-      "tokens": [
-        "benchmark2",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "shapely",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_benchmark3.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties",
-        "main"
-      ],
-      "tokens": [
-        "benchmark3",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_benchmark4.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties",
-        "main"
-      ],
-      "tokens": [
-        "benchmark4",
-        "bowties",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_e2e_make_valid_debug.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "main"
-      ],
-      "tokens": [
-        "bowties",
-        "debug",
-        "e2e",
-        "main",
-        "make",
-        "py",
-        "scripts",
-        "shapely",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_profile_make_valid_detailed.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "sync_time",
-        "main"
-      ],
-      "tokens": [
-        "bowties",
-        "detailed",
-        "main",
-        "make",
-        "profile",
-        "py",
-        "scripts",
-        "shapely",
-        "sync",
-        "time",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_profile_make_valid_stages.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties",
-        "sync_time",
-        "main"
-      ],
-      "tokens": [
-        "bowties",
-        "main",
-        "make",
-        "profile",
-        "py",
-        "scripts",
-        "stages",
-        "sync",
-        "time",
-        "valid"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_profile_output_assembly.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "sync_time",
-        "main"
-      ],
-      "tokens": [
-        "assembly",
-        "bowties",
-        "main",
-        "make",
-        "output",
-        "profile",
-        "py",
-        "scripts",
-        "shapely",
-        "sync",
-        "time"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/_profile_repolygonize_detail.py",
-      "referenced_by": [],
-      "symbols": [
-        "make_bowties_shapely",
-        "sync_time",
-        "main"
-      ],
-      "tokens": [
-        "bowties",
-        "detail",
-        "main",
-        "make",
-        "profile",
-        "py",
-        "repolygonize",
-        "scripts",
-        "shapely",
-        "sync",
-        "time"
-      ]
-    },
-    {
-      "kind": "script",
       "path": "scripts/bench_compact_gather.py",
       "referenced_by": [],
       "symbols": [
@@ -17394,7 +17145,7 @@
         "_extract_relation_blocks",
         "_build_way_id_to_refs",
         "_chain_ways_to_rings",
-        "_process_relations_gpu"
+        "_collect_way_refs"
       ],
       "tokens": [
         "blob",
@@ -17403,6 +17154,7 @@
         "blocks",
         "build",
         "chain",
+        "collect",
         "cpu",
         "decode",
         "decompress",
@@ -17419,14 +17171,12 @@
         "osmgpuresult",
         "packed",
         "parse",
-        "process",
         "py",
         "read",
         "refs",
         "relation",
         "relationblock",
         "relationmember",
-        "relations",
         "rings",
         "single",
         "sint64",
