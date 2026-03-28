@@ -10477,21 +10477,6 @@
     },
     {
       "kind": "doc",
-      "path": "docs/proposals/voronoi_tensor_core_hybrid.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "core",
-        "docs",
-        "hybrid",
-        "md",
-        "proposals",
-        "tensor",
-        "voronoi"
-      ]
-    },
-    {
-      "kind": "doc",
       "path": "docs/testing/contract-promotion.md",
       "referenced_by": [
         "docs/testing/contract-promotion.md"
@@ -10856,6 +10841,21 @@
         "md",
         "reports",
         "wiring"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "reports/proposals/voronoi_tensor_core_hybrid.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "core",
+        "hybrid",
+        "md",
+        "proposals",
+        "reports",
+        "tensor",
+        "voronoi"
       ]
     },
     {
@@ -16286,6 +16286,8 @@
         "CsvGpuResult",
         "_extract_field_spans",
         "_strip_quotes_from_spans",
+        "_detect_geom_format",
+        "_extract_wkb_and_parse",
         "_assemble_point_geometry",
         "_extract_wkt_and_parse",
         "read_csv_gpu"
@@ -16302,6 +16304,8 @@
         "end",
         "extract",
         "field",
+        "format",
+        "geom",
         "geometry",
         "gpu",
         "header",
@@ -16323,6 +16327,7 @@
         "structural",
         "toggle",
         "vibespatial",
+        "wkb",
         "wkt"
       ]
     },
@@ -20962,6 +20967,9 @@
         "TestReadCsvGpuEdgeCases",
         "TestReadCsvGpuErrors",
         "TestReadCsvGpuOgaStructure",
+        "TestReadCsvGpuWkb",
+        "TestDetectGeomFormat",
+        "TestWkbColumnNameDetection",
         "TestCsvIODispatchWiring"
       ],
       "tokens": [
@@ -20980,13 +20988,16 @@
         "testcsvspatialdetection",
         "testcsvstructuralbasic",
         "testcsvvalidation",
+        "testdetectgeomformat",
         "testreadcsvgpuautodetection",
         "testreadcsvgpuedgecases",
         "testreadcsvgpuerrors",
         "testreadcsvgpulatlon",
         "testreadcsvgpuogastructure",
+        "testreadcsvgpuwkb",
         "testreadcsvgpuwkt",
-        "tests"
+        "tests",
+        "testwkbcolumnnamedetection"
       ]
     },
     {

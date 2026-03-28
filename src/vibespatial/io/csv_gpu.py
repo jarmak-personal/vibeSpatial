@@ -34,6 +34,9 @@ Given the structural analysis result, extracts spatial geometry:
   ``parse_ascii_floats``, assembles as Point OwnedGeometryArray.
 - **WKT mode**: extracts WKT column, concatenates with newline separators,
   delegates to ``read_wkt_gpu``.
+- **WKB mode**: extracts hex-encoded WKB column (auto-detected), decodes
+  hex to binary on CPU, delegates to ``decode_wkb_arrow_array_owned``
+  which has a GPU fast path via pylibcudf.
 
 All structural kernels are integer-only byte classification (no
 floating-point computation), so no PrecisionPlan is needed per ADR-0002
@@ -210,7 +213,7 @@ _LONGITUDE_NAMES: frozenset[str] = frozenset({
     "longitude", "lon", "lng", "x", "long", "lon_x", "point_x",
 })
 _GEOMETRY_NAMES: frozenset[str] = frozenset({
-    "geometry", "geom", "wkt", "the_geom", "shape",
+    "geometry", "geom", "wkt", "the_geom", "shape", "wkb",
 })
 
 
@@ -746,6 +749,148 @@ def _strip_quotes_from_spans(
     return d_starts_out, d_ends_out
 
 
+_HEX_CHARS: frozenset[int] = frozenset(
+    b"0123456789abcdefABCDEF"
+)
+
+# WKT geometry type prefixes (first character of the type name).
+_WKT_LEAD_CHARS: frozenset[int] = frozenset(
+    b"PLMGplmg"  # Point, LineString, MultiPoint, Polygon, GeometryCollection, etc.
+)
+
+
+def _detect_geom_format(
+    d_bytes: cp.ndarray,
+    d_starts: cp.ndarray,
+    d_ends: cp.ndarray,
+) -> str:
+    """Peek at the first non-empty geometry value to detect WKT vs hex WKB.
+
+    Transfers only a few bytes D->H (the first non-empty field) to classify
+    the geometry encoding.  This is a one-time, small transfer.
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full CSV file.
+    d_starts : cp.ndarray
+        int64 field start positions (inclusive), shape ``(n_rows,)``.
+    d_ends : cp.ndarray
+        int64 field end positions (exclusive), shape ``(n_rows,)``.
+
+    Returns
+    -------
+    str
+        ``"wkt"`` or ``"wkb"``.
+    """
+    n_rows = d_starts.shape[0]
+    if n_rows == 0:
+        return "wkt"
+
+    # Find the first non-empty field on device.
+    d_field_lens = (d_ends - d_starts).astype(cp.int64)
+    d_nonempty_mask = d_field_lens > 0
+    d_nonempty_idx = cp.flatnonzero(d_nonempty_mask)
+
+    if d_nonempty_idx.shape[0] == 0:
+        return "wkt"
+
+    first_idx = int(d_nonempty_idx[0])
+    start = int(d_starts[first_idx])
+    end = int(d_ends[first_idx])
+    # Transfer at most 64 bytes -- enough to classify the field.
+    peek_end = min(end, start + 64)
+    sample_bytes: bytes = cp.asnumpy(d_bytes[start:peek_end]).tobytes()
+
+    # Strip leading whitespace.
+    stripped = sample_bytes.lstrip()
+    if not stripped:
+        return "wkt"
+
+    first_char = stripped[0]
+
+    # If the first character is a WKT type-name leader, it is WKT.
+    if first_char in _WKT_LEAD_CHARS:
+        return "wkt"
+
+    # If all non-whitespace characters in the sample are hex digits, treat
+    # the field as hex-encoded WKB.
+    if all(b in _HEX_CHARS for b in stripped):
+        return "wkb"
+
+    # Default: backwards-compatible WKT.
+    return "wkt"
+
+
+def _extract_wkb_and_parse(
+    d_bytes: cp.ndarray,
+    d_starts: cp.ndarray,
+    d_ends: cp.ndarray,
+) -> OwnedGeometryArray:
+    """Extract hex-encoded WKB fields and decode via the GPU WKB pipeline.
+
+    For each row, the field bytes are transferred to the host, decoded
+    from hex to binary, and assembled into a PyArrow binary array which
+    is then decoded through ``decode_wkb_arrow_array_owned`` (which has
+    a GPU fast path internally).
+
+    The D->H transfer of the geometry column is acceptable:
+    - The WKB GPU decode pipeline is well-optimized.
+    - Hex decoding on CPU is fast (character-to-nibble mapping).
+    - A GPU hex decoder kernel would add complexity for marginal benefit.
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full CSV file.
+    d_starts : cp.ndarray
+        int64 field start positions (inclusive), shape ``(n_rows,)``.
+    d_ends : cp.ndarray
+        int64 field end positions (exclusive), shape ``(n_rows,)``.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Geometry array decoded from hex WKB.
+    """
+    import pyarrow as pa
+
+    from vibespatial.io.wkb import decode_wkb_arrow_array_owned
+
+    n_rows = d_starts.shape[0]
+
+    if n_rows == 0:
+        empty_arrow = pa.array([], type=pa.binary())
+        return decode_wkb_arrow_array_owned(empty_arrow)
+
+    # Transfer field span boundaries to host (two small int64 arrays).
+    h_starts = cp.asnumpy(d_starts)
+    h_ends = cp.asnumpy(d_ends)
+
+    # Transfer the full device byte array to host once, then slice per row.
+    # This is a single bulk D->H copy rather than n_rows small copies.
+    h_bytes: bytes = cp.asnumpy(d_bytes).tobytes()
+
+    wkb_values: list[bytes | None] = []
+    for i in range(n_rows):
+        s = int(h_starts[i])
+        e = int(h_ends[i])
+        if s >= e:
+            wkb_values.append(None)
+            continue
+        hex_str = h_bytes[s:e].decode("ascii", errors="replace").strip()
+        if not hex_str:
+            wkb_values.append(None)
+            continue
+        try:
+            wkb_values.append(bytes.fromhex(hex_str))
+        except ValueError:
+            wkb_values.append(None)
+
+    arrow_array = pa.array(wkb_values, type=pa.binary())
+    return decode_wkb_arrow_array_owned(arrow_array)
+
+
 def _assemble_point_geometry(
     d_lon: cp.ndarray,
     d_lat: cp.ndarray,
@@ -903,9 +1048,10 @@ def read_csv_gpu(
        (or auto-detected), extracts numeric latitude and longitude
        columns and assembles them as Point geometries.
 
-    2. **WKT mode**: When ``geom_col`` is specified (or auto-detected),
-       extracts the WKT geometry column and delegates to the GPU WKT
-       parser.
+    2. **WKT/WKB mode**: When ``geom_col`` is specified (or auto-detected),
+       extracts the geometry column.  Hex-encoded WKB is auto-detected
+       and decoded via the GPU WKB pipeline.  WKT text is parsed via the
+       GPU WKT parser.
 
     All computation is device-resident.  The only D->H transfers are
     the small header row (for column name extraction) and the structural
@@ -924,8 +1070,9 @@ def read_csv_gpu(
         Name of the longitude column.  If None, auto-detected from
         header names.
     geom_col : str or None, default None
-        Name of the WKT geometry column.  If None, auto-detected from
-        header names.
+        Name of the geometry column (WKT or hex-encoded WKB).  If None,
+        auto-detected from header names.  The format (WKT vs hex WKB)
+        is auto-detected from field content.
 
     Returns
     -------
@@ -1027,11 +1174,15 @@ def read_csv_gpu(
     # Stage 3: Extract geometry
     # ------------------------------------------------------------------
     if "geom" in spatial:
-        # WKT mode
+        # Geometry column mode: auto-detect WKT vs hex WKB
         geom_idx = spatial["geom"]
         d_starts, d_ends = _extract_field_spans(d_bytes, structural, geom_idx, has_header=True)
         d_starts, d_ends = _strip_quotes_from_spans(d_bytes, d_starts, d_ends)
-        geometry = _extract_wkt_and_parse(d_bytes, d_starts, d_ends)
+        fmt = _detect_geom_format(d_bytes, d_starts, d_ends)
+        if fmt == "wkb":
+            geometry = _extract_wkb_and_parse(d_bytes, d_starts, d_ends)
+        else:
+            geometry = _extract_wkt_and_parse(d_bytes, d_starts, d_ends)
         return CsvGpuResult(geometry=geometry, n_rows=structural.n_rows)
 
     # Lat/lon mode

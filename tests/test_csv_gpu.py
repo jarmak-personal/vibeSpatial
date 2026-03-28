@@ -946,6 +946,288 @@ class TestReadCsvGpuOgaStructure:
 
 
 # ===================================================================
+# read_csv_gpu tests: hex WKB mode
+# ===================================================================
+
+
+class TestReadCsvGpuWkb:
+    """Geometry extraction via hex-encoded WKB column."""
+
+    @needs_gpu
+    def test_hex_wkb_point_column(self):
+        """CSV with hex-encoded WKB Point geometry column."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        # POINT(1 2) little-endian WKB:
+        # 01 (LE) 01000000 (type=Point) 000000000000F03F (x=1.0) 0000000000000040 (y=2.0)
+        csv = b"id,geometry\n1,0101000000000000000000F03F0000000000000040\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        assert GeometryFamily.POINT in result.geometry.families
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+
+    @needs_gpu
+    def test_hex_wkb_multiple_points(self):
+        """Multiple rows of hex-encoded WKB Points."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        # POINT(1 2) and POINT(3 4)
+        wkb_1_2 = b"0101000000000000000000F03F0000000000000040"
+        wkb_3_4 = b"01010000000000000000000840000000000000F03F"
+        # POINT(3 4): x=3.0 -> 0000000000000840, but let me use shapely-validated hex.
+        # x=3.0 = 0x4008000000000000 LE -> 0000000000000840
+        # y=1.0 = 0x3FF0000000000000 LE -> 000000000000F03F
+        # Actually POINT(3 1) with that hex. Let me use correct values.
+        # For POINT(3 4): x=3.0, y=4.0
+        # 3.0 fp64 LE = 0000000000000840
+        # 4.0 fp64 LE = 0000000000001040
+        wkb_3_4 = b"010100000000000000000008400000000000001040"
+        csv = b"id,geometry\n1," + wkb_1_2 + b"\n2," + wkb_3_4 + b"\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+        np.testing.assert_allclose(x[1], 3.0, atol=1e-10)
+        np.testing.assert_allclose(y[1], 4.0, atol=1e-10)
+
+    @needs_gpu
+    def test_hex_wkb_polygon_column(self):
+        """CSV with hex WKB Polygon decodes correctly."""
+        from shapely import Polygon, to_wkb
+
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])
+        wkb_hex = to_wkb(poly, hex=True)
+        csv = f"id,geometry\n1,{wkb_hex}\n".encode("ascii")
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        assert GeometryFamily.POLYGON in result.geometry.families
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POLYGON)
+        # Triangle with 4 coords (closed ring)
+        assert len(x) == 4
+        np.testing.assert_allclose(x, [0.0, 1.0, 1.0, 0.0], atol=1e-10)
+        np.testing.assert_allclose(y, [0.0, 0.0, 1.0, 0.0], atol=1e-10)
+
+    @needs_gpu
+    def test_wkb_auto_detection_not_sent_to_wkt(self):
+        """Hex WKB is auto-detected and NOT sent to WKT parser."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        # If this were sent to the WKT parser, it would fail because
+        # "0101000000..." is not valid WKT.  Successful parse proves
+        # the auto-detection routed to the WKB pipeline.
+        csv = b"id,geometry\n1,0101000000000000000000F03F0000000000000040\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        assert GeometryFamily.POINT in result.geometry.families
+
+    @needs_gpu
+    def test_wkb_column_named_wkb(self):
+        """Column named 'wkb' is detected as geometry column."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"id,wkb\n1,0101000000000000000000F03F0000000000000040\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        assert GeometryFamily.POINT in result.geometry.families
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+
+    @needs_gpu
+    def test_quoted_wkb(self):
+        """Quoted hex WKB field is handled correctly (quote stripping works)."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b'id,geometry\n1,"0101000000000000000000F03F0000000000000040"\n'
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        assert GeometryFamily.POINT in result.geometry.families
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+
+    @needs_gpu
+    def test_wkb_user_override_geom_col(self):
+        """User override geom_col routes hex WKB column correctly."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"id,my_geom\n1,0101000000000000000000F03F0000000000000040\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes, geom_col="my_geom")
+
+        assert result.n_rows == 1
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+
+    @needs_gpu
+    def test_wkt_still_works_after_wkb_support(self):
+        """WKT geometry columns still route to WKT parser (regression guard)."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"id,geometry\n1,POINT(1 2)\n2,POINT(3 4)\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+        np.testing.assert_allclose(x[1], 3.0, atol=1e-10)
+        np.testing.assert_allclose(y[1], 4.0, atol=1e-10)
+
+    @needs_gpu
+    def test_uppercase_hex_wkb(self):
+        """Uppercase hex WKB is detected and decoded correctly."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        # Same POINT(1 2) but with uppercase hex
+        csv = b"id,geometry\n1,0101000000000000000000F03F0000000000000040\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+
+    @needs_gpu
+    def test_lowercase_hex_wkb(self):
+        """Lowercase hex WKB is detected and decoded correctly."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        # Same POINT(1 2) but forcing all lowercase
+        hex_lower = b"0101000000000000000000f03f0000000000000040"
+        csv = b"id,geometry\n1," + hex_lower + b"\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 1
+        x, y = _get_device_coords(result.geometry, GeometryFamily.POINT)
+        np.testing.assert_allclose(x[0], 1.0, atol=1e-10)
+        np.testing.assert_allclose(y[0], 2.0, atol=1e-10)
+
+
+class TestDetectGeomFormat:
+    """Direct tests for _detect_geom_format heuristic."""
+
+    @needs_gpu
+    def test_wkt_point_detected(self):
+        """WKT starting with 'P' detected as wkt."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        csv = b"POINT(1 2)"
+        d_bytes = _to_device_bytes(csv)
+        d_starts = cp.array([0], dtype=cp.int64)
+        d_ends = cp.array([len(csv)], dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkt"
+
+    @needs_gpu
+    def test_wkt_linestring_detected(self):
+        """WKT starting with 'L' detected as wkt."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        csv = b"LINESTRING(0 0, 1 1)"
+        d_bytes = _to_device_bytes(csv)
+        d_starts = cp.array([0], dtype=cp.int64)
+        d_ends = cp.array([len(csv)], dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkt"
+
+    @needs_gpu
+    def test_hex_wkb_detected(self):
+        """Hex WKB string detected as wkb."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        hex_str = b"0101000000000000000000F03F0000000000000040"
+        d_bytes = _to_device_bytes(hex_str)
+        d_starts = cp.array([0], dtype=cp.int64)
+        d_ends = cp.array([len(hex_str)], dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkb"
+
+    @needs_gpu
+    def test_empty_fields_fallback_to_wkt(self):
+        """All-empty fields default to wkt."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        d_bytes = _to_device_bytes(b"abc")
+        # Zero-length spans
+        d_starts = cp.array([0, 1], dtype=cp.int64)
+        d_ends = cp.array([0, 1], dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkt"
+
+    @needs_gpu
+    def test_no_rows_fallback_to_wkt(self):
+        """Zero rows default to wkt."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        d_bytes = _to_device_bytes(b"")
+        d_starts = cp.empty(0, dtype=cp.int64)
+        d_ends = cp.empty(0, dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkt"
+
+    @needs_gpu
+    def test_multipolygon_wkt_detected(self):
+        """WKT starting with 'M' detected as wkt."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        csv = b"MULTIPOLYGON(((0 0, 1 0, 1 1, 0 0)))"
+        d_bytes = _to_device_bytes(csv)
+        d_starts = cp.array([0], dtype=cp.int64)
+        d_ends = cp.array([len(csv)], dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkt"
+
+    @needs_gpu
+    def test_geometry_collection_wkt_detected(self):
+        """WKT starting with 'G' detected as wkt."""
+        from vibespatial.io.csv_gpu import _detect_geom_format
+
+        csv = b"GEOMETRYCOLLECTION(POINT(1 2))"
+        d_bytes = _to_device_bytes(csv)
+        d_starts = cp.array([0], dtype=cp.int64)
+        d_ends = cp.array([len(csv)], dtype=cp.int64)
+
+        assert _detect_geom_format(d_bytes, d_starts, d_ends) == "wkt"
+
+
+class TestWkbColumnNameDetection:
+    """Verify 'wkb' is in the spatial column detection heuristics."""
+
+    @needs_gpu
+    def test_wkb_column_detected_as_geom(self):
+        """Column named 'wkb' is recognized as a geometry column."""
+        from vibespatial.io.csv_gpu import csv_structural_analysis
+
+        csv = b"id,wkb\n1,0101000000000000000000F03F0000000000000040\n"
+        d_bytes = _to_device_bytes(csv)
+        result = csv_structural_analysis(d_bytes)
+
+        assert result.spatial_columns == {"geom": 1}
+
+
+# ===================================================================
 # IO dispatch wiring tests
 # ===================================================================
 
