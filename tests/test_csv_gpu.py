@@ -1294,3 +1294,136 @@ class TestCsvIODispatchWiring:
 
         plan = plan_vector_file_io("data.CSV", operation=IOOperation.READ)
         assert plan.format == IOFormat.CSV
+
+
+# ===================================================================
+# Non-spatial attribute extraction tests
+# ===================================================================
+
+
+class TestCsvNonspatialColumns:
+    """Tests for _extract_nonspatial_columns: attribute data extraction."""
+
+    @needs_gpu
+    def test_latlon_with_attributes(self):
+        """CSV with id,name,lat,lon returns GeoDataFrame with id and name."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"id,name,lat,lon\n1,Alice,40.7,-74.0\n2,Bob,34.0,-118.2\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert "id" in result.attributes
+        assert "name" in result.attributes
+        assert result.attributes["id"] == ["1", "2"]
+        assert result.attributes["name"] == ["Alice", "Bob"]
+        # Spatial columns should NOT be in attributes
+        assert "lat" not in result.attributes
+        assert "lon" not in result.attributes
+
+    @needs_gpu
+    def test_latlon_only_no_attributes(self):
+        """CSV with only lat,lon has no attribute columns."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"lat,lon\n40.7,-74.0\n34.0,-118.2\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is None
+
+    @needs_gpu
+    def test_quoted_string_attributes(self):
+        """Quoted string attributes are correctly unquoted."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b'name,lat,lon\n"New York, NY",40.7,-74.0\n"Los Angeles, CA",34.0,-118.2\n'
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert result.attributes["name"] == ["New York, NY", "Los Angeles, CA"]
+
+    @needs_gpu
+    def test_numeric_attributes_as_strings(self):
+        """Numeric attributes are extracted as strings (pandas auto-converts)."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"population,lat,lon\n8336817,40.7,-74.0\n3979576,34.0,-118.2\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert result.attributes["population"] == ["8336817", "3979576"]
+
+    @needs_gpu
+    def test_geom_column_with_attributes(self):
+        """CSV with a geometry column and other attributes."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = (
+            b"id,geometry,category\n"
+            b'1,"POINT (-74.0 40.7)",residential\n'
+            b'2,"POINT (-118.2 34.0)",commercial\n'
+        )
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert "id" in result.attributes
+        assert "category" in result.attributes
+        assert result.attributes["id"] == ["1", "2"]
+        assert result.attributes["category"] == ["residential", "commercial"]
+        # Geometry column should NOT be in attributes
+        assert "geometry" not in result.attributes
+
+    @needs_gpu
+    def test_many_attribute_columns(self):
+        """CSV with many attribute columns preserves order and values."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = (
+            b"id,name,type,status,lat,lon\n"
+            b"101,Park,recreation,open,40.7,-74.0\n"
+            b"202,Library,education,closed,34.0,-118.2\n"
+        )
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert list(result.attributes.keys()) == ["id", "name", "type", "status"]
+        assert result.attributes["name"] == ["Park", "Library"]
+        assert result.attributes["status"] == ["open", "closed"]
+
+    @needs_gpu
+    def test_empty_attribute_values(self):
+        """Empty attribute values produce empty strings."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b"id,name,lat,lon\n1,,40.7,-74.0\n2,Bob,34.0,-118.2\n"
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert result.attributes["name"] == ["", "Bob"]
+
+    @needs_gpu
+    def test_doubled_quotes_in_attributes(self):
+        """Doubled quotes inside quoted fields are unescaped."""
+        from vibespatial.io.csv_gpu import read_csv_gpu
+
+        csv = b'name,lat,lon\n"She said ""hello""",40.7,-74.0\n"normal",34.0,-118.2\n'
+        d_bytes = _to_device_bytes(csv)
+        result = read_csv_gpu(d_bytes)
+
+        assert result.n_rows == 2
+        assert result.attributes is not None
+        assert result.attributes["name"] == ['She said "hello"', "normal"]

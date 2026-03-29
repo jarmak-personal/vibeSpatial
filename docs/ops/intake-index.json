@@ -16421,6 +16421,7 @@
         "_extract_wkb_and_parse",
         "_assemble_point_geometry",
         "_extract_wkt_and_parse",
+        "_extract_nonspatial_columns",
         "read_csv_gpu"
       ],
       "tokens": [
@@ -16444,6 +16445,7 @@
         "kernel",
         "kernels",
         "launch",
+        "nonspatial",
         "parse",
         "point",
         "py",
@@ -17148,6 +17150,7 @@
         "_find_tag_positions",
         "_build_comment_mask",
         "_pair_open_close_tags",
+        "KmlGpuResult",
         "KmlStructuralResult",
         "kml_structural_analysis",
         "_count_commas_spaces_kernels",
@@ -17164,12 +17167,14 @@
         "_assemble_kml_mixed",
         "_count_rings_per_placemark_subset",
         "_count_ring_coords_for_subset",
-        "read_kml_gpu"
+        "_extract_tag_text",
+        "_extract_kml_attributes"
       ],
       "tokens": [
         "analysis",
         "assemble",
         "assign",
+        "attributes",
         "build",
         "close",
         "commas",
@@ -17192,6 +17197,7 @@
         "kernel",
         "kernels",
         "kml",
+        "kmlgpuresult",
         "kmlstructuralresult",
         "launch",
         "mask",
@@ -17204,7 +17210,6 @@
         "placemark",
         "positions",
         "py",
-        "read",
         "region",
         "regions",
         "ring",
@@ -17215,6 +17220,7 @@
         "subset",
         "tag",
         "tags",
+        "text",
         "type",
         "vibespatial"
       ]
@@ -21110,7 +21116,8 @@
         "TestReadCsvGpuWkb",
         "TestDetectGeomFormat",
         "TestWkbColumnNameDetection",
-        "TestCsvIODispatchWiring"
+        "TestCsvIODispatchWiring",
+        "TestCsvNonspatialColumns"
       ],
       "tokens": [
         "bytes",
@@ -21123,6 +21130,7 @@
         "test",
         "testcsvdevicearrays",
         "testcsviodispatchwiring",
+        "testcsvnonspatialcolumns",
         "testcsvquoteparity",
         "testcsvquoting",
         "testcsvspatialdetection",
@@ -23512,6 +23520,7 @@
         "_polygon_placemark",
         "TestKmlStructuralAnalysis",
         "TestReadKmlGpu",
+        "TestKmlAttributeExtraction",
         "TestKmlIOWiring",
         "TestDimensionalityDetection"
       ],
@@ -23529,6 +23538,7 @@
         "py",
         "test",
         "testdimensionalitydetection",
+        "testkmlattributeextraction",
         "testkmliowiring",
         "testkmlstructuralanalysis",
         "testreadkmlgpu",

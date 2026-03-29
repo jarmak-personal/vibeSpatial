@@ -342,7 +342,7 @@ Power users can import GPU readers directly for fine-grained control:
 from vibespatial.io import (
     read_wkt_gpu,        # WKT bytes → OwnedGeometryArray
     read_csv_gpu,        # CSV bytes → CsvGpuResult
-    read_kml_gpu,        # KML bytes → OwnedGeometryArray
+    read_kml_gpu,        # KML bytes → KmlGpuResult
     read_osm_pbf_nodes,  # PBF path → OsmGpuResult
     build_spatial_index,  # Coordinates → GpuSpatialIndex
 )

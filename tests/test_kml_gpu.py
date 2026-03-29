@@ -238,7 +238,8 @@ class TestReadKmlGpu:
 
         kml = _wrap_kml(_point_placemark(-122.08, 37.42))
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         assert GeometryFamily.POINT in owned.families
@@ -254,7 +255,8 @@ class TestReadKmlGpu:
 
         kml = _wrap_kml(_point_placemark(-122.08, 37.42, 100.5))
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         x, y = _get_device_coords(owned, GeometryFamily.POINT)
@@ -270,7 +272,8 @@ class TestReadKmlGpu:
         coords = [(-122.0, 37.0, 0), (-121.0, 36.0, 0), (-120.0, 35.0, 0)]
         kml = _wrap_kml(_linestring_placemark(coords))
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         assert GeometryFamily.LINESTRING in owned.families
@@ -288,7 +291,8 @@ class TestReadKmlGpu:
         outer = [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 0, 0)]
         kml = _wrap_kml(_polygon_placemark(outer))
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         assert GeometryFamily.POLYGON in owned.families
@@ -315,7 +319,8 @@ class TestReadKmlGpu:
         inner = [(2, 2, 0), (8, 2, 0), (8, 8, 0), (2, 8, 0), (2, 2, 0)]
         kml = _wrap_kml(_polygon_placemark(outer, inners=[inner]))
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         assert GeometryFamily.POLYGON in owned.families
@@ -350,7 +355,8 @@ class TestReadKmlGpu:
             _point_placemark(-120.0, 35.0, 0),
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 3
         assert GeometryFamily.POINT in owned.families
@@ -370,7 +376,8 @@ class TestReadKmlGpu:
             _linestring_placemark([(-121.0, 36.0, 0), (-120.0, 35.0, 0)]),
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 2
         assert GeometryFamily.POINT in owned.families
@@ -400,7 +407,8 @@ class TestReadKmlGpu:
             _point_placemark(-121.0, 36.0, 0),
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         # Only 2 real Placemarks, not 3
         assert owned.row_count == 2
@@ -420,7 +428,8 @@ class TestReadKmlGpu:
             "</kml:kml>\n"
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         x, y = _get_device_coords(owned, GeometryFamily.POINT)
@@ -437,7 +446,8 @@ class TestReadKmlGpu:
         lat = 37.77493400000001
         kml = _wrap_kml(_point_placemark(lon, lat))
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         x, y = _get_device_coords(owned, GeometryFamily.POINT)
         # parse_ascii_floats has limited precision for very long decimals,
@@ -458,7 +468,8 @@ class TestReadKmlGpu:
             "</Placemark>"
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         x, y = _get_device_coords(owned, GeometryFamily.LINESTRING)
@@ -481,7 +492,8 @@ class TestReadKmlGpu:
             "</Placemark>"
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 1
         x, y = _get_device_coords(owned, GeometryFamily.LINESTRING)
@@ -495,7 +507,8 @@ class TestReadKmlGpu:
 
         kml = _wrap_kml()
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 0
 
@@ -509,7 +522,8 @@ class TestReadKmlGpu:
             _linestring_placemark([(-120.0, 35.0, 0), (-119.0, 34.0, 0), (-118.0, 33.0, 0)]),
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 2
         assert GeometryFamily.LINESTRING in owned.families
@@ -535,7 +549,8 @@ class TestReadKmlGpu:
             _polygon_placemark(outer2),
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 2
         assert GeometryFamily.POLYGON in owned.families
@@ -555,12 +570,164 @@ class TestReadKmlGpu:
             _polygon_placemark(outer),
         )
         d_bytes = _to_device_bytes(kml)
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
+        owned = kml_result.geometry
 
         assert owned.row_count == 3
         assert GeometryFamily.POINT in owned.families
         assert GeometryFamily.LINESTRING in owned.families
         assert GeometryFamily.POLYGON in owned.families
+
+
+# ===================================================================
+# KML attribute extraction tests
+# ===================================================================
+
+
+class TestKmlAttributeExtraction:
+    """Tests for Placemark name/description extraction."""
+
+    @needs_gpu
+    def test_placemark_with_name(self):
+        """Placemark with <name> tag extracts name column."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = _wrap_kml(
+            "<Placemark>"
+            "<name>City Hall</name>"
+            "<Point><coordinates>-122.08,37.42,0</coordinates></Point>"
+            "</Placemark>"
+        )
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 1
+        assert result.attributes is not None
+        assert "name" in result.attributes
+        assert result.attributes["name"] == ["City Hall"]
+
+    @needs_gpu
+    def test_placemark_with_description(self):
+        """Placemark with <description> tag extracts description column."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = _wrap_kml(
+            "<Placemark>"
+            "<description>A notable building</description>"
+            "<Point><coordinates>-122.08,37.42,0</coordinates></Point>"
+            "</Placemark>"
+        )
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 1
+        assert result.attributes is not None
+        assert "description" in result.attributes
+        assert result.attributes["description"] == ["A notable building"]
+
+    @needs_gpu
+    def test_placemark_with_name_and_description(self):
+        """Placemark with both name and description."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = _wrap_kml(
+            "<Placemark>"
+            "<name>City Hall</name>"
+            "<description>The main government building</description>"
+            "<Point><coordinates>-122.08,37.42,0</coordinates></Point>"
+            "</Placemark>"
+        )
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 1
+        assert result.attributes is not None
+        assert result.attributes["name"] == ["City Hall"]
+        assert result.attributes["description"] == ["The main government building"]
+
+    @needs_gpu
+    def test_placemark_without_name_returns_none(self):
+        """Placemark without <name> produces None for that row."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = _wrap_kml(
+            "<Placemark>"
+            "<name>Has Name</name>"
+            "<Point><coordinates>-122.08,37.42,0</coordinates></Point>"
+            "</Placemark>",
+            "<Placemark>"
+            "<Point><coordinates>-121.0,36.0,0</coordinates></Point>"
+            "</Placemark>",
+        )
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 2
+        assert result.attributes is not None
+        assert result.attributes["name"] == ["Has Name", None]
+
+    @needs_gpu
+    def test_no_attributes_returns_none(self):
+        """Placemarks with no name or description produce None attributes."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = _wrap_kml(_point_placemark(-122.08, 37.42, 0))
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 1
+        # No name or description found anywhere => attributes is None
+        assert result.attributes is None
+
+    @needs_gpu
+    def test_namespace_prefixed_name(self):
+        """Namespace-prefixed <kml:name> is extracted."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = (
+            '<kml:kml xmlns:kml="http://www.opengis.net/kml/2.2">\n'
+            "<kml:Document>\n"
+            "<kml:Placemark>\n"
+            "<kml:name>NS Point</kml:name>\n"
+            "<kml:Point><kml:coordinates>-122.08,37.42</kml:coordinates></kml:Point>\n"
+            "</kml:Placemark>\n"
+            "</kml:Document>\n"
+            "</kml:kml>\n"
+        )
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 1
+        assert result.attributes is not None
+        assert result.attributes["name"] == ["NS Point"]
+
+    @needs_gpu
+    def test_multiple_placemarks_mixed_attributes(self):
+        """Multiple Placemarks with varying attributes."""
+        from vibespatial.io.kml_gpu import read_kml_gpu
+
+        kml = _wrap_kml(
+            "<Placemark>"
+            "<name>First</name>"
+            "<description>Desc 1</description>"
+            "<Point><coordinates>-122.0,37.0,0</coordinates></Point>"
+            "</Placemark>",
+            "<Placemark>"
+            "<name>Second</name>"
+            "<Point><coordinates>-121.0,36.0,0</coordinates></Point>"
+            "</Placemark>",
+            "<Placemark>"
+            "<description>Only desc</description>"
+            "<Point><coordinates>-120.0,35.0,0</coordinates></Point>"
+            "</Placemark>",
+        )
+        d_bytes = _to_device_bytes(kml)
+        result = read_kml_gpu(d_bytes)
+
+        assert result.n_placemarks == 3
+        assert result.attributes is not None
+        assert result.attributes["name"] == ["First", "Second", None]
+        assert result.attributes["description"] == ["Desc 1", None, "Only desc"]
 
 
 # ===================================================================

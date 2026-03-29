@@ -406,9 +406,16 @@ def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         crs = target_crs if target_crs is not None else None
         geom_series = geoseries_from_owned(csv_result.geometry, name="geometry", crs=crs)
 
+        import pandas as pd
+
         import vibespatial.api as geopandas
 
-        gdf = geopandas.GeoDataFrame(geometry=geom_series)
+        # Merge non-spatial attribute columns into the GeoDataFrame.
+        if csv_result.attributes:
+            attrs_df = pd.DataFrame(csv_result.attributes)
+        else:
+            attrs_df = pd.DataFrame(index=range(csv_result.n_rows))
+        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -494,16 +501,23 @@ def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | No
 
         from .kml_gpu import read_kml_gpu
 
-        owned = read_kml_gpu(d_bytes)
+        kml_result = read_kml_gpu(d_bytes)
 
         # KML has no embedded CRS.  When target_crs is requested, set it
         # as the CRS label on the output.
         crs = target_crs if target_crs is not None else None
-        geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
+        geom_series = geoseries_from_owned(kml_result.geometry, name="geometry", crs=crs)
+
+        import pandas as pd
 
         import vibespatial.api as geopandas
 
-        gdf = geopandas.GeoDataFrame(geometry=geom_series)
+        # Merge Placemark attributes (name, description) into the GeoDataFrame.
+        if kml_result.attributes:
+            attrs_df = pd.DataFrame(kml_result.attributes)
+        else:
+            attrs_df = pd.DataFrame(index=range(kml_result.n_placemarks))
+        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",

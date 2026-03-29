@@ -543,6 +543,26 @@ def _pair_open_close_tags(
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True, slots=True)
+class KmlGpuResult:
+    """Result of GPU KML reading.
+
+    Attributes
+    ----------
+    geometry : OwnedGeometryArray
+        Device-resident geometry array.
+    n_placemarks : int
+        Number of Placemarks (features) read.
+    attributes : dict[str, list[str | None]] or None
+        Extracted Placemark attributes (name, description) as
+        host-resident string lists.  None when no attributes found.
+    """
+
+    geometry: OwnedGeometryArray
+    n_placemarks: int
+    attributes: dict[str, list[str | None]] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class KmlStructuralResult:
     """Result of KML structural analysis.
 
@@ -1843,10 +1863,132 @@ def _count_ring_coords_for_subset(
 
 
 # ---------------------------------------------------------------------------
+# KML attribute extraction (host-side, text data)
+# ---------------------------------------------------------------------------
+
+def _extract_tag_text(
+    h_bytes: bytes,
+    start: int,
+    end: int,
+    open_tag: bytes,
+    close_tag: bytes,
+) -> str | None:
+    """Extract text content between an XML tag pair within a byte range.
+
+    Searches ``h_bytes[start:end]`` for the first occurrence of
+    ``<open_tag>text</close_tag>`` and returns the text content.
+    Returns None if the tag is not found.
+
+    Parameters
+    ----------
+    h_bytes : bytes
+        Full KML file bytes on host.
+    start : int
+        Start byte offset of the search region (inclusive).
+    end : int
+        End byte offset of the search region (exclusive).
+    open_tag : bytes
+        Opening tag bytes, e.g. ``b"<name>"``.
+    close_tag : bytes
+        Closing tag bytes, e.g. ``b"</name>"``.
+
+    Returns
+    -------
+    str or None
+        Decoded text content, or None if not found.
+    """
+    region = h_bytes[start:end]
+    # Try plain tag first, then namespace-prefixed variant
+    open_pos = region.find(open_tag)
+    if open_pos == -1:
+        return None
+    content_start = open_pos + len(open_tag)
+    close_pos = region.find(close_tag, content_start)
+    if close_pos == -1:
+        return None
+    text = region[content_start:close_pos]
+    return text.decode("utf-8", errors="replace").strip()
+
+
+def _extract_kml_attributes(
+    d_bytes: cp.ndarray,
+    d_placemark_starts: cp.ndarray,
+    d_placemark_ends: cp.ndarray,
+    n_placemarks: int,
+) -> dict[str, list[str | None]] | None:
+    """Extract name and description from each Placemark.
+
+    Transfers Placemark boundary indices to host, then for each
+    Placemark searches for ``<name>`` and ``<description>`` tags
+    within its byte range.  Attribute/text data is inherently
+    host-resident, so this approach is correct.
+
+    Also handles namespace-prefixed variants (``<kml:name>``, etc.).
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full KML file.
+    d_placemark_starts : cp.ndarray
+        int64 byte offsets of each Placemark start.
+    d_placemark_ends : cp.ndarray
+        int64 byte offsets of each Placemark end.
+    n_placemarks : int
+        Number of Placemarks.
+
+    Returns
+    -------
+    dict[str, list[str | None]] or None
+        Column name -> list of values.  None if no attributes found.
+    """
+    if n_placemarks == 0:
+        return None
+
+    # Single bulk D->H transfer of the full byte array.
+    h_bytes: bytes = cp.asnumpy(d_bytes).tobytes()
+
+    # Transfer Placemark boundaries to host (two small int64 arrays).
+    h_starts = cp.asnumpy(d_placemark_starts)
+    h_ends = cp.asnumpy(d_placemark_ends)
+
+    # Tag pairs to search for: plain and namespace-prefixed
+    tag_specs: list[tuple[str, list[tuple[bytes, bytes]]]] = [
+        ("name", [
+            (b"<name>", b"</name>"),
+            (b"<kml:name>", b"</kml:name>"),
+        ]),
+        ("description", [
+            (b"<description>", b"</description>"),
+            (b"<kml:description>", b"</kml:description>"),
+        ]),
+    ]
+
+    results: dict[str, list[str | None]] = {}
+    any_found = False
+
+    for col_name, variants in tag_specs:
+        values: list[str | None] = []
+        for i in range(n_placemarks):
+            s = int(h_starts[i])
+            e = int(h_ends[i])
+            text = None
+            for open_tag, close_tag in variants:
+                text = _extract_tag_text(h_bytes, s, e, open_tag, close_tag)
+                if text is not None:
+                    break
+            values.append(text)
+            if text is not None:
+                any_found = True
+        results[col_name] = values
+
+    return results if any_found else None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-def read_kml_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
+def read_kml_gpu(d_bytes: cp.ndarray) -> KmlGpuResult:
     """Parse KML bytes on GPU and return device-resident geometry.
 
     Given a device-resident byte array containing a KML document, this
@@ -1869,11 +2011,12 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
 
     Returns
     -------
-    OwnedGeometryArray
-        Device-resident geometry array.  Coordinates are always fp64.
-        Structural metadata (offsets, validity) is materialized on both
-        host and device per the standard ``_build_device_*_owned``
-        pattern.
+    KmlGpuResult
+        Frozen dataclass with ``geometry`` (OwnedGeometryArray),
+        ``n_placemarks`` (int), and ``attributes`` (dict or None).
+        Coordinates are always fp64.  Structural metadata (offsets,
+        validity) is materialized on both host and device per the
+        standard ``_build_device_*_owned`` pattern.
 
     Notes
     -----
@@ -1894,8 +2037,8 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
     ...   <Placemark><Point><coordinates>-122.08,37.42,0</coordinates></Point></Placemark>
     ... </Document></kml>'''
     >>> d_bytes = cp.frombuffer(kml, dtype=cp.uint8)
-    >>> owned = read_kml_gpu(d_bytes)
-    >>> owned.row_count
+    >>> result = read_kml_gpu(d_bytes)
+    >>> result.geometry.row_count
     1
     """
     # ------------------------------------------------------------------
@@ -1905,7 +2048,9 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
     n_placemarks = structural.n_placemarks
 
     if n_placemarks == 0:
-        return _build_empty_owned()
+        return KmlGpuResult(
+            geometry=_build_empty_owned(), n_placemarks=0,
+        )
 
     # ------------------------------------------------------------------
     # Stage 2: Coordinate extraction
@@ -1915,17 +2060,31 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
     )
 
     if d_x.shape[0] == 0:
-        return _build_empty_owned()
+        return KmlGpuResult(
+            geometry=_build_empty_owned(), n_placemarks=0,
+        )
 
     # ------------------------------------------------------------------
-    # Stage 3: Determine if homogeneous or mixed
+    # Stage 3: Extract Placemark attributes (name, description)
+    # ------------------------------------------------------------------
+    attributes = _extract_kml_attributes(
+        d_bytes,
+        structural.d_placemark_starts,
+        structural.d_placemark_ends,
+        n_placemarks,
+    )
+
+    # ------------------------------------------------------------------
+    # Stage 4: Determine if homogeneous or mixed
     # ------------------------------------------------------------------
     # Filter to valid (known, supported) family tags
     d_valid_tags = structural.d_family_tags[structural.d_family_tags >= 0]
     d_valid_tags = d_valid_tags[d_valid_tags != KML_FAMILY_MULTI]
 
     if d_valid_tags.size == 0:
-        return _build_empty_owned()
+        return KmlGpuResult(
+            geometry=_build_empty_owned(), n_placemarks=0,
+        )
 
     d_unique_tags = cp.unique(d_valid_tags)
     n_unique = d_unique_tags.shape[0]
@@ -1937,13 +2096,19 @@ def read_kml_gpu(d_bytes: cp.ndarray) -> OwnedGeometryArray:
         if family is None:
             msg = f"Unsupported KML geometry tag: {h_unique_tags[0]}"
             raise ValueError(msg)
-        return _assemble_kml_homogeneous(
+        geometry = _assemble_kml_homogeneous(
             family, n_placemarks, d_x, d_y,
             d_placemark_coord_counts, structural, dim, d_bytes,
         )
+    else:
+        # Mixed file
+        geometry = _assemble_kml_mixed(
+            n_placemarks, d_x, d_y,
+            d_placemark_coord_counts, structural, dim, d_bytes,
+        )
 
-    # Mixed file
-    return _assemble_kml_mixed(
-        n_placemarks, d_x, d_y,
-        d_placemark_coord_counts, structural, dim, d_bytes,
+    return KmlGpuResult(
+        geometry=geometry,
+        n_placemarks=n_placemarks,
+        attributes=attributes,
     )

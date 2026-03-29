@@ -575,10 +575,15 @@ class CsvGpuResult:
         were in the WKT column.
     n_rows : int
         Number of data rows read.
+    attributes : dict[str, list[str]] or None
+        Non-spatial columns extracted as host-resident string lists.
+        Keys are column names, values are per-row string values.
+        None when there are no non-spatial columns.
     """
 
     geometry: OwnedGeometryArray
     n_rows: int
+    attributes: dict[str, list[str]] | None = None
 
 
 def _extract_field_spans(
@@ -1031,6 +1036,85 @@ def _extract_wkt_and_parse(
     return read_wkt_gpu(d_output)
 
 
+def _extract_nonspatial_columns(
+    d_bytes: cp.ndarray,
+    structural: CsvStructuralResult,
+    spatial_column_indices: set[int],
+) -> dict[str, list[str]] | None:
+    """Extract all non-spatial columns as host-resident string lists.
+
+    For each column whose index is NOT in ``spatial_column_indices``,
+    extracts field byte spans on the GPU, transfers to host, and decodes
+    as UTF-8 strings.  This is the correct approach for attribute data
+    (names, IDs, categories) which is inherently text and host-resident.
+
+    Parameters
+    ----------
+    d_bytes : cp.ndarray
+        Device-resident uint8 byte array of the full CSV file.
+    structural : CsvStructuralResult
+        Result from ``csv_structural_analysis``.
+    spatial_column_indices : set[int]
+        Set of 0-based column indices that are spatial (lat, lon, geom)
+        and should be excluded from the result.
+
+    Returns
+    -------
+    dict[str, list[str]] or None
+        Column name -> list of string values.  None if there are no
+        non-spatial columns.
+    """
+    n_rows = structural.n_rows
+    n_columns = structural.n_columns
+    column_names = structural.column_names
+
+    nonspatial_indices = [
+        i for i in range(n_columns) if i not in spatial_column_indices
+    ]
+    if not nonspatial_indices or n_rows == 0:
+        return None
+
+    # ---- Phase 1: compute all field spans on device ----
+    # Keeps all GPU work batched before any D->H transfer.
+    device_spans: list[tuple[int, cp.ndarray, cp.ndarray]] = []
+    for col_idx in nonspatial_indices:
+        d_starts, d_ends = _extract_field_spans(
+            d_bytes, structural, col_idx, has_header=True,
+        )
+        d_starts, d_ends = _strip_quotes_from_spans(d_bytes, d_starts, d_ends)
+        device_spans.append((col_idx, d_starts, d_ends))
+
+    # ---- Phase 2: bulk D->H transfer ----
+    # Single transfer for the byte payload; batch span arrays together.
+    h_bytes: bytes = cp.asnumpy(d_bytes).tobytes()
+    host_spans: list[tuple[int, np.ndarray, np.ndarray]] = [
+        (col_idx, cp.asnumpy(d_s), cp.asnumpy(d_e))
+        for col_idx, d_s, d_e in device_spans
+    ]
+
+    # ---- Phase 3: host-side decode (pure CPU, no device calls) ----
+    attributes: dict[str, list[str]] = {}
+    for col_idx, h_starts, h_ends in host_spans:
+        col_name = column_names[col_idx]
+        values: list[str] = []
+        for i in range(n_rows):
+            s = int(h_starts[i])
+            e = int(h_ends[i])
+            if s >= e:
+                values.append("")
+            else:
+                field_bytes = h_bytes[s:e]
+                # Strip \r from Windows line endings and decode
+                value = field_bytes.decode("utf-8", errors="replace").rstrip("\r")
+                # Unescape doubled quotes inside quoted CSV fields
+                if '""' in value:
+                    value = value.replace('""', '"')
+                values.append(value)
+        attributes[col_name] = values
+
+    return attributes if attributes else None
+
+
 def read_csv_gpu(
     d_bytes: cp.ndarray,
     *,
@@ -1176,6 +1260,7 @@ def read_csv_gpu(
     if "geom" in spatial:
         # Geometry column mode: auto-detect WKT vs hex WKB
         geom_idx = spatial["geom"]
+        spatial_indices = {geom_idx}
         d_starts, d_ends = _extract_field_spans(d_bytes, structural, geom_idx, has_header=True)
         d_starts, d_ends = _strip_quotes_from_spans(d_bytes, d_starts, d_ends)
         fmt = _detect_geom_format(d_bytes, d_starts, d_ends)
@@ -1183,24 +1268,34 @@ def read_csv_gpu(
             geometry = _extract_wkb_and_parse(d_bytes, d_starts, d_ends)
         else:
             geometry = _extract_wkt_and_parse(d_bytes, d_starts, d_ends)
-        return CsvGpuResult(geometry=geometry, n_rows=structural.n_rows)
+    else:
+        # Lat/lon mode
+        lat_idx = spatial["lat"]
+        lon_idx = spatial["lon"]
+        spatial_indices = {lat_idx, lon_idx}
 
-    # Lat/lon mode
-    lat_idx = spatial["lat"]
-    lon_idx = spatial["lon"]
+        # Extract lat field spans
+        d_lat_starts, d_lat_ends = _extract_field_spans(d_bytes, structural, lat_idx, has_header=True)
+        d_lat_starts, d_lat_ends = _strip_quotes_from_spans(d_bytes, d_lat_starts, d_lat_ends)
 
-    # Extract lat field spans
-    d_lat_starts, d_lat_ends = _extract_field_spans(d_bytes, structural, lat_idx, has_header=True)
-    d_lat_starts, d_lat_ends = _strip_quotes_from_spans(d_bytes, d_lat_starts, d_lat_ends)
+        # Extract lon field spans
+        d_lon_starts, d_lon_ends = _extract_field_spans(d_bytes, structural, lon_idx, has_header=True)
+        d_lon_starts, d_lon_ends = _strip_quotes_from_spans(d_bytes, d_lon_starts, d_lon_ends)
 
-    # Extract lon field spans
-    d_lon_starts, d_lon_ends = _extract_field_spans(d_bytes, structural, lon_idx, has_header=True)
-    d_lon_starts, d_lon_ends = _strip_quotes_from_spans(d_bytes, d_lon_starts, d_lon_ends)
+        # Parse numeric values (delegates to gpu_parse NVRTC kernel)
+        d_lat = parse_ascii_floats(d_bytes, d_lat_starts, d_lat_ends)
+        d_lon = parse_ascii_floats(d_bytes, d_lon_starts, d_lon_ends)
 
-    # Parse numeric values (delegates to gpu_parse NVRTC kernel)
-    d_lat = parse_ascii_floats(d_bytes, d_lat_starts, d_lat_ends)
-    d_lon = parse_ascii_floats(d_bytes, d_lon_starts, d_lon_ends)
+        # Assemble Point geometry: x = longitude, y = latitude (GIS convention)
+        geometry = _assemble_point_geometry(d_lon, d_lat, structural.n_rows)
 
-    # Assemble Point geometry: x = longitude, y = latitude (GIS convention)
-    geometry = _assemble_point_geometry(d_lon, d_lat, structural.n_rows)
-    return CsvGpuResult(geometry=geometry, n_rows=structural.n_rows)
+    # ------------------------------------------------------------------
+    # Stage 4: Extract non-spatial attribute columns
+    # ------------------------------------------------------------------
+    attributes = _extract_nonspatial_columns(
+        d_bytes, structural, spatial_column_indices=spatial_indices,
+    )
+
+    return CsvGpuResult(
+        geometry=geometry, n_rows=structural.n_rows, attributes=attributes,
+    )
