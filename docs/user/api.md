@@ -281,13 +281,14 @@ available. No code changes are required — GPU acceleration is transparent.
 
 | Format | Extension | GPU Condition | Fallback |
 |--------|-----------|---------------|----------|
+| GeoParquet | `.parquet`, `.geoparquet` | Always | pyarrow |
+| Feather/Arrow | `.feather`, `.arrow`, `.ipc` | Always | pyarrow |
 | GeoJSON | `.geojson`, `.json` | File > 10 MB | pyogrio |
 | Shapefile | `.shp` | File > 10 MB | pyogrio |
 | CSV/TSV | `.csv`, `.tsv` | File > 10 MB | pyogrio |
 | KML | `.kml` | File > 10 MB | pyogrio |
 | WKT | `.wkt` | Always | None (GPU-only) |
 | OSM PBF | `.pbf`, `.osm.pbf` | Always | None (GPU-only) |
-| GeoParquet | `.parquet` | Always | pyarrow |
 
 ### CSV Spatial Column Auto-Detection
 

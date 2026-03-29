@@ -165,6 +165,11 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         ".tsv": "CSV",
         ".kml": "KML",
         ".pbf": "OSM-PBF",
+        ".parquet": "GeoParquet",
+        ".geoparquet": "GeoParquet",
+        ".feather": "Feather",
+        ".arrow": "Arrow",
+        ".ipc": "Arrow",
     }
     return mapping.get(suffix, "GDAL-legacy")
 
@@ -887,10 +892,10 @@ def read_vector_file(
     build_index: bool = False,
     **kwargs,
 ):
-    """Read a vector file into a GeoDataFrame.
+    """Read a spatial file into a GeoDataFrame.
 
-    Supports Shapefile, GeoPackage, GeoJSON, WKT, CSV, KML, OSM PBF,
-    and any format readable by pyogrio/fiona.
+    Supports GeoParquet, Feather/Arrow, Shapefile, GeoPackage, GeoJSON,
+    WKT, CSV, KML, OSM PBF, and any format readable by pyogrio/fiona.
 
     GPU acceleration is automatic for GeoJSON, Shapefile, WKT, CSV, KML,
     and OSM PBF formats.  For CSV, KML, GeoJSON, and Shapefile, GPU
@@ -941,6 +946,28 @@ def read_vector_file(
     GeoDataFrame
     """
     plan = plan_vector_file_io(filename, operation=IOOperation.READ)
+
+    # Delegate GeoParquet/Feather/Arrow to their dedicated readers.
+    # These formats have their own optimized pipelines (GPU-native for
+    # Parquet via pylibcudf, Arrow-native for Feather/IPC) and are not
+    # handled by the pyogrio vector file path.
+    normalized = _normalize_driver(filename)
+    if normalized == "GeoParquet":
+        from .arrow import read_geoparquet
+
+        parquet_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
+        if columns is not None:
+            parquet_kwargs["columns"] = columns
+        if bbox is not None:
+            parquet_kwargs["bbox"] = bbox
+        return read_geoparquet(filename, **parquet_kwargs)
+    if normalized in ("Feather", "Arrow"):
+        from vibespatial.api.io.arrow import _read_feather
+
+        feather_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
+        if columns is not None:
+            feather_kwargs["columns"] = columns
+        return _read_feather(filename, **feather_kwargs)
 
     # Try GPU-dominant owned path for supported formats.
     _GPU_DISPATCH_FORMATS = {
