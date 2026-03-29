@@ -9241,6 +9241,121 @@
       ]
     },
     {
+      "kind": "repo",
+      "path": "benchmarks/shootout/_data.py",
+      "referenced_by": [],
+      "symbols": [
+        "get_scale",
+        "_grid_side",
+        "_linspace",
+        "_make_clustered_points",
+        "_make_grid_polygons",
+        "_convexish_polygon",
+        "_make_convex_polygons",
+        "_star_polygon",
+        "_make_star_polygons",
+        "_make_river_lines",
+        "_make_grid_lines",
+        "_write_parquet",
+        "_write_geojson",
+        "setup_fixtures",
+        "fingerprint"
+      ],
+      "tokens": [
+        "benchmarks",
+        "clustered",
+        "convex",
+        "convexish",
+        "data",
+        "fingerprint",
+        "fixtures",
+        "geojson",
+        "get",
+        "grid",
+        "lines",
+        "linspace",
+        "make",
+        "parquet",
+        "points",
+        "polygon",
+        "polygons",
+        "py",
+        "river",
+        "scale",
+        "setup",
+        "shootout",
+        "side",
+        "star",
+        "write"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/shootout/flood_exposure.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "benchmarks",
+        "exposure",
+        "flood",
+        "py",
+        "shootout"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/shootout/network_service_area.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "area",
+        "benchmarks",
+        "network",
+        "py",
+        "service",
+        "shootout"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/shootout/parcel_zoning.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "benchmarks",
+        "parcel",
+        "py",
+        "shootout",
+        "zoning"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/shootout/site_suitability.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "benchmarks",
+        "py",
+        "shootout",
+        "site",
+        "suitability"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmarks/shootout/vegetation_corridor.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "benchmarks",
+        "corridor",
+        "py",
+        "shootout",
+        "vegetation"
+      ]
+    },
+    {
       "kind": "doc",
       "path": "docs/architecture/adaptive-runtime.md",
       "referenced_by": [
@@ -13954,6 +14069,7 @@
         "render_suite",
         "render_list",
         "_shootout_status",
+        "_fingerprint_label",
         "_render_shootout_quiet",
         "_render_shootout_plain",
         "_render_shootout_rich",
@@ -13962,8 +14078,10 @@
       "tokens": [
         "bench",
         "bytes",
+        "fingerprint",
         "fmt",
         "has",
+        "label",
         "list",
         "output",
         "plain",
@@ -14225,6 +14343,8 @@
         "_fmt_time",
         "_build_run_from_result",
         "_error_run",
+        "_extract_fingerprint",
+        "_fingerprints_match",
         "_run_harness",
         "run_shootout"
       ],
@@ -14232,9 +14352,13 @@
         "bench",
         "build",
         "error",
+        "extract",
         "find",
+        "fingerprint",
+        "fingerprints",
         "fmt",
         "harness",
+        "match",
         "py",
         "result",
         "run",
@@ -17142,10 +17266,10 @@
         "_parse_stringtable",
         "_decode_packed_uint32",
         "_decode_packed_sint64_cpu",
-        "_parse_single_way",
-        "_extract_way_blocks",
-        "_parse_single_relation",
-        "_extract_relation_blocks"
+        "_decode_dense_node_tags",
+        "_decode_way_tags",
+        "_decode_relation_tags",
+        "_tags_to_dataframe"
       ],
       "tokens": [
         "batch",
@@ -17154,6 +17278,7 @@
         "blockinfo",
         "blocks",
         "cpu",
+        "dataframe",
         "decode",
         "decompress",
         "dense",
@@ -17163,6 +17288,7 @@
         "gpu",
         "index",
         "io",
+        "node",
         "nodes",
         "osm",
         "osmgpuresult",
@@ -17174,13 +17300,13 @@
         "relationblock",
         "relationmember",
         "relations",
-        "single",
         "sint64",
         "skip",
         "src",
         "stream",
         "stringtable",
         "tag",
+        "tags",
         "uint32",
         "varint",
         "vibespatial",

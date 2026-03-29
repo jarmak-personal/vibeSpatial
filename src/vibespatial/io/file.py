@@ -526,11 +526,16 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
     and Relations (MultiPolygons) extracted via CPU protobuf parsing with
     GPU varint decoding, coordinate assembly, and binary-search-based
     coordinate resolution.  Returns a GeoDataFrame with mixed geometry
-    types and OSM ID columns, or None on failure.
+    types, OSM ID columns, and tag/attribute columns, or None on failure.
+
+    Follows the GeoJSON hybrid pattern: geometry is device-resident,
+    attributes (tags) are host-resident in a pandas DataFrame.
     """
     try:
+        import pandas as pd
+
         from .arrow import geoseries_from_owned
-        from .osm_gpu import read_osm_pbf
+        from .osm_gpu import _tags_to_dataframe, read_osm_pbf
 
         osm_result = read_osm_pbf(filename)
         has_nodes = osm_result.nodes is not None and osm_result.n_nodes > 0
@@ -555,48 +560,73 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
         if n_types == 1:
             if has_nodes:
                 geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
-                data: dict[str, object] = {}
+                tags_df = (
+                    _tags_to_dataframe(osm_result.node_tags)
+                    if osm_result.node_tags
+                    else pd.DataFrame(index=range(osm_result.n_nodes))
+                )
+                gdf = geopandas.GeoDataFrame(tags_df, geometry=geom_series)
                 if osm_result.node_ids is not None:
-                    data["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
-                gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+                    gdf["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
             elif has_ways:
                 geom_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
-                data = {}
+                tags_df = (
+                    _tags_to_dataframe(osm_result.way_tags)
+                    if osm_result.way_tags
+                    else pd.DataFrame(index=range(osm_result.n_ways))
+                )
+                gdf = geopandas.GeoDataFrame(tags_df, geometry=geom_series)
                 if osm_result.way_ids is not None:
-                    data["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
-                gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+                    gdf["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
             else:
                 geom_series = geoseries_from_owned(osm_result.relations, name="geometry", crs=crs)
-                data = {}
+                tags_df = (
+                    _tags_to_dataframe(osm_result.relation_tags)
+                    if osm_result.relation_tags
+                    else pd.DataFrame(index=range(osm_result.n_relations))
+                )
+                gdf = geopandas.GeoDataFrame(tags_df, geometry=geom_series)
                 if osm_result.relation_ids is not None:
-                    data["osm_relation_id"] = _cp.asnumpy(osm_result.relation_ids)
-                gdf = geopandas.GeoDataFrame(data, geometry=geom_series)
+                    gdf["osm_relation_id"] = _cp.asnumpy(osm_result.relation_ids)
         else:
             # Multiple element types -- build per-type GeoDataFrames and concatenate.
-            import pandas as pd
-
             frames = []
 
             if has_nodes:
                 node_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
-                node_data: dict[str, object] = {"osm_element": "node"}
+                node_tags_df = (
+                    _tags_to_dataframe(osm_result.node_tags)
+                    if osm_result.node_tags
+                    else pd.DataFrame(index=range(osm_result.n_nodes))
+                )
+                node_tags_df["osm_element"] = "node"
                 if osm_result.node_ids is not None:
-                    node_data["osm_id"] = _cp.asnumpy(osm_result.node_ids)
-                frames.append(geopandas.GeoDataFrame(node_data, geometry=node_series))
+                    node_tags_df["osm_id"] = _cp.asnumpy(osm_result.node_ids)
+                frames.append(geopandas.GeoDataFrame(node_tags_df, geometry=node_series))
 
             if has_ways:
                 way_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
-                way_data: dict[str, object] = {"osm_element": "way"}
+                way_tags_df = (
+                    _tags_to_dataframe(osm_result.way_tags)
+                    if osm_result.way_tags
+                    else pd.DataFrame(index=range(osm_result.n_ways))
+                )
+                way_tags_df["osm_element"] = "way"
                 if osm_result.way_ids is not None:
-                    way_data["osm_id"] = _cp.asnumpy(osm_result.way_ids)
-                frames.append(geopandas.GeoDataFrame(way_data, geometry=way_series))
+                    way_tags_df["osm_id"] = _cp.asnumpy(osm_result.way_ids)
+                frames.append(geopandas.GeoDataFrame(way_tags_df, geometry=way_series))
 
             if has_relations:
                 rel_series = geoseries_from_owned(osm_result.relations, name="geometry", crs=crs)
-                rel_data: dict[str, object] = {"osm_element": "relation"}
+                rel_tags_df = (
+                    _tags_to_dataframe(osm_result.relation_tags)
+                    if osm_result.relation_tags
+                    else pd.DataFrame(index=range(osm_result.n_relations))
+                )
+                rel_tags_df["osm_element"] = "relation"
                 if osm_result.relation_ids is not None:
-                    rel_data["osm_id"] = _cp.asnumpy(osm_result.relation_ids)
-                frames.append(geopandas.GeoDataFrame(rel_data, geometry=rel_series))
+                    rel_tags_df["osm_id"] = _cp.asnumpy(osm_result.relation_ids)
+                frames.append(geopandas.GeoDataFrame(rel_tags_df, geometry=rel_series))
 
             gdf = geopandas.GeoDataFrame(
                 pd.concat(frames, ignore_index=True),
@@ -609,8 +639,9 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
             reason=(
                 "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
                 "decoding, coordinate assembly, Way/Relation coordinate "
-                "resolution via binary-search kernel, and MultiPolygon "
-                "assembly from Relation Way members."
+                "resolution via binary-search kernel, MultiPolygon "
+                "assembly from Relation Way members, and host-resident "
+                "tag/attribute extraction."
             ),
             selected=ExecutionMode.GPU,
         )

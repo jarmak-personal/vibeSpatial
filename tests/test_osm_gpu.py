@@ -103,16 +103,30 @@ def _build_dense_nodes(
     id_deltas: list[int],
     lat_deltas: list[int],
     lon_deltas: list[int],
+    keys_vals: list[int] | None = None,
 ) -> bytes:
-    """Build a DenseNodes protobuf message."""
+    """Build a DenseNodes protobuf message.
+
+    Parameters
+    ----------
+    keys_vals
+        Optional packed uint32 array for DenseNodes tags.
+        Uses the interleaved key_sid/val_sid/0 encoding:
+        ``[key1, val1, 0, key2, val2, key3, val3, 0, ...]``
+        where ``0`` delimits between nodes.
+    """
     id_packed = _encode_packed_sint64(id_deltas)
     lat_packed = _encode_packed_sint64(lat_deltas)
     lon_packed = _encode_packed_sint64(lon_deltas)
-    return (
+    result = (
         _encode_length_delimited(1, id_packed)    # field 1: id
         + _encode_length_delimited(8, lat_packed)  # field 8: lat
         + _encode_length_delimited(9, lon_packed)  # field 9: lon
     )
+    if keys_vals is not None:
+        kv_packed = _encode_packed_uint32(keys_vals)
+        result += _encode_length_delimited(10, kv_packed)  # field 10: keys_vals
+    return result
 
 
 def _build_primitive_group(dense_nodes: bytes) -> bytes:
@@ -2562,3 +2576,489 @@ class TestStreamingPipeline:
 
         assert isinstance(_STREAM_BATCH_SIZE, int)
         assert _STREAM_BATCH_SIZE >= 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: Tag / attribute extraction
+# ---------------------------------------------------------------------------
+
+
+class TestDenseNodeTagDecoding:
+    """Test DenseNodes tag extraction from the keys_vals packed field."""
+
+    def test_decode_single_node_single_tag(self):
+        """Single node with one tag pair -> one dict with one entry."""
+        from vibespatial.io.osm_gpu import _decode_dense_node_tags
+
+        # keys_vals = [key_sid=1, val_sid=2, 0] -- one node, one tag
+        st = [b"", b"name", b"Main St"]
+        result = _decode_dense_node_tags([1, 2, 0], st, n_nodes=1)
+        assert len(result) == 1
+        assert result[0] == {"name": "Main St"}
+
+    def test_decode_multiple_nodes_with_varying_tags(self):
+        """Three nodes: first has 2 tags, second has 0, third has 1."""
+        from vibespatial.io.osm_gpu import _decode_dense_node_tags
+
+        st = [b"", b"highway", b"residential", b"name", b"Oak Ave"]
+        # Node 1: highway=residential, name=Oak Ave
+        # Node 2: (no tags)
+        # Node 3: highway=residential
+        keys_vals = [1, 2, 3, 4, 0, 0, 1, 2, 0]
+        result = _decode_dense_node_tags(keys_vals, st, n_nodes=3)
+        assert len(result) == 3
+        assert result[0] == {"highway": "residential", "name": "Oak Ave"}
+        assert result[1] == {}
+        assert result[2] == {"highway": "residential"}
+
+    def test_decode_no_tags_all_zeros(self):
+        """All nodes have no tags -> all zeros -> all empty dicts."""
+        from vibespatial.io.osm_gpu import _decode_dense_node_tags
+
+        # 3 nodes, no tags: [0, 0, 0]
+        result = _decode_dense_node_tags([0, 0, 0], [b""], n_nodes=3)
+        assert len(result) == 3
+        assert all(d == {} for d in result)
+
+    def test_decode_empty_keys_vals(self):
+        """Empty keys_vals array -> n_nodes empty dicts."""
+        from vibespatial.io.osm_gpu import _decode_dense_node_tags
+
+        result = _decode_dense_node_tags([], [b""], n_nodes=5)
+        assert len(result) == 5
+        assert all(d == {} for d in result)
+
+    def test_decode_unicode_tag_values(self):
+        """Tags with non-ASCII characters decode correctly."""
+        from vibespatial.io.osm_gpu import _decode_dense_node_tags
+
+        st = [b"", b"name", "Caf\u00e9 R\u00f6sti".encode()]
+        result = _decode_dense_node_tags([1, 2, 0], st, n_nodes=1)
+        assert result[0] == {"name": "Caf\u00e9 R\u00f6sti"}
+
+
+class TestWayTagDecoding:
+    """Test Way tag extraction from WayBlock stringtable indices."""
+
+    def test_decode_way_with_tags(self):
+        """Way with tags -> decoded dict."""
+        from vibespatial.io.osm_gpu import WayBlock, _decode_way_tags
+
+        st = [b"", b"highway", b"building", b"residential", b"yes"]
+        wb = WayBlock(
+            way_ids=[100],
+            refs_per_way=[[1, 2, 3]],
+            tag_keys_per_way=[[1, 2]],       # highway, building
+            tag_vals_per_way=[[3, 4]],        # residential, yes
+            stringtable=st,
+        )
+        result = _decode_way_tags(wb)
+        assert len(result) == 1
+        assert result[0] == {"highway": "residential", "building": "yes"}
+
+    def test_decode_way_without_tags(self):
+        """Way with no tags -> empty dict."""
+        from vibespatial.io.osm_gpu import WayBlock, _decode_way_tags
+
+        wb = WayBlock(
+            way_ids=[200],
+            refs_per_way=[[1, 2, 3]],
+            tag_keys_per_way=[[]],
+            tag_vals_per_way=[[]],
+            stringtable=[b""],
+        )
+        result = _decode_way_tags(wb)
+        assert len(result) == 1
+        assert result[0] == {}
+
+    def test_decode_multiple_ways_mixed_tags(self):
+        """Multiple ways: first with tags, second without."""
+        from vibespatial.io.osm_gpu import WayBlock, _decode_way_tags
+
+        st = [b"", b"highway", b"primary"]
+        wb = WayBlock(
+            way_ids=[100, 200],
+            refs_per_way=[[1, 2], [3, 4]],
+            tag_keys_per_way=[[1], []],
+            tag_vals_per_way=[[2], []],
+            stringtable=st,
+        )
+        result = _decode_way_tags(wb)
+        assert len(result) == 2
+        assert result[0] == {"highway": "primary"}
+        assert result[1] == {}
+
+
+class TestRelationTagDecoding:
+    """Test Relation tag extraction from RelationBlock."""
+
+    def test_decode_relation_with_tags(self):
+        """Relation with tags -> decoded dict."""
+        from vibespatial.io.osm_gpu import RelationBlock, _decode_relation_tags
+
+        st = [b"", b"outer", b"type", b"multipolygon", b"name", b"Park"]
+        rb = RelationBlock(
+            relation_ids=[5000],
+            members_per_relation=[[]],
+            stringtable=st,
+            granularity=100,
+            lat_offset=0,
+            lon_offset=0,
+            tag_keys_per_relation=[[2, 4]],      # type, name
+            tag_vals_per_relation=[[3, 5]],       # multipolygon, Park
+        )
+        result = _decode_relation_tags(rb)
+        assert len(result) == 1
+        assert result[0] == {"type": "multipolygon", "name": "Park"}
+
+    def test_decode_relation_without_tags(self):
+        """Relation with no tags -> empty dict."""
+        from vibespatial.io.osm_gpu import RelationBlock, _decode_relation_tags
+
+        rb = RelationBlock(
+            relation_ids=[6000],
+            members_per_relation=[[]],
+            stringtable=[b""],
+            granularity=100,
+            lat_offset=0,
+            lon_offset=0,
+            tag_keys_per_relation=None,
+            tag_vals_per_relation=None,
+        )
+        result = _decode_relation_tags(rb)
+        assert len(result) == 1
+        assert result[0] == {}
+
+
+class TestTagsToDataframe:
+    """Test the _tags_to_dataframe helper."""
+
+    def test_empty_tags(self):
+        """Empty list -> empty DataFrame."""
+        from vibespatial.io.osm_gpu import _tags_to_dataframe
+
+        df = _tags_to_dataframe([])
+        assert len(df) == 0
+
+    def test_uniform_tags(self):
+        """All elements have the same keys."""
+        from vibespatial.io.osm_gpu import _tags_to_dataframe
+
+        tags = [
+            {"highway": "primary", "name": "Main St"},
+            {"highway": "secondary", "name": "Oak Ave"},
+        ]
+        df = _tags_to_dataframe(tags)
+        assert len(df) == 2
+        assert "highway" in df.columns
+        assert "name" in df.columns
+        assert df["highway"].iloc[0] == "primary"
+        assert df["name"].iloc[1] == "Oak Ave"
+
+    def test_sparse_tags(self):
+        """Different elements have different keys -> NaN for missing."""
+        import pandas as pd
+
+        from vibespatial.io.osm_gpu import _tags_to_dataframe
+
+        tags = [
+            {"highway": "primary"},
+            {"building": "yes"},
+            {},
+        ]
+        df = _tags_to_dataframe(tags)
+        assert len(df) == 3
+        assert "highway" in df.columns
+        assert "building" in df.columns
+        # Missing values become NaN
+        assert pd.isna(df["highway"].iloc[1])
+        assert pd.isna(df["building"].iloc[0])
+        assert pd.isna(df["highway"].iloc[2])
+
+
+class TestDenseNodeTagsEndToEnd:
+    """End-to-end: PBF with DenseNodes tags -> OsmGpuResult.node_tags."""
+
+    @needs_gpu
+    def test_nodes_with_tags(self):
+        """Nodes with tags extracted via read_osm_pbf_nodes."""
+        from vibespatial.io.osm_gpu import read_osm_pbf_nodes
+
+        # stringtable: [b"", b"amenity", b"cafe", b"name", b"Joe's"]
+        # Node 1: amenity=cafe, name=Joe's
+        # Node 2: (no tags)
+        # keys_vals: [1, 2, 3, 4, 0, 0]  (node1: key1=val2, key3=val4; node2: empty)
+        keys_vals = [1, 2, 3, 4, 0, 0]
+
+        dense = _build_dense_nodes(
+            id_deltas=[1, 1],
+            lat_deltas=[400000000, 1000000],
+            lon_deltas=[-740000000, 100000],
+            keys_vals=keys_vals,
+        )
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=[b"", b"amenity", b"cafe", b"name", b"Joe's"],
+        )
+        data_block = _build_pbf_block("OSMData", pblock)
+        pbf = _build_osm_header() + data_block
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf_nodes(path)
+            assert result.n_nodes == 2
+            assert result.node_tags is not None
+            assert len(result.node_tags) == 2
+            assert result.node_tags[0] == {"amenity": "cafe", "name": "Joe's"}
+            assert result.node_tags[1] == {}
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_nodes_without_tags_returns_none(self):
+        """Nodes with no keys_vals field -> node_tags is None."""
+        from vibespatial.io.osm_gpu import read_osm_pbf_nodes
+
+        pbf = _build_test_pbf(
+            id_deltas=[1, 1],
+            lat_deltas=[100, 200],
+            lon_deltas=[300, 400],
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf_nodes(path)
+            assert result.n_nodes == 2
+            assert result.node_tags is None
+        finally:
+            path.unlink()
+
+
+class TestWayTagsEndToEnd:
+    """End-to-end: PBF with Way tags -> OsmGpuResult.way_tags."""
+
+    @needs_gpu
+    def test_ways_with_tags(self):
+        """Ways with tags extracted via read_osm_pbf."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # 3 nodes
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [0, 10000, 20000]
+        node_lon_deltas = [0, 10000, 20000]
+
+        # Way 100 with tags: highway=primary (st[1]=highway, st[2]=primary)
+        way = _build_way(100, [1, 1, 1], keys=[1], vals=[2])
+        ways_group = _build_primitive_group_with_ways([way])
+
+        dense = _build_dense_nodes(node_id_deltas, node_lat_deltas, node_lon_deltas)
+        dense_group = _build_primitive_group(dense)
+
+        pblock = _build_primitive_block_with_stringtable(
+            [dense_group, ways_group],
+            stringtable_entries=[b"", b"highway", b"primary"],
+        )
+        data_block = _build_pbf_block("OSMData", pblock)
+        pbf = _build_osm_header() + data_block
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+            assert result.way_tags is not None
+            assert len(result.way_tags) == 1
+            assert result.way_tags[0] == {"highway": "primary"}
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_ways_without_tags_returns_none(self):
+        """Ways with no tags -> way_tags is None."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [0, 10000, 20000]
+        node_lon_deltas = [0, 10000, 20000]
+
+        ways = [(100, [1, 2, 3])]
+        pbf = _build_test_pbf_with_ways(
+            node_id_deltas, node_lat_deltas, node_lon_deltas, ways,
+        )
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+            assert result.way_tags is None
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_multiple_tags_per_way(self):
+        """Way with multiple tag key/value pairs."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        node_id_deltas = [1, 1, 1]
+        node_lat_deltas = [0, 10000, 20000]
+        node_lon_deltas = [0, 10000, 20000]
+
+        # st: [b"", b"highway", b"building", b"primary", b"yes"]
+        way = _build_way(100, [1, 1, 1], keys=[1, 2], vals=[3, 4])
+        ways_group = _build_primitive_group_with_ways([way])
+
+        dense = _build_dense_nodes(node_id_deltas, node_lat_deltas, node_lon_deltas)
+        dense_group = _build_primitive_group(dense)
+
+        pblock = _build_primitive_block_with_stringtable(
+            [dense_group, ways_group],
+            stringtable_entries=[b"", b"highway", b"building", b"primary", b"yes"],
+        )
+        data_block = _build_pbf_block("OSMData", pblock)
+        pbf = _build_osm_header() + data_block
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_ways == 1
+            assert result.way_tags is not None
+            assert result.way_tags[0] == {"highway": "primary", "building": "yes"}
+        finally:
+            path.unlink()
+
+
+class TestRelationTagsEndToEnd:
+    """End-to-end: PBF with Relation tags -> OsmGpuResult.relation_tags."""
+
+    @needs_gpu
+    def test_relation_with_tags(self):
+        """Relation with tags extracted via read_osm_pbf."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        # Build a simple multipolygon relation with tags
+        # 4 nodes for a closed ring
+        node_id_deltas = [1, 1, 1, 1]
+        node_lat_deltas = [0, 10000000, 0, -10000000]
+        node_lon_deltas = [0, 0, 10000000, 0]
+
+        # Way 50: closed ring [1, 2, 3, 4, 1]
+        ways = [(50, [1, 2, 3, 4, 1])]
+
+        # Relation 9000: Way 50 as outer, tags: type=multipolygon, name=TestPark
+        # st: [b"", b"outer", b"type", b"multipolygon", b"name", b"TestPark"]
+        rel = _build_relation(
+            9000,
+            members=[(50, 1, 1)],  # Way 50, type=WAY, role="outer" (st[1])
+            keys=[2, 4],           # type, name
+            vals=[3, 5],           # multipolygon, TestPark
+        )
+        rel_group = _build_primitive_group_with_relations([rel])
+
+        # Build Ways group
+        way_messages = []
+        for way_id, absolute_refs in ways:
+            ref_deltas = [absolute_refs[0]]
+            for i in range(1, len(absolute_refs)):
+                ref_deltas.append(absolute_refs[i] - absolute_refs[i - 1])
+            way_messages.append(_build_way(way_id, ref_deltas))
+        ways_group = _build_primitive_group_with_ways(way_messages)
+
+        dense = _build_dense_nodes(node_id_deltas, node_lat_deltas, node_lon_deltas)
+        dense_group = _build_primitive_group(dense)
+
+        pblock = _build_primitive_block_with_stringtable(
+            [dense_group, ways_group, rel_group],
+            stringtable_entries=[
+                b"", b"outer", b"type", b"multipolygon", b"name", b"TestPark",
+            ],
+        )
+        data_block = _build_pbf_block("OSMData", pblock)
+        pbf = _build_osm_header() + data_block
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path)
+            assert result.n_relations > 0
+            assert result.relation_tags is not None
+            assert len(result.relation_tags) == result.n_relations
+            # The first (only) resolved relation should have our tags
+            assert result.relation_tags[0] == {
+                "type": "multipolygon",
+                "name": "TestPark",
+            }
+        finally:
+            path.unlink()
+
+
+class TestRelationParsingWithTags:
+    """Test that _parse_single_relation captures tag key/val fields."""
+
+    def test_relation_keys_vals_captured(self):
+        """Relation protobuf with keys/vals fields -> parsed correctly."""
+        from vibespatial.io.osm_gpu import _parse_single_relation
+
+        st = [b"", b"outer", b"type", b"multipolygon"]
+        rel_bytes = _build_relation(
+            1000,
+            members=[(10, 1, 1)],  # one Way member
+            keys=[2],              # "type"
+            vals=[3],              # "multipolygon"
+        )
+        rel_id, members, tag_keys, tag_vals = _parse_single_relation(rel_bytes, st)
+        assert rel_id == 1000
+        assert len(members) == 1
+        assert tag_keys == [2]
+        assert tag_vals == [3]
+
+    def test_relation_no_tags(self):
+        """Relation without tags -> empty key/val lists."""
+        from vibespatial.io.osm_gpu import _parse_single_relation
+
+        st = [b"", b"outer"]
+        rel_bytes = _build_relation(2000, members=[(10, 1, 1)])
+        rel_id, members, tag_keys, tag_vals = _parse_single_relation(rel_bytes, st)
+        assert rel_id == 2000
+        assert tag_keys == []
+        assert tag_vals == []
+
+
+class TestDenseNodesTagExtraction:
+    """Test that _extract_dense_nodes_blocks captures keys_vals and stringtable."""
+
+    def test_keys_vals_and_stringtable_captured(self):
+        """DenseNodes block with keys_vals -> DenseNodesBlock has both."""
+        from vibespatial.io.osm_gpu import _extract_dense_nodes_blocks
+
+        # keys_vals: node1 has tag key=1, val=2; node2 has no tags
+        keys_vals = [1, 2, 0, 0]
+        dense = _build_dense_nodes([1, 1], [100, 200], [300, 400], keys_vals=keys_vals)
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=[b"", b"amenity", b"cafe"],
+        )
+
+        results = _extract_dense_nodes_blocks([pblock])
+        assert len(results) == 1
+        block = results[0]
+        assert block.keys_vals_bytes != b""
+        assert block.stringtable is not None
+        assert len(block.stringtable) == 3
+        assert block.stringtable[1] == b"amenity"
+
+    def test_no_keys_vals_field(self):
+        """DenseNodes without keys_vals -> empty bytes, stringtable still parsed."""
+        from vibespatial.io.osm_gpu import _extract_dense_nodes_blocks
+
+        dense = _build_dense_nodes([1], [100], [200])
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=[b"", b"test"],
+        )
+
+        results = _extract_dense_nodes_blocks([pblock])
+        assert len(results) == 1
+        block = results[0]
+        assert block.keys_vals_bytes == b""
+        assert block.stringtable is not None

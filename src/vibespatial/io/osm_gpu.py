@@ -310,6 +310,7 @@ _PRIMITIVEGROUP_RELATIONS_FIELD = 4       # repeated Relation
 _DENSENODES_ID_FIELD = 1         # packed sint64 (ZigZag + delta)
 _DENSENODES_LAT_FIELD = 8        # packed sint64 (ZigZag + delta)
 _DENSENODES_LON_FIELD = 9        # packed sint64 (ZigZag + delta)
+_DENSENODES_KEYS_VALS_FIELD = 10 # packed uint32 (interleaved key/val/0)
 
 # Way fields
 _WAY_ID_FIELD = 1                # int64 (varint)
@@ -355,6 +356,8 @@ class DenseNodesBlock:
     granularity: int        # nanodegree granularity (default 100)
     lat_offset: int         # nanodegree lat offset (default 0)
     lon_offset: int         # nanodegree lon offset (default 0)
+    keys_vals_bytes: bytes = b""  # packed uint32 for DenseNodes tag extraction
+    stringtable: list[bytes] | None = None  # block's string table for tag decoding
 
 
 @dataclass(frozen=True)
@@ -387,6 +390,8 @@ class RelationBlock:
     granularity: int
     lat_offset: int
     lon_offset: int
+    tag_keys_per_relation: list[list[int]] | None = None   # stringtable indices
+    tag_vals_per_relation: list[list[int]] | None = None   # stringtable indices
 
 
 @dataclass(frozen=True)
@@ -401,6 +406,9 @@ class OsmGpuResult:
     node_ids
         Device-resident int64 array of OSM node IDs, parallel to the
         geometry array.  ``None`` if no nodes were found.
+    node_tags
+        Per-node tag dicts (host-resident strings).  ``None`` if no
+        nodes were found or no tags present.
     n_nodes
         Total number of nodes extracted.
     ways
@@ -410,6 +418,9 @@ class OsmGpuResult:
     way_ids
         Device-resident int64 array of OSM Way IDs, parallel to the
         ways geometry array.  ``None`` if no ways were found.
+    way_tags
+        Per-way tag dicts (host-resident strings).  ``None`` if no
+        ways were found or no tags present.
     n_ways
         Total number of ways extracted.
     relations
@@ -418,6 +429,9 @@ class OsmGpuResult:
     relation_ids
         Device-resident int64 array of OSM Relation IDs, parallel to
         the relations geometry array.  ``None`` if no relations found.
+    relation_tags
+        Per-relation tag dicts (host-resident strings).  ``None`` if
+        no relations found or no tags present.
     n_relations
         Total number of multipolygon relations extracted.
     """
@@ -425,11 +439,14 @@ class OsmGpuResult:
     nodes: OwnedGeometryArray | None
     node_ids: cp.ndarray | None
     n_nodes: int
+    node_tags: list[dict[str, str]] | None = None
     ways: OwnedGeometryArray | None = None
     way_ids: cp.ndarray | None = None
+    way_tags: list[dict[str, str]] | None = None
     n_ways: int = 0
     relations: OwnedGeometryArray | None = None
     relation_ids: cp.ndarray | None = None
+    relation_tags: list[dict[str, str]] | None = None
     n_relations: int = 0
 
 
@@ -645,7 +662,7 @@ _STREAM_BATCH_SIZE = 4  # blocks per batch -- balances memory vs. overhead
 def _stream_decode_nodes(
     path: Path,
     block_index: list[BlockInfo],
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray] | None:
+) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[dict[str, str]] | None] | None:
     """Stream-decode DenseNodes from PBF blocks in batches.
 
     Processes blocks in groups of ``_STREAM_BATCH_SIZE`` to bound peak host
@@ -653,14 +670,18 @@ def _stream_decode_nodes(
     on GPU, delta-decoded (cumsum), and scaled.  Results are accumulated as
     device-resident CuPy array chunks and concatenated at the end.
 
-    Returns ``(d_all_ids, d_all_lat, d_all_lon)`` -- concatenated device
-    arrays -- or ``None`` if no nodes were found.
+    Returns ``(d_all_ids, d_all_lat, d_all_lon, all_node_tags)`` --
+    concatenated device arrays and host-resident tag dicts -- or ``None``
+    if no nodes were found.  ``all_node_tags`` is ``None`` if no blocks
+    contained tag data.
     """
     data_blocks = [bi for bi in block_index if bi.block_type == "OSMData"]
 
     id_chunks: list[cp.ndarray] = []
     lat_chunks: list[cp.ndarray] = []
     lon_chunks: list[cp.ndarray] = []
+    tag_chunks: list[list[dict[str, str]]] = []
+    has_any_tags = False
 
     for batch_start in range(0, len(data_blocks), _STREAM_BATCH_SIZE):
         batch = data_blocks[batch_start : batch_start + _STREAM_BATCH_SIZE]
@@ -683,6 +704,21 @@ def _stream_decode_nodes(
             lat_chunks.append(d_lat)
             lon_chunks.append(d_lon)
 
+            # Decode tags for this batch (CPU, host-resident strings)
+            batch_tags: list[dict[str, str]] = []
+            for dense in dense_blocks:
+                n_block_nodes = _count_varints(dense.id_bytes)
+                if dense.keys_vals_bytes and dense.stringtable is not None:
+                    kv = _decode_packed_uint32(dense.keys_vals_bytes)
+                    block_tags = _decode_dense_node_tags(
+                        kv, dense.stringtable, n_block_nodes,
+                    )
+                    has_any_tags = has_any_tags or any(block_tags)
+                else:
+                    block_tags = [{} for _ in range(n_block_nodes)]
+                batch_tags.extend(block_tags)
+            tag_chunks.append(batch_tags)
+
     if not id_chunks:
         return None
 
@@ -691,7 +727,14 @@ def _stream_decode_nodes(
     d_all_lat = cp.concatenate(lat_chunks) if len(lat_chunks) > 1 else lat_chunks[0]
     d_all_lon = cp.concatenate(lon_chunks) if len(lon_chunks) > 1 else lon_chunks[0]
 
-    return d_all_ids, d_all_lat, d_all_lon
+    # Flatten tag chunks (host-side list concatenation)
+    all_node_tags: list[dict[str, str]] | None = None
+    if has_any_tags:
+        all_node_tags = []
+        for chunk in tag_chunks:
+            all_node_tags.extend(chunk)
+
+    return d_all_ids, d_all_lat, d_all_lon, all_node_tags
 
 
 def _stream_extract_ways_and_relations(
@@ -732,7 +775,7 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
 
     For each PrimitiveBlock, locates the DenseNodes message and extracts
     the raw packed varint bytes for the id, lat, and lon delta arrays,
-    plus the granularity and offset parameters.
+    plus the granularity and offset parameters, and the keys_vals tag field.
     """
     results: list[DenseNodesBlock] = []
 
@@ -741,6 +784,8 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
         lat_offset = 0          # default
         lon_offset = 0          # default
         primitive_groups: list[tuple[int, int]] = []  # (start, length) of each group
+        st_start = -1
+        st_length = 0
 
         # Parse PrimitiveBlock top-level fields
         pos = 0
@@ -751,7 +796,10 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
             if wire_type == _WIRE_LENGTH_DELIMITED:
                 length, consumed = _decode_varint(block_data, pos)
                 pos += consumed
-                if field_num == _PRIMITIVEBLOCK_PRIMITIVEGROUP_FIELD:
+                if field_num == _PRIMITIVEBLOCK_STRINGTABLE_FIELD:
+                    st_start = pos
+                    st_length = length
+                elif field_num == _PRIMITIVEBLOCK_PRIMITIVEGROUP_FIELD:
                     primitive_groups.append((pos, length))
                 pos += length
             elif wire_type == _WIRE_VARINT:
@@ -766,6 +814,10 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
                     lon_offset = (value >> 1) ^ -(value & 1)
             else:
                 pos = _skip_field(block_data, pos, wire_type)
+
+        stringtable: list[bytes] | None = None
+        if st_start >= 0:
+            stringtable = _parse_stringtable(block_data, st_start, st_length)
 
         # Parse each PrimitiveGroup looking for DenseNodes
         for group_start, group_length in primitive_groups:
@@ -783,9 +835,11 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
                     pos += length
 
                     # Parse DenseNodes to find id, lat, lon packed arrays
+                    # and keys_vals tag field
                     id_bytes = b""
                     lat_bytes = b""
                     lon_bytes = b""
+                    keys_vals_bytes = b""
                     dpos = 0
                     while dpos < len(dense_data):
                         d_field, d_wire, d_consumed = _parse_field_tag(
@@ -804,6 +858,8 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
                                 lat_bytes = payload
                             elif d_field == _DENSENODES_LON_FIELD:
                                 lon_bytes = payload
+                            elif d_field == _DENSENODES_KEYS_VALS_FIELD:
+                                keys_vals_bytes = payload
                         else:
                             dpos = _skip_field(dense_data, dpos, d_wire)
 
@@ -815,6 +871,8 @@ def _extract_dense_nodes_blocks(raw_blocks: list[bytes]) -> list[DenseNodesBlock
                             granularity=granularity,
                             lat_offset=lat_offset,
                             lon_offset=lon_offset,
+                            keys_vals_bytes=keys_vals_bytes,
+                            stringtable=stringtable,
                         ))
                 else:
                     pos = _skip_field(block_data, pos, wire_type)
@@ -871,6 +929,126 @@ def _decode_packed_sint64_cpu(data: bytes) -> list[int]:
         acc += d
         absolute.append(acc)
     return absolute
+
+
+# ---------------------------------------------------------------------------
+# CPU: Tag decoding helpers
+# ---------------------------------------------------------------------------
+
+
+def _decode_dense_node_tags(
+    keys_vals: list[int],
+    stringtable: list[bytes],
+    n_nodes: int,
+) -> list[dict[str, str]]:
+    """Decode DenseNodes interleaved key/val/0 array to per-node tag dicts.
+
+    The keys_vals array from DenseNodes field 10 uses a special encoding:
+    alternating key_sid, value_sid pairs for each node, separated by a
+    ``0`` delimiter between nodes.  Nodes with no tags just have the ``0``
+    delimiter.
+
+    Parameters
+    ----------
+    keys_vals
+        Decoded uint32 array from the packed field.
+    stringtable
+        Block's string table for resolving string IDs to bytes.
+    n_nodes
+        Expected number of nodes (for padding if keys_vals is short).
+
+    Returns
+    -------
+    List of tag dicts, one per node.  Nodes without tags get an empty dict.
+    """
+    tags_per_node: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    i = 0
+    while i < len(keys_vals):
+        if keys_vals[i] == 0:
+            tags_per_node.append(current)
+            current = {}
+            i += 1
+        else:
+            key_sid = keys_vals[i]
+            val_sid = keys_vals[i + 1] if i + 1 < len(keys_vals) else 0
+            key = (
+                stringtable[key_sid].decode("utf-8", errors="replace")
+                if key_sid < len(stringtable) else str(key_sid)
+            )
+            val = (
+                stringtable[val_sid].decode("utf-8", errors="replace")
+                if val_sid < len(stringtable) else str(val_sid)
+            )
+            current[key] = val
+            i += 2
+    # Handle last node if not terminated by 0
+    if current or len(tags_per_node) < n_nodes:
+        tags_per_node.append(current)
+    # Pad with empty dicts if keys_vals was shorter than expected
+    while len(tags_per_node) < n_nodes:
+        tags_per_node.append({})
+    return tags_per_node
+
+
+def _decode_way_tags(way_block: WayBlock) -> list[dict[str, str]]:
+    """Decode Way tags from a WayBlock's stringtable indices.
+
+    Each Way stores parallel lists of key and value stringtable indices.
+    This resolves them to ``{key_str: val_str}`` dicts.
+
+    Returns
+    -------
+    List of tag dicts, one per Way in the block.
+    """
+    tags: list[dict[str, str]] = []
+    st = way_block.stringtable
+    for keys, vals in zip(way_block.tag_keys_per_way, way_block.tag_vals_per_way):
+        d: dict[str, str] = {}
+        for k, v in zip(keys, vals):
+            key = st[k].decode("utf-8", errors="replace") if k < len(st) else str(k)
+            val = st[v].decode("utf-8", errors="replace") if v < len(st) else str(v)
+            d[key] = val
+        tags.append(d)
+    return tags
+
+
+def _decode_relation_tags(relation_block: RelationBlock) -> list[dict[str, str]]:
+    """Decode Relation tags from a RelationBlock's stringtable indices.
+
+    Returns
+    -------
+    List of tag dicts, one per Relation in the block.
+    """
+    tag_keys = relation_block.tag_keys_per_relation
+    tag_vals = relation_block.tag_vals_per_relation
+    if tag_keys is None or tag_vals is None:
+        return [{} for _ in relation_block.relation_ids]
+    st = relation_block.stringtable
+    tags: list[dict[str, str]] = []
+    for keys, vals in zip(tag_keys, tag_vals):
+        d: dict[str, str] = {}
+        for k, v in zip(keys, vals):
+            key = st[k].decode("utf-8", errors="replace") if k < len(st) else str(k)
+            val = st[v].decode("utf-8", errors="replace") if v < len(st) else str(v)
+            d[key] = val
+        tags.append(d)
+    return tags
+
+
+def _tags_to_dataframe(tags: list[dict[str, str]]) -> object:
+    """Convert list of tag dicts to a pandas DataFrame.
+
+    Discovers all unique keys across all elements and creates one column
+    per key.  Missing tags become ``None`` / ``NaN``.
+
+    Returns an empty DataFrame if *tags* is empty.
+    """
+    import pandas as pd
+
+    if not tags:
+        return pd.DataFrame()
+    return pd.DataFrame(tags)
 
 
 def _parse_single_way(way_data: bytes) -> tuple[int, list[int], list[int], list[int]]:
@@ -998,12 +1176,14 @@ def _extract_way_blocks(raw_blocks: list[bytes]) -> list[WayBlock]:
 def _parse_single_relation(
     relation_data: bytes,
     stringtable: list[bytes],
-) -> tuple[int, list[RelationMember]]:
+) -> tuple[int, list[RelationMember], list[int], list[int]]:
     """Parse a single Relation message.
 
-    Returns (relation_id, members).
+    Returns (relation_id, members, tag_keys, tag_vals).
     """
     relation_id = 0
+    keys_bytes = b""
+    vals_bytes = b""
     roles_sid_bytes = b""
     memids_bytes = b""
     types_bytes = b""
@@ -1021,7 +1201,11 @@ def _parse_single_relation(
             pos += consumed
             payload = bytes(relation_data[pos : pos + length])
             pos += length
-            if field_num == _RELATION_ROLES_SID_FIELD:
+            if field_num == _RELATION_KEYS_FIELD:
+                keys_bytes = payload
+            elif field_num == _RELATION_VALS_FIELD:
+                vals_bytes = payload
+            elif field_num == _RELATION_ROLES_SID_FIELD:
                 roles_sid_bytes = payload
             elif field_num == _RELATION_MEMIDS_FIELD:
                 memids_bytes = payload
@@ -1038,6 +1222,10 @@ def _parse_single_relation(
     # roles_sid: packed uint32 -> stringtable indices
     roles_sid = _decode_packed_uint32(roles_sid_bytes) if roles_sid_bytes else []
 
+    # Decode tag fields
+    tag_keys = _decode_packed_uint32(keys_bytes) if keys_bytes else []
+    tag_vals = _decode_packed_uint32(vals_bytes) if vals_bytes else []
+
     # Build member list -- all three arrays must be parallel
     n_members = min(len(member_ids), len(member_types), len(roles_sid))
     members: list[RelationMember] = []
@@ -1052,7 +1240,7 @@ def _parse_single_relation(
             role=role,
         ))
 
-    return relation_id, members
+    return relation_id, members, tag_keys, tag_vals
 
 
 def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
@@ -1105,6 +1293,8 @@ def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
         # Parse each PrimitiveGroup looking for Relations (field 4)
         block_relation_ids: list[int] = []
         block_members: list[list[RelationMember]] = []
+        block_tag_keys: list[list[int]] = []
+        block_tag_vals: list[list[int]] = []
 
         for group_start, group_length in primitive_groups:
             pos = group_start
@@ -1120,12 +1310,14 @@ def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
                     relation_data = block_data[pos : pos + length]
                     pos += length
 
-                    rel_id, members = _parse_single_relation(
+                    rel_id, members, tag_keys, tag_vals = _parse_single_relation(
                         relation_data, stringtable,
                     )
                     if members:  # Skip relations with no members
                         block_relation_ids.append(rel_id)
                         block_members.append(members)
+                        block_tag_keys.append(tag_keys)
+                        block_tag_vals.append(tag_vals)
                 else:
                     pos = _skip_field(block_data, pos, wire_type)
 
@@ -1137,6 +1329,8 @@ def _extract_relation_blocks(raw_blocks: list[bytes]) -> list[RelationBlock]:
                 granularity=granularity,
                 lat_offset=lat_offset,
                 lon_offset=lon_offset,
+                tag_keys_per_relation=block_tag_keys,
+                tag_vals_per_relation=block_tag_vals,
             ))
 
     return results
@@ -1824,7 +2018,7 @@ def _process_ways_gpu(
     d_node_ids: cp.ndarray,
     d_lon: cp.ndarray,
     d_lat: cp.ndarray,
-) -> tuple[OwnedGeometryArray | None, cp.ndarray | None, int]:
+) -> tuple[OwnedGeometryArray | None, cp.ndarray | None, int, np.ndarray | None]:
     """Process all extracted Ways into device-resident geometries.
 
     1. Build sorted node lookup table on GPU
@@ -1833,7 +2027,10 @@ def _process_ways_gpu(
     4. Classify Ways as LineString (open) or Polygon (closed)
     5. Assemble OwnedGeometryArray(s)
 
-    Returns (ways_owned, d_way_ids, n_ways).
+    Returns (ways_owned, d_way_ids, n_ways, reorder_indices).
+    ``reorder_indices`` is a host int32 numpy array mapping original Way
+    order to the output order (LineStrings first, then Polygons), or
+    ``None`` if no reorder was applied (single-family result).
     """
     # Collect all ways across blocks
     all_way_ids: list[int] = []
@@ -1845,7 +2042,7 @@ def _process_ways_gpu(
 
     n_ways = len(all_way_ids)
     if n_ways == 0:
-        return None, None, 0
+        return None, None, 0, None
 
     # Build node lookup table on GPU (Tier 2 CuPy)
     d_sorted_ids, d_sorted_x, d_sorted_y = _build_node_lookup(
@@ -1861,7 +2058,7 @@ def _process_ways_gpu(
 
     total_refs = len(flat_refs)
     if total_refs == 0:
-        return None, None, 0
+        return None, None, 0, None
 
     # Upload flat refs to GPU
     h_flat_refs = np.array(flat_refs, dtype=np.int64)
@@ -1896,7 +2093,7 @@ def _process_ways_gpu(
     n_line = int(cp.sum(d_line_mask))
 
     if n_poly == 0 and n_line == 0:
-        return None, None, 0
+        return None, None, 0, None
 
     # Build the OwnedGeometryArray -- use _build_device_single_family_owned
     # for single-family results or _build_device_mixed_owned for mixed.
@@ -1907,14 +2104,14 @@ def _process_ways_gpu(
         owned = _assemble_linestring_ways(
             d_out_x, d_out_y, d_way_offsets, n_line,
         )
-        return owned, d_way_ids, n_ways
+        return owned, d_way_ids, n_ways, None
 
     if n_line == 0:
         # All Polygons
         owned = _assemble_polygon_ways(
             d_out_x, d_out_y, d_way_offsets, n_poly,
         )
-        return owned, d_way_ids, n_ways
+        return owned, d_way_ids, n_ways, None
 
     # Mixed: split coordinates by classification and build mixed owned
     # Reorder ways so LineStrings come first, then Polygons
@@ -1922,8 +2119,9 @@ def _process_ways_gpu(
     d_poly_indices = cp.flatnonzero(d_poly_mask).astype(cp.int32)
     d_reorder = cp.concatenate([d_line_indices, d_poly_indices])
 
-    # Reorder way IDs
+    # Reorder way IDs and export reorder indices to host for tag alignment
     d_way_ids = d_way_ids[d_reorder]
+    h_reorder = cp.asnumpy(d_reorder)
 
     # Extract per-family coordinate slices
     d_line_offsets_raw = d_way_offsets[:-1][d_line_indices]
@@ -2004,7 +2202,7 @@ def _process_ways_gpu(
         },
         detail=f"osm_gpu: {n_line} LineString + {n_poly} Polygon Ways from PBF",
     )
-    return owned, d_way_ids, n_ways
+    return owned, d_way_ids, n_ways, h_reorder
 
 
 def _expand_offsets_to_indices(
@@ -2210,7 +2408,7 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
     if nodes_result is None:
         return OsmGpuResult(nodes=None, node_ids=None, n_nodes=0)
 
-    d_node_ids, d_lat, d_lon = nodes_result
+    d_node_ids, d_lat, d_lon, node_tags = nodes_result
     n_nodes = int(d_node_ids.shape[0])
     logger.info("OSM PBF: extracted %d nodes", n_nodes)
 
@@ -2221,6 +2419,7 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
         nodes=owned,
         node_ids=d_node_ids,
         n_nodes=n_nodes,
+        node_tags=node_tags,
     )
 
 
@@ -2267,9 +2466,10 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     d_lon: cp.ndarray | None = None
     n_nodes = 0
     nodes_owned: OwnedGeometryArray | None = None
+    node_tags: list[dict[str, str]] | None = None
 
     if nodes_result is not None:
-        d_node_ids, d_lat, d_lon = nodes_result
+        d_node_ids, d_lat, d_lon, node_tags = nodes_result
         n_nodes = int(d_node_ids.shape[0])
         logger.info("OSM PBF: extracted %d nodes", n_nodes)
         nodes_owned = _assemble_point_geometry(d_lon, d_lat, n_nodes)
@@ -2290,9 +2490,10 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     ways_owned: OwnedGeometryArray | None = None
     d_way_ids: cp.ndarray | None = None
     n_ways = 0
+    way_reorder: np.ndarray | None = None
 
     if way_blocks and d_node_ids is not None and d_lon is not None and d_lat is not None:
-        ways_owned, d_way_ids, n_ways = _process_ways_gpu(
+        ways_owned, d_way_ids, n_ways, way_reorder = _process_ways_gpu(
             way_blocks, d_node_ids, d_lon, d_lat,
         )
         logger.info(
@@ -2300,6 +2501,19 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
             n_ways,
             "with geometry" if ways_owned is not None else "no resolved geometry",
         )
+
+    # Decode Way tags (host-resident strings from CPU-parsed WayBlocks).
+    # If _process_ways_gpu reordered ways (mixed LineString/Polygon),
+    # apply the same reorder to the tag list.
+    way_tags: list[dict[str, str]] | None = None
+    if way_blocks and n_ways > 0:
+        all_way_tags: list[dict[str, str]] = []
+        for wb in way_blocks:
+            all_way_tags.extend(_decode_way_tags(wb))
+        if way_reorder is not None:
+            all_way_tags = [all_way_tags[i] for i in way_reorder]
+        if any(all_way_tags):
+            way_tags = all_way_tags
 
     # Phase 8: GPU -- resolve Relation Way members and assemble MultiPolygons
     relations_owned: OwnedGeometryArray | None = None
@@ -2322,14 +2536,37 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
             "with geometry" if relations_owned is not None else "no resolved geometry",
         )
 
+    # Decode Relation tags (host-resident strings from CPU-parsed RelationBlocks).
+    # Not all parsed relations resolve to geometry -- only those whose Way
+    # members successfully chain into closed rings.  Build a relation_id ->
+    # tag dict lookup and then select only the valid IDs.
+    relation_tags: list[dict[str, str]] | None = None
+    if relation_blocks and n_relations > 0 and d_relation_ids is not None:
+        # Build id -> tags lookup from all parsed relation blocks
+        rel_id_to_tags: dict[int, dict[str, str]] = {}
+        for rb in relation_blocks:
+            decoded = _decode_relation_tags(rb)
+            rel_id_to_tags.update(zip(rb.relation_ids, decoded))
+
+        # Align with the valid relation IDs from _process_relations_gpu
+        h_valid_rel_ids = cp.asnumpy(d_relation_ids)
+        aligned_tags = [
+            rel_id_to_tags.get(int(rid), {}) for rid in h_valid_rel_ids
+        ]
+        if any(aligned_tags):
+            relation_tags = aligned_tags
+
     return OsmGpuResult(
         nodes=nodes_owned,
         node_ids=d_node_ids,
         n_nodes=n_nodes,
+        node_tags=node_tags,
         ways=ways_owned,
         way_ids=d_way_ids,
+        way_tags=way_tags,
         n_ways=n_ways,
         relations=relations_owned,
         relation_ids=d_relation_ids,
+        relation_tags=relation_tags,
         n_relations=n_relations,
     )
