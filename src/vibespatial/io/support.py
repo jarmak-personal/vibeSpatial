@@ -16,6 +16,11 @@ class IOFormat(StrEnum):
     OSM_PBF = "osm-pbf"
     GEOPACKAGE = "geopackage"
     FILE_GEODATABASE = "file-geodatabase"
+    FLATGEOBUF = "flatgeobuf"
+    GML = "gml"
+    GPX = "gpx"
+    TOPOJSON = "topojson"
+    GEOJSONSEQ = "geojsonseq"
     GDAL_LEGACY = "gdal-legacy"
 
 
@@ -140,6 +145,46 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         write_path=IOPathKind.FALLBACK,
         canonical_gpu=False,
         reason="File Geodatabase read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+    ),
+    IOFormat.FLATGEOBUF: IOSupportEntry(
+        format=IOFormat.FLATGEOBUF,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="FlatGeobuf read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+    ),
+    IOFormat.GML: IOSupportEntry(
+        format=IOFormat.GML,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="GML read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+    ),
+    IOFormat.GPX: IOSupportEntry(
+        format=IOFormat.GPX,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="GPX read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+    ),
+    IOFormat.TOPOJSON: IOSupportEntry(
+        format=IOFormat.TOPOJSON,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="TopoJSON read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+    ),
+    IOFormat.GEOJSONSEQ: IOSupportEntry(
+        format=IOFormat.GEOJSONSEQ,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="GeoJSON-Seq read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
     ),
     IOFormat.GDAL_LEGACY: IOSupportEntry(
         format=IOFormat.GDAL_LEGACY,

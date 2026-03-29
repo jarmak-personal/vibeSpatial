@@ -287,8 +287,13 @@ available. No code changes are required — GPU acceleration is transparent.
 | Shapefile | `.shp` | File > 10 MB | pyogrio |
 | GeoPackage | `.gpkg` | Always | pyogrio |
 | File Geodatabase | `.gdb` | Always | pyogrio |
+| FlatGeobuf | `.fgb` | Always | pyogrio |
 | CSV/TSV | `.csv`, `.tsv` | File > 10 MB | pyogrio |
 | KML | `.kml` | File > 10 MB | pyogrio |
+| GML | `.gml` | Always | pyogrio |
+| GPX | `.gpx` | Always | pyogrio |
+| TopoJSON | `.topojson` | Always | pyogrio |
+| GeoJSON-Seq | `.geojsonl`, `.geojsonseq` | Always | pyogrio |
 | WKT | `.wkt` | Always | None (GPU-only) |
 | OSM PBF | `.pbf`, `.osm.pbf` | Always | None (GPU-only) |
 | PostGIS | `read_postgis()` | When ADBC installed | Shapely WKB |

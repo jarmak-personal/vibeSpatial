@@ -167,6 +167,12 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         ".pbf": "OSM-PBF",
         ".gpkg": "GPKG",
         ".gdb": "OpenFileGDB",
+        ".fgb": "FlatGeobuf",
+        ".gml": "GML",
+        ".gpx": "GPX",
+        ".topojson": "TopoJSON",
+        ".geojsonl": "GeoJSONSeq",
+        ".geojsonseq": "GeoJSONSeq",
         ".parquet": "GeoParquet",
         ".geoparquet": "GeoParquet",
         ".feather": "Feather",
@@ -216,6 +222,26 @@ def plan_vector_file_io(
         io_format = IOFormat.FILE_GEODATABASE
         implementation = "fgdb_pyogrio_arrow_gpu_wkb"
         reason = "File Geodatabase uses pyogrio Arrow container parse with GPU WKB geometry decode."
+    elif normalized_driver == "FlatGeobuf":
+        io_format = IOFormat.FLATGEOBUF
+        implementation = "flatgeobuf_pyogrio_arrow_gpu_wkb"
+        reason = "FlatGeobuf uses pyogrio Arrow container parse with GPU WKB geometry decode."
+    elif normalized_driver == "GML":
+        io_format = IOFormat.GML
+        implementation = "gml_pyogrio_arrow_gpu_wkb"
+        reason = "GML uses pyogrio Arrow container parse with GPU WKB geometry decode."
+    elif normalized_driver == "GPX":
+        io_format = IOFormat.GPX
+        implementation = "gpx_pyogrio_arrow_gpu_wkb"
+        reason = "GPX uses pyogrio Arrow container parse with GPU WKB geometry decode."
+    elif normalized_driver == "TopoJSON":
+        io_format = IOFormat.TOPOJSON
+        implementation = "topojson_pyogrio_arrow_gpu_wkb"
+        reason = "TopoJSON uses pyogrio Arrow container parse with GPU WKB geometry decode."
+    elif normalized_driver == "GeoJSONSeq":
+        io_format = IOFormat.GEOJSONSEQ
+        implementation = "geojsonseq_pyogrio_arrow_gpu_wkb"
+        reason = "GeoJSON-Seq uses pyogrio Arrow container parse with GPU WKB geometry decode."
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"
@@ -903,8 +929,8 @@ def read_vector_file(
     """Read a spatial file into a GeoDataFrame.
 
     Supports GeoParquet, Feather/Arrow, Shapefile, GeoPackage, File
-    Geodatabase, GeoJSON, WKT, CSV, KML, OSM PBF, and any format
-    readable by pyogrio/fiona.
+    Geodatabase, FlatGeobuf, GeoJSON, GeoJSON-Seq, GML, GPX, TopoJSON,
+    WKT, CSV, KML, OSM PBF, and any format readable by pyogrio/fiona.
 
     GPU acceleration is automatic for GeoJSON, Shapefile, WKT, CSV, KML,
     and OSM PBF formats.  For CSV, KML, GeoJSON, and Shapefile, GPU
@@ -988,6 +1014,11 @@ def read_vector_file(
         IOFormat.OSM_PBF,
         IOFormat.GEOPACKAGE,
         IOFormat.FILE_GEODATABASE,
+        IOFormat.FLATGEOBUF,
+        IOFormat.GML,
+        IOFormat.GPX,
+        IOFormat.TOPOJSON,
+        IOFormat.GEOJSONSEQ,
     }
     if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         gpu_result = _try_gpu_read_file(
