@@ -48,6 +48,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.residency import Residency
@@ -469,6 +470,17 @@ def _convex_hull_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         from vibespatial.geometry.owned import from_shapely_geometries
         return from_shapely_geometries([])
 
+    # Materialize device-resident coordinate buffers to host before
+    # accessing family buffers.  Without this, device-only arrays have
+    # stub host buffers with empty x/y arrays, causing IndexError.
+    if owned.device_state is not None:
+        owned._ensure_host_state()
+        record_fallback_event(
+            surface="convex_hull_cpu",
+            reason="CPU fallback requires host-resident coordinates",
+            d2h_transfer=True,
+        )
+
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
 
@@ -823,10 +835,12 @@ def convex_hull_owned(
             kernel_class=KernelClass.COARSE,
             requested=precision,
         )
-        # GPU path supports single-family non-MultiPolygon inputs
+        # GPU path supports single-family non-MultiPolygon inputs.
+        # Use family_has_rows() which checks device buffers when present,
+        # avoiding false negatives from unmaterialized host stubs.
         families_with_rows = [
-            fam for fam, buf in owned.families.items()
-            if buf.row_count > 0
+            fam for fam in owned.families
+            if owned.family_has_rows(fam)
         ]
         is_single_family = len(families_with_rows) == 1
         has_multipolygon = GeometryFamily.MULTIPOLYGON in families_with_rows

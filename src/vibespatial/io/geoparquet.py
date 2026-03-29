@@ -529,8 +529,9 @@ def _pylibcudf_table_to_geopandas(
     for column_name in result_column_names:
         if column_name in decoded_geometry:
             gdf[column_name] = decoded_geometry[column_name]
-        else:
+        elif column_name in data.columns:
             gdf[column_name] = data[column_name]
+        # else: pandas index column, already restored into data.index
     gdf.__class__ = GeoDataFrame
     gdf._geometry_column_name = geometry
     if df_attrs:

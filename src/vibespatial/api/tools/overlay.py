@@ -583,13 +583,15 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 get_cuda_runtime().free_pool_memory()
             except Exception:
                 pass
-            # Force GPU dispatch when a GPU runtime is available: the
-            # overlay pipeline has device-resident data and the 50K
-            # CONSTRUCTIVE crossover threshold should not route small
-            # batches to CPU, forcing a D->H->D round-trip.
-            _pairwise_mode = (
-                ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
-            )
+            # AUTO dispatch, not forced GPU.  The GPU polygon_intersection
+            # kernel has a systematic validity-bitmap bug (~26% of results
+            # marked invalid regardless of batch size).  Until the kernel
+            # is fixed, AUTO routes to CPU which is correct.  The old
+            # forced-GPU path avoided D->H->CPU->H->D ping-pong but
+            # produced silently corrupt results.
+            # TODO: restore forced GPU after polygon_intersection_gpu
+            #       validity bitmap is fixed.
+            _pairwise_mode = ExecutionMode.AUTO
 
             # ---- Many-vs-one detection ----
             # Check BEFORE device_take: for many-vs-one (all pairs
@@ -794,13 +796,15 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
                 segmented_union_all,
             )
 
-            # Force GPU dispatch when a GPU runtime is available: the
-            # overlay pipeline has device-resident data and the 50K
-            # CONSTRUCTIVE crossover threshold should not route small
-            # batches to CPU, forcing a D->H->D round-trip.
-            _pairwise_mode = (
-                ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
-            )
+            # AUTO dispatch, not forced GPU.  The GPU polygon_intersection
+            # kernel has a systematic validity-bitmap bug (~26% of results
+            # marked invalid regardless of batch size).  Until the kernel
+            # is fixed, AUTO routes to CPU which is correct.  The old
+            # forced-GPU path avoided D->H->CPU->H->D ping-pong but
+            # produced silently corrupt results.
+            # TODO: restore forced GPU after polygon_intersection_gpu
+            #       validity bitmap is fixed.
+            _pairwise_mode = ExecutionMode.AUTO
 
             # Phase 2 zero-copy: pass CuPy device arrays directly to
             # device_take() when available, eliminating H→D re-upload.

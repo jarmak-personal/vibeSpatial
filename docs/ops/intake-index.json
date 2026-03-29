@@ -15006,6 +15006,8 @@
       "referenced_by": [],
       "symbols": [
         "_compile_kernel",
+        "_fp32_center_coords",
+        "_coord_stats_from_owned",
         "_area_gpu",
         "_length_gpu",
         "_area_cpu",
@@ -15019,9 +15021,13 @@
       ],
       "tokens": [
         "area",
+        "center",
         "compile",
         "constructive",
+        "coord",
+        "coords",
         "cpu",
+        "fp32",
         "gpu",
         "kernel",
         "length",
@@ -15032,6 +15038,7 @@
         "rings",
         "segment",
         "src",
+        "stats",
         "sum",
         "vibespatial"
       ]

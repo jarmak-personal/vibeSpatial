@@ -139,13 +139,29 @@ vsbench shootout examples/nearby_buildings.py --repeat 5
 vsbench shootout my_etl.py --with pyogrio --json
 ```
 
+The `script` argument accepts a single Python file or a directory of scripts.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--repeat` | 3 | Timed runs per engine |
+| `--scale` | none | Passed as `VSBENCH_SCALE` env var (e.g. `10K`, `100K`) |
 | `--no-warmup` | off | Skip the untimed warmup run |
 | `--baseline-python` | auto | Python interpreter with real geopandas |
 | `--with DEP` | none | Extra pip deps for the geopandas env (repeatable) |
 | `--timeout` | 300 | Per-run timeout in seconds |
+
+#### Fingerprint correctness checking
+
+Scripts can print a deterministic summary line to stdout:
+
+```
+SHOOTOUT_FINGERPRINT: rows=998 bounds=(-9.55, 71.1, 1004.26, 1010.0) convex_hull_area=105251.17
+```
+
+When both engines emit a fingerprint, vsbench compares them with numeric
+tolerance (`rtol=1e-3`) to catch correctness regressions while allowing
+expected floating-point divergence between GPU and CPU paths.  A mismatch
+is reported as a test failure.
 
 ## Fixture scales
 

@@ -103,7 +103,7 @@ def _delegate_property(op, this):
     # type: (str, GeoSeries) -> GeoSeries/Series
     a_this = this.geometry.values
     data = getattr(a_this, op)
-    if isinstance(data, GeometryArray):
+    if is_geometry_type(data):
         from vibespatial.api.geoseries import GeoSeries
 
         return GeoSeries(data, index=this.index, crs=this.crs)

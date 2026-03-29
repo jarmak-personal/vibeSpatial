@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,6 +88,8 @@ class ShootoutRun:
         }
         if self.error:
             d["error"] = self.error
+        if self.stdout:
+            d["stdout"] = self.stdout
         return d
 
 
@@ -159,6 +162,48 @@ def _error_run(label: str, error: str) -> ShootoutRun:
         timing=timing_from_samples([]),
         error=error,
     )
+
+
+_FINGERPRINT_PREFIX = "SHOOTOUT_FINGERPRINT: "
+
+
+def _extract_fingerprint(stdout: str) -> str | None:
+    """Extract the SHOOTOUT_FINGERPRINT line from captured stdout."""
+    for line in stdout.splitlines():
+        if line.startswith(_FINGERPRINT_PREFIX):
+            return line[len(_FINGERPRINT_PREFIX):].strip()
+    return None
+
+
+_FP_NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+
+def _fingerprints_match(fp_a: str, fp_b: str, *, rtol: float = 1e-3) -> bool:
+    """Compare two fingerprint strings with numeric tolerance.
+
+    Extracts all numbers from each string and compares them pairwise
+    with relative tolerance *rtol*.  Non-numeric tokens must match
+    exactly.
+    """
+    if fp_a == fp_b:
+        return True
+    nums_a = _FP_NUMBER_RE.findall(fp_a)
+    nums_b = _FP_NUMBER_RE.findall(fp_b)
+    if len(nums_a) != len(nums_b):
+        return False
+    # Check non-numeric skeleton matches
+    skel_a = _FP_NUMBER_RE.sub("@", fp_a)
+    skel_b = _FP_NUMBER_RE.sub("@", fp_b)
+    if skel_a != skel_b:
+        return False
+    for sa, sb in zip(nums_a, nums_b):
+        va, vb = float(sa), float(sb)
+        if va == vb:
+            continue
+        denom = max(abs(va), abs(vb), 1e-15)
+        if abs(va - vb) / denom > rtol:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +303,7 @@ def run_shootout(
     extra_deps: list[str] | None = None,
     timeout: int = 300,
     quiet: bool = False,
+    scale: str | None = None,
 ) -> ShootoutResult:
     """Run a user script with geopandas and vibespatial, return comparison."""
     script = Path(script_path)
@@ -297,6 +343,8 @@ def run_shootout(
 
     gpd_env = os.environ.copy()
     gpd_env.pop("_VIBESPATIAL_GEOPANDAS_COMPAT", None)
+    if scale is not None:
+        gpd_env["VSBENCH_SCALE"] = scale
 
     gpd_run = _run_harness(
         label="geopandas",
@@ -312,6 +360,8 @@ def run_shootout(
     # --- vibespatial ---
     vs_env = os.environ.copy()
     vs_env["_VIBESPATIAL_GEOPANDAS_COMPAT"] = "1"
+    if scale is not None:
+        vs_env["VSBENCH_SCALE"] = scale
 
     vs_run = _run_harness(
         label="vibespatial",
@@ -336,6 +386,27 @@ def run_shootout(
     if vs_run.error:
         errors.append(f"vibespatial: {vs_run.error}")
 
+    # --- fingerprint comparison ---
+    gpd_fp = _extract_fingerprint(gpd_run.stdout)
+    vs_fp = _extract_fingerprint(vs_run.stdout)
+    fingerprint_match: str | None = None
+    if gpd_fp and vs_fp:
+        if _fingerprints_match(gpd_fp, vs_fp):
+            fingerprint_match = "match"
+        else:
+            fingerprint_match = "mismatch"
+            if not has_error:
+                errors.append(f"fingerprint mismatch: geopandas={gpd_fp} vibespatial={vs_fp}")
+                has_error = True
+
+    meta: dict[str, Any] = {"repeat": repeat, "warmup": warmup}
+    if scale is not None:
+        meta["scale"] = scale
+    if fingerprint_match:
+        meta["fingerprint"] = fingerprint_match
+        meta["fingerprint_geopandas"] = gpd_fp
+        meta["fingerprint_vibespatial"] = vs_fp
+
     return ShootoutResult(
         script=str(script),
         geopandas=gpd_run,
@@ -343,5 +414,5 @@ def run_shootout(
         speedup=speedup,
         status="error" if has_error else "pass",
         status_reason="; ".join(errors) if errors else "ok",
-        metadata={"repeat": repeat, "warmup": warmup},
+        metadata=meta,
     )
