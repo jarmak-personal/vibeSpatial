@@ -64,6 +64,22 @@ This works in terminals, VS Code git output, and CI alike.
 | ZCOPY001 | No ping-pong D/H transfers in same function | `.get()` followed by `cp.asarray()` |
 | ZCOPY002 | No per-element D/H transfers in loops | `.get()` inside a `for` body |
 | ZCOPY003 | Functions using device APIs must not return host data | Public function calls `.get()` in return |
+| ZCOPY_EMPTY_SUPPRESSION | Suppression comment must include a reason | `# zcopy:ok()` with empty parens |
+
+#### Inline Suppression
+
+Intentional D/H transfers (e.g., materialization boundaries, OOM-prevention
+batching) can be suppressed with an inline comment:
+
+```python
+host_data = device_array.get()  # zcopy:ok(materialization boundary: DataFrame construction)
+```
+
+- The reason inside the parentheses is **required** — `# zcopy:ok()` with an
+  empty reason emits `ZCOPY_EMPTY_SUPPRESSION` instead of suppressing.
+- Suppressed lines are excluded from the violation count but reported separately
+  in the summary output.
+- The suppression count is tracked to ensure visibility of documented debt.
 
 ### Performance Rules (VPAT)
 

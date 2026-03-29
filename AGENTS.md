@@ -139,8 +139,8 @@ against a single corridor or boundary polygon), route to:
 - `vsbench` (entry point): unified benchmarking CLI for operations, pipelines, kernel microbenchmarks, regression detection, and geopandas-vs-vibespatial shootout comparisons. See `src/vibespatial/bench/cli.py`.
 - `scripts/benchmark_pipelines.py`: end-to-end pipeline benchmarking and GPU sparkline profiling (legacy; prefer `vsbench suite`).
 - `scripts/check_architecture_lints.py`: validate architecture constraints and doc consistency.
-- `scripts/check_zero_copy.py`: zero-copy device transfer enforcement (ZCOPY001-003).
-- `scripts/check_perf_patterns.py`: performance anti-pattern detection (VPAT001-004).
+- `scripts/check_zero_copy.py`: zero-copy enforcement (ZCOPY001-003, `# zcopy:ok` suppression).
+- `scripts/check_perf_patterns.py`: performance anti-pattern detection (VPAT001-004). `scripts/property_dashboard.py`: unified property dashboard.
 - `scripts/check_maintainability.py`: intake discoverability enforcement (MAINT001-003).
 - `scripts/check_import_guard.py`: numpy/shapely import guard for GPU-path modules (IGRD001-002).
 - `src/geopandas/`: local GeoPandas-compatible package surface owned by this repo.

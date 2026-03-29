@@ -42,7 +42,7 @@ class PropertyState:
 
 def _collect_arch() -> list[PropertyState]:
     """ARCH001-007: hard-fail architecture lints."""
-    from check_architecture_lints import run_checks, run_advisory_checks
+    from check_architecture_lints import run_advisory_checks, run_checks
     errors = run_checks(REPO_ROOT)
     advisory = run_advisory_checks(REPO_ROOT)
     count = len(errors)
@@ -64,8 +64,8 @@ def _collect_arch() -> list[PropertyState]:
 
 def _collect_zcopy() -> list[PropertyState]:
     """ZCOPY001-003: zero-copy compliance (ratchet)."""
-    from check_zero_copy import run_checks, _VIOLATION_BASELINE
-    errors = run_checks(REPO_ROOT)
+    from check_zero_copy import _VIOLATION_BASELINE, run_checks
+    errors, _suppressed = run_checks(REPO_ROOT)
     count = len(errors)
     baseline = _VIOLATION_BASELINE
     distance = count / max(baseline, 1)
@@ -91,7 +91,7 @@ def _collect_zcopy() -> list[PropertyState]:
 
 def _collect_vpat() -> list[PropertyState]:
     """VPAT001-004: performance anti-patterns (ratchet)."""
-    from check_perf_patterns import run_checks, _VIOLATION_BASELINE
+    from check_perf_patterns import _VIOLATION_BASELINE, run_checks
     errors = run_checks(REPO_ROOT)
     count = len(errors)
     baseline = _VIOLATION_BASELINE
@@ -119,9 +119,9 @@ def _collect_vpat() -> list[PropertyState]:
 def _collect_igrd() -> list[PropertyState]:
     """IGRD001-002: import isolation (ratchet, two sub-properties)."""
     from check_import_guard import (
-        run_checks,
-        _SHAPELY_VIOLATION_BASELINE,
         _NUMPY_VIOLATION_BASELINE,
+        _SHAPELY_VIOLATION_BASELINE,
+        run_checks,
     )
     shapely_errors, numpy_errors = run_checks(REPO_ROOT)
     sc, nc = len(shapely_errors), len(numpy_errors)
@@ -154,7 +154,7 @@ def _collect_igrd() -> list[PropertyState]:
 
 def _collect_maint() -> list[PropertyState]:
     """MAINT001-003: maintainability/discoverability (ratchet)."""
-    from check_maintainability import run_checks, _VIOLATION_BASELINE
+    from check_maintainability import _VIOLATION_BASELINE, run_checks
     errors = run_checks(REPO_ROOT)
     count = len(errors)
     baseline = _VIOLATION_BASELINE

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,9 +86,6 @@ def iter_python_files(root: Path) -> list[Path]:
     )
 
 
-def parse_module(path: Path) -> ast.AST:
-    return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
 
 def _call_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
@@ -146,14 +144,54 @@ def _is_h2d_call(node: ast.Call) -> bool:
     return False
 
 
+# ---- Inline suppression: # zcopy:ok(reason) ----
+
+_SUPPRESSION_RE = re.compile(r"#\s*zcopy:ok\(([^)]*)\)")
+
+
+def _parse_suppression_comments(source: str) -> dict[int, str]:
+    """Scan *source* for ``# zcopy:ok(reason)`` comments.
+
+    Returns ``{lineno: reason}`` with 1-indexed line numbers.
+    Lines where the reason is empty are **not** included — they will be
+    reported as ``ZCOPY_EMPTY_SUPPRESSION`` errors by the caller.
+    """
+    suppressions: dict[int, str] = {}
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        m = _SUPPRESSION_RE.search(line)
+        if m is not None:
+            reason = m.group(1).strip()
+            if reason:  # empty-reason lines are NOT valid suppressions
+                suppressions[lineno] = reason
+    return suppressions
+
+
+def _find_empty_suppression_lines(source: str) -> list[int]:
+    """Return 1-indexed line numbers with ``# zcopy:ok()`` (empty reason)."""
+    empty_lines: list[int] = []
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        m = _SUPPRESSION_RE.search(line)
+        if m is not None and not m.group(1).strip():
+            empty_lines.append(lineno)
+    return empty_lines
+
+
 # ---- ZCOPY001: Ping-pong transfers in the same function ----
 
-def check_pingpong_transfers(repo_root: Path) -> list[LintError]:
-    """Find functions where data goes D->H then back H->D (or vice versa)."""
+def check_pingpong_transfers(
+    repo_root: Path,
+) -> tuple[list[LintError], int]:
+    """Find functions where data goes D->H then back H->D (or vice versa).
+
+    Returns ``(errors, suppressed_count)``.
+    """
     errors: list[LintError] = []
+    suppressed = 0
     root = repo_root / "src" / "vibespatial"
     for path in iter_python_files(root):
-        tree = parse_module(path)
+        source = path.read_text(encoding="utf-8")
+        suppressions = _parse_suppression_comments(source)
+        tree = ast.parse(source, filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -170,6 +208,9 @@ def check_pingpong_transfers(repo_root: Path) -> list[LintError]:
                 first_d2h = min(d2h_lines)
                 later_h2d = [ln for ln in h2d_lines if ln > first_d2h]
                 if later_h2d:
+                    if first_d2h in suppressions:
+                        suppressed += 1
+                        continue
                     errors.append(
                         LintError(
                             code="ZCOPY001",
@@ -183,17 +224,25 @@ def check_pingpong_transfers(repo_root: Path) -> list[LintError]:
                             doc_path=RUNTIME_DOC,
                         )
                     )
-    return errors
+    return errors, suppressed
 
 
 # ---- ZCOPY002: Per-element device transfers in loops ----
 
-def check_loop_transfers(repo_root: Path) -> list[LintError]:
-    """Find D->H transfer calls inside for/while loop bodies."""
+def check_loop_transfers(
+    repo_root: Path,
+) -> tuple[list[LintError], int]:
+    """Find D->H transfer calls inside for/while loop bodies.
+
+    Returns ``(errors, suppressed_count)``.
+    """
     errors: list[LintError] = []
+    suppressed = 0
     root = repo_root / "src" / "vibespatial"
     for path in iter_python_files(root):
-        tree = parse_module(path)
+        source = path.read_text(encoding="utf-8")
+        suppressions = _parse_suppression_comments(source)
+        tree = ast.parse(source, filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.For, ast.While)):
                 continue
@@ -201,6 +250,9 @@ def check_loop_transfers(repo_root: Path) -> list[LintError]:
                 if not isinstance(descendant, ast.Call):
                     continue
                 if _is_d2h_call(descendant):
+                    if descendant.lineno in suppressions:
+                        suppressed += 1
+                        continue
                     errors.append(
                         LintError(
                             code="ZCOPY002",
@@ -213,7 +265,7 @@ def check_loop_transfers(repo_root: Path) -> list[LintError]:
                             doc_path=RUNTIME_DOC,
                         )
                     )
-    return errors
+    return errors, suppressed
 
 
 # ---- ZCOPY003: Functions that accept device data but return host data ----
@@ -248,12 +300,20 @@ _ALLOWED_HOST_RETURN = {
 }
 
 
-def check_boundary_type_leak(repo_root: Path) -> list[LintError]:
-    """Find functions using device APIs that return D->H converted results."""
+def check_boundary_type_leak(
+    repo_root: Path,
+) -> tuple[list[LintError], int]:
+    """Find functions using device APIs that return D->H converted results.
+
+    Returns ``(errors, suppressed_count)``.
+    """
     errors: list[LintError] = []
+    suppressed = 0
     root = repo_root / "src" / "vibespatial"
     for path in iter_python_files(root):
-        tree = parse_module(path)
+        source = path.read_text(encoding="utf-8")
+        suppressions = _parse_suppression_comments(source)
+        tree = ast.parse(source, filename=str(path))
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -263,6 +323,9 @@ def check_boundary_type_leak(repo_root: Path) -> list[LintError]:
                 continue
             d2h_line = _returns_host_conversion(node)
             if d2h_line is not None:
+                if d2h_line in suppressions:
+                    suppressed += 1
+                    continue
                 errors.append(
                     LintError(
                         code="ZCOPY003",
@@ -275,15 +338,57 @@ def check_boundary_type_leak(repo_root: Path) -> list[LintError]:
                         doc_path=RUNTIME_DOC,
                     )
                 )
+    return errors, suppressed
+
+
+def _check_empty_suppressions(repo_root: Path) -> list[LintError]:
+    """Emit errors for ``# zcopy:ok()`` with empty reason strings."""
+    errors: list[LintError] = []
+    root = repo_root / "src" / "vibespatial"
+    for path in iter_python_files(root):
+        source = path.read_text(encoding="utf-8")
+        for lineno in _find_empty_suppression_lines(source):
+            errors.append(
+                LintError(
+                    code="ZCOPY_EMPTY_SUPPRESSION",
+                    path=path,
+                    line=lineno,
+                    message=(
+                        "Suppression comment # zcopy:ok() has empty reason. "
+                        "Provide a justification: # zcopy:ok(reason here)."
+                    ),
+                    doc_path=RUNTIME_DOC,
+                )
+            )
     return errors
 
 
-def run_checks(repo_root: Path) -> list[LintError]:
+def run_checks(repo_root: Path) -> tuple[list[LintError], int]:
+    """Run all ZCOPY checks.
+
+    Returns ``(errors, suppressed_count)``.
+    """
     errors: list[LintError] = []
-    errors.extend(check_pingpong_transfers(repo_root))
-    errors.extend(check_loop_transfers(repo_root))
-    errors.extend(check_boundary_type_leak(repo_root))
-    return sorted(errors, key=lambda e: (str(e.path), e.line, e.code))
+    total_suppressed = 0
+
+    pingpong_errors, pingpong_suppressed = check_pingpong_transfers(repo_root)
+    errors.extend(pingpong_errors)
+    total_suppressed += pingpong_suppressed
+
+    loop_errors, loop_suppressed = check_loop_transfers(repo_root)
+    errors.extend(loop_errors)
+    total_suppressed += loop_suppressed
+
+    leak_errors, leak_suppressed = check_boundary_type_leak(repo_root)
+    errors.extend(leak_errors)
+    total_suppressed += leak_suppressed
+
+    errors.extend(_check_empty_suppressions(repo_root))
+
+    return (
+        sorted(errors, key=lambda e: (str(e.path), e.line, e.code)),
+        total_suppressed,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -299,8 +404,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.all:
         parser.error("pass --all")
 
-    errors = run_checks(REPO_ROOT)
+    errors, suppressed_count = run_checks(REPO_ROOT)
     count = len(errors)
+
+    suppressed_msg = ""
+    if suppressed_count:
+        suppressed_msg = f" ({suppressed_count} suppressed via # zcopy:ok)"
 
     if count > _VIOLATION_BASELINE:
         for error in errors:
@@ -308,7 +417,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"\nZero-copy checks FAILED: {count} violations found, "
             f"baseline is {_VIOLATION_BASELINE}. "
-            f"New code introduced {count - _VIOLATION_BASELINE} violation(s).",
+            f"New code introduced {count - _VIOLATION_BASELINE} violation(s)."
+            f"{suppressed_msg}",
             file=sys.stderr,
         )
         return 1
@@ -316,10 +426,13 @@ def main(argv: list[str] | None = None) -> int:
     if count < _VIOLATION_BASELINE:
         print(
             f"Zero-copy checks passed ({count} known violations, baseline {_VIOLATION_BASELINE}). "
-            f"Debt reduced! Update _VIOLATION_BASELINE to {count}."
+            f"Debt reduced! Update _VIOLATION_BASELINE to {count}.{suppressed_msg}"
         )
     else:
-        print(f"Zero-copy checks passed ({count} known violations, baseline holds).")
+        print(
+            f"Zero-copy checks passed ({count} known violations, baseline holds)."
+            f"{suppressed_msg}"
+        )
     return 0
 
 
