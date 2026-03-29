@@ -922,7 +922,96 @@ def _assemble_polygon(
 
 
 # ---------------------------------------------------------------------------
-# Phase 5: Public API
+# Phase 5: Core decode — from parsed header + device bytes
+# ---------------------------------------------------------------------------
+
+
+def _decode_shp_records(
+    header: ShpHeader,
+    d_shp: cp.ndarray,
+    h_offsets: np.ndarray,
+    h_content_lengths: np.ndarray,
+) -> OwnedGeometryArray:
+    """Decode SHP records on GPU given pre-parsed header and device bytes.
+
+    This is the shared core for both file-based and bytes-based paths.
+    """
+    n_records = header.n_records
+
+    d_offsets = cp.asarray(h_offsets)
+    d_content_lengths = cp.asarray(h_content_lengths)
+
+    if header.shape_type == SHP_POINT:
+        d_x, d_y = _decode_points(d_shp, d_offsets, n_records)
+        return _assemble_points(d_x, d_y, n_records)
+
+    if header.shape_type == SHP_MULTIPOINT:
+        result = _count_scatter_complex(
+            d_shp, d_offsets, d_content_lengths, n_records, SHP_MULTIPOINT,
+        )
+        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
+         total_points, total_parts, _, d_num_parts, d_num_points) = result
+        return _assemble_multipoint(
+            d_x, d_y, d_coord_offsets, d_is_null, n_records, total_points,
+        )
+
+    if header.shape_type == SHP_POLYLINE:
+        result = _count_scatter_complex(
+            d_shp, d_offsets, d_content_lengths, n_records, SHP_POLYLINE,
+        )
+        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
+         total_points, total_parts, d_ring_flat, d_num_parts, d_num_points) = result
+        return _assemble_linestring(
+            d_x, d_y, d_coord_offsets, d_ring_flat, d_part_offsets,
+            d_is_null, d_num_parts, n_records, total_points, total_parts,
+        )
+
+    if header.shape_type == SHP_POLYGON:
+        result = _count_scatter_complex(
+            d_shp, d_offsets, d_content_lengths, n_records, SHP_POLYGON,
+        )
+        (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
+         total_points, total_parts, d_ring_flat, d_num_parts, d_num_points) = result
+        return _assemble_polygon(
+            d_x, d_y, d_coord_offsets, d_ring_flat, d_part_offsets,
+            d_is_null, d_num_parts, n_records, total_points, total_parts,
+        )
+
+    raise ValueError(f"Unsupported SHP shape type: {header.shape_type}")
+
+
+def _assemble_from_shp_bytes(
+    shp_bytes: bytes,
+    shx_bytes: bytes,
+) -> OwnedGeometryArray:
+    """Decode SHP geometry from in-memory bytes (for zip extraction).
+
+    Parameters
+    ----------
+    shp_bytes : bytes
+        Raw .shp file contents.
+    shx_bytes : bytes
+        Raw .shx file contents.
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Device-resident geometry array.
+    """
+    if cp is None:
+        raise ImportError("CuPy is required for _assemble_from_shp_bytes")
+
+    header, h_offsets, h_content_lengths = _parse_shx_bytes(shx_bytes)
+
+    if header.n_records == 0:
+        return _make_empty_owned(header.shape_type)
+
+    d_shp = cp.frombuffer(shp_bytes, dtype=cp.uint8).copy()
+    return _decode_shp_records(header, d_shp, h_offsets, h_content_lengths)
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: Public API
 # ---------------------------------------------------------------------------
 
 
@@ -963,148 +1052,27 @@ def read_shp_gpu(shp_path: Path | str) -> OwnedGeometryArray:
     # Handle .shp.zip and .zip archives: extract SHP/SHX to memory.
     if shp_path.suffix.lower() == ".zip" or str(shp_path).lower().endswith(".shp.zip"):
         shp_bytes, shx_bytes = _extract_shp_from_zip(shp_path)
-        header, h_offsets, h_content_lengths = _read_shx_index_from_bytes(shx_bytes)
+        return _assemble_from_shp_bytes(shp_bytes, shx_bytes)
 
-        if header.n_records == 0:
-            return _make_empty_owned(header.shape_type)
+    shx_path = shp_path.with_suffix(".shx")
 
-        n_records = header.n_records
-        d_shp = cp.frombuffer(shp_bytes, dtype=cp.uint8).copy()
-    else:
-        shx_path = shp_path.with_suffix(".shx")
+    if not shp_path.exists():
+        raise FileNotFoundError(f"SHP file not found: {shp_path}")
+    if not shx_path.exists():
+        raise FileNotFoundError(f"SHX file not found: {shx_path}")
 
-        if not shp_path.exists():
-            raise FileNotFoundError(f"SHP file not found: {shp_path}")
-        if not shx_path.exists():
-            raise FileNotFoundError(f"SHX file not found: {shx_path}")
+    header, h_offsets, h_content_lengths = _read_shx_index(shx_path)
 
-        # ---- Phase 1: CPU -- parse SHX index ----
-        header, h_offsets, h_content_lengths = _read_shx_index(shx_path)
+    if header.n_records == 0:
+        return _make_empty_owned(header.shape_type)
 
-        if header.n_records == 0:
-            return _make_empty_owned(header.shape_type)
+    from vibespatial.io.kvikio_reader import read_file_to_device
 
-        n_records = header.n_records
+    shp_size = shp_path.stat().st_size
+    file_result = read_file_to_device(shp_path, shp_size)
+    d_shp = file_result.device_bytes
 
-        # ---- Phase 2: GPU -- bulk read SHP file to device ----
-        from vibespatial.io.kvikio_reader import read_file_to_device
-
-        shp_size = shp_path.stat().st_size
-        file_result = read_file_to_device(shp_path, shp_size)
-        d_shp = file_result.device_bytes
-
-    # Transfer record offsets and content lengths to device
-    d_offsets = cp.asarray(h_offsets)
-    d_content_lengths = cp.asarray(h_content_lengths)
-
-    # ---- Phase 3-5: Decode and assemble based on shape type ----
-    if header.shape_type == SHP_POINT:
-        d_x, d_y = _decode_points(d_shp, d_offsets, n_records)
-        return _assemble_points(d_x, d_y, n_records)
-
-    if header.shape_type == SHP_MULTIPOINT:
-        result = _count_scatter_complex(
-            d_shp,
-            d_offsets,
-            d_content_lengths,
-            n_records,
-            SHP_MULTIPOINT,
-        )
-        (
-            d_x,
-            d_y,
-            d_coord_offsets,
-            d_part_offsets,
-            d_is_null,
-            total_points,
-            total_parts,
-            _,
-            d_num_parts,
-            d_num_points,
-        ) = result
-        return _assemble_multipoint(
-            d_x,
-            d_y,
-            d_coord_offsets,
-            d_is_null,
-            n_records,
-            total_points,
-        )
-
-    if header.shape_type == SHP_POLYLINE:
-        result = _count_scatter_complex(
-            d_shp,
-            d_offsets,
-            d_content_lengths,
-            n_records,
-            SHP_POLYLINE,
-        )
-        (
-            d_x,
-            d_y,
-            d_coord_offsets,
-            d_part_offsets,
-            d_is_null,
-            total_points,
-            total_parts,
-            d_ring_flat,
-            d_num_parts,
-            d_num_points,
-        ) = result
-        return _assemble_linestring(
-            d_x,
-            d_y,
-            d_coord_offsets,
-            d_ring_flat,
-            d_part_offsets,
-            d_is_null,
-            d_num_parts,
-            n_records,
-            total_points,
-            total_parts,
-        )
-
-    if header.shape_type == SHP_POLYGON:
-        result = _count_scatter_complex(
-            d_shp,
-            d_offsets,
-            d_content_lengths,
-            n_records,
-            SHP_POLYGON,
-        )
-        (
-            d_x,
-            d_y,
-            d_coord_offsets,
-            d_part_offsets,
-            d_is_null,
-            total_points,
-            total_parts,
-            d_ring_flat,
-            d_num_parts,
-            d_num_points,
-        ) = result
-        return _assemble_polygon(
-            d_x,
-            d_y,
-            d_coord_offsets,
-            d_ring_flat,
-            d_part_offsets,
-            d_is_null,
-            d_num_parts,
-            n_records,
-            total_points,
-            total_parts,
-        )
-
-    # Null-only files: all records are Null shape
-    if header.shape_type == SHP_NULL:
-        return _make_empty_owned(SHP_POINT)
-
-    raise ValueError(
-        f"Unsupported SHP shape type {header.shape_type}. "
-        f"Supported types: Point (1), PolyLine (3), Polygon (5), MultiPoint (8)."
-    )
+    return _decode_shp_records(header, d_shp, h_offsets, h_content_lengths)
 
 
 def _make_empty_owned(shape_type: int) -> OwnedGeometryArray:

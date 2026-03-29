@@ -16492,10 +16492,13 @@
         "_extract_logical_field",
         "_extract_character_field",
         "_extract_deletion_flags",
+        "_dbf_from_device_bytes",
+        "read_dbf_gpu_from_bytes",
         "read_dbf_gpu",
         "dbf_result_to_dataframe"
       ],
       "tokens": [
+        "bytes",
         "character",
         "dataframe",
         "date",
@@ -16505,6 +16508,7 @@
         "dbfgpuresult",
         "dbfheader",
         "deletion",
+        "device",
         "extract",
         "field",
         "flags",
@@ -17550,6 +17554,8 @@
         "_assemble_multipoint",
         "_assemble_linestring",
         "_assemble_polygon",
+        "_decode_shp_records",
+        "_assemble_from_shp_bytes",
         "read_shp_gpu",
         "_make_empty_owned"
       ],
@@ -17579,6 +17585,7 @@
         "polygon",
         "py",
         "read",
+        "records",
         "scatter",
         "shp",
         "shpheader",

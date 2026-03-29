@@ -489,34 +489,33 @@ def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
     """
     try:
         from .arrow import geoseries_from_owned
-        from .shp_gpu import read_shp_gpu
 
         file_path = Path(filename)
-
-        # For .shp.zip archives, read_shp_gpu extracts SHP/SHX from the
-        # zip internally.  For bare .shp files, check for the sibling .shx.
         is_zip = (
             file_path.suffix.lower() == ".zip"
             or str(file_path).lower().endswith(".shp.zip")
         )
-        if not is_zip:
-            shx_path = file_path.with_suffix(".shx")
-            if not shx_path.exists():
-                return None
 
-        # Read geometry directly from SHP binary on GPU
-        owned = read_shp_gpu(file_path)
-
-        # Try to get CRS and attributes.
-        # For zips, extract .prj and .dbf from the archive.
         crs = None
         attrs_df = None
 
         if is_zip:
+            # Single-pass zip extraction: read SHP, SHX, PRJ, DBF all at
+            # once to avoid opening the archive multiple times.
             import zipfile
+
+            from .shp_gpu import _assemble_from_shp_bytes
 
             with zipfile.ZipFile(file_path) as zf:
                 names = zf.namelist()
+                shp_name = next((n for n in names if n.lower().endswith(".shp")), None)
+                shx_name = next((n for n in names if n.lower().endswith(".shx")), None)
+                if shp_name is None or shx_name is None:
+                    return None
+
+                shp_bytes = zf.read(shp_name)
+                shx_bytes = zf.read(shx_name)
+
                 prj_name = next((n for n in names if n.lower().endswith(".prj")), None)
                 if prj_name:
                     try:
@@ -525,21 +524,28 @@ def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
                         pass
 
                 dbf_name = next((n for n in names if n.lower().endswith(".dbf")), None)
-                if dbf_name:
-                    import tempfile
+                dbf_bytes = zf.read(dbf_name) if dbf_name else None
 
-                    from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+            # GPU decode SHP geometry from in-memory bytes
+            owned = _assemble_from_shp_bytes(shp_bytes, shx_bytes)
+            del shp_bytes, shx_bytes
 
-                    dbf_bytes = zf.read(dbf_name)
-                    with tempfile.NamedTemporaryFile(suffix=".dbf", delete=False) as tmp:
-                        tmp.write(dbf_bytes)
-                        tmp_path = Path(tmp.name)
-                    try:
-                        dbf_result = read_dbf_gpu(tmp_path)
-                        attrs_df = dbf_result_to_dataframe(dbf_result)
-                    finally:
-                        tmp_path.unlink(missing_ok=True)
+            # GPU decode DBF attributes from in-memory bytes (no temp file)
+            if dbf_bytes is not None:
+                from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu_from_bytes
+
+                dbf_result = read_dbf_gpu_from_bytes(dbf_bytes)
+                del dbf_bytes
+                attrs_df = dbf_result_to_dataframe(dbf_result)
         else:
+            from .shp_gpu import read_shp_gpu
+
+            shx_path = file_path.with_suffix(".shx")
+            if not shx_path.exists():
+                return None
+
+            owned = read_shp_gpu(file_path)
+
             prj_path = file_path.with_suffix(".prj")
             if prj_path.exists():
                 try:
