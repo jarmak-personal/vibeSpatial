@@ -19,6 +19,8 @@ def __getattr__(name: str):
         "read_csv_gpu": ("vibespatial.io.csv_gpu", "read_csv_gpu"),
         "read_kml_gpu": ("vibespatial.io.kml_gpu", "read_kml_gpu"),
         "read_dbf_gpu": ("vibespatial.io.dbf_gpu", "read_dbf_gpu"),
+        "read_shp_gpu": ("vibespatial.io.shp_gpu", "read_shp_gpu"),
+        "read_fgb_gpu": ("vibespatial.io.fgb_gpu", "read_fgb_gpu"),
         "read_osm_pbf_nodes": ("vibespatial.io.osm_gpu", "read_osm_pbf_nodes"),
         "build_spatial_index": (
             "vibespatial.io.gpu_parse.indexing",
@@ -52,6 +54,8 @@ __all__ = [
     "read_csv_gpu",
     "read_kml_gpu",
     "read_dbf_gpu",
+    "read_shp_gpu",
+    "read_fgb_gpu",
     "read_osm_pbf_nodes",
     "build_spatial_index",
     "GpuSpatialIndex",

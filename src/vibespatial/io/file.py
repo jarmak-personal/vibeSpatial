@@ -154,6 +154,10 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         return driver
     if not isinstance(filename, str | Path):
         return "GDAL-legacy"
+    # Handle compound extensions like .shp.zip before Path.suffix
+    fname_lower = str(filename).lower()
+    if fname_lower.endswith(".shp.zip"):
+        return "ESRI Shapefile"
     suffix = Path(filename).suffix.lower()
     mapping = {
         ".json": "GeoJSON",
@@ -224,8 +228,8 @@ def plan_vector_file_io(
         reason = "File Geodatabase uses pyogrio Arrow container parse with GPU WKB geometry decode."
     elif normalized_driver == "FlatGeobuf":
         io_format = IOFormat.FLATGEOBUF
-        implementation = "flatgeobuf_pyogrio_arrow_gpu_wkb"
-        reason = "FlatGeobuf uses pyogrio Arrow container parse with GPU WKB geometry decode."
+        implementation = "flatgeobuf_gpu_direct_decode"
+        reason = "FlatGeobuf uses direct GPU binary decode via NVRTC FlatBuffer navigation, bypassing pyogrio/WKB roundtrip. Falls back to pyogrio Arrow + GPU WKB for filtered reads or small files."
     elif normalized_driver == "GML":
         io_format = IOFormat.GML
         implementation = "gml_pyogrio_arrow_gpu_wkb"
@@ -472,6 +476,70 @@ def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
+def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
+    """Try to read a Shapefile using direct GPU SHP binary decode.
+
+    When both .shp and .shx files exist, bypasses the pyogrio -> WKB ->
+    GPU WKB decode roundtrip entirely.  Geometry is extracted directly
+    from the SHP binary format on GPU.  Attributes come from the GPU
+    DBF parser.
+
+    Falls back to None on failure (missing .shx, unsupported shape type,
+    etc.), allowing the caller to try the pyogrio + GPU WKB path.
+    """
+    try:
+        from .arrow import geoseries_from_owned
+        from .shp_gpu import read_shp_gpu
+
+        file_path = Path(filename)
+        shx_path = file_path.with_suffix(".shx")
+        if not shx_path.exists():
+            return None
+
+        # Read geometry directly from SHP binary on GPU
+        owned = read_shp_gpu(file_path)
+
+        # Try to get CRS from a .prj file (standard Shapefile sidecar)
+        crs = None
+        prj_path = file_path.with_suffix(".prj")
+        if prj_path.exists():
+            try:
+                crs = prj_path.read_text().strip()
+            except Exception:
+                pass
+
+        geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
+
+        # Read attributes via GPU DBF parser if .dbf exists
+        dbf_path = file_path.with_suffix(".dbf")
+        if dbf_path.exists():
+            from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+
+            dbf_result = read_dbf_gpu(dbf_path)
+            attrs_df = dbf_result_to_dataframe(dbf_result)
+        else:
+            import pandas as pd
+
+            attrs_df = pd.DataFrame(index=range(len(geom_series)))
+
+        import vibespatial.api as geopandas
+
+        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="shapefile_shp_direct_gpu_adapter",
+            reason=(
+                "GPU-native Shapefile read: direct SHP binary decode on GPU "
+                "(no WKB intermediate), GPU DBF parser for attributes."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
 def _try_shapefile_dbf_gpu_read(filename) -> object | None:
     """Try to read a Shapefile with GPU DBF attribute parsing.
 
@@ -705,6 +773,54 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
         return None
 
 
+def _try_fgb_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
+    """Try to read a FlatGeobuf file using the GPU direct binary decoder.
+
+    Parses the FGB binary format directly on GPU, bypassing the
+    pyogrio -> WKB -> GPU WKB decode roundtrip.  FGB stores coordinates
+    as flat arrays, making the GPU decode path very efficient.
+
+    Returns a GeoDataFrame with geometry + attributes, or None on failure.
+    """
+    try:
+        from .arrow import geoseries_from_owned
+        from .fgb_gpu import read_fgb_gpu
+
+        fgb_result = read_fgb_gpu(filename)
+
+        # Determine CRS: prefer target_crs, then embedded CRS
+        crs = target_crs if target_crs is not None else fgb_result.crs
+        geom_series = geoseries_from_owned(fgb_result.geometry, name="geometry", crs=crs)
+
+        import pandas as pd
+
+        import vibespatial.api as geopandas
+
+        if fgb_result.attributes:
+            attrs_df = pd.DataFrame(fgb_result.attributes)
+        else:
+            attrs_df = pd.DataFrame(index=range(fgb_result.n_features))
+        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+
+        # Fused reproject: if target_crs differs from embedded CRS, reproject.
+        if target_crs is not None and fgb_result.crs is not None and target_crs != fgb_result.crs:
+            _reproject_gdf_gpu(gdf, target_crs)
+
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation="flatgeobuf_gpu_direct_decode_adapter",
+            reason=(
+                "GPU direct FGB decode: binary FlatBuffer navigation on GPU via "
+                "NVRTC kernels, bypassing pyogrio/WKB roundtrip."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return gdf
+    except Exception:
+        return None
+
+
 # Minimum file size (in bytes) for GPU fast-path routing.
 # Below this threshold, let the CPU handle it -- kernel launch overhead
 # dominates for small files.
@@ -784,8 +900,18 @@ def _try_gpu_read_file(
                 return gpu_result
             # fall through to pyogrio CPU path
 
-        # Shapefile: route to GPU DBF parser for attributes (large files)
+        # Shapefile: try direct GPU SHP binary decode first (fastest path),
+        # then fall back to pyogrio Arrow + GPU WKB + GPU DBF path.
         if plan.format is IOFormat.SHAPEFILE and file_size > _GPU_MIN_FILE_SIZE:
+            # Direct SHP binary decode (no WKB intermediate)
+            gpu_result = _try_shapefile_shp_direct_gpu_read(filename)
+            if gpu_result is not None:
+                if target_crs is not None:
+                    _reproject_gdf_gpu(gpu_result, target_crs)
+                if build_index:
+                    _attach_gpu_spatial_index(gpu_result)
+                return gpu_result
+            # Fallback: pyogrio Arrow geometry + GPU DBF attributes
             gpu_result = _try_shapefile_dbf_gpu_read(filename)
             if gpu_result is not None:
                 if target_crs is not None:
@@ -827,6 +953,16 @@ def _try_gpu_read_file(
                 return gdf
             except Exception:
                 pass  # fall through to pyogrio GPU WKB path
+
+        # FlatGeobuf: direct GPU binary decode for files > 10 MB.
+        # FGB stores coordinates as flat arrays -- almost our OGA format.
+        if plan.format is IOFormat.FLATGEOBUF and file_size > _GPU_MIN_FILE_SIZE:
+            gpu_result = _try_fgb_gpu_read(filename, target_crs=target_crs)
+            if gpu_result is not None:
+                if build_index:
+                    _attach_gpu_spatial_index(gpu_result)
+                return gpu_result
+            # fall through to pyogrio GPU WKB path
 
     try:
         skip_features, max_features = _normalize_feature_window(rows)
