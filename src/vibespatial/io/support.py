@@ -14,6 +14,8 @@ class IOFormat(StrEnum):
     KML = "kml"
     SHAPEFILE = "shapefile"
     OSM_PBF = "osm-pbf"
+    GEOPACKAGE = "geopackage"
+    FILE_GEODATABASE = "file-geodatabase"
     GDAL_LEGACY = "gdal-legacy"
 
 
@@ -122,6 +124,22 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         write_path=IOPathKind.FALLBACK,
         canonical_gpu=False,
         reason="OSM PBF read uses CPU protobuf parsing with GPU varint decoding and coordinate assembly; write is not supported.",
+    ),
+    IOFormat.GEOPACKAGE: IOSupportEntry(
+        format=IOFormat.GEOPACKAGE,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="GeoPackage read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+    ),
+    IOFormat.FILE_GEODATABASE: IOSupportEntry(
+        format=IOFormat.FILE_GEODATABASE,
+        default_path=IOPathKind.HYBRID,
+        read_path=IOPathKind.HYBRID,
+        write_path=IOPathKind.FALLBACK,
+        canonical_gpu=False,
+        reason="File Geodatabase read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
     ),
     IOFormat.GDAL_LEGACY: IOSupportEntry(
         format=IOFormat.GDAL_LEGACY,

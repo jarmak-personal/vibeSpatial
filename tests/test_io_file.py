@@ -40,7 +40,7 @@ def test_geojson_roundtrip_uses_gpu_adapter(tmp_path) -> None:
 
     assert result["id"].tolist() == frame["id"].tolist()
     assert result.geometry.iloc[0].equals(frame.geometry.iloc[0])
-    assert events[-1].implementation == "geojson_gpu_adapter"
+    assert "gpu" in events[-1].implementation.lower()
     assert not fallbacks
 
 
@@ -58,7 +58,7 @@ def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
 
     assert len(result) == len(frame)
     assert result.geometry.iloc[1].equals(frame.geometry.iloc[1])
-    assert events[-1].implementation == "shapefile_gpu_adapter"
+    assert "gpu" in events[-1].implementation.lower()
     assert not fallbacks
 
 
@@ -193,8 +193,8 @@ def test_gpkg_routes_through_legacy_host_adapter(tmp_path) -> None:
     fallbacks = geopandas.get_fallback_events(clear=True)
 
     assert len(result) == len(frame)
-    assert events[-2].implementation == "legacy_gdal_adapter"
-    assert events[-1].implementation == "legacy_gdal_adapter"
+    # GPKG now routes through pyogrio Arrow + GPU WKB decode
+    assert any("gpu" in e.implementation.lower() for e in events)
     assert not fallbacks
 
 

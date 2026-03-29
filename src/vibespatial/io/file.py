@@ -165,6 +165,8 @@ def _normalize_driver(filename, driver: str | None = None) -> str:
         ".tsv": "CSV",
         ".kml": "KML",
         ".pbf": "OSM-PBF",
+        ".gpkg": "GPKG",
+        ".gdb": "OpenFileGDB",
         ".parquet": "GeoParquet",
         ".geoparquet": "GeoParquet",
         ".feather": "Feather",
@@ -206,6 +208,14 @@ def plan_vector_file_io(
         io_format = IOFormat.OSM_PBF
         implementation = "osm_pbf_gpu_hybrid_adapter"
         reason = "OSM PBF uses CPU protobuf parsing with GPU varint decoding and coordinate assembly."
+    elif normalized_driver == "GPKG":
+        io_format = IOFormat.GEOPACKAGE
+        implementation = "gpkg_pyogrio_arrow_gpu_wkb"
+        reason = "GeoPackage uses pyogrio Arrow container parse with GPU WKB geometry decode."
+    elif normalized_driver == "OpenFileGDB":
+        io_format = IOFormat.FILE_GEODATABASE
+        implementation = "fgdb_pyogrio_arrow_gpu_wkb"
+        reason = "File Geodatabase uses pyogrio Arrow container parse with GPU WKB geometry decode."
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"
@@ -860,9 +870,7 @@ def _try_gpu_read_file(
         gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
 
         # Record GPU dispatch event.
-        gpu_impl = (
-            "geojson_gpu_adapter" if plan.format is IOFormat.GEOJSON else "shapefile_gpu_adapter"
-        )
+        gpu_impl = f"{plan.format.value}_pyogrio_arrow_gpu_wkb"
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -894,8 +902,9 @@ def read_vector_file(
 ):
     """Read a spatial file into a GeoDataFrame.
 
-    Supports GeoParquet, Feather/Arrow, Shapefile, GeoPackage, GeoJSON,
-    WKT, CSV, KML, OSM PBF, and any format readable by pyogrio/fiona.
+    Supports GeoParquet, Feather/Arrow, Shapefile, GeoPackage, File
+    Geodatabase, GeoJSON, WKT, CSV, KML, OSM PBF, and any format
+    readable by pyogrio/fiona.
 
     GPU acceleration is automatic for GeoJSON, Shapefile, WKT, CSV, KML,
     and OSM PBF formats.  For CSV, KML, GeoJSON, and Shapefile, GPU
@@ -977,6 +986,8 @@ def read_vector_file(
         IOFormat.CSV,
         IOFormat.KML,
         IOFormat.OSM_PBF,
+        IOFormat.GEOPACKAGE,
+        IOFormat.FILE_GEODATABASE,
     }
     if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         gpu_result = _try_gpu_read_file(
