@@ -28,6 +28,14 @@ def __getattr__(name: str):
             "vibespatial.io.gpu_parse.indexing",
             "GpuSpatialIndex",
         ),
+        "read_postgis_gpu": (
+            "vibespatial.io.postgis_gpu",
+            "read_postgis_gpu",
+        ),
+        "to_postgis_gpu": (
+            "vibespatial.io.postgis_gpu",
+            "to_postgis_gpu",
+        ),
     }
     if name in _LAZY_IMPORTS:
         module_path, attr = _LAZY_IMPORTS[name]
@@ -47,4 +55,6 @@ __all__ = [
     "read_osm_pbf_nodes",
     "build_spatial_index",
     "GpuSpatialIndex",
+    "read_postgis_gpu",
+    "to_postgis_gpu",
 ]

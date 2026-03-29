@@ -120,6 +120,7 @@ markers = [
   "gpu: requires a CUDA-capable NVIDIA GPU",
   "cpu_fallback: verifies explicit CPU fallback behavior",
   "web: upstream tests that require network connectivity",
+  "postgis: requires a live PostGIS database (VIBESPATIAL_TEST_POSTGIS_URI)",
 ]
 xfail_strict = true
 

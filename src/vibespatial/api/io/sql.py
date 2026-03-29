@@ -180,6 +180,13 @@ def _read_postgis(
     >>> sql = "SELECT ST_AsBinary(geom) AS geom, highway FROM roads"
     >>> df = geopandas.read_postgis(sql, con)  # doctest: +SKIP
     """
+    # --- GPU path via ADBC ---------------------------------------------------
+    gpu_result = _try_gpu_read_postgis(sql, con, geom_col=geom_col, crs=crs,
+                                       chunksize=chunksize)
+    if gpu_result is not None:
+        return gpu_result
+
+    # --- existing Shapely path (unchanged) -----------------------------------
     if chunksize is None:
         # read all in one chunk and return a single GeoDataFrame
         df = pd.read_sql(
@@ -392,6 +399,12 @@ def _write_postgis(
 /mydatabase";)  # doctest: +SKIP
     >>> gdf.to_postgis("my_table", engine)  # doctest: +SKIP
     """
+    # --- GPU path via ADBC ---------------------------------------------------
+    if _try_gpu_write_postgis(gdf, name, con, if_exists=if_exists,
+                              schema=schema, index=index):
+        return
+
+    # --- existing Shapely/GeoAlchemy2 path (unchanged) -----------------------
     try:
         from geoalchemy2 import Geometry
         from sqlalchemy import text
@@ -457,6 +470,39 @@ def _write_postgis(
             dtype=dtype,
             method=_psql_insert_copy,
         )
+
+
+def _try_gpu_read_postgis(sql, con, *, geom_col="geom", crs=None, chunksize=None):
+    """Attempt GPU-accelerated PostGIS read via ADBC.
+
+    Returns a GeoDataFrame on success, or ``None`` if the GPU path cannot
+    be used (missing ADBC, connection type unsupported, or any failure).
+    """
+    try:
+        from vibespatial.io.postgis_gpu import read_postgis_gpu
+
+        return read_postgis_gpu(
+            sql, con, geom_col=geom_col, crs=crs, chunksize=chunksize,
+        )
+    except Exception:
+        return None
+
+
+def _try_gpu_write_postgis(gdf, name, con, *, if_exists="fail", schema=None,
+                           index=False):
+    """Attempt GPU-accelerated PostGIS write via ADBC.
+
+    Returns ``True`` if the write succeeded, ``False`` if the caller should
+    fall through to the Shapely/GeoAlchemy2 path.
+    """
+    try:
+        from vibespatial.io.postgis_gpu import to_postgis_gpu
+
+        return to_postgis_gpu(
+            gdf, name, con, if_exists=if_exists, schema=schema, index=index,
+        )
+    except Exception:
+        return False
 
 
 @lru_cache

@@ -13018,6 +13018,8 @@
         "_convert_to_ewkb",
         "_psql_insert_copy",
         "_write_postgis",
+        "_try_gpu_read_postgis",
+        "_try_gpu_write_postgis",
         "_get_spatial_ref_sys_df"
       ],
       "tokens": [
@@ -13031,6 +13033,7 @@
         "geodf",
         "geometry",
         "get",
+        "gpu",
         "insert",
         "io",
         "linearring",
@@ -13045,6 +13048,7 @@
         "src",
         "srid",
         "sys",
+        "try",
         "type",
         "vibespatial",
         "write"
@@ -17326,6 +17330,42 @@
         "way",
         "wayblock",
         "ways"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/postgis_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_is_simple_table_name",
+        "_wrap_sql_for_wkb",
+        "_get_connection_uri",
+        "_detect_crs_from_table",
+        "_arrow_table_to_geodataframe",
+        "read_postgis_gpu",
+        "to_postgis_gpu"
+      ],
+      "tokens": [
+        "arrow",
+        "connection",
+        "crs",
+        "detect",
+        "geodataframe",
+        "get",
+        "gpu",
+        "io",
+        "name",
+        "postgis",
+        "py",
+        "read",
+        "simple",
+        "sql",
+        "src",
+        "table",
+        "uri",
+        "vibespatial",
+        "wkb",
+        "wrap"
       ]
     },
     {
@@ -24974,6 +25014,32 @@
         "testmultipolygonde9im",
         "testquerypipelineintegration",
         "tests"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_postgis_gpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "TestSqlRewriting",
+        "TestSimpleTableDetection",
+        "TestConnectionUriExtraction",
+        "TestArrowWkbToGeoDataFrame",
+        "TestGracefulFallback",
+        "TestPostgisIntegration"
+      ],
+      "tokens": [
+        "gpu",
+        "postgis",
+        "py",
+        "test",
+        "testarrowwkbtogeodataframe",
+        "testconnectionuriextraction",
+        "testgracefulfallback",
+        "testpostgisintegration",
+        "tests",
+        "testsimpletabledetection",
+        "testsqlrewriting"
       ]
     },
     {
