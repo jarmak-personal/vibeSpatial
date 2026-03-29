@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 244/260 lines
+Body Budget: 260/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -19,12 +19,12 @@ Section Map (Body Lines)
 | 33-38 | Risks |
 | 39-47 | Mission |
 | 48-57 | Startup |
-| 58-79 | Routing |
-| 80-106 | Project Shape |
-| 107-124 | Execution Model |
-| 125-136 | Test Strategy |
-| 137-146 | Build And Tooling |
-| 147-165 | Verification |
+| 58-95 | Routing |
+| 96-122 | Project Shape |
+| 123-140 | Execution Model |
+| 141-152 | Test Strategy |
+| 153-162 | Build And Tooling |
+| 163-181 | Verification |
 | ... | (4 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -95,6 +95,22 @@ Use `docs/ops/intake.md` as the source of truth for:
 Generated headers and `docs/ops/intake-index.json` turn those docs into
 machine-readable routing input. Do not front-load full-repo reads. Route,
 inspect the local area, then expand.
+
+### Explore and Impact Agents
+
+Two agents handle codebase exploration and analysis:
+
+- **Explore** (`.claude/agents/Explore.md`): vibeSpatial-specialized replacement
+  for the default explore agent. Uses the intake router as its first move, the
+  10-layer dispatch stack as its mental model, and doc headers for section-level
+  navigation. Supports five strategies: dispatch stack trace, gap finder, direct
+  search, ADR trail, and health probe.
+
+- **impact-analyzer** (`.claude/agents/impact-analyzer.md`): Deep cross-cutting
+  analysis agent with three modes: What-If Simulator (enumerate all touchpoints
+  for a hypothetical change), Dual-Path Diff (compare GPU vs CPU execution for
+  an operation), and Data Flow Tracer (trace geometry buffers through
+  device/host boundaries).
 
 ### Many-vs-One Overlay (N-vs-1 Pattern)
 
