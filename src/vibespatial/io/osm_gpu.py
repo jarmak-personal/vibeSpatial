@@ -492,10 +492,27 @@ def _skip_field(data: bytes | memoryview, offset: int, wire_type: int) -> int:
     elif wire_type == _WIRE_LENGTH_DELIMITED:
         length, consumed = _decode_varint(data, offset)
         return offset + consumed + length
+    elif wire_type == 3:
+        # Deprecated "start group" — skip fields until matching "end group"
+        while offset < len(data):
+            tag, consumed = _decode_varint(data, offset)
+            offset += consumed
+            inner_wt = tag & 0x07
+            if inner_wt == 4:  # end group
+                return offset
+            offset = _skip_field(data, offset, inner_wt)
+        return offset
+    elif wire_type == 4:
+        # "end group" marker — nothing to skip
+        return offset
     elif wire_type == _WIRE_32BIT:
         return offset + 4
     else:
-        raise ValueError(f"Unknown wire type {wire_type}")
+        # Unknown wire type — likely lost sync within the message.
+        # Return len(data) to terminate the current parse loop gracefully
+        # rather than crashing the entire pipeline.
+        logger.debug("Unknown wire type %d at offset %d, skipping rest of message", wire_type, offset)
+        return len(data)
 
 
 def _parse_field_tag(data: bytes | memoryview, offset: int) -> tuple[int, int, int]:
@@ -662,7 +679,10 @@ _STREAM_BATCH_SIZE = 4  # blocks per batch -- balances memory vs. overhead
 def _stream_decode_nodes(
     path: Path,
     block_index: list[BlockInfo],
-) -> tuple[cp.ndarray, cp.ndarray, cp.ndarray, list[dict[str, str]] | None] | None:
+    *,
+    extract_tags: bool = True,
+    extract_ids: bool = True,
+) -> tuple[cp.ndarray | None, cp.ndarray, cp.ndarray, list[dict[str, str]] | None] | None:
     """Stream-decode DenseNodes from PBF blocks in batches.
 
     Processes blocks in groups of ``_STREAM_BATCH_SIZE`` to bound peak host
@@ -670,10 +690,19 @@ def _stream_decode_nodes(
     on GPU, delta-decoded (cumsum), and scaled.  Results are accumulated as
     device-resident CuPy array chunks and concatenated at the end.
 
+    Parameters
+    ----------
+    extract_tags : bool
+        If False, skip tag decoding entirely.  This avoids the ~200 bytes
+        per-node Python dict overhead that dominates memory for large files.
+    extract_ids : bool
+        If False, skip node ID extraction.  For geometry-only mode.
+
     Returns ``(d_all_ids, d_all_lat, d_all_lon, all_node_tags)`` --
     concatenated device arrays and host-resident tag dicts -- or ``None``
-    if no nodes were found.  ``all_node_tags`` is ``None`` if no blocks
-    contained tag data.
+    if no nodes were found.  ``d_all_ids`` is ``None`` if ``extract_ids``
+    is False.  ``all_node_tags`` is ``None`` if tags not requested or no
+    blocks contained tag data.
     """
     data_blocks = [bi for bi in block_index if bi.block_type == "OSMData"]
 
@@ -700,36 +729,42 @@ def _stream_decode_nodes(
         result = _gpu_delta_decode_and_scale(dense_blocks)
         if result is not None:
             d_ids, d_lat, d_lon = result
-            id_chunks.append(d_ids)
+            if extract_ids:
+                id_chunks.append(d_ids)
             lat_chunks.append(d_lat)
             lon_chunks.append(d_lon)
 
-            # Decode tags for this batch (CPU, host-resident strings)
-            batch_tags: list[dict[str, str]] = []
-            for dense in dense_blocks:
-                n_block_nodes = _count_varints(dense.id_bytes)
-                if dense.keys_vals_bytes and dense.stringtable is not None:
-                    kv = _decode_packed_uint32(dense.keys_vals_bytes)
-                    block_tags = _decode_dense_node_tags(
-                        kv, dense.stringtable, n_block_nodes,
-                    )
-                    has_any_tags = has_any_tags or any(block_tags)
-                else:
-                    block_tags = [{} for _ in range(n_block_nodes)]
-                batch_tags.extend(block_tags)
-            tag_chunks.append(batch_tags)
+            # Decode tags for this batch (CPU, host-resident strings).
+            # Skipped when extract_tags is False to avoid ~200 bytes/node
+            # Python dict overhead (180+ GB for planet-scale files).
+            if extract_tags:
+                batch_tags: list[dict[str, str]] = []
+                for dense in dense_blocks:
+                    n_block_nodes = _count_varints(dense.id_bytes)
+                    if dense.keys_vals_bytes and dense.stringtable is not None:
+                        kv = _decode_packed_uint32(dense.keys_vals_bytes)
+                        block_tags = _decode_dense_node_tags(
+                            kv, dense.stringtable, n_block_nodes,
+                        )
+                        has_any_tags = has_any_tags or any(block_tags)
+                    else:
+                        block_tags = [{} for _ in range(n_block_nodes)]
+                    batch_tags.extend(block_tags)
+                tag_chunks.append(batch_tags)
 
-    if not id_chunks:
+    if not lat_chunks:
         return None
 
     # Concatenate all batch results (Tier 2 CuPy -- device-only)
-    d_all_ids = cp.concatenate(id_chunks) if len(id_chunks) > 1 else id_chunks[0]
+    d_all_ids = None
+    if id_chunks:
+        d_all_ids = cp.concatenate(id_chunks) if len(id_chunks) > 1 else id_chunks[0]
     d_all_lat = cp.concatenate(lat_chunks) if len(lat_chunks) > 1 else lat_chunks[0]
     d_all_lon = cp.concatenate(lon_chunks) if len(lon_chunks) > 1 else lon_chunks[0]
 
     # Flatten tag chunks (host-side list concatenation)
     all_node_tags: list[dict[str, str]] | None = None
-    if has_any_tags:
+    if extract_tags and has_any_tags:
         all_node_tags = []
         for chunk in tag_chunks:
             all_node_tags.extend(chunk)
@@ -2423,7 +2458,12 @@ def read_osm_pbf_nodes(path: str | Path) -> OsmGpuResult:
     )
 
 
-def read_osm_pbf(path: str | Path) -> OsmGpuResult:
+def read_osm_pbf(
+    path: str | Path,
+    *,
+    tags: bool | str = "ways",
+    geometry_only: bool = False,
+) -> OsmGpuResult:
     """Extract nodes, ways, and relations from an OSM PBF file.
 
     Uses a hybrid CPU/GPU streaming pipeline to extract:
@@ -2442,13 +2482,50 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     ----------
     path
         Path to the ``.osm.pbf`` file.
+    tags : bool or str, default ``"ways"``
+        Controls tag/attribute extraction.  Tags are host-resident Python
+        dicts and can consume significant memory for large files.
+
+        - ``True`` — extract tags for all elements (nodes, ways, relations).
+          Warning: for planet-scale files, node tags alone can exceed 100 GB
+          of host memory since most of the ~8 billion OSM nodes carry
+          per-object Python dict overhead even when empty.
+        - ``"ways"`` (default) — extract tags for ways and relations only.
+          Node tags are skipped.  This is the recommended setting for most
+          workflows since node tags are rarely needed (nodes are primarily
+          coordinate waypoints for ways).
+        - ``False`` — skip all tag extraction.  Fastest and lowest memory.
+
+    geometry_only : bool, default False
+        If True, skip all tag extraction AND OSM ID extraction.  Returns
+        only device-resident geometry with no host-side attributes.  This
+        is the fastest mode, ideal for visualization or spatial analysis
+        where element metadata is not needed.
 
     Returns
     -------
     OsmGpuResult
         Contains device-resident Point, LineString, Polygon, and
-        MultiPolygon OwnedGeometryArrays with corresponding OSM IDs.
+        MultiPolygon OwnedGeometryArrays with corresponding OSM IDs
+        (unless ``geometry_only=True``).
     """
+    # Normalize tags parameter
+    if geometry_only:
+        extract_node_tags = False
+        extract_way_tags = False
+        extract_relation_tags = False
+    elif tags is True:
+        extract_node_tags = True
+        extract_way_tags = True
+        extract_relation_tags = True
+    elif tags == "ways":
+        extract_node_tags = False
+        extract_way_tags = True
+        extract_relation_tags = True
+    else:
+        extract_node_tags = False
+        extract_way_tags = False
+        extract_relation_tags = False
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"PBF file not found: {path}")
@@ -2459,7 +2536,13 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     logger.info("OSM PBF: %d blocks (%d OSMData)", len(block_index), n_data)
 
     # Phase 2-5: Streaming node decode -- batched decompression + GPU decode
-    nodes_result = _stream_decode_nodes(path, block_index)
+    # Node IDs are always needed (Ways reference nodes by ID for coordinate
+    # resolution), but they're only exposed in the result when not geometry_only.
+    nodes_result = _stream_decode_nodes(
+        path, block_index,
+        extract_tags=extract_node_tags,
+        extract_ids=True,  # always needed for Way coordinate lookup
+    )
 
     d_node_ids: cp.ndarray | None = None
     d_lat: cp.ndarray | None = None
@@ -2469,10 +2552,11 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     node_tags: list[dict[str, str]] | None = None
 
     if nodes_result is not None:
-        d_node_ids, d_lat, d_lon, node_tags = nodes_result
+        d_node_ids, d_lat, d_lon, raw_node_tags = nodes_result
         n_nodes = int(d_node_ids.shape[0])
         logger.info("OSM PBF: extracted %d nodes", n_nodes)
         nodes_owned = _assemble_point_geometry(d_lon, d_lat, n_nodes)
+        node_tags = raw_node_tags if extract_node_tags else None
 
     # Phase 6: Streaming Way + Relation extraction -- batched decompression,
     # CPU protobuf parsing, decompressed memory freed per-batch.
@@ -2506,7 +2590,7 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     # If _process_ways_gpu reordered ways (mixed LineString/Polygon),
     # apply the same reorder to the tag list.
     way_tags: list[dict[str, str]] | None = None
-    if way_blocks and n_ways > 0:
+    if extract_way_tags and way_blocks and n_ways > 0:
         all_way_tags: list[dict[str, str]] = []
         for wb in way_blocks:
             all_way_tags.extend(_decode_way_tags(wb))
@@ -2541,7 +2625,7 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
     # members successfully chain into closed rings.  Build a relation_id ->
     # tag dict lookup and then select only the valid IDs.
     relation_tags: list[dict[str, str]] | None = None
-    if relation_blocks and n_relations > 0 and d_relation_ids is not None:
+    if extract_relation_tags and relation_blocks and n_relations > 0 and d_relation_ids is not None:
         # Build id -> tags lookup from all parsed relation blocks
         rel_id_to_tags: dict[int, dict[str, str]] = {}
         for rb in relation_blocks:
@@ -2558,15 +2642,15 @@ def read_osm_pbf(path: str | Path) -> OsmGpuResult:
 
     return OsmGpuResult(
         nodes=nodes_owned,
-        node_ids=d_node_ids,
+        node_ids=None if geometry_only else d_node_ids,
         n_nodes=n_nodes,
         node_tags=node_tags,
         ways=ways_owned,
-        way_ids=d_way_ids,
+        way_ids=None if geometry_only else d_way_ids,
         way_tags=way_tags,
         n_ways=n_ways,
         relations=relations_owned,
-        relation_ids=d_relation_ids,
+        relation_ids=None if geometry_only else d_relation_ids,
         relation_tags=relation_tags,
         n_relations=n_relations,
     )
