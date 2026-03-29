@@ -492,32 +492,71 @@ def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
         from .shp_gpu import read_shp_gpu
 
         file_path = Path(filename)
-        shx_path = file_path.with_suffix(".shx")
-        if not shx_path.exists():
-            return None
+
+        # For .shp.zip archives, read_shp_gpu extracts SHP/SHX from the
+        # zip internally.  For bare .shp files, check for the sibling .shx.
+        is_zip = (
+            file_path.suffix.lower() == ".zip"
+            or str(file_path).lower().endswith(".shp.zip")
+        )
+        if not is_zip:
+            shx_path = file_path.with_suffix(".shx")
+            if not shx_path.exists():
+                return None
 
         # Read geometry directly from SHP binary on GPU
         owned = read_shp_gpu(file_path)
 
-        # Try to get CRS from a .prj file (standard Shapefile sidecar)
+        # Try to get CRS and attributes.
+        # For zips, extract .prj and .dbf from the archive.
         crs = None
-        prj_path = file_path.with_suffix(".prj")
-        if prj_path.exists():
-            try:
-                crs = prj_path.read_text().strip()
-            except Exception:
-                pass
+        attrs_df = None
+
+        if is_zip:
+            import zipfile
+
+            with zipfile.ZipFile(file_path) as zf:
+                names = zf.namelist()
+                prj_name = next((n for n in names if n.lower().endswith(".prj")), None)
+                if prj_name:
+                    try:
+                        crs = zf.read(prj_name).decode("utf-8", errors="replace").strip()
+                    except Exception:
+                        pass
+
+                dbf_name = next((n for n in names if n.lower().endswith(".dbf")), None)
+                if dbf_name:
+                    import tempfile
+
+                    from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+
+                    dbf_bytes = zf.read(dbf_name)
+                    with tempfile.NamedTemporaryFile(suffix=".dbf", delete=False) as tmp:
+                        tmp.write(dbf_bytes)
+                        tmp_path = Path(tmp.name)
+                    try:
+                        dbf_result = read_dbf_gpu(tmp_path)
+                        attrs_df = dbf_result_to_dataframe(dbf_result)
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
+        else:
+            prj_path = file_path.with_suffix(".prj")
+            if prj_path.exists():
+                try:
+                    crs = prj_path.read_text().strip()
+                except Exception:
+                    pass
+
+            dbf_path = file_path.with_suffix(".dbf")
+            if dbf_path.exists():
+                from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+
+                dbf_result = read_dbf_gpu(dbf_path)
+                attrs_df = dbf_result_to_dataframe(dbf_result)
 
         geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
 
-        # Read attributes via GPU DBF parser if .dbf exists
-        dbf_path = file_path.with_suffix(".dbf")
-        if dbf_path.exists():
-            from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
-
-            dbf_result = read_dbf_gpu(dbf_path)
-            attrs_df = dbf_result_to_dataframe(dbf_result)
-        else:
+        if attrs_df is None:
             import pandas as pd
 
             attrs_df = pd.DataFrame(index=range(len(geom_series)))
