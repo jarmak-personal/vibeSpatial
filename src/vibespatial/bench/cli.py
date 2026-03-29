@@ -94,7 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         "shootout",
         help="Compare a script running with real geopandas vs vibespatial",
     )
-    p_shootout.add_argument("script", type=Path, help="Python script using geopandas")
+    p_shootout.add_argument("script", type=Path, help="Python script or directory of scripts")
     p_shootout.add_argument("--repeat", type=int, default=3, help="Number of timed runs (default: 3)")
     p_shootout.add_argument("--no-warmup", action="store_true", help="Skip warmup run")
     p_shootout.add_argument(
@@ -105,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         "--with", action="append", dest="extra_deps",
         help="Extra pip dep for the geopandas env (can repeat)",
     )
+    p_shootout.add_argument("--scale", type=str, default=None, help="Data scale for scripts (e.g. 1000, 10K, 1M)")
     p_shootout.add_argument("--timeout", type=int, default=300, help="Per-run timeout in seconds (default: 300)")
     p_shootout.add_argument("--json", action="store_true", dest="json_output")
     p_shootout.add_argument("--quiet", action="store_true")
@@ -509,24 +510,47 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
     from .output import render_shootout
     from .shootout import run_shootout
 
-    script = args.script.resolve()
-    if not script.is_file():
-        print(f"Error: script not found: {script}", file=sys.stderr)
+    target = args.script.resolve()
+
+    # Collect script(s) to run
+    if target.is_dir():
+        scripts = sorted(p for p in target.glob("*.py") if not p.name.startswith("_"))
+        if not scripts:
+            print(f"Error: no .py files found in {target}", file=sys.stderr)
+            return 1
+    elif target.is_file():
+        scripts = [target]
+    else:
+        print(f"Error: script not found: {target}", file=sys.stderr)
         return 1
 
-    result = run_shootout(
-        script,
-        repeat=args.repeat,
-        warmup=not args.no_warmup,
-        extra_deps=args.extra_deps,
-        baseline_python=args.baseline_python,
-        timeout=args.timeout,
-        quiet=args.quiet,
-    )
+    mode = _output_mode(args)
+    all_failed = 0
+    texts: list[str] = []
 
-    text = render_shootout(result, mode=_output_mode(args))
+    for script in scripts:
+        result = run_shootout(
+            script,
+            repeat=args.repeat,
+            warmup=not args.no_warmup,
+            extra_deps=args.extra_deps,
+            baseline_python=args.baseline_python,
+            timeout=args.timeout,
+            quiet=args.quiet,
+            scale=args.scale,
+        )
+        texts.append(render_shootout(result, mode=mode))
+        if result.status != "pass":
+            all_failed += 1
+
+    separator = "\n" if mode == "json" else "\n\n"
+    text = separator.join(texts)
+
+    if len(scripts) > 1 and mode == "human":
+        text += f"\n\n{'─' * 60}\n{len(scripts)} scripts, {len(scripts) - all_failed} passed, {all_failed} failed"
+
     _write_output(text, args.output)
-    return 0 if result.status == "pass" else 1
+    return 1 if all_failed else 0
 
 
 if __name__ == "__main__":

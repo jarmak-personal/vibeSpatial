@@ -476,7 +476,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.overlay.dissolve import union_all_gpu
         return union_all_gpu(self._owned, grid_size=grid_size)
 
-    def buffer(self, distance, resolution=16, **kwargs):
+    def buffer(self, distance, quad_segs=None, **kwargs):
         """Buffer -- routes through owned dispatch with GPU kernel when possible."""
         from vibespatial.runtime import ExecutionMode
         from vibespatial.runtime.dispatch import record_dispatch_event
@@ -485,10 +485,28 @@ class DeviceGeometryArray(ExtensionArray):
         if isinstance(distance, pd.Series):
             distance = np.asarray(distance)
 
-        cap_style = kwargs.get("cap_style", "round")
-        join_style = kwargs.get("join_style", "round")
-        mitre_limit = float(kwargs.get("mitre_limit", 5.0))
-        single_sided = bool(kwargs.get("single_sided", False))
+        # Reconcile quad_segs / resolution (deprecated alias)
+        if "resolution" in kwargs:
+            if quad_segs is not None:
+                raise ValueError(
+                    "`buffer` received both `quad_segs` and `resolution` but these are "
+                    "aliases for the same parameter. Use `quad_segs` only instead."
+                )
+            import warnings
+            warnings.warn(
+                "The `resolution` argument to `buffer` is deprecated, `quad_segs` "
+                "should be used instead to align with shapely.",
+                category=DeprecationWarning,
+                stacklevel=4,
+            )
+            quad_segs = kwargs.pop("resolution")
+        if quad_segs is None:
+            quad_segs = 16
+
+        cap_style = kwargs.pop("cap_style", "round")
+        join_style = kwargs.pop("join_style", "round")
+        mitre_limit = float(kwargs.pop("mitre_limit", 5.0))
+        single_sided = bool(kwargs.pop("single_sided", False))
 
         # Route via owned metadata -- no Shapely materialization for classification
         owned = self._owned
@@ -514,7 +532,7 @@ class DeviceGeometryArray(ExtensionArray):
 
                 try:
                     result = point_buffer_owned_array(
-                        owned, distance, quad_segs=resolution,
+                        owned, distance, quad_segs=quad_segs,
                     )
                     record_dispatch_event(
                         surface="DeviceGeometryArray.buffer",
@@ -538,7 +556,7 @@ class DeviceGeometryArray(ExtensionArray):
                 try:
                     result = linestring_buffer_owned_array(
                         owned, distance,
-                        quad_segs=resolution,
+                        quad_segs=quad_segs,
                         cap_style=cap_style,
                         join_style=join_style,
                         mitre_limit=mitre_limit,
@@ -565,7 +583,7 @@ class DeviceGeometryArray(ExtensionArray):
                 try:
                     result = polygon_buffer_owned_array(
                         owned, distance,
-                        quad_segs=resolution,
+                        quad_segs=quad_segs,
                         join_style=join_style,
                         mitre_limit=mitre_limit,
                     )
@@ -595,7 +613,10 @@ class DeviceGeometryArray(ExtensionArray):
         )
         shapely_geoms = self._owned.to_shapely()
         result = shapely.buffer(
-            shapely_geoms, distance, quad_segs=resolution, **kwargs
+            shapely_geoms, distance, quad_segs=quad_segs,
+            cap_style=cap_style, join_style=join_style,
+            mitre_limit=mitre_limit, single_sided=single_sided,
+            **kwargs,
         )
         record_dispatch_event(
             surface="DeviceGeometryArray.buffer",

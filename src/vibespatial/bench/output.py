@@ -373,6 +373,13 @@ def _shootout_status(run: Any) -> str:
     return "ERR" if run.error else "OK"
 
 
+def _fingerprint_label(result: Any) -> str | None:
+    fp = result.metadata.get("fingerprint")
+    if not fp:
+        return None
+    return "MATCH" if fp == "match" else "MISMATCH"
+
+
 def _render_shootout_quiet(result: Any) -> str:
     status = "PASS" if result.status == "pass" else "ERR"
     parts = [
@@ -384,6 +391,9 @@ def _render_shootout_quiet(result: Any) -> str:
     ]
     if result.speedup is not None:
         parts.append(f"speedup={result.speedup:.1f}x")
+    fp = _fingerprint_label(result)
+    if fp:
+        parts.append(f"fingerprint={fp}")
     return " ".join(parts)
 
 
@@ -410,6 +420,9 @@ def _render_shootout_plain(result: Any) -> str:
         lines.append(f"  Speedup: {result.speedup:.2f}x (vibespatial is {label})")
     else:
         lines.append("  Speedup: N/A")
+    fp = _fingerprint_label(result)
+    if fp:
+        lines.append(f"  Fingerprint: {fp}")
     return "\n".join(lines)
 
 
@@ -452,6 +465,15 @@ def _render_shootout_rich(result: Any) -> str:
         table.add_row(
             "Speedup",
             f"[{style}]{result.speedup:.2f}x[/] ({label})",
+            "", "", "", "",
+        )
+
+    fp = _fingerprint_label(result)
+    if fp:
+        fp_style = "bold green" if fp == "MATCH" else "bold red"
+        table.add_row(
+            "Fingerprint",
+            f"[{fp_style}]{fp}[/]",
             "", "", "", "",
         )
 
