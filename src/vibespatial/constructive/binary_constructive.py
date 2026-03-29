@@ -37,6 +37,7 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
+    materialize_broadcast,
     tile_single_row,
 )
 from vibespatial.runtime._runtime import ExecutionMode
@@ -739,7 +740,8 @@ def binary_constructive_owned(
     # only replicates the tiny metadata arrays (validity, tags,
     # family_row_offsets) and shares the coordinate buffers, so this is
     # O(N) in int8/int32/bool, not O(N * vertex_count) in fp64.
-    if workload is WorkloadShape.BROADCAST_RIGHT:
+    is_broadcast = workload is WorkloadShape.BROADCAST_RIGHT
+    if is_broadcast:
         right = tile_single_row(right, left.row_count)
 
     if left.row_count == 0:
@@ -755,10 +757,17 @@ def binary_constructive_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=left.row_count,
         requested_mode=effective_mode,
+        workload_shape=workload,
     )
 
     gpu_attempted = False
     if selection.selected is ExecutionMode.GPU:
+        # Broadcast-right tiles share coordinate buffers (family
+        # row_count == 1) which GPU kernels cannot index by global row.
+        # Materialize physically replicated coordinate buffers so that
+        # family row_count == n, enabling direct kernel indexing.
+        if is_broadcast:
+            right = materialize_broadcast(right)
         # ADR-0002: CONSTRUCTIVE kernels stay fp64.  precision_plan is
         # computed for observability (dispatch event detail) only; the
         # overlay and PIP kernels manage their own precision internally.

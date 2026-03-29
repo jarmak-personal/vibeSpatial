@@ -5,7 +5,7 @@ Scope: Dual fp32/fp64 compute strategy, runtime precision dispatch, and canonica
 Read If: You are designing kernel arithmetic, precision selection, or numerical policy.
 STOP IF: Your task already has a settled precision plan and only needs implementation detail.
 Source Of Truth: Phase-1 precision dispatch policy before owned kernel expansion.
-Body Budget: 105/240 lines
+Body Budget: 110/240 lines
 Document: docs/architecture/precision.md
 
 Section Map (Body Lines)
@@ -19,10 +19,10 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-47 | Canonical Rule |
 | 48-55 | Precision Modes |
-| 56-62 | Kernel Classes |
-| 63-79 | Default Policy |
-| 80-95 | What Staged fp32 Means |
-| 96-105 | Buffer And Signature Implications |
+| 56-67 | Kernel Classes |
+| 68-84 | Default Policy |
+| 85-100 | What Staged fp32 Means |
+| 101-110 | Buffer And Signature Implications |
 DOC_HEADER:END -->
 
 Use dual compute precision with one canonical storage precision.
@@ -81,9 +81,14 @@ partitioning.
 ## Kernel Classes
 
 - `coarse`: bounds, simple filters, sort keys, and other cheap geometry-local work
-- `metric`: area, length, centroid-like reductions, and other accumulation-heavy kernels
+- `metric`: area, length, and other accumulation-heavy kernels
 - `predicate`: orientation tests, point-in-polygon, binary predicates, and exact-refine pipelines
-- `constructive`: clip, intersection, union, difference, and other geometry-producing kernels
+- `constructive`: clip, intersection, union, difference, centroid, and other geometry-producing kernels
+
+Note: centroid was reclassified from `metric` to `constructive` because the
+shoelace formula computes coordinate products (x[i]*y[i+1] - x[i+1]*y[i])
+whose magnitude scales with the square of absolute coordinates. This requires
+fp64 on the constructive path rather than compensated fp32 accumulation.
 
 ## Default Policy
 

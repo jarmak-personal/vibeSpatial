@@ -357,6 +357,49 @@ def _compile_segmented_reduce(
     )
 
 
+class _BinarySearchAdapter:
+    """Wrap a CCCL _BinarySearch callable to match the temp-storage calling
+    convention used by the precompiled primitive call-sites.
+
+    CCCL ``make_lower_bound`` / ``make_upper_bound`` return callables with
+    signature ``(d_data, d_values, d_out, comp, num_items, num_values)``.
+    The precompiled call-sites in ``cccl_primitives.py`` expect the
+    ``(temp_storage, d_data, d_values, d_out, num_items, num_values)``
+    pattern shared by scan/reduce/sort families.  This adapter bridges the
+    gap so both the fresh-compile and disk-cache paths expose the same
+    interface.
+
+    Binary search has no temp storage requirement, so the ``temp_storage``
+    argument is accepted but ignored (returning ``1`` when ``None`` for the
+    query convention).
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    @property
+    def build_result(self) -> Any:
+        """Proxy ``build_result`` for disk-cache serialisation."""
+        return self._inner.build_result
+
+    def __call__(
+        self,
+        temp_storage: Any,
+        d_data: Any,
+        d_values: Any,
+        d_out: Any,
+        num_items: int,
+        num_values: int,
+        stream: Any = None,
+    ) -> int:
+        if temp_storage is None:
+            return 1  # Binary search needs no temp storage.
+        self._inner(d_data, d_values, d_out, None, num_items, num_values, stream)
+        return 0
+
+
 def _compile_lower_bound(
     spec: CCCLWarmupSpec, cp_module: Any, algorithms: Any,
 ) -> PrecompiledPrimitive:
@@ -365,14 +408,16 @@ def _compile_lower_bound(
     d_query = cp_module.empty(_N, dtype=spec.key_dtype)
     d_out = cp_module.empty(_N, dtype=np.uintp)
     t0 = perf_counter()
-    callable_obj = make_fn(d_sorted, d_query, d_out)
-    temp_bytes = callable_obj(None, d_sorted, d_query, d_out, _N, _N)
-    temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
-    d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
+    raw_callable = make_fn(d_sorted, d_query, d_out)
+    # Validate the compiled callable by executing it once.
+    raw_callable(d_sorted, d_query, d_out, None, _N, _N)
     elapsed = (perf_counter() - t0) * 1000.0
+    # Wrap so the call-site can use the temp-storage calling convention.
+    adapted = _BinarySearchAdapter(raw_callable)
+    d_temp = cp_module.empty(1, dtype=cp_module.uint8)
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
+        name=spec.name, make_callable=adapted,
+        temp_storage=d_temp, temp_storage_bytes=1,
         high_water_n=_N, warmup_ms=elapsed,
     )
 
@@ -385,14 +430,16 @@ def _compile_upper_bound(
     d_query = cp_module.empty(_N, dtype=spec.key_dtype)
     d_out = cp_module.empty(_N, dtype=np.uintp)
     t0 = perf_counter()
-    callable_obj = make_fn(d_sorted, d_query, d_out)
-    temp_bytes = callable_obj(None, d_sorted, d_query, d_out, _N, _N)
-    temp_bytes = max(int(temp_bytes) if temp_bytes else 1, 1)
-    d_temp = cp_module.empty(temp_bytes, dtype=cp_module.uint8)
+    raw_callable = make_fn(d_sorted, d_query, d_out)
+    # Validate the compiled callable by executing it once.
+    raw_callable(d_sorted, d_query, d_out, None, _N, _N)
     elapsed = (perf_counter() - t0) * 1000.0
+    # Wrap so the call-site can use the temp-storage calling convention.
+    adapted = _BinarySearchAdapter(raw_callable)
+    d_temp = cp_module.empty(1, dtype=cp_module.uint8)
     return PrecompiledPrimitive(
-        name=spec.name, make_callable=callable_obj,
-        temp_storage=d_temp, temp_storage_bytes=temp_bytes,
+        name=spec.name, make_callable=adapted,
+        temp_storage=d_temp, temp_storage_bytes=1,
         high_water_n=_N, warmup_ms=elapsed,
     )
 

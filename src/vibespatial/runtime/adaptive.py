@@ -22,6 +22,7 @@ from .precision import (
     select_precision_plan,
 )
 from .residency import Residency
+from .workload import WorkloadShape
 
 
 class MonitoringBackend(StrEnum):
@@ -69,6 +70,7 @@ class WorkloadProfile:
     is_streaming: bool = False
     chunk_index: int = 0
     avg_vertices_per_geometry: float = 0.0
+    workload_shape: WorkloadShape | None = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +281,7 @@ def plan_adaptive_execution(
         row_count=workload.row_count,
         policy=crossover_policy,
         gpu_available=snapshot.gpu_available,
+        workload_shape=workload.workload_shape,
     )
 
     if initial_runtime.requested is ExecutionMode.AUTO and dispatch_decision is DispatchDecision.CPU:
@@ -428,6 +431,7 @@ def plan_kernel_dispatch(
     is_streaming: bool = False,
     chunk_index: int = 0,
     gpu_available: bool | None = None,
+    workload_shape: WorkloadShape | None = None,
 ) -> AdaptivePlan:
     """Plan kernel dispatch with a cached device snapshot.
 
@@ -463,6 +467,7 @@ def plan_kernel_dispatch(
         coordinate_stats=coordinate_stats,
         is_streaming=is_streaming,
         chunk_index=chunk_index,
+        workload_shape=workload_shape,
     )
     return plan_adaptive_execution(
         kernel_name=kernel_name,
@@ -481,6 +486,7 @@ def plan_dispatch_selection(
     row_count: int,
     requested_mode: ExecutionMode | str = ExecutionMode.AUTO,
     gpu_available: bool | None = None,
+    workload_shape: WorkloadShape | None = None,
 ) -> RuntimeSelection:
     """Thin wrapper: plan dispatch and return just the RuntimeSelection."""
     return plan_kernel_dispatch(
@@ -489,6 +495,7 @@ def plan_dispatch_selection(
         row_count=row_count,
         requested_mode=requested_mode,
         gpu_available=gpu_available,
+        workload_shape=workload_shape,
     ).runtime_selection
 
 

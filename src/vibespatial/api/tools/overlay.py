@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import warnings
 
 import numpy as np
@@ -21,6 +22,8 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
+logger = logging.getLogger(__name__)
+
 
 def _extract_owned_pair(df1, df2):
     """Return (left_owned, right_owned) if both DataFrames have owned backing, else (None, None)."""
@@ -31,6 +34,260 @@ def _extract_owned_pair(df1, df2):
     if left_owned is not None and right_owned is not None:
         return left_owned, right_owned
     return None, None
+
+
+# ---- Memory estimation for overlay difference GPU guard ----
+#
+# The overlay difference owned path gathers all right-side polygons by pair
+# index, then runs segmented union + element-wise difference on GPU.  At
+# large scale (100K+ rows) the gathered right array can exceed VRAM.
+#
+# Safety factor: the gathered array is only the first allocation.
+# Segmented union and difference each need comparable working memory.
+# Use 3x to account for the full pipeline.
+
+# ---- Batched overlay difference constants ----
+#
+# When the number of spatial-join pairs exceeds what fits in VRAM, process
+# groups of left geometries in batches.  Each batch gathers only its own
+# right-side pairs, runs segmented union + pairwise difference, then frees
+# intermediate memory before the next batch.
+#
+# VRAM_BUDGET_FRACTION: fraction of *free* device memory to use for a single
+# batch's gathered right array.  Conservative because segmented_union and
+# binary_constructive each allocate comparable working memory.
+_VRAM_BUDGET_FRACTION = 0.3
+# MIN_GROUPS_PER_BATCH: lower bound to avoid pathological per-group dispatch
+# overhead when groups are very large.
+_MIN_GROUPS_PER_BATCH = 64
+# MAX_GROUPS_PER_BATCH: upper bound; larger batches reduce dispatch overhead
+# but risk OOM on skewed group-size distributions.
+_MAX_GROUPS_PER_BATCH = 10_000
+# PAIR_THRESHOLD: below this total pair count, skip batching entirely (the
+# unbatched path is faster due to fewer dispatch overheads).
+_PAIR_THRESHOLD = 200_000
+
+
+def _estimate_bytes_per_pair(right_owned) -> int:
+    """Estimate average device bytes consumed per gathered right-side pair.
+
+    The dominant cost is the coordinate buffers (x, y as float64) plus
+    offset arrays (geometry_offsets, part_offsets, ring_offsets as int32)
+    and per-row metadata (validity, tags, family_row_offsets).
+
+    We estimate from the *source* right_owned array: total family buffer
+    bytes / row_count gives average bytes per row.  Since ``take`` gathers
+    by duplicating rows, each pair costs approximately one row.
+    """
+    try:
+        total_bytes = 0
+        n_rows = max(right_owned.row_count, 1)
+        # Per-row metadata overhead (validity: bool, tag: int8, fro: int32)
+        total_bytes += 6 * n_rows  # 1 + 1 + 4
+        for buf in right_owned.families.values():
+            total_bytes += buf.x.nbytes + buf.y.nbytes
+            total_bytes += buf.geometry_offsets.nbytes
+            if buf.empty_mask is not None:
+                total_bytes += buf.empty_mask.nbytes
+            if hasattr(buf, 'part_offsets') and buf.part_offsets is not None:
+                total_bytes += buf.part_offsets.nbytes
+            if hasattr(buf, 'ring_offsets') and buf.ring_offsets is not None:
+                total_bytes += buf.ring_offsets.nbytes
+        return max(total_bytes // n_rows, 64)  # floor at 64 bytes
+    except Exception:
+        return 256  # conservative default
+
+
+def _compute_batch_groups(
+    h_group_offsets: np.ndarray,
+    total_pairs: int,
+    right_owned,
+) -> int:
+    """Determine how many groups to process per batch.
+
+    Uses ``cupy.cuda.Device().mem_info`` to query free VRAM and
+    ``_estimate_bytes_per_pair`` for per-pair cost.  Returns the number
+    of groups per batch, clamped to [_MIN_GROUPS_PER_BATCH,
+    _MAX_GROUPS_PER_BATCH].
+
+    If VRAM query fails or the total pair count is below
+    _PAIR_THRESHOLD, returns n_groups (process everything in one batch).
+    """
+    n_groups = len(h_group_offsets) - 1
+    if total_pairs < _PAIR_THRESHOLD:
+        return n_groups  # single-batch fast path
+
+    try:
+        import cupy
+        free_bytes, _total = cupy.cuda.Device().mem_info
+    except Exception:
+        return n_groups  # cannot query VRAM; single-batch fallback
+
+    bytes_per_pair = _estimate_bytes_per_pair(right_owned)
+    # Budget: fraction of free VRAM for the gathered right array
+    budget_bytes = int(free_bytes * _VRAM_BUDGET_FRACTION)
+    if budget_bytes <= 0:
+        budget_bytes = 256 * 1024 * 1024  # 256 MiB absolute floor
+
+    max_pairs_per_batch = max(budget_bytes // bytes_per_pair, 1)
+
+    # Average pairs per group to convert pair budget -> group budget
+    avg_pairs = max(total_pairs / max(n_groups, 1), 1.0)
+    groups_per_batch = int(max_pairs_per_batch / avg_pairs)
+    groups_per_batch = max(groups_per_batch, _MIN_GROUPS_PER_BATCH)
+    groups_per_batch = min(groups_per_batch, _MAX_GROUPS_PER_BATCH)
+
+    # If the computed batch already covers all groups, use single batch
+    if groups_per_batch >= n_groups:
+        return n_groups
+
+    return groups_per_batch
+
+
+def _batched_overlay_difference_owned(
+    left_owned,
+    right_owned,
+    idx1,
+    idx2,
+    d_idx1,
+    d_idx2,
+    _has_device_indices: bool,
+    _pairwise_mode,
+):
+    """Process overlay difference in VRAM-safe batches.
+
+    Splits the unique left indices into batches, and for each batch:
+      1. Gathers the right-side pairs for that batch of groups
+      2. Runs segmented union on the gathered right geometries
+      3. Runs pairwise difference (left_sub - right_unions)
+      4. Frees intermediates before the next batch
+
+    Returns (diff_owned, idx1_unique) ready for concat_owned_scatter.
+    """
+    from vibespatial.constructive.binary_constructive import (
+        binary_constructive_owned,
+    )
+    from vibespatial.kernels.constructive.segmented_union import (
+        _concat_owned_arrays,
+        segmented_union_all,
+    )
+
+    xp = np
+    if hasattr(idx1, "__cuda_array_interface__"):
+        try:
+            import cupy
+            xp = cupy
+        except ImportError:
+            pass
+
+    # --- Compute group structure (unique left indices + group offsets) ---
+    idx1_unique, idx1_split_at = xp.unique(idx1, return_index=True)
+    group_offsets_full = xp.concatenate(
+        [idx1_split_at, xp.asarray([len(idx2)])]
+    )
+
+    # Bring group structure to host for batch slicing.  These are small
+    # metadata arrays (n_groups + 1 elements), so the D->H cost is trivial.
+    h_group_offsets = np.asarray(group_offsets_full)
+    h_idx1_unique = np.asarray(idx1_unique)
+    n_groups = len(h_idx1_unique)
+    total_pairs = int(h_group_offsets[-1])
+
+    # Decide batch size
+    groups_per_batch = _compute_batch_groups(
+        h_group_offsets, total_pairs, right_owned,
+    )
+
+    # --- Single-batch fast path (original code, no overhead) ---
+    if groups_per_batch >= n_groups:
+        if _has_device_indices:
+            right_gathered = right_owned.device_take(d_idx2)
+        else:
+            right_gathered = right_owned.take(idx2)
+
+        right_unions_owned = segmented_union_all(right_gathered, group_offsets_full)
+        left_sub = left_owned.take(idx1_unique)
+        diff_owned = binary_constructive_owned(
+            "difference", left_sub, right_unions_owned,
+            dispatch_mode=_pairwise_mode,
+        )
+        return diff_owned, idx1_unique
+
+    # --- Multi-batch path ---
+    logger.info(
+        "overlay difference: batching %d groups into batches of %d "
+        "(total_pairs=%d, budget_frac=%.1f%%)",
+        n_groups, groups_per_batch, total_pairs,
+        _VRAM_BUDGET_FRACTION * 100,
+    )
+
+    # We need host-side idx2 for slicing.  If indices are on device,
+    # bring idx2 to host (one transfer for the full array — unavoidable
+    # for per-batch slicing, but we slice *groups* not individual pairs).
+    h_idx2 = np.asarray(idx2)
+
+    batch_results = []
+    batch_unique_indices = []
+
+    for batch_start in range(0, n_groups, groups_per_batch):
+        batch_end = min(batch_start + groups_per_batch, n_groups)
+
+        # Pair range for this batch of groups
+        pair_start = int(h_group_offsets[batch_start])
+        pair_end = int(h_group_offsets[batch_end])
+        batch_n_pairs = pair_end - pair_start
+
+        if batch_n_pairs == 0:
+            continue
+
+        # Free cached pool memory before each batch
+        try:
+            from vibespatial.cuda._runtime import get_cuda_runtime
+            get_cuda_runtime().free_pool_memory()
+        except Exception:
+            pass
+
+        # Gather right geometries for this batch only
+        batch_idx2 = h_idx2[pair_start:pair_end]
+        right_gathered = right_owned.take(batch_idx2)
+
+        # Build local group offsets for this batch (0-based)
+        batch_group_starts = h_group_offsets[batch_start:batch_end + 1] - pair_start
+        batch_group_offsets = np.asarray(batch_group_starts, dtype=np.int64)
+
+        # Segmented union: one union per group in this batch
+        right_unions = segmented_union_all(right_gathered, batch_group_offsets)
+        del right_gathered  # free gathered array before difference
+
+        # Take the corresponding left geometries
+        batch_left_indices = h_idx1_unique[batch_start:batch_end]
+        left_sub = left_owned.take(batch_left_indices)
+
+        # Pairwise difference
+        batch_diff = binary_constructive_owned(
+            "difference", left_sub, right_unions,
+            dispatch_mode=_pairwise_mode,
+        )
+        del right_unions, left_sub  # free intermediates
+
+        batch_results.append(batch_diff)
+        batch_unique_indices.append(batch_left_indices)
+
+    # Concatenate all batch results
+    if len(batch_results) == 0:
+        # Edge case: all batches were empty (shouldn't happen, but be safe)
+        from vibespatial.geometry.owned import from_shapely_geometries
+        diff_owned = from_shapely_geometries([])
+        all_unique = np.array([], dtype=np.int64)
+    elif len(batch_results) == 1:
+        diff_owned = batch_results[0]
+        all_unique = batch_unique_indices[0]
+    else:
+        diff_owned = _concat_owned_arrays(batch_results)
+        all_unique = np.concatenate(batch_unique_indices)
+
+    # Return in the same format as idx1_unique (host numpy)
+    return diff_owned, all_unique
 
 
 def _make_valid_geoseries(gs):
@@ -417,7 +674,6 @@ def _many_vs_one_intersection_owned(
     # remainder without SH clip -> complex_result (in complex order)
     from vibespatial.geometry.owned import OwnedGeometryArray
 
-    parts_to_concat: list[OwnedGeometryArray] = []
     # Track (global_indices, oga) for each chunk to enable correct ordering.
     index_oga_pairs: list[tuple[np.ndarray, OwnedGeometryArray]] = []
 
@@ -666,7 +922,7 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                     left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
                     right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
                     intersections = GeoSeries(
-                        shapely.intersection(left_shapely, right_shapely),  # CPU-only mode
+                        shapely.intersection(left_shapely, right_shapely),
                         crs=df1.crs,
                     )
 
@@ -786,15 +1042,10 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     # the union step when the segmented_union_all GPU kernel is available.
     # Phase 18: uses concat_owned_scatter to keep the result device-resident
     # instead of materializing via to_shapely().
+    #
     if idx1.size > 0 and left_owned is not None and right_owned is not None:
         try:
-            from vibespatial.constructive.binary_constructive import (
-                binary_constructive_owned,
-            )
             from vibespatial.geometry.owned import concat_owned_scatter
-            from vibespatial.kernels.constructive.segmented_union import (
-                segmented_union_all,
-            )
 
             # AUTO dispatch, not forced GPU.  The GPU polygon_intersection
             # kernel has a systematic validity-bitmap bug (~26% of results
@@ -806,36 +1057,18 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             #       validity bitmap is fixed.
             _pairwise_mode = ExecutionMode.AUTO
 
-            # Phase 2 zero-copy: pass CuPy device arrays directly to
-            # device_take() when available, eliminating H→D re-upload.
-            if _has_device_indices:
-                right_gathered = right_owned.device_take(d_idx2)
-            else:
-                right_gathered = right_owned.take(idx2)
-
-            # Build group offsets from the sorted idx1 split points.
-            # Use the same array library as the indices to avoid D→H
-            # transfers when indices are already on device (Phase 3).
-            xp = np
-            if hasattr(idx1, "__cuda_array_interface__"):
-                try:
-                    import cupy
-                    xp = cupy
-                except ImportError:
-                    pass
-            idx1_unique, idx1_split_at = xp.unique(idx1, return_index=True)
-            group_offsets = xp.concatenate([idx1_split_at, xp.asarray([len(idx2)])])
-
-            # GPU segmented union: one union per left geometry's neighbors.
-            right_unions_owned = segmented_union_all(
-                right_gathered, group_offsets,
-            )
-
-            # GPU difference: left[unique] - union(right_neighbors[unique]).
-            left_sub = left_owned.take(idx1_unique)
-            diff_owned = binary_constructive_owned(
-                "difference", left_sub, right_unions_owned,
-                dispatch_mode=_pairwise_mode,
+            # Batched overlay difference: splits groups into VRAM-safe
+            # batches to prevent OOM at large scale (100K+).  At small
+            # scale the fast path processes everything in a single batch.
+            diff_owned, idx1_unique = _batched_overlay_difference_owned(
+                left_owned,
+                right_owned,
+                idx1,
+                idx2,
+                d_idx1,
+                d_idx2,
+                _has_device_indices,
+                _pairwise_mode,
             )
 
             # Assemble full result: scatter differenced rows into the

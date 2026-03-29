@@ -25,7 +25,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-27.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 123  # +1 false-positive dict.get() in io/geojson_gpu, io/wkt_gpu loops
+_VIOLATION_BASELINE = 45  # false positives eliminated 2026-03-29: dict.get(), np.asarray H2D
 # +3 intentional batch D->H in segment_primitives (OOM prevention)
 # +4 materialization D->H in dbf_gpu (DataFrame construction)
 # +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)
@@ -99,16 +99,50 @@ def _call_name(node: ast.Call) -> str | None:
 
 def _is_d2h_call(node: ast.Call) -> bool:
     name = _call_name(node)
-    return name in D2H_APIS
+    if name not in D2H_APIS:
+        return False
+    # --- Disambiguate dict.get() from cupy_array.get() ---
+    # cupy.ndarray.get() signature: get(stream=None, order='C', out=None)
+    #   → 0 positional args in normal usage, or keyword args only.
+    # dict.get() signature: get(key[, default])
+    #   → always has >=1 positional arg.
+    #
+    # Rule: if .get() has any positional args, it's dict.get() (not D2H).
+    # cupy .get() is only called with 0 positional args (keyword-only).
+    if name == "get" and isinstance(node.func, ast.Attribute) and node.args:
+        return False  # dict.get(key), dict.get(key, default), etc.
+    # --- Disambiguate pyarrow.to_pylist() from cupy.to_pylist() ---
+    # to_pylist() on pyarrow arrays is host-to-host, not D2H.
+    # Heuristic: if the method is to_pylist and the call chain involves
+    # .field(), .column(), or the receiver looks like an Arrow type, skip it.
+    if name == "to_pylist" and isinstance(node.func, ast.Attribute):
+        # Check if the receiver is a result of .field() or .column() call
+        if isinstance(node.func.value, ast.Call):
+            inner = node.func.value
+            if isinstance(inner.func, ast.Attribute) and inner.func.attr in (
+                "field", "column", "to_pandas", "to_pydict",
+            ):
+                return False
+    return True
 
 
 def _is_h2d_call(node: ast.Call) -> bool:
     name = _call_name(node)
-    if name in H2D_APIS:
-        return True
+    if name not in H2D_APIS:
+        return False
+    # Only count as H2D if the receiver is a device module (cp/cupy).
+    # np.asarray() and np.array() are host-to-host — NOT H2D transfers.
     if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-        if node.func.value.id in H2D_MODULES and node.func.attr in H2D_APIS:
-            return True
+        receiver = node.func.value.id
+        if receiver in H2D_MODULES:
+            return True  # cp.asarray(), cupy.array() — real H2D
+        if receiver in ("np", "numpy"):
+            return False  # np.asarray() — host-to-host, not H2D
+        # Other receivers (e.g. torch.asarray) — flag conservatively
+        return True
+    # Bare function call (e.g. asarray() without module prefix) — flag it
+    if isinstance(node.func, ast.Name) and name in H2D_APIS:
+        return True
     return False
 
 

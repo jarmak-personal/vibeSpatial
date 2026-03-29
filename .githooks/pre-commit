@@ -26,6 +26,9 @@ uv run python scripts/check_perf_patterns.py --all
 printf "pre-commit: checking maintainability...\n"
 uv run python scripts/check_maintainability.py --all
 
+printf "pre-commit: checking import guards (numpy/shapely in GPU paths)...\n"
+uv run python scripts/check_import_guard.py --all
+
 # ===========================================================================
 # Tier 2: AI review reminder
 #

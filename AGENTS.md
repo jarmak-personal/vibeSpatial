@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 242/260 lines
+Body Budget: 244/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -20,11 +20,11 @@ Section Map (Body Lines)
 | 39-47 | Mission |
 | 48-57 | Startup |
 | 58-79 | Routing |
-| 80-105 | Project Shape |
-| 106-123 | Execution Model |
-| 124-135 | Test Strategy |
-| 136-145 | Build And Tooling |
-| 146-163 | Verification |
+| 80-106 | Project Shape |
+| 107-124 | Execution Model |
+| 125-136 | Test Strategy |
+| 137-146 | Build And Tooling |
+| 147-165 | Verification |
 | ... | (4 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -126,6 +126,7 @@ against a single corridor or boundary polygon), route to:
 - `scripts/check_zero_copy.py`: zero-copy device transfer enforcement (ZCOPY001-003).
 - `scripts/check_perf_patterns.py`: performance anti-pattern detection (VPAT001-004).
 - `scripts/check_maintainability.py`: intake discoverability enforcement (MAINT001-003).
+- `scripts/check_import_guard.py`: numpy/shapely import guard for GPU-path modules (IGRD001-002).
 - `src/geopandas/`: local GeoPandas-compatible package surface owned by this repo.
 - `src/vibespatial/api/`: public API dispatch boundary for GeoPandas-facing methods.
 - `src/vibespatial/kernels/`: scaffolded owned kernel modules and variant manifest.
@@ -182,6 +183,7 @@ Do not borrow cuSpatial architecture by default. Re-justify every design.
 - Zero-copy lint: `uv run python scripts/check_zero_copy.py --all`
 - Performance lint: `uv run python scripts/check_perf_patterns.py --all`
 - Maintainability lint: `uv run python scripts/check_maintainability.py --all`
+- Import guard lint: `uv run python scripts/check_import_guard.py --all`
 - Ruff lint: `uv run ruff check`
 - AI pre-land review: `/commit` (runs /pre-land-review automatically)
 - Upstream smoke: `uv run pytest tests/upstream/geopandas/tests/test_config.py`

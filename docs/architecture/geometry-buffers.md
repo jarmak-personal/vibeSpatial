@@ -5,7 +5,7 @@ Scope: Canonical owned geometry buffer schema for points, lines, polygons, and m
 Read If: You are designing adapters, kernels, or memory layout for owned geometry arrays.
 STOP IF: Your task already has a settled buffer schema and only needs implementation detail.
 Source Of Truth: Phase-2 owned geometry buffer layout contract.
-Body Budget: 131/260 lines
+Body Budget: 158/260 lines
 Document: docs/architecture/geometry-buffers.md
 
 Section Map (Body Lines)
@@ -23,7 +23,8 @@ Section Map (Body Lines)
 | 97-102 | Mixed-Geometry Integration |
 | 103-117 | Adapter Surface |
 | 118-124 | Offset Rules |
-| 125-131 | Execution Boundaries |
+| 125-151 | Indexed-View Pattern |
+| 152-158 | Execution Boundaries |
 DOC_HEADER:END -->
 
 Use separated fp64 coordinate buffers plus hierarchical offsets as the owned geometry core.
@@ -147,6 +148,33 @@ validation, buffer inspection, and later IO work to target.
 - Empty valid geometries use equal adjacent offsets.
 - Nullness is never encoded by offset shape.
 - `int32` is the default offset dtype for Phase 2; revisit only when measured scale requires wider offsets.
+
+## Indexed-View Pattern
+
+`OwnedGeometryArray` supports an indexed-view optimisation for operations
+that expand few unique geometries to many output rows (e.g., sjoin).
+
+- `_base`: the compact `OwnedGeometryArray` holding only unique rows.
+- `_index_map`: int64 array mapping each logical row to a `_base` row.
+- `is_indexed_view`: property returning `True` when `_base` and `_index_map`
+  are set.
+- `families` dict: shared by reference with `_base` (no coordinate copy).
+- `_resolve()`: materialises the view into a flat contiguous array by
+  physically gathering coordinates. Called automatically before kernel
+  dispatch (`_ensure_device_state`) and host materialisation
+  (`_ensure_host_state`). After resolution, `_base` and `_index_map` are
+  set to `None`.
+
+Threshold policy constants control when `take()` produces an indexed view
+instead of a physical copy:
+
+- `_INDEXED_VIEW_MIN_ROWS = 1000`: minimum output size to consider.
+- `_INDEXED_VIEW_RATIO_THRESHOLD = 0.5`: unique/total ratio below which
+  the indexed view is used.
+
+Stacking indexed views is prevented: if `self` is already an indexed view,
+`take()` composes the two index maps and builds a single view over the
+original physical base.
 
 ## Execution Boundaries
 

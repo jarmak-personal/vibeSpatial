@@ -571,12 +571,11 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attr
             crs = "OGC:CRS84"
 
         if col_metadata["encoding"] == "WKB":
-            from vibespatial.io.wkb import _decode_native_wkb
+            from vibespatial.io.wkb import decode_wkb_arrow_array_owned
 
             arrow_col = table[col].combine_chunks()
-            wkb_values = arrow_col.to_pylist()
             try:
-                owned, _plan = _decode_native_wkb(wkb_values)
+                owned = decode_wkb_arrow_array_owned(arrow_col)
                 geom_arr = GeometryArray.from_owned(owned, crs=crs)
             except (ValueError, NotImplementedError):
                 geom_arr = from_wkb(np.array(table[col]), crs=crs)

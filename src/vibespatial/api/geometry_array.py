@@ -272,6 +272,13 @@ def _is_scalar_geometry(geom) -> bool:
     return isinstance(geom, BaseGeometry)
 
 
+_FROM_SHAPELY_OWNED_THRESHOLD = 100
+"""Threshold for eagerly building OwnedGeometryArray after a Shapely-
+computed result (e.g. buffer fallback) that is likely to feed subsequent
+GPU operations.  Used in compute paths only — the ``from_shapely``
+constructor defers owned construction to ``to_owned()``."""
+
+
 def from_shapely(data, crs: CRS | None = None) -> GeometryArray:
     """
     Convert a list or array of shapely objects to a GeometryArray.
@@ -311,6 +318,10 @@ def from_shapely(data, crs: CRS | None = None) -> GeometryArray:
                 raise TypeError(f"Input must be valid geometry objects: {geom}")
         arr = np.array(out, dtype=object)
 
+    # Owned backing is constructed lazily on first GPU use via to_owned().
+    # This avoids spending ~2-8 ms per array on owned construction for
+    # write-only paths (e.g. to_parquet, to_file) that never need GPU
+    # dispatch.
     return GeometryArray(arr, crs=crs)
 
 
@@ -601,9 +612,14 @@ class GeometryArray(ExtensionArray):
         ):
             # special case of a full slice -> preserve the sindex
             # (to ensure view() preserves it as well)
-            result = GeometryArray(self._data[idx], crs=self.crs)
+            if self._owned is not None and self._shapely_data is None:
+                # Avoid triggering Shapely materialization for identity
+                # slice (e.g. pandas view() during DataFrame copy).
+                result = GeometryArray.from_owned(self._owned, crs=self.crs)
+            else:
+                result = GeometryArray(self._data[idx], crs=self.crs)
+                result._owned = self._owned
             result._sindex = self._sindex
-            result._owned = self._owned
             result._owned_flat_sindex = self._owned_flat_sindex
             result._owned_spatial_input_supported = self._owned_spatial_input_supported
             result._provenance = self._provenance
@@ -613,6 +629,14 @@ class GeometryArray(ExtensionArray):
         # validate and convert IntegerArray/BooleanArray
         # to numpy array, pass-through non-array-like indexers
         idx = pd.api.indexers.check_array_indexer(self, idx)
+
+        # Preserve _owned backing through partial indexing so that
+        # downstream GPU dispatches don't silently fall back to Shapely.
+        if self._owned is not None and isinstance(idx, np.ndarray):
+            int_indices = np.flatnonzero(idx) if idx.dtype == bool else idx
+            subset_owned = self._owned.take(int_indices)
+            return GeometryArray.from_owned(subset_owned, crs=self.crs)
+
         return GeometryArray(self._data[idx], crs=self.crs)
 
     def __setitem__(self, key, value):
@@ -694,7 +718,16 @@ class GeometryArray(ExtensionArray):
 
     def to_owned(self) -> OwnedGeometryArray:
         if self._owned is None:
-            self._owned = _to_owned_via_wkb(self._data)
+            # Prefer the fast vectorized builder (~2x faster than WKB
+            # round-trip) when Shapely data is available and all geometry
+            # types are supported.  Falls back to the WKB path for
+            # unsupported types (Multi*, GeometryCollection).
+            from vibespatial.geometry.owned import _from_shapely_vectorized
+
+            owned = _from_shapely_vectorized(self._data)
+            if owned is None:
+                owned = _to_owned_via_wkb(self._data)
+            self._owned = owned
         return self._owned
 
     def owned_flat_sindex(self):
@@ -1621,10 +1654,20 @@ class GeometryArray(ExtensionArray):
             selected=ExecutionMode.CPU,
         )
 
-        result = GeometryArray(
-            shapely.buffer(self._data, distance, quad_segs=quad_segs, **kwargs),
-            crs=self.crs,
-        )
+        buf_arr = shapely.buffer(self._data, distance, quad_segs=quad_segs, **kwargs)
+        result = GeometryArray(buf_arr, crs=self.crs)
+        # Eagerly build owned backing so downstream operations (dissolve,
+        # sjoin, clip) can dispatch to GPU instead of falling back to
+        # Shapely.  The vectorized builder is fast (~2 ms / 1 k polygons).
+        if len(buf_arr) >= _FROM_SHAPELY_OWNED_THRESHOLD:
+            from vibespatial.runtime import has_gpu_runtime
+
+            if has_gpu_runtime():
+                from vibespatial.geometry.owned import _from_shapely_vectorized
+
+                owned = _from_shapely_vectorized(buf_arr)
+                if owned is not None:
+                    result._owned = owned
         result._provenance = make_buffer_tag(self, distance, cap_style, join_style, single_sided, quad_segs)
         return result
 
@@ -2319,9 +2362,15 @@ class GeometryArray(ExtensionArray):
         # Owned-path: OwnedGeometryArray.take() operates at buffer level
         # without Shapely materialization.  Preserves DGA chain for downstream
         # dispatch (e.g., overlay intersection via binary_constructive_owned).
-        if self._owned is not None and not allow_fill:
-            result_owned = self._owned.take(np.asarray(indices))
-            return GeometryArray.from_owned(result_owned, crs=self.crs)
+        if self._owned is not None:
+            idx_arr = np.asarray(indices)
+            # When allow_fill is True, pandas uses -1 as the fill sentinel.
+            # If no indices are negative, no filling occurs and we can use
+            # the owned fast path to preserve GPU dispatch capability.
+            needs_fill = allow_fill and int(idx_arr.size) > 0 and bool(np.any(idx_arr < 0))
+            if not needs_fill:
+                result_owned = self._owned.take(idx_arr)
+                return GeometryArray.from_owned(result_owned, crs=self.crs)
 
         result = take(self._data, indices, allow_fill=allow_fill, fill_value=fill_value)
         if allow_fill and fill_value is None:

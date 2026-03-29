@@ -203,30 +203,41 @@ class DeviceGeometryArray(ExtensionArray):
 
     @property
     def geom_type(self) -> np.ndarray:
-        """Geometry type names from owned tags — no Shapely materialization."""
-        result = np.empty(len(self), dtype=object)
-        for i in range(len(self)):
-            tag = int(self._owned.tags[i])
-            if tag == NULL_TAG:
-                result[i] = None
-            else:
-                result[i] = _TAG_TO_GEOM_TYPE_NAME.get(tag)
+        """Geometry type names from owned tags — no Shapely materialization.
+
+        Uses vectorized numpy indexing instead of per-element Python loop
+        (VPAT001 compliance).
+        """
+        tags = self._owned.tags
+        result = np.empty(len(tags), dtype=object)
+        for tag_value, name in _TAG_TO_GEOM_TYPE_NAME.items():
+            result[tags == tag_value] = name
+        result[tags == NULL_TAG] = None
         return result
 
     @property
     def is_empty(self) -> np.ndarray:
-        """Per-geometry emptiness from owned empty_mask — no Shapely materialization."""
-        result = np.zeros(len(self), dtype=bool)
-        for i in range(len(self)):
-            tag = int(self._owned.tags[i])
-            if tag == NULL_TAG:
+        """Per-geometry emptiness from owned empty_mask — no Shapely materialization.
+
+        Uses vectorized numpy indexing per family instead of per-element
+        Python loop (VPAT001 compliance).
+        """
+        tags = self._owned.tags
+        offsets = self._owned.family_row_offsets
+        result = np.zeros(len(tags), dtype=bool)
+        for tag_value, family in TAG_FAMILIES.items():
+            if family not in self._owned.families:
                 continue
-            family = TAG_FAMILIES[tag]
-            if family in self._owned.families:
-                buf = self._owned.families[family]
-                family_row = int(self._owned.family_row_offsets[i])
-                if 0 <= family_row < len(buf.empty_mask):
-                    result[i] = bool(buf.empty_mask[family_row])
+            buf = self._owned.families[family]
+            mask = tags == tag_value
+            if not mask.any():
+                continue
+            family_rows = offsets[mask]
+            valid = (family_rows >= 0) & (family_rows < len(buf.empty_mask))
+            # Only index into empty_mask for valid family rows
+            family_result = np.zeros(mask.sum(), dtype=bool)
+            family_result[valid] = buf.empty_mask[family_rows[valid]]
+            result[mask] = family_result
         return result
 
     @property
@@ -516,9 +527,23 @@ class DeviceGeometryArray(ExtensionArray):
         if len(families) == 1 and all_valid and not single_sided:
             family = next(iter(families))
             buf = owned.families[family]
-            # Guard against device-resident stubs where empty_mask is zero-length
+            # Check for empties using whichever side is authoritative.
+            # Device-resident stubs have host_materialized=False with a
+            # zero-length empty_mask that cannot be trusted.  Query the
+            # device-side empty_mask instead so we don't pessimistically
+            # fall through to Shapely for every device-resident buffer call.
             if not buf.host_materialized:
-                has_empties = True  # conservative: can't trust stub metadata
+                try:
+                    import cupy as _cp
+
+                    ds = owned.device_state
+                    if ds is not None and family in ds.families:
+                        d_empty = ds.families[family].empty_mask
+                        has_empties = bool(_cp.any(d_empty))
+                    else:
+                        has_empties = False  # no device state -> no empties detectable
+                except Exception:
+                    has_empties = True  # conservative fallback
             else:
                 has_empties = bool(np.any(buf.empty_mask))
 
@@ -1291,11 +1316,28 @@ class DeviceGeometryArray(ExtensionArray):
         return result
 
     def __setitem__(self, key: Any, value: Any) -> None:
-        # Mutating device geometry arrays forces Shapely materialization
-        # to match GeometryArray semantics.  This is intentionally costly
-        # to discourage mutation patterns.
-        cache = self._ensure_shapely_cache()
         key = pd.api.indexers.check_array_indexer(self, key)
+
+        # Fast path: DGA-to-DGA assignment at the owned level.
+        # Avoids Shapely materialization entirely (zero-copy discipline).
+        if isinstance(value, DeviceGeometryArray):
+            indices = self._resolve_setitem_indices(key, len(value))
+            if indices is not None:
+                if len(indices) == len(self) and len(indices) == value._owned.row_count:
+                    # Full replacement: just swap the owned array.
+                    self._owned = value._owned
+                    self._shapely_cache = None
+                    return
+                if len(indices) == value._owned.row_count:
+                    from vibespatial.geometry.owned import concat_owned_scatter
+                    self._owned = concat_owned_scatter(
+                        self._owned, value._owned, indices,
+                    )
+                    self._shapely_cache = None
+                    return
+
+        # Slow path: Shapely materialization for scalar or non-DGA values.
+        cache = self._ensure_shapely_cache()
         if isinstance(value, DeviceGeometryArray):
             value_cache = value._ensure_shapely_cache()
             cache[key] = value_cache
@@ -1308,6 +1350,24 @@ class DeviceGeometryArray(ExtensionArray):
         # Rebuild owned from modified shapely cache
         self._owned = from_shapely_geometries(cache.tolist())
         self._shapely_cache = cache
+
+    @staticmethod
+    def _resolve_setitem_indices(
+        key: Any, value_len: int,
+    ) -> np.ndarray | None:
+        """Convert a __setitem__ key to a flat int64 index array, or None."""
+        if isinstance(key, np.ndarray):
+            if key.dtype == bool:
+                return np.flatnonzero(key)
+            return np.asarray(key, dtype=np.int64)
+        if isinstance(key, slice):
+            # Full slice is the most common case from pandas internals.
+            if key == slice(None):
+                return np.arange(value_len, dtype=np.int64)
+            return None
+        if isinstance(key, tuple) and len(key) == 1:
+            return DeviceGeometryArray._resolve_setitem_indices(key[0], value_len)
+        return None
 
     def __eq__(self, other: Any) -> np.ndarray:
         if not isinstance(other, DeviceGeometryArray):

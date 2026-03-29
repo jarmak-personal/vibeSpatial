@@ -22,6 +22,7 @@ uv run python scripts/check_architecture_lints.py --all
 uv run python scripts/check_zero_copy.py --all
 uv run python scripts/check_perf_patterns.py --all
 uv run python scripts/check_maintainability.py --all
+uv run python scripts/check_import_guard.py --all
 ```
 
 If any fail, fix the issues before proceeding. The pre-commit hook will
@@ -57,9 +58,10 @@ its prompt. **Launch all applicable agents in a SINGLE message.**
 | Category | Agent | When |
 |----------|-------|------|
 | GPU Code Review | `gpu-code-reviewer` | kernel/GPU/NVRTC/device code changed |
-| Zero-Copy | `zero-copy-reviewer` | runtime/kernel/pipeline code changed |
-| Performance | `performance-reviewer` | kernel/pipeline/dispatch code changed |
+| Zero-Copy | `zero-copy-reviewer` | src/vibespatial/ code changed (not docs/scripts/tests) |
+| Performance | `performance-reviewer` | src/vibespatial/ code changed (not docs/scripts/tests) |
 | Maintainability | `maintainability-reviewer` | any non-test source code changed |
+| Acceleration Angel | `acceleration-angel` | src/vibespatial/ code changed (not docs/scripts/tests) |
 
 Prompt template for each agent:
 
@@ -103,6 +105,9 @@ Wait for all agents to complete, then compile results.
 [findings or "N/A"]
 
 #### Maintainability: [DISCOVERABLE / GAPS / ORPHANED]
+[findings or "N/A"]
+
+#### Acceleration Angel: [PASS / FIX REQUIRED]
 [findings or "N/A"]
 
 ### Overall Verdict

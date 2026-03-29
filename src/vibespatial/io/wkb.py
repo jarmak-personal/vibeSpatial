@@ -1691,6 +1691,142 @@ def _decode_arrow_wkb_polygon_uniform_fast(array) -> OwnedGeometryArray | None:
     )
     return owned
 
+def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
+    """Decode a WKB Arrow binary column containing only MultiPolygon geometries.
+
+    Two-pass approach (same as the Polygon fast path):
+    Pass 1 scans headers to compute total rings, points, and polygon counts.
+    Pass 2 copies coordinates into pre-allocated numpy arrays.
+    Returns None if any record is not a valid little-endian MultiPolygon.
+    """
+    validity = np.asarray(array.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
+    row_count = int(validity.size)
+    tags = np.full(row_count, -1, dtype=np.int8)
+    family_row_offsets = np.full(row_count, -1, dtype=np.int32)
+    valid_count = int(validity.sum())
+    if valid_count == 0:
+        return OwnedGeometryArray(
+            validity=validity, tags=tags,
+            family_row_offsets=family_row_offsets, families={},
+        )
+
+    offsets = _arrow_binary_offsets(array)
+    data_buffer = array.buffers()[2]
+    if data_buffer is None:
+        return None
+    data = memoryview(data_buffer)
+
+    geometry_offsets = np.empty(valid_count + 1, dtype=np.int32)
+    geometry_offsets[0] = 0
+    empty_mask = np.zeros(valid_count, dtype=bool)
+    total_polygons = 0
+    total_rings = 0
+    total_points = 0
+
+    wkb_mp_type = WKB_TYPE_IDS[GeometryFamily.MULTIPOLYGON]
+    wkb_poly_type = WKB_TYPE_IDS[GeometryFamily.POLYGON]
+
+    # --- Pass 1: scan structure ---
+    valid_row = 0
+    for row_index in range(row_count):
+        if not validity[row_index]:
+            continue
+        start = int(offsets[row_index])
+        end = int(offsets[row_index + 1])
+        if end - start < 9:
+            return None
+        if data[start] != 1 or int.from_bytes(data[start + 1 : start + 5], "little") != wkb_mp_type:
+            return None
+        polygon_count = int.from_bytes(data[start + 5 : start + 9], "little")
+        empty_mask[valid_row] = polygon_count == 0
+        cursor = start + 9
+        for _ in range(polygon_count):
+            if cursor + 9 > end:
+                return None
+            if data[cursor] != 1 or int.from_bytes(data[cursor + 1 : cursor + 5], "little") != wkb_poly_type:
+                return None
+            ring_count = int.from_bytes(data[cursor + 5 : cursor + 9], "little")
+            cursor += 9
+            for _ in range(ring_count):
+                if cursor + 4 > end:
+                    return None
+                point_count = int.from_bytes(data[cursor : cursor + 4], "little")
+                cursor += 4 + (point_count * 16)
+                if cursor > end:
+                    return None
+                total_points += point_count
+            total_rings += ring_count
+        if cursor != end:
+            return None
+        total_polygons += polygon_count
+        valid_row += 1
+        geometry_offsets[valid_row] = total_polygons
+
+    # --- Pass 2: extract coordinates ---
+    part_offsets = np.empty(total_polygons + 1, dtype=np.int32)
+    ring_offsets = np.empty(total_rings + 1, dtype=np.int32)
+    x = np.empty(total_points, dtype=np.float64)
+    y = np.empty(total_points, dtype=np.float64)
+    poly_cursor = 0
+    ring_cursor = 0
+    coord_cursor = 0
+    for row_index in range(row_count):
+        if not validity[row_index]:
+            continue
+        start = int(offsets[row_index])
+        polygon_count = int.from_bytes(data[start + 5 : start + 9], "little")
+        cursor = start + 9
+        for _ in range(polygon_count):
+            ring_count = int.from_bytes(data[cursor + 5 : cursor + 9], "little")
+            cursor += 9
+            part_offsets[poly_cursor] = ring_cursor
+            for _ in range(ring_count):
+                point_count = int.from_bytes(data[cursor : cursor + 4], "little")
+                cursor += 4
+                ring_offsets[ring_cursor] = coord_cursor
+                if point_count:
+                    nbytes = point_count * 16
+                    coords = np.frombuffer(
+                        data[cursor : cursor + nbytes],
+                        dtype="<f8", count=point_count * 2,
+                    ).reshape(point_count, 2)
+                    x[coord_cursor : coord_cursor + point_count] = coords[:, 0]
+                    y[coord_cursor : coord_cursor + point_count] = coords[:, 1]
+                    coord_cursor += point_count
+                    cursor += nbytes
+                ring_cursor += 1
+            poly_cursor += 1
+    part_offsets[poly_cursor] = ring_cursor
+    ring_offsets[ring_cursor] = coord_cursor
+
+    tags[validity] = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+    family_row_offsets[validity] = np.arange(valid_count, dtype=np.int32)
+    owned = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families={
+            GeometryFamily.MULTIPOLYGON: FamilyGeometryBuffer(
+                family=GeometryFamily.MULTIPOLYGON,
+                schema=get_geometry_buffer_schema(GeometryFamily.MULTIPOLYGON),
+                row_count=valid_count,
+                x=x,
+                y=y,
+                geometry_offsets=geometry_offsets,
+                empty_mask=empty_mask,
+                part_offsets=part_offsets,
+                ring_offsets=ring_offsets,
+            )
+        },
+    )
+    owned._record(
+        DiagnosticKind.CREATED,
+        "created owned geometry array from raw Arrow WKB multipolygon buffers",
+        visible=True,
+    )
+    return owned
+
+
 def _hexify_if_requested(values: list[bytes | None], *, hex_output: bool) -> list[bytes | str | None]:
     if not hex_output:
         return values
@@ -1995,6 +2131,9 @@ def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGe
     polygon_fast = _decode_arrow_wkb_polygon_fast(array)
     if polygon_fast is not None:
         return polygon_fast
+    multipolygon_fast = _decode_arrow_wkb_multipolygon_fast(array)
+    if multipolygon_fast is not None:
+        return multipolygon_fast
     values = np.asarray(array.to_numpy(zero_copy_only=False), dtype=object)
     return decode_wkb_owned(list(values), on_invalid=on_invalid)
 

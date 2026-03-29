@@ -46,7 +46,7 @@ DEFAULT_BROADCAST_CROSSOVER_POLICIES: dict[KernelClass, int] = {
     KernelClass.COARSE: 256,
     KernelClass.METRIC: 500,
     KernelClass.PREDICATE: 1_000,
-    KernelClass.CONSTRUCTIVE: 10_000,
+    KernelClass.CONSTRUCTIVE: 500,
 }
 
 _KERNEL_CROSSOVER_OVERRIDES: dict[str, int] = {

@@ -5,7 +5,7 @@ Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented out
 Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
 STOP IF: You already have the reconstruction planner open and only need local implementation detail.
 Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-Body Budget: 98/220 lines
+Body Budget: 112/220 lines
 Document: docs/architecture/overlay-reconstruction.md
 
 Section Map (Body Lines)
@@ -20,7 +20,7 @@ Section Map (Body Lines)
 | 37-46 | Options Considered |
 | 47-60 | Decision |
 | 61-74 | CCCL Mapping |
-| 75-98 | Consequences |
+| 75-112 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
@@ -113,6 +113,20 @@ overlay operations.
   mixed-family constructive overlay stays explicitly unsupported until a later
   a later change widens the kernel contract
 - later GPU overlay work has an explicit CCCL-friendly assembly seam
+- **Memory-Safe Difference Batching:** overlay difference splits large
+  workloads into VRAM-safe batches to prevent OOM at scale. The strategy:
+  1. Estimate per-pair byte cost from right-side coordinate density.
+  2. Query free VRAM via `cupy.cuda.Device().mem_info`.
+  3. Budget = `free_bytes * _VRAM_BUDGET_FRACTION` (0.3, conservative
+     because segmented_union and binary_constructive each allocate
+     comparable working memory).
+  4. Compute groups per batch from budget / (avg_pairs * bytes_per_pair),
+     clamped to `[_MIN_GROUPS_PER_BATCH=64, _MAX_GROUPS_PER_BATCH=10K]`.
+  5. Below `_PAIR_THRESHOLD` (200K total pairs), skip batching entirely
+     and process in a single dispatch (lower overhead).
+  6. Each batch gathers its left/right slices, runs the GPU overlay
+     difference kernel, and appends results. Final assembly concatenates
+     batch outputs with consistent index tracking.
 - many-vs-one (N-vs-1) overlay uses a three-tier strategy that bypasses the
   full reconstruction graph for the common broadcast_right workload shape:
   (1) containment bypass identifies polygons fully inside the clip polygon

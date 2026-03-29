@@ -539,6 +539,7 @@
         "Leaving crossover implicit invites ad hoc size checks inside individual kernels."
       ],
       "sections": [
+        "Broadcast Thresholds",
         "Canonical Rule",
         "Intent",
         "Measurement Rule",
@@ -555,6 +556,7 @@
         "are",
         "auto",
         "before",
+        "broadcast",
         "canonical",
         "changing",
         "cpu",
@@ -1022,6 +1024,7 @@
         "Canonical Rule",
         "Execution Boundaries",
         "Family Schemas",
+        "Indexed-View Pattern",
         "Intent",
         "Mixed-Geometry Integration",
         "Offset Rules",
@@ -1054,6 +1057,7 @@
         "geometry",
         "has",
         "implementation",
+        "indexed",
         "integration",
         "intent",
         "kernels",
@@ -1069,6 +1073,7 @@
         "only",
         "open",
         "owned",
+        "pattern",
         "phase",
         "points",
         "polygons",
@@ -1084,6 +1089,7 @@
         "surface",
         "task",
         "verify",
+        "view",
         "you",
         "your"
       ],
@@ -3860,6 +3866,1681 @@
     },
     {
       "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/001.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "001",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/002.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "002",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/003.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "003",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/004.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "004",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/005.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "005",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/006.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "006",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/007.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "007",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/008.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "008",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/009.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "009",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/010.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "010",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/011.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "011",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/012.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "012",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/013.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "013",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/014.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "014",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/015.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "015",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/016.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "016",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/017.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "017",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/018.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "018",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/019.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "019",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/ideas/020.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "020",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/problem.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "0d10e9a4b253",
+        "brainstorm",
+        "md",
+        "problem"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/report.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "0d10e9a4b253",
+        "brainstorm",
+        "md",
+        "report"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-001/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ComprehensionQuiz",
+        "ComprehensionGate"
+      ],
+      "tokens": [
+        "001",
+        "0d10e9a4b253",
+        "brainstorm",
+        "comprehensiongate",
+        "comprehensionquiz",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-002/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "AntiPatternTestMixin",
+        "TestOverlayIntersectionAntiPatterns"
+      ],
+      "tokens": [
+        "002",
+        "0d10e9a4b253",
+        "antipatterntestmixin",
+        "brainstorm",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes",
+        "testoverlayintersectionantipatterns"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-003/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ViolationContext",
+        "_get_ctx",
+        "DeviceResidencyViolation",
+        "install_strict_mode",
+        "gpu_pipeline",
+        "overlay_intersection_gpu",
+        "strict_device_mode"
+      ],
+      "tokens": [
+        "003",
+        "0d10e9a4b253",
+        "brainstorm",
+        "ctx",
+        "device",
+        "deviceresidencyviolation",
+        "get",
+        "gpu",
+        "idea",
+        "install",
+        "intersection",
+        "mode",
+        "overlay",
+        "pipeline",
+        "prototype",
+        "py",
+        "sandboxes",
+        "strict",
+        "violationcontext"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-004/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ConstraintDeclaration",
+        "ConstraintVerifier",
+        "declare_constraints_for_task",
+        "post_tool_hook"
+      ],
+      "tokens": [
+        "004",
+        "0d10e9a4b253",
+        "brainstorm",
+        "constraintdeclaration",
+        "constraints",
+        "constraintverifier",
+        "declare",
+        "hook",
+        "idea",
+        "post",
+        "prototype",
+        "py",
+        "sandboxes",
+        "task",
+        "tool"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-005/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "AgentRole",
+        "ImplementationBrief",
+        "CapabilityGate",
+        "ReaderWriterOrchestrator"
+      ],
+      "tokens": [
+        "005",
+        "0d10e9a4b253",
+        "agentrole",
+        "brainstorm",
+        "capabilitygate",
+        "idea",
+        "implementationbrief",
+        "prototype",
+        "py",
+        "readerwriterorchestrator",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-006/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "OutcomeSpec",
+        "BenchmarkResult",
+        "ContinuousBenchmarkRunner"
+      ],
+      "tokens": [
+        "006",
+        "0d10e9a4b253",
+        "benchmarkresult",
+        "brainstorm",
+        "continuousbenchmarkrunner",
+        "idea",
+        "outcomespec",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-007/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "FallbackExpired",
+        "temporary_fallback",
+        "FallbackRegistry",
+        "ci_time_travel_check",
+        "_union_via_shapely",
+        "_overlay_difference_geopandas_fallback"
+      ],
+      "tokens": [
+        "007",
+        "0d10e9a4b253",
+        "brainstorm",
+        "check",
+        "ci",
+        "difference",
+        "fallback",
+        "fallbackexpired",
+        "fallbackregistry",
+        "geopandas",
+        "idea",
+        "overlay",
+        "prototype",
+        "py",
+        "sandboxes",
+        "shapely",
+        "temporary",
+        "time",
+        "travel",
+        "union",
+        "via"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-008/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "Exemplar",
+        "GitArchaeologist",
+        "present_exemplars_to_agent"
+      ],
+      "tokens": [
+        "008",
+        "0d10e9a4b253",
+        "agent",
+        "brainstorm",
+        "exemplar",
+        "exemplars",
+        "gitarchaeologist",
+        "idea",
+        "present",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-009/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "DeviceTag",
+        "HostTag",
+        "ArrayLike",
+        "DeviceArray",
+        "HostArray",
+        "gpu_segment_intersection",
+        "gpu_point_in_polygon",
+        "cpu_shapely_fallback",
+        "example_agent_mistake"
+      ],
+      "tokens": [
+        "009",
+        "0d10e9a4b253",
+        "agent",
+        "arraylike",
+        "brainstorm",
+        "cpu",
+        "devicearray",
+        "devicetag",
+        "example",
+        "fallback",
+        "gpu",
+        "hostarray",
+        "hosttag",
+        "idea",
+        "intersection",
+        "mistake",
+        "point",
+        "polygon",
+        "prototype",
+        "py",
+        "sandboxes",
+        "segment",
+        "shapely"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-010/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "SlotStatus",
+        "TemplateSlot",
+        "KernelTemplate"
+      ],
+      "tokens": [
+        "010",
+        "0d10e9a4b253",
+        "brainstorm",
+        "idea",
+        "kerneltemplate",
+        "prototype",
+        "py",
+        "sandboxes",
+        "slotstatus",
+        "templateslot"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-011/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "AttemptRecord",
+        "FeatureBudget",
+        "BudgetTracker"
+      ],
+      "tokens": [
+        "011",
+        "0d10e9a4b253",
+        "attemptrecord",
+        "brainstorm",
+        "budgettracker",
+        "featurebudget",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-012/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ShortcutPrediction",
+        "RedTeamReport",
+        "RedTeamAgent",
+        "ShortcutTrap",
+        "_trapped_get",
+        "pre_implementation_redteam"
+      ],
+      "tokens": [
+        "012",
+        "0d10e9a4b253",
+        "brainstorm",
+        "get",
+        "idea",
+        "implementation",
+        "pre",
+        "prototype",
+        "py",
+        "redteam",
+        "redteamagent",
+        "redteamreport",
+        "sandboxes",
+        "shortcutprediction",
+        "shortcuttrap",
+        "trapped"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-013/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "NarrativeAnalysis",
+        "analyze_narrative"
+      ],
+      "tokens": [
+        "013",
+        "0d10e9a4b253",
+        "analyze",
+        "brainstorm",
+        "idea",
+        "narrative",
+        "narrativeanalysis",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-014/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ReputationLedger",
+        "pre_session_check",
+        "post_session_record"
+      ],
+      "tokens": [
+        "014",
+        "0d10e9a4b253",
+        "brainstorm",
+        "check",
+        "idea",
+        "post",
+        "pre",
+        "prototype",
+        "py",
+        "record",
+        "reputationledger",
+        "sandboxes",
+        "session"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-015/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "DiffFeatures",
+        "HistoricalDiff",
+        "DiffShapeClassifier"
+      ],
+      "tokens": [
+        "015",
+        "0d10e9a4b253",
+        "brainstorm",
+        "difffeatures",
+        "diffshapeclassifier",
+        "historicaldiff",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-016/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "Capability",
+        "Requirement",
+        "Gap",
+        "CapabilityScanner",
+        "GapAnalyzer",
+        "generate_task_from_gap"
+      ],
+      "tokens": [
+        "016",
+        "0d10e9a4b253",
+        "brainstorm",
+        "capability",
+        "capabilityscanner",
+        "gap",
+        "gapanalyzer",
+        "generate",
+        "idea",
+        "prototype",
+        "py",
+        "requirement",
+        "sandboxes",
+        "task"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-017/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "MicroTask",
+        "MicroTaskGenerator",
+        "MicroTaskGrader",
+        "warmup_before_real_task"
+      ],
+      "tokens": [
+        "017",
+        "0d10e9a4b253",
+        "before",
+        "brainstorm",
+        "idea",
+        "microtask",
+        "microtaskgenerator",
+        "microtaskgrader",
+        "prototype",
+        "py",
+        "real",
+        "sandboxes",
+        "task",
+        "warmup"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-018/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ShortcutStripper",
+        "rewrite_edit",
+        "post_edit_rewriter",
+        "overlay_intersection"
+      ],
+      "tokens": [
+        "018",
+        "0d10e9a4b253",
+        "brainstorm",
+        "edit",
+        "idea",
+        "intersection",
+        "overlay",
+        "post",
+        "prototype",
+        "py",
+        "rewrite",
+        "rewriter",
+        "sandboxes",
+        "shortcutstripper"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-019/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "QuestionCategory",
+        "DialogTurn",
+        "SpecificationOracle"
+      ],
+      "tokens": [
+        "019",
+        "0d10e9a4b253",
+        "brainstorm",
+        "dialogturn",
+        "idea",
+        "prototype",
+        "py",
+        "questioncategory",
+        "sandboxes",
+        "specificationoracle"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/0d10e9a4b253/sandboxes/idea-020/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "CounterfactualBrief",
+        "CounterfactualGrader",
+        "require_counterfactual"
+      ],
+      "tokens": [
+        "020",
+        "0d10e9a4b253",
+        "brainstorm",
+        "counterfactual",
+        "counterfactualbrief",
+        "counterfactualgrader",
+        "idea",
+        "prototype",
+        "py",
+        "require",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/001.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "001",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/002.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "002",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/003.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "003",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/004.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "004",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/005.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "005",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/006.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "006",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/007.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "007",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/008.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "008",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/009.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "009",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/010.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "010",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/011.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "011",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/012.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "012",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/013.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "013",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/014.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "014",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/015.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "015",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/016.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "016",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/017.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "017",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/018.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "018",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/019.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "019",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/ideas/020.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "020",
+        "b2057efc6ed9",
+        "brainstorm",
+        "ideas",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/problem.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "b2057efc6ed9",
+        "brainstorm",
+        "md",
+        "problem"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/report.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "b2057efc6ed9",
+        "brainstorm",
+        "md",
+        "report"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-001/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "InvestigationBudget",
+        "compute_budget",
+        "gate_proposal"
+      ],
+      "tokens": [
+        "001",
+        "b2057efc6ed9",
+        "brainstorm",
+        "budget",
+        "compute",
+        "gate",
+        "idea",
+        "investigationbudget",
+        "proposal",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-002/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "parse_causal_graph",
+        "node_depth",
+        "validate_fix_target",
+        "post_edit_hook"
+      ],
+      "tokens": [
+        "002",
+        "b2057efc6ed9",
+        "brainstorm",
+        "causal",
+        "depth",
+        "edit",
+        "fix",
+        "graph",
+        "hook",
+        "idea",
+        "node",
+        "parse",
+        "post",
+        "prototype",
+        "py",
+        "sandboxes",
+        "target",
+        "validate"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-003/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ToolCallStats",
+        "extract_stats_from_log",
+        "check_investigation_floor"
+      ],
+      "tokens": [
+        "003",
+        "b2057efc6ed9",
+        "brainstorm",
+        "check",
+        "extract",
+        "floor",
+        "idea",
+        "investigation",
+        "log",
+        "prototype",
+        "py",
+        "sandboxes",
+        "stats",
+        "toolcallstats"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-004/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "DebtInvoice"
+      ],
+      "tokens": [
+        "004",
+        "b2057efc6ed9",
+        "brainstorm",
+        "debtinvoice",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-005/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "shape_signature",
+        "validate_enumeration"
+      ],
+      "tokens": [
+        "005",
+        "b2057efc6ed9",
+        "brainstorm",
+        "enumeration",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes",
+        "shape",
+        "signature",
+        "validate"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-006/progress_tracker.py",
+      "referenced_by": [],
+      "symbols": [
+        "ProgressReport",
+        "compare_snapshots",
+        "format_progress",
+        "PropertySession"
+      ],
+      "tokens": [
+        "006",
+        "b2057efc6ed9",
+        "brainstorm",
+        "compare",
+        "format",
+        "idea",
+        "progress",
+        "progressreport",
+        "propertysession",
+        "py",
+        "sandboxes",
+        "snapshots",
+        "tracker"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-006/property_registry.py",
+      "referenced_by": [],
+      "symbols": [
+        "Category",
+        "PropertyState",
+        "Property",
+        "_run_check_script",
+        "_parse_ratchet_output",
+        "make_ratchet_property",
+        "snapshot_all",
+        "format_dashboard"
+      ],
+      "tokens": [
+        "006",
+        "all",
+        "b2057efc6ed9",
+        "brainstorm",
+        "category",
+        "check",
+        "dashboard",
+        "format",
+        "idea",
+        "make",
+        "output",
+        "parse",
+        "property",
+        "propertystate",
+        "py",
+        "ratchet",
+        "registry",
+        "run",
+        "sandboxes",
+        "script",
+        "snapshot"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-006/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "Property",
+        "measure_progress"
+      ],
+      "tokens": [
+        "006",
+        "b2057efc6ed9",
+        "brainstorm",
+        "idea",
+        "measure",
+        "progress",
+        "property",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-006/task_reframing.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "006",
+        "b2057efc6ed9",
+        "brainstorm",
+        "idea",
+        "md",
+        "reframing",
+        "sandboxes",
+        "task"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-007/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "find_fix_refix_patterns",
+        "check_proposed_change"
+      ],
+      "tokens": [
+        "007",
+        "b2057efc6ed9",
+        "brainstorm",
+        "change",
+        "check",
+        "find",
+        "fix",
+        "idea",
+        "patterns",
+        "proposed",
+        "prototype",
+        "py",
+        "refix",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-008/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "validate_prosecution",
+        "gate_implementation"
+      ],
+      "tokens": [
+        "008",
+        "b2057efc6ed9",
+        "brainstorm",
+        "gate",
+        "idea",
+        "implementation",
+        "prosecution",
+        "prototype",
+        "py",
+        "sandboxes",
+        "validate"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-009/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "build_import_graph",
+        "estimate_blast_radius",
+        "check_proportionality"
+      ],
+      "tokens": [
+        "009",
+        "b2057efc6ed9",
+        "blast",
+        "brainstorm",
+        "build",
+        "check",
+        "estimate",
+        "graph",
+        "idea",
+        "import",
+        "proportionality",
+        "prototype",
+        "py",
+        "radius",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-010/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "Lifespan",
+        "PermanenceDeclaration",
+        "FollowUpTask",
+        "challenge_declaration",
+        "create_followup"
+      ],
+      "tokens": [
+        "010",
+        "b2057efc6ed9",
+        "brainstorm",
+        "challenge",
+        "create",
+        "declaration",
+        "followup",
+        "followuptask",
+        "idea",
+        "lifespan",
+        "permanencedeclaration",
+        "prototype",
+        "py",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-011/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "scrub_context",
+        "scrub_file_content"
+      ],
+      "tokens": [
+        "011",
+        "b2057efc6ed9",
+        "brainstorm",
+        "content",
+        "context",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes",
+        "scrub"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-012/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "_ValidatedTag",
+        "ValidatedGeometry",
+        "validate",
+        "spatial_join",
+        "DispatchTarget",
+        "dispatch"
+      ],
+      "tokens": [
+        "012",
+        "b2057efc6ed9",
+        "brainstorm",
+        "dispatch",
+        "dispatchtarget",
+        "idea",
+        "join",
+        "prototype",
+        "py",
+        "sandboxes",
+        "spatial",
+        "validate",
+        "validatedgeometry",
+        "validatedtag"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-013/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ExemplarPair",
+        "select_relevant_pairs",
+        "format_exemplars_for_context"
+      ],
+      "tokens": [
+        "013",
+        "b2057efc6ed9",
+        "brainstorm",
+        "context",
+        "exemplarpair",
+        "exemplars",
+        "format",
+        "idea",
+        "pairs",
+        "prototype",
+        "py",
+        "relevant",
+        "sandboxes",
+        "select"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-014/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "FrictionRule",
+        "compute_friction",
+        "path_of_least_resistance"
+      ],
+      "tokens": [
+        "014",
+        "b2057efc6ed9",
+        "brainstorm",
+        "compute",
+        "friction",
+        "frictionrule",
+        "idea",
+        "least",
+        "prototype",
+        "py",
+        "resistance",
+        "sandboxes"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-015/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "detect_hand_waving",
+        "evaluate_teachback"
+      ],
+      "tokens": [
+        "015",
+        "b2057efc6ed9",
+        "brainstorm",
+        "detect",
+        "evaluate",
+        "hand",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes",
+        "teachback",
+        "waving"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-016/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "extract_ast_patterns",
+        "compute_codebase_distribution",
+        "measure_diff_surprise"
+      ],
+      "tokens": [
+        "016",
+        "ast",
+        "b2057efc6ed9",
+        "brainstorm",
+        "codebase",
+        "compute",
+        "diff",
+        "distribution",
+        "extract",
+        "idea",
+        "measure",
+        "patterns",
+        "prototype",
+        "py",
+        "sandboxes",
+        "surprise"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-017/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "TimeLock",
+        "CommitReadiness"
+      ],
+      "tokens": [
+        "017",
+        "b2057efc6ed9",
+        "brainstorm",
+        "commitreadiness",
+        "idea",
+        "prototype",
+        "py",
+        "sandboxes",
+        "timelock"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-018/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "simulate_inaction",
+        "parse_simulation"
+      ],
+      "tokens": [
+        "018",
+        "b2057efc6ed9",
+        "brainstorm",
+        "idea",
+        "inaction",
+        "parse",
+        "prototype",
+        "py",
+        "sandboxes",
+        "simulate",
+        "simulation"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-019/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "ProofChain",
+        "extract_causal_chain",
+        "verify_chain_depth",
+        "verify_fix_targets_chain",
+        "validate_commit_proof"
+      ],
+      "tokens": [
+        "019",
+        "b2057efc6ed9",
+        "brainstorm",
+        "causal",
+        "chain",
+        "commit",
+        "depth",
+        "extract",
+        "fix",
+        "idea",
+        "proof",
+        "proofchain",
+        "prototype",
+        "py",
+        "sandboxes",
+        "targets",
+        "validate",
+        "verify"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".brainstorm/b2057efc6ed9/sandboxes/idea-020/prototype.py",
+      "referenced_by": [],
+      "symbols": [
+        "SocraticQuestion",
+        "evaluate_answer",
+        "run_interrogation"
+      ],
+      "tokens": [
+        "020",
+        "answer",
+        "b2057efc6ed9",
+        "brainstorm",
+        "evaluate",
+        "idea",
+        "interrogation",
+        "prototype",
+        "py",
+        "run",
+        "sandboxes",
+        "socraticquestion"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/agents/acceleration-angel.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "acceleration",
+        "agents",
+        "angel",
+        "claude",
+        "md"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/agents/cuda-engineer.md",
       "referenced_by": [],
       "symbols": [],
@@ -4150,6 +5831,20 @@
         "compliance",
         "md",
         "precision",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".claude/skills/property-framing/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "claude",
+        "framing",
+        "md",
+        "property",
         "skill",
         "skills"
       ]
@@ -11795,6 +13490,45 @@
     },
     {
       "kind": "script",
+      "path": "scripts/check_import_guard.py",
+      "referenced_by": [],
+      "symbols": [
+        "LintError",
+        "_is_exempt",
+        "_relative_key",
+        "_is_in_allowlist",
+        "iter_python_files",
+        "_has_shapely_import",
+        "_has_numpy_import",
+        "check_shapely_imports",
+        "check_numpy_imports",
+        "run_checks",
+        "main"
+      ],
+      "tokens": [
+        "allowlist",
+        "check",
+        "checks",
+        "exempt",
+        "guard",
+        "has",
+        "import",
+        "imports",
+        "iter",
+        "key",
+        "linterror",
+        "main",
+        "numpy",
+        "py",
+        "python",
+        "relative",
+        "run",
+        "scripts",
+        "shapely"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/check_maintainability.py",
       "referenced_by": [],
       "symbols": [
@@ -12316,6 +14050,43 @@
         "query",
         "scripts",
         "spatial"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/property_dashboard.py",
+      "referenced_by": [],
+      "symbols": [
+        "PropertyState",
+        "_collect_arch",
+        "_collect_zcopy",
+        "_collect_vpat",
+        "_collect_igrd",
+        "_collect_maint",
+        "snapshot",
+        "total_distance",
+        "format_dashboard",
+        "format_json",
+        "main"
+      ],
+      "tokens": [
+        "arch",
+        "collect",
+        "dashboard",
+        "distance",
+        "format",
+        "igrd",
+        "json",
+        "main",
+        "maint",
+        "property",
+        "propertystate",
+        "py",
+        "scripts",
+        "snapshot",
+        "total",
+        "vpat",
+        "zcopy"
       ]
     },
     {
@@ -13321,6 +15092,9 @@
       "referenced_by": [],
       "symbols": [
         "_extract_owned_pair",
+        "_estimate_bytes_per_pair",
+        "_compute_batch_groups",
+        "_batched_overlay_difference_owned",
         "_make_valid_geoseries",
         "_ensure_geometry_column",
         "_intersecting_index_pairs",
@@ -13340,16 +15114,22 @@
         "api",
         "assemble",
         "attributes",
+        "batch",
+        "batched",
+        "bytes",
         "collection",
         "column",
+        "compute",
         "diff",
         "difference",
         "ensure",
+        "estimate",
         "extract",
         "families",
         "geom",
         "geometry",
         "geoseries",
+        "groups",
         "identity",
         "index",
         "intersecting",
@@ -13361,6 +15141,7 @@
         "owned",
         "pair",
         "pairs",
+        "per",
         "py",
         "src",
         "symmetric",
@@ -16031,6 +17812,7 @@
         "_compile_select",
         "_compile_reduce_into",
         "_compile_segmented_reduce",
+        "_BinarySearchAdapter",
         "_compile_lower_bound",
         "_compile_upper_bound",
         "_compile_radix_sort",
@@ -16039,11 +17821,11 @@
         "_compile_segmented_sort",
         "_build_cached_callable",
         "_query_cached_temp",
-        "CCCLPrecompiler",
-        "request_warmup"
+        "CCCLPrecompiler"
       ],
       "tokens": [
         "algorithmfamily",
+        "binarysearchadapter",
         "bound",
         "build",
         "cached",
@@ -16069,7 +17851,6 @@
         "real",
         "reduce",
         "registry",
-        "request",
         "scan",
         "segmented",
         "select",
@@ -16082,7 +17863,6 @@
         "unique",
         "upper",
         "vibespatial",
-        "warmup",
         "warmupdiagnostic",
         "warnings"
       ]
@@ -20233,6 +22013,41 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/testing/device_guard.py",
+      "referenced_by": [],
+      "symbols": [
+        "DeviceResidencyViolation",
+        "_in_guarded_scope",
+        "_current_scope",
+        "_caller_is_allowed",
+        "_format_violation",
+        "device_residency_guard",
+        "_install_patches",
+        "_uninstall_patches"
+      ],
+      "tokens": [
+        "allowed",
+        "caller",
+        "current",
+        "device",
+        "deviceresidencyviolation",
+        "format",
+        "guard",
+        "guarded",
+        "install",
+        "patches",
+        "py",
+        "residency",
+        "scope",
+        "src",
+        "testing",
+        "uninstall",
+        "vibespatial",
+        "violation"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/testing/mixed_layouts.py",
       "referenced_by": [
         "docs/architecture/mixed-geometries.md"
@@ -20463,6 +22278,7 @@
         "dispatch_selection",
         "auto_runtime_selection",
         "synthetic_dataset",
+        "strict_device_guard",
         "oracle_runner"
       ],
       "tokens": [
@@ -20473,9 +22289,11 @@
         "conftest",
         "cuda",
         "dataset",
+        "device",
         "dispatch",
         "generate",
         "gpu",
+        "guard",
         "modes",
         "modifyitems",
         "oracle",
@@ -20485,6 +22303,7 @@
         "runner",
         "runtime",
         "selection",
+        "strict",
         "synthetic",
         "tests"
       ]
@@ -23213,6 +25032,56 @@
         "testsjoinpreservesattributes",
         "testspatialnearestreturnsindexarrays",
         "testspatialqueryreturnsintegerarrays"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_indexed_view_take.py",
+      "referenced_by": [],
+      "symbols": [
+        "_sample_geometries",
+        "_all_families",
+        "_make_high_repetition_indices",
+        "_assert_shapely_equal",
+        "TestIndexedViewCreation",
+        "TestIndexedViewCorrectness",
+        "TestIndexedViewRowCount",
+        "TestIndexedViewMetadata",
+        "TestResolve",
+        "TestChainedTake",
+        "TestConcatWithIndexedViews",
+        "TestMemorySavings",
+        "TestDeviceTakeIndexedView",
+        "TestDGATakeIndexedView"
+      ],
+      "tokens": [
+        "all",
+        "assert",
+        "equal",
+        "families",
+        "geometries",
+        "high",
+        "indexed",
+        "indices",
+        "make",
+        "py",
+        "repetition",
+        "sample",
+        "shapely",
+        "take",
+        "test",
+        "testchainedtake",
+        "testconcatwithindexedviews",
+        "testdevicetakeindexedview",
+        "testdgatakeindexedview",
+        "testindexedviewcorrectness",
+        "testindexedviewcreation",
+        "testindexedviewmetadata",
+        "testindexedviewrowcount",
+        "testmemorysavings",
+        "testresolve",
+        "tests",
+        "view"
       ]
     },
     {

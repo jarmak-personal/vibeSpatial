@@ -12,6 +12,7 @@ __pycache__/
 .claude/last-review.md
 .claude/.review-completed
 .claude/projects/
+.brainstorm/
 
 # Dolt database files (added by bd init)
 .dolt/
@@ -26,6 +27,7 @@ docs/autoapi/
 cufile.log
 result_images/
 <_io.BytesIO object at *>
+<fsspec*
 
 # Benchmark fixture cache and results
 .benchmark_fixtures/

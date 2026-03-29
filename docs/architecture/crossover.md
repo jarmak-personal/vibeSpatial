@@ -5,7 +5,7 @@ Scope: Per-kernel auto-dispatch thresholds and CPU/GPU crossover policy.
 Read If: You are changing auto mode, size thresholds, or CPU/GPU dispatch heuristics.
 STOP IF: Your task already has a settled crossover policy and only needs implementation detail.
 Source Of Truth: Phase-1 crossover policy before adaptive runtime lands.
-Body Budget: 58/240 lines
+Body Budget: 74/240 lines
 Document: docs/architecture/crossover.md
 
 Section Map (Body Lines)
@@ -19,7 +19,8 @@ Section Map (Body Lines)
 | 31-36 | Risks |
 | 37-43 | Canonical Rule |
 | 44-53 | Provisional Thresholds |
-| 54-58 | Measurement Rule |
+| 54-69 | Broadcast Thresholds |
+| 70-74 | Measurement Rule |
 DOC_HEADER:END -->
 
 `auto` mode should use per-kernel row thresholds, not one global size rule.
@@ -72,6 +73,22 @@ each kernel class before adaptive runtime work lands.
 
 These are policy constants, not folklore. Update them when kernel
 implementations materially change.
+
+## Broadcast Thresholds
+
+Broadcast-right workloads (N-vs-1) have lower crossover thresholds than
+pairwise workloads because the single right-side geometry is read once and
+reused N times from L1 cache, giving near-perfect data locality.
+
+- `coarse`: `256`
+- `metric`: `500`
+- `predicate`: `1K`
+- `constructive`: `500`
+
+The `constructive` broadcast threshold (500) is notably lower than its
+pairwise counterpart (50K) because broadcast clip and difference avoid the
+full overlay reconstruction graph in favor of a batched Sutherland-Hodgman
+fast path.
 
 ## Measurement Rule
 

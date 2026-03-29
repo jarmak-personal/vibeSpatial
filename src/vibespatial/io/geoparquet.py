@@ -1044,13 +1044,21 @@ def write_geoparquet(
         selected=ExecutionMode.CPU,
     )
 
-    # Check if any geometry column is a DeviceGeometryArray.  If so, use
-    # the native owned-buffer encoder which avoids the D→H→Shapely roundtrip.
+    # Check if any geometry column already has owned backing (either via
+    # DeviceGeometryArray or a GeometryArray with _owned populated).  When
+    # owned is available, use the native owned-buffer encoder which avoids
+    # the D→H→Shapely roundtrip.  We intentionally do NOT trigger owned
+    # construction here — if only Shapely data exists, the standard pyarrow
+    # path with shapely.to_wkb is faster than building owned first.
     geometry_mask = df.dtypes.map(lambda d: d.name in ("geometry", "device_geometry"))
     geometry_columns = df.columns[geometry_mask]
-    has_dga = any(isinstance(df[col].array, DeviceGeometryArray) for col in geometry_columns)
+    has_owned = any(
+        isinstance(df[col].array, DeviceGeometryArray)
+        or getattr(df[col].array, "_owned", None) is not None
+        for col in geometry_columns
+    )
 
-    if has_dga and geometry_columns.size > 0:
+    if has_owned and geometry_columns.size > 0:
         _write_geoparquet_native(
             df,
             path,

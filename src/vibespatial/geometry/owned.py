@@ -200,6 +200,16 @@ class OwnedGeometryArray:
         self.device_adopted = device_adopted
         self.device_state = device_state
         self._device_metadata = device_metadata
+        # Indexed-view support: when take() detects high index repetition,
+        # the result stores a compact base array plus an index map instead
+        # of physically copying all coordinate data.  This avoids OOM when
+        # sjoin expands 38K unique polygons to 76.8M rows.
+        # _base: the unique-row OwnedGeometryArray (physical data)
+        # _index_map: int array mapping logical row -> base row.
+        #   - numpy int64 when created from take() (host path)
+        #   - CuPy int64 when created from device_take() (device path)
+        self._base: OwnedGeometryArray | None = None
+        self._index_map: np.ndarray | Any | None = None  # numpy or CuPy
         # Cache row_count so we don't need to materialise host arrays just
         # to query the length.  When host validity is present we derive it;
         # otherwise the caller must supply _row_count explicitly.
@@ -278,6 +288,182 @@ class OwnedGeometryArray:
     @property
     def row_count(self) -> int:
         return self._row_count
+
+    @property
+    def is_indexed_view(self) -> bool:
+        """True when this array is a virtual indexed view over a compact base."""
+        return self._base is not None and self._index_map is not None
+
+    @classmethod
+    def _indexed_view(
+        cls,
+        base: OwnedGeometryArray,
+        index_map: np.ndarray,
+    ) -> OwnedGeometryArray:
+        """Create an indexed view: a virtual expansion of *base* via *index_map*.
+
+        The returned array appears to have ``len(index_map)`` rows, but stores
+        only the unique rows in *base*.  Coordinate buffers are shared, not
+        copied, saving memory when many output rows map to few unique geometries
+        (e.g., sjoin expansion).
+
+        *index_map* may be a numpy array (host path from :meth:`take`) or a
+        CuPy array (device path from :meth:`device_take`).  When CuPy AND the
+        base is device-resident, metadata expansion happens entirely on device
+        — no D2H transfer of the index map or base metadata occurs.  The
+        index map is stored as-is (CuPy or numpy) and consumed by the
+        appropriate resolve path (:meth:`_device_resolve` or :meth:`_resolve`).
+
+        Physical materialisation is deferred until a consumer needs contiguous
+        buffers (kernel dispatch, GeoArrow export, etc.) via :meth:`_resolve`
+        or :meth:`_device_resolve`.
+        """
+        _index_map_on_device = (
+            cp is not None and hasattr(index_map, "__cuda_array_interface__")
+        )
+        index_map_size = int(index_map.size)
+
+        if _index_map_on_device and base.device_state is not None:
+            # Device path: expand metadata on device using CuPy fancy indexing.
+            # This avoids the D2H transfer of the inverse map and the base
+            # metadata arrays that the old code path forced.
+            ds = base.device_state
+            d_expanded_validity = ds.validity[index_map]
+            d_expanded_tags = ds.tags[index_map]
+            d_expanded_fro = ds.family_row_offsets[index_map]
+
+            d_meta = DeviceMetadataState(
+                validity=d_expanded_validity,
+                tags=d_expanded_tags,
+                family_row_offsets=d_expanded_fro,
+            )
+
+            view = cls(
+                validity=None,         # host metadata stays lazy
+                tags=None,
+                family_row_offsets=None,
+                families=base.families,
+                residency=Residency.DEVICE,
+                device_state=base.device_state,
+                device_metadata=d_meta,
+                _row_count=index_map_size,
+            )
+            view._base = base
+            # Store CuPy index map directly — no .get()
+            view._index_map = index_map.astype(cp.int64, copy=False)
+        else:
+            # Host path: expand metadata on host via numpy indexing.
+            # This is the original behaviour for take() with numpy indices.
+            h_index_map = np.asarray(index_map, dtype=np.int64)
+            base_validity = base.validity
+            base_tags = base.tags
+            base_family_row_offsets = base.family_row_offsets
+
+            expanded_validity = base_validity[h_index_map]
+            expanded_tags = base_tags[h_index_map]
+            expanded_fro = base_family_row_offsets[h_index_map]
+
+            view = cls(
+                validity=expanded_validity,
+                tags=expanded_tags,
+                family_row_offsets=expanded_fro,
+                families=base.families,
+                residency=base.residency,
+                device_state=base.device_state,
+                device_metadata=base._device_metadata,
+                _row_count=index_map_size,
+            )
+            view._base = base
+            view._index_map = h_index_map
+
+        view._record(
+            DiagnosticKind.CREATED,
+            f"indexed view: {index_map_size} logical rows over "
+            f"{base.row_count} base rows ({base.row_count / max(index_map_size, 1):.1%} unique)",
+            visible=False,
+        )
+        return view
+
+    def _resolve(self) -> OwnedGeometryArray:
+        """Materialise an indexed view into a flat (non-virtual) host array.
+
+        If this is already a flat array, returns ``self`` unchanged.
+        If this is an indexed view with a CuPy index map and a
+        device-resident base, delegates to :meth:`_device_resolve` first,
+        then materialises host buffers.  Otherwise performs the host-side
+        physical take directly.  Returns ``self`` after mutation.
+        """
+        if not self.is_indexed_view:
+            return self
+
+        _map_on_device = (
+            cp is not None
+            and hasattr(self._index_map, "__cuda_array_interface__")
+        )
+
+        if _map_on_device and self._base is not None and self._base.device_state is not None:
+            # Device-resident indexed view: resolve via GPU gather,
+            # then let _ensure_host_state handle the D2H if needed.
+            self._device_resolve()
+            return self
+
+        base = self._base
+        index_map = self._index_map
+        # Perform the physical take on the compact base.
+        # Use _physical_take (not take) to guarantee a flat result --
+        # take() might produce another indexed view if the index_map
+        # itself has high repetition, which would leave self unresolved.
+        resolved = base._physical_take(index_map)
+        # Copy resolved state into self, clearing the indexed-view link.
+        self._validity = resolved._validity
+        self._tags = resolved._tags
+        self._family_row_offsets = resolved._family_row_offsets
+        self.families = resolved.families
+        self.residency = resolved.residency
+        self.device_state = resolved.device_state
+        self._device_metadata = resolved._device_metadata
+        self._base = None
+        self._index_map = None
+        self._record(
+            DiagnosticKind.MATERIALIZATION,
+            f"resolved indexed view: materialised {self._row_count} rows",
+            visible=False,
+        )
+        return self
+
+    def _device_resolve(self) -> OwnedGeometryArray:
+        """Materialise a device-resident indexed view via GPU gather.
+
+        Requires ``_index_map`` to be a CuPy array and the base to have
+        ``device_state``.  Performs ``_physical_device_take`` on the base
+        using the device-resident index map, then copies the resolved
+        device state into ``self``, clearing the indexed-view fields.
+
+        This is the device-side counterpart of :meth:`_resolve` and
+        eliminates the D->H->D round-trip that the old code path forced.
+        """
+        if not self.is_indexed_view:
+            return self
+        base = self._base
+        d_index_map = self._index_map
+        # Physical device take of the base using the CuPy index map.
+        resolved = base._physical_device_take(d_index_map)
+        # Copy resolved state into self, clearing the indexed-view link.
+        self._validity = resolved._validity
+        self._tags = resolved._tags
+        self._family_row_offsets = resolved._family_row_offsets
+        self.families = resolved.families
+        self.residency = resolved.residency
+        self.device_state = resolved.device_state
+        self._device_metadata = resolved._device_metadata
+        self._base = None
+        self._index_map = None
+        self._record(
+            DiagnosticKind.MATERIALIZATION,
+            f"device-resolved indexed view: materialised {self._row_count} rows on GPU",
+            visible=False,
+        )
+        return self
 
     def family_has_rows(self, family: GeometryFamily) -> bool:
         """Check whether *family* has at least one geometry row to process.
@@ -409,6 +595,19 @@ class OwnedGeometryArray:
         family_state.bounds = bounds
 
     def _ensure_device_state(self) -> OwnedGeometryDeviceState:
+        # Indexed views share the base's families dict but have expanded
+        # metadata.  Resolve to a flat array before uploading to device
+        # so that kernels see contiguous per-row coordinate buffers.
+        if self.is_indexed_view:
+            _map_on_device = (
+                cp is not None
+                and hasattr(self._index_map, "__cuda_array_interface__")
+            )
+            if _map_on_device and self._base is not None and self._base.device_state is not None:
+                # Fast path: resolve entirely on device, no D2H round-trip.
+                self._device_resolve()
+            else:
+                self._resolve()
         if self.device_state is not None:
             return self.device_state
         runtime = get_cuda_runtime()
@@ -482,6 +681,20 @@ class OwnedGeometryArray:
         return self.device_state
 
     def _ensure_host_state(self) -> None:
+        # Indexed views share the base's families dict but have expanded
+        # metadata.  Resolve to a flat array before materialising host
+        # buffers so that downstream host consumers see correct per-row data.
+        if self.is_indexed_view:
+            _map_on_device = (
+                cp is not None
+                and hasattr(self._index_map, "__cuda_array_interface__")
+            )
+            if _map_on_device and self._base is not None and self._base.device_state is not None:
+                # Device-resident indexed view: resolve on GPU first,
+                # then fall through to the normal host materialisation below.
+                self._device_resolve()
+            else:
+                self._resolve()
         if self.device_state is None:
             return
         if all(buffer.host_materialized for buffer in self.families.values()):
@@ -565,6 +778,13 @@ class OwnedGeometryArray:
             )
         if len(arrays) == 1:
             return arrays[0]
+
+        # Resolve any indexed views before concatenation — their families
+        # dict is shared with a base array and would produce incorrect
+        # family_row_offsets when combined with other arrays.
+        for arr in arrays:
+            if arr.is_indexed_view:
+                arr._resolve()
 
         # --- Device-resident fast path ---
         all_device = (
@@ -773,6 +993,13 @@ class OwnedGeometryArray:
             ],
         }
 
+    # Repetition threshold for indexed-view optimisation.  When
+    # unique_count / total_count < threshold AND total_count exceeds
+    # _INDEXED_VIEW_MIN_ROWS, take() returns an indexed view instead
+    # of physically copying coordinate data.
+    _INDEXED_VIEW_RATIO_THRESHOLD: float = 0.5
+    _INDEXED_VIEW_MIN_ROWS: int = 1000
+
     def take(self, indices: np.ndarray) -> OwnedGeometryArray:
         """Return a new OwnedGeometryArray containing only the rows at *indices*.
 
@@ -780,6 +1007,17 @@ class OwnedGeometryArray:
         When the array is DEVICE-resident **or** indices are already on device
         (CuPy / ``__cuda_array_interface__``), dispatches to :meth:`device_take`
         to keep all gathering on GPU.  Otherwise returns a HOST-resident array.
+
+        When the indices have high repetition (many output rows mapping to
+        few unique source rows), returns a virtual indexed view that stores
+        only the unique rows and an index map, avoiding the physical
+        coordinate copy.  This is transparent to consumers: kernel dispatch
+        triggers :meth:`_resolve`, and :meth:`to_shapely` expands via cheap
+        Python object references.
+
+        Memory pressure is handled by the ADR-0040 tiered allocator:
+        Tier B (default) retries with gc.collect on OOM; Tier C (opt-in)
+        uses CUDA managed memory for datasets exceeding VRAM.
         """
         # Route to device_take when indices are already on device — avoids
         # a D→H transfer from np.asarray() followed by an H→D re-upload
@@ -796,9 +1034,54 @@ class OwnedGeometryArray:
             )
         ):
             return self.device_take(indices)
-        self._ensure_host_state()
-        if indices.dtype == bool:
+
+        if hasattr(indices, 'dtype') and indices.dtype == bool:
             indices = np.flatnonzero(indices)
+        indices = np.asarray(indices, dtype=np.int64)
+
+        # --- Indexed-view fast path ---
+        # When repetition is high, avoid physical coordinate copy.
+        # Use a cheap sampling heuristic first to avoid the O(n log n) cost
+        # of np.unique when repetition is low.
+        total = indices.size
+        if total >= self._INDEXED_VIEW_MIN_ROWS:
+            sample_size = min(1024, total)
+            sample = indices[np.linspace(0, total - 1, sample_size, dtype=np.int64)]
+            approx_unique = len(set(sample.tolist()))
+            if approx_unique / sample_size >= self._INDEXED_VIEW_RATIO_THRESHOLD:
+                # Low repetition — skip the full unique computation.
+                return self._physical_take(indices)
+            unique_indices, inverse = np.unique(indices, return_inverse=True)
+            unique_count = unique_indices.size
+            if unique_count / max(total, 1) < self._INDEXED_VIEW_RATIO_THRESHOLD:
+                # If self is already an indexed view, compose the maps
+                # so we don't stack indexed views on top of indexed views.
+                if self.is_indexed_view:
+                    # Map through: logical -> self._index_map -> base row
+                    # unique_indices are logical indices into *self* which
+                    # map via _index_map to base rows.
+                    composed_map = self._index_map[unique_indices]
+                    # Build a physical take of just the unique base rows
+                    base_unique, base_inverse = np.unique(composed_map, return_inverse=True)
+                    physical_base = self._base.take(base_unique)
+                    # The final inverse: for each output row, which base_unique row?
+                    final_inverse = base_inverse[inverse]
+                    return OwnedGeometryArray._indexed_view(physical_base, final_inverse)
+
+                # Standard case: build physical take of unique rows only.
+                physical_base = self._physical_take(unique_indices)
+                return OwnedGeometryArray._indexed_view(physical_base, inverse)
+
+        # --- Physical copy path (original behaviour) ---
+        return self._physical_take(indices)
+
+    def _physical_take(self, indices: np.ndarray) -> OwnedGeometryArray:
+        """Perform a physical (non-virtual) take, copying coordinate data."""
+        # If this is an indexed view, resolve first so we have contiguous
+        # buffers to gather from.
+        if self.is_indexed_view:
+            self._resolve()
+        self._ensure_host_state()
         indices = np.asarray(indices, dtype=np.int64)
         new_validity = self.validity[indices]
         new_tags = self.tags[indices]
@@ -831,10 +1114,13 @@ class OwnedGeometryArray:
         Accepts numpy or CuPy indices/mask.  Returns a DEVICE-resident
         OwnedGeometryArray with host buffers marked ``host_materialized=False``.
         The host side is lazily populated by :meth:`_ensure_host_state` on demand.
+
+        When indices have high repetition, returns a virtual indexed view
+        instead of performing a full device gather.  See :meth:`take` for
+        the design rationale.
         """
         if cp is None:
             raise RuntimeError("CuPy is required for device_take")
-        d_state = self._ensure_device_state()
 
         # Accept numpy or CuPy indices — skip H→D upload when indices
         # are already on device (Phase 3: vibeSpatial-p23.3).
@@ -848,6 +1134,33 @@ class OwnedGeometryArray:
             d_indices = cp.flatnonzero(d_indices).astype(cp.int64)
         else:
             d_indices = d_indices.astype(cp.int64, copy=False)
+
+        # --- Indexed-view fast path ---
+        # Use a cheap sampling heuristic to avoid the O(n log n) cost of
+        # cp.unique when repetition is low.
+        total = int(d_indices.size)
+        if total >= self._INDEXED_VIEW_MIN_ROWS:
+            sample_size = min(1024, total)
+            d_sample = d_indices[cp.linspace(0, total - 1, sample_size, dtype=cp.int64)]
+            approx_unique = int(cp.unique(d_sample).size)
+            if approx_unique / sample_size >= self._INDEXED_VIEW_RATIO_THRESHOLD:
+                return self._physical_device_take(d_indices)
+            d_unique_indices, d_inverse = cp.unique(d_indices, return_inverse=True)
+            unique_count = int(d_unique_indices.size)
+            if unique_count / max(total, 1) < self._INDEXED_VIEW_RATIO_THRESHOLD:
+                # Physical take of only the unique rows (on device)
+                physical_base = self._physical_device_take(d_unique_indices)
+                # Pass the CuPy inverse map directly -- no D2H transfer.
+                # _indexed_view detects the CuPy array and expands metadata
+                # on device, keeping the entire path GPU-resident.
+                return OwnedGeometryArray._indexed_view(physical_base, d_inverse)
+
+        # --- Physical copy path ---
+        return self._physical_device_take(d_indices)
+
+    def _physical_device_take(self, d_indices) -> OwnedGeometryArray:
+        """Perform a physical (non-virtual) device-side take."""
+        d_state = self._ensure_device_state()
 
         d_new_validity = d_state.validity[d_indices]
         d_new_tags = d_state.tags[d_indices]
@@ -911,6 +1224,33 @@ class OwnedGeometryArray:
         return result
 
     def to_shapely(self) -> list[object | None]:
+        # Indexed-view fast path: materialize only the compact base array
+        # (e.g. 38K unique polygons) and expand via index map (76.8M Python
+        # object references).  This avoids materializing 76.8M coordinate
+        # rows -- Shapely objects are refcounted, so the reference expansion
+        # is nearly free.
+        if self.is_indexed_view:
+            base_shapely = self._base.to_shapely()
+            # Convert to numpy object array for O(1) index-map expansion
+            base_arr = np.empty(len(base_shapely), dtype=object)
+            base_arr[:] = base_shapely
+            # If the index map is device-resident (CuPy), bring it to host
+            # for the numpy object-array expansion.  This is an intentional
+            # D2H transfer of the small index map only -- NOT the coordinate
+            # buffers -- and is required because Shapely objects are
+            # CPU-only Python objects.
+            h_index_map = self._index_map
+            if cp is not None and hasattr(h_index_map, "__cuda_array_interface__"):
+                h_index_map = h_index_map.get()
+            expanded = base_arr[h_index_map]
+            self._record(
+                DiagnosticKind.MATERIALIZATION,
+                f"materialized shapely geometries (indexed view: "
+                f"{self._base.row_count} base -> {self._row_count} expanded)",
+                visible=True,
+            )
+            return list(expanded)
+
         if self.residency is Residency.DEVICE:
             self.move_to(
                 Residency.HOST,
@@ -1745,11 +2085,187 @@ def _finalize_family_buffer(family: GeometryFamily, state: dict[str, Any]) -> Fa
     )
 
 
+def _from_shapely_vectorized(
+    geom_arr: np.ndarray,
+    *,
+    residency: Residency = Residency.HOST,
+) -> OwnedGeometryArray | None:
+    """Fast vectorized path for building OwnedGeometryArray from Shapely.
+
+    Uses ``shapely.get_coordinates``, ``shapely.get_rings``, and vectorized
+    offset arithmetic instead of per-geometry Python iteration.  Returns
+    ``None`` when the input contains geometry types that this fast path does
+    not handle, so the caller can fall through to the scalar loop.
+
+    Currently supports homogeneous arrays of:
+    - Point (type_id 0)
+    - LineString (type_id 1)
+    - Polygon (type_id 3)
+    - Mixed arrays containing only the above three types
+    """
+    n = len(geom_arr)
+    if n == 0:
+        return None
+
+    validity = ~shapely.is_missing(geom_arr)
+    valid_mask = validity.copy()
+    # Also mark empty as valid-but-empty (is_missing covers None)
+    valid_geoms = geom_arr[valid_mask]
+    if len(valid_geoms) == 0:
+        # All null -- fall through to scalar path for simplicity
+        return None
+
+    type_ids = shapely.get_type_id(valid_geoms)
+    unique_types = np.unique(type_ids)
+
+    # Only handle Point(0), LineString(1), Polygon(3)
+    _SUPPORTED_TYPE_IDS = np.array([0, 1, 3])
+    if not np.isin(unique_types, _SUPPORTED_TYPE_IDS).all():
+        return None
+
+    empty_flags = shapely.is_empty(valid_geoms)
+    tags = np.full(n, NULL_TAG, dtype=np.int8)
+    family_row_offsets = np.full(n, -1, dtype=np.int32)
+    families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+
+    # Map type_id -> family
+    _type_to_family = {
+        0: GeometryFamily.POINT,
+        1: GeometryFamily.LINESTRING,
+        3: GeometryFamily.POLYGON,
+    }
+
+    valid_indices = np.flatnonzero(valid_mask)
+
+    for tid in sorted(unique_types):
+        family = _type_to_family[int(tid)]
+        fam_local_mask = type_ids == tid
+        fam_global_indices = valid_indices[fam_local_mask]
+        fam_geoms = valid_geoms[fam_local_mask]
+        fam_empty = empty_flags[fam_local_mask]
+        fam_count = len(fam_geoms)
+        fam_non_empty = fam_geoms[~fam_empty]
+
+        tags[fam_global_indices] = FAMILY_TAGS[family]
+        family_row_offsets[fam_global_indices] = np.arange(fam_count, dtype=np.int32)
+
+        if family is GeometryFamily.POINT:
+            if len(fam_non_empty) > 0:
+                coords = shapely.get_coordinates(fam_non_empty)
+                x = coords[:, 0].astype(np.float64, copy=True)
+                y = coords[:, 1].astype(np.float64, copy=True)
+            else:
+                x = np.empty(0, dtype=np.float64)
+                y = np.empty(0, dtype=np.float64)
+            # Points: geometry_offsets[i] = index into coord array
+            # Each non-empty point contributes 1 coord
+            go = np.zeros(fam_count + 1, dtype=np.int32)
+            go[1:] = np.cumsum(~fam_empty)
+            families[family] = FamilyGeometryBuffer(
+                family=family,
+                schema=get_geometry_buffer_schema(family),
+                row_count=fam_count,
+                x=x, y=y,
+                geometry_offsets=go,
+                empty_mask=fam_empty.copy(),
+            )
+
+        elif family is GeometryFamily.LINESTRING:
+            if len(fam_non_empty) > 0:
+                coords = shapely.get_coordinates(fam_non_empty)
+                x = coords[:, 0].astype(np.float64, copy=True)
+                y = coords[:, 1].astype(np.float64, copy=True)
+                num_coords = shapely.get_num_coordinates(fam_non_empty)
+            else:
+                x = np.empty(0, dtype=np.float64)
+                y = np.empty(0, dtype=np.float64)
+                num_coords = np.empty(0, dtype=np.int32)
+            # geometry_offsets: start index in coord array per geometry
+            # Empty geometries contribute 0 coords
+            all_num_coords = np.zeros(fam_count, dtype=np.int32)
+            all_num_coords[~fam_empty] = num_coords
+            go = np.zeros(fam_count + 1, dtype=np.int32)
+            np.cumsum(all_num_coords, out=go[1:])
+            families[family] = FamilyGeometryBuffer(
+                family=family,
+                schema=get_geometry_buffer_schema(family),
+                row_count=fam_count,
+                x=x, y=y,
+                geometry_offsets=go,
+                empty_mask=fam_empty.copy(),
+            )
+
+        elif family is GeometryFamily.POLYGON:
+            if len(fam_non_empty) > 0:
+                # Get all rings with parent geometry index
+                rings, ring_parents = shapely.get_rings(fam_non_empty, return_index=True)
+                ring_coords = shapely.get_coordinates(rings)
+                x = ring_coords[:, 0].astype(np.float64, copy=True)
+                y = ring_coords[:, 1].astype(np.float64, copy=True)
+                ring_num_coords = shapely.get_num_coordinates(rings)
+
+                # ring_offsets: start index in coord array per ring
+                ro = np.zeros(len(rings) + 1, dtype=np.int32)
+                np.cumsum(ring_num_coords, out=ro[1:])
+
+                # Rings per non-empty geometry
+                rings_per_ne = np.bincount(ring_parents, minlength=len(fam_non_empty)).astype(np.int32)
+            else:
+                x = np.empty(0, dtype=np.float64)
+                y = np.empty(0, dtype=np.float64)
+                ro = np.zeros(1, dtype=np.int32)
+                rings_per_ne = np.empty(0, dtype=np.int32)
+
+            # geometry_offsets: index into ring_offsets per geometry
+            # Empty polygons contribute 0 rings
+            all_rings_per = np.zeros(fam_count, dtype=np.int32)
+            all_rings_per[~fam_empty] = rings_per_ne
+            go = np.zeros(fam_count + 1, dtype=np.int32)
+            np.cumsum(all_rings_per, out=go[1:])
+            families[family] = FamilyGeometryBuffer(
+                family=family,
+                schema=get_geometry_buffer_schema(family),
+                row_count=fam_count,
+                x=x, y=y,
+                geometry_offsets=go,
+                empty_mask=fam_empty.copy(),
+                ring_offsets=ro,
+            )
+
+    array = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=families,
+        residency=Residency.HOST,
+    )
+    array._record(
+        DiagnosticKind.CREATED,
+        "created owned geometry array from shapely input (vectorized fast path)",
+        visible=True,
+    )
+    if residency is Residency.DEVICE:
+        array.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="created owned geometry array with device residency requested",
+        )
+    return array
+
+
 def from_shapely_geometries(
     geometries: list[object | None] | tuple[object | None, ...],
     *,
     residency: Residency = Residency.HOST,
 ) -> OwnedGeometryArray:
+    # Try vectorized fast path first (50x faster for common types)
+    geom_arr = np.empty(len(geometries), dtype=object)
+    geom_arr[:] = geometries
+    result = _from_shapely_vectorized(geom_arr, residency=residency)
+    if result is not None:
+        return result
+
+    # Scalar fallback for multi-types and mixed geometry collections
     validity = np.asarray([geometry is not None for geometry in geometries], dtype=bool)
     tags = np.full(len(geometries), NULL_TAG, dtype=np.int8)
     family_row_offsets = np.full(len(geometries), -1, dtype=np.int32)
@@ -2257,3 +2773,126 @@ def tile_single_row(
             residency=Residency.HOST,
         )
     return result
+
+
+def materialize_broadcast(tiled: OwnedGeometryArray) -> OwnedGeometryArray:
+    """Physically replicate coordinate buffers in a tiled owned array.
+
+    :func:`tile_single_row` creates an N-row metadata facade that shares
+    the 1-row coordinate buffers.  GPU kernels that index into family
+    buffers by global row index require ``family_buf.row_count == n``.
+    This function converts the metadata-only tile into a fully-
+    materialized array where each family buffer has ``n`` physical rows
+    with replicated coordinate data.
+
+    The operation is O(N * vertices_per_geometry) in coordinate copies
+    but avoids per-element Python loops and the Shapely round-trip that
+    would otherwise be required.  It is only called for the GPU path
+    of broadcast-right constructive operations.
+
+    Parameters
+    ----------
+    tiled
+        An :class:`OwnedGeometryArray` produced by :func:`tile_single_row`
+        (N-row metadata, 1-row family buffers with all
+        ``family_row_offsets == 0``).
+
+    Returns
+    -------
+    OwnedGeometryArray
+        Same metadata but with physically replicated family buffers
+        where ``family_buf.row_count == tiled.row_count``.
+    """
+    n = tiled.row_count
+    tiled._ensure_host_state()
+
+    new_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+    for family, buf in tiled.families.items():
+        if buf.row_count == 0:
+            new_families[family] = buf
+            continue
+
+        # How many rows in the tiled array belong to this family?
+        family_tag = FAMILY_TAGS[family]
+        family_n = int(np.sum(tiled.tags == family_tag))
+        if family_n == 0 or buf.row_count >= family_n:
+            # Already materialized or empty -- keep as-is.
+            new_families[family] = buf
+            continue
+
+        # The source has 1 geometry row; replicate it family_n times.
+        # Coordinate span for the single source row.
+        src_geom_start = int(buf.geometry_offsets[0])
+        src_geom_end = int(buf.geometry_offsets[1])
+        src_n_rings = src_geom_end - src_geom_start
+
+        if buf.ring_offsets is not None:
+            src_coord_start = int(buf.ring_offsets[src_geom_start])
+            src_coord_end = int(buf.ring_offsets[src_geom_end])
+        else:
+            src_coord_start = 0
+            src_coord_end = len(buf.x)
+
+        # Replicate coordinates: tile the single row's coords N times.
+        src_x = buf.x[src_coord_start:src_coord_end]
+        src_y = buf.y[src_coord_start:src_coord_end]
+        new_x = np.tile(src_x, family_n)
+        new_y = np.tile(src_y, family_n)
+
+        # Build geometry_offsets: each row has src_n_rings rings.
+        # [0, R, 2R, ..., family_n*R]
+        new_geom_offsets = np.arange(family_n + 1, dtype=np.int32) * src_n_rings
+
+        # Build ring_offsets (if present): each ring has the same length.
+        new_ring_offsets = None
+        if buf.ring_offsets is not None:
+            src_ring_lens = np.diff(
+                buf.ring_offsets[src_geom_start:src_geom_end + 1]
+            )
+            # Tile ring lengths, then cumulative sum with leading 0.
+            tiled_ring_lens = np.tile(src_ring_lens, family_n)
+            new_ring_offsets = np.empty(
+                len(tiled_ring_lens) + 1, dtype=np.int32,
+            )
+            new_ring_offsets[0] = 0
+            np.cumsum(tiled_ring_lens, out=new_ring_offsets[1:])
+
+        # Build part_offsets (if present, for multi-geometries).
+        new_part_offsets = None
+        if buf.part_offsets is not None:
+            src_n_parts = int(buf.part_offsets[1]) - int(buf.part_offsets[0])
+            new_part_offsets = np.arange(
+                family_n + 1, dtype=np.int32,
+            ) * src_n_parts
+
+        # Replicate empty_mask.
+        new_empty_mask = np.repeat(buf.empty_mask[:1], family_n)
+
+        new_families[family] = FamilyGeometryBuffer(
+            family=family,
+            schema=buf.schema,
+            row_count=family_n,
+            x=new_x,
+            y=new_y,
+            geometry_offsets=new_geom_offsets,
+            empty_mask=new_empty_mask,
+            part_offsets=new_part_offsets,
+            ring_offsets=new_ring_offsets,
+        )
+
+    # Build new family_row_offsets that map to 0..family_n-1 (not all 0).
+    # Vectorized per-tag cumulative count (VPAT001: no per-element Python loops).
+    new_fro = np.full(n, -1, dtype=np.int32)
+    for tag_val in np.unique(tiled.tags):
+        if tag_val == NULL_TAG:
+            continue
+        mask = tiled.tags == tag_val
+        new_fro[mask] = np.arange(int(mask.sum()), dtype=np.int32)
+
+    return OwnedGeometryArray(
+        validity=tiled.validity.copy(),
+        tags=tiled.tags.copy(),
+        family_row_offsets=new_fro,
+        families=new_families,
+        residency=Residency.HOST,
+    )

@@ -803,6 +803,11 @@ def _centroid_cpu(
     owned: OwnedGeometryArray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """CPU centroid for all geometry families using NumPy."""
+    # Ensure host buffers are populated -- device_take creates stub host
+    # buffers with host_materialized=False that must be hydrated before
+    # any host-side computation.
+    owned._ensure_host_state()
+
     row_count = owned.row_count
     cx = np.full(row_count, np.nan, dtype=np.float64)
     cy = np.full(row_count, np.nan, dtype=np.float64)
@@ -1006,9 +1011,15 @@ def centroid_owned(
                 coord_min = min(coord_min, float(buf.x.min()), float(buf.y.min()))
                 coord_max = max(coord_max, float(buf.x.max()), float(buf.y.max()))
         span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
+        # The centroid shoelace formula involves products of coordinates
+        # (xi*yi1 - xi1*yi) which require constructive-level precision.
+        # fp32 introduces unacceptable absolute errors even with Kahan
+        # summation and coordinate centering (observed >1 unit error for
+        # coordinate ranges [0, 1000]).  Request CONSTRUCTIVE precision
+        # planning to guarantee fp64 compute on consumer GPUs.
         precision_plan = select_precision_plan(
             runtime_selection=selection,
-            kernel_class=KernelClass.METRIC,
+            kernel_class=KernelClass.CONSTRUCTIVE,
             requested=precision,
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
         )

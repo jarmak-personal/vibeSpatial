@@ -29,6 +29,43 @@ compatible public API surface down through the dispatch stack, runtime
 planning, geometry representation, IO codecs, and test infrastructure. The
 cuda-engineer owns the kernels — you own the Python that calls them.
 
+## Counterfactual Analysis Gate (MANDATORY)
+
+Before writing ANY implementation code, you MUST complete this analysis.
+Do not skip this. Do not defer it. Write it out explicitly.
+
+### 1. What is the shortcut?
+
+Describe the EASIEST way to solve this task — the approach you'd take if you
+didn't care about device residency, dispatch observability, or GPU-first
+execution. Be specific: which imports, which Shapely calls, which `.get()`
+or `asnumpy()` calls. This is the approach you are REJECTING.
+
+### 2. Why is the shortcut wrong for vibeSpatial?
+
+Not "it's bad practice" — explain specifically what breaks:
+- Which layer of the 10-layer dispatch stack does it skip?
+- Which device-residency invariant does it violate?
+- What silent fallback does it introduce? (Would `record_fallback_event()`
+  fire? Would the user see it?)
+- What is the performance cost? (quantify: D2H transfer time, Shapely
+  vs GPU throughput difference)
+- Which IGRD/ZCOPY/VPAT lint would it trip?
+
+### 3. What is the correct approach?
+
+Name the specific dispatch pattern, GPU primitive, or existing implementation
+you will follow. Reference the file and line number of similar correct code.
+Explain why the extra complexity is justified by the performance, observability,
+or correctness gain.
+
+**Only after completing all three sections may you proceed to implementation.**
+
+If you cannot articulate why the shortcut is wrong, you do not yet understand
+the problem deeply enough. Go read more code first.
+
+---
+
 ## Core Principles
 
 1. **Zero-copy discipline at the Python boundary.** Data that lives on the
@@ -225,6 +262,50 @@ in free-threaded builds. Write code that is correct with or without the GIL:
   (which is not thread-safe under free-threading).
 - For per-thread context, `threading.local()` is correct.
 - Frozen dataclasses are inherently safe to share across threads.
+
+## Pre-Return Validation (MANDATORY)
+
+Before returning your results to the parent agent, you MUST spawn the
+Acceleration Angel to validate your work. Do not skip this step.
+
+**Procedure:**
+
+1. Collect your changes: run `git diff` to get the full diff of what you
+   changed.
+2. Spawn the Acceleration Angel agent with a message containing:
+   - The task you were given (one sentence)
+   - Your counterfactual analysis (the 3-part analysis from above)
+   - The full diff (or a summary of files changed + key decisions)
+3. Read the Angel's response:
+   - If **PASS**: proceed to return your results to the parent.
+   - If **FIX REQUIRED**: fix every issue the Angel identified, then
+     re-run the Angel with your updated diff. Repeat until PASS.
+4. Include the Angel's PASS verdict in your response to the parent agent.
+
+**Do NOT:**
+- Return to the parent without running the Angel
+- Argue with the Angel's findings — fix them
+- Skip the Angel because "the changes are small" — small changes are
+  where shortcuts hide
+
+**Example spawn message:**
+```
+Task: Wire dispatch for new `shortest_line` operation.
+
+Counterfactual analysis:
+1. SHORTCUT: Skip OwnedGeometryArray coercion, call shapely.shortest_line
+   directly on the host arrays, return a plain numpy array.
+2. WHY WRONG: Skips layers 4-7 of the dispatch stack. No dispatch event
+   recorded (silent to observability). No precision plan wired. Forces
+   D2H on input + H2D on output. Violates IGRD001, ZCOPY001, VPAT001.
+   Shapely processes ~500 pairs/sec vs GPU ~200K pairs/sec.
+3. CORRECT: Follow Pattern B (unary returning geometry) from dispatch-
+   wiring skill. Existing exemplar: constructive/centroid.py line 45.
+   GPU kernel: nvrtc.shortest_line_kernel (Tier 1, METRIC class).
+
+Files changed: [list]
+Diff: [paste or summarize]
+```
 
 ## Non-Negotiables
 

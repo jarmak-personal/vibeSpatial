@@ -8,6 +8,7 @@ from vibespatial import ExecutionMode
 from vibespatial.testing import (
     SyntheticSpec,
     assert_matches_shapely,
+    device_residency_guard,
     generate_lines,
     generate_points,
     generate_polygons,
@@ -96,6 +97,25 @@ def synthetic_dataset():
         return generators[spec.geometry_type](spec)
 
     return _factory
+
+
+@pytest.fixture
+def strict_device_guard():
+    """Activate runtime device-residency enforcement.
+
+    Any D2H transfer (cupy .get(), asnumpy, numpy.asarray on device data)
+    inside this fixture's scope raises DeviceResidencyViolation immediately.
+
+    Allowed callers (materialization, oracle comparison) are exempted.
+
+    Usage::
+
+        def test_my_gpu_op(strict_device_guard):
+            result = my_gpu_operation(device_data)
+            # Raises if my_gpu_operation transfers to host
+    """
+    with device_residency_guard("test"):
+        yield
 
 
 @pytest.fixture

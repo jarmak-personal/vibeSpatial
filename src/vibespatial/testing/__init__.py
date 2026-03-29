@@ -16,6 +16,10 @@ from .degeneracy import (
     verify_overlay_case,
     verify_segment_case,
 )
+from .device_guard import (
+    DeviceResidencyViolation,
+    device_residency_guard,
+)
 from .mixed_layouts import (
     DATASET_MIXES,
     GeometryFamily,
@@ -52,6 +56,8 @@ from .synthetic import (
 )
 
 __all__ = [
+    "DeviceResidencyViolation",
+    "device_residency_guard",
     "DATASET_MIXES",
     "DEGENERACY_CORPUS",
     "ORACLE_SCENARIOS",
