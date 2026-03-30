@@ -27,7 +27,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-27.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 23  # FIX-06: polygon DE-9IM return_device eliminates D->H->D ping-pong 2026-03-29
+_VIOLATION_BASELINE = 19  # FIX-08: remove cp.asnumpy early-exit guards in pylibcudf WKB loops 2026-03-29
 # +3 intentional batch D->H in segment_primitives (OOM prevention)
 # +4 materialization D->H in dbf_gpu (DataFrame construction)
 # +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)

@@ -482,9 +482,10 @@ def _build_device_wkb_polygon_family(column, row_indexes):
 
     for ring_idx in range(max_rings):
         # Which polygons have a ring at this index?
+        # No early-exit guard needed: loop bounded by max_rings (from .max()),
+        # so has_ring is guaranteed non-empty for all ring_idx < max_rings.
+        # Masked ops below are no-ops for polygons with fewer rings.
         has_ring = ring_counts > ring_idx
-        if not bool(cp.asnumpy(has_ring.any())):
-            break
 
         # Global ring positions for ring_idx of each polygon
         global_ring_idxs = geometry_offsets_device[:-1][has_ring] + ring_idx
@@ -598,9 +599,10 @@ def _build_device_wkb_multilinestring_family(column, row_indexes):
     current_positions = (starts + 9).copy()
 
     for part_idx in range(max_parts):
+        # No early-exit guard needed: loop bounded by max_parts (from .max()),
+        # so has_part is guaranteed non-empty for all part_idx < max_parts.
+        # Masked ops below are no-ops for rows with fewer parts.
         has_part = part_counts > part_idx
-        if not bool(cp.asnumpy(has_part.any())):
-            break
 
         global_part_idxs = geometry_offsets_device[:-1][has_part] + part_idx
         part_byte_starts[global_part_idxs] = current_positions[has_part]
@@ -684,9 +686,10 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
     # then advance past the entire polygon record.
 
     for poly_idx in range(max_polygons):
+        # No early-exit guard needed: loop bounded by max_polygons (from .max()),
+        # so has_poly is guaranteed non-empty for all poly_idx < max_polygons.
+        # Masked ops below are no-ops for rows with fewer polygons.
         has_poly = polygon_counts > poly_idx
-        if not bool(cp.asnumpy(has_poly.any())):
-            break
 
         global_poly_idxs = geometry_offsets_device[:-1][has_poly] + poly_idx
 
@@ -705,7 +708,8 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
         # masked ops are no-ops for polygons with fewer rings.
         # NOTE: int(.max()) still performs one D2H scalar read per polygon
         # batch (unavoidable — Python needs a host int for range()).
-        # has_poly guaranteed non-empty by outer-loop early-exit at line 688.
+        # has_poly guaranteed non-empty: outer loop bounded by max_polygons
+        # (from .max()), so at least one row has polygon_counts == max_polygons.
         max_rings_here = int(ring_counts_here.max())
         poly_cursors = current_positions[has_poly] + 9  # start of ring data
 
@@ -744,9 +748,10 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
     poly_cursors = poly_ring0_starts.copy()
 
     for ring_idx in range(max_rings):
+        # No early-exit guard needed: loop bounded by max_rings (from .max()),
+        # so has_ring is guaranteed non-empty for all ring_idx < max_rings.
+        # Masked ops below are no-ops for polygons with fewer rings.
         has_ring = poly_ring_counts > ring_idx
-        if not bool(cp.asnumpy(has_ring.any())):
-            break
 
         global_ring_idxs = part_offsets_device[:-1][has_ring] + ring_idx
         ring_byte_starts[global_ring_idxs] = poly_cursors[has_ring]
