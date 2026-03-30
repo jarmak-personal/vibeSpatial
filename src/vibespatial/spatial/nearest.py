@@ -1914,6 +1914,8 @@ def _dwithin_refine_gpu(
     right_idx: np.ndarray,
     per_row_distance: np.ndarray,
     device_candidates: _DeviceCandidates | None = None,
+    *,
+    return_device: bool = False,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """GPU dwithin refinement: distance <= threshold filter.
 
@@ -1922,7 +1924,12 @@ def _dwithin_refine_gpu(
       2. Build per-pair thresholds on device (Tier 2 CuPy)
       3. Apply distance <= threshold filter on device (Tier 2 CuPy)
       4. Compact surviving indices on device (Tier 2 CuPy flatnonzero)
-      5. Single D→H transfer of filtered index arrays
+      5. Single D->H transfer of filtered index arrays (unless return_device)
+
+    When *return_device* is True, the surviving index arrays are returned as
+    CuPy device arrays, avoiding a D->H round-trip when the caller will
+    immediately re-upload them (e.g. the ``return_device`` path in
+    ``query_spatial_index``).
 
     Returns ``(left_idx, right_idx)`` on success, or ``None``
     when the GPU runtime is unavailable.
@@ -1965,11 +1972,14 @@ def _dwithin_refine_gpu(
     d_keep_idx = cp.flatnonzero(d_keep)
 
     if d_keep_idx.size == 0:
-        return np.empty(0, dtype=left_idx.dtype), np.empty(0, dtype=right_idx.dtype)
+        empty = np.empty(0, dtype=left_idx.dtype)
+        if return_device:
+            return cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)
+        return empty, empty
 
     # Gather surviving indices on device.
     if device_candidates is not None and hasattr(device_candidates, "d_left"):
-        # Indices are already on device — gather directly.
+        # Indices are already on device -- gather directly.
         d_left_result = device_candidates.d_left[d_keep_idx]
         d_right_result = device_candidates.d_right[d_keep_idx]
     else:
@@ -1978,7 +1988,11 @@ def _dwithin_refine_gpu(
         d_left_result = d_left_all[d_keep_idx]
         d_right_result = d_right_all[d_keep_idx]
 
-    # --- Single D→H transfer of filtered results ---
+    if return_device:
+        # Keep results on device -- caller will consume them directly.
+        return d_left_result.astype(cp.int32, copy=False), d_right_result.astype(cp.int32, copy=False)
+
+    # --- Single D->H transfer of filtered results ---
     return cp.asnumpy(d_left_result), cp.asnumpy(d_right_result)
 
 

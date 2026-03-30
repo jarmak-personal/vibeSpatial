@@ -2881,7 +2881,7 @@ def _build_polygon_output_from_faces_gpu(
     ring_coord_counts = d_ring_edge_counts + 1
     d_ring_coord_offsets = exclusive_sum(ring_coord_counts.astype(cp.int32, copy=False))
     # Single scalar D->H read: total_coords = last_offset + last_count.
-    total_coords = int(cp.asnumpy(d_ring_coord_offsets[-1:] + ring_coord_counts[-1:])[0])
+    total_coords = int(cp.asnumpy(d_ring_coord_offsets[-1:] + ring_coord_counts[-1:])[0])  # zcopy:ok(allocation-fence: need total_coords to size d_out_x/d_out_y output buffers)
 
     # --- Step 7: Scatter ring coordinates via GPU kernel ---
     # Zero-fill to prevent denormalized garbage in unwritten positions if the
@@ -4815,7 +4815,7 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
     ).astype(cp.uint8, copy=False)
     adjacency_counts = adjacency_mask.astype(cp.int32, copy=False)
     adjacency_offsets = exclusive_sum(adjacency_counts)
-    pair_count = int(cp.asnumpy(adjacency_offsets[-1] + adjacency_counts[-1])) if int(adjacency_counts.size) else 0
+    pair_count = int(cp.asnumpy(adjacency_offsets[-1] + adjacency_counts[-1])) if int(adjacency_counts.size) else 0  # zcopy:ok(allocation-fence: need pair_count to size 6 atomic-edge output buffers)
 
     out_source_ids = runtime.allocate((pair_count * 2,), np.int32)
     out_direction = runtime.allocate((pair_count * 2,), np.int8)

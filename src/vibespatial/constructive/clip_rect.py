@@ -1596,18 +1596,17 @@ def _build_line_clip_device_result(
         line_count = valid_geom_count
 
     # Transfer global_row_map to host (small metadata -- single D2H).
+    # Caller needs host numpy for scatter into host result array.
     global_row_map = cp.asnumpy(d_global_row_map).astype(np.int32)
 
     # ---------------------------------------------------------------
     # 7. Build device-resident OwnedGeometryArray
     # ---------------------------------------------------------------
-    output_empty_mask = np.zeros(line_count, dtype=np.bool_)
+    # Create metadata arrays directly on device to avoid H2D re-uploads.
+    d_empty_mask = cp.zeros(line_count, dtype=cp.bool_)
     output_validity = np.ones(line_count, dtype=np.bool_)
     output_tags = np.full(line_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
     output_family_row_offsets = np.arange(line_count, dtype=np.int32)
-
-    # Upload small metadata arrays to device for DeviceFamilyGeometryBuffer
-    d_empty_mask = cp.asarray(output_empty_mask)
 
     device_families = {
         GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(

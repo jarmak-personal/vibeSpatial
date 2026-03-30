@@ -466,14 +466,17 @@ def query_spatial_index(
             # Host indices needed for tag-based family grouping in the
             # distance dispatch loop; device candidates passed separately
             # for device-side gather of surviving indices after filtering.
-            left_idx, right_idx = device_dist_cands.to_host()
+            left_idx, right_idx = device_dist_cands.to_host()  # zcopy:ok(dwithin threshold indexing: per_row_distance[left_idx] requires host numpy; return_device path returns early with device arrays)
         else:
             left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)
 
         # Try GPU dwithin refinement first.
+        # When return_device is requested, ask _dwithin_refine_gpu to keep
+        # results on device (CuPy arrays) to avoid D->H + H->D round-trip.
         gpu_dwithin = _dwithin_refine_gpu(
             query_owned, tree_owned, left_idx, right_idx, per_row_distance,
             device_candidates=device_dist_cands if gpu_candidate_gen else None,
+            return_device=return_device,
         )
         if gpu_dwithin is not None:
             left_idx, right_idx = gpu_dwithin
@@ -482,6 +485,27 @@ def query_spatial_index(
                 selected=ExecutionMode.GPU,
                 reason="GPU dwithin refinement via distance kernels",
             )
+            # When return_device is True and results are already device-
+            # resident CuPy arrays, return early to avoid the generic
+            # return_device block which would D->H->D round-trip via
+            # cp.asarray.  The _dwithin_refine_gpu(return_device=True)
+            # path keeps indices on device throughout.
+            if return_device and hasattr(left_idx, "__cuda_array_interface__"):
+                import cupy as _cp_dw
+                execution = SpatialQueryExecution(
+                    requested=ExecutionMode.AUTO,
+                    selected=ExecutionMode.GPU,
+                    implementation="owned_gpu_spatial_query",
+                    reason="repo-owned GPU bbox candidate generation with GPU exact predicate refinement",
+                )
+                d_left = left_idx.astype(_cp_dw.int32, copy=False)
+                d_right = right_idx.astype(_cp_dw.int32, copy=False)
+                if sort and d_left.size > 0:
+                    order = _cp_dw.lexsort(_cp_dw.stack([d_right.astype(_cp_dw.int64), d_left.astype(_cp_dw.int64)]))
+                    d_left = d_left[order]
+                    d_right = d_right[order]
+                device_result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+                return (device_result, execution) if return_metadata else device_result
         else:
             # CPU Shapely fallback.
             if query_values is None:
@@ -623,7 +647,7 @@ def query_spatial_index(
 
     # Phase 2 zero-copy: when caller requests device-resident index arrays
     # (e.g., overlay with both sides owned-backed), keep refined indices on
-    # device to feed directly into device_take() — eliminates H→D re-upload.
+    # device to feed directly into device_take() — eliminates H->D re-upload.
     # Only applies to non-scalar "indices" format with GPU execution.
     if (
         return_device
@@ -634,9 +658,18 @@ def query_spatial_index(
     ):
         import cupy as _cp
 
+        # When indices are already device-resident CuPy arrays (e.g. from
+        # _dwithin_refine_gpu with return_device=True), use them directly
+        # to avoid a D->H + H->D round-trip.
+        _already_device = hasattr(left_idx, "__cuda_array_interface__")
+        if _already_device:
+            d_left = left_idx.astype(_cp.int32, copy=False)
+            d_right = right_idx.astype(_cp.int32, copy=False)
+        else:
+            d_left = _cp.asarray(left_idx, dtype=_cp.int32)
+            d_right = _cp.asarray(right_idx, dtype=_cp.int32)
+
         # Sort on device if requested (overlay always passes sort=True).
-        d_left = _cp.asarray(left_idx, dtype=_cp.int32)
-        d_right = _cp.asarray(right_idx, dtype=_cp.int32)
         if sort and d_left.size > 0:
             order = _cp.lexsort(_cp.stack([_cp.asarray(d_right, dtype=_cp.int64), _cp.asarray(d_left, dtype=_cp.int64)]))
             d_left = d_left[order]
