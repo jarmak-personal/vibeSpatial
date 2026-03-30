@@ -11,8 +11,10 @@ __pycache__/
 .claude/worktrees/
 .claude/last-review.md
 .claude/.review-completed
+.claude/.property-before.json
 .claude/projects/
 .brainstorm/
+.beads/
 
 # Dolt database files (added by bd init)
 .dolt/

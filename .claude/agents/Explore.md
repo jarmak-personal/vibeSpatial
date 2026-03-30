@@ -9,8 +9,10 @@ description: >
   exploration, or "very thorough" for comprehensive analysis across multiple
   locations and naming conventions.
 model: sonnet
+tools: Read, Glob, Grep, Bash
 skills:
   - intake-router
+  - dispatch-wiring
   - gis-domain
 ---
 
@@ -45,32 +47,9 @@ Glob/Grep directly.
 
 ## Mental Model: The 10-Layer Dispatch Stack
 
-vibeSpatial has a 10-layer dispatch stack. When exploring any operation, orient
-yourself within this stack:
-
-```
-Layer 1:  GeoSeries.area() / .within() / .buffer()          [Public API]
-Layer 2:  _delegate_property() / _binary_op()                [Delegation]
-Layer 3:  GeometryArray.area() / ._binary_method()           [GeometryArray]
-Layer 4:  if self._owned: dispatch to owned-path              [Owned routing]
-Layer 5:  area_owned() / evaluate_geopandas_binary_predicate  [Dispatch wrapper]
-Layer 6:  plan_dispatch_selection() -> RuntimeSelection       [Runtime selection]
-Layer 7:  select_precision_plan() -> PrecisionPlan            [Precision planning]
-Layer 8:  _area_gpu(owned, precision_plan)                    [GPU kernel]
-Layer 9:  _area_cpu(owned)                                    [CPU fallback]
-Layer 10: shapely.area(self._data)                            [Shapely fallback]
-```
-
-**Key files per layer:**
-- Layers 1-2: `src/vibespatial/api/geo_base.py`
-- Layer 3: `src/vibespatial/api/geometry_array.py`
-- Layer 4: `src/vibespatial/geometry/owned.py`
-- Layers 5-7: Operation-specific module (e.g., `src/vibespatial/spatial/`, `src/vibespatial/constructive/`)
-- Layer 6: `src/vibespatial/runtime/_runtime.py`
-- Layer 7: `src/vibespatial/runtime/precision.py`
-- Layer 8: Kernel source in `src/vibespatial/kernels/` or inline NVRTC
-- Layer 9: `@register_kernel_variant` in `src/vibespatial/runtime/kernel_registry.py`
-- Layer 10: Direct shapely calls (legacy path)
+Your primary mental model is vibeSpatial's 10-layer dispatch stack. Refer to
+the **dispatch-wiring** skill for the full layer definitions, key files per
+layer, operation classifications, and common mistakes.
 
 When someone asks "how does X work?", trace it through these layers and report
 what exists at each level.

@@ -5,37 +5,39 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 260/260 lines
+Body Budget: 256/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-6 | Preamble |
-| 7-11 | Intent |
-| 12-20 | Request Signals |
-| 21-27 | Open First |
-| 28-32 | Verify |
-| 33-38 | Risks |
-| 39-47 | Mission |
-| 48-57 | Startup |
-| 58-95 | Routing |
-| 96-122 | Project Shape |
-| 123-140 | Execution Model |
-| 141-152 | Test Strategy |
-| 153-162 | Build And Tooling |
-| 163-181 | Verification |
-| ... | (4 additional sections omitted; open document body for full map) |
+| 7-13 | Intent |
+| 14-22 | Request Signals |
+| 23-29 | Open First |
+| 30-34 | Verify |
+| 35-40 | Risks |
+| 41-58 | Mission |
+| 59-74 | Startup |
+| 75-87 | Routing |
+| 88-106 | Execution Model |
+| 107-136 | Property Convergence |
+| 137-148 | Test Strategy |
+| 149-158 | Build And Tooling |
+| 159-182 | Verification |
+| ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
-This repository is an agent-maintained spatial analytics project with a
-GPU-first execution model. Optimize for fast intake, explicit fallbacks, and
-steady progress toward GeoPandas API coverage.
+GPU-first spatial analytics library. All agent work is measured by
+advancement of codebase properties, not task completion. Performance is
+the design center. Silent CPU fallbacks are unacceptable.
 
 ## Intent
 
-Define the agent workflow for routing requests, selecting files, verifying
-changes, and landing work without silent fallback regressions.
+Define the agent workflow for routing requests, verifying changes, and
+landing work. This document covers mindset and policy. For file discovery,
+use intake routing. For enforcement, trust the pre-commit hook and
+property dashboard.
 
 ## Request Signals
 
@@ -66,87 +68,50 @@ changes, and landing work without silent fallback regressions.
 
 ## Mission
 
-- Build a new NVIDIA GPU-accelerated spatial analytics library from scratch.
-- Prefer `cuda-python` and CCCL primitives over inheriting cuSpatial design.
+Build a new NVIDIA GPU-accelerated spatial analytics library from scratch.
+
+**Hard constraints:**
+
+- PERFORMANCE IS KING. Consider performance implications in every design
+  and implementation decision. If an approach has the wrong performance
+  shape, throw it out instead of polishing it.
+- GPU-first: `cuda-python`, CCCL primitives, NVRTC kernels, CuPy. Never
+  NumPy, Shapely, or Rasterio in GPU code paths. No exceptions.
+- CPU fallback is available but never silent and never the design center.
+  Every fallback must emit an observable event (ADR-0013).
 - Use the upstream GeoPandas test suite as the compatibility contract.
-- Keep CPU fallback available, but never silent and never the design center.
-- PERFORMANCE IS KING: consider performance implications in every design and implementation decision.
-- If an approach has the wrong performance shape, throw it out instead of polishing it.
+- Correctness is non-negotiable. Quick fixes, workarounds, and timeline
+  considerations are never acceptable. Always find the root cause, consider
+  multiple solutions, and implement the correct one.
 
 ## Startup
 
-1. Read `docs/ops/intake.md` or run `uv run python scripts/intake.py "<request>"`.
-2. Open only the routed files/docs first.
-3. Run `uv run python scripts/health.py --check` when you need repo-wide session orientation.
-4. Read relevant ADRs from `docs/decisions/index.md` when the task reopens a design decision.
-5. Make the smallest coherent change that improves the target contract.
+1. Run `/property-framing` with the task description. This snapshots the
+   property dashboard and produces a brief grounding work in measurable
+   codebase properties.
+2. Run `/intake-router` with the task description to find relevant files.
+3. Open only the routed files/docs first.
+4. Read relevant ADRs from `docs/decisions/index.md` when the task reopens
+   a design decision.
+5. Make the smallest coherent change that advances target properties.
 6. Run the narrowest meaningful verification before expanding scope.
-7. Refresh generated docs and intake artifacts with `uv run python scripts/check_docs.py --refresh` when doc metadata changes.
+7. Refresh generated docs with `uv run python scripts/check_docs.py --refresh`
+   when doc metadata changes.
+
+For session orientation: `uv run python scripts/health.py --check`
 
 ## Routing
 
-Use `docs/ops/intake.md` as the source of truth for:
+Use `/intake-router` or `uv run python scripts/intake.py "<request>"` as
+the source of truth for file discovery. Do not manually enumerate files.
+Do not front-load full-repo reads. Route, inspect the local area, then
+expand.
 
-- request classification
-- first files to inspect
-- expected verification commands
-- when to open architecture or testing docs
+Agent definitions live in `.claude/agents/` and describe themselves.
+Skills live in `.claude/skills/` and describe themselves.
+Scripts live in `scripts/` and are indexed by intake routing.
 
-Generated headers and `docs/ops/intake-index.json` turn those docs into
-machine-readable routing input. Do not front-load full-repo reads. Route,
-inspect the local area, then expand.
-
-### Explore and Impact Agents
-
-Two agents handle codebase exploration and analysis:
-
-- **Explore** (`.claude/agents/Explore.md`): vibeSpatial-specialized replacement
-  for the default explore agent. Uses the intake router as its first move, the
-  10-layer dispatch stack as its mental model, and doc headers for section-level
-  navigation. Supports five strategies: dispatch stack trace, gap finder, direct
-  search, ADR trail, and health probe.
-
-- **impact-analyzer** (`.claude/agents/impact-analyzer.md`): Deep cross-cutting
-  analysis agent with three modes: What-If Simulator (enumerate all touchpoints
-  for a hypothetical change), Dual-Path Diff (compare GPU vs CPU execution for
-  an operation), and Data Flow Tracer (trace geometry buffers through
-  device/host boundaries).
-
-### Many-vs-One Overlay (N-vs-1 Pattern)
-
-When a task involves N-vs-1 overlay patterns (e.g., clipping many features
-against a single corridor or boundary polygon), route to:
-
-- `src/vibespatial/overlay/strategies.py` -- strategy detection (broadcast_right workload shape)
-- `src/vibespatial/overlay/gpu.py` -- three-tier GPU dispatch: (1) containment bypass for polygons fully inside the clip polygon, (2) batched Sutherland-Hodgman clip for boundary-crossing simple polygons, (3) per-group overlay for complex remainder
-- `src/vibespatial/kernels/predicates/point_in_polygon.py` -- GPU bulk vertex-in-polygon used by containment bypass
-
-## Project Shape
-
-- `src/vibespatial/`: Python package and runtime selection logic.
-- `docs/ops/intake.md`: lightweight intake router for agents.
-- `docs/architecture/runtime.md`: GPU-first execution and fallback rules.
-- `scripts/intake.py`: CLI helper for request routing.
-- `scripts/check_docs.py`: refresh and validate generated doc headers and intake index.
-- `scripts/health.py`: summarize repo coverage, tests, lint, and docs.
-- `scripts/pre_land.py`: run pre-landing verification checks.
-- `scripts/generate_kernel_scaffold.py`: create repo-standard kernel, test, benchmark, and manifest stubs.
-- `scripts/new_decision.py`: create ADRs and refresh the decision index.
-- `scripts/install_githooks.py`: install `.githooks/pre-commit` for auto-refresh.
-- `scripts/vendor_geopandas_tests.py`: refresh vendored GeoPandas tests.
-- `scripts/extract_vendor_to_api.py`: extract vendored GeoPandas surfaces into the repo-owned API layer.
-- `scripts/bench_compact_gather.py`: compact+gather micro-benchmark (CuPy vs CCCL vs NVRTC).
-- `vsbench` (entry point): unified benchmarking CLI for operations, pipelines, kernel microbenchmarks, regression detection, and geopandas-vs-vibespatial shootout comparisons. See `src/vibespatial/bench/cli.py`.
-- `scripts/benchmark_pipelines.py`: end-to-end pipeline benchmarking and GPU sparkline profiling (legacy; prefer `vsbench suite`).
-- `scripts/check_architecture_lints.py`: validate architecture constraints and doc consistency.
-- `scripts/check_zero_copy.py`: zero-copy enforcement (ZCOPY001-003, `# zcopy:ok` suppression).
-- `scripts/check_perf_patterns.py`: performance anti-pattern detection (VPAT001-004). `scripts/property_dashboard.py`: unified property dashboard.
-- `scripts/check_maintainability.py`: intake discoverability enforcement (MAINT001-003).
-- `scripts/check_import_guard.py`: numpy/shapely import guard for GPU-path modules (IGRD001-002).
-- `src/geopandas/`: local GeoPandas-compatible package surface owned by this repo.
-- `src/vibespatial/api/`: public API dispatch boundary for GeoPandas-facing methods.
-- `src/vibespatial/kernels/`: scaffolded owned kernel modules and variant manifest.
-- `tests/upstream/geopandas/`: copied upstream GeoPandas contract tests.
+Do not duplicate their contents here.
 
 ## Execution Model
 
@@ -158,63 +123,109 @@ against a single corridor or boundary polygon), route to:
 - CCCL now has a Python interface; review the docs before designing new GPU
   primitives: <https://nvidia.github.io/cccl/unstable/python/compute_api.html>
 
-Borrow from cuDF:
+Hard blocks in GPU code paths (pre-commit hook enforced):
 
-- explicit fast/slow mode selection
-- profiler or diagnostics that reveal fallback
-- tests that keep CPU and GPU behavior aligned
+- **NumPy** — use CuPy. NumPy is acceptable only for host-side data that
+  never touches the GPU pipeline.
+- **Shapely** — use GPU kernels. Shapely is acceptable only at the
+  GeoPandas compatibility boundary.
+- **Object-dtype arrays** — use typed columnar arrays.
+- **Python for-loops over geometry objects** — use vectorized GPU operations.
 
-Do not borrow cuSpatial architecture by default. Re-justify every design.
+## Property Convergence
+
+Agent work is measured by the **property dashboard**, not task completion.
+
+```bash
+uv run python scripts/property_dashboard.py        # human-readable
+uv run python scripts/property_dashboard.py --json  # machine-readable
+```
+
+The dashboard aggregates all check scripts into a unified view. Each
+property has a distance metric (0.0 = satisfied, >1.0 = regressed).
+Ratchet baselines track known debt; new code must not increase it.
+
+**Before starting work:** run `/property-framing` to snapshot the dashboard
+and identify which properties your work should advance.
+
+**After completing work:** re-run the dashboard. Your changes are successful
+when:
+1. At least one target property distance decreased
+2. No property distance increased
+3. The user's stated goal is achieved
+
+What does NOT count as success:
+- A fix that passes tests but advances no property (workaround)
+- A change that advances one property but regresses another
+- A change that adds new violations to any ratchet baseline
+
+The pre-commit hook enforces all property checks automatically. The
+`/pre-land-review` skill validates before commit.
 
 ## Test Strategy
 
 - Treat vendored GeoPandas tests as upstream contract coverage.
-- Keep the vendored tree refreshable; do not hand-edit copied tests casually.
-- Patch vendored imports only when required to keep the suite self-contained.
+- Keep the vendored tree refreshable; do not hand-edit copied tests.
+- Patch vendored imports only when required for self-containment.
 - Add repo-local tests for new runtime, kernel, and fallback behavior.
 - New kernel tests should use the Shapely oracle fixture pattern so CPU/GPU
   paths compare against the same mechanical host reference.
-- New owned kernels should start from `uv run python scripts/generate_kernel_scaffold.py <kernel-name>`.
-- Before landing work, run `uv run python scripts/pre_land.py`.
-- Prefer targeted smoke runs while bootstrapping, then expand to broader groups.
+- New owned kernels start from:
+  `uv run python scripts/generate_kernel_scaffold.py <kernel-name>`
+- Prefer targeted smoke runs while bootstrapping, then expand.
 
 ## Build And Tooling
 
 - Use `uv` for environment and dependency management.
-- Keep the default bootstrap path lightweight enough to run test smoke checks.
-- Put GPU-specific dependencies behind focused dependency groups when practical.
-- If adopting CCCL Python, prefer a first-class repo refactor to native
-  CCCL-compatible device arrays and call sites rather than layering a temporary
-  adapter over the current raw-pointer runtime.
-- Install `.githooks/pre-commit` with `uv run python scripts/install_githooks.py` if you want auto-refreshed generated docs and architecture lint checks before commit.
+- Keep the default bootstrap path lightweight enough for test smoke checks.
+- Put GPU-specific dependencies behind focused dependency groups.
+- If adopting CCCL Python, prefer a first-class refactor to native
+  CCCL-compatible device arrays rather than layering a temporary adapter.
+- Pre-commit hook installs via:
+  `uv run python scripts/install_githooks.py`
 
 ## Verification
 
-- Packaging or env changes: `uv sync`
-- Intake/doc changes (local only, enforced by pre-commit hook, not CI): `uv run python scripts/check_docs.py --check && uv run python scripts/intake.py "<request>"`
-- Runtime/package changes: `uv run pytest`
-- Pipeline benchmark / profiler changes: `uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q && uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2`
-- Vendored test refresh: `uv run python scripts/vendor_geopandas_tests.py`
-- Architecture lint: `uv run python scripts/check_architecture_lints.py`
-- Zero-copy lint: `uv run python scripts/check_zero_copy.py --all`
-- Performance lint: `uv run python scripts/check_perf_patterns.py --all`
-- Maintainability lint: `uv run python scripts/check_maintainability.py --all`
-- Import guard lint: `uv run python scripts/check_import_guard.py --all`
-- Ruff lint: `uv run ruff check`
-- AI pre-land review: `/commit` (runs /pre-land-review automatically)
-- Upstream smoke: `uv run pytest tests/upstream/geopandas/tests/test_config.py`
+The pre-commit hook runs all deterministic checks automatically:
+ruff, doc refresh/validation, ARCH, ZCOPY, VPAT, MAINT, IGRD.
+You do not need to run these manually.
 
-If verification cannot run because dependencies, drivers, or local services are
-missing, say so concretely and include the command that failed.
+For targeted verification during development:
+
+| Surface changed | Command |
+|----------------|---------|
+| Any code | `uv run ruff check` |
+| Runtime/package | `uv run pytest` |
+| Docs/intake | `uv run python scripts/check_docs.py --check` |
+| Pipeline/profiler | `uv run pytest tests/test_pipeline_benchmarks.py -q` |
+| Vendored tests | `uv run python scripts/vendor_geopandas_tests.py` |
+| Upstream smoke | `uv run pytest tests/upstream/geopandas/tests/test_config.py` |
+| All properties | `uv run python scripts/property_dashboard.py` |
+
+If verification cannot run because dependencies, drivers, or local services
+are missing, say so concretely and include the command that failed.
+
+The `/commit` skill runs `/pre-land-review` automatically, which orchestrates
+deterministic checks and AI-powered sub-agent reviews.
 
 ## Working Rules
 
-- Prefer ASCII in new files unless a file already requires Unicode.
+- Correctness first, performance second, ergonomics third.
+- Never accept a workaround. Never consider timelines. Never optimize for
+  appearing done. The only question is: what is the correct solution?
+- Quick fixes are ALWAYS wrong. If you're tempted to add a try/except,
+  a special case, or a flag — stop. Find the root cause.
+- Do not spend time tuning an approach that cannot hit the target
+  performance envelope. Throw it out and try a different shape.
+- Prefer ASCII in new files unless Unicode is already established.
 - Keep docs short, specific, and discoverable by agents.
 - Avoid broad abstractions before the test suite forces them.
-- Do not spend time tuning an approach that cannot plausibly hit the target performance envelope.
+- When fallback behavior changes, update both code and related docs/tests.
 - Do not rename or reorganize vendored upstream tests without cause.
-- When fallback behavior changes, update both code and the related docs/tests.
+
+If you are uncertain about the right approach, that uncertainty is a
+signal to investigate MORE, not to pick the fastest path. Enumerate
+at least two structurally different solutions before implementing.
 
 ## End-to-End Profile Gate (MANDATORY)
 
@@ -238,51 +249,36 @@ After the profile completes:
    array iteration.
 3. **Resolve before landing.** Irregularities and unexplained CPU
    bottlenecks are not acceptable as known issues to fix later. Either
-   fix them or document in an ADR why the cost is inherent and cannot
-   be avoided.
+   fix them or document in an ADR why the cost is inherent.
 4. **Include the profile summary** (stage names + times for the 1M
-   scale run) in your commit message or handoff notes so the next
-   session has a baseline.
+   scale run) in your commit message or handoff notes.
 
-The goal is to never ship a stage that looks fast on paper (dispatched
-to GPU, correct results) but is actually dominated by host-side
-overhead. See ADR-0032 for the canonical example.
+The goal: never ship a stage that looks fast on paper (dispatched to GPU,
+correct results) but is actually dominated by host-side overhead.
+See ADR-0032 for the canonical example.
 
-## Landing (MANDATORY)
+## Landing
 
-Before committing or ending a session, you MUST complete every applicable step.
-This checklist is also enforced by the `/pre-land-review` skill which fires
-automatically when you attempt to commit.
+All landing is handled by the `/commit` skill. Run `/commit` when work
+is complete. It orchestrates:
 
-1. Refresh vendored tests if upstream copy logic changed.
-2. Run the narrow verification gate for the edited surface.
-3. Run the end-to-end profile gate if runtime/kernel/pipeline code changed.
-4. **Run `/commit`** which orchestrates pre-land review, staging, and commit.
-5. Update docs that define the changed workflow or invariant.
-7. Report any blockers, especially GPU availability.
+1. `/pre-land-review` — deterministic checks + AI sub-agent reviews
+2. Staging and review marker generation
+3. Git commit with content-addressable review verification
 
-## Landing the Plane (Session Completion)
+**The `/commit` skill will reject your work if:**
+- Any deterministic check fails (ruff, ARCH, ZCOPY, VPAT, MAINT, IGRD)
+- AI review finds BLOCKING issues (all findings default to BLOCKING)
+- The review marker hash doesn't match the staged diff
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+**After committing, you MUST push:**
+```bash
+git pull --rebase && git push
+```
+Work is NOT complete until `git push` succeeds. Never stop before
+pushing. Never say "ready to push when you are" — YOU must push.
 
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
-   ```bash
-   git pull --rebase
-   bd sync
-   git push
-   git status  # MUST show "up to date with origin"
-   ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
+**Session completion checklist:**
+1. File issues for remaining work
+2. Push to remote (MANDATORY)
+3. Hand off context for next session

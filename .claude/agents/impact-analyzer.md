@@ -7,6 +7,7 @@ description: >
   "trace the geometry buffer through X". Heavier than Explore — use when you
   need deep cross-cutting analysis, not quick lookups.
 model: opus
+tools: Read, Glob, Grep, Bash
 skills:
   - intake-router
   - dispatch-wiring
