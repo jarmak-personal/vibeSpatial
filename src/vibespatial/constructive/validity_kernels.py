@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
+from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
@@ -169,29 +170,8 @@ _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
 # PREDICATE class, fp64 only — no centering needed for validity checks.
 # ---------------------------------------------------------------------------
 
-_HOLES_IN_SHELL_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
-extern "C" __device__ inline bool point_on_segment_validity(
-    double px,
-    double py,
-    double ax,
-    double ay,
-    double bx,
-    double by
-) {{
-    const double dx = bx - ax;
-    const double dy = by - ay;
-    const double cross = ((px - ax) * dy) - ((py - ay) * dx);
-    const double scale = fabs(dx) + fabs(dy) + 1.0;
-    if (fabs(cross) > (1e-12 * scale)) {{
-        return false;
-    }}
-    const double minx = ax < bx ? ax : bx;
-    const double maxx = ax > bx ? ax : bx;
-    const double miny = ay < by ? ay : by;
-    const double maxy = ay > by ? ay : by;
-    return px >= (minx - 1e-12) && px <= (maxx + 1e-12)
-        && py >= (miny - 1e-12) && py <= (maxy + 1e-12);
-}}
+_HOLES_IN_SHELL_KERNEL_SOURCE = PRECISION_PREAMBLE + POINT_ON_SEGMENT_DEVICE + r"""
+#define VALIDITY_BOUNDARY_TOLERANCE 1e-12
 
 extern "C" __device__ inline bool ring_contains_point_validity(
     double px,
@@ -216,7 +196,7 @@ extern "C" __device__ inline bool ring_contains_point_validity(
         const double by = y[coord];
 
         /* Boundary test: point on edge counts as inside (OGC validity) */
-        if (point_on_segment_validity(px, py, ax, ay, bx, by)) {{
+        if (vs_point_on_segment(px, py, ax, ay, bx, by, VALIDITY_BOUNDARY_TOLERANCE)) {{
             return true;
         }}
 

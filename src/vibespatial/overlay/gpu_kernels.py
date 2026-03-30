@@ -8,6 +8,8 @@ compile_kernel_group wrappers remain in gpu.py.
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+
 # ---------------------------------------------------------------------------
 # 1. Split event emission kernels
 # ---------------------------------------------------------------------------
@@ -468,30 +470,11 @@ _OVERLAY_FACE_WALK_KERNEL_NAMES = (
 # ---------------------------------------------------------------------------
 # Kernels: label_face_coverage_polygon, label_face_coverage_multipolygon
 
-_OVERLAY_FACE_LABEL_KERNEL_SOURCE = r"""
+_OVERLAY_FACE_LABEL_KERNEL_SOURCE = POINT_ON_SEGMENT_DEVICE + r"""
 // -------------------------------------------------------------------
 // Phase 2: GPU Face Labeling via Batch Point-in-Polygon
 // -------------------------------------------------------------------
-
-extern "C" __device__ inline double vibespatial_abs(double value) {
-  return value < 0.0 ? -value : value;
-}
-
-extern "C" __device__ inline bool point_on_segment(
-    double px, double py, double ax, double ay, double bx, double by
-) {
-  const double dx = bx - ax;
-  const double dy = by - ay;
-  const double cross = ((px - ax) * dy) - ((py - ay) * dx);
-  const double scale = vibespatial_abs(dx) + vibespatial_abs(dy) + 1.0;
-  if (vibespatial_abs(cross) > (1e-12 * scale)) return false;
-  const double minx = ax < bx ? ax : bx;
-  const double maxx = ax > bx ? ax : bx;
-  const double miny = ay < by ? ay : by;
-  const double maxy = ay > by ? ay : by;
-  return px >= (minx - 1e-12) && px <= (maxx + 1e-12)
-      && py >= (miny - 1e-12) && py <= (maxy + 1e-12);
-}
+#define OVERLAY_BOUNDARY_TOLERANCE 1e-12
 
 extern "C" __device__ inline bool ring_contains_even_odd(
     double px, double py,
@@ -506,7 +489,7 @@ extern "C" __device__ inline bool ring_contains_even_odd(
     const double ay = y[coord - 1];
     const double bx = x[coord];
     const double by = y[coord];
-    if (point_on_segment(px, py, ax, ay, bx, by)) {
+    if (vs_point_on_segment(px, py, ax, ay, bx, by, OVERLAY_BOUNDARY_TOLERANCE)) {
       *on_boundary = true;
       return true;
     }

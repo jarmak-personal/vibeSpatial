@@ -8,11 +8,14 @@ Extracted from point_in_polygon.py -- dispatch logic remains there.
 """
 from __future__ import annotations
 
-_POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE = """
+from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+
+_POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE = POINT_ON_SEGMENT_DEVICE + """
 typedef {compute_type} compute_t;
 
 #define CX(val) ((compute_t)((val) - center_x))
 #define CY(val) ((compute_t)((val) - center_y))
+#define PIP_BOUNDARY_TOLERANCE 1e-7
 
 extern "C" __device__ inline compute_t vibespatial_abs(compute_t value) {{
   return value < (compute_t)0.0 ? -value : value;
@@ -20,28 +23,6 @@ extern "C" __device__ inline compute_t vibespatial_abs(compute_t value) {{
 
 extern "C" __device__ inline compute_t vibespatial_max(compute_t left, compute_t right) {{
   return left > right ? left : right;
-}}
-
-extern "C" __device__ inline bool point_on_segment(
-    compute_t px,
-    compute_t py,
-    compute_t ax,
-    compute_t ay,
-    compute_t bx,
-    compute_t by
-) {{
-  const compute_t dx = bx - ax;
-  const compute_t dy = by - ay;
-  const compute_t cross = ((px - ax) * dy) - ((py - ay) * dx);
-  const compute_t scale = vibespatial_abs(dx) + vibespatial_abs(dy) + (compute_t)1.0;
-  if (vibespatial_abs(cross) > ((compute_t)1e-7 * scale)) {{
-    return false;
-  }}
-  const compute_t minx = ax < bx ? ax : bx;
-  const compute_t maxx = ax > bx ? ax : bx;
-  const compute_t miny = ay < by ? ay : by;
-  const compute_t maxy = ay > by ? ay : by;
-  return px >= (minx - (compute_t)1e-7) && px <= (maxx + (compute_t)1e-7) && py >= (miny - (compute_t)1e-7) && py <= (maxy + (compute_t)1e-7);
 }}
 
 extern "C" __device__ inline bool ring_contains_even_odd(
@@ -64,7 +45,7 @@ extern "C" __device__ inline bool ring_contains_even_odd(
     const compute_t ay = CY(y[coord - 1]);
     const compute_t bx = CX(x[coord]);
     const compute_t by = CY(y[coord]);
-    if (point_on_segment(px, py, ax, ay, bx, by)) {{
+    if (vs_point_on_segment((double)px, (double)py, (double)ax, (double)ay, (double)bx, (double)by, PIP_BOUNDARY_TOLERANCE)) {{
       *on_boundary = true;
       return true;
     }}
@@ -593,35 +574,12 @@ extern "C" __global__ void point_in_polygon_fused(
 }}
 """
 
-_PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE = """
+_PIP_BLOCK_PER_PAIR_KERNEL_SOURCE_TEMPLATE = POINT_ON_SEGMENT_DEVICE + """
 typedef {compute_type} compute_t;
 
 #define CX(val) ((compute_t)((val) - center_x))
 #define CY(val) ((compute_t)((val) - center_y))
-
-extern "C" __device__ inline compute_t vibespatial_abs_bp(compute_t value) {{
-  return value < (compute_t)0.0 ? -value : value;
-}}
-
-extern "C" __device__ inline bool point_on_segment_bp(
-    compute_t px, compute_t py,
-    compute_t ax, compute_t ay,
-    compute_t bx, compute_t by
-) {{
-  const compute_t dx = bx - ax;
-  const compute_t dy = by - ay;
-  const compute_t cross = ((px - ax) * dy) - ((py - ay) * dx);
-  const compute_t scale = vibespatial_abs_bp(dx) + vibespatial_abs_bp(dy) + (compute_t)1.0;
-  if (vibespatial_abs_bp(cross) > ((compute_t)1e-7 * scale)) {{
-    return false;
-  }}
-  const compute_t minx = ax < bx ? ax : bx;
-  const compute_t maxx = ax > bx ? ax : bx;
-  const compute_t miny = ay < by ? ay : by;
-  const compute_t maxy = ay > by ? ay : by;
-  return px >= (minx - (compute_t)1e-7) && px <= (maxx + (compute_t)1e-7)
-      && py >= (miny - (compute_t)1e-7) && py <= (maxy + (compute_t)1e-7);
-}}
+#define PIP_BOUNDARY_TOLERANCE 1e-7
 
 extern "C" __global__ void pip_block_per_pair_polygon(
     const int* candidate_left,
@@ -695,7 +653,7 @@ extern "C" __global__ void pip_block_per_pair_polygon(
             const compute_t bx = CX(polygon_x[c]);
             const compute_t by = CY(polygon_y[c]);
 
-            if (point_on_segment_bp(px, py, ax, ay, bx, by)) {{
+            if (vs_point_on_segment((double)px, (double)py, (double)ax, (double)ay, (double)bx, (double)by, PIP_BOUNDARY_TOLERANCE)) {{
                 my_boundary = 1;
             }}
             const bool intersects = ((ay > py) != (by > py)) &&
@@ -819,7 +777,7 @@ extern "C" __global__ void pip_block_per_pair_multipolygon(
             const compute_t bx = CX(multipolygon_x[c]);
             const compute_t by = CY(multipolygon_y[c]);
 
-            if (point_on_segment_bp(px, py, ax, ay, bx, by)) {{
+            if (vs_point_on_segment((double)px, (double)py, (double)ax, (double)ay, (double)bx, (double)by, PIP_BOUNDARY_TOLERANCE)) {{
                 my_boundary = 1;
             }}
             const bool intersects = ((ay > py) != (by > py)) &&

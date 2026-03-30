@@ -2,46 +2,25 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_on_segment import (
+    POINT_ON_SEGMENT_KIND_DEVICE,
+)
+
 # ---------------------------------------------------------------------------
 # CUDA kernel source -- shared device helpers
 # ---------------------------------------------------------------------------
-# These helper functions (vibespatial_abs, point_on_segment_kind,
-# ring_contains_even_odd_kind, polygon_point_location,
-# multipolygon_point_location) are used by both single-point and multipoint
-# kernels.  Previously they were duplicated across two kernel source strings
-# (~140 lines each).  We now define them once and compose via concatenation.
+# These helper functions (vibespatial_abs, ring_contains_even_odd_kind,
+# polygon_point_location, multipolygon_point_location) are used by both
+# single-point and multipoint kernels.  Previously they were duplicated
+# across two kernel source strings (~140 lines each).  We now define them
+# once and compose via concatenation.  vs_point_on_segment_kind is provided
+# by the shared cuda.device_functions.point_on_segment module.
 
-_SHARED_DEVICE_HELPERS = r"""
+_SHARED_DEVICE_HELPERS = POINT_ON_SEGMENT_KIND_DEVICE + r"""
+#define POINT_RELATION_TOLERANCE 1e-12
+
 extern "C" __device__ inline double vibespatial_abs(double value) {
   return value < 0.0 ? -value : value;
-}
-
-extern "C" __device__ inline unsigned char point_on_segment_kind(
-    double px,
-    double py,
-    double ax,
-    double ay,
-    double bx,
-    double by
-) {
-  const double dx = bx - ax;
-  const double dy = by - ay;
-  const double cross = ((px - ax) * dy) - ((py - ay) * dx);
-  const double scale = vibespatial_abs(dx) + vibespatial_abs(dy) + 1.0;
-  if (vibespatial_abs(cross) > (1e-12 * scale)) {
-    return 0;
-  }
-  const double minx = ax < bx ? ax : bx;
-  const double maxx = ax > bx ? ax : bx;
-  const double miny = ay < by ? ay : by;
-  const double maxy = ay > by ? ay : by;
-  if (px < (minx - 1e-12) || px > (maxx + 1e-12) || py < (miny - 1e-12) || py > (maxy + 1e-12)) {
-    return 0;
-  }
-  const bool endpoint =
-      (vibespatial_abs(px - ax) <= 1e-12 && vibespatial_abs(py - ay) <= 1e-12) ||
-      (vibespatial_abs(px - bx) <= 1e-12 && vibespatial_abs(py - by) <= 1e-12);
-  return endpoint ? 1 : 2;
 }
 
 extern "C" __device__ inline unsigned char ring_contains_even_odd_kind(
@@ -61,7 +40,7 @@ extern "C" __device__ inline unsigned char ring_contains_even_odd_kind(
     const double ay = y[coord - 1];
     const double bx = x[coord];
     const double by = y[coord];
-    const unsigned char segment_kind = point_on_segment_kind(px, py, ax, ay, bx, by);
+    const unsigned char segment_kind = vs_point_on_segment_kind(px, py, ax, ay, bx, by, POINT_RELATION_TOLERANCE);
     if (segment_kind != 0) {
       return 1;
     }
@@ -207,13 +186,14 @@ extern "C" __global__ void point_on_linestring_compacted(
   const int coord_end = line_geometry_offsets[line_row + 1];
   unsigned char best = 0;
   for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-    const unsigned char kind = point_on_segment_kind(
+    const unsigned char kind = vs_point_on_segment_kind(
         px,
         py,
         line_x[coord - 1],
         line_y[coord - 1],
         line_x[coord],
-        line_y[coord]
+        line_y[coord],
+        POINT_RELATION_TOLERANCE
     );
     if (kind == 2) {
       out[index] = 2;
@@ -263,13 +243,14 @@ extern "C" __global__ void point_on_multilinestring_compacted(
     const int coord_start = line_part_offsets[part];
     const int coord_end = line_part_offsets[part + 1];
     for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-      const unsigned char kind = point_on_segment_kind(
+      const unsigned char kind = vs_point_on_segment_kind(
           px,
           py,
           line_x[coord - 1],
           line_y[coord - 1],
           line_x[coord],
-          line_y[coord]
+          line_y[coord],
+          POINT_RELATION_TOLERANCE
       );
       if (kind == 2) {
         out[index] = 2;
@@ -453,7 +434,7 @@ extern "C" __global__ void multipoint_linestring_relation_compacted(
     const double py = mp_y[c];
     unsigned char best = 0;
     for (int s = ls + 1; s < le; ++s) {
-      const unsigned char kind = point_on_segment_kind(px, py, line_x[s - 1], line_y[s - 1], line_x[s], line_y[s]);
+      const unsigned char kind = vs_point_on_segment_kind(px, py, line_x[s - 1], line_y[s - 1], line_x[s], line_y[s], POINT_RELATION_TOLERANCE);
       if (kind == 2) { best = 2; break; }
       if (kind == 1) best = 1;
     }
@@ -500,7 +481,7 @@ extern "C" __global__ void multipoint_multilinestring_relation_compacted(
       const int cs = mls_part_offsets[part];
       const int ce = mls_part_offsets[part + 1];
       for (int s = cs + 1; s < ce; ++s) {
-        const unsigned char kind = point_on_segment_kind(px, py, mls_x[s - 1], mls_y[s - 1], mls_x[s], mls_y[s]);
+        const unsigned char kind = vs_point_on_segment_kind(px, py, mls_x[s - 1], mls_y[s - 1], mls_x[s], mls_y[s], POINT_RELATION_TOLERANCE);
         if (kind == 2) { best = 2; break; }
         if (kind == 1) best = 1;
       }

@@ -12,3 +12,10 @@ prepend these strings to their kernel source::
 
 See ``README.md`` in this package for conventions and guidelines.
 """
+
+# Re-export for convenience
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE  # noqa: F401
+from vibespatial.cuda.device_functions.point_on_segment import (  # noqa: F401
+    POINT_ON_SEGMENT_DEVICE,
+    POINT_ON_SEGMENT_KIND_DEVICE,
+)

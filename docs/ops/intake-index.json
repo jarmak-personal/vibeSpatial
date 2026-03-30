@@ -23687,6 +23687,30 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/cuda/device_functions/point_on_segment.py",
+      "referenced_by": [],
+      "symbols": [
+        "POINT_ON_SEGMENT_DEVICE",
+        "POINT_ON_SEGMENT_KIND_DEVICE"
+      ],
+      "tokens": [
+        "boundary",
+        "cuda",
+        "device",
+        "function",
+        "functions",
+        "kind",
+        "point",
+        "py",
+        "segment",
+        "shared",
+        "src",
+        "test",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/cuda/nvrtc_precompile.py",
       "referenced_by": [],
       "symbols": [
