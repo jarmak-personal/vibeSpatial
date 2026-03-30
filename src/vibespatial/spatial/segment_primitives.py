@@ -21,6 +21,7 @@ request_warmup([
     "select_i64",
     "exclusive_scan_i32",
     "exclusive_scan_i64",
+    "lower_bound_i64",
 ])
 from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_I32,
@@ -1420,43 +1421,52 @@ def _main_sweep_scatter_and_filter(
         )
 
     # --- Batched path: partition left segments into VRAM-bounded chunks ---
-    # We need batch boundaries [b0, b1, b2, ...] such that
-    #   d_cand_offsets[b_{k+1}] - d_cand_offsets[b_k] <= max_batch_pairs
-    # The offsets array is monotonically non-decreasing, so we use a simple
-    # host-side scan of the offsets to find batch boundaries.
-    # Transfer d_cand_offsets to host — one int32 array of size n_left (small).
-    runtime.synchronize()  # ensure exclusive_sum is complete
-    h_offsets = cp.asnumpy(d_cand_offsets)
-
+    # Batch boundaries are found entirely on device using lower_bound on
+    # the monotonically non-decreasing d_cand_offsets, then only the small
+    # boundary array is transferred to host for loop control flow.
     n_left = left.count
-    # Also need the total so we can compute the last batch's count.
-    # total_raw_candidates is already available.
 
-    batch_boundaries = [0]
-    batch_start_offset = 0
-    for i in range(1, n_left):
-        batch_pair_count = int(h_offsets[i]) - batch_start_offset
-        if batch_pair_count > max_batch_pairs:
-            # End the previous batch at segment i (exclusive).
-            batch_boundaries.append(i)
-            batch_start_offset = int(h_offsets[i])
+    # Build search targets: multiples of max_batch_pairs up to total.
+    n_batches_est = (total_raw_candidates + max_batch_pairs - 1) // max_batch_pairs
+    d_targets = cp.arange(1, n_batches_est, dtype=cp.int64) * max_batch_pairs
+    d_inner = lower_bound(d_cand_offsets, d_targets, synchronize=False)
 
-    batch_boundaries.append(n_left)
+    # Full boundary array: [0, *inner_boundaries, n_left]
+    d_boundaries = cp.concatenate([
+        cp.zeros(1, dtype=cp.intp),
+        d_inner.astype(cp.intp),
+        cp.full(1, n_left, dtype=cp.intp),
+    ])
+    # Remove duplicate boundaries (collapsed empty batches).
+    d_boundaries = cp.unique(d_boundaries)
 
-    # Process each batch, collecting surviving pairs on HOST to prevent
-    # accumulated device results from consuming all VRAM.
-    result_left_parts: list[np.ndarray] = []
-    result_right_parts: list[np.ndarray] = []
+    # Gather offset values at each boundary for batch-size computation.
+    # Clamp indices to valid range for the offsets array (n_left entries).
+    d_boundary_clamped = cp.minimum(d_boundaries, n_left - 1)
+    d_boundary_offsets = d_cand_offsets[d_boundary_clamped]
 
-    for b in range(len(batch_boundaries) - 1):
-        b_lo = batch_boundaries[b]
-        b_hi = batch_boundaries[b + 1]
+    # Single bulk transfer of the small boundaries + offset-values arrays.
+    runtime.synchronize()
+    h_boundaries = cp.asnumpy(d_boundaries)
+    h_boundary_offsets = cp.asnumpy(d_boundary_offsets)
+
+    # Process each batch, keeping filtered results on device.  Filtered
+    # output is a small fraction of raw candidates (typically 5-20% after
+    # MBR filtering) so accumulating on device is safe — the raw pair
+    # temporaries that drive OOM are freed inside _scatter_and_filter_single.
+    result_left_parts: list = []
+    result_right_parts: list = []
+
+    n_bounds = len(h_boundaries)
+    for b in range(n_bounds - 1):
+        b_lo = int(h_boundaries[b])
+        b_hi = int(h_boundaries[b + 1])
         if b_lo >= b_hi:
             continue
 
-        b_offset_base = int(h_offsets[b_lo])
+        b_offset_base = int(h_boundary_offsets[b])
         if b_hi < n_left:
-            b_raw_count = int(h_offsets[b_hi]) - b_offset_base
+            b_raw_count = int(h_boundary_offsets[b + 1]) - b_offset_base
         else:
             b_raw_count = total_raw_candidates - b_offset_base
 
@@ -1488,18 +1498,16 @@ def _main_sweep_scatter_and_filter(
             batch_raw_count=b_raw_count,
         )
         if b_left.size > 0:
-            # Transfer to host immediately to free GPU memory for next batch.
-            result_left_parts.append(cp.asnumpy(b_left))
-            result_right_parts.append(cp.asnumpy(b_right))
-            del b_left, b_right
+            result_left_parts.append(b_left)
+            result_right_parts.append(b_right)
 
     if not result_left_parts:
         return cp.empty(0, dtype=cp.int32), cp.empty(0, dtype=cp.int32)
     if len(result_left_parts) == 1:
-        return cp.asarray(result_left_parts[0]), cp.asarray(result_right_parts[0])
+        return result_left_parts[0], result_right_parts[0]
     return (
-        cp.asarray(np.concatenate(result_left_parts)),
-        cp.asarray(np.concatenate(result_right_parts)),
+        cp.concatenate(result_left_parts),
+        cp.concatenate(result_right_parts),
     )
 
 
@@ -1936,7 +1944,7 @@ def extract_segments(geometry_array: OwnedGeometryArray) -> SegmentTable:
             continue
 
         global_rows = _valid_global_rows(geometry_array, family_name)
-        for family_row, row_index in enumerate(global_rows.tolist()):
+        for family_row, row_index in enumerate(global_rows.tolist()):  # zcopy:ok(CPU-only legacy path: global_rows is np.ndarray from np.flatnonzero)
             if bool(buffer.empty_mask[family_row]):
                 continue
 

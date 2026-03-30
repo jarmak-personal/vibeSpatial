@@ -113,6 +113,7 @@ def _build_spec_registry() -> dict[str, CCCLWarmupSpec]:
         "segmented_reduce_max_f64": S("segmented_reduce_max_f64", F.SEGMENTED_REDUCE, f64, None, "max"),
         # Binary search
         "lower_bound_i32": S("lower_bound_i32", F.LOWER_BOUND, i32, None, "none"),
+        "lower_bound_i64": S("lower_bound_i64", F.LOWER_BOUND, i64, None, "none"),
         "lower_bound_u64": S("lower_bound_u64", F.LOWER_BOUND, u64, None, "none"),
         "upper_bound_i32": S("upper_bound_i32", F.UPPER_BOUND, i32, None, "none"),
         "upper_bound_u64": S("upper_bound_u64", F.UPPER_BOUND, u64, None, "none"),
