@@ -17018,7 +17018,6 @@
         "_device_scatter_repaired",
         "_build_batch_repaired_owned",
         "_extract_batch_coords",
-        "_scatter_repaired_geoms",
         "gpu_repair_invalid_polygons"
       ],
       "tokens": [
@@ -17035,7 +17034,6 @@
         "edges",
         "extract",
         "fix",
-        "geoms",
         "gpu",
         "gpurepairresult",
         "intersections",

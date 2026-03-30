@@ -457,15 +457,18 @@ def _detect_self_intersections_gpu(owned, valid_mask: np.ndarray, geometries: np
             # Step 5: Map family-row invalidity back to global row mask
             # Vectorized: find all global rows whose (tag, family_row_offset)
             # matches any of the invalid polygon family rows.
-            h_invalid_polys = cp.asnumpy(d_unique_invalid_polys)
-            h_invalid_polys = h_invalid_polys[h_invalid_polys < polygon_count]
-            if h_invalid_polys.size > 0:
+            # Keep invalid poly set on device; upload family offsets for
+            # device-side cp.isin to avoid ZCOPY002 D2H inside loop.
+            d_invalid_polys = d_unique_invalid_polys[d_unique_invalid_polys < polygon_count]
+            if d_invalid_polys.size > 0:
                 family_tag = FAMILY_TAGS[family_name]
                 tag_match = owned.validity & (owned.tags == family_tag)
                 global_rows_for_family = np.flatnonzero(tag_match)
                 if global_rows_for_family.size > 0:
                     fam_offsets = owned.family_row_offsets[global_rows_for_family]
-                    invalid_set = np.isin(fam_offsets, h_invalid_polys)
+                    d_fam_offsets = cp.asarray(fam_offsets)
+                    d_invalid_set = cp.isin(d_fam_offsets, d_invalid_polys)
+                    invalid_set = cp.asnumpy(d_invalid_set)  # zcopy:ok(final bool result to host valid_mask)
                     valid_mask[global_rows_for_family[invalid_set]] = False
 
     except Exception:

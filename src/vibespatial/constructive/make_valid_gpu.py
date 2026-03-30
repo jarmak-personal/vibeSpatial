@@ -1348,16 +1348,15 @@ def _device_scatter_repaired(
     family_name: str,
     invalid_family_rows: np.ndarray,
     fam_to_global: dict[int, int],
-    invalid_rows_set: set[int],
 ) -> OwnedGeometryArray:
     """Merge repaired polygon family buffer back into original on device.
 
-    Device-side equivalent of _scatter_repaired_geoms: takes the original
-    device-resident OwnedGeometryArray and the batch repair result, then
-    produces a new device-resident OwnedGeometryArray where repaired rows
-    are scattered back into the correct positions. Uses existing
-    _device_take_family_buffer and _concat_device_family_buffers from
-    owned.py for all buffer work. No D->H coordinate transfers.
+    Takes the original device-resident OwnedGeometryArray and the batch
+    repair result, then produces a new device-resident OwnedGeometryArray
+    where repaired rows are scattered back into the correct positions.
+    Uses existing _device_take_family_buffer and
+    _concat_device_family_buffers from owned.py for all buffer work.
+    No D->H coordinate transfers.
     """
     from vibespatial.geometry.owned import (
         _concat_device_family_buffers,
@@ -1729,42 +1728,6 @@ def _extract_batch_coords(
     return batch_x, batch_y, batch_ring_offsets, batch_geom_offsets
 
 
-def _scatter_repaired_geoms(
-    owned_result: OwnedGeometryArray,
-    invalid_family_rows: np.ndarray,
-    batch_poly_count: int,
-    fam_to_global: dict[int, int],
-    invalid_rows_set: set[int],
-    result: np.ndarray,
-) -> int:
-    """Map repaired OwnedGeometryArray output back to global result array.
-
-    Converts the batch result to Shapely, validates each geometry, and
-    scatters valid results into the correct global row positions.
-    Returns the number of successfully repaired geometries.
-    """
-    import shapely as shp
-
-    repaired_geoms = owned_result.to_shapely()
-    if repaired_geoms is None or len(repaired_geoms) == 0:
-        return 0
-
-    count = 0
-    validity = shp.is_valid(repaired_geoms)
-    for out_idx in range(min(len(repaired_geoms), batch_poly_count)):
-        geom = repaired_geoms[out_idx]
-        if geom is None or geom.is_empty:
-            continue
-        if not validity[out_idx]:
-            continue
-        fam_row = int(invalid_family_rows[out_idx])
-        global_row = fam_to_global.get(fam_row)
-        if global_row is not None and global_row in invalid_rows_set:
-            result[global_row] = geom
-            count += 1
-    return count
-
-
 def gpu_repair_invalid_polygons(
     owned: OwnedGeometryArray,
     invalid_rows: np.ndarray,
@@ -1845,7 +1808,6 @@ def gpu_repair_invalid_polygons(
 
     phases_used: list[str] = []
     gpu_repaired_count = 0
-    invalid_rows_set = set(invalid_rows.tolist())
     repaired_global_rows: set[int] = set()
     # Start with the original owned; each family merge updates it
     merged_owned = owned
@@ -1960,7 +1922,7 @@ def gpu_repair_invalid_polygons(
             if batch_result is not None:
                 merged_owned = _device_scatter_repaired(
                     merged_owned, batch_result, family_name,
-                    invalid_family_rows, fam_to_global, invalid_rows_set,
+                    invalid_family_rows, fam_to_global,
                 )
                 gpu_repaired_count += batch_poly_count
                 for fro in invalid_family_rows:
