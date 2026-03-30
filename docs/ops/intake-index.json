@@ -27017,6 +27017,40 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_overlay_index_alignment.py",
+      "referenced_by": [],
+      "symbols": [
+        "_make_non_contiguous_gdf",
+        "non_contiguous_pair",
+        "_reference_overlay",
+        "test_overlay_intersection_preserves_all_rows_with_non_contiguous_index",
+        "test_overlay_all_modes_with_non_contiguous_index",
+        "test_overlay_intersection_with_iloc_derived_index"
+      ],
+      "tokens": [
+        "alignment",
+        "all",
+        "contiguous",
+        "derived",
+        "gdf",
+        "iloc",
+        "index",
+        "intersection",
+        "make",
+        "modes",
+        "non",
+        "overlay",
+        "pair",
+        "preserves",
+        "py",
+        "reference",
+        "rows",
+        "test",
+        "tests"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_overlay_reconstruction.py",
       "referenced_by": [
         "docs/architecture/overlay-reconstruction.md"

@@ -5,7 +5,7 @@ Scope: Compact-invalid-row make_valid pipeline staging and repair-only-invalids 
 Read If: You are changing make_valid, validity checking, or topology repair pipelines.
 STOP IF: Your task already has the make_valid pipeline open and only needs local implementation detail.
 Source Of Truth: Make-valid pipeline architecture for compact-and-repair staging.
-Body Budget: 62/220 lines
+Body Budget: 68/220 lines
 Document: docs/architecture/make-valid.md
 
 Section Map (Body Lines)
@@ -17,9 +17,9 @@ Section Map (Body Lines)
 | 17-22 | Open First |
 | 23-27 | Verify |
 | 28-32 | Risks |
-| 33-44 | Decision |
-| 45-54 | Dispatch |
-| 55-62 | Performance Notes |
+| 33-50 | Decision |
+| 51-60 | Dispatch |
+| 61-68 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -59,6 +59,12 @@ stages.
 - Leave valid rows untouched.
 - Repair only the compacted invalid subset.
 - Scatter repaired rows back into original order.
+- When constructing a replacement ``GeoSeries`` from repaired geometry,
+  always pass ``index=df.index`` (or ``index=gs.index``) to preserve
+  non-contiguous index alignment from upstream operations like ``clip()``
+  or ``iloc`` slicing.  Omitting the index creates a default
+  ``RangeIndex(0..N-1)`` which silently drops rows during pandas column
+  assignment when the DataFrame index is non-contiguous.
 - When all rows pass validation and an ``OwnedGeometryArray`` was provided,
   ``MakeValidResult.owned`` carries the original device-resident array so
   downstream stages (e.g., dissolve) can stay on device without re-uploading

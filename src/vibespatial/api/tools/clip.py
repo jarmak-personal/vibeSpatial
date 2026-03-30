@@ -4,7 +4,6 @@ import warnings
 
 import numpy as np
 import pandas.api.types
-
 from shapely.geometry import MultiPolygon, Polygon, box
 
 from vibespatial.api import GeoDataFrame, GeoSeries
@@ -113,6 +112,17 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
     if clipping_by_rectangle:
         # clip_by_rect might return empty geometry collections in edge cases
         clipped = clipped[~clipped.is_empty]
+    else:
+        # GPU intersection may produce degenerate zero-area polygon slivers at
+        # exact clip boundaries where GEOS/Shapely returns lower-dimensional
+        # results (LineStrings/Points).  Remove empty geometries and zero-area
+        # polygon slivers so clip output matches stock geopandas behaviour.
+        keep = ~clipped.is_empty
+        if non_point_mask.any():
+            poly_rows = clipped.geom_type.isin(POLYGON_GEOM_TYPES)
+            if poly_rows.any():
+                keep = keep & ~(poly_rows & (clipped.geometry.area <= 0))
+        clipped = clipped[keep]
     return clipped
 
 

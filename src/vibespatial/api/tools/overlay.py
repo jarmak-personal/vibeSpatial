@@ -1451,7 +1451,7 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                                 mv_result.geometries, crs=df.crs,
                             )
                     col = df._geometry_column_name
-                    df[col] = GeoSeries(new_ga)
+                    df[col] = GeoSeries(new_ga, index=df.index)
                     df = _collection_extract(
                         df, geom_type="Polygon", keep_geom_type_warning=False
                     )
