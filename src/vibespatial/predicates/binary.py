@@ -767,6 +767,69 @@ def _evaluate_gpu_de9im_candidates(
     return evaluate_predicate_from_de9im(de9im_masks, predicate)
 
 
+def _evaluate_de9im_device(d_masks: object, predicate: str) -> object:
+    """Evaluate a spatial predicate from DE-9IM bitmasks on device.
+
+    CuPy-native mirror of ``polygon.evaluate_predicate_from_de9im`` that
+    keeps the entire evaluation on device (Tier 2 — CuPy element-wise).
+
+    Parameters
+    ----------
+    d_masks : cupy uint16 array of DE-9IM bitmasks (device-resident)
+    predicate : one of the supported predicate names
+
+    Returns
+    -------
+    cupy bool array (device-resident)
+    """
+    import cupy as cp
+
+    from .polygon import (
+        _CONTACT_MASK,
+        _PREDICATE_RULES,
+        DE9IM_BB,
+        DE9IM_BE,
+        DE9IM_BI,
+        DE9IM_EB,
+        DE9IM_EI,
+        DE9IM_IB,
+        DE9IM_IE,
+        DE9IM_II,
+    )
+
+    m = d_masks.astype(cp.uint16, copy=False)
+
+    if predicate == "intersects":
+        return (m & _CONTACT_MASK).astype(bool)
+
+    if predicate == "touches":
+        has_contact = (m & (DE9IM_IB | DE9IM_BI | DE9IM_BB)).astype(bool)
+        no_ii = ~(m & DE9IM_II).astype(bool)
+        return has_contact & no_ii
+
+    if predicate == "covers":
+        has_contact = (m & _CONTACT_MASK).astype(bool)
+        no_ext = ~(m & (DE9IM_EI | DE9IM_EB)).astype(bool)
+        return has_contact & no_ext
+
+    if predicate == "covered_by":
+        has_contact = (m & _CONTACT_MASK).astype(bool)
+        no_ext = ~(m & (DE9IM_IE | DE9IM_BE)).astype(bool)
+        return has_contact & no_ext
+
+    rule = _PREDICATE_RULES.get(predicate)
+    if rule is None:
+        raise ValueError(f"Unsupported predicate for DE-9IM evaluation: {predicate}")
+
+    required_set, required_unset = rule
+    result = cp.ones(len(m), dtype=bool)
+    if required_set:
+        result &= (m & required_set) == required_set
+    if required_unset:
+        result &= (m & required_unset) == 0
+    return result
+
+
 def _fused_gpu_binary_predicate(
     predicate: str,
     left: OwnedGeometryArray,
@@ -873,18 +936,14 @@ def _fused_gpu_binary_predicate(
         return None  # Fall back to the partitioned dispatch.
 
     # DE-9IM kernel — pass device indices to avoid H2D re-upload.
-    from .polygon import (
-        compute_polygon_de9im_gpu,
-        evaluate_predicate_from_de9im,
-    )
+    from .polygon import compute_polygon_de9im_gpu
 
     cand_count = int(d_cand_rows.size)
-    de9im_masks = np.zeros(cand_count, dtype=np.uint16)
+    # DE-9IM mask accumulator lives on device (Tier 2 — CuPy element-wise).
+    d_de9im_masks = cp.zeros(cand_count, dtype=cp.uint16)
 
     # Group by (left_family, right_family) tag pair — unique extraction
-    # and sub-masking stay on device; per-group index subsets are
-    # transferred to host before the dispatch loop.
-    groups: list[tuple[GeometryFamily, GeometryFamily, np.ndarray, np.ndarray]] = []
+    # and sub-masking stay on device; dispatch uses device arrays directly.
     d_group_refs: list[tuple] = []
     for lt, rt in unique_tag_pairs(d_cand_ltags, d_cand_rtags):
         lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
@@ -898,28 +957,29 @@ def _fused_gpu_binary_predicate(
         d_sub_cand = d_cand_rows[d_sub_idx]
         d_group_refs.append((lf, rf, d_sub_idx, d_sub_cand))
 
-    # D->H: pull per-group indices to host for dispatch.
+    # Dispatch per-group DE-9IM kernels.  Indices stay on device;
+    # compute_polygon_de9im_gpu returns device arrays directly via
+    # return_device=True — no D->H->D ping-pong per group.
     for lf, rf, d_sub_idx, d_sub_cand in d_group_refs:
-        groups.append((lf, rf, cp.asnumpy(d_sub_idx), cp.asnumpy(d_sub_cand)))
-
-    for gi, (lf, rf, h_sub_idx, h_sub_cand) in enumerate(groups):
-        sub_result = compute_polygon_de9im_gpu(
+        d_sub_result = compute_polygon_de9im_gpu(
             left, right,
-            h_sub_cand, h_sub_cand,
             query_family=lf, tree_family=rf,
-            d_left=d_group_refs[gi][3], d_right=d_group_refs[gi][3],
+            d_left=d_sub_cand, d_right=d_sub_cand,
+            return_device=True,
         )
-        if sub_result is not None:
-            de9im_masks[h_sub_idx] = sub_result
+        if d_sub_result is not None:
+            # Device-resident scatter — no host round-trip.
+            d_de9im_masks[d_sub_idx] = d_sub_result
 
-    cand_result = evaluate_predicate_from_de9im(de9im_masks, predicate)
+    # Evaluate predicate entirely on device (CuPy bitwise ops).
+    d_cand_result = _evaluate_de9im_device(d_de9im_masks, predicate)
 
     # Scatter candidate results into full-size output.
     # For DISJOINT: non-candidates (no bbox overlap) are True (definitely
     # disjoint).  Candidates get their exact DE-9IM result.
     is_disjoint = predicate == "disjoint"
     out = np.ones(n, dtype=bool) if is_disjoint else np.zeros(n, dtype=bool)
-    out[cp.asnumpy(d_cand_rows)] = cand_result
+    out[cp.asnumpy(d_cand_rows)] = cp.asnumpy(d_cand_result)
     return out
 
 

@@ -976,13 +976,14 @@ def _build_side_args(ptr, state, buf, family):
 def compute_polygon_de9im_gpu(
     query_owned: OwnedGeometryArray,
     tree_owned: OwnedGeometryArray,
-    left_indices: np.ndarray,
-    right_indices: np.ndarray,
+    left_indices: np.ndarray | None = None,
+    right_indices: np.ndarray | None = None,
     *,
     query_family: GeometryFamily,
     tree_family: GeometryFamily,
     d_left: object | None = None,
     d_right: object | None = None,
+    return_device: bool = False,
 ) -> np.ndarray | None:
     """Compute DE-9IM bitmasks for geometry candidate pairs on GPU.
 
@@ -991,11 +992,25 @@ def compute_polygon_de9im_gpu(
 
     When *d_left* / *d_right* are provided (device-resident CuPy int32
     arrays), they are used directly instead of uploading *left_indices* /
-    *right_indices* from host — avoiding a redundant host→device transfer
+    *right_indices* from host — avoiding a redundant host->device transfer
     when candidates are already on device.
 
-    Returns uint16 array of DE-9IM bitmasks, or None if the family pair is
-    not supported.
+    Parameters
+    ----------
+    left_indices, right_indices : np.ndarray or None
+        Host index arrays.  May be ``None`` when *d_left* / *d_right* are
+        provided — ``pair_count`` is derived from ``d_left.shape[0]``.
+    return_device : bool
+        When True, return the result as a device-resident CuPy uint16 array
+        (caller takes ownership).  The D->H copy is skipped entirely.
+        Default False preserves backward compatibility (returns host
+        np.ndarray).
+
+    Returns
+    -------
+    np.ndarray | cupy.ndarray | None
+        uint16 DE-9IM bitmask array, or None if the family pair is
+        not supported.
     """
     key = (query_family, tree_family)
     swap = False
@@ -1038,7 +1053,17 @@ def compute_polygon_de9im_gpu(
 
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    pair_count = left_indices.size
+
+    # Derive pair_count: prefer device arrays (avoids need for host
+    # placeholder), then fall back to host indices.
+    if eff_d_left is not None:
+        pair_count = eff_d_left.shape[0]
+    elif eff_left is not None:
+        pair_count = eff_left.size
+    else:
+        raise ValueError(
+            "compute_polygon_de9im_gpu requires either d_left or left_indices"
+        )
 
     # Use device-resident arrays when provided; otherwise upload from host.
     own_d_left = eff_d_left is None
@@ -1069,8 +1094,14 @@ def compute_polygon_de9im_gpu(
             block=block,
             params=(all_args, all_types),
         )
-        runtime.synchronize()
+        if return_device:
+            # Return device-resident CuPy array — caller takes ownership.
+            # No sync needed: CuPy ops on the same stream are ordered.
+            if swap:
+                d_mask = _transpose_de9im_device(d_mask)
+            return d_mask
 
+        runtime.synchronize()
         h_mask = np.empty(pair_count, dtype=np.uint16)
         runtime.copy_device_to_host(d_mask, h_mask)
 
@@ -1084,7 +1115,8 @@ def compute_polygon_de9im_gpu(
             runtime.free(eff_d_left)
         if own_d_right:
             runtime.free(eff_d_right)
-        runtime.free(d_mask)
+        if not return_device:
+            runtime.free(d_mask)
 
 
 def _transpose_de9im(masks: np.ndarray) -> np.ndarray:
@@ -1105,6 +1137,32 @@ def _transpose_de9im(masks: np.ndarray) -> np.ndarray:
     out |= np.where(m & DE9IM_EB, DE9IM_BE, 0).astype(np.uint16)
     # BB stays.
     out |= (m & DE9IM_BB)
+    return out
+
+
+def _transpose_de9im_device(d_masks: object) -> object:
+    """Transpose DE-9IM bitmasks on device (CuPy — Tier 2 element-wise).
+
+    Device-resident mirror of ``_transpose_de9im`` that keeps data on GPU.
+    """
+    import cupy as cp
+
+    m = d_masks.astype(cp.uint16, copy=False)
+    out = cp.zeros_like(m)
+    # II stays, EE stays.
+    out |= m & DE9IM_II
+    out |= m & DE9IM_EE
+    # Swap IB <-> BI.
+    out |= cp.where(m & DE9IM_IB, DE9IM_BI, 0).astype(cp.uint16)
+    out |= cp.where(m & DE9IM_BI, DE9IM_IB, 0).astype(cp.uint16)
+    # Swap IE <-> EI.
+    out |= cp.where(m & DE9IM_IE, DE9IM_EI, 0).astype(cp.uint16)
+    out |= cp.where(m & DE9IM_EI, DE9IM_IE, 0).astype(cp.uint16)
+    # Swap BE <-> EB.
+    out |= cp.where(m & DE9IM_BE, DE9IM_EB, 0).astype(cp.uint16)
+    out |= cp.where(m & DE9IM_EB, DE9IM_BE, 0).astype(cp.uint16)
+    # BB stays.
+    out |= m & DE9IM_BB
     return out
 
 

@@ -21014,6 +21014,7 @@
         "_build_side_args",
         "compute_polygon_de9im_gpu",
         "_transpose_de9im",
+        "_transpose_de9im_device",
         "supported_predicate_families"
       ],
       "tokens": [
@@ -21021,6 +21022,7 @@
         "build",
         "compute",
         "de9im",
+        "device",
         "evaluate",
         "families",
         "gpu",
