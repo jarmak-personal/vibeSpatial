@@ -19,7 +19,7 @@ from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.runtime.adaptive import plan_dispatch_selection, plan_kernel_dispatch
 from vibespatial.runtime.crossover import DispatchDecision
 
-request_warmup(["exclusive_scan_i32"])
+request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "segmented_reduce_sum_i32"])
 from vibespatial.cuda._runtime import (  # noqa: E402
     compile_kernel_group,
     count_scatter_total,
@@ -323,6 +323,39 @@ extern "C" __global__ void lb_clip_segments(
 
 _LB_KERNEL_NAMES = ("lb_clip_segments",)
 
+# ---------------------------------------------------------------------------
+# Segmented arange NVRTC kernel (Tier 1 — geometry-specific gather index)
+# ---------------------------------------------------------------------------
+# Given per-ring (start, length, write_offset), produce a flat array of
+# gather indices: for ring i, write  start[i], start[i]+1, ..., start[i]+len[i]-1
+# at output[write_offset[i] .. write_offset[i]+len[i]).
+# One thread per surviving ring — each thread writes a short range.
+
+_SEGMENTED_ARANGE_KERNEL_SOURCE = r"""
+extern "C" __global__ void __launch_bounds__(256, 4)
+segmented_arange(
+    const long long* __restrict__ starts,
+    const long long* __restrict__ lens,
+    const long long* __restrict__ write_offsets,
+    long long* __restrict__ output,
+    const int n_segments
+) {
+    const int stride = blockDim.x * gridDim.x;
+    for (int seg = blockIdx.x * blockDim.x + threadIdx.x;
+         seg < n_segments;
+         seg += stride) {
+        long long base = starts[seg];
+        long long off  = write_offsets[seg];
+        long long len  = lens[seg];
+        for (long long j = 0; j < len; j++) {
+            output[off + j] = base + j;
+        }
+    }
+}
+"""
+
+_SEG_ARANGE_KERNEL_NAMES = ("segmented_arange",)
+
 
 # ---------------------------------------------------------------------------
 # NVRTC kernel compilation helpers
@@ -333,6 +366,7 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 request_nvrtc_warmup([
     ("sh-clip", _SUTHERLAND_HODGMAN_KERNEL_SOURCE, _SH_KERNEL_NAMES),
     ("lb-clip", _LIANG_BARSKY_KERNEL_SOURCE, _LB_KERNEL_NAMES),
+    ("seg-arange", _SEGMENTED_ARANGE_KERNEL_SOURCE, _SEG_ARANGE_KERNEL_NAMES),
 ])
 
 
@@ -342,6 +376,12 @@ def _compile_sh_kernels():
 
 def _compile_lb_kernels():
     return compile_kernel_group("lb-clip", _LIANG_BARSKY_KERNEL_SOURCE, _LB_KERNEL_NAMES)
+
+
+def _compile_seg_arange_kernels():
+    return compile_kernel_group(
+        "seg-arange", _SEGMENTED_ARANGE_KERNEL_SOURCE, _SEG_ARANGE_KERNEL_NAMES,
+    )
 
 
 class RectClipResult:
@@ -2040,9 +2080,9 @@ def _build_polygon_clip_owned_result(
 ) -> tuple[OwnedGeometryArray | None, np.ndarray]:
     """Build a device-resident OwnedGeometryArray from GPU clip output.
 
-    Constructs GeoArrow offset arrays on host (they are small metadata) and
-    keeps coordinates on device.  No Shapely construction, no per-element
-    Python loops.
+    Ring survival analysis and gather-index construction run entirely on
+    device (CuPy).  Only small GeoArrow metadata offsets are brought to
+    host for OwnedGeometryArray construction.  No D->H->D ping-pong.
 
     Returns (owned_result, validity_mask) where validity_mask is a bool array
     of length input_row_count indicating which global rows have valid output.
@@ -2050,68 +2090,82 @@ def _build_polygon_clip_owned_result(
     """
     import cupy as cp
 
-    runtime = get_cuda_runtime()
-    h_full_offsets = cp.asnumpy(d_full_offsets)
+    from vibespatial.cuda.cccl_primitives import exclusive_sum, segmented_reduce_sum
 
-    # ---- Vectorized ring survival analysis ----
-    # Replaces the O(total_rings) Python loop with bulk numpy operations.
+    runtime = get_cuda_runtime()
+
+    # ---- Vectorized ring survival analysis (device-resident) ----
     total_rings = len(ring_is_exterior)
 
     if total_rings == 0:
         validity_mask = np.zeros(input_row_count, dtype=bool)
         return None, validity_mask
 
-    # Per-ring vertex counts from the GPU output offsets.
-    ring_verts = np.diff(h_full_offsets[:total_rings + 1]).astype(np.int32)
+    # Upload small host metadata arrays to device once.
+    d_ring_is_exterior = cp.asarray(ring_is_exterior)
+    d_geom_ring_offsets = cp.asarray(geom_ring_offsets)
+
+    # Per-ring vertex counts from the GPU output offsets (stays on device).
+    d_ring_verts = cp.diff(d_full_offsets[:total_rings + 1]).astype(cp.int32)
 
     # Exterior ring validity: an exterior ring survives if it has >= 4 verts.
-    is_ext = ring_is_exterior.astype(bool)
-    ext_positions = np.flatnonzero(is_ext)
-    ext_valid = ring_verts[ext_positions] >= 4  # bool per exterior ring
+    d_is_ext = d_ring_is_exterior.astype(bool)
+    d_ext_positions = cp.flatnonzero(d_is_ext)
+    d_ext_valid = d_ring_verts[d_ext_positions] >= 4  # bool per exterior ring
 
     # Forward-fill exterior validity to subsequent holes.  Each exterior
     # ring's validity applies to itself and all following holes until the
-    # next exterior ring.  We compute segment lengths from the gaps between
-    # consecutive exterior positions and use np.repeat to broadcast.
-    if len(ext_positions) > 0:
-        seg_lengths = np.empty(len(ext_positions), dtype=np.int32)
-        seg_lengths[:-1] = np.diff(ext_positions)
-        seg_lengths[-1] = total_rings - int(ext_positions[-1])
-        ext_validity_filled = np.repeat(ext_valid, seg_lengths)
-        # Handle any rings before the first exterior (shouldn't happen in
-        # well-formed data, but guard: mark them invalid).
-        if int(ext_positions[0]) > 0:
-            prefix = np.zeros(int(ext_positions[0]), dtype=bool)
-            ext_validity_filled = np.concatenate([prefix, ext_validity_filled])
+    # next exterior ring.
+    #
+    # Strategy: use exclusive_sum on a marker array to assign each ring its
+    # exterior's index, then gather the exterior validity via that index.
+    # This avoids cp.repeat with per-element device counts (which internally
+    # calls .get() for output sizing — hidden D2H sync).
+    n_ext = d_ext_positions.size
+    if n_ext > 0:
+        # Build a marker: 1 at each exterior position, 0 elsewhere.
+        # exclusive_sum gives each ring the index of its owning exterior.
+        d_ext_marker = cp.zeros(total_rings, dtype=cp.int32)
+        d_ext_marker[d_ext_positions] = 1
+        d_ext_owner_idx = exclusive_sum(d_ext_marker, synchronize=False)
+        # Each ring's validity = its owning exterior's validity.
+        d_ext_validity_filled = d_ext_valid[d_ext_owner_idx]
+        # Any rings before the first exterior have owner index 0 from
+        # the exclusive scan, but they should be invalid.  Guard by
+        # zeroing rings before the first exterior position.
+        first_ext_pos = int(d_ext_positions[0].item())  # zcopy:ok(single scalar for branch guard)
+        if first_ext_pos > 0:
+            d_ext_validity_filled[:first_ext_pos] = False
     else:
-        ext_validity_filled = np.zeros(total_rings, dtype=bool)
+        d_ext_validity_filled = cp.zeros(total_rings, dtype=bool)
 
     # A ring survives if: (a) its exterior is valid, AND (b) it has >= 4 verts.
-    ring_survives = ext_validity_filled & (ring_verts >= 4)
+    d_ring_survives = d_ext_validity_filled & (d_ring_verts >= 4)
 
-    # ---- Per-geometry aggregation ----
-    # Compute per-geometry ring counts and survival using the offset array.
+    # ---- Per-geometry aggregation (device-resident) ----
+    # CCCL segmented_reduce_sum (Tier 3a) — replaces cumsum+indexing pattern.
     n_geoms = len(geom_ring_offsets) - 1
-    geom_ring_counts = np.diff(geom_ring_offsets)
-    has_rings = geom_ring_counts > 0
+    d_ring_survives_i32 = d_ring_survives.astype(cp.int32)
 
-    # For each geometry, count how many of its rings survived.
-    # Use np.add.reduceat on ring_survives grouped by geom_ring_offsets.
-    if total_rings > 0 and has_rings.any():
-        # reduceat needs valid split points; filter to non-empty geometries.
-        ne_starts = geom_ring_offsets[:-1][has_rings]
-        surviving_per_ne_geom = np.add.reduceat(ring_survives.astype(np.int32), ne_starts)
-        # Map back to all geometries.
-        surviving_per_geom = np.zeros(n_geoms, dtype=np.int32)
-        surviving_per_geom[has_rings] = surviving_per_ne_geom
-    else:
-        surviving_per_geom = np.zeros(n_geoms, dtype=np.int32)
+    seg_result = segmented_reduce_sum(
+        d_ring_survives_i32,
+        d_geom_ring_offsets[:-1],
+        d_geom_ring_offsets[1:],
+        num_segments=n_geoms,
+        synchronize=False,
+    )
+    d_surviving_per_geom = seg_result.values
 
-    geom_has_output = surviving_per_geom > 0
+    d_geom_has_output = d_surviving_per_geom > 0
+
+    # Bring small per-geometry results to host for validity mask construction
+    # and GeoArrow metadata.  These are O(n_geoms) -- small metadata.
+    h_geom_has_output = cp.asnumpy(d_geom_has_output)  # zcopy:ok(small per-geom metadata for host mask)
+    h_surviving_per_geom = cp.asnumpy(d_surviving_per_geom)  # zcopy:ok(small per-geom metadata for GeoArrow offsets)
 
     # Global row indices for geometries with output.
     global_rows_arr = np.asarray(global_row_indices, dtype=np.intp)
-    output_valid_rows_arr = global_rows_arr[geom_has_output]
+    output_valid_rows_arr = global_rows_arr[h_geom_has_output]
     output_row_count = int(output_valid_rows_arr.size)
 
     # Build validity mask for the caller (covers all input rows).
@@ -2123,38 +2177,76 @@ def _build_polygon_clip_owned_result(
         return None, validity_mask
 
     # ---- Build GeoArrow offsets for surviving rings ----
-    # Surviving ring indices (flat).
-    surviving_idx = np.flatnonzero(ring_survives)
-    surviving_verts = ring_verts[surviving_idx]
+    # Surviving ring indices (flat) -- stays on device for gather.
+    d_surviving_idx = cp.flatnonzero(d_ring_survives)
+    d_surviving_verts = d_ring_verts[d_surviving_idx]
 
     # Ring offsets: cumulative vertex counts of surviving rings.
-    h_ring_offsets = np.empty(len(surviving_verts) + 1, dtype=np.int32)
-    h_ring_offsets[0] = 0
-    np.cumsum(surviving_verts, out=h_ring_offsets[1:])
+    # Compute on device to avoid D->H->D round-trip, then D2H once for
+    # GeoArrow metadata.
+    d_ring_offsets_dev = cp.empty(d_surviving_verts.size + 1, dtype=cp.int32)
+    d_ring_offsets_dev[0] = 0
+    cp.cumsum(d_surviving_verts, out=d_ring_offsets_dev[1:])
+    h_ring_offsets = cp.asnumpy(d_ring_offsets_dev)  # zcopy:ok(small ring offsets for GeoArrow metadata)
 
     # Geometry offsets: cumulative surviving-ring counts per output geometry.
-    output_surviving_counts = surviving_per_geom[geom_has_output]
+    output_surviving_counts = h_surviving_per_geom[h_geom_has_output]
     h_geom_offsets = np.empty(output_row_count + 1, dtype=np.int32)
     h_geom_offsets[0] = 0
     np.cumsum(output_surviving_counts, out=h_geom_offsets[1:])
 
-    # ---- Build gather indices vectorially ----
+    # ---- Build gather indices on device via NVRTC segmented_arange ----
     # For each surviving ring, gather coordinates from
-    # h_full_offsets[ring_idx] .. h_full_offsets[ring_idx+1].
-    gather_starts = h_full_offsets[surviving_idx].astype(np.int64)
-    gather_lens = surviving_verts.astype(np.int64)
-    total_gather = int(gather_lens.sum())
+    # d_full_offsets[ring_idx] .. d_full_offsets[ring_idx+1].
+    d_gather_starts = d_full_offsets[d_surviving_idx].astype(cp.int64)
+    d_gather_lens = d_surviving_verts.astype(cp.int64)
+    # total_gather is already available as the last element of h_ring_offsets
+    # (cumsum of surviving vertex counts), avoiding an extra D2H transfer.
+    total_gather = int(h_ring_offsets[-1])
 
-    h_gather = np.repeat(gather_starts, gather_lens)
-    within_offsets = np.arange(total_gather, dtype=np.int64)
-    range_bases = np.repeat(
-        np.concatenate(([np.int64(0)], np.cumsum(gather_lens[:-1]))),
-        gather_lens,
-    )
-    h_gather += within_offsets - range_bases
-    d_gather = cp.asarray(h_gather)
-    gathered_x = d_out_x[d_gather]
-    gathered_y = d_out_y[d_gather]
+    if total_gather > 0:
+        # Compute per-ring write offsets via exclusive_sum (CCCL Tier 3a).
+        d_write_offsets = exclusive_sum(d_gather_lens, synchronize=False)
+
+        # Launch NVRTC segmented_arange kernel: one thread per surviving ring,
+        # each writes its contiguous range of gather indices.
+        from vibespatial.cuda._runtime import KERNEL_PARAM_I32, KERNEL_PARAM_PTR
+
+        n_surviving_rings = int(d_surviving_idx.size)
+        d_gather = cp.empty(total_gather, dtype=cp.int64)
+
+        kernels = _compile_seg_arange_kernels()
+        ptr = runtime.pointer
+        seg_params = (
+            (
+                ptr(d_gather_starts),
+                ptr(d_gather_lens),
+                ptr(d_write_offsets),
+                ptr(d_gather),
+                n_surviving_rings,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        seg_grid, seg_block = runtime.launch_config(
+            kernels["segmented_arange"], n_surviving_rings,
+        )
+        runtime.launch(
+            kernels["segmented_arange"],
+            grid=seg_grid,
+            block=seg_block,
+            params=seg_params,
+        )
+        gathered_x = d_out_x[d_gather]
+        gathered_y = d_out_y[d_gather]
+    else:
+        gathered_x = cp.empty(0, dtype=cp.float64)
+        gathered_y = cp.empty(0, dtype=cp.float64)
 
     output_empty_mask = np.zeros(output_row_count, dtype=bool)
 

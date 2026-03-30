@@ -107,6 +107,7 @@ def _build_spec_registry() -> dict[str, CCCLWarmupSpec]:
         "reduce_sum_f64": S("reduce_sum_f64", F.REDUCE_INTO, f64, None, "sum"),
         "reduce_sum_i32": S("reduce_sum_i32", F.REDUCE_INTO, i32, None, "sum"),
         # Segmented reduce
+        "segmented_reduce_sum_i32": S("segmented_reduce_sum_i32", F.SEGMENTED_REDUCE, i32, None, "sum"),
         "segmented_reduce_sum_f64": S("segmented_reduce_sum_f64", F.SEGMENTED_REDUCE, f64, None, "sum"),
         "segmented_reduce_min_f64": S("segmented_reduce_min_f64", F.SEGMENTED_REDUCE, f64, None, "min"),
         "segmented_reduce_max_f64": S("segmented_reduce_max_f64", F.SEGMENTED_REDUCE, f64, None, "max"),

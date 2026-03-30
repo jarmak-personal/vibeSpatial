@@ -16695,6 +16695,7 @@
       "symbols": [
         "_compile_sh_kernels",
         "_compile_lb_kernels",
+        "_compile_seg_arange_kernels",
         "RectClipResult",
         "RectClipBenchmark",
         "_normalize_values",
@@ -16715,10 +16716,10 @@
         "_clip_line_family",
         "_polygon_ring_spans",
         "_clip_polygon_family",
-        "_clip_polygon_rings_gpu",
-        "_clip_polygon_rings_gpu_device"
+        "_clip_polygon_rings_gpu"
       ],
       "tokens": [
+        "arange",
         "barsky",
         "bottom",
         "bounds",
@@ -16727,7 +16728,6 @@
         "clipped",
         "compile",
         "constructive",
-        "device",
         "family",
         "gpu",
         "hodgman",
@@ -16753,6 +16753,7 @@
         "right",
         "ring",
         "rings",
+        "seg",
         "segment",
         "segments",
         "sh",
@@ -23433,7 +23434,8 @@
         "test_clip_by_rect_owned_preserves_polygon_holes",
         "test_clip_by_rect_owned_falls_back_for_invalid_polygon_rows",
         "test_geopandas_clip_by_rect_surface_is_observable_when_row_fallback_happens",
-        "test_clip_by_rect_benchmark_reports_candidate_and_fallback_counts"
+        "test_clip_by_rect_benchmark_reports_candidate_and_fallback_counts",
+        "test_clip_polygon_gpu_coordinates_stay_device_resident"
       ],
       "tokens": [
         "assert",
@@ -23441,11 +23443,14 @@
         "benchmark",
         "candidate",
         "clip",
+        "coordinates",
         "counts",
+        "device",
         "fallback",
         "falls",
         "geometries",
         "geopandas",
+        "gpu",
         "happens",
         "holes",
         "invalid",
@@ -23461,9 +23466,11 @@
         "py",
         "rect",
         "reports",
+        "resident",
         "row",
         "rows",
         "shapely",
+        "stay",
         "surface",
         "test",
         "tests",
