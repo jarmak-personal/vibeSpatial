@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-import numpy as np
+import numpy as np  # hygiene:ok — used for type alias, not device computation
 
-from vibespatial.constructive.clip_rect import RectClipResult, clip_by_rect_owned
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+
+if TYPE_CHECKING:
+    from vibespatial.constructive.clip_rect import RectClipResult
 
 ClipInput = Sequence[object | None] | np.ndarray | object
 
@@ -31,6 +34,8 @@ def clip_by_rect_kernel(
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> RectClipResult:
+    from vibespatial.constructive.clip_rect import clip_by_rect_owned  # lazy
+
     return clip_by_rect_owned(
         values,
         xmin,

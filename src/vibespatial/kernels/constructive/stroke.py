@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-import numpy as np
+import numpy as np  # hygiene:ok — used for type alias and array construction, not device computation
 
-from vibespatial.constructive.stroke import (
-    BufferKernelResult,
-    OffsetCurveKernelResult,
-    offset_curve_owned,
-    point_buffer_owned,
-)
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
+
+if TYPE_CHECKING:
+    from vibespatial.constructive.stroke import BufferKernelResult, OffsetCurveKernelResult
 
 StrokeInput = Sequence[object | None] | np.ndarray | object
 
@@ -33,6 +31,8 @@ def point_buffer_kernel(
     *,
     quad_segs: int = 16,
 ) -> BufferKernelResult:
+    from vibespatial.constructive.stroke import point_buffer_owned  # lazy
+
     return point_buffer_owned(values, distance, quad_segs=quad_segs)
 
 
@@ -56,10 +56,11 @@ def point_buffer_kernel_gpu(
     # the full Shapely -> OwnedGeometryArray -> Device transfer.  Callers
     # that already hold a device-resident OwnedGeometryArray should call
     # point_buffer_owned_array() directly to skip the H->D round-trip.
-    from vibespatial.constructive.point import point_buffer_owned_array
+    from vibespatial.constructive.point import point_buffer_owned_array  # lazy
+    from vibespatial.constructive.stroke import BufferKernelResult  # lazy
     from vibespatial.geometry.owned import from_shapely_geometries
 
-    geometries = np.asarray(values, dtype=object)
+    geometries = np.asarray(values, dtype=object)  # hygiene:ok — host Shapely objects
     owned = from_shapely_geometries(list(geometries))
     result = point_buffer_owned_array(owned, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
     row_count = result.row_count
@@ -67,7 +68,7 @@ def point_buffer_kernel_gpu(
         geometries=None,
         row_count=row_count,
         fast_rows=np.arange(row_count, dtype=np.int32),
-        fallback_rows=np.asarray([], dtype=np.int32),
+        fallback_rows=np.asarray([], dtype=np.int32),  # hygiene:ok — host index array
         owned_result=result,
     )
 
@@ -90,6 +91,8 @@ def polygon_buffer_kernel_gpu(
     join_style: str = "round",
     mitre_limit: float = 5.0,
 ) -> BufferKernelResult:
+    from vibespatial.constructive.stroke import point_buffer_owned  # lazy
+
     # Dispatch handled by stroke_kernels.evaluate_geopandas_buffer
     return point_buffer_owned(values, distance, quad_segs=quad_segs)
 
@@ -111,6 +114,8 @@ def offset_curve_kernel(
     join_style: str = "round",
     mitre_limit: float = 5.0,
 ) -> OffsetCurveKernelResult:
+    from vibespatial.constructive.stroke import offset_curve_owned  # lazy
+
     return offset_curve_owned(
         values,
         distance,

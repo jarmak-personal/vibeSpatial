@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
-import numpy as np
+import numpy as np  # hygiene:ok — used for type alias, not device computation
 
-from vibespatial.constructive.make_valid_pipeline import MakeValidResult, make_valid_owned
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
+
+if TYPE_CHECKING:
+    from vibespatial.constructive.make_valid_pipeline import MakeValidResult
 
 MakeValidInput = Sequence[object | None] | np.ndarray | object
 
@@ -27,6 +30,8 @@ def make_valid_kernel(
     method: str = "linework",
     keep_collapsed: bool = True,
 ) -> MakeValidResult:
+    from vibespatial.constructive.make_valid_pipeline import make_valid_owned  # lazy
+
     return make_valid_owned(values, method=method, keep_collapsed=keep_collapsed)
 
 
@@ -53,4 +58,6 @@ def make_valid_gpu_kernel(
     self-intersection splitting, and re-polygonization.  Falls back to CPU
     Shapely path for non-polygon families and when GPU repair fails.
     """
+    from vibespatial.constructive.make_valid_pipeline import make_valid_owned  # lazy
+
     return make_valid_owned(values, method=method, keep_collapsed=keep_collapsed, owned=owned)
