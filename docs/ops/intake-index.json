@@ -19540,6 +19540,24 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/affine_transform_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "affine",
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "transform",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/binary_constructive.py",
       "referenced_by": [],
       "symbols": [
@@ -19832,6 +19850,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/centroid_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "centroid",
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/clip_rect.py",
       "referenced_by": [
         "docs/architecture/clip-fast-paths.md"
@@ -19908,6 +19943,24 @@
         "top",
         "values",
         "vertical",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/clip_rect_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "clip",
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "rect",
+        "sources",
+        "src",
         "vibespatial"
       ]
     },
@@ -20014,6 +20067,24 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/convex_hull_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "convex",
+        "hull",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/envelope.py",
       "referenced_by": [],
       "symbols": [
@@ -20067,6 +20138,23 @@
         "xmin",
         "ymax",
         "ymin"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/envelope_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "envelope",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -20480,6 +20568,24 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/linear_ref_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "linear",
+        "nvrtc",
+        "py",
+        "ref",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/linestring.py",
       "referenced_by": [],
       "symbols": [
@@ -20507,6 +20613,23 @@
         "py",
         "src",
         "variable",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/linestring_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "linestring",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
         "vibespatial"
       ]
     },
@@ -20643,6 +20766,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/make_valid_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "gpu",
+        "kernel",
+        "kernels",
+        "make",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "valid",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/make_valid_pipeline.py",
       "referenced_by": [
         "docs/architecture/make-valid.md"
@@ -20653,7 +20795,6 @@
         "MakeValidPlan",
         "MakeValidResult",
         "MakeValidBenchmark",
-        "_format_validity_kernel_source",
         "_compile_validity_kernels",
         "_gpu_polygon_validity_mask",
         "_detect_self_intersections_gpu",
@@ -20676,12 +20817,10 @@
         "cpu",
         "detect",
         "evaluate",
-        "format",
         "fusion",
         "geopandas",
         "gpu",
         "intersections",
-        "kernel",
         "kernels",
         "make",
         "makevalidbenchmark",
@@ -20698,12 +20837,35 @@
         "py",
         "repair",
         "self",
-        "source",
         "src",
         "valid",
         "validity",
         "vibespatial",
         "warmup"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/make_valid_pipeline_kernels.py",
+      "referenced_by": [],
+      "symbols": [
+        "_format_validity_kernel_source"
+      ],
+      "tokens": [
+        "constructive",
+        "format",
+        "kernel",
+        "kernels",
+        "make",
+        "nvrtc",
+        "pipeline",
+        "py",
+        "source",
+        "sources",
+        "src",
+        "valid",
+        "validity",
+        "vibespatial"
       ]
     },
     {
@@ -20787,6 +20949,23 @@
         "vibespatial",
         "when",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/measurement_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "measurement",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -20942,6 +21121,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/minimum_bounding_circle_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "bounding",
+        "circle",
+        "constructive",
+        "kernel",
+        "kernels",
+        "minimum",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/minimum_clearance.py",
       "referenced_by": [],
       "symbols": [
@@ -21059,6 +21257,24 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/minimum_clearance_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "clearance",
+        "constructive",
+        "kernel",
+        "kernels",
+        "minimum",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/minimum_rotated_rectangle.py",
       "referenced_by": [],
       "symbols": [
@@ -21144,6 +21360,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/minimum_rotated_rectangle_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "minimum",
+        "nvrtc",
+        "py",
+        "rectangle",
+        "rotated",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/normalize.py",
       "referenced_by": [],
       "symbols": [
@@ -21223,6 +21458,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/normalize_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "normalize",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/orient.py",
       "referenced_by": [],
       "symbols": [
@@ -21281,6 +21533,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/orient_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "orient",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/point.py",
       "referenced_by": [],
       "symbols": [
@@ -21329,6 +21598,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/point_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "point",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/polygon.py",
       "referenced_by": [],
       "symbols": [
@@ -21365,6 +21651,23 @@
         "variable",
         "vibespatial",
         "winding"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/polygon_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "polygon",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -21479,6 +21782,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/properties_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "properties",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/remove_repeated_points.py",
       "referenced_by": [],
       "symbols": [
@@ -21576,6 +21896,25 @@
         "warmup",
         "wired",
         "within"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/remove_repeated_points_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "points",
+        "py",
+        "remove",
+        "repeated",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -21687,6 +22026,24 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/representative_point_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "point",
+        "py",
+        "representative",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/reverse.py",
       "referenced_by": [],
       "symbols": [
@@ -21725,6 +22082,23 @@
         "types",
         "vibespatial",
         "within"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/reverse_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "reverse",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -21805,6 +22179,23 @@
         "tier",
         "unchanged",
         "user",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/segmentize_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "segmentize",
+        "sources",
+        "src",
         "vibespatial"
       ]
     },
@@ -22167,6 +22558,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/simplify_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "simplify",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/snap.py",
       "referenced_by": [],
       "symbols": [
@@ -22307,6 +22715,23 @@
         "wise",
         "within",
         "xy"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/snap_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "snap",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -22675,6 +23100,23 @@
         "wired",
         "within",
         "without"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/validity_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "constructive",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "validity",
+        "vibespatial"
       ]
     },
     {

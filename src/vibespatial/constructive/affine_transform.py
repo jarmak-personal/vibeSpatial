@@ -31,7 +31,6 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
-from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
@@ -49,37 +48,14 @@ from vibespatial.runtime.residency import Residency
 if TYPE_CHECKING:
     pass
 
-# ---------------------------------------------------------------------------
-# NVRTC kernel source
-# ---------------------------------------------------------------------------
-
-_AFFINE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
-extern "C" __global__ void affine_transform_coords(
-    const double* __restrict__ x_in,
-    const double* __restrict__ y_in,
-    double* __restrict__ x_out,
-    double* __restrict__ y_out,
-    double a, double b, double xoff,
-    double d, double e, double yoff,
-    double center_x, double center_y,
-    int coord_count
-) {{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= coord_count) return;
-
-    const double xi = x_in[i];
-    const double yi = y_in[i];
-    x_out[i] = a * xi + b * yi + xoff;
-    y_out[i] = d * xi + e * yi + yoff;
-}}
-"""
-
-_AFFINE_KERNEL_NAMES = ("affine_transform_coords",)
-_AFFINE_FP64 = _AFFINE_KERNEL_SOURCE.format(compute_type="double")
-_AFFINE_FP32 = _AFFINE_KERNEL_SOURCE.format(compute_type="float")
+from vibespatial.constructive.affine_transform_kernels import (
+    _AFFINE_FP32,
+    _AFFINE_FP64,
+    _AFFINE_KERNEL_NAMES,
+)
 
 # Background precompilation
-from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 
 request_nvrtc_warmup([
     ("affine-transform-fp64", _AFFINE_FP64, _AFFINE_KERNEL_NAMES),

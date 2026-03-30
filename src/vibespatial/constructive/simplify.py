@@ -23,6 +23,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.simplify_kernels import _VW_AREA_FP64, _VW_AREA_KERNEL_NAMES
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -30,7 +31,6 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
-from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
@@ -45,52 +45,6 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# NVRTC kernel: compute effective area per vertex (Visvalingam-Whyatt)
-# ---------------------------------------------------------------------------
-
-_VW_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
-extern "C" __global__ void vw_effective_area(
-    const double* __restrict__ x,
-    const double* __restrict__ y,
-    const int* __restrict__ offsets,
-    double* __restrict__ areas,
-    double center_x, double center_y,
-    int span_count
-) {{
-    const int span = blockIdx.x * blockDim.x + threadIdx.x;
-    if (span >= span_count) return;
-
-    const int start = offsets[span];
-    const int end = offsets[span + 1];
-    const int n = end - start;
-
-    /* First and last vertices always kept (infinite area) */
-    if (n <= 2) {{
-        for (int i = start; i < end; i++) {{
-            areas[i] = 1e308;  /* effectively infinite */
-        }}
-        return;
-    }}
-
-    areas[start] = 1e308;
-    areas[end - 1] = 1e308;
-
-    for (int i = start + 1; i < end - 1; i++) {{
-        /* Triangle area = 0.5 * |cross product of (p[i-1]->p[i]) x (p[i-1]->p[i+1])| */
-        double ax = x[i] - x[i - 1];
-        double ay = y[i] - y[i - 1];
-        double bx = x[i + 1] - x[i - 1];
-        double by = y[i + 1] - y[i - 1];
-        double cross = ax * by - ay * bx;
-        areas[i] = 0.5 * (cross < 0 ? -cross : cross);
-    }}
-}}
-"""
-
-_VW_AREA_KERNEL_NAMES = ("vw_effective_area",)
-_VW_AREA_FP64 = _VW_AREA_KERNEL_SOURCE.format(compute_type="double")
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
