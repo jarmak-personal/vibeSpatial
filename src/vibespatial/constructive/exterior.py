@@ -4,8 +4,7 @@ For Polygon geometries, extracts ring 0 coordinates and produces LineString outp
 For MultiPolygon, falls back to CPU (each polygon's exterior produces a MultiLineString).
 For non-polygon types, returns None per Shapely convention.
 
-ADR-0033: Tier 1 NVRTC, 1 thread per geometry for offset computation,
-1 thread per coordinate for scatter.
+ADR-0033: Tier 2 CuPy vectorized offset computation and coordinate gather.
 """
 
 from __future__ import annotations
@@ -17,9 +16,6 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
-from vibespatial.cuda._runtime import (
-    get_cuda_runtime,
-)
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -31,44 +27,9 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
-
-from .measurement import _PRECISION_PREAMBLE
-
-# ---------------------------------------------------------------------------
-# NVRTC kernel: extract exterior ring coordinates
-# ---------------------------------------------------------------------------
-
-_EXTERIOR_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
-extern "C" __global__ void exterior_ring_scatter(
-    const double* __restrict__ x_in,
-    const double* __restrict__ y_in,
-    const int* __restrict__ ring_offsets,
-    const int* __restrict__ geom_offsets,
-    const int* __restrict__ out_offsets,
-    double* __restrict__ x_out,
-    double* __restrict__ y_out,
-    double center_x, double center_y,
-    int total_out_coords
-) {{
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= total_out_coords) return;
-
-    x_out[i] = x_in[i];
-    y_out[i] = y_in[i];
-}}
-"""
-
-_EXTERIOR_KERNEL_NAMES = ("exterior_ring_scatter",)
-_EXTERIOR_FP64 = _EXTERIOR_KERNEL_SOURCE.format(compute_type="double")
-
-from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
-
-request_nvrtc_warmup([
-    ("exterior-ring-fp64", _EXTERIOR_FP64, _EXTERIOR_KERNEL_NAMES),
-])
-
 
 # ---------------------------------------------------------------------------
 # GPU implementation
@@ -88,8 +49,12 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     Extracts ring 0 from each polygon, producing a LineString per geometry.
     Returns device-resident LineString OwnedGeometryArray.
+
+    All offset computation and coordinate gathering is done on device
+    via CuPy vectorized operations (Tier 2 per ADR-0033).  No D2H/H2D
+    transfers except one unavoidable scalar read (total_coords) for
+    output allocation sizing.
     """
-    runtime = get_cuda_runtime()
     d_state = owned._ensure_device_state()
 
     if GeometryFamily.POLYGON not in d_state.families:
@@ -102,36 +67,38 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # Ring 0 for geometry g starts at ring_offsets[geom_offsets[g]]
     # and ends at ring_offsets[geom_offsets[g] + 1].
 
-    # Download offsets for computation (small metadata)
-    h_geom_offsets = cp.asnumpy(d_poly.geometry_offsets)
-    h_ring_offsets = cp.asnumpy(d_poly.ring_offsets)
+    d_geom_offsets = d_poly.geometry_offsets
+    d_ring_offsets = d_poly.ring_offsets
 
-    poly_count = len(h_geom_offsets) - 1
+    poly_count = d_geom_offsets.shape[0] - 1
 
-    # Compute output geometry offsets: each geometry's exterior ring length
-    out_geom_offsets = np.empty(poly_count + 1, dtype=np.int32)
-    out_geom_offsets[0] = 0
-    for g in range(poly_count):
-        ring_start = h_ring_offsets[h_geom_offsets[g]]
-        ring_end = h_ring_offsets[h_geom_offsets[g] + 1]
-        out_geom_offsets[g + 1] = out_geom_offsets[g] + (ring_end - ring_start)
+    # Gather ring-0 start/end for each geometry (device fancy indexing)
+    d_ring0_start_idx = d_geom_offsets[:-1]
+    d_ring_starts = d_ring_offsets[d_ring0_start_idx]
+    d_ring_ends = d_ring_offsets[d_ring0_start_idx + 1]
 
-    total_coords = int(out_geom_offsets[-1])
+    # Compute per-geometry exterior ring lengths and output offsets (all on device)
+    d_ring_lengths = d_ring_ends - d_ring_starts
+    d_out_geom_offsets = cp.zeros(poly_count + 1, dtype=cp.int32)
+    cp.cumsum(d_ring_lengths, out=d_out_geom_offsets[1:])
+
+    # Single scalar D2H to get total output size (unavoidable for allocation)
+    total_coords = int(d_out_geom_offsets[-1])
     if total_coords == 0:
         return from_shapely_geometries([None] * owned.row_count)
 
-    # Compute source coordinate indices for gathering
-    src_indices = np.empty(total_coords, dtype=np.int32)
-    pos = 0
-    for g in range(poly_count):
-        ring_start = h_ring_offsets[h_geom_offsets[g]]
-        ring_end = h_ring_offsets[h_geom_offsets[g] + 1]
-        length = ring_end - ring_start
-        src_indices[pos:pos + length] = np.arange(ring_start, ring_end, dtype=np.int32)
-        pos += length
+    # Build gather index map on device via searchsorted:
+    # Map each output position to its owning geometry, then compute the
+    # source coordinate index.  This is robust to zero-length segments
+    # (degenerate rings) since no output position maps to an empty segment.
+    # TODO: Replace cp.arange + cp.searchsorted with CCCL lower_bound +
+    # CountingIterator to avoid materializing the full d_positions array
+    # (ADR-0033 Tier 3c opportunity).
+    d_positions = cp.arange(total_coords, dtype=cp.int32)
+    d_geom_ids = cp.searchsorted(d_out_geom_offsets[1:], d_positions, side="right")
+    d_idx = d_ring_starts[d_geom_ids] + (d_positions - d_out_geom_offsets[d_geom_ids])
 
-    # Gather coordinates on device
-    d_idx = cp.asarray(src_indices)
+    # Gather coordinates on device (no host round-trip)
     d_x_out = d_poly.x[d_idx]
     d_y_out = d_poly.y[d_idx]
 
@@ -147,8 +114,7 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     out_family_row_offsets = np.full(owned.row_count, -1, dtype=np.int32)
     out_family_row_offsets[poly_mask] = np.arange(poly_count, dtype=np.int32)
 
-    d_out_geom_offsets = runtime.from_host(out_geom_offsets)
-    d_empty_mask = runtime.from_host(np.zeros(poly_count, dtype=bool))
+    d_empty_mask = cp.zeros(poly_count, dtype=cp.bool_)
 
     device_families = {
         GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
@@ -245,8 +211,13 @@ def exterior_owned(
         )
         try:
             result = _exterior_gpu(owned)
-        except Exception:
-            pass
+        except Exception as exc:
+            record_fallback_event(
+                surface="geopandas.array.exterior",
+                reason="GPU exterior kernel raised, fell back to CPU",
+                detail=str(exc),
+                d2h_transfer=True,
+            )
         else:
             record_dispatch_event(
                 surface="geopandas.array.exterior",
