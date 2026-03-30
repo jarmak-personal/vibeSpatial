@@ -5989,6 +5989,26 @@
     },
     {
       "kind": "repo",
+      "path": ".claude/projects/-home-picard-repos-vibeSpatial/memory/feedback_no_parallel_benches.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "benches",
+        "claude",
+        "feedback",
+        "home",
+        "md",
+        "memory",
+        "no",
+        "parallel",
+        "picard",
+        "projects",
+        "repos",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".claude/settings.json",
       "referenced_by": [],
       "symbols": [],
@@ -25314,15 +25334,20 @@
         "test_result_is_device_resident",
         "test_partial_overlap_pentagon",
         "test_many_pairs",
-        "test_precision_plan_wired"
+        "test_precision_plan_wired",
+        "test_cw_clip_polygon_validity",
+        "test_mixed_winding_boxes"
       ],
       "tokens": [
         "assert",
         "basic",
+        "boxes",
+        "clip",
         "contained",
         "coordinates",
         "count",
         "cpu",
+        "cw",
         "device",
         "edges",
         "empty",
@@ -25339,6 +25364,7 @@
         "make",
         "many",
         "mismatch",
+        "mixed",
         "multiple",
         "no",
         "null",
@@ -25362,6 +25388,8 @@
         "tests",
         "touching",
         "triangle",
+        "validity",
+        "winding",
         "wired"
       ]
     },

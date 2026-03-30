@@ -87,6 +87,23 @@ _POLYGON_INTERSECTION_KERNEL_SOURCE = r"""
 /*  "Inside" is the left side of the directed edge.                    */
 /* ------------------------------------------------------------------ */
 
+/* Compute 2x signed area of a ring (shoelace formula).
+   Positive => CCW, negative => CW.  Used to detect winding direction
+   so the Sutherland-Hodgman inside/outside test works for both CW and
+   CCW clip polygons. */
+__device__ double ring_signed_area_2x(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    int start, int count
+) {
+    double area2 = 0.0;
+    for (int i = 0; i < count; i++) {
+        int j = (i + 1 < count) ? i + 1 : 0;
+        area2 += x[start + i] * y[start + j] - x[start + j] * y[start + i];
+    }
+    return area2;
+}
+
 __device__ double cross_sign(
     double px, double py,
     double ex0, double ey0,
@@ -189,6 +206,16 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
         return;
     }
 
+    /* Detect winding direction of the clip (right) polygon.
+       Sutherland-Hodgman assumes the clip polygon is CCW (interior on
+       the left side of each directed edge).  If the clip polygon is CW,
+       we negate the cross_sign results so the inside/outside test still
+       works correctly.  This handles arbitrary input winding without
+       requiring a pre-normalization step. */
+    const double clip_area2 = ring_signed_area_2x(
+        right_x, right_y, r_coord_start, r_n);
+    const double wsign = (clip_area2 >= 0.0) ? 1.0 : -1.0;
+
     /* Local workspace for Sutherland-Hodgman.
        We alternate between buf_a and buf_b. */
     double buf_ax[MAX_CLIP_VERTS], buf_ay[MAX_CLIP_VERTS];
@@ -229,8 +256,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
             double sx = in_x[i], sy = in_y[i];
             double px = in_x[j], py = in_y[j];
 
-            double s_side = cross_sign(sx, sy, ex0, ey0, ex1, ey1);
-            double p_side = cross_sign(px, py, ex0, ey0, ex1, ey1);
+            double s_side = wsign * cross_sign(sx, sy, ex0, ey0, ex1, ey1);
+            double p_side = wsign * cross_sign(px, py, ex0, ey0, ex1, ey1);
 
             if (s_side >= 0.0) {
                 /* S is inside */
@@ -342,6 +369,11 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
         if (dx * dx + dy * dy < 1e-24) r_n--;
     }
 
+    /* Detect winding direction of the clip polygon (same as count pass). */
+    const double clip_area2 = ring_signed_area_2x(
+        right_x, right_y, r_coord_start, r_n);
+    const double wsign = (clip_area2 >= 0.0) ? 1.0 : -1.0;
+
     /* Local workspace for Sutherland-Hodgman. */
     double buf_ax[MAX_CLIP_VERTS], buf_ay[MAX_CLIP_VERTS];
     double buf_bx[MAX_CLIP_VERTS], buf_by[MAX_CLIP_VERTS];
@@ -374,8 +406,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
             double sx = in_x[i], sy = in_y[i];
             double px = in_x[j], py = in_y[j];
 
-            double s_side = cross_sign(sx, sy, ex0, ey0, ex1, ey1);
-            double p_side = cross_sign(px, py, ex0, ey0, ex1, ey1);
+            double s_side = wsign * cross_sign(sx, sy, ex0, ey0, ex1, ey1);
+            double p_side = wsign * cross_sign(px, py, ex0, ey0, ex1, ey1);
 
             if (s_side >= 0.0) {
                 if (out_count < MAX_CLIP_VERTS) {
@@ -717,11 +749,10 @@ def _polygon_intersection_gpu(
     # geometry_offsets: one ring per polygon = [0, 1, 2, ..., n]
     # (host-side only; device state uses the same pattern implicitly)
 
-    # Validity + empty_mask: use d_valid directly (already on device)
-    d_valid_cp = _cp.asarray(d_valid)
-
-    # Host copies for OwnedGeometryArray metadata (small: O(n) int/bool)
-    validity = runtime.copy_device_to_host(d_valid_cp).astype(bool)
+    # Host copies for OwnedGeometryArray metadata (small: O(n) int/bool).
+    # d_valid is already a CuPy array (returned by runtime.allocate), so
+    # pass it directly to copy_device_to_host -- no cp.asarray() needed.
+    validity = runtime.copy_device_to_host(d_valid).astype(bool)
     geometry_offsets = np.arange(n + 1, dtype=np.int32)
     ring_offsets = runtime.copy_device_to_host(d_ring_offsets)
 

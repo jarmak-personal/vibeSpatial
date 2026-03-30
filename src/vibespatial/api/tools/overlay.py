@@ -839,14 +839,13 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 get_cuda_runtime().free_pool_memory()
             except Exception:
                 pass
-            # AUTO dispatch, not forced GPU.  The GPU polygon_intersection
-            # kernel has a systematic validity-bitmap bug (~26% of results
-            # marked invalid regardless of batch size).  Until the kernel
-            # is fixed, AUTO routes to CPU which is correct.  The old
-            # forced-GPU path avoided D->H->CPU->H->D ping-pong but
-            # produced silently corrupt results.
-            # TODO: restore forced GPU after polygon_intersection_gpu
-            #       validity bitmap is fixed.
+            # AUTO dispatch: the GPU polygon_intersection kernel uses
+            # Sutherland-Hodgman, which is only correct for convex clip
+            # polygons.  AUTO lets the crossover policy route small
+            # batches (< 50K rows) to the CPU/Shapely path that handles
+            # concave polygons.  The validity-bitmap winding-direction
+            # bug has been fixed, so GPU dispatch IS correct when the
+            # crossover threshold selects it for convex-only workloads.
             _pairwise_mode = ExecutionMode.AUTO
 
             # ---- Many-vs-one detection ----
@@ -1047,14 +1046,11 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
         try:
             from vibespatial.geometry.owned import concat_owned_scatter
 
-            # AUTO dispatch, not forced GPU.  The GPU polygon_intersection
-            # kernel has a systematic validity-bitmap bug (~26% of results
-            # marked invalid regardless of batch size).  Until the kernel
-            # is fixed, AUTO routes to CPU which is correct.  The old
-            # forced-GPU path avoided D->H->CPU->H->D ping-pong but
-            # produced silently corrupt results.
-            # TODO: restore forced GPU after polygon_intersection_gpu
-            #       validity bitmap is fixed.
+            # The GPU polygon_intersection kernel uses Sutherland-Hodgman
+            # which only handles convex clip polygons.  The difference
+            # pipeline may produce concave intermediates (e.g., union of
+            # overlapping circles), so keep AUTO until the kernel supports
+            # concave clipping.
             _pairwise_mode = ExecutionMode.AUTO
 
             # Batched overlay difference: splits groups into VRAM-safe

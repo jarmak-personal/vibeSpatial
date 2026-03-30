@@ -492,6 +492,106 @@ def test_precision_plan_wired():
 
 
 # ---------------------------------------------------------------------------
+# Test: CW-wound clip polygon (winding direction fix)
+# ---------------------------------------------------------------------------
+
+@requires_gpu
+def test_cw_clip_polygon_validity(strict_device_guard):
+    """Clip polygons with CW winding must produce correct intersections.
+
+    Regression test for the validity bitmap bug where Sutherland-Hodgman
+    assumed CCW winding on the clip (right) polygon.  CW-wound polygons
+    inverted the inside/outside test, producing degenerate (< 3 vertex)
+    results that were marked invalid.  The fix computes the signed area
+    of the clip polygon to detect winding and flips the test accordingly.
+    """
+    n = 200
+    rng = np.random.default_rng(42)
+    left_geoms = []
+    right_geoms = []
+    for _ in range(n):
+        # Random triangles -- Polygon() from random points produces
+        # CW or CCW winding depending on vertex order.
+        pts_l = rng.uniform(0, 100, (3, 2))
+        pts_r = pts_l + rng.uniform(-2, 2, (3, 2))
+        left_geoms.append(Polygon(pts_l))
+        right_geoms.append(Polygon(pts_r))
+
+    left = _make_owned_polygons(left_geoms)
+    right = _make_owned_polygons(right_geoms)
+
+    from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
+
+    result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    result_geoms = result.to_shapely()
+    ref_geoms = _shapely_intersection(left_geoms, right_geoms)
+
+    # GPU valid count should match Shapely (some pairs may have degenerate
+    # intersections that the kernel correctly marks invalid)
+    false_invalids = 0
+    for i in range(n):
+        ref = ref_geoms[i]
+        ref_area = shapely.area(ref) if ref is not None else 0.0
+        if ref_area > 1e-10 and not result.validity[i]:
+            false_invalids += 1
+
+    assert false_invalids == 0, (
+        f"{false_invalids} false invalids (GPU marked invalid but Shapely "
+        f"produced non-degenerate polygon)"
+    )
+
+    # Geometric correctness for valid pairs
+    for i in range(n):
+        if not result.validity[i]:
+            continue
+        ref_area = shapely.area(ref_geoms[i])
+        gpu_area = shapely.area(result_geoms[i]) if result_geoms[i] is not None else 0.0
+        if ref_area < 1e-10:
+            continue
+        ratio = abs(gpu_area - ref_area) / max(abs(ref_area), 1e-15)
+        assert ratio < 1e-4, (
+            f"Pair {i}: GPU area={gpu_area}, ref area={ref_area}, ratio={ratio}"
+        )
+
+
+@requires_gpu
+def test_mixed_winding_boxes(strict_device_guard):
+    """Intersection works regardless of left/right winding direction.
+
+    Tests all 4 combinations: CCW/CCW, CCW/CW, CW/CCW, CW/CW.
+    """
+    n = 10
+    ccw_left = [box(i, i, i + 2, i + 2) for i in range(n)]
+    ccw_right = [box(i + 1, i + 1, i + 3, i + 3) for i in range(n)]
+    # Reverse coordinate order to get CW winding
+    cw_left = [Polygon(list(g.exterior.coords)[::-1]) for g in ccw_left]
+    cw_right = [Polygon(list(g.exterior.coords)[::-1]) for g in ccw_right]
+
+    from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
+
+    for label, left_geoms, right_geoms in [
+        ("CCW/CCW", ccw_left, ccw_right),
+        ("CCW/CW", ccw_left, cw_right),
+        ("CW/CCW", cw_left, ccw_right),
+        ("CW/CW", cw_left, cw_right),
+    ]:
+        left = _make_owned_polygons(left_geoms)
+        right = _make_owned_polygons(right_geoms)
+        result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+        assert result.validity.all(), (
+            f"{label}: expected all {n} valid, got {result.validity.sum()}"
+        )
+
+        # Check areas match expected (1x1 intersection box = area 1.0)
+        result_geoms = result.to_shapely()
+        for i in range(n):
+            gpu_area = shapely.area(result_geoms[i])
+            assert abs(gpu_area - 1.0) < 1e-6, (
+                f"{label} pair {i}: expected area 1.0, got {gpu_area}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Import guard for Residency
 # ---------------------------------------------------------------------------
 
