@@ -90,6 +90,31 @@ def iter_python_files(root: Path) -> list[Path]:
 
 
 
+def _assign_parents(tree: ast.AST) -> None:
+    """Annotate every node in *tree* with a ``_parent`` attribute."""
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            child._parent = node  # type: ignore[attr-defined]
+
+
+def _enclosing_func_numpy_names(
+    node: ast.AST,
+    func_numpy: dict[int, frozenset[str]],
+) -> frozenset[str]:
+    """Walk up the ``_parent`` chain to find the enclosing function's numpy names.
+
+    Returns ``frozenset()`` if the node is not inside any tracked function
+    (e.g., module-level code), which means the caller will conservatively
+    flag unknown receivers.
+    """
+    current: ast.AST = node
+    while hasattr(current, "_parent"):
+        current = current._parent  # type: ignore[attr-defined]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return func_numpy.get(id(current), frozenset())
+    return frozenset()
+
+
 def _call_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Name):
         return node.func.id
@@ -98,7 +123,101 @@ def _call_name(node: ast.Call) -> str | None:
     return None
 
 
-def _is_d2h_call(node: ast.Call) -> bool:
+# Modules whose function/constructor calls produce host-resident numpy
+# arrays (never device arrays).
+_NUMPY_MODULES = {"np", "numpy", "shapely"}
+
+
+def _collect_numpy_names(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> frozenset[str]:
+    """Collect variable names in *func_node* that are known numpy/host arrays.
+
+    A variable is considered "known numpy" when:
+    1. It is assigned from a ``np.*()`` / ``numpy.*()`` / ``shapely.*()``
+       call (e.g., ``x = np.flatnonzero(mask)``).
+    2. It is a parameter annotated as ``np.ndarray``.
+
+    This is intentionally conservative — only clear-cut cases are included.
+    If a variable's provenance is ambiguous, it is NOT added (so
+    ``_is_d2h_call`` will still flag it).
+    """
+    names: set[str] = set()
+
+    # 1. Parameters with np.ndarray type annotations.
+    for arg in func_node.args.args + func_node.args.kwonlyargs:
+        ann = arg.annotation
+        if ann is None:
+            continue
+        # Match ``np.ndarray`` or ``numpy.ndarray`` as an Attribute node.
+        if (
+            isinstance(ann, ast.Attribute)
+            and ann.attr == "ndarray"
+            and isinstance(ann.value, ast.Name)
+            and ann.value.id in _NUMPY_MODULES
+        ):
+            names.add(arg.arg)
+
+    # 2. Assignments from np.*/numpy.*/shapely.* calls.
+    #    We only look at simple ``name = module.func(...)`` patterns —
+    #    no chained calls, no tuple unpacking.
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        # Only simple single-target assignments (``x = ...``).
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        target_name = node.targets[0].id
+        value = node.value
+
+        # Check for ``module.func(...)`` call where module is numpy/shapely.
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            receiver = value.func.value
+            if isinstance(receiver, ast.Name) and receiver.id in _NUMPY_MODULES:
+                names.add(target_name)
+
+    return frozenset(names)
+
+
+def _receiver_is_numpy(
+    node: ast.Call,
+    numpy_names: frozenset[str],
+) -> bool:
+    """Return True if the method-call receiver is a known numpy/host variable.
+
+    Checks three patterns:
+    - ``name.tolist()``  where *name* is in *numpy_names*
+    - ``name[slice].tolist()``  (Subscript of a numpy variable)
+    - ``name.attr.tolist()``  (Attribute of a numpy variable — rare)
+    - ``np.func(...).tolist()``  (inline numpy call result)
+    """
+    if not isinstance(node.func, ast.Attribute):
+        return False  # bare function call, not a method
+
+    receiver = node.func.value
+
+    # Direct variable: ``arr.tolist()``
+    if isinstance(receiver, ast.Name) and receiver.id in numpy_names:
+        return True
+
+    # Subscript of a numpy variable: ``arr[:-1].tolist()``
+    if isinstance(receiver, ast.Subscript):
+        if isinstance(receiver.value, ast.Name) and receiver.value.id in numpy_names:
+            return True
+
+    # Inline numpy call result: ``np.flatnonzero(mask).tolist()``
+    if isinstance(receiver, ast.Call) and isinstance(receiver.func, ast.Attribute):
+        inner_receiver = receiver.func.value
+        if isinstance(inner_receiver, ast.Name) and inner_receiver.id in _NUMPY_MODULES:
+            return True
+
+    return False
+
+
+def _is_d2h_call(
+    node: ast.Call,
+    numpy_names: frozenset[str] = frozenset(),
+) -> bool:
     name = _call_name(node)
     if name not in D2H_APIS:
         return False
@@ -124,6 +243,12 @@ def _is_d2h_call(node: ast.Call) -> bool:
                 "field", "column", "to_pandas", "to_pydict",
             ):
                 return False
+    # --- Disambiguate numpy host-to-host from cupy D->H ---
+    # .tolist(), .asnumpy(), .get() on a numpy array is a host-to-host
+    # conversion, not a device-to-host transfer. Skip if the receiver is
+    # a known numpy/host variable or an inline numpy call result.
+    if numpy_names and _receiver_is_numpy(node, numpy_names):
+        return False
     return True
 
 
@@ -201,12 +326,13 @@ def check_pingpong_transfers(
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
+            numpy_names = _collect_numpy_names(node)
             d2h_lines: list[int] = []
             h2d_lines: list[int] = []
             for descendant in ast.walk(node):
                 if not isinstance(descendant, ast.Call):
                     continue
-                if _is_d2h_call(descendant):
+                if _is_d2h_call(descendant, numpy_names):
                     d2h_lines.append(descendant.lineno)
                 if _is_h2d_call(descendant):
                     h2d_lines.append(descendant.lineno)
@@ -255,13 +381,26 @@ def check_loop_transfers(
         source = path.read_text(encoding="utf-8")
         suppressions = _parse_suppression_comments(source)
         tree = ast.parse(source, filename=str(path))
+
+        # Pre-compute numpy name sets per enclosing function.
+        # For loops at module level, use an empty set (conservative).
+        func_numpy: dict[int, frozenset[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                func_numpy[id(node)] = _collect_numpy_names(node)
+
+        # Assign parent links so we can look up enclosing function.
+        _assign_parents(tree)
+
         for node in ast.walk(tree):
             if not isinstance(node, (ast.For, ast.While)):
                 continue
+            # Find enclosing function scope for numpy name tracking.
+            numpy_names = _enclosing_func_numpy_names(node, func_numpy)
             for descendant in ast.walk(node):
                 if not isinstance(descendant, ast.Call):
                     continue
-                if _is_d2h_call(descendant):
+                if _is_d2h_call(descendant, numpy_names):
                     is_suppressed = descendant.lineno in suppressions
                     if is_suppressed:
                         suppressed += 1
@@ -287,11 +426,12 @@ def check_loop_transfers(
 
 def _returns_host_conversion(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
     """Return the line number of a D->H call in a return statement, or None."""
+    numpy_names = _collect_numpy_names(func_node)
     for node in ast.walk(func_node):
         if not isinstance(node, ast.Return) or node.value is None:
             continue
         for descendant in ast.walk(node.value):
-            if isinstance(descendant, ast.Call) and _is_d2h_call(descendant):
+            if isinstance(descendant, ast.Call) and _is_d2h_call(descendant, numpy_names):
                 return descendant.lineno
     return None
 

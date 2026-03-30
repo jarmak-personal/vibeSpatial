@@ -12,6 +12,12 @@ Guarded transfer points:
   - ``cupy.asnumpy()``
   - ``numpy.asarray()`` when given a cupy array (implicit D2H)
 
+Scalar exemption: transfers of single-element arrays (``size <= 1``) are
+permitted without raising.  These are O(1) reads needed for Python control
+flow or allocation sizing (e.g. ``int(d_offsets[-1])``).  Anti-patterns
+involving scalars (D2H in loops, ping-pong) are caught by the static
+linter (``check_zero_copy.py`` ZCOPY001/ZCOPY002).
+
 Usage in tests::
 
     def test_overlay_stays_on_device(strict_device_guard):
@@ -135,7 +141,11 @@ def _install_patches() -> dict[str, Any]:
 
             @functools.wraps(cp.ndarray.get)
             def _guarded_get(self: Any, *args: Any, **kwargs: Any) -> Any:
-                if _in_guarded_scope() and not _caller_is_allowed():
+                if (
+                    _in_guarded_scope()
+                    and self.size > 1
+                    and not _caller_is_allowed()
+                ):
                     raise DeviceResidencyViolation(
                         _format_violation(
                             ".get()",
@@ -153,7 +163,11 @@ def _install_patches() -> dict[str, Any]:
 
             @functools.wraps(cp.asnumpy)
             def _guarded_asnumpy(a: Any, *args: Any, **kwargs: Any) -> Any:
-                if _in_guarded_scope() and not _caller_is_allowed():
+                if (
+                    _in_guarded_scope()
+                    and hasattr(a, "size") and a.size > 1
+                    and not _caller_is_allowed()
+                ):
                     raise DeviceResidencyViolation(
                         _format_violation("cupy.asnumpy()")
                     )
@@ -177,6 +191,7 @@ def _install_patches() -> dict[str, Any]:
                 if (
                     _in_guarded_scope()
                     and hasattr(a, "__cuda_array_interface__")
+                    and hasattr(a, "size") and a.size > 1
                     and not _caller_is_allowed()
                 ):
                     raise DeviceResidencyViolation(

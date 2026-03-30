@@ -13955,7 +13955,11 @@
         "LintError",
         "_is_excluded",
         "iter_python_files",
+        "_assign_parents",
+        "_enclosing_func_numpy_names",
         "_call_name",
+        "_collect_numpy_names",
+        "_receiver_is_numpy",
         "_is_d2h_call",
         "_is_h2d_call",
         "_parse_suppression_comments",
@@ -13974,6 +13978,7 @@
       "tokens": [
         "all",
         "apis",
+        "assign",
         "boundary",
         "call",
         "check",
@@ -13986,8 +13991,10 @@
         "detail",
         "device",
         "empty",
+        "enclosing",
         "excluded",
         "find",
+        "func",
         "h2d",
         "host",
         "iter",
@@ -13997,10 +14004,14 @@
         "loop",
         "main",
         "name",
+        "names",
+        "numpy",
+        "parents",
         "parse",
         "pingpong",
         "py",
         "python",
+        "receiver",
         "render",
         "returns",
         "run",
@@ -23823,6 +23834,22 @@
         "testserialization",
         "testtakecopyconcatnoroundtrip",
         "testwkbwktserialization"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_device_guard.py",
+      "referenced_by": [],
+      "symbols": [
+        "TestScalarExemption"
+      ],
+      "tokens": [
+        "device",
+        "guard",
+        "py",
+        "test",
+        "tests",
+        "testscalarexemption"
       ]
     },
     {
