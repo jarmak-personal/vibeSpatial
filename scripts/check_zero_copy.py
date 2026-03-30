@@ -27,7 +27,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-27.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 39  # pylibcudf ring-skip inner-loop D2H eliminated 2026-03-29
+_VIOLATION_BASELINE = 27  # receiver-type analysis eliminates numpy false positives 2026-03-29
 # +3 intentional batch D->H in segment_primitives (OOM prevention)
 # +4 materialization D->H in dbf_gpu (DataFrame construction)
 # +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)
@@ -128,15 +128,39 @@ def _call_name(node: ast.Call) -> str | None:
 _NUMPY_MODULES = {"np", "numpy", "shapely"}
 
 
+def _is_numpy_annotation(ann: ast.expr) -> bool:
+    """Return True if *ann* is or contains ``np.ndarray`` / ``numpy.ndarray``.
+
+    Handles:
+    - Simple: ``np.ndarray``
+    - PEP 604 union: ``np.ndarray | None``
+    """
+    # Direct ``np.ndarray`` / ``numpy.ndarray``
+    if (
+        isinstance(ann, ast.Attribute)
+        and ann.attr == "ndarray"
+        and isinstance(ann.value, ast.Name)
+        and ann.value.id in _NUMPY_MODULES
+    ):
+        return True
+    # PEP 604 union: ``X | Y`` — check both sides recursively.
+    if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
+        return _is_numpy_annotation(ann.left) or _is_numpy_annotation(ann.right)
+    return False
+
+
 def _collect_numpy_names(
     func_node: ast.FunctionDef | ast.AsyncFunctionDef,
 ) -> frozenset[str]:
     """Collect variable names in *func_node* that are known numpy/host arrays.
 
     A variable is considered "known numpy" when:
-    1. It is assigned from a ``np.*()`` / ``numpy.*()`` / ``shapely.*()``
+    1. It is a parameter annotated as ``np.ndarray`` (including union types
+       like ``np.ndarray | None``).
+    2. It is assigned from a ``np.*()`` / ``numpy.*()`` / ``shapely.*()``
        call (e.g., ``x = np.flatnonzero(mask)``).
-    2. It is a parameter annotated as ``np.ndarray``.
+    3. It is assigned from a subscript of a known-numpy variable
+       (e.g., ``y = x[start:end]``).
 
     This is intentionally conservative — only clear-cut cases are included.
     If a variable's provenance is ambiguous, it is NOT added (so
@@ -149,13 +173,7 @@ def _collect_numpy_names(
         ann = arg.annotation
         if ann is None:
             continue
-        # Match ``np.ndarray`` or ``numpy.ndarray`` as an Attribute node.
-        if (
-            isinstance(ann, ast.Attribute)
-            and ann.attr == "ndarray"
-            and isinstance(ann.value, ast.Name)
-            and ann.value.id in _NUMPY_MODULES
-        ):
+        if _is_numpy_annotation(ann):
             names.add(arg.arg)
 
     # 2. Assignments from np.*/numpy.*/shapely.* calls.
@@ -176,7 +194,52 @@ def _collect_numpy_names(
             if isinstance(receiver, ast.Name) and receiver.id in _NUMPY_MODULES:
                 names.add(target_name)
 
+    # 3. Propagate: variables assigned from operations on known-numpy names.
+    #    This covers:
+    #    - Subscripts: ``y = x[start:end]`` where *x* is in *names*.
+    #    - Arithmetic: ``z = x - scalar + scalar`` where *x* is in *names*.
+    #    A single propagation pass is sufficient for the patterns we see in
+    #    practice (direct subscript or one level of arithmetic on a subscript).
+    #    We run two passes to handle ``y = x[s:e]; z = y - k``.
+    for _pass in range(2):
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Assign):
+                continue
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                continue
+            target_name = node.targets[0].id
+            if target_name in names:
+                continue  # already tracked
+            value = node.value
+            if _value_derives_from_numpy(value, names):
+                names.add(target_name)
+
     return frozenset(names)
+
+
+def _value_derives_from_numpy(value: ast.expr, names: set[str]) -> bool:
+    """Return True if *value* is derived from a known-numpy variable.
+
+    Handles:
+    - Direct name reference: ``x`` where x is in *names*
+    - Subscript: ``x[i]``, ``x[start:end]``
+    - Arithmetic (BinOp): ``x - scalar``, ``x + y`` where at least one
+      operand derives from numpy
+    - Unary op: ``-x``
+    """
+    if isinstance(value, ast.Name) and value.id in names:
+        return True
+    if isinstance(value, ast.Subscript):
+        if isinstance(value.value, ast.Name) and value.value.id in names:
+            return True
+    if isinstance(value, ast.BinOp):
+        return (
+            _value_derives_from_numpy(value.left, names)
+            or _value_derives_from_numpy(value.right, names)
+        )
+    if isinstance(value, ast.UnaryOp):
+        return _value_derives_from_numpy(value.operand, names)
+    return False
 
 
 def _receiver_is_numpy(
@@ -247,7 +310,7 @@ def _is_d2h_call(
     # .tolist(), .asnumpy(), .get() on a numpy array is a host-to-host
     # conversion, not a device-to-host transfer. Skip if the receiver is
     # a known numpy/host variable or an inline numpy call result.
-    if numpy_names and _receiver_is_numpy(node, numpy_names):
+    if _receiver_is_numpy(node, numpy_names):
         return False
     return True
 

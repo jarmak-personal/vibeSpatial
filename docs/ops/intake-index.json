@@ -13958,7 +13958,9 @@
         "_assign_parents",
         "_enclosing_func_numpy_names",
         "_call_name",
+        "_is_numpy_annotation",
         "_collect_numpy_names",
+        "_value_derives_from_numpy",
         "_receiver_is_numpy",
         "_is_d2h_call",
         "_is_h2d_call",
@@ -13977,6 +13979,7 @@
       ],
       "tokens": [
         "all",
+        "annotation",
         "apis",
         "assign",
         "boundary",
@@ -13988,6 +13991,7 @@
         "conversion",
         "copy",
         "d2h",
+        "derives",
         "detail",
         "device",
         "empty",
@@ -14021,6 +14025,7 @@
         "transfers",
         "type",
         "uses",
+        "value",
         "violations",
         "zero"
       ]
