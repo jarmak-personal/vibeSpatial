@@ -74,6 +74,36 @@ from .spatial_index_device import (
 )
 
 
+def _device_candidates_to_result(
+    device_cands: _DeviceCandidates,
+    *,
+    sort: bool,
+    execution: SpatialQueryExecution,
+    return_metadata: bool,
+) -> Any:
+    """Build a DeviceSpatialJoinResult directly from device-resident candidates.
+
+    Eliminates the D->H->D ping-pong that occurs when regular-grid paths
+    call .to_host() and then the return_device block re-uploads via
+    cp.asarray().  The candidate arrays stay on device throughout.
+    """
+    import cupy as _cp
+
+    d_left = device_cands.d_left
+    d_right = device_cands.d_right
+    if sort and d_left.size > 0:
+        order = _cp.lexsort(
+            _cp.stack([
+                _cp.asarray(d_right, dtype=_cp.int64),
+                _cp.asarray(d_left, dtype=_cp.int64),
+            ])
+        )
+        d_left = d_left[order]
+        d_right = d_right[order]
+    result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+    return (result, execution) if return_metadata else result
+
+
 def query_spatial_index(
     tree_owned: OwnedGeometryArray,
     flat_index,
@@ -135,16 +165,30 @@ def query_spatial_index(
             flat_index, _rg_bounds, predicate=predicate,
         )
         if regular_grid_box_pairs is not None:
-            if isinstance(regular_grid_box_pairs, _DeviceCandidates):
-                left_idx, right_idx = regular_grid_box_pairs.to_host()
-            else:
-                left_idx, right_idx = regular_grid_box_pairs
             execution = SpatialQueryExecution(
                 requested=ExecutionMode.AUTO,
                 selected=ExecutionMode.GPU,
                 implementation="owned_gpu_spatial_query",
                 reason="repo-owned regular-grid rectangle box query executed on GPU with exact range expansion",
             )
+            # Short-circuit: keep indices on device when caller wants device
+            # results (ZCOPY001: avoid D->H->D ping-pong in regular-grid path).
+            if (
+                return_device
+                and not scalar
+                and output_format == "indices"
+                and isinstance(regular_grid_box_pairs, _DeviceCandidates)
+            ):
+                return _device_candidates_to_result(
+                    regular_grid_box_pairs,
+                    sort=sort,
+                    execution=execution,
+                    return_metadata=return_metadata,
+                )
+            if isinstance(regular_grid_box_pairs, _DeviceCandidates):
+                left_idx, right_idx = regular_grid_box_pairs.to_host()
+            else:
+                left_idx, right_idx = regular_grid_box_pairs
             if scalar:
                 indices = right_idx.astype(np.intp, copy=False)
             else:
@@ -258,16 +302,30 @@ def query_spatial_index(
         predicate=predicate,
     )
     if regular_grid_box_pairs is not None:
-        if isinstance(regular_grid_box_pairs, _DeviceCandidates):
-            left_idx, right_idx = regular_grid_box_pairs.to_host()
-        else:
-            left_idx, right_idx = regular_grid_box_pairs
         execution = SpatialQueryExecution(
             requested=ExecutionMode.AUTO,
             selected=ExecutionMode.GPU,
             implementation="owned_gpu_spatial_query",
             reason="repo-owned regular-grid rectangle box query executed on GPU with exact range expansion",
         )
+        # Short-circuit: keep indices on device when caller wants device
+        # results (ZCOPY001: avoid D->H->D ping-pong in regular-grid path).
+        if (
+            return_device
+            and not scalar
+            and output_format == "indices"
+            and isinstance(regular_grid_box_pairs, _DeviceCandidates)
+        ):
+            return _device_candidates_to_result(
+                regular_grid_box_pairs,
+                sort=sort,
+                execution=execution,
+                return_metadata=return_metadata,
+            )
+        if isinstance(regular_grid_box_pairs, _DeviceCandidates):
+            left_idx, right_idx = regular_grid_box_pairs.to_host()
+        else:
+            left_idx, right_idx = regular_grid_box_pairs
         if scalar:
             indices = right_idx.astype(np.intp, copy=False)
         else:
@@ -300,6 +358,20 @@ def query_spatial_index(
             implementation="owned_gpu_spatial_query",
             reason="regular-grid point query selected the repo-owned GPU candidate kernel",
         )
+        # Short-circuit: keep indices on device when caller wants device
+        # results (ZCOPY001: avoid D->H->D ping-pong in regular-grid path).
+        if (
+            return_device
+            and not scalar
+            and output_format == "indices"
+            and isinstance(fast_pairs, _DeviceCandidates)
+        ):
+            return _device_candidates_to_result(
+                fast_pairs,
+                sort=sort,
+                execution=execution,
+                return_metadata=return_metadata,
+            )
         if isinstance(fast_pairs, _DeviceCandidates):
             left_idx, right_idx = fast_pairs.to_host()
         else:

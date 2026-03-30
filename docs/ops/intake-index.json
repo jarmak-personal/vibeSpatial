@@ -21962,15 +21962,19 @@
         "docs/architecture/spatial-joins.md"
       ],
       "symbols": [
+        "_device_candidates_to_result",
         "query_spatial_index",
         "build_owned_spatial_index"
       ],
       "tokens": [
         "build",
+        "candidates",
+        "device",
         "index",
         "owned",
         "py",
         "query",
+        "result",
         "spatial",
         "src",
         "vibespatial"
