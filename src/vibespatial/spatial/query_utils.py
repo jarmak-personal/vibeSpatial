@@ -387,6 +387,10 @@ def _filter_predicate_pairs_owned(
             | (d_right_is_point & _cp.isin(d_left_tags, all_non_de9im))
         )
 
+        # Device-resident non-point tag set for DE-9IM path (avoids H2D
+        # upload of host non_point_tags later).
+        d_non_point_tags = _cp.concatenate([line_tags_arr, region_tags_arr])
+
         all_gpu = bool(_cp.all(d_gpu_pair_mask))
         any_gpu = bool(_cp.any(d_gpu_pair_mask))
 
@@ -502,6 +506,19 @@ def _filter_predicate_pairs_owned(
             _dc = device_candidates
             _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
 
+            # Pre-compute device-side DE-9IM index mask to avoid D->H->D
+            # round-trip (ZCOPY001).  d_left_tags/d_right_tags from line
+            # 374-375 stay on device; we compute per-(lt,rt) sub-indices
+            # directly on GPU instead of uploading host numpy masks.
+            if _use_device_idx:
+                d_non_gpu_mask = ~d_gpu_pair_mask
+                d_de9im_pair_mask = (
+                    _cp.isin(d_left_tags, d_non_point_tags)
+                    & _cp.isin(d_right_tags, d_non_point_tags)
+                )
+                d_de9im_base_mask = d_non_gpu_mask & d_de9im_pair_mask
+                d_de9im_idx = _cp.flatnonzero(d_de9im_base_mask).astype(_cp.int32)
+
             # Group by (left_family, right_family) to dispatch correct kernel.
             de9im_masks = np.zeros(de9im_idx.size, dtype=np.uint16)
             for (lt, rt) in unique_tag_pairs(de9im_left_tags, de9im_right_tags):
@@ -515,13 +532,13 @@ def _filter_predicate_pairs_owned(
                     continue
 
                 # Build device sub-arrays when candidates are device-resident.
+                # Compute sub-indices on device from device tag arrays to avoid
+                # uploading host-computed indices (eliminates D->H->D ping-pong).
                 d_sub_left = None
                 d_sub_right = None
                 if _use_device_idx:
-                    import cupy as cp
-                    # de9im_idx[sub_idx] maps back to the full candidate array
-                    full_sub_idx = de9im_idx[sub_idx]
-                    d_full_idx = cp.asarray(full_sub_idx.astype(np.int32))
+                    d_sub_mask = (d_left_tags[d_de9im_idx] == lt) & (d_right_tags[d_de9im_idx] == rt)
+                    d_full_idx = d_de9im_idx[_cp.flatnonzero(d_sub_mask)]
                     d_sub_left = _dc.d_left[d_full_idx]
                     d_sub_right = _dc.d_right[d_full_idx]
 
