@@ -538,9 +538,16 @@ def _fp32_center_coords(
     reductions (min_x, max_x, min_y, max_y) are packed into a single device
     array so that only **one** ``.get()`` call (and therefore one implicit D2H
     sync) is issued instead of four.
+
+    The ``.get()`` is issued outside the family search loop to satisfy
+    ZCOPY002 (no D2H transfers inside loop bodies).
     """
     import cupy as _cp
 
+    # Phase 1: find the first non-empty family and compute device stats
+    # (no .get() inside the loop).
+    d_stats = None
+    host_center: tuple[float, float] | None = None
     for fam, buf in owned.families.items():
         if buf.row_count == 0:
             continue
@@ -550,19 +557,25 @@ def _fp32_center_coords(
             if int(d_buf.x.size) > 0:
                 d_x = _cp.asarray(d_buf.x)
                 d_y = _cp.asarray(d_buf.y)
-                # Batch 4 reductions into 1 D2H transfer
-                stats = _cp.array([
+                # Batch 4 reductions into 1 device array (transfer deferred)
+                d_stats = _cp.array([
                     _cp.min(d_x), _cp.max(d_x),
                     _cp.min(d_y), _cp.max(d_y),
                 ])
-                s = stats.get()  # single sync
-                center_x = float((s[0] + s[1]) * 0.5)
-                center_y = float((s[2] + s[3]) * 0.5)
-                return center_x, center_y
+                break
         elif buf.x.size > 0:
-            center_x = float((buf.x.min() + buf.x.max()) * 0.5)
-            center_y = float((buf.y.min() + buf.y.max()) * 0.5)
-            return center_x, center_y
+            host_center = (
+                float((buf.x.min() + buf.x.max()) * 0.5),
+                float((buf.y.min() + buf.y.max()) * 0.5),
+            )
+            break
+
+    # Phase 2: single D2H transfer outside the loop.
+    if d_stats is not None:
+        s = d_stats.get()
+        return float((s[0] + s[1]) * 0.5), float((s[2] + s[3]) * 0.5)
+    if host_center is not None:
+        return host_center
     return 0.0, 0.0
 
 
@@ -572,9 +585,9 @@ def _coord_stats_from_owned(
     """Return ``(max_abs, coord_min, coord_max)`` across all families.
 
     When device buffers are available the six CuPy reductions per family
-    (abs_max_x, abs_max_y, min_x, min_y, max_x, max_y) are packed into a
-    single device array so that only **one** ``.get()`` call is issued per
-    family instead of six.
+    (abs_max_x, abs_max_y, min_x, min_y, max_x, max_y) are collected into
+    a single device array across ALL families so that only **one** ``.get()``
+    call is issued outside the loop, satisfying ZCOPY002.
     """
     import cupy as _cp
 
@@ -582,6 +595,9 @@ def _coord_stats_from_owned(
     coord_min: float = float("inf")
     coord_max: float = float("-inf")
 
+    # Phase 1: collect device-side reduction scalars across all families
+    # (no .get() inside the loop).
+    device_scalars: list = []  # list of CuPy 0-d arrays
     for fam, buf in owned.families.items():
         if buf.row_count == 0:
             continue
@@ -591,20 +607,26 @@ def _coord_stats_from_owned(
             if int(d_buf.x.size) > 0:
                 d_x = _cp.asarray(d_buf.x)
                 d_y = _cp.asarray(d_buf.y)
-                # Batch 6 reductions into 1 D2H transfer
-                stats = _cp.array([
+                # 6 reduction scalars per family, deferred to bulk transfer
+                device_scalars.extend([
                     _cp.max(_cp.abs(d_x)), _cp.max(_cp.abs(d_y)),
                     _cp.min(d_x), _cp.min(d_y),
                     _cp.max(d_x), _cp.max(d_y),
                 ])
-                s = stats.get()  # single sync
-                max_abs = max(max_abs, float(s[0]), float(s[1]))
-                coord_min = min(coord_min, float(s[2]), float(s[3]))
-                coord_max = max(coord_max, float(s[4]), float(s[5]))
         elif buf.x.size > 0:
+            # Host-resident data: accumulate directly (no D2H).
             max_abs = max(max_abs, float(np.abs(buf.x).max()), float(np.abs(buf.y).max()))
             coord_min = min(coord_min, float(buf.x.min()), float(buf.y.min()))
             coord_max = max(coord_max, float(buf.x.max()), float(buf.y.max()))
+
+    # Phase 2: single D2H transfer outside the loop for all device families.
+    if device_scalars:
+        all_stats = _cp.array(device_scalars).get()
+        # Process in groups of 6 (abs_max_x, abs_max_y, min_x, min_y, max_x, max_y)
+        for i in range(0, len(all_stats), 6):
+            max_abs = max(max_abs, float(all_stats[i]), float(all_stats[i + 1]))
+            coord_min = min(coord_min, float(all_stats[i + 2]), float(all_stats[i + 3]))
+            coord_max = max(coord_max, float(all_stats[i + 4]), float(all_stats[i + 5]))
 
     return max_abs, coord_min, coord_max
 

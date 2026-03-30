@@ -27,7 +27,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-29.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 13  # FIX-10: device-side batch splitting in segment_primitives 2026-03-29
+_VIOLATION_BASELINE = 11  # FIX-11: segmented reduction in measurement.py coord stats 2026-03-29
 # +4 materialization D->H in dbf_gpu (DataFrame construction)
 # +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)
 
