@@ -5265,11 +5265,12 @@ def spatial_overlay_owned(
         d_right_remap[d_unique_right] = cp.arange(int(d_unique_right.size), dtype=cp.int64)
         d_right_subset_indices = d_right_remap[d_right_indices]
 
-        # Materialize group_starts/group_ends to host for per-group loop
-        # iteration (small arrays — O(unique_left) scalars).  The actual
-        # index arrays used for take() stay on device.
-        group_starts = cp.asnumpy(d_group_starts)
-        group_ends = cp.asnumpy(d_group_ends)
+        # Keep group boundaries on device — they are small O(unique_left)
+        # arrays used for filtering in the containment/SH bypass paths.
+        # They are materialised to host lazily right before the per-group
+        # Python loop or segmented_union_all call (FIX-09: ZCOPY001).
+        group_starts = d_group_starts  # device CuPy array
+        group_ends = d_group_ends  # device CuPy array
         unique_left = d_unique_left  # device array for take()
         right_subset_indices = d_right_subset_indices  # device array for take()
 
@@ -5384,17 +5385,18 @@ def spatial_overlay_owned(
                     cp.arange(len(group_starts), dtype=cp.int64)
                 ]
                 new_group_indices = cp.flatnonzero(d_grp_mask)
-                h_new_group_indices = cp.asnumpy(new_group_indices)
 
-                group_starts = group_starts[h_new_group_indices]
-                group_ends = group_ends[h_new_group_indices]
+                # FIX-09: index device arrays directly — no D2H for
+                # group boundary filtering.
+                group_starts = group_starts[new_group_indices]
+                group_ends = group_ends[new_group_indices]
                 unique_left = unique_left[new_group_indices]
 
                 # right_subset_indices are unchanged — they reference right_subset
                 # rows which are not affected by left filtering.
             else:
                 # CPU path: rebuild grouping.
-                h_remainder_mask = cp.asnumpy(_containment_remainder_mask) if cp is not None else _containment_remainder_mask
+                h_remainder_mask = cp.asnumpy(_containment_remainder_mask) if cp is not None else _containment_remainder_mask  # zcopy:ok(CPU-path branch; H2D at 5450 is in device branch — mutually exclusive)
                 old_to_new = np.full(len(h_remainder_mask), -1, dtype=np.int64)
                 h_remainder_indices = np.flatnonzero(h_remainder_mask)
                 old_to_new[h_remainder_indices] = np.arange(len(h_remainder_indices), dtype=np.int64)
@@ -5465,9 +5467,9 @@ def spatial_overlay_owned(
                                     cp.arange(len(group_starts), dtype=cp.int64)
                                 ]
                                 new_grp_sh = cp.flatnonzero(d_sh_grp_mask)
-                                h_new_grp_sh = cp.asnumpy(new_grp_sh)
-                                group_starts = group_starts[h_new_grp_sh]
-                                group_ends = group_ends[h_new_grp_sh]
+                                # FIX-09: index device arrays directly.
+                                group_starts = group_starts[new_grp_sh]
+                                group_ends = group_ends[new_grp_sh]
                                 unique_left = unique_left[new_grp_sh]
                             else:
                                 h_complex_mask = ~sh_eligible_mask
@@ -5583,12 +5585,18 @@ def spatial_overlay_owned(
             )
 
             # Build CSR-style group offsets for segmented_union_all.
-            # group_starts is always host numpy (materialised above for both
-            # device and host paths).  segmented_union_all converts to host
-            # internally via np.asarray.
-            group_offsets = np.empty(len(group_starts) + 1, dtype=np.int64)
-            group_offsets[:-1] = group_starts
-            group_offsets[-1] = len(right_subset_indices)
+            # segmented_union_all expects host numpy offsets.
+            # FIX-09: when pairs are on device, materialise group_starts
+            # to host here (single bulk D2H for small metadata).
+            if _pairs_on_device:
+                h_group_starts = cp.asnumpy(group_starts)  # zcopy:ok(small metadata for segmented_union_all)
+                n_rsi = int(right_subset_indices.shape[0])
+            else:
+                h_group_starts = group_starts  # already host numpy
+                n_rsi = len(right_subset_indices)
+            group_offsets = np.empty(len(h_group_starts) + 1, dtype=np.int64)
+            group_offsets[:-1] = h_group_starts
+            group_offsets[-1] = n_rsi
 
             right_gathered = right_subset.take(right_subset_indices)
             right_unions = segmented_union_all(right_gathered, group_offsets)
@@ -5683,6 +5691,17 @@ def spatial_overlay_owned(
                 else:
                     _stream_pool = None
 
+                # FIX-09: materialise group boundaries to host once
+                # right before the per-group Python loop.  This is the
+                # only D2H for these arrays; all upstream filtering
+                # (containment bypass, SH bypass) operated on device.
+                if _pairs_on_device and _n_groups > 0:
+                    _h_group_starts = cp.asnumpy(group_starts)
+                    _h_group_ends = cp.asnumpy(group_ends)
+                else:
+                    _h_group_starts = group_starts
+                    _h_group_ends = group_ends
+
                 if _is_broadcast_right_overlay and _n_groups > 0:
                     # Materialise right host state once outside the loop.
                     # _overlay_owned calls _ensure_host_state on both
@@ -5695,7 +5714,7 @@ def spatial_overlay_owned(
                     # synchronization.
                     _futures: list[tuple] = []
                     for grp_idx in range(_n_groups):
-                        start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
+                        start, end = int(_h_group_starts[grp_idx]), int(_h_group_ends[grp_idx])
                         n_pairs = end - start
                         _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
                         with (_stream if _stream is not None else contextlib.nullcontext()):
@@ -5747,7 +5766,7 @@ def spatial_overlay_owned(
                     # or non-broadcast_right strategy.
                     _futures_gen: list[tuple] = []
                     for grp_idx in range(_n_groups):
-                        start, end = int(group_starts[grp_idx]), int(group_ends[grp_idx])
+                        start, end = int(_h_group_starts[grp_idx]), int(_h_group_ends[grp_idx])
                         n_pairs = end - start
                         _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
                         with (_stream if _stream is not None else contextlib.nullcontext()):
