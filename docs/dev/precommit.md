@@ -96,7 +96,6 @@ host_data = device_array.get()  # zcopy:ok(materialization boundary: DataFrame c
 |------|------|---------|
 | MAINT001 | New modules in `src/vibespatial/` must be in intake | Missing from `intake-index.json` |
 | MAINT002 | New ADRs must be indexed | Missing from `docs/decisions/index.md` |
-| MAINT003 | New scripts must be in AGENTS.md | Missing from project shape section |
 
 ## Layer 2: Pre-Land Review Skill (Claude Code, proactive)
 

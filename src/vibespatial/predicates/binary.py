@@ -1467,7 +1467,16 @@ def evaluate_geopandas_binary_predicate(
         # Topological equality = structural equality after normalization.
         # Routes to normalize-then-compare composition in equality.py.
         if predicate == "equals":
-            return _evaluate_geopandas_equals(left, right, **kwargs)
+            try:
+                return _evaluate_geopandas_equals(left, right, **kwargs)
+            except NotImplementedError:
+                record_fallback_event(
+                    surface="geopandas.array.equals",
+                    reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
+                    detail="NotImplementedError from from_shapely_geometries",
+                    pipeline="predicate",
+                )
+                return None
 
         # --- equals_exact special path ---
         # Tolerance invalidates the standard bbox coarse filter (two
@@ -1475,13 +1484,31 @@ def evaluate_geopandas_binary_predicate(
         # don't overlap).  Route directly to the dedicated coordinate-
         # comparison dispatch in geometry/equality.py.
         if predicate == "equals_exact":
-            return _evaluate_geopandas_equals_exact(left, right, **kwargs)
+            try:
+                return _evaluate_geopandas_equals_exact(left, right, **kwargs)
+            except NotImplementedError:
+                record_fallback_event(
+                    surface="geopandas.array.equals_exact",
+                    reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
+                    detail="NotImplementedError from from_shapely_geometries",
+                    pipeline="predicate",
+                )
+                return None
 
         # --- equals_identical special path ---
         # Strict coordinate-level identity (tolerance=0).  Routes through
         # the same NVRTC kernel infrastructure as equals_exact.
         if predicate == "equals_identical":
-            return _evaluate_geopandas_equals_identical(left, right, **kwargs)
+            try:
+                return _evaluate_geopandas_equals_identical(left, right, **kwargs)
+            except NotImplementedError:
+                record_fallback_event(
+                    surface="geopandas.array.equals_identical",
+                    reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
+                    detail="NotImplementedError from from_shapely_geometries",
+                    pipeline="predicate",
+                )
+                return None
 
         left_coerced = left if isinstance(left, OwnedGeometryArray) else np.asarray(left, dtype=object)
         if isinstance(right, OwnedGeometryArray) or np.isscalar(right) or right is None:

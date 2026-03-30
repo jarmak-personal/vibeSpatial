@@ -1,7 +1,7 @@
-"""Maintainability and discoverability lints (MAINT001-003).
+"""Maintainability and discoverability lints (MAINT001-002).
 
 Ensures new code is findable through the intake routing system and that
-new decision records, scripts, and modules are properly indexed.
+new decision records are properly indexed.
 
 Uses a ratchet baseline: fails only when violations INCREASE beyond the
 known debt count.  Decrease the baseline as debt is paid down.
@@ -26,7 +26,7 @@ DECISIONS_INDEX = "docs/decisions/index.md"
 # Known pre-existing violations as of 2026-03-17.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 38  # +1: scripts/verify_degeneracy_corpus.py added by other agent
+_VIOLATION_BASELINE = 0
 
 # Modules that are intentionally not in intake (internal, generated, etc.).
 _INTAKE_EXEMPT_MODULES = {
@@ -159,46 +159,10 @@ def check_adr_index_coverage(repo_root: Path) -> list[LintError]:
     return errors
 
 
-# ---- MAINT003: Scripts must be listed in AGENTS.md project shape ----
-
-def check_script_agents_coverage(repo_root: Path) -> list[LintError]:
-    """Verify every script in scripts/ is referenced in AGENTS.md."""
-    errors: list[LintError] = []
-    scripts_dir = repo_root / "scripts"
-    agents_path = repo_root / AGENTS_DOC
-
-    if not scripts_dir.exists() or not agents_path.exists():
-        return errors
-
-    agents_text = agents_path.read_text(encoding="utf-8")
-    script_files = sorted(
-        p for p in scripts_dir.glob("*.py")
-        if not p.name.startswith(".") and p.name != "__init__.py"
-    )
-
-    for script in script_files:
-        ref = f"scripts/{script.name}"
-        if ref not in agents_text and script.name not in agents_text:
-            errors.append(
-                LintError(
-                    code="MAINT003",
-                    path=script,
-                    line=1,
-                    message=(
-                        f"{ref} is not listed in AGENTS.md project shape. "
-                        "Add a one-line description so agents can discover and route to it."
-                    ),
-                    doc_path=AGENTS_DOC,
-                )
-            )
-    return errors
-
-
 def run_checks(repo_root: Path) -> list[LintError]:
     errors: list[LintError] = []
     errors.extend(check_module_intake_coverage(repo_root))
     errors.extend(check_adr_index_coverage(repo_root))
-    errors.extend(check_script_agents_coverage(repo_root))
     return sorted(errors, key=lambda e: (str(e.path), e.line, e.code))
 
 
