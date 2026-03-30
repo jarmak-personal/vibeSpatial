@@ -5,7 +5,7 @@ Scope: Architecture decision log and index of accepted or superseded ADRs.
 Read If: You are resolving, revisiting, or querying a design decision.
 STOP IF: You already have the specific ADR open and do not need the index.
 Source Of Truth: Decision log for architecture choices.
-Body Budget: 81/220 lines
+Body Budget: 83/220 lines
 Document: docs/decisions/index.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 17-25 | Open First |
 | 26-30 | Verify |
 | 31-35 | Risks |
-| 36-81 | Decisions |
+| 36-83 | Decisions |
 DOC_HEADER:END -->
 
 Use this index to find accepted architecture decisions.
@@ -54,6 +54,8 @@ Track architecture decisions in a stable, agent-discoverable format.
 - Buried or unindexed ADRs make agents re-litigate settled design choices.
 
 ## Decisions
+
+See also [adr-index.md](adr-index.md) for the Sphinx toctree listing.
 
 | ADR | Status | Date | Title |
 |---|---|---|---|

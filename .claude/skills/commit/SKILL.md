@@ -16,10 +16,11 @@ Invoke the `pre-land-review` skill. This runs:
 - All deterministic checks (ruff, check_docs, architecture lints, zero-copy,
   perf patterns, maintainability)
 - AI-powered sub-agent reviews (GPU code review, zero-copy enforcer,
-  performance analysis, maintainability enforcer) as applicable
+  performance analysis, maintainability enforcer, acceleration angel) as applicable
 
 If the review finds BLOCKING issues, **stop here**. Fix them and re-run
-`/commit`. Do not proceed to Step 2 with blocking findings.
+`/commit`. Do not proceed to Step 2 with blocking findings. NEVER descope
+BLOCKING issues.
 
 ## Step 2: Stage changes
 
@@ -99,10 +100,12 @@ line of code must meet the standard. If existing code has a shortcoming
 (e.g., a function returns host arrays when it should return device arrays),
 your new code must not compound that problem by building on it. Instead:
 
-- If the fix is small (< 5 minutes): fix the upstream function too.
-- If the fix is structural: spawn a `cuda-engineer` agent with the context
+- If the fix is small (< 5 minutes): fix the upstream function in your workstream.
+- If the fix is structural or large: spawn a `cuda-engineer` agent with the context
   needed to fix the upstream API, then build your code against the fixed
   version.
+- If the fix is pre-existing and "out-of-scope": it is now in-scope. Spawn required agents
+  to understand, then fix, the issue. Do not build new code that depends on broken paths.
 
 The goal is to shrink the cleanup backlog, not grow it.
 
@@ -122,9 +125,9 @@ excuses that are NOT valid:
 
 ### What to do when a finding requires upstream fixes
 
-Do NOT mark the review as LAND and leave a TODO. Instead:
+Do NOT EVER mark the review as LAND and leave a TODO. Instead:
 
-1. Spawn a `cuda-engineer` agent (background, worktree) with:
+1. Spawn a `cuda-engineer` or `python-engineer` agent (background) with:
    - The specific function/API that needs fixing
    - What it currently returns (e.g., host array)
    - What it should return (e.g., device array)

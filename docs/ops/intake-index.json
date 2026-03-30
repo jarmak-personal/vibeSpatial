@@ -13854,7 +13854,6 @@
         "_load_agents_referenced_paths",
         "check_module_intake_coverage",
         "check_adr_index_coverage",
-        "check_script_agents_coverage",
         "run_checks",
         "main"
       ],
@@ -13874,7 +13873,6 @@
         "py",
         "referenced",
         "run",
-        "script",
         "scripts"
       ]
     },
