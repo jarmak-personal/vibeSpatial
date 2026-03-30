@@ -156,6 +156,109 @@ csv_find_delimiters(
 _CSV_FIND_DELIMITERS_NAMES: tuple[str, ...] = ("csv_find_delimiters",)
 
 # ---------------------------------------------------------------------------
+# Hex-to-binary WKB decode kernel (Tier 1 NVRTC)
+#
+# Two entry points for count-scatter pattern:
+#   csv_hex_wkb_count  -- per-row binary byte count + validity
+#   csv_hex_wkb_decode -- scatter hex-decoded bytes into output buffer
+#
+# Integer-only byte classification, no PrecisionPlan needed.
+# ---------------------------------------------------------------------------
+
+_CSV_HEX_WKB_SOURCE = r"""
+// Convert a hex ASCII character to its 4-bit value.
+// Returns -1 for invalid characters.
+__device__ __forceinline__ int hex_nibble(unsigned char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Returns 1 if the character is ASCII whitespace (space, tab, \r, \n).
+__device__ __forceinline__ int is_ws(unsigned char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+csv_hex_wkb_count(
+    const unsigned char* __restrict__ data,
+    const long long*     __restrict__ starts,
+    const long long*     __restrict__ ends,
+    int*                 __restrict__ counts,
+    unsigned char*       __restrict__ valid,
+    int n_rows
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+
+    long long s = starts[row];
+    long long e = ends[row];
+
+    // Skip leading whitespace.
+    while (s < e && is_ws(data[s])) s++;
+    // Skip trailing whitespace.
+    while (e > s && is_ws(data[e - 1])) e--;
+
+    long long hex_len = e - s;
+    if (hex_len <= 0 || (hex_len & 1) != 0) {
+        // Empty or odd-length: invalid hex WKB.
+        counts[row] = 0;
+        valid[row] = 0;
+        return;
+    }
+
+    // Quick validation: check all characters are valid hex.
+    int ok = 1;
+    for (long long i = s; i < e; i++) {
+        if (hex_nibble(data[i]) < 0) { ok = 0; break; }
+    }
+    if (!ok) {
+        counts[row] = 0;
+        valid[row] = 0;
+        return;
+    }
+
+    counts[row] = (int)(hex_len >> 1);
+    valid[row] = 1;
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+csv_hex_wkb_decode(
+    const unsigned char* __restrict__ data,
+    const long long*     __restrict__ starts,
+    const long long*     __restrict__ ends,
+    const int*           __restrict__ offsets,
+    const unsigned char* __restrict__ valid,
+    unsigned char*       __restrict__ output,
+    int n_rows
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    if (!valid[row]) return;
+
+    long long s = starts[row];
+    long long e = ends[row];
+
+    // Skip whitespace (same logic as count kernel).
+    while (s < e && is_ws(data[s])) s++;
+    while (e > s && is_ws(data[e - 1])) e--;
+
+    int out_off = offsets[row];
+    long long hex_len = e - s;
+    int n_bytes = (int)(hex_len >> 1);
+
+    for (int i = 0; i < n_bytes; i++) {
+        int hi = hex_nibble(data[s + 2 * i]);
+        int lo = hex_nibble(data[s + 2 * i + 1]);
+        output[out_off + i] = (unsigned char)((hi << 4) | lo);
+    }
+}
+"""
+
+_CSV_HEX_WKB_NAMES: tuple[str, ...] = ("csv_hex_wkb_count", "csv_hex_wkb_decode")
+
+# ---------------------------------------------------------------------------
 # NVRTC warmup registration (ADR-0034 Level 2)
 # ---------------------------------------------------------------------------
 
@@ -165,6 +268,7 @@ request_nvrtc_warmup([
     ("csv-quote-toggle", _CSV_QUOTE_TOGGLE_SOURCE, _CSV_QUOTE_TOGGLE_NAMES),
     ("csv-find-row-ends", _CSV_FIND_ROW_ENDS_SOURCE, _CSV_FIND_ROW_ENDS_NAMES),
     ("csv-find-delimiters", _CSV_FIND_DELIMITERS_SOURCE, _CSV_FIND_DELIMITERS_NAMES),
+    ("csv-hex-wkb", _CSV_HEX_WKB_SOURCE, _CSV_HEX_WKB_NAMES),
 ])
 
 # ---------------------------------------------------------------------------
@@ -187,6 +291,12 @@ def _row_end_kernels() -> dict[str, object]:
 def _delimiter_kernels() -> dict[str, object]:
     return compile_kernel_group(
         "csv-find-delimiters", _CSV_FIND_DELIMITERS_SOURCE, _CSV_FIND_DELIMITERS_NAMES,
+    )
+
+
+def _hex_wkb_kernels() -> dict[str, object]:
+    return compile_kernel_group(
+        "csv-hex-wkb", _CSV_HEX_WKB_SOURCE, _CSV_HEX_WKB_NAMES,
     )
 
 
@@ -834,15 +944,9 @@ def _extract_wkb_and_parse(
 ) -> OwnedGeometryArray:
     """Extract hex-encoded WKB fields and decode via the GPU WKB pipeline.
 
-    For each row, the field bytes are transferred to the host, decoded
-    from hex to binary, and assembled into a PyArrow binary array which
-    is then decoded through ``decode_wkb_arrow_array_owned`` (which has
-    a GPU fast path internally).
-
-    The D->H transfer of the geometry column is acceptable:
-    - The WKB GPU decode pipeline is well-optimized.
-    - Hex decoding on CPU is fast (character-to-nibble mapping).
-    - A GPU hex decoder kernel would add complexity for marginal benefit.
+    Fully device-resident: hex-to-binary decode runs on GPU via an NVRTC
+    kernel, then the resulting binary WKB column is fed directly into the
+    pylibcudf-based GPU WKB decode pipeline -- no D->H transfers.
 
     Parameters
     ----------
@@ -858,42 +962,88 @@ def _extract_wkb_and_parse(
     OwnedGeometryArray
         Geometry array decoded from hex WKB.
     """
-    import pyarrow as pa
+    import pylibcudf as plc
 
-    from vibespatial.io.wkb import decode_wkb_arrow_array_owned
+    from vibespatial.cuda.cccl_primitives import exclusive_sum
+    from vibespatial.io.pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
 
     n_rows = d_starts.shape[0]
 
     if n_rows == 0:
+        import pyarrow as pa
+
+        from vibespatial.io.wkb import decode_wkb_arrow_array_owned
+
         empty_arrow = pa.array([], type=pa.binary())
         return decode_wkb_arrow_array_owned(empty_arrow)
 
-    # Transfer field span boundaries to host (two small int64 arrays).
-    h_starts = cp.asnumpy(d_starts)
-    h_ends = cp.asnumpy(d_ends)
+    runtime = get_cuda_runtime()
+    kernels = _hex_wkb_kernels()
 
-    # Transfer the full device byte array to host once, then slice per row.
-    # This is a single bulk D->H copy rather than n_rows small copies.
-    h_bytes: bytes = cp.asnumpy(d_bytes).tobytes()
+    # --- Pass 1: count binary bytes per row + validity ---
+    d_counts = cp.zeros(n_rows, dtype=cp.int32)
+    d_valid = cp.zeros(n_rows, dtype=cp.uint8)
 
-    wkb_values: list[bytes | None] = []
-    for i in range(n_rows):
-        s = int(h_starts[i])
-        e = int(h_ends[i])
-        if s >= e:
-            wkb_values.append(None)
-            continue
-        hex_str = h_bytes[s:e].decode("ascii", errors="replace").strip()
-        if not hex_str:
-            wkb_values.append(None)
-            continue
-        try:
-            wkb_values.append(bytes.fromhex(hex_str))
-        except ValueError:
-            wkb_values.append(None)
+    ptr = runtime.pointer
+    count_params = (
+        (ptr(d_bytes), ptr(d_starts), ptr(d_ends),
+         ptr(d_counts), ptr(d_valid), n_rows),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+    )
+    _launch_kernel(runtime, kernels["csv_hex_wkb_count"], n_rows, count_params)
 
-    arrow_array = pa.array(wkb_values, type=pa.binary())
-    return decode_wkb_arrow_array_owned(arrow_array)
+    # --- Prefix sum for output offsets ---
+    d_offsets_body = exclusive_sum(d_counts, synchronize=False)
+
+    # Build full offsets array (n_rows + 1) for pylibcudf column.
+    d_offsets = cp.empty(n_rows + 1, dtype=cp.int32)
+    d_offsets[:n_rows] = d_offsets_body
+    d_offsets[n_rows] = d_offsets_body[-1] + d_counts[-1]
+    # Read total on host (single scalar sync).
+    total_bytes = int(d_offsets[n_rows])
+
+    if total_bytes == 0:
+        # All rows invalid -- return empty/all-null geometry.
+        import pyarrow as pa
+
+        from vibespatial.io.wkb import decode_wkb_arrow_array_owned
+
+        empty_arrow = pa.array([None] * n_rows, type=pa.binary())
+        return decode_wkb_arrow_array_owned(empty_arrow)
+
+    # --- Pass 2: decode hex to binary ---
+    d_payload = cp.empty(total_bytes, dtype=cp.uint8)
+    decode_params = (
+        (ptr(d_bytes), ptr(d_starts), ptr(d_ends),
+         ptr(d_offsets), ptr(d_valid), ptr(d_payload), n_rows),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+         KERNEL_PARAM_I32),
+    )
+    _launch_kernel(runtime, kernels["csv_hex_wkb_decode"], n_rows, decode_params)
+    runtime.synchronize()
+
+    # --- Build pylibcudf column on device ---
+    offsets_column = plc.Column.from_cuda_array_interface(d_offsets)
+    column = plc.Column(
+        plc.types.DataType(plc.types.TypeId.STRING),
+        n_rows,
+        plc.gpumemoryview(d_payload),
+        None,
+        0,
+        0,
+        [offsets_column],
+    )
+
+    # Attach null mask for invalid rows.
+    null_count = int(n_rows - int(d_valid.sum()))
+    if null_count:
+        validity_bool = d_valid.astype(cp.uint8)
+        validity_bytes = cp.packbits(validity_bool, bitorder="little")  # zcopy:ok terminal
+        column = column.with_mask(plc.gpumemoryview(validity_bytes), null_count)
+
+    return _decode_pylibcudf_wkb_general_column_to_owned(column)
 
 
 def _assemble_point_geometry(

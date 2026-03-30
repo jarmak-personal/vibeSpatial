@@ -427,6 +427,42 @@ def _launch_device_wkb_write_kernel(
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
 
+def _wkb_upper_bound_bytes(
+    state,
+    family_selections: dict,
+) -> int:
+    """Compute a host-side upper bound for total WKB output bytes.
+
+    Uses only ``.shape[0]`` on device arrays (no sync), so this never
+    triggers a D->H transfer.  The bound is tight -- it over-estimates
+    only by the contribution of invalid (unselected) rows in each family
+    buffer, which is typically zero.
+    """
+    total = 0
+    for family, (row_indexes_host, _family_rows_host) in family_selections.items():
+        n_rows_family = row_indexes_host.shape[0]
+        buf = state.families[family]
+        n_coords = buf.x.shape[0]
+
+        if family is GeometryFamily.POINT:
+            total += 21 * n_rows_family
+        elif family is GeometryFamily.LINESTRING:
+            total += 9 * n_rows_family + 16 * n_coords
+        elif family is GeometryFamily.POLYGON:
+            n_rings = buf.ring_offsets.shape[0] - 1 if buf.ring_offsets is not None else 0
+            total += 9 * n_rows_family + 4 * n_rings + 16 * n_coords
+        elif family is GeometryFamily.MULTIPOINT:
+            total += 9 * n_rows_family + 21 * n_coords
+        elif family is GeometryFamily.MULTILINESTRING:
+            n_parts = buf.part_offsets.shape[0] - 1 if buf.part_offsets is not None else 0
+            total += 9 * n_rows_family + 9 * n_parts + 16 * n_coords
+        elif family is GeometryFamily.MULTIPOLYGON:
+            n_parts = buf.part_offsets.shape[0] - 1 if buf.part_offsets is not None else 0
+            n_rings = buf.ring_offsets.shape[0] - 1 if buf.ring_offsets is not None else 0
+            total += 9 * n_rows_family + 9 * n_parts + 4 * n_rings + 16 * n_coords
+    return total
+
+
 def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
     import cupy as cp
     import pylibcudf as plc
@@ -449,7 +485,10 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
         offsets[-1] = cp.sum(lengths, dtype=cp.int32)
     else:
         offsets[...] = 0
-    total_bytes = int(cp.asnumpy(offsets[-1])) if row_count else 0
+    # Upper-bound allocation: compute total from host-side buffer shapes
+    # (no device sync). Slightly over-estimates if invalid rows contribute
+    # coordinates to family buffers but are excluded from encoding.
+    total_bytes = _wkb_upper_bound_bytes(state, family_selections) if row_count else 0
     payload = cp.empty(total_bytes, dtype=cp.uint8)
 
     for family, (row_indexes_host, family_rows_host) in family_selections.items():

@@ -696,6 +696,9 @@ def read_dbf_gpu(
 def dbf_result_to_dataframe(result: DbfGpuResult, *, include_deleted: bool = False):
     """Convert a DbfGpuResult to a pandas DataFrame.
 
+    All device-to-host transfers are batched outside the column loop to
+    avoid per-column sync overhead (ZCOPY002).
+
     Parameters
     ----------
     result : DbfGpuResult
@@ -709,19 +712,30 @@ def dbf_result_to_dataframe(result: DbfGpuResult, *, include_deleted: bool = Fal
     """
     import pandas as pd
 
-    data = {}
+    # --- Batch D->H: collect all device arrays, transfer once ---
+    device_cols: dict[str, cp.ndarray] = {}
+    host_cols: dict[str, object] = {}
     for name, col in result.columns.items():
         if col.dtype == "string":
-            values = col.data
-        elif col.dtype == "float64":
-            values = cp.asnumpy(col.data)
-        elif col.dtype == "int32":
-            values = cp.asnumpy(col.data)
-        elif col.dtype == "bool":
-            values = cp.asnumpy(col.data).astype(bool)
+            host_cols[name] = col.data
+        elif hasattr(col.data, "get"):
+            device_cols[name] = col.data
         else:
-            values = cp.asnumpy(col.data) if hasattr(col.data, "get") else col.data
-        data[name] = values
+            host_cols[name] = col.data
+
+    # Single bulk transfer outside the loop.
+    host_transferred = {name: cp.asnumpy(arr) for name, arr in device_cols.items()}
+
+    # --- Build data dict from host arrays ---
+    data = {}
+    for name, col in result.columns.items():
+        if name in host_cols:
+            data[name] = host_cols[name]
+        else:
+            values = host_transferred[name]
+            if col.dtype == "bool":
+                values = values.astype(bool)
+            data[name] = values
 
     df = pd.DataFrame(data)
 

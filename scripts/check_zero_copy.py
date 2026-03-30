@@ -27,9 +27,8 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-29.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 11  # FIX-11: segmented reduction in measurement.py coord stats 2026-03-29
-# +4 materialization D->H in dbf_gpu (DataFrame construction)
-# +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)
+_VIOLATION_BASELINE = 5  # FIX-14: csv hex-decode GPU kernel, dbf batch D2H, wkb upper-bound alloc 2026-03-29
+# Remaining: clip_rect(1) + overlay/gpu(2) + query(1) + query_utils(1)
 
 # Method names that pull data from device to host.
 D2H_APIS = {"get", "copy_to_host", "to_host", "asnumpy", "tolist", "to_pylist"}
