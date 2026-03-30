@@ -256,7 +256,7 @@ The compliance ledger file is at:
 - `src/vibespatial/spatial/segment_primitives.py` (CONSTRUCTIVE) — dispatch uses plan_dispatch_selection; kernel stays fp64
 - `src/vibespatial/constructive/clip_rect.py` (CONSTRUCTIVE) — dispatch uses plan_dispatch_selection; kernel stays fp64
 - `src/vibespatial/predicates/support.py` (PREDICATE) — dispatch uses plan_kernel_dispatch; downstream PIP kernels now use staged fp32
-- `src/vibespatial/overlay/gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002
+- `src/vibespatial/overlay/gpu.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; kernel source in `overlay/gpu_kernels.py`
 - `src/vibespatial/constructive/point.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; dispatch via plan_dispatch_selection
 - `src/vibespatial/constructive/linestring.py` (CONSTRUCTIVE) — fp64 by design per ADR-0002; dispatch via plan_dispatch_selection
 - `src/vibespatial/constructive/polygon.py` (mixed CONSTRUCTIVE/METRIC) — buffer kernels fp64 by design per ADR-0002; **polygon_centroid kernel (METRIC) fully compliant**: templated on compute_t with Kahan-compensated shoelace accumulation, coordinate centering via center_x/center_y, precision-keyed NVRTC cache (fp32/fp64 variants precompiled). fp32+center+Kahan achieves 8e-4 max error vs Shapely at 1e6-magnitude coords.

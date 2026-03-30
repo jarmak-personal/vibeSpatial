@@ -60,7 +60,7 @@ Choose the mode that matches the question. If unclear, ask the caller.
    | Layer 5: Dispatch wrapper | Operation-specific module | ? |
    | Layer 6: Runtime selection | `src/vibespatial/runtime/_runtime.py` | ? |
    | Layer 7: Precision plan | `src/vibespatial/runtime/precision.py` | ? |
-   | Layer 8: GPU kernel | `src/vibespatial/kernels/` or inline | ? |
+   | Layer 8: GPU kernel | `src/vibespatial/kernels/` or `*_kernels.py` sibling | ? |
    | Layer 9: CPU fallback | `@register_kernel_variant` | ? |
    | Layer 10: Shapely fallback | Direct shapely call | ? |
    | Warmup registration | `request_nvrtc_warmup()` / `request_warmup()` | ? |
@@ -204,7 +204,7 @@ Layer 4:  Owned routing (if self._owned)               → src/vibespatial/geome
 Layer 5:  Dispatch wrapper                             → operation-specific module
 Layer 6:  Runtime selection                            → src/vibespatial/runtime/_runtime.py
 Layer 7:  Precision planning                           → src/vibespatial/runtime/precision.py
-Layer 8:  GPU kernel                                   → src/vibespatial/kernels/ or inline
+Layer 8:  GPU kernel                                   → src/vibespatial/kernels/ or *_kernels.py sibling
 Layer 9:  CPU fallback                                 → @register_kernel_variant decorated
 Layer 10: Shapely fallback (legacy, non-owned path)    → direct shapely.* call
 ```

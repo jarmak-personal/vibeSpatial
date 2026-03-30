@@ -19,12 +19,14 @@ ready-to-apply rewrites ranked by expected impact.
 
 ### Step 0: Read the Code
 
-Read the target file completely. Also read any files it imports from
-`vibespatial.*` that contain kernel source strings or GPU dispatch logic.
+Read the target file completely. Also read the companion `*_kernels.py`
+or `*_source.py` sibling file where kernel source now lives (kernel source
+is no longer inline in dispatch files). Also read any other files the
+target imports from `vibespatial.*` that contain GPU dispatch logic.
 Identify:
 
 - All NVRTC kernel source strings (look for `_KERNEL_SOURCE` or multi-line
-  strings containing `__global__`)
+  strings containing `__global__` in `*_kernels.py` / `*_source.py` files)
 - All CuPy operations (`cp.` calls)
 - All CCCL primitive usage (`cccl_primitives.*`, `cccl_algorithms.*`)
 - All `runtime.launch()` calls and their parameters

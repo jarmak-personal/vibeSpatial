@@ -100,11 +100,13 @@ hand-written CUDA. The NVRTC compile cost is paid once per
 `make_kernel_cache_key` and cached in `CudaDriverRuntime._module_cache`
 for the process lifetime.
 
-**Pattern:** Write the kernel as a `_KERNEL_SOURCE` string constant,
-compile via `runtime.compile_kernels()`, launch via `runtime.launch()`.
-This is the established pattern in `point_in_polygon.py`,
-`segment_primitives.py`, `overlay_gpu.py`, `point_binary_relations.py`,
-`point_constructive.py`, `spatial_query.py`, and `indexing.py`.
+**Pattern:** Write the kernel as a `_KERNEL_SOURCE` string constant in a
+sibling `*_kernels.py` or `*_source.py` file, import it into the dispatch
+module, compile via `runtime.compile_kernels()`, launch via
+`runtime.launch()`. This is the established pattern in
+`point_in_polygon_source.py`, `segment_primitives_kernels.py`,
+`gpu_kernels.py` (overlay), `point_relations_kernels.py`,
+`point_kernels.py`, `spatial_query_kernels.py`, and `indexing_kernels.py`.
 
 **Polygon-family note:** This tier gets *more* important for polygons,
 not less. Ring traversal, part offset indirection, winding number

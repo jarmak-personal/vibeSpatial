@@ -135,7 +135,7 @@ sjoin / spatial_query.py
   ├── upper_bound        → upper_bound
   └── segmented_reduce_* → segmented_reduce
 
-overlay / overlay_gpu.py
+overlay / overlay_gpu.py (kernel source in overlay/gpu_kernels.py)
   ├── exclusive_sum      → exclusive_scan
   ├── sort_pairs         → radix_sort / merge_sort
   └── unique_sorted_pairs → unique_by_key
@@ -494,20 +494,20 @@ no compile-option variance, deterministic cache keys.
 
 | # | Source Constant | Module | CUDA Lines | Kernels | Est. Compile Cost |
 |---|---|---|---|---|---|
-| 1 | `_SPATIAL_QUERY_KERNEL_SOURCE` | `spatial_query.py` | 948 | 19 | ~200--400ms |
-| 2 | `_POLYGON_PREDICATES_KERNEL_SOURCE` | `polygon_predicates.py` | 750 | 10 | ~150--300ms |
-| 3 | `_SEGMENT_DISTANCE_KERNEL_SOURCE` | `segment_distance.py` | 493 | 10 | ~100--250ms |
-| 4 | `_POINT_IN_POLYGON_KERNEL_SOURCE` | `point_in_polygon.py` | 434 | 8 | ~80--200ms |
-| 5 | `_POINT_DISTANCE_KERNEL_SOURCE` | `point_distance.py` | 399 | 4 | ~80--180ms |
-| 6 | `_POINT_BINARY_RELATIONS_KERNEL_SOURCE` | `point_binary_relations.py` | 345 | 5 | ~70--150ms |
-| 7 | `_MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE` | `point_binary_relations.py` | 329 | 6 | ~60--140ms |
-| 8 | `_OVERLAY_SPLIT_KERNEL_SOURCE` | `overlay_gpu.py` | 253 | 4 | ~50--120ms |
-| 9 | `_BOUNDS_KERNEL_SOURCE` | `geometry_analysis.py` | 247 | 6 | ~50--100ms |
-| 10 | `_WKB_ENCODE_KERNEL_SOURCE` | `io_arrow.py` | 213 | 6 | ~40--90ms |
-| 11 | `_MORTON_RANGE_KERNEL_SOURCE` | `spatial_query.py` | 133 | 3 | ~30--60ms |
-| 12 | `_SEGMENT_INTERSECTION_KERNEL_SOURCE` | `segment_primitives.py` | 117 | 1 | ~25--50ms |
-| 13 | `_POINT_CONSTRUCTIVE_KERNEL_SOURCE` | `point_constructive.py` | 83 | 3 | ~20--40ms |
-| 14 | `_INDEXING_KERNEL_SOURCE` | `indexing.py` | 41 | 1 | ~10--20ms |
+| 1 | `_SPATIAL_QUERY_KERNEL_SOURCE` | `spatial_query_kernels.py` | 948 | 19 | ~200--400ms |
+| 2 | `_POLYGON_PREDICATES_KERNEL_SOURCE` | `polygon_kernels.py` | 750 | 10 | ~150--300ms |
+| 3 | `_SEGMENT_DISTANCE_KERNEL_SOURCE` | `segment_distance_kernels.py` | 493 | 10 | ~100--250ms |
+| 4 | `_POINT_IN_POLYGON_KERNEL_SOURCE` | `point_in_polygon_source.py` | 434 | 8 | ~80--200ms |
+| 5 | `_POINT_DISTANCE_KERNEL_SOURCE` | `point_distance_kernels.py` | 399 | 4 | ~80--180ms |
+| 6 | `_POINT_BINARY_RELATIONS_KERNEL_SOURCE` | `point_relations_kernels.py` | 345 | 5 | ~70--150ms |
+| 7 | `_MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE` | `point_relations_kernels.py` | 329 | 6 | ~60--140ms |
+| 8 | `_OVERLAY_SPLIT_KERNEL_SOURCE` | `overlay/gpu_kernels.py` | 253 | 4 | ~50--120ms |
+| 9 | `_BOUNDS_KERNEL_SOURCE` | `geometry_analysis_source.py` | 247 | 6 | ~50--100ms |
+| 10 | `_WKB_ENCODE_KERNEL_SOURCE` | `wkb_kernels.py` | 213 | 6 | ~40--90ms |
+| 11 | `_MORTON_RANGE_KERNEL_SOURCE` | `spatial_query_kernels.py` | 133 | 3 | ~30--60ms |
+| 12 | `_SEGMENT_INTERSECTION_KERNEL_SOURCE` | `segment_primitives_kernels.py` | 117 | 1 | ~25--50ms |
+| 13 | `_POINT_CONSTRUCTIVE_KERNEL_SOURCE` | `point_kernels.py` | 83 | 3 | ~20--40ms |
+| 14 | `_INDEXING_KERNEL_SOURCE` | `indexing_kernels.py` | 41 | 1 | ~10--20ms |
 
 **Totals:** ~4,785 lines of CUDA C, 85 `__global__` entry points,
 14 compilation units, ~1.0--2.5s serial compilation.
@@ -534,8 +534,11 @@ Each module that defines NVRTC kernel sources declares its compile
 units at module scope:
 
 ```python
-# spatial_query.py
+# spatial_query.py — imports source from spatial_query_kernels.py
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
+from vibespatial.kernels.core.spatial_query_kernels import (
+    _SPATIAL_QUERY_KERNEL_SOURCE, _MORTON_RANGE_KERNEL_SOURCE,
+)
 
 request_nvrtc_warmup([
     ("spatial-query", _SPATIAL_QUERY_KERNEL_SOURCE, _SQ_KERNEL_NAMES),
@@ -544,8 +547,11 @@ request_nvrtc_warmup([
 ```
 
 ```python
-# point_in_polygon.py
+# point_in_polygon.py — imports source from point_in_polygon_source.py
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
+from vibespatial.kernels.predicates.point_in_polygon_source import (
+    _POINT_IN_POLYGON_KERNEL_SOURCE,
+)
 
 request_nvrtc_warmup([
     ("pip", _POINT_IN_POLYGON_KERNEL_SOURCE, _PIP_KERNEL_NAMES),
