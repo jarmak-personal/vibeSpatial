@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # NVRTC kernel: orient rings by shoelace signed area
 # ---------------------------------------------------------------------------
 
-_ORIENT_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_ORIENT_KERNEL_SOURCE = SIGNED_AREA_DEVICE + PRECISION_PREAMBLE + r"""
 extern "C" __global__ void orient_rings(
     const double* __restrict__ x_in,
     const double* __restrict__ y_in,
@@ -36,10 +37,7 @@ extern "C" __global__ void orient_rings(
     }}
 
     /* Shoelace signed area (2x): positive = CCW, negative = CW. */
-    double area2 = 0.0;
-    for (int j = start; j < end - 1; j++) {{
-        area2 += x_in[j] * y_in[j + 1] - x_in[j + 1] * y_in[j];
-    }}
+    const double area2 = vs_ring_signed_area_2x(x_in, y_in, start, end);
 
     /* Determine desired orientation:
        - Exterior rings: CCW when exterior_ccw=1, CW when exterior_ccw=0

@@ -7,9 +7,11 @@ Extracted from polygon_intersection.py -- dispatch logic remains there.
 """
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
+
 _MAX_CLIP_VERTS = 64  # 4 buffers * 64 * 8 bytes = 2KB per thread (vs 8KB at 256)
 
-_POLYGON_INTERSECTION_KERNEL_SOURCE = r"""
+_POLYGON_INTERSECTION_KERNEL_SOURCE = SIGNED_AREA_DEVICE + r"""
 #define MAX_CLIP_VERTS """ + str(_MAX_CLIP_VERTS) + r"""
 
 /* ------------------------------------------------------------------ */
@@ -18,23 +20,6 @@ _POLYGON_INTERSECTION_KERNEL_SOURCE = r"""
 /*  clip_edge defined by points (ex0,ey0) -> (ex1,ey1).               */
 /*  "Inside" is the left side of the directed edge.                    */
 /* ------------------------------------------------------------------ */
-
-/* Compute 2x signed area of a ring (shoelace formula).
-   Positive => CCW, negative => CW.  Used to detect winding direction
-   so the Sutherland-Hodgman inside/outside test works for both CW and
-   CCW clip polygons. */
-__device__ double ring_signed_area_2x(
-    const double* __restrict__ x,
-    const double* __restrict__ y,
-    int start, int count
-) {
-    double area2 = 0.0;
-    for (int i = 0; i < count; i++) {
-        int j = (i + 1 < count) ? i + 1 : 0;
-        area2 += x[start + i] * y[start + j] - x[start + j] * y[start + i];
-    }
-    return area2;
-}
 
 __device__ double cross_sign(
     double px, double py,
@@ -144,7 +129,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
        we negate the cross_sign results so the inside/outside test still
        works correctly.  This handles arbitrary input winding without
        requiring a pre-normalization step. */
-    const double clip_area2 = ring_signed_area_2x(
+    const double clip_area2 = vs_ring_signed_area_2x_open(
         right_x, right_y, r_coord_start, r_n);
     const double wsign = (clip_area2 >= 0.0) ? 1.0 : -1.0;
 
@@ -302,7 +287,7 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
     }
 
     /* Detect winding direction of the clip polygon (same as count pass). */
-    const double clip_area2 = ring_signed_area_2x(
+    const double clip_area2 = vs_ring_signed_area_2x_open(
         right_x, right_y, r_coord_start, r_n);
     const double wsign = (clip_area2 >= 0.0) ? 1.0 : -1.0;
 

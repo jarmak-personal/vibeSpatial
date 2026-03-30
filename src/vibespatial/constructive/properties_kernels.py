@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
+
 # ---------------------------------------------------------------------------
 # NVRTC kernels for is_closed and is_ccw (Tier 1, ADR-0033)
 # ---------------------------------------------------------------------------
@@ -62,8 +64,8 @@ extern "C" __global__ void is_closed_multilinestring(
 """
 _IS_CLOSED_KERNEL_NAMES = ("is_closed_linestring", "is_closed_multilinestring")
 _IS_CLOSED_FP64 = _IS_CLOSED_KERNEL_SOURCE.format()
-# is_ccw: shoelace signed area on exterior ring
-_IS_CCW_KERNEL_SOURCE = r"""
+# is_ccw: shoelace signed area on exterior ring (uses shared vs_ring_signed_area_2x)
+_IS_CCW_KERNEL_SOURCE = SIGNED_AREA_DEVICE + r"""
 extern "C" __global__ void is_ccw_polygon(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -87,10 +89,7 @@ extern "C" __global__ void is_ccw_polygon(
         return;
     }}
 
-    double area2 = 0.0;
-    for (int j = coord_start; j < coord_end - 1; j++) {{
-        area2 += x[j] * y[j + 1] - x[j + 1] * y[j];
-    }}
+    const double area2 = vs_ring_signed_area_2x(x, y, coord_start, coord_end);
     out[i] = (area2 > 0.0) ? 1 : 0;
 }}
 
@@ -119,10 +118,7 @@ extern "C" __global__ void is_ccw_multipolygon(
         return;
     }}
 
-    double area2 = 0.0;
-    for (int j = coord_start; j < coord_end - 1; j++) {{
-        area2 += x[j] * y[j + 1] - x[j + 1] * y[j];
-    }}
+    const double area2 = vs_ring_signed_area_2x(x, y, coord_start, coord_end);
     out[i] = (area2 > 0.0) ? 1 : 0;
 }}
 """

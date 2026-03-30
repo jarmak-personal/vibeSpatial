@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
+
 _POLYGON_BUFFER_KERNEL_SOURCE = r"""
 #define PI 3.14159265358979323846
 #define EPSILON 1e-12
@@ -296,12 +299,12 @@ extern "C" __global__ void polygon_buffer_ring_scatter(
 """
 POLYGON_BUFFER_GPU_THRESHOLD = 50_000
 _POLYGON_BUFFER_KERNEL_NAMES = ("polygon_buffer_ring_count", "polygon_buffer_ring_scatter")
-_RING_WINDING_KERNEL_SOURCE = r"""
+_RING_WINDING_KERNEL_SOURCE = SIGNED_AREA_DEVICE + r"""
 extern "C" __global__ void compute_ring_winding(
-    const double* x,
-    const double* y,
-    const int* ring_offsets,
-    double* ring_winding,
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int* __restrict__ ring_offsets,
+    double* __restrict__ ring_winding,
     int total_rings
 ) {
     const int ring = blockIdx.x * blockDim.x + threadIdx.x;
@@ -315,16 +318,8 @@ extern "C" __global__ void compute_ring_winding(
         return;
     }
 
-    /* Shoelace formula: sum of (x[i]*y[i+1] - x[i+1]*y[i]).
-       Exclude closing vertex (last == first). */
-    double area = 0.0;
-    const int last = coord_end - 1;
-    for (int i = coord_start; i < last; ++i) {
-        int next = i + 1;
-        if (next >= last) next = coord_start;
-        area += x[i] * y[next] - x[next] * y[i];
-    }
-    ring_winding[ring] = area > 0.0 ? 1.0 : -1.0;
+    const double area2 = vs_ring_signed_area_2x(x, y, coord_start, coord_end);
+    ring_winding[ring] = area2 > 0.0 ? 1.0 : -1.0;
 }
 """
 _RING_WINDING_KERNEL_NAMES = ("compute_ring_winding",)
@@ -338,26 +333,7 @@ _RING_WINDING_KERNEL_NAMES = ("compute_ring_winding",)
 #   cx = sum((x_i + x_{i+1}) * cross_i) / (6 * signed_area)
 #   cy = sum((y_i + y_{i+1}) * cross_i) / (6 * signed_area)
 
-_POLYGON_CENTROID_KERNEL_SOURCE = r"""
-typedef {compute_type} compute_t;
-
-/* Centered coordinate read: subtract center in fp64, then cast to compute_t.
-   When compute_t is double, this is a no-op identity.  When compute_t is float,
-   centering reduces absolute magnitude before the lossy cast. */
-#define CX(val) ((compute_t)((val) - center_x))
-#define CY(val) ((compute_t)((val) - center_y))
-
-/* Kahan summation helper — add `val` to `sum` with compensation `c`.
-   When compute_t is double, the compiler can optimize this away if it
-   proves the compensation term is always zero (it won't, but the cost
-   is negligible at fp64 throughput). */
-#define KAHAN_ADD(sum, val, c) do {{ \
-    const compute_t _y = (val) - (c); \
-    const compute_t _t = (sum) + _y; \
-    (c) = (_t - (sum)) - _y; \
-    (sum) = _t; \
-}} while(0)
-
+_POLYGON_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void polygon_centroid(
     const double* x,
     const double* y,

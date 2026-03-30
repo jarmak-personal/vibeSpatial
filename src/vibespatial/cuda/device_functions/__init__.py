@@ -19,3 +19,4 @@ from vibespatial.cuda.device_functions.point_on_segment import (  # noqa: F401
     POINT_ON_SEGMENT_DEVICE,
     POINT_ON_SEGMENT_KIND_DEVICE,
 )
+from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE  # noqa: F401
