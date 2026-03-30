@@ -28,6 +28,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/check_edit_hygiene.py\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

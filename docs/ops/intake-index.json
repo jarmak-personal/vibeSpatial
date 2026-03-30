@@ -5832,19 +5832,6 @@
     },
     {
       "kind": "repo",
-      "path": ".claude/agents/acceleration-angel.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "acceleration",
-        "agents",
-        "angel",
-        "claude",
-        "md"
-      ]
-    },
-    {
-      "kind": "repo",
       "path": ".claude/agents/cuda-engineer.md",
       "referenced_by": [],
       "symbols": [],
@@ -5854,20 +5841,6 @@
         "cuda",
         "engineer",
         "md"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".claude/agents/gpu-code-reviewer.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "agents",
-        "claude",
-        "code",
-        "gpu",
-        "md",
-        "reviewer"
       ]
     },
     {
@@ -5885,27 +5858,15 @@
     },
     {
       "kind": "repo",
-      "path": ".claude/agents/maintainability-reviewer.md",
+      "path": ".claude/agents/pre-land-reviewer.md",
       "referenced_by": [],
       "symbols": [],
       "tokens": [
         "agents",
         "claude",
-        "maintainability",
+        "land",
         "md",
-        "reviewer"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".claude/agents/performance-reviewer.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "agents",
-        "claude",
-        "md",
-        "performance",
+        "pre",
         "reviewer"
       ]
     },
@@ -5920,20 +5881,6 @@
         "engineer",
         "md",
         "python"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".claude/agents/zero-copy-reviewer.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "agents",
-        "claude",
-        "copy",
-        "md",
-        "reviewer",
-        "zero"
       ]
     },
     {
@@ -13823,6 +13770,26 @@
         "refresh",
         "scripts",
         "stage"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/check_edit_hygiene.py",
+      "referenced_by": [],
+      "symbols": [
+        "_classify_path",
+        "_check_text",
+        "main"
+      ],
+      "tokens": [
+        "check",
+        "classify",
+        "edit",
+        "hygiene",
+        "main",
+        "py",
+        "scripts",
+        "text"
       ]
     },
     {

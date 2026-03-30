@@ -15,8 +15,8 @@ step. Do not create a git commit without completing the review.
 Invoke the `pre-land-review` skill. This runs:
 - All deterministic checks (ruff, check_docs, architecture lints, zero-copy,
   perf patterns, maintainability)
-- AI-powered sub-agent reviews (GPU code review, zero-copy enforcer,
-  performance analysis, maintainability enforcer, acceleration angel) as applicable
+- AI-powered review (GPU code, zero-copy, performance, maintainability,
+  diff shape) via a single consolidated review agent
 
 If the review finds BLOCKING issues, **stop here**. Fix them and re-run
 `/commit`. Do not proceed to Step 2 with blocking findings. NEVER descope

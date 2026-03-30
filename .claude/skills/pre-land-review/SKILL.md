@@ -9,7 +9,7 @@ argument-hint: "[git-ref range, default HEAD~1]"
 
 This skill is the landing gate for vibeSpatial. Every commit must pass
 through it. The checklist has two tiers: deterministic checks (enforced by
-the pre-commit hook) and AI-powered analysis (run as review agents).
+the pre-commit hook) and AI-powered analysis (run as a single review agent).
 
 ## Tier 1: Deterministic Checks
 
@@ -28,10 +28,11 @@ uv run python scripts/check_import_guard.py --all
 If any fail, fix the issues before proceeding. The pre-commit hook will
 also enforce these, but catching them here avoids a failed commit attempt.
 
-## Tier 2: AI-Powered Review Agents
+## Tier 2: AI-Powered Review
 
-The pre-commit hook CANNOT do this — it requires AI judgment. Reviews run
-as **dedicated agents** so they analyze the code with fresh eyes, without
+The pre-commit hook CANNOT do this — it requires AI judgment. The review
+runs as a **single dedicated agent** that performs all review passes
+sequentially in one context, analyzing the code with fresh eyes without
 being biased by the context of having written the code.
 
 ### Step 1: Gather context
@@ -39,31 +40,16 @@ being biased by the context of having written the code.
 1. Run `git diff --cached --name-only` (or `git diff HEAD~1 --name-only`)
    and save the file list.
 2. Run `git diff --cached` (or `git diff HEAD~1`) and save the full diff.
-3. Categorize the changed files:
-   - **kernel/GPU code** (`*_kernels.py`, `*_gpu.py`, CUDA source strings,
-     `cuda_runtime.py`, `cccl_*.py`): needs GPU code review + performance +
-     zero-copy analysis
-   - **pipeline/dispatch** (`*_pipeline.py`, dispatch logic, runtime):
-     needs performance + zero-copy analysis
-   - **api** (`api/`, public functions): needs zero-copy + maintainability
-   - **docs/scripts**: needs maintainability only
-   - **tests only**: skip AI analysis (deterministic checks suffice)
+3. If the changes are **test-only**, skip Tier 2 entirely — deterministic
+   checks suffice.
 
-### Step 2: Launch review agents
+### Step 2: Launch review agent
 
-Based on the categories, spawn the applicable agents **in parallel** using
-the Agent tool. Each agent gets the file list and full diff injected into
-its prompt. **Launch all applicable agents in a SINGLE message.**
+Spawn a **single** `pre-land-reviewer` agent with the file list and diff.
+This agent performs all review passes (GPU code, zero-copy, performance,
+maintainability, diff shape) sequentially in one context.
 
-| Category | Agent | When |
-|----------|-------|------|
-| GPU Code Review | `gpu-code-reviewer` | kernel/GPU/NVRTC/device code changed |
-| Zero-Copy | `zero-copy-reviewer` | src/vibespatial/ code changed (not docs/scripts/tests) |
-| Performance | `performance-reviewer` | src/vibespatial/ code changed (not docs/scripts/tests) |
-| Maintainability | `maintainability-reviewer` | any non-test source code changed |
-| Acceleration Angel | `acceleration-angel` | src/vibespatial/ code changed (not docs/scripts/tests) |
-
-Prompt template for each agent:
+Prompt template:
 
 ```
 Review the following changes for vibeSpatial.
@@ -75,12 +61,12 @@ Review the following changes for vibeSpatial.
 {diff}
 ```
 
-The agents already know their review procedure and severity rules from
-their agent definitions. You only need to provide the diff context.
+The agent already knows its review procedure and severity rules from its
+agent definition. You only need to provide the diff context.
 
 ### Step 3: Collect and report
 
-Wait for all agents to complete, then compile results.
+Wait for the agent to complete, then report its findings.
 
 ## Report Format
 
@@ -93,7 +79,7 @@ Wait for all agents to complete, then compile results.
 ### Deterministic Checks
 [PASS/FAIL for each]
 
-### Agent Reviews
+### Agent Review
 
 #### GPU Code Review: [CLEAN / BLOCKING ISSUES]
 [findings or "N/A — no GPU code touched"]
@@ -107,19 +93,19 @@ Wait for all agents to complete, then compile results.
 #### Maintainability: [DISCOVERABLE / GAPS / ORPHANED]
 [findings or "N/A"]
 
-#### Acceleration Angel: [PASS / FIX REQUIRED]
+#### Diff Shape: [CLEAN / findings]
 [findings or "N/A"]
 
 ### Overall Verdict
-[LAND / FIX REQUIRED / NEEDS PROFILING]
+[LAND / FIX REQUIRED]
 
-Note: LAND requires zero BLOCKING findings across all agents.
+Note: LAND requires zero BLOCKING findings across all passes.
 ```
 
 ## Severity Rules
 
-All review agents follow these severity rules (defined in their agent
-definitions):
+The review agent follows these severity rules (defined in its agent
+definition):
 
 - **BLOCKING** — Must fix before landing. Default for all findings.
 - **NIT** — Only for pure style preferences with zero functional or
@@ -132,8 +118,8 @@ the upstream too.
 ## Rules
 
 - ALL deterministic checks must pass.
-- ANY BLOCKING agent finding means FIX REQUIRED.
-- Test-only changes need only deterministic checks (skip agents).
+- ANY BLOCKING finding means FIX REQUIRED.
+- Test-only changes need only deterministic checks (skip agent).
 - Be concise — this is a gate, not a code review.
 
 ## After Review
