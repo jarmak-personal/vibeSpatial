@@ -47,6 +47,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.kernels.constructive.polygon_intersection_source import (
     _KERNEL_NAMES,
+    _MAX_CLIP_VERTS,
     _POLYGON_INTERSECTION_KERNEL_SOURCE,
 )
 from vibespatial.runtime import ExecutionMode
