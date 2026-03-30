@@ -30042,6 +30042,27 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/spatial/distance_metrics_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "discrete",
+        "distance",
+        "frechet",
+        "hausdorff",
+        "kernel",
+        "kernels",
+        "metrics",
+        "nvrtc",
+        "py",
+        "sources",
+        "spatial",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/spatial/distance_owned.py",
       "referenced_by": [],
       "symbols": [
@@ -30182,6 +30203,28 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/spatial/indexing_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "indexing",
+        "kernel",
+        "kernels",
+        "keys",
+        "mbr",
+        "morton",
+        "nvrtc",
+        "py",
+        "segment",
+        "sources",
+        "spatial",
+        "src",
+        "sweep",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/spatial/nearest.py",
       "referenced_by": [],
       "symbols": [
@@ -30260,7 +30303,6 @@
       "path": "src/vibespatial/spatial/point_distance.py",
       "referenced_by": [],
       "symbols": [
-        "_format_distance_kernel_source",
         "_point_distance_kernels",
         "_compute_center",
         "compute_point_distance_gpu",
@@ -30271,16 +30313,37 @@
         "compute",
         "distance",
         "families",
-        "format",
         "gpu",
-        "kernel",
         "kernels",
         "point",
         "py",
-        "source",
         "spatial",
         "src",
         "supported",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/spatial/point_distance_kernels.py",
+      "referenced_by": [],
+      "symbols": [
+        "format_distance_kernel_source"
+      ],
+      "tokens": [
+        "computation",
+        "distance",
+        "format",
+        "geometry",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "point",
+        "py",
+        "source",
+        "sources",
+        "spatial",
+        "src",
         "vibespatial"
       ]
     },
@@ -30489,6 +30552,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/spatial/segment_distance_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "computation",
+        "distance",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "segment",
+        "sources",
+        "spatial",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/spatial/segment_primitives.py",
       "referenced_by": [
         "docs/architecture/segment-primitives.md",
@@ -30503,8 +30585,6 @@
         "SegmentIntersectionDeviceState",
         "SegmentIntersectionCandidates",
         "DeviceSegmentIntersectionCandidates",
-        "_format_extract_source",
-        "_format_classify_source",
         "_extract_kernels",
         "_classify_kernels",
         "_candidate_scatter_kernels",
@@ -30518,7 +30598,9 @@
         "extract_segments",
         "generate_segment_candidates",
         "_generate_segment_candidates_from_tables",
-        "_orient2d_fast"
+        "_orient2d_fast",
+        "_line_intersection_point",
+        "_fraction"
       ],
       "tokens": [
         "append",
@@ -30532,15 +30614,18 @@
         "extract",
         "fast",
         "filter",
-        "format",
+        "fraction",
         "generate",
         "global",
         "gpu",
+        "intersection",
         "kernels",
+        "line",
         "main",
         "max",
         "orient2d",
         "pairs",
+        "point",
         "primitives",
         "py",
         "rows",
@@ -30554,13 +30639,41 @@
         "segments",
         "segmenttable",
         "single",
-        "source",
         "span",
         "spatial",
         "src",
         "sweep",
         "tables",
         "valid",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/spatial/segment_primitives_kernels.py",
+      "referenced_by": [],
+      "symbols": [
+        "format_extract_source",
+        "format_classify_source"
+      ],
+      "tokens": [
+        "candidate",
+        "classification",
+        "classify",
+        "extract",
+        "extraction",
+        "format",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "primitives",
+        "py",
+        "scatter",
+        "segment",
+        "source",
+        "sources",
+        "spatial",
+        "src",
         "vibespatial"
       ]
     },
