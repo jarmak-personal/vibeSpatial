@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
@@ -266,55 +267,12 @@ _HOLES_IN_SHELL_FP64 = _HOLES_IN_SHELL_KERNEL_SOURCE.format(compute_type="double
 #   - Multi-touch (2+ distinct contact points between a ring pair) -> INVALID
 #   - Single touch (1 contact point between a ring pair) -> VALID per OGC
 #
-# PREDICATE class, fp64 only.  Uses Shewchuk orient2d_adaptive for exact
-# orientation predicates (embedded from segment_primitives.py).
+# PREDICATE class, fp64 only.  Uses shared vs_orient2d for exact
+# orientation predicates (via cuda.device_functions.orient2d).
 # ---------------------------------------------------------------------------
 
-_RING_PAIR_INTERACTION_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
-/* ------------------------------------------------------------------ */
-/* Shewchuk error-free primitives (fp64 exact predicates)             */
-/* ------------------------------------------------------------------ */
-
-__device__ inline void two_product_rpi(double a, double b, double &p, double &e) {{
-    p = a * b;
-    e = fma(a, b, -p);
-}}
-
-__device__ inline void two_sum_rpi(double a, double b, double &s, double &e) {{
-    s = a + b;
-    double bv = s - a;
-    double av = s - bv;
-    double br = b - bv;
-    double ar = a - av;
-    e = ar + br;
-}}
-
-__device__ int orient2d_rpi(
-    double ax, double ay,
-    double bx, double by,
-    double cx, double cy
-) {{
-    double acx = ax - cx;
-    double bcx = bx - cx;
-    double acy = ay - cy;
-    double bcy = by - cy;
-
-    double detleft, detleft_err;
-    two_product_rpi(acx, bcy, detleft, detleft_err);
-
-    double detright, detright_err;
-    two_product_rpi(acy, bcx, detright, detright_err);
-
-    double det_sum, det_sum_err;
-    two_sum_rpi(detleft, -detright, det_sum, det_sum_err);
-
-    double B3 = detleft_err - detright_err + det_sum_err;
-    double det = det_sum + B3;
-
-    if (det > 0.0) return 1;
-    if (det < 0.0) return -1;
-    return 0;
-}}
+_RING_PAIR_INTERACTION_KERNEL_SOURCE = PRECISION_PREAMBLE + ORIENT2D_DEVICE + r"""
+/* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
 
 /* Check if point (px,py) is on segment (ax,ay)-(bx,by), assuming collinear.
    Uses exact double comparisons (valid for fp64). */
@@ -441,10 +399,10 @@ ring_pair_interaction(
                 }}
 
                 /* Shewchuk exact orientations */
-                int o1 = orient2d_rpi(ax, ay, bx, by, cx, cy);
-                int o2 = orient2d_rpi(ax, ay, bx, by, dx, dy);
-                int o3 = orient2d_rpi(cx, cy, dx, dy, ax, ay);
-                int o4 = orient2d_rpi(cx, cy, dx, dy, bx, by);
+                int o1 = vs_orient2d(ax, ay, bx, by, cx, cy);
+                int o2 = vs_orient2d(ax, ay, bx, by, dx, dy);
+                int o3 = vs_orient2d(cx, cy, dx, dy, ax, ay);
+                int o4 = vs_orient2d(cx, cy, dx, dy, bx, by);
 
                 /* Case 1: Proper crossing */
                 if (o1 != 0 && o2 != 0 && o1 != o2 && o3 != 0 && o4 != 0 && o3 != o4) {{

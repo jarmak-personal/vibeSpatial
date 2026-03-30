@@ -4,9 +4,9 @@ Each sibling ``.py`` module exports one or more string constants containing
 self-contained ``__device__`` functions as CUDA C++ source.  Kernel authors
 prepend these strings to their kernel source::
 
-    from vibespatial.cuda.device_functions.orientation import VS_ORIENT2D
+    from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 
-    _MY_KERNEL = VS_ORIENT2D + r\"\"\"
+    _MY_KERNEL = ORIENT2D_DEVICE + r\"\"\"
     __global__ void my_kernel(...) { ... }
     \"\"\"
 

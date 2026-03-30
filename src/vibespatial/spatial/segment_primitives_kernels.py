@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS
 
@@ -236,63 +237,7 @@ __device__ inline compute_t abs_ct(compute_t value) {{{{
     return value < (compute_t)0.0 ? -value : value;
 }}}}
 
-/* Shewchuk two-product error-free transformation (GPU implementation).
-   Given a, b: computes (p, e) such that a*b = p + e exactly.
-   Uses Dekker's algorithm with FMA where available. */
-__device__ inline void two_product(double a, double b, double &p, double &e) {{{{
-    p = a * b;
-    e = fma(a, b, -p);
-}}}}
-
-/* Shewchuk two-sum error-free transformation.
-   Given a, b: computes (s, e) such that a+b = s + e exactly. */
-__device__ inline void two_sum(double a, double b, double &s, double &e) {{{{
-    s = a + b;
-    double bv = s - a;
-    double av = s - bv;
-    double br = b - bv;
-    double ar = a - av;
-    e = ar + br;
-}}}}
-
-/* Shewchuk orient2d adaptive predicate (stage B).
-   Returns exact sign of det = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax)
-   using error-free arithmetic expansions when the fast filter is ambiguous.
-   Returns: +1, 0, or -1  */
-__device__ int orient2d_adaptive(
-    double ax, double ay,
-    double bx, double by,
-    double cx, double cy
-) {{{{
-    double acx = ax - cx;
-    double bcx = bx - cx;
-    double acy = ay - cy;
-    double bcy = by - cy;
-
-    double detleft, detleft_err;
-    two_product(acx, bcy, detleft, detleft_err);
-
-    double detright, detright_err;
-    two_product(acy, bcx, detright, detright_err);
-
-    double det_sum, det_sum_err;
-    two_sum(detleft, -detright, det_sum, det_sum_err);
-
-    /* Accumulate all error terms */
-    double B3 = detleft_err - detright_err + det_sum_err;
-
-    /* B3 is the correction: det = det_sum + B3 */
-    double det = det_sum + B3;
-
-    if (det > 0.0) return 1;
-    if (det < 0.0) return -1;
-
-    /* Stage 1 already uses error-free two_product (FMA-based) and two_sum,
-       capturing all rounding error in B3. For IEEE-754 fp64 inputs, the
-       accumulated det = det_sum + B3 is exact. If it is zero, the
-       orientation is truly zero (collinear). */
-    return 0;
-}}}}
+/* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
 
 /* Check if point (px,py) is on segment (ax,ay)-(bx,by), assuming collinear.
    Uses exact double comparisons (valid for fp64). */
@@ -469,10 +414,10 @@ classify_segment_pairs_v2(
     }}}}
 
     /* Phase 3: Shewchuk adaptive refinement on GPU (no host round-trip) */
-    int s1 = orient2d_adaptive(ax, ay, bx, by, cx, cy);
-    int s2 = orient2d_adaptive(ax, ay, bx, by, dx, dy);
-    int s3 = orient2d_adaptive(cx, cy, dx, dy, ax, ay);
-    int s4 = orient2d_adaptive(cx, cy, dx, dy, bx, by);
+    int s1 = vs_orient2d(ax, ay, bx, by, cx, cy);
+    int s2 = vs_orient2d(ax, ay, bx, by, dx, dy);
+    int s3 = vs_orient2d(cx, cy, dx, dy, ax, ay);
+    int s4 = vs_orient2d(cx, cy, dx, dy, bx, by);
 
     /* Handle degenerate (zero-length) segments */
     if (a_is_point && c_is_point) {{{{
@@ -690,10 +635,11 @@ def format_classify_source(compute_type: str = "double") -> str:
     else:
         eps = float(np.finfo(np.float64).eps)
     errbound = (3.0 + 16.0 * eps) * eps
-    return _SEGMENT_CLASSIFY_KERNEL_SOURCE_TEMPLATE.format(
+    formatted = _SEGMENT_CLASSIFY_KERNEL_SOURCE_TEMPLATE.format(
         compute_type=compute_type,
         errbound_val=f"{errbound:.20e}",
     )
+    return ORIENT2D_DEVICE + formatted
 
 
 # Pre-formatted kernel sources for warmup

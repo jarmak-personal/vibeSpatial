@@ -23645,7 +23645,6 @@
         "my",
         "one",
         "orient2d",
-        "orientation",
         "package",
         "prepend",
         "py",
@@ -23661,8 +23660,29 @@
         "their",
         "these",
         "vibespatial",
-        "void",
-        "vs"
+        "void"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/cuda/device_functions/orient2d.py",
+      "referenced_by": [],
+      "symbols": [
+        "ORIENT2D_DEVICE"
+      ],
+      "tokens": [
+        "adaptive",
+        "cuda",
+        "device",
+        "function",
+        "functions",
+        "orient2d",
+        "predicate",
+        "py",
+        "shared",
+        "shewchuk",
+        "src",
+        "vibespatial"
       ]
     },
     {

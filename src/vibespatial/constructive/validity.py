@@ -221,31 +221,17 @@ def _is_valid_polygon_ring(
 
 
 def _orient2d_exact(ax, ay, bx, by, cx, cy):
-    """Shewchuk-style exact orient2d using FMA error-free arithmetic (CPU)."""
-    import math
-    acx = ax - cx
-    bcx = bx - cx
-    acy = ay - cy
-    bcy = by - cy
-    # two_product via math.fma (Python 3.13+) or manual Dekker
-    detleft = acx * bcy
-    detleft_err = math.fma(acx, bcy, -detleft) if hasattr(math, 'fma') else 0.0
-    detright = acy * bcx
-    detright_err = math.fma(acy, bcx, -detright) if hasattr(math, 'fma') else 0.0
-    # two_sum
-    det_sum = detleft + (-detright)
-    bv = det_sum - detleft
-    av = det_sum - bv
-    br = (-detright) - bv
-    ar = detleft - av
-    det_sum_err = ar + br
-    B3 = detleft_err - detright_err + det_sum_err
-    det = det_sum + B3
-    if det > 0.0:
-        return 1
-    if det < 0.0:
-        return -1
-    return 0
+    """Exact orient2d using fractions.Fraction for arbitrary-precision arithmetic (CPU).
+
+    Returns +1, 0, or -1 for the sign of det = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax).
+    Uses Fraction to avoid FMA dependency (math.fma requires Python 3.13+).
+    """
+    from fractions import Fraction
+
+    det = (Fraction(bx) - Fraction(ax)) * (Fraction(cy) - Fraction(ay)) - (
+        Fraction(by) - Fraction(ay)
+    ) * (Fraction(cx) - Fraction(ax))
+    return int(det > 0) - int(det < 0)
 
 
 def _point_on_seg_collinear_cpu(px, py, ax, ay, bx, by):
