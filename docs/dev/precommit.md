@@ -50,7 +50,7 @@ required. Total runtime: ~3-5 seconds. Enforced by `.githooks/pre-commit`.
 | 2 | Doc refresh | `check_docs.py --refresh` | Auto-refresh generated headers |
 | 3 | Doc validate | `check_docs.py --check` | Header budgets, routing sections |
 | 4 | Architecture | `check_architecture_lints.py --all` | ARCH001-006 |
-| 5 | Zero-copy | `check_zero_copy.py --all` | ZCOPY001-003 |
+| 5 | Zero-copy | `check_zero_copy.py --all` | ZCOPY001-003 (add `--detail` for per-violation breakdown during debt paydown) |
 | 6 | Performance | `check_perf_patterns.py --all` | VPAT001-004 |
 | 7 | Maintainability | `check_maintainability.py --all` | MAINT001-003 |
 

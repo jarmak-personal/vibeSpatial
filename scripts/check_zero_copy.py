@@ -10,6 +10,7 @@ known debt count.  Decrease the baseline as debt is paid down.
 
 Run:
     uv run python scripts/check_zero_copy.py --all
+    uv run python scripts/check_zero_copy.py --all --detail
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-27.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 45  # false positives eliminated 2026-03-29: dict.get(), np.asarray H2D
+_VIOLATION_BASELINE = 45
 # +3 intentional batch D->H in segment_primitives (OOM prevention)
 # +4 materialization D->H in dbf_gpu (DataFrame construction)
 # +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)
@@ -61,10 +62,12 @@ class LintError:
     line: int
     message: str
     doc_path: str
+    suppressed: bool = False
 
     def render(self, repo_root: Path) -> str:
         relative = self.path.relative_to(repo_root)
-        return f"{relative}:{self.line}: {self.code} {self.message} See {self.doc_path}."
+        prefix = "[SUPPRESSED] " if self.suppressed else ""
+        return f"{prefix}{relative}:{self.line}: {self.code} {self.message} See {self.doc_path}."
 
 
 def _is_excluded(path: Path) -> bool:
@@ -180,10 +183,13 @@ def _find_empty_suppression_lines(source: str) -> list[int]:
 
 def check_pingpong_transfers(
     repo_root: Path,
+    *,
+    include_suppressed: bool = False,
 ) -> tuple[list[LintError], int]:
     """Find functions where data goes D->H then back H->D (or vice versa).
 
-    Returns ``(errors, suppressed_count)``.
+    Returns ``(errors, suppressed_count)``.  When *include_suppressed* is
+    True, suppressed violations appear in *errors* with ``suppressed=True``.
     """
     errors: list[LintError] = []
     suppressed = 0
@@ -208,9 +214,11 @@ def check_pingpong_transfers(
                 first_d2h = min(d2h_lines)
                 later_h2d = [ln for ln in h2d_lines if ln > first_d2h]
                 if later_h2d:
-                    if first_d2h in suppressions:
+                    is_suppressed = first_d2h in suppressions
+                    if is_suppressed:
                         suppressed += 1
-                        continue
+                        if not include_suppressed:
+                            continue
                     errors.append(
                         LintError(
                             code="ZCOPY001",
@@ -222,6 +230,7 @@ def check_pingpong_transfers(
                                 "Keep data on device; see execution_trace.py for runtime detection."
                             ),
                             doc_path=RUNTIME_DOC,
+                            suppressed=is_suppressed,
                         )
                     )
     return errors, suppressed
@@ -231,10 +240,13 @@ def check_pingpong_transfers(
 
 def check_loop_transfers(
     repo_root: Path,
+    *,
+    include_suppressed: bool = False,
 ) -> tuple[list[LintError], int]:
     """Find D->H transfer calls inside for/while loop bodies.
 
-    Returns ``(errors, suppressed_count)``.
+    Returns ``(errors, suppressed_count)``.  When *include_suppressed* is
+    True, suppressed violations appear in *errors* with ``suppressed=True``.
     """
     errors: list[LintError] = []
     suppressed = 0
@@ -250,9 +262,11 @@ def check_loop_transfers(
                 if not isinstance(descendant, ast.Call):
                     continue
                 if _is_d2h_call(descendant):
-                    if descendant.lineno in suppressions:
+                    is_suppressed = descendant.lineno in suppressions
+                    if is_suppressed:
                         suppressed += 1
-                        continue
+                        if not include_suppressed:
+                            continue
                     errors.append(
                         LintError(
                             code="ZCOPY002",
@@ -263,6 +277,7 @@ def check_loop_transfers(
                                 "Transfer in bulk outside the loop instead of per-element."
                             ),
                             doc_path=RUNTIME_DOC,
+                            suppressed=is_suppressed,
                         )
                     )
     return errors, suppressed
@@ -302,10 +317,13 @@ _ALLOWED_HOST_RETURN = {
 
 def check_boundary_type_leak(
     repo_root: Path,
+    *,
+    include_suppressed: bool = False,
 ) -> tuple[list[LintError], int]:
     """Find functions using device APIs that return D->H converted results.
 
-    Returns ``(errors, suppressed_count)``.
+    Returns ``(errors, suppressed_count)``.  When *include_suppressed* is
+    True, suppressed violations appear in *errors* with ``suppressed=True``.
     """
     errors: list[LintError] = []
     suppressed = 0
@@ -323,9 +341,11 @@ def check_boundary_type_leak(
                 continue
             d2h_line = _returns_host_conversion(node)
             if d2h_line is not None:
-                if d2h_line in suppressions:
+                is_suppressed = d2h_line in suppressions
+                if is_suppressed:
                     suppressed += 1
-                    continue
+                    if not include_suppressed:
+                        continue
                 errors.append(
                     LintError(
                         code="ZCOPY003",
@@ -336,6 +356,7 @@ def check_boundary_type_leak(
                             "Return device arrays and let the caller materialize."
                         ),
                         doc_path=RUNTIME_DOC,
+                        suppressed=is_suppressed,
                     )
                 )
     return errors, suppressed
@@ -391,6 +412,53 @@ def run_checks(repo_root: Path) -> tuple[list[LintError], int]:
     )
 
 
+def _collect_all_violations(repo_root: Path) -> list[LintError]:
+    """Collect all violations including suppressed ones for ``--detail``.
+
+    Reuses the same check functions as ``run_checks()`` with
+    ``include_suppressed=True`` so analysis logic is never duplicated.
+    """
+    all_violations: list[LintError] = []
+
+    pp_errs, _ = check_pingpong_transfers(repo_root, include_suppressed=True)
+    all_violations.extend(pp_errs)
+
+    loop_errs, _ = check_loop_transfers(repo_root, include_suppressed=True)
+    all_violations.extend(loop_errs)
+
+    leak_errs, _ = check_boundary_type_leak(repo_root, include_suppressed=True)
+    all_violations.extend(leak_errs)
+
+    all_violations.extend(_check_empty_suppressions(repo_root))
+
+    return sorted(all_violations, key=lambda e: (str(e.path), e.line, e.code))
+
+
+def _render_detail(
+    all_violations: list[LintError],
+    repo_root: Path,
+) -> None:
+    """Print all violations grouped by file, including suppressed ones."""
+    if not all_violations:
+        print("No violations found.")
+        return
+
+    current_file: Path | None = None
+    for error in all_violations:
+        if error.path != current_file:
+            current_file = error.path
+            relative = error.path.relative_to(repo_root)
+            print(f"\n{relative}")
+        print(f"  {error.render(repo_root)}")
+
+    active = sum(1 for e in all_violations if not e.suppressed)
+    suppressed = sum(1 for e in all_violations if e.suppressed)
+    print(
+        f"\nTotal: {active} active, {suppressed} suppressed, "
+        f"{len(all_violations)} total"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Check zero-copy device transfer constraints."
@@ -398,6 +466,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all", action="store_true",
         help="Scan src/vibespatial/ for zero-copy violations.",
+    )
+    parser.add_argument(
+        "--detail", action="store_true",
+        help=(
+            "Print every violation with file:line, code, and message "
+            "regardless of whether count exceeds the baseline."
+        ),
     )
     args = parser.parse_args(argv)
 
@@ -411,9 +486,15 @@ def main(argv: list[str] | None = None) -> int:
     if suppressed_count:
         suppressed_msg = f" ({suppressed_count} suppressed via # zcopy:ok)"
 
+    if args.detail:
+        all_violations = _collect_all_violations(REPO_ROOT)
+        _render_detail(all_violations, REPO_ROOT)
+        print()
+
     if count > _VIOLATION_BASELINE:
-        for error in errors:
-            print(error.render(REPO_ROOT))
+        if not args.detail:
+            for error in errors:
+                print(error.render(REPO_ROOT))
         print(
             f"\nZero-copy checks FAILED: {count} violations found, "
             f"baseline is {_VIOLATION_BASELINE}. "
