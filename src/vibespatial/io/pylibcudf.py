@@ -701,14 +701,16 @@ def _build_device_wkb_multipolygon_family(column, row_indexes):
 
         # Advance past the entire polygon: walk all rings to find byte size.
         # We need to scan each ring's point_count to skip its coords.
-        # Use a sub-loop over rings within this polygon batch.
-        max_rings_here = int(cp.asnumpy(ring_counts_here.max())) if bool(cp.asnumpy(has_poly.any())) else 0
+        # Removed per-ring-index cp.asnumpy(has_ring.any()) D2H early-exit;
+        # masked ops are no-ops for polygons with fewer rings.
+        # NOTE: int(.max()) still performs one D2H scalar read per polygon
+        # batch (unavoidable — Python needs a host int for range()).
+        # has_poly guaranteed non-empty by outer-loop early-exit at line 688.
+        max_rings_here = int(ring_counts_here.max())
         poly_cursors = current_positions[has_poly] + 9  # start of ring data
 
         for ring_idx in range(max_rings_here):
             has_ring = ring_counts_here > ring_idx
-            if not bool(cp.asnumpy(has_ring.any())):
-                break
             pts = _pylibcudf_unpack_le_uint32(
                 payload, poly_cursors[has_ring]
             ).astype(cp.int64, copy=False)
