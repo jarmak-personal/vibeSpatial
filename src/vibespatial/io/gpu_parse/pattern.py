@@ -51,6 +51,10 @@ KERNEL_PARAM_I64 = ctypes.c_longlong
 _pattern_kernel_cache: dict[bytes, dict] = {}
 
 
+# NOTE: This kernel source is dynamically generated per-pattern and cannot be
+# statically extracted.  The pattern bytes, pattern length, and quote-check
+# configuration are embedded as compile-time constants in the generated CUDA
+# source, enabling NVRTC to optimize the comparison loop.
 def _generate_pattern_match_source(
     pattern: bytes, check_quote: bool, quote_check_offset: int
 ) -> str:

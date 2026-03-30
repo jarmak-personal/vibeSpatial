@@ -32,6 +32,12 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
+# Dispatch thresholds for point constructive operations.  These are Python-
+# side constants consumed by bench/pipeline.py; they live here (not in the
+# kernels file) because they are dispatch policy, not CUDA source.
+POINT_CLIP_GPU_THRESHOLD = 10_000
+POINT_BUFFER_GPU_THRESHOLD = 10_000
+
 request_nvrtc_warmup([
     ("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES),
 ])

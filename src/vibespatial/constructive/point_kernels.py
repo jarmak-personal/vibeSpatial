@@ -123,6 +123,4 @@ extern "C" __global__ void point_subset_gather(
   out_y[row] = point_y[coord];
 }
 """
-POINT_CLIP_GPU_THRESHOLD = 10_000
-POINT_BUFFER_GPU_THRESHOLD = 10_000
 _POINT_CONSTRUCTIVE_KERNEL_NAMES = ("point_rect_mask", "point_buffer_quad1", "point_buffer_round", "point_subset_gather")
