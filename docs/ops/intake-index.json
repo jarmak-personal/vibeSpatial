@@ -29083,6 +29083,26 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/predicates/point_relations_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "binary",
+        "kernel",
+        "kernels",
+        "multipoint",
+        "nvrtc",
+        "point",
+        "predicates",
+        "py",
+        "relations",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/predicates/polygon.py",
       "referenced_by": [],
       "symbols": [
@@ -29112,6 +29132,26 @@
         "src",
         "supported",
         "transpose",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/predicates/polygon_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "9im",
+        "de",
+        "kernel",
+        "kernels",
+        "line",
+        "nvrtc",
+        "polygon",
+        "predicates",
+        "py",
+        "sources",
+        "src",
         "vibespatial"
       ]
     },
