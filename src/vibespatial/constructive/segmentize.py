@@ -45,8 +45,7 @@ from vibespatial.cuda._runtime import (
     count_scatter_total,
     get_cuda_runtime,
 )
-
-from .measurement import _PRECISION_PREAMBLE
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # NVRTC kernel source: two-pass segmentize
@@ -67,7 +66,7 @@ from .measurement import _PRECISION_PREAMBLE
 # for Polygons, part_offsets for MultiLineStrings).
 # ---------------------------------------------------------------------------
 
-_SEGMENTIZE_COUNT_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_SEGMENTIZE_COUNT_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void segmentize_count(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -102,7 +101,7 @@ extern "C" __global__ void segmentize_count(
 }}
 """
 
-_SEGMENTIZE_SCATTER_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_SEGMENTIZE_SCATTER_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void segmentize_scatter(
     const double* __restrict__ x,
     const double* __restrict__ y,

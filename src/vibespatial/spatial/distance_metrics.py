@@ -219,13 +219,13 @@ def _min_distances_vectorized(
 # GPU NVRTC Kernels (ADR-0033 Tier 1)
 # ===========================================================================
 
-from vibespatial.constructive.measurement import _PRECISION_PREAMBLE  # noqa: E402
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Hausdorff kernel: 1 block per pair, shared-memory max reduction
 # ---------------------------------------------------------------------------
 
-_HAUSDORFF_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_HAUSDORFF_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void hausdorff_distance(
     const double* __restrict__ x_a,
@@ -316,7 +316,7 @@ _HAUSDORFF_KERNEL_NAMES = ("hausdorff_distance",)
 
 _MAX_FRECHET_B = 2048
 
-_FRECHET_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_FRECHET_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 #define MAX_FRECHET_B {max_frechet_b}
 
 extern "C" __global__

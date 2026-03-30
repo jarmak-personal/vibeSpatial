@@ -32,6 +32,7 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -42,7 +43,6 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 
-from .measurement import _PRECISION_PREAMBLE
 from .polygon import (
     _POLYGON_CENTROID_KERNEL_NAMES,
     _POLYGON_CENTROID_KERNEL_SOURCE,
@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 # Cooperative polygon centroid kernel: 1 block per geometry (for complex polygons)
 # ---------------------------------------------------------------------------
 
-_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void polygon_centroid_cooperative(
     const double* __restrict__ x,
@@ -190,7 +190,7 @@ void polygon_centroid_cooperative(
 # Point centroid kernel: identity copy (x, y -> cx, cy)
 # ---------------------------------------------------------------------------
 
-_POINT_CENTROID_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_POINT_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void point_centroid(
     const double* x,
     const double* y,
@@ -214,7 +214,7 @@ extern "C" __global__ void point_centroid(
 # MultiPoint centroid kernel: Kahan mean of all points in each geometry
 # ---------------------------------------------------------------------------
 
-_MULTIPOINT_CENTROID_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_MULTIPOINT_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void multipoint_centroid(
     const double* x,
     const double* y,
@@ -257,7 +257,7 @@ extern "C" __global__ void multipoint_centroid(
 # LineString centroid kernel: length-weighted segment midpoints
 # ---------------------------------------------------------------------------
 
-_LINESTRING_CENTROID_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_LINESTRING_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void linestring_centroid(
     const double* x,
     const double* y,
@@ -325,7 +325,7 @@ extern "C" __global__ void linestring_centroid(
 # MultiLineString centroid kernel: length-weighted across all parts
 # ---------------------------------------------------------------------------
 
-_MULTILINESTRING_CENTROID_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_MULTILINESTRING_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void multilinestring_centroid(
     const double* x,
     const double* y,

@@ -113,7 +113,29 @@ def path_exists(root: Path, relative_path: str) -> bool:
 
 def collect_python_symbols(content: str) -> list[str]:
     symbols = re.findall(r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", content, flags=re.MULTILINE)
+
+    # Also harvest names exported via __all__
+    all_match = re.search(r"^__all__\s*=\s*\[([^\]]*)\]", content, flags=re.MULTILINE | re.DOTALL)
+    if all_match:
+        all_names = re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"|\'([A-Za-z_][A-Za-z0-9_]*)\'', all_match.group(1))
+        for groups in all_names:
+            name = groups[0] or groups[1]
+            if name not in symbols:
+                symbols.append(name)
+
     return symbols[:24]
+
+
+def extract_module_docstring(content: str) -> str:
+    """Return the module-level docstring text, or empty string."""
+    # Match triple-quoted docstring at the start of the file, optionally
+    # preceded or followed by a future-annotations import.
+    for quote in ('"""', "'''"):
+        pattern = rf'^(?:#[^\n]*\n)*\s*{quote}(.*?){quote}'
+        match = re.match(pattern, content, flags=re.DOTALL)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def classify_file(relative_path: str) -> str:
@@ -210,7 +232,8 @@ def build_file_entries(root: Path, doc_entries: list[dict[str, Any]]) -> list[di
         relative_path = path.relative_to(root).as_posix()
         content = path.read_text() if path.suffix == ".py" else ""
         content_tokens = collect_python_symbols(content) if content else []
-        token_source = " ".join([relative_path, *content_tokens])
+        docstring = extract_module_docstring(content) if content else ""
+        token_source = " ".join([relative_path, *content_tokens, docstring])
 
         entries.append(
             {

@@ -44,6 +44,7 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -56,8 +57,6 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
-from .measurement import _PRECISION_PREAMBLE
-
 # ---------------------------------------------------------------------------
 # NVRTC kernel: is_valid_rings — 1 thread per ring (Tier 1, ADR-0033)
 #
@@ -67,7 +66,7 @@ from .measurement import _PRECISION_PREAMBLE
 # Note: orientation is NOT checked (GEOS does not enforce winding in is_valid).
 # ---------------------------------------------------------------------------
 
-_IS_VALID_RINGS_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_IS_VALID_RINGS_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void is_valid_rings(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -116,7 +115,7 @@ _IS_VALID_RINGS_FP64 = _IS_VALID_RINGS_KERNEL_SOURCE.format(compute_type="double
 # crossing found.
 # ---------------------------------------------------------------------------
 
-_IS_SIMPLE_SEGMENTS_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_IS_SIMPLE_SEGMENTS_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void is_simple_segments(
     const double* __restrict__ x,
@@ -228,7 +227,7 @@ _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
 # PREDICATE class, fp64 only — no centering needed for validity checks.
 # ---------------------------------------------------------------------------
 
-_HOLES_IN_SHELL_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_HOLES_IN_SHELL_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __device__ inline bool point_on_segment_validity(
     double px,
     double py,
@@ -333,7 +332,7 @@ _HOLES_IN_SHELL_FP64 = _HOLES_IN_SHELL_KERNEL_SOURCE.format(compute_type="double
 # orientation predicates (embedded from segment_primitives.py).
 # ---------------------------------------------------------------------------
 
-_RING_PAIR_INTERACTION_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_RING_PAIR_INTERACTION_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 /* ------------------------------------------------------------------ */
 /* Shewchuk error-free primitives (fp64 exact predicates)             */
 /* ------------------------------------------------------------------ */

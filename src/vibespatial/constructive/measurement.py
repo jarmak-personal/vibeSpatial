@@ -23,6 +23,7 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -37,33 +38,14 @@ from vibespatial.runtime.precision import KernelClass
 if TYPE_CHECKING:
     from vibespatial.runtime.precision import PrecisionMode, PrecisionPlan
 
-# ---------------------------------------------------------------------------
-# Shared CUDA macros (identical to polygon_constructive.py centroid kernel)
-# ---------------------------------------------------------------------------
-
-_PRECISION_PREAMBLE = r"""
-typedef {compute_type} compute_t;
-
-/* Centered coordinate read: subtract center in fp64, then cast to compute_t.
-   When compute_t is double, this is a no-op identity.  When compute_t is float,
-   centering reduces absolute magnitude before the lossy cast. */
-#define CX(val) ((compute_t)((val) - center_x))
-#define CY(val) ((compute_t)((val) - center_y))
-
-/* Kahan summation helper -- add `val` to `sum` with compensation `c`. */
-#define KAHAN_ADD(sum, val, c) do {{ \
-    const compute_t _y = (val) - (c); \
-    const compute_t _t = (sum) + _y; \
-    (c) = (_t - (sum)) - _y; \
-    (sum) = _t; \
-}} while(0)
-"""
+# Backward-compat alias for any external consumers
+_PRECISION_PREAMBLE = PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # Cooperative area kernel: 1 block per geometry (for complex polygons)
 # ---------------------------------------------------------------------------
 
-_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void polygon_area_cooperative(
     const double* __restrict__ x,
@@ -164,7 +146,7 @@ void polygon_area_cooperative(
 # Area kernel: Polygon (also used by MultiPolygon per-polygon-part)
 # ---------------------------------------------------------------------------
 
-_POLYGON_AREA_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_POLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void polygon_area(
     const double* x,
     const double* y,
@@ -227,7 +209,7 @@ extern "C" __global__ void polygon_area(
 # Area kernel: MultiPolygon (triple indirection: geom -> part -> ring -> coord)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_AREA_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_MULTIPOLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void multipolygon_area(
     const double* x,
     const double* y,
@@ -322,7 +304,7 @@ __device__ void accumulate_segment_lengths(
 # Length kernel: Polygon (all rings — exterior + holes)
 # ---------------------------------------------------------------------------
 
-_POLYGON_LENGTH_KERNEL_SOURCE = _PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_POLYGON_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
 extern "C" __global__ void polygon_length(
     const double* x,
     const double* y,
@@ -358,7 +340,7 @@ extern "C" __global__ void polygon_length(
 # Length kernel: MultiPolygon (all rings of all polygon parts)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_LENGTH_KERNEL_SOURCE = _PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_MULTIPOLYGON_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
 extern "C" __global__ void multipolygon_length(
     const double* x,
     const double* y,
@@ -399,7 +381,7 @@ extern "C" __global__ void multipolygon_length(
 # Length kernel: LineString (geometry_offsets -> coords)
 # ---------------------------------------------------------------------------
 
-_LINESTRING_LENGTH_KERNEL_SOURCE = _PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_LINESTRING_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
 extern "C" __global__ void linestring_length(
     const double* x,
     const double* y,
@@ -433,7 +415,7 @@ extern "C" __global__ void linestring_length(
 # Length kernel: MultiLineString (geometry_offsets -> part_offsets -> coords)
 # ---------------------------------------------------------------------------
 
-_MULTILINESTRING_LENGTH_KERNEL_SOURCE = _PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
+_MULTILINESTRING_LENGTH_KERNEL_SOURCE = PRECISION_PREAMBLE + _LENGTH_DEVICE_HELPER + r"""
 extern "C" __global__ void multilinestring_length(
     const double* x,
     const double* y,

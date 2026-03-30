@@ -22,6 +22,7 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
@@ -35,13 +36,11 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
 
-from .measurement import _PRECISION_PREAMBLE
-
 # ---------------------------------------------------------------------------
 # NVRTC kernel: orient rings by shoelace signed area
 # ---------------------------------------------------------------------------
 
-_ORIENT_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_ORIENT_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void orient_rings(
     const double* __restrict__ x_in,
     const double* __restrict__ y_in,

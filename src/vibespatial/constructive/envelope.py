@@ -27,6 +27,7 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -40,8 +41,6 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.residency import Residency
 
-from .measurement import _PRECISION_PREAMBLE
-
 if TYPE_CHECKING:
     pass
 
@@ -49,7 +48,7 @@ if TYPE_CHECKING:
 # NVRTC kernel: compute bounds per geometry and emit envelope polygon
 # ---------------------------------------------------------------------------
 
-_ENVELOPE_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_ENVELOPE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void envelope_from_bounds(
     const double* __restrict__ bounds,  /* (N, 4): xmin, ymin, xmax, ymax */
     double* __restrict__ x_out,         /* 5*N coords */

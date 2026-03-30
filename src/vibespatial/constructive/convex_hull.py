@@ -37,6 +37,7 @@ from vibespatial.cuda._runtime import (
     count_scatter_total,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -52,8 +53,6 @@ from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.residency import Residency
-
-from .measurement import _PRECISION_PREAMBLE
 
 if TYPE_CHECKING:
     pass
@@ -72,7 +71,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_HULL_VERTS = 2048
 
-_CONVEX_HULL_KERNEL_SOURCE = _PRECISION_PREAMBLE + (
+_CONVEX_HULL_KERNEL_SOURCE = PRECISION_PREAMBLE + (
     "\n#define MAX_HULL_VERTS " + str(_MAX_HULL_VERTS) + "\n"
 ) + r"""
 /* ---------- shared device helper: monotone chain ----------

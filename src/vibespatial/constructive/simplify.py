@@ -30,6 +30,7 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
@@ -43,15 +44,13 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 
-from .measurement import _PRECISION_PREAMBLE
-
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # NVRTC kernel: compute effective area per vertex (Visvalingam-Whyatt)
 # ---------------------------------------------------------------------------
 
-_VW_AREA_KERNEL_SOURCE = _PRECISION_PREAMBLE + r"""
+_VW_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
 extern "C" __global__ void vw_effective_area(
     const double* __restrict__ x,
     const double* __restrict__ y,
