@@ -27,7 +27,7 @@ RUNTIME_DOC = "docs/architecture/runtime.md"
 # Known pre-existing violations as of 2026-03-27.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 27  # receiver-type analysis eliminates numpy false positives 2026-03-29
+_VIOLATION_BASELINE = 26  # pyarrow to_pylist + branch exclusion false positives 2026-03-29
 # +3 intentional batch D->H in segment_primitives (OOM prevention)
 # +4 materialization D->H in dbf_gpu (DataFrame construction)
 # +1 intentional bulk D->H in csv_gpu _extract_wkb_and_parse (hex decode on CPU)
@@ -112,6 +112,23 @@ def _enclosing_func_numpy_names(
         current = current._parent  # type: ignore[attr-defined]
         if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
             return func_numpy.get(id(current), frozenset())
+    return frozenset()
+
+
+def _enclosing_func_pyarrow_names(
+    node: ast.AST,
+    func_pyarrow: dict[int, frozenset[str]],
+) -> frozenset[str]:
+    """Walk up the ``_parent`` chain to find the enclosing function's pyarrow names.
+
+    Returns ``frozenset()`` if the node is not inside any tracked function
+    (module-level code), which is conservative (won't skip to_pylist).
+    """
+    current: ast.AST = node
+    while hasattr(current, "_parent"):
+        current = current._parent  # type: ignore[attr-defined]
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return func_pyarrow.get(id(current), frozenset())
     return frozenset()
 
 
@@ -242,6 +259,107 @@ def _value_derives_from_numpy(value: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _scope_has_pyarrow(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Return True if *func_node* body contains ``import pyarrow`` (any alias).
+
+    Also returns True when the function references known pyarrow aliases
+    (``pa``) even without an explicit import in the function body — this
+    covers the common pattern of module-level ``import pyarrow as pa``
+    with usage inside functions.
+
+    This is intentionally conservative on the "skip" side: we only return
+    True when pyarrow usage is unambiguous.
+    """
+    for node in ast.walk(func_node):
+        # ``import pyarrow`` / ``import pyarrow as pa``
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "pyarrow" or alias.name.startswith("pyarrow."):
+                    return True
+        # ``from pyarrow import ...``
+        if isinstance(node, ast.ImportFrom) and node.module is not None:
+            if node.module == "pyarrow" or node.module.startswith("pyarrow."):
+                return True
+        # Reference to ``pa`` name — common alias for pyarrow at module level.
+        # Arrow-specific method calls: .field(), .column(), .type, .num_fields
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "field", "column", "num_fields",
+        ):
+            return True
+    return False
+
+
+# PyArrow method names whose return values are host-resident Arrow objects.
+_PYARROW_PRODUCER_METHODS = frozenset({
+    "field", "column", "to_pandas", "to_pydict", "chunk", "chunks",
+    "combine_chunks", "slice", "filter", "take", "cast", "flatten",
+})
+
+
+def _collect_pyarrow_names(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> frozenset[str]:
+    """Collect variable names that are known PyArrow host-resident objects.
+
+    A variable is considered "known pyarrow" when it is assigned from a
+    call to a PyArrow producer method (e.g., ``child = struct.field(0)``).
+
+    This ONLY runs when the enclosing scope has pyarrow indicators
+    (checked by the caller).  Intentionally conservative: only clear-cut
+    assignment patterns are tracked.
+    """
+    names: set[str] = set()
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        target_name = node.targets[0].id
+        value = node.value
+        # Pattern: ``name = something.field(...)`` / ``.column(...)`` etc.
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            if value.func.attr in _PYARROW_PRODUCER_METHODS:
+                names.add(target_name)
+    # One propagation pass: variables assigned from operations on known names.
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        target_name = node.targets[0].id
+        if target_name in names:
+            continue
+        value = node.value
+        # ``y = x.field(...)`` where x is already tracked.
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute):
+            receiver = value.func.value
+            if isinstance(receiver, ast.Name) and receiver.id in names:
+                if value.func.attr in _PYARROW_PRODUCER_METHODS:
+                    names.add(target_name)
+    return frozenset(names)
+
+
+def _receiver_is_pyarrow(
+    node: ast.Call,
+    pyarrow_names: frozenset[str],
+) -> bool:
+    """Return True if the method-call receiver is a known PyArrow host variable.
+
+    Checks:
+    - ``name.to_pylist()`` where *name* is in *pyarrow_names*
+    - ``name[slice].to_pylist()``  (Subscript of a pyarrow variable)
+    """
+    if not isinstance(node.func, ast.Attribute):
+        return False
+    receiver = node.func.value
+    if isinstance(receiver, ast.Name) and receiver.id in pyarrow_names:
+        return True
+    if isinstance(receiver, ast.Subscript):
+        if isinstance(receiver.value, ast.Name) and receiver.value.id in pyarrow_names:
+            return True
+    return False
+
+
 def _receiver_is_numpy(
     node: ast.Call,
     numpy_names: frozenset[str],
@@ -280,6 +398,8 @@ def _receiver_is_numpy(
 def _is_d2h_call(
     node: ast.Call,
     numpy_names: frozenset[str] = frozenset(),
+    *,
+    pyarrow_names: frozenset[str] = frozenset(),
 ) -> bool:
     name = _call_name(node)
     if name not in D2H_APIS:
@@ -296,16 +416,23 @@ def _is_d2h_call(
         return False  # dict.get(key), dict.get(key, default), etc.
     # --- Disambiguate pyarrow.to_pylist() from cupy.to_pylist() ---
     # to_pylist() on pyarrow arrays is host-to-host, not D2H.
-    # Heuristic: if the method is to_pylist and the call chain involves
-    # .field(), .column(), or the receiver looks like an Arrow type, skip it.
+    # Two-level heuristic:
+    #   1. Direct receiver chain: receiver is a .field()/.column() call result.
+    #   2. Receiver-name tracking: receiver is a variable assigned from a
+    #      PyArrow producer method (.field(), .column(), etc.).
     if name == "to_pylist" and isinstance(node.func, ast.Attribute):
-        # Check if the receiver is a result of .field() or .column() call
+        # Level 1: immediate receiver is a .field()/.column() call result.
         if isinstance(node.func.value, ast.Call):
             inner = node.func.value
             if isinstance(inner.func, ast.Attribute) and inner.func.attr in (
                 "field", "column", "to_pandas", "to_pydict",
             ):
                 return False
+        # Level 2: receiver is a known PyArrow variable (assigned from
+        # .field() / .column() etc.).  Covers the pattern:
+        #   ``var = struct.field(0); var.to_pylist()``
+        if _receiver_is_pyarrow(node, pyarrow_names):
+            return False
     # --- Disambiguate numpy host-to-host from cupy D->H ---
     # .tolist(), .asnumpy(), .get() on a numpy array is a host-to-host
     # conversion, not a device-to-host transfer. Skip if the receiver is
@@ -367,6 +494,86 @@ def _find_empty_suppression_lines(source: str) -> list[int]:
     return empty_lines
 
 
+# ---- Branch mutual-exclusion helpers ----
+
+def _node_is_descendant_of(node: ast.AST, ancestor: ast.AST) -> bool:
+    """Return True if *node* is a descendant of *ancestor* (using parent links)."""
+    current: ast.AST = node
+    while hasattr(current, "_parent"):
+        current = current._parent  # type: ignore[attr-defined]
+        if current is ancestor:
+            return True
+    return False
+
+
+def _stmt_list_always_returns(stmts: list[ast.stmt]) -> bool:
+    """Return True if a list of statements always reaches a ``return``.
+
+    Only checks for top-level ``return`` in the statement list and simple
+    ``if/else`` branches where both sides return.  This is intentionally
+    conservative — complex control flow (try/except, while/break) is NOT
+    analysed, so we err on the side of *not* excluding a pair (more false
+    positives, fewer false negatives).
+    """
+    for stmt in stmts:
+        if isinstance(stmt, ast.Return):
+            return True
+        if isinstance(stmt, ast.If):
+            if stmt.orelse and _stmt_list_always_returns(stmt.body) and _stmt_list_always_returns(stmt.orelse):
+                return True
+    return False
+
+
+def _in_mutually_exclusive_branches(
+    d2h_node: ast.Call,
+    h2d_node: ast.Call,
+) -> bool:
+    """Return True if *d2h_node* and *h2d_node* are in mutually exclusive branches.
+
+    Detects the pattern where D2H is in an ``if`` body that always returns
+    and H2D is outside that ``if`` body (or in its ``else`` branch).
+    Requires ``_assign_parents()`` to have been called on the tree.
+
+    This is intentionally conservative: it only recognises simple patterns
+    where the D2H branch unconditionally returns.  Unknown or complex
+    control flow is *not* excluded (false-positive safe).
+    """
+    # Walk up from d2h_node looking for an enclosing If node.
+    current: ast.AST = d2h_node
+    while hasattr(current, "_parent"):
+        parent = current._parent  # type: ignore[attr-defined]
+        if isinstance(parent, ast.If):
+            # Determine which branch the D2H is in (body vs orelse).
+            in_body = any(current is stmt or _node_is_descendant_of(current, stmt) for stmt in parent.body)
+            in_orelse = any(current is stmt or _node_is_descendant_of(current, stmt) for stmt in parent.orelse)
+
+            if in_body and _stmt_list_always_returns(parent.body):
+                # D2H is in the if-body which always returns.
+                # If H2D is NOT in the same body, they are mutually exclusive.
+                if not _node_is_descendant_of(h2d_node, parent) or (
+                    parent.orelse and any(
+                        h2d_node is stmt or _node_is_descendant_of(h2d_node, stmt)
+                        for stmt in parent.orelse
+                    )
+                ):
+                    return True
+
+            if in_orelse and _stmt_list_always_returns(parent.orelse):
+                # D2H is in the else-branch which always returns.
+                # If H2D is NOT in the orelse, they are mutually exclusive.
+                if not _node_is_descendant_of(h2d_node, parent) or any(
+                    h2d_node is stmt or _node_is_descendant_of(h2d_node, stmt)
+                    for stmt in parent.body
+                ):
+                    return True
+
+        # Stop at function boundary — don't leak into outer scopes.
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            break
+        current = parent
+    return False
+
+
 # ---- ZCOPY001: Ping-pong transfers in the same function ----
 
 def check_pingpong_transfers(
@@ -386,23 +593,43 @@ def check_pingpong_transfers(
         source = path.read_text(encoding="utf-8")
         suppressions = _parse_suppression_comments(source)
         tree = ast.parse(source, filename=str(path))
+        _assign_parents(tree)
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             numpy_names = _collect_numpy_names(node)
-            d2h_lines: list[int] = []
-            h2d_lines: list[int] = []
+            pa_names = _collect_pyarrow_names(node) if _scope_has_pyarrow(node) else frozenset()
+            d2h_calls: list[ast.Call] = []
+            h2d_calls: list[ast.Call] = []
             for descendant in ast.walk(node):
                 if not isinstance(descendant, ast.Call):
                     continue
-                if _is_d2h_call(descendant, numpy_names):
-                    d2h_lines.append(descendant.lineno)
+                if _is_d2h_call(descendant, numpy_names, pyarrow_names=pa_names):
+                    d2h_calls.append(descendant)
                 if _is_h2d_call(descendant):
-                    h2d_lines.append(descendant.lineno)
-            if d2h_lines and h2d_lines:
-                first_d2h = min(d2h_lines)
-                later_h2d = [ln for ln in h2d_lines if ln > first_d2h]
-                if later_h2d:
+                    h2d_calls.append(descendant)
+            if d2h_calls and h2d_calls:
+                # Sort by line number for deterministic pairing.
+                d2h_sorted = sorted(d2h_calls, key=lambda c: c.lineno)
+                h2d_sorted = sorted(h2d_calls, key=lambda c: c.lineno)
+                # Find the first D2H → later H2D pair that is NOT in
+                # mutually exclusive branches.
+                paired_d2h: ast.Call | None = None
+                paired_h2d: ast.Call | None = None
+                for d2h_call in d2h_sorted:
+                    for h2d_call in h2d_sorted:
+                        if h2d_call.lineno <= d2h_call.lineno:
+                            continue
+                        if _in_mutually_exclusive_branches(d2h_call, h2d_call):
+                            continue  # skip: branches can't co-execute
+                        paired_d2h = d2h_call
+                        paired_h2d = h2d_call
+                        break
+                    if paired_d2h is not None:
+                        break
+                if paired_d2h is not None and paired_h2d is not None:
+                    first_d2h = paired_d2h.lineno
+                    first_h2d = paired_h2d.lineno
                     is_suppressed = first_d2h in suppressions
                     if is_suppressed:
                         suppressed += 1
@@ -415,7 +642,7 @@ def check_pingpong_transfers(
                             line=first_d2h,
                             message=(
                                 f"Ping-pong transfer: D->H at line {first_d2h} followed by "
-                                f"H->D at line {later_h2d[0]} in {node.name}(). "
+                                f"H->D at line {first_h2d} in {node.name}(). "
                                 "Keep data on device; see execution_trace.py for runtime detection."
                             ),
                             doc_path=RUNTIME_DOC,
@@ -445,12 +672,16 @@ def check_loop_transfers(
         suppressions = _parse_suppression_comments(source)
         tree = ast.parse(source, filename=str(path))
 
-        # Pre-compute numpy name sets per enclosing function.
-        # For loops at module level, use an empty set (conservative).
+        # Pre-compute numpy name sets and pyarrow names per enclosing function.
+        # For loops at module level, use empty sets (conservative).
         func_numpy: dict[int, frozenset[str]] = {}
+        func_pyarrow: dict[int, frozenset[str]] = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 func_numpy[id(node)] = _collect_numpy_names(node)
+                func_pyarrow[id(node)] = (
+                    _collect_pyarrow_names(node) if _scope_has_pyarrow(node) else frozenset()
+                )
 
         # Assign parent links so we can look up enclosing function.
         _assign_parents(tree)
@@ -460,10 +691,11 @@ def check_loop_transfers(
                 continue
             # Find enclosing function scope for numpy name tracking.
             numpy_names = _enclosing_func_numpy_names(node, func_numpy)
+            pa_names = _enclosing_func_pyarrow_names(node, func_pyarrow)
             for descendant in ast.walk(node):
                 if not isinstance(descendant, ast.Call):
                     continue
-                if _is_d2h_call(descendant, numpy_names):
+                if _is_d2h_call(descendant, numpy_names, pyarrow_names=pa_names):
                     is_suppressed = descendant.lineno in suppressions
                     if is_suppressed:
                         suppressed += 1
@@ -490,11 +722,16 @@ def check_loop_transfers(
 def _returns_host_conversion(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
     """Return the line number of a D->H call in a return statement, or None."""
     numpy_names = _collect_numpy_names(func_node)
+    pa_names = (
+        _collect_pyarrow_names(func_node) if _scope_has_pyarrow(func_node) else frozenset()
+    )
     for node in ast.walk(func_node):
         if not isinstance(node, ast.Return) or node.value is None:
             continue
         for descendant in ast.walk(node.value):
-            if isinstance(descendant, ast.Call) and _is_d2h_call(descendant, numpy_names):
+            if isinstance(descendant, ast.Call) and _is_d2h_call(
+                descendant, numpy_names, pyarrow_names=pa_names
+            ):
                 return descendant.lineno
     return None
 

@@ -504,3 +504,188 @@ def f(offsets: np.ndarray):
     func = tree.body[0]
     names = _collect_numpy_names(func)
     assert "rebased" in names
+
+
+# ---------------------------------------------------------------------------
+# INFRA-04: PyArrow to_pylist() false positive elimination
+# ---------------------------------------------------------------------------
+
+
+def test_pyarrow_to_pylist_not_flagged_in_loop(tmp_path: Path) -> None:
+    """to_pylist() in a function that uses pyarrow .field() should NOT be flagged.
+
+    Covers the pattern in geojson.py where .field(0) result is stored in
+    an intermediate variable and then .to_pylist() is called on it.
+    """
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(feature_struct):
+    for index in range(feature_struct.type.num_fields):
+        child = feature_struct.field(index)
+        maybe_type = child.field(0)
+        values = [v for v in maybe_type.to_pylist() if v is not None]
+        if values:
+            return index
+    return None
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
+
+
+def test_pyarrow_direct_field_to_pylist_not_flagged(tmp_path: Path) -> None:
+    """struct.field(0).to_pylist() should NOT be flagged (existing heuristic)."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(table):
+    for col_idx in range(table.num_columns):
+        vals = table.column(col_idx).to_pylist()
+        use(vals)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
+
+
+def test_cupy_to_pylist_still_flagged_with_pyarrow(tmp_path: Path) -> None:
+    """cp.something.to_pylist() should still be flagged even with pyarrow in scope."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(data):
+    import pyarrow as pa
+    result = cp.arange(10)
+    for val in result.to_pylist():
+        use(val)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert len(errors) == 1
+    assert errors[0].code == "ZCOPY002"
+
+
+def test_pyarrow_to_pylist_not_flagged_in_pingpong(tmp_path: Path) -> None:
+    """to_pylist() on pyarrow data should not count as D2H in ping-pong detection."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(struct, data):
+    child = struct.field(0)
+    values = child.to_pylist()
+    result = cp.asarray(data)
+    return result
+""",
+    )
+    errors, suppressed = check_pingpong_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
+
+
+# ---------------------------------------------------------------------------
+# INFRA-05: Branch mutual exclusion for ZCOPY001
+# ---------------------------------------------------------------------------
+
+
+def test_branch_exclusion_returning_if(tmp_path: Path) -> None:
+    """D2H in an if-branch that returns should not pair with H2D after the branch."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(data, flag):
+    if flag is None:
+        host = data.to_host()
+        return host
+
+    result = cp.asarray(data)
+    return result
+""",
+    )
+    errors, suppressed = check_pingpong_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
+
+
+def test_branch_exclusion_non_returning_if_still_flagged(tmp_path: Path) -> None:
+    """D2H in an if-branch that does NOT return should still pair with later H2D."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(data, flag):
+    if flag is None:
+        host = data.to_host()
+        use(host)
+
+    result = cp.asarray(data)
+    return result
+""",
+    )
+    errors, suppressed = check_pingpong_transfers(tmp_path)
+    assert len(errors) == 1
+    assert errors[0].code == "ZCOPY001"
+    assert suppressed == 0
+
+
+def test_branch_exclusion_else_with_return(tmp_path: Path) -> None:
+    """D2H in else-branch that returns should not pair with H2D after the branch."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(data, flag):
+    if flag:
+        pass
+    else:
+        host = data.to_host()
+        return host
+
+    result = cp.asarray(data)
+    return result
+""",
+    )
+    errors, suppressed = check_pingpong_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
+
+
+def test_branch_exclusion_both_in_same_branch_still_flagged(tmp_path: Path) -> None:
+    """D2H and H2D in the same branch should still be flagged."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(data, flag):
+    if flag:
+        host = data.to_host()
+        result = cp.asarray(host)
+        return result
+    return None
+""",
+    )
+    errors, suppressed = check_pingpong_transfers(tmp_path)
+    assert len(errors) == 1
+    assert errors[0].code == "ZCOPY001"
+    assert suppressed == 0
+
+
+def test_branch_exclusion_nested_if_with_return(tmp_path: Path) -> None:
+    """D2H in nested returning if-block should be excluded from pairing."""
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process(data, pred, total):
+    if pred is None or total == 0:
+        if data is not None:
+            left, right = data.to_host()
+        if pred is None:
+            return left, right
+        return left, right
+
+    result = cp.asarray(data)
+    return result
+""",
+    )
+    errors, suppressed = check_pingpong_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
