@@ -24237,6 +24237,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/csv_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "csv",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "reader",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/io/dbf_gpu.py",
       "referenced_by": [],
       "symbols": [
@@ -24402,6 +24421,27 @@
         "wise",
         "without",
         "yyyymmdd"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/dbf_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "dbase",
+        "dbf",
+        "gpu",
+        "iii",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "reader",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -24612,6 +24652,26 @@
         "well",
         "wkb",
         "xy"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/fgb_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "decoder",
+        "fgb",
+        "flatgeobuf",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -24954,6 +25014,25 @@
         "supports",
         "type",
         "using",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/geojson_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "geojson",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "parser",
+        "py",
+        "sources",
+        "src",
         "vibespatial"
       ]
     },
@@ -25312,6 +25391,29 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/indexing_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "fused",
+        "gpu",
+        "index",
+        "indexing",
+        "ingest",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "parse",
+        "py",
+        "sources",
+        "spatial",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/io/gpu_parse/numeric.py",
       "referenced_by": [],
       "symbols": [
@@ -25376,6 +25478,27 @@
         "values",
         "vibespatial",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/numeric_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "numeric",
+        "nvrtc",
+        "parse",
+        "parsing",
+        "primitives",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -25463,6 +25586,28 @@
         "wkt",
         "xml",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/pattern_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "detection",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "matching",
+        "nvrtc",
+        "parse",
+        "pattern",
+        "py",
+        "sources",
+        "span",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -25609,6 +25754,28 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/properties_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "extraction",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "parse",
+        "primitives",
+        "properties",
+        "property",
+        "py",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/io/gpu_parse/structural.py",
       "referenced_by": [],
       "symbols": [
@@ -25680,6 +25847,27 @@
         "vibespatial",
         "which",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/gpu_parse/structural_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "parse",
+        "primitives",
+        "py",
+        "scanning",
+        "sources",
+        "src",
+        "structural",
+        "vibespatial"
       ]
     },
     {
@@ -25960,6 +26148,25 @@
         "wkt",
         "xml",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/kml_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "kml",
+        "nvrtc",
+        "py",
+        "reader",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -26274,6 +26481,26 @@
         "wise",
         "within",
         "zlib"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/osm_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "osm",
+        "pbf",
+        "py",
+        "reader",
+        "sources",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -26607,6 +26834,27 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/io/shp_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "binary",
+        "decoder",
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "shapefile",
+        "shp",
+        "sources",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/io/support.py",
       "referenced_by": [],
       "symbols": [
@@ -26718,6 +26966,24 @@
         "wkbbridgeplan",
         "wkbpartitionplan",
         "write"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/wkb_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "encode",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "py",
+        "sources",
+        "src",
+        "vibespatial",
+        "wkb"
       ]
     },
     {
@@ -26921,6 +27187,25 @@
         "wkt",
         "wktstructuralresult",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/io/wkt_gpu_kernels.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "gpu",
+        "io",
+        "kernel",
+        "kernels",
+        "nvrtc",
+        "parser",
+        "py",
+        "sources",
+        "src",
+        "vibespatial",
+        "wkt"
       ]
     },
     {

@@ -29,6 +29,13 @@ from vibespatial.cuda._runtime import (
     get_cuda_runtime,
     make_kernel_cache_key,
 )
+from vibespatial.io.gpu_parse.pattern_kernels import (
+    _MARK_SPANS_NAMES,
+    _MARK_SPANS_SOURCE,
+    _PATTERN_MATCH_NAMES,
+    _SPAN_BOUNDARIES_NAMES,
+    _SPAN_BOUNDARIES_SOURCE,
+)
 
 if TYPE_CHECKING:
     import cupy as cp
@@ -97,9 +104,6 @@ def _generate_pattern_match_source(
     return source
 
 
-_PATTERN_MATCH_NAMES = ("pattern_match_kernel",)
-
-
 def _compile_pattern_match(
     pattern: bytes, check_quote: bool, quote_check_offset: int
 ) -> dict:
@@ -132,72 +136,15 @@ def _compile_pattern_match(
 # span_boundaries — static kernel source
 # ---------------------------------------------------------------------------
 
-_SPAN_BOUNDARIES_SOURCE = r"""
-extern "C" __global__ void span_boundaries_kernel(
-    const int* __restrict__ depth,
-    const long long* __restrict__ starts,
-    long long* __restrict__ ends,
-    int n_spans,
-    long long n_bytes,
-    int skip_bytes
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_spans) return;
-
-    // Start scanning after skip_bytes past the start position
-    long long pos = starts[idx] + (long long)skip_bytes;
-    // Skip whitespace: advance while depth does not change
-    while (pos < n_bytes && depth[pos] == depth[pos - 1]) {
-        pos++;
-    }
-    if (pos >= n_bytes) {
-        ends[idx] = n_bytes;
-        return;
-    }
-    int start_depth = depth[pos];
-    // Scan forward until depth drops below start_depth
-    pos++;
-    while (pos < n_bytes && depth[pos] >= start_depth) {
-        pos++;
-    }
-    ends[idx] = pos;
-}
-"""
-
-_SPAN_BOUNDARIES_NAMES = ("span_boundaries_kernel",)
-
-
 # ---------------------------------------------------------------------------
 # mark_spans — static kernel source
 # ---------------------------------------------------------------------------
-
-_MARK_SPANS_SOURCE = r"""
-extern "C" __global__ void mark_spans_kernel(
-    const long long* __restrict__ starts,
-    const long long* __restrict__ ends,
-    unsigned char* __restrict__ mask,
-    int n_spans
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_spans) return;
-
-    long long start = starts[idx];
-    long long end = ends[idx];
-    for (long long i = start; i < end; i++) {
-        mask[i] = 1;
-    }
-}
-"""
-
-_MARK_SPANS_NAMES = ("mark_spans_kernel",)
-
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034 Level 2)
 # ---------------------------------------------------------------------------
 # Only the static kernels can be warmed up at module scope.
 # pattern_match kernels are generated per-pattern and compiled on demand.
-
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([
