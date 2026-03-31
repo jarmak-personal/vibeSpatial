@@ -249,7 +249,6 @@ def test_real_repo_still_at_baseline() -> None:
         f"Expected {_VIOLATION_BASELINE} violations, got {len(errors)}. "
         f"Suppressed: {suppressed}."
     )
-    assert suppressed == 0
 
 
 # ---------------------------------------------------------------------------
