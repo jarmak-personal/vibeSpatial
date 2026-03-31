@@ -608,8 +608,6 @@
       },
       "open_first": [
         "docs/architecture/determinism.md",
-        "src/vibespatial/runtime/determinism.py",
-        "scripts/check_determinism.py",
         "docs/architecture/runtime.md",
         "docs/architecture/precision.md"
       ],
@@ -15899,38 +15897,6 @@
     },
     {
       "kind": "script",
-      "path": "scripts/check_determinism.py",
-      "referenced_by": [
-        "docs/architecture/determinism.md"
-      ],
-      "symbols": [
-        "DeterminismProbeResult",
-        "build_dissolve_frame",
-        "_fingerprint_dissolve_output",
-        "_run_dissolve_area_pipeline",
-        "probe_determinism",
-        "main"
-      ],
-      "tokens": [
-        "area",
-        "build",
-        "check",
-        "determinism",
-        "determinismproberesult",
-        "dissolve",
-        "fingerprint",
-        "frame",
-        "main",
-        "output",
-        "pipeline",
-        "probe",
-        "py",
-        "run",
-        "scripts"
-      ]
-    },
-    {
-      "kind": "script",
       "path": "scripts/check_device_function_duplication.py",
       "referenced_by": [],
       "symbols": [
@@ -30630,39 +30596,6 @@
     },
     {
       "kind": "source",
-      "path": "src/vibespatial/runtime/determinism.py",
-      "referenced_by": [
-        "docs/architecture/determinism.md"
-      ],
-      "symbols": [
-        "DeterminismMode",
-        "ReproducibilityGuarantee",
-        "DeterminismPlan",
-        "normalize_determinism_mode",
-        "determinism_mode_from_env",
-        "deterministic_mode_enabled",
-        "select_determinism_plan"
-      ],
-      "tokens": [
-        "determinism",
-        "determinismmode",
-        "determinismplan",
-        "deterministic",
-        "enabled",
-        "env",
-        "mode",
-        "normalize",
-        "plan",
-        "py",
-        "reproducibilityguarantee",
-        "runtime",
-        "select",
-        "src",
-        "vibespatial"
-      ]
-    },
-    {
-      "kind": "source",
       "path": "src/vibespatial/runtime/dispatch.py",
       "referenced_by": [],
       "symbols": [
@@ -33758,48 +33691,6 @@
         "test",
         "tests",
         "verification"
-      ]
-    },
-    {
-      "kind": "test",
-      "path": "tests/test_determinism_policy.py",
-      "referenced_by": [],
-      "symbols": [
-        "test_env_mode_defaults_to_default",
-        "test_env_mode_can_force_deterministic",
-        "test_default_metric_plan_allows_fast_reductions",
-        "test_deterministic_constructive_plan_requires_fixed_order",
-        "test_dissolve_area_probe_is_bitwise_identical_on_current_cpu_path"
-      ],
-      "tokens": [
-        "allows",
-        "area",
-        "bitwise",
-        "can",
-        "constructive",
-        "cpu",
-        "current",
-        "default",
-        "defaults",
-        "determinism",
-        "deterministic",
-        "dissolve",
-        "env",
-        "fast",
-        "fixed",
-        "force",
-        "identical",
-        "metric",
-        "mode",
-        "order",
-        "plan",
-        "policy",
-        "probe",
-        "py",
-        "reductions",
-        "requires",
-        "test",
-        "tests"
       ]
     },
     {

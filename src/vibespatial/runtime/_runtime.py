@@ -66,7 +66,7 @@ def select_runtime(requested: ExecutionMode | str = ExecutionMode.AUTO) -> Runti
 
 
 # ---------------------------------------------------------------------------
-# Session-scoped execution mode override (mirrors determinism.py pattern)
+# Session-scoped execution mode override
 # ---------------------------------------------------------------------------
 
 _override_mode: ExecutionMode | None = None
