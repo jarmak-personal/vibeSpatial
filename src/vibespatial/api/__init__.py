@@ -2,13 +2,11 @@ import numpy as np
 import pandas as pd
 
 import vibespatial.api.datasets
-from vibespatial.api import geo_base as base  # GeoPandas compat: geopandas.base
-from vibespatial.api import geometry_array as array  # GeoPandas compat: geopandas.array
 from vibespatial.api._config import options
 from vibespatial.api._version import __version__
-from vibespatial.api.geodataframe import GeoDataFrame
-from vibespatial.api.geometry_array import points_from_xy
-from vibespatial.api.geoseries import GeoSeries
+from vibespatial.api.geoseries import GeoSeries  # noqa: E402 — must precede GeoDataFrame to avoid circular import
+from vibespatial.api.geodataframe import GeoDataFrame  # noqa: E402
+from vibespatial.api.geometry_array import points_from_xy  # noqa: E402
 from vibespatial.api.io.arrow import _read_feather as read_feather
 from vibespatial.api.io.file import _list_layers as list_layers
 from vibespatial.api.io.sql import _read_postgis as read_postgis
@@ -45,3 +43,16 @@ def get_runtime_selection(
     requested: ExecutionMode | str = ExecutionMode.AUTO,
 ) -> RuntimeSelection:
     return select_runtime(requested)
+
+
+# Lazy aliases for GeoPandas compat: geopandas.array → geometry_array,
+# geopandas.base → geo_base.  Eager import creates a circular dependency
+# (geo_base → geometry_array → sindex → geoseries → geo_base).
+def __getattr__(name: str):
+    if name == "array":
+        from vibespatial.api import geometry_array
+        return geometry_array
+    if name == "base":
+        from vibespatial.api import geo_base
+        return geo_base
+    raise AttributeError(f"module 'vibespatial.api' has no attribute {name!r}")

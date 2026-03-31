@@ -17363,11 +17363,13 @@
         "docs/architecture/runtime.md"
       ],
       "symbols": [
-        "get_runtime_selection"
+        "get_runtime_selection",
+        "__getattr__"
       ],
       "tokens": [
         "api",
         "get",
+        "getattr",
         "init",
         "py",
         "runtime",
