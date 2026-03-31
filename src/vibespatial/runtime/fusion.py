@@ -119,32 +119,3 @@ def plan_fusion(steps: tuple[PipelineStep, ...] | list[PipelineStep]) -> FusionP
         peak_memory_target_ratio=1.5,
         reason="use a lightweight staged DAG: fuse ephemeral device-local chains, persist reusable structures, and stop at explicit materialization boundaries",
     )
-
-
-def default_fusible_sequences() -> dict[str, tuple[PipelineStep, ...]]:
-    return {
-        "bounds_sfc_sort": (
-            PipelineStep(name="bounds", kind=StepKind.DERIVED, output_name="bounds"),
-            PipelineStep(name="morton_keys", kind=StepKind.ORDERING, output_name="morton_keys"),
-            PipelineStep(name="sort", kind=StepKind.ORDERING, output_name="permutation", output_rows_follow_input=False),
-        ),
-        "predicate_filter_materialize": (
-            PipelineStep(name="predicate", kind=StepKind.FILTER, output_name="predicate_mask"),
-            PipelineStep(name="filter", kind=StepKind.FILTER, output_name="filtered_rows"),
-            PipelineStep(
-                name="to_pandas",
-                kind=StepKind.MATERIALIZATION,
-                output_name="host_frame",
-                materializes_host_output=True,
-            ),
-        ),
-        "build_and_query_index": (
-            PipelineStep(
-                name="build_index",
-                kind=StepKind.INDEX,
-                output_name="spatial_index",
-                reusable_output=True,
-            ),
-            PipelineStep(name="query_index", kind=StepKind.FILTER, output_name="candidate_pairs"),
-        ),
-    }

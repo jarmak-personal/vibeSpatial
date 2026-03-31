@@ -223,7 +223,6 @@ from .runtime import (
 )
 from .runtime.adaptive import (
     AdaptivePlan,
-    AdaptiveRuntime,
     DeviceSnapshot,
     MonitoringBackend,
     MonitoringSample,
@@ -271,7 +270,6 @@ from .runtime.fusion import (
     IntermediateDisposition,
     PipelineStep,
     StepKind,
-    default_fusible_sequences,
     plan_fusion,
 )
 from .runtime.nulls import (
@@ -334,7 +332,6 @@ from .testing import SCALE_PRESETS, SyntheticDataset, SyntheticSpec
 
 __all__ = [
     "AdaptivePlan",
-    "AdaptiveRuntime",
     "AtomicEdgeDeviceState",
     "AtomicEdgeTable",
     "BufferSharingMode",
@@ -501,7 +498,6 @@ __all__ = [
     "decode_owned_geoarrow",
     "decode_wkb_owned",
     "default_crossover_policy",
-    "default_fusible_sequences",
     "from_geoarrow",
     "from_shapely_geometries",
     "from_wkb",

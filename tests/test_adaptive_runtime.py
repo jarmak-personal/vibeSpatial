@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from vibespatial import (
     DEFAULT_CONSUMER_PROFILE,
-    AdaptiveRuntime,
     CoordinateStats,
     DeviceSnapshot,
     DispatchDecision,
@@ -17,7 +16,6 @@ from vibespatial import (
     plan_adaptive_execution,
 )
 from vibespatial.runtime.adaptive import (
-    ChunkedPlanIterator,
     _detect_device_profile,
     get_cached_snapshot,
     invalidate_snapshot_cache,
@@ -106,19 +104,17 @@ def test_planner_picks_specialized_point_variant_then_replans_for_polygons() -> 
         max_rows=None,
         tags=("general",),
     )
-    runtime = AdaptiveRuntime(
-        device_snapshot=DeviceSnapshot(
-            backend=MonitoringBackend.NVML,
-            gpu_available=True,
-            device_profile=DEFAULT_CONSUMER_PROFILE,
-            sm_utilization_pct=30.0,
-            memory_utilization_pct=40.0,
-            device_name="fake-gpu",
-            reason="test snapshot",
-        )
+    snapshot = DeviceSnapshot(
+        backend=MonitoringBackend.NVML,
+        gpu_available=True,
+        device_profile=DEFAULT_CONSUMER_PROFILE,
+        sm_utilization_pct=30.0,
+        memory_utilization_pct=40.0,
+        device_name="fake-gpu",
+        reason="test snapshot",
     )
 
-    first_plan = runtime.plan(
+    first_plan = plan_adaptive_execution(
         kernel_name="streaming_predicate",
         kernel_class=KernelClass.PREDICATE,
         workload=WorkloadProfile(
@@ -129,9 +125,10 @@ def test_planner_picks_specialized_point_variant_then_replans_for_polygons() -> 
             chunk_index=0,
             coordinate_stats=CoordinateStats(max_abs_coord=10_000.0, span=100.0),
         ),
+        device_snapshot=snapshot,
         variants=(point_variant, general_variant),
     )
-    second_plan = runtime.plan(
+    second_plan = plan_adaptive_execution(
         kernel_name="streaming_predicate",
         kernel_class=KernelClass.PREDICATE,
         workload=WorkloadProfile(
@@ -142,6 +139,7 @@ def test_planner_picks_specialized_point_variant_then_replans_for_polygons() -> 
             chunk_index=1,
             coordinate_stats=CoordinateStats(max_abs_coord=10_000.0, span=100.0),
         ),
+        device_snapshot=snapshot,
         variants=(point_variant, general_variant),
     )
 
@@ -244,32 +242,6 @@ def test_detect_device_profile_returns_device_precision_profile() -> None:
     assert profile.fp64_to_fp32_ratio > 0.0
     assert profile.fp64_to_fp32_ratio <= 1.0
 
-
-def test_chunked_plan_iterator_covers_all_rows() -> None:
-    invalidate_snapshot_cache()
-    total = 250_000
-    iterator = ChunkedPlanIterator(
-        kernel_name="test_chunked",
-        kernel_class=KernelClass.COARSE,
-        total_rows=total,
-    )
-    covered = 0
-    chunks = list(iterator)
-    for plan, row_range in chunks:
-        assert len(row_range) > 0
-        covered += len(row_range)
-    assert covered == total
-    assert len(chunks) >= 1
-
-
-def test_chunked_plan_iterator_empty_workload() -> None:
-    invalidate_snapshot_cache()
-    iterator = ChunkedPlanIterator(
-        kernel_name="test_empty",
-        kernel_class=KernelClass.COARSE,
-        total_rows=0,
-    )
-    assert list(iterator) == []
 
 
 # ---------------------------------------------------------------------------

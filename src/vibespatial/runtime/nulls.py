@@ -14,19 +14,6 @@ class GeometryPresence(StrEnum):
     VALUE = "value"
 
 
-class UnaryNullPolicy(StrEnum):
-    PROPAGATE = "propagate"
-
-
-class EmptyMeasurementPolicy(StrEnum):
-    ZERO = "zero"
-    NAN_BOUNDS = "nan-bounds"
-
-
-class PredicateNullPolicy(StrEnum):
-    PROPAGATE = "propagate"
-
-
 @dataclass(frozen=True)
 class GeometrySemantics:
     presence: GeometryPresence

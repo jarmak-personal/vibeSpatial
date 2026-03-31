@@ -85,31 +85,6 @@ class AdaptivePlan:
     diagnostics: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class AdaptiveRuntime:
-    device_snapshot: DeviceSnapshot | None = None
-
-    def plan(
-        self,
-        *,
-        kernel_name: str,
-        kernel_class: KernelClass | str,
-        workload: WorkloadProfile,
-        requested_mode: ExecutionMode | str = ExecutionMode.AUTO,
-        requested_precision: PrecisionMode | str = PrecisionMode.AUTO,
-        variants: tuple[KernelVariantSpec, ...] | None = None,
-    ) -> AdaptivePlan:
-        return plan_adaptive_execution(
-            kernel_name=kernel_name,
-            kernel_class=kernel_class,
-            workload=workload,
-            requested_mode=requested_mode,
-            requested_precision=requested_precision,
-            device_snapshot=self.device_snapshot,
-            variants=variants,
-        )
-
-
 def capture_device_snapshot(
     *,
     probe: MonitoringProbe | None = None,
@@ -497,62 +472,6 @@ def plan_dispatch_selection(
         gpu_available=gpu_available,
         workload_shape=workload_shape,
     ).runtime_selection
-
-
-# ---------------------------------------------------------------------------
-# Phase 5: Chunked plan iterator (ADR-0007 streaming interface, design only)
-# ---------------------------------------------------------------------------
-
-class ChunkedPlanIterator:
-    """Yield AdaptivePlans for successive chunks of a streaming workload.
-
-    This is a design-only interface for future streaming integration where
-    io_arrow.py chunk sizing should be informed by AdaptivePlan.chunk_rows.
-    No production code calls this yet.
-    """
-
-    def __init__(
-        self,
-        *,
-        kernel_name: str,
-        kernel_class: KernelClass | str,
-        total_rows: int,
-        requested_mode: ExecutionMode | str = ExecutionMode.AUTO,
-        requested_precision: PrecisionMode | str = PrecisionMode.AUTO,
-    ) -> None:
-        self.kernel_name = kernel_name
-        self.kernel_class = kernel_class
-        self.total_rows = total_rows
-        self.requested_mode = requested_mode
-        self.requested_precision = requested_precision
-        self._chunk_index: int = 0
-        self._offset: int = 0
-
-    def __iter__(self) -> ChunkedPlanIterator:
-        return self
-
-    def __next__(self) -> tuple[AdaptivePlan, range]:
-        if self._offset >= self.total_rows:
-            raise StopIteration
-        remaining = self.total_rows - self._offset
-        plan = plan_kernel_dispatch(
-            kernel_name=self.kernel_name,
-            kernel_class=self.kernel_class,
-            row_count=remaining,
-            requested_mode=self.requested_mode,
-            requested_precision=self.requested_precision,
-            is_streaming=True,
-            chunk_index=self._chunk_index,
-        )
-        chunk_size = min(plan.chunk_rows, remaining)
-        if chunk_size <= 0:
-            raise StopIteration
-        row_range = range(self._offset, self._offset + chunk_size)
-        self._offset += chunk_size
-        self._chunk_index += 1
-        if plan.replan_after_chunk:
-            invalidate_snapshot_cache()
-        return plan, row_range
 
 
 # ---------------------------------------------------------------------------
