@@ -17,10 +17,6 @@ from vibespatial.api.tools import clip
 
 import vibespatial.api.datasets
 
-# Backwards-compatible submodule aliases (e.g. geopandas.array -> geometry_array).
-from vibespatial.api import geometry_array as array  # noqa: F401
-from vibespatial.api import geo_base as base  # noqa: F401
-
 import pandas as pd
 import numpy as np
 

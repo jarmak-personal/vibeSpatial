@@ -15,8 +15,6 @@ import pandas as pd
 import shapely
 import shapely.affinity
 import shapely.geometry
-import shapely.ops
-import shapely.wkt
 from pandas.api.extensions import (
     ExtensionArray,
     ExtensionDtype,

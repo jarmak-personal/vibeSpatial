@@ -370,19 +370,6 @@ class DeviceSegmentIntersectionCandidates:
 # NVRTC compilation and warmup
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# NVRTC compilation and warmup
-# ---------------------------------------------------------------------------
-
-# Backward-compat aliases for internal callers
-_format_extract_source = format_extract_source
-_format_classify_source = format_classify_source
-_EXTRACT_SOURCE_FP64 = EXTRACT_SOURCE_FP64
-_EXTRACT_SOURCE_FP32 = EXTRACT_SOURCE_FP32
-_CLASSIFY_SOURCE_FP64 = CLASSIFY_SOURCE_FP64
-_CLASSIFY_SOURCE_FP32 = CLASSIFY_SOURCE_FP32
-
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
 request_nvrtc_warmup([

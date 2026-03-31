@@ -7,7 +7,6 @@ like holding the options and giving a nice repr.
 """
 
 import textwrap
-import warnings
 from collections import namedtuple
 
 Option = namedtuple("Option", "key default_value doc validator callback")
@@ -85,14 +84,6 @@ display_precision = Option(
     validator=_validate_display_precision,
     callback=None,
 )
-
-
-def _warn_use_pygeos_deprecated(_value) -> None:
-    warnings.warn(
-        "pygeos support was removed in 1.0. "
-        "geopandas.use_pygeos is a no-op and will be removed in geopandas 1.1.",
-        stacklevel=3,
-    )
 
 
 def _validate_io_engine(value: str) -> None:

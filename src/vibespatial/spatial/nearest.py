@@ -617,63 +617,6 @@ def _nearest_refine_gpu_typed(
         runtime.free(d_distances)
 
 
-# Backward-compatible wrappers for the two old functions.
-
-def _nearest_refine_gpu_point_distance(
-    query_owned: OwnedGeometryArray,
-    tree_owned: OwnedGeometryArray,
-    left_idx: np.ndarray,
-    right_idx: np.ndarray,
-    n_queries: int,
-    *,
-    max_distance: float,
-    return_all: bool = True,
-    exclusive: bool = False,
-    return_distance: bool = False,
-    tree_family: GeometryFamily,
-) -> tuple[np.ndarray, np.ndarray | None] | None:
-    """GPU nearest refinement for point queries against non-point trees.
-
-    Uses point-to-segment/polygon distance kernels from ``point_distance``.
-    Returns ``(indices_2xN, distances_or_None)`` on success, or ``None``.
-    """
-    strategy = PointFamilyDistanceStrategy(tree_family)
-    return _nearest_refine_gpu_typed(
-        query_owned, tree_owned, left_idx, right_idx, n_queries,
-        strategy,
-        max_distance=max_distance, return_all=return_all,
-        exclusive=exclusive, return_distance=return_distance,
-    )
-
-
-def _nearest_refine_gpu_segment_distance(
-    query_owned: OwnedGeometryArray,
-    tree_owned: OwnedGeometryArray,
-    left_idx: np.ndarray,
-    right_idx: np.ndarray,
-    n_queries: int,
-    *,
-    max_distance: float,
-    return_all: bool = True,
-    exclusive: bool = False,
-    return_distance: bool = False,
-    query_family: GeometryFamily,
-    tree_family: GeometryFamily,
-) -> tuple[np.ndarray, np.ndarray | None] | None:
-    """GPU nearest refinement for non-point geometry pairs.
-
-    Uses segment-to-segment distance kernels from ``segment_distance``.
-    Returns ``(indices_2xN, distances_or_None)`` on success, or ``None``.
-    """
-    strategy = SegmentFamilyDistanceStrategy(query_family, tree_family)
-    return _nearest_refine_gpu_typed(
-        query_owned, tree_owned, left_idx, right_idx, n_queries,
-        strategy,
-        max_distance=max_distance, return_all=return_all,
-        exclusive=exclusive, return_distance=return_distance,
-    )
-
-
 # ---------------------------------------------------------------------------
 # GPU candidate generation
 # ---------------------------------------------------------------------------

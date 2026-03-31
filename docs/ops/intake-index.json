@@ -17404,7 +17404,6 @@
       "symbols": [
         "Options",
         "_validate_display_precision",
-        "_warn_use_pygeos_deprecated",
         "_validate_io_engine"
       ],
       "tokens": [
@@ -17436,15 +17435,13 @@
         "options",
         "precision",
         "py",
-        "pygeos",
         "repr",
         "simplified",
         "src",
         "style",
         "topper",
         "validate",
-        "vibespatial",
-        "warn"
+        "vibespatial"
       ]
     },
     {
@@ -31321,15 +31318,15 @@
         "PointFamilyDistanceStrategy",
         "SegmentFamilyDistanceStrategy",
         "_nearest_refine_gpu_typed",
-        "_nearest_refine_gpu_point_distance",
-        "_nearest_refine_gpu_segment_distance",
         "_generate_point_nearest_candidates_regular_grid_gpu",
         "_extract_point_coords_for_nearest",
         "_nearest_grid_gpu",
         "_nearest_indexed_point_gpu",
         "_generate_point_nearest_candidates_gpu",
         "_compute_pair_distances_gpu",
-        "_compute_multipoint_distances_gpu"
+        "_compute_multipoint_distances_gpu",
+        "_compute_mixed_distances_gpu",
+        "_dwithin_refine_gpu"
       ],
       "tokens": [
         "candidates",
@@ -31341,6 +31338,7 @@
         "distance",
         "distances",
         "distancestrategy",
+        "dwithin",
         "empty",
         "extract",
         "families",
@@ -31353,6 +31351,7 @@
         "kernel",
         "launch",
         "make",
+        "mixed",
         "multipoint",
         "nearest",
         "only",
@@ -31366,7 +31365,6 @@
         "refine",
         "regular",
         "result",
-        "segment",
         "segmentfamilydistancestrategy",
         "single",
         "spatial",

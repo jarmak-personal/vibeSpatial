@@ -11,7 +11,6 @@ import shapely
 
 PANDAS_GE_23 = Version(pd.__version__) >= Version("2.3.0")
 PANDAS_GE_30 = Version(pd.__version__) >= Version("3.0.0")
-PANDAS_GE_31 = Version(pd.__version__) >= Version("3.1.0.dev0")
 PANDAS_INFER_STR = PANDAS_GE_23 and pd.options.future.infer_string
 
 
@@ -19,7 +18,6 @@ PANDAS_INFER_STR = PANDAS_GE_23 and pd.options.future.infer_string
 # Shapely / GEOS compat
 # -----------------------------------------------------------------------------
 
-GEOS_GE_390 = shapely.geos_version >= (3, 9, 0)
 GEOS_GE_310 = shapely.geos_version >= (3, 10, 0)
 GEOS_GE_312 = shapely.geos_version >= (3, 12, 0)
 
