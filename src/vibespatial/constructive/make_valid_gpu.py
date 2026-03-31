@@ -56,8 +56,10 @@ from vibespatial.geometry.owned import (  # noqa: E402
     FamilyGeometryBuffer,
     OwnedGeometryArray,
 )
-from vibespatial.overlay.gpu import (  # noqa: E402
+from vibespatial.overlay.assemble import (  # noqa: E402
     _build_polygon_output_from_faces_gpu,
+)
+from vibespatial.overlay.gpu import (  # noqa: E402
     _gpu_face_walk,
     build_gpu_half_edge_graph,
 )

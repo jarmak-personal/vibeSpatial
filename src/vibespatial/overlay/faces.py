@@ -213,7 +213,7 @@ def _assemble_faces_from_device_indices(
     faster for most cases.  GPU assembly handles the "spans multiple
     source rows" edge case (ADR-0016 Stage 8).
     """
-    from vibespatial.overlay.gpu import (
+    from vibespatial.overlay.assemble import (
         _build_polygon_output_from_faces_gpu,
         _empty_polygon_output,
     )
