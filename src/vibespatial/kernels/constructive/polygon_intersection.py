@@ -47,7 +47,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.kernels.constructive.polygon_intersection_source import (
     _KERNEL_NAMES,
-    _MAX_CLIP_VERTS,
+    _MAX_CLIP_VERTS,  # noqa: F401 — re-exported for overlay/gpu.py and binary_constructive.py
     _POLYGON_INTERSECTION_KERNEL_SOURCE,
 )
 from vibespatial.runtime import ExecutionMode
