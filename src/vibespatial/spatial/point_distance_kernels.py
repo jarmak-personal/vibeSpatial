@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-_POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = """
-typedef {compute_type} compute_t;
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE
+
+_POINT_DISTANCE_KERNEL_SOURCE_TEMPLATE = PRECISION_PREAMBLE + """
 
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
-
-// Centered coordinate read: subtract center in fp64, then cast to compute_t.
-// When compute_t is double, this is a no-op identity.  When compute_t is float,
-// the fp64 subtraction removes large-magnitude bias before the fp32 cast,
-// preserving relative precision for the local arithmetic.
-#define CX(val) ((compute_t)((val) - center_x))
-#define CY(val) ((compute_t)((val) - center_y))
 
 // ---------------------------------------------------------------------------
 // Tier 1 NVRTC: point-to-segment squared distance (device helper)
