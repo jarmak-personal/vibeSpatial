@@ -51,6 +51,8 @@ _SHAPELY_ALLOWLIST: dict[str, str] = {
     # overlay/ — tracked fallback paths (shrink over time)
     "overlay/dissolve.py": "GeometryCollection sentinel + fallback aggregation",
     "overlay/gpu.py": "Fallback host path for unsupported overlay cases",
+    "overlay/bypass.py": "Empty-geometry sentinel for containment bypass empty result",
+    "overlay/host_fallback.py": "Host fallback path for overlay face-to-polygon assembly",
     # spatial/ — vectorized shapely C ops + fallback paths
     "spatial/query_utils.py": "Vectorized shapely.get_type_id/get_coordinates (C-accelerated)",
     "spatial/query_box.py": "BaseGeometry type check for input validation",
@@ -85,7 +87,7 @@ _NUMPY_ALLOWLIST: dict[str, str] = {
 # Decrease as debt is paid.  Fails only if current count EXCEEDS baseline.
 # These are shapely/numpy imports in GPU-path code that predate the guard.
 # Every file here is tracked debt — the baseline MUST only go down.
-_SHAPELY_VIOLATION_BASELINE = 35
+_SHAPELY_VIOLATION_BASELINE = 34
 _NUMPY_VIOLATION_BASELINE = 17
 
 

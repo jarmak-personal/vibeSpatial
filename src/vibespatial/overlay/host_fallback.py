@@ -339,11 +339,11 @@ def _build_polygon_output_from_faces(
     selected_face_indices: np.ndarray,
 ) -> OwnedGeometryArray:
     # Lazy imports to avoid circular dependency with gpu.py
-    from vibespatial.overlay.gpu import (
+    from vibespatial.overlay.bypass import (
         _BATCH_PIP_GPU_THRESHOLD,
         _batch_point_in_ring_gpu,
-        _empty_polygon_output,
     )
+    from vibespatial.overlay.gpu import _empty_polygon_output
 
     if selected_face_indices.size == 0:
         return _empty_polygon_output(faces.runtime_selection)

@@ -473,7 +473,7 @@ def _many_vs_one_intersection_owned(
 
     if _cp_local is not None:
         try:
-            from vibespatial.overlay.gpu import _containment_bypass_gpu
+            from vibespatial.overlay.bypass import _containment_bypass_gpu
 
             _contained_result, _remainder_mask = _containment_bypass_gpu(
                 left_sub, right_one, "intersection",
@@ -547,7 +547,7 @@ def _many_vs_one_intersection_owned(
 
     if _cp_local is not None and left_remainder.row_count > 0:
         try:
-            from vibespatial.overlay.gpu import (
+            from vibespatial.overlay.bypass import (
                 _batched_sh_clip,
                 _classify_remainder_sh_eligible,
                 _is_clip_polygon_sh_eligible,
