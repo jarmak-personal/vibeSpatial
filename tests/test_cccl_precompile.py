@@ -57,18 +57,18 @@ class TestPrecompileEnabled:
 # ---------------------------------------------------------------------------
 
 class TestSpecRegistry:
-    def test_registry_has_21_specs(self):
-        assert len(SPEC_REGISTRY) == 21
+    def test_registry_has_23_specs(self):
+        assert len(SPEC_REGISTRY) == 23
 
     def test_all_expected_specs_present(self):
         expected = {
             "exclusive_scan_i32", "exclusive_scan_i64",
             "select_i32", "select_i64",
             "reduce_sum_f64", "reduce_sum_i32",
-            "segmented_reduce_sum_f64",
+            "segmented_reduce_sum_f64", "segmented_reduce_sum_i32",
             "segmented_reduce_min_f64",
             "segmented_reduce_max_f64",
-            "lower_bound_i32", "lower_bound_u64",
+            "lower_bound_i32", "lower_bound_i64", "lower_bound_u64",
             "upper_bound_i32", "upper_bound_u64",
             "radix_sort_i32_i32", "radix_sort_i64_i32", "radix_sort_u64_i32",
             "merge_sort_u64_i32",

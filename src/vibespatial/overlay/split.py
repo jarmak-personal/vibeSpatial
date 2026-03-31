@@ -545,7 +545,7 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
     ).astype(cp.uint8, copy=False)
     adjacency_counts = adjacency_mask.astype(cp.int32, copy=False)
     adjacency_offsets = exclusive_sum(adjacency_counts)
-    pair_count = int(cp.asnumpy(adjacency_offsets[-1] + adjacency_counts[-1])) if int(adjacency_counts.size) else 0  # hygiene:ok — zcopy:ok(allocation-fence: need pair_count to size 6 atomic-edge output buffers)
+    pair_count = int(cp.asnumpy(adjacency_offsets[-1] + adjacency_counts[-1])) if int(adjacency_counts.size) else 0  # zcopy:ok(allocation-fence: need pair_count to size 6 atomic-edge output buffers) hygiene:ok
 
     out_source_ids = runtime.allocate((pair_count * 2,), np.int32)
     out_direction = runtime.allocate((pair_count * 2,), np.int8)
@@ -598,7 +598,7 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
         # Derive source_side and row / part / ring indices on GPU via
         # searchsorted against split_events device metadata, avoiding
         # host round-trip.
-        d_out_ids = cp.asarray(out_source_ids)
+        d_out_ids = cp.asarray(out_source_ids)  # zcopy:ok(already device-resident — cp.asarray is a no-op)
         left_count = split_events.left_segment_count
         d_source_side = cp.where(d_out_ids < left_count, cp.int8(1), cp.int8(2))
 

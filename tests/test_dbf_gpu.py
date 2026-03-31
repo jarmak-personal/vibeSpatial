@@ -675,6 +675,7 @@ class TestDbfEdgeCases:
         assert result.n_records == 5
         assert len(result.columns) == n_cols
 
+    @needs_gpu
     def test_file_too_small_raises(self):
         """File smaller than 32 bytes should raise ValueError."""
         from vibespatial.io.dbf_gpu import read_dbf_gpu

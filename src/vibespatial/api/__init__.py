@@ -1,26 +1,21 @@
-from vibespatial.api._config import options
-
-from vibespatial.api.geoseries import GeoSeries
-from vibespatial.api.geodataframe import GeoDataFrame
-from vibespatial.api.geometry_array import points_from_xy
-
-from vibespatial.io.file import read_vector_file as read_file
-from vibespatial.api.io.file import _list_layers as list_layers
-from vibespatial.io.arrow import read_geoparquet as read_parquet
-from vibespatial.api.io.arrow import _read_feather as read_feather
-from vibespatial.api.io.sql import _read_postgis as read_postgis
-from vibespatial.api.tools import sjoin, sjoin_nearest
-from vibespatial.api.tools import overlay
-from vibespatial.api.tools._show_versions import show_versions
-from vibespatial.api.tools import clip
-
+import numpy as np
+import pandas as pd
 
 import vibespatial.api.datasets
-
-import pandas as pd
-import numpy as np
-
+from vibespatial.api import geo_base as base  # GeoPandas compat: geopandas.base
+from vibespatial.api import geometry_array as array  # GeoPandas compat: geopandas.array
+from vibespatial.api._config import options
 from vibespatial.api._version import __version__
+from vibespatial.api.geodataframe import GeoDataFrame
+from vibespatial.api.geometry_array import points_from_xy
+from vibespatial.api.geoseries import GeoSeries
+from vibespatial.api.io.arrow import _read_feather as read_feather
+from vibespatial.api.io.file import _list_layers as list_layers
+from vibespatial.api.io.sql import _read_postgis as read_postgis
+from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
+from vibespatial.api.tools._show_versions import show_versions
+from vibespatial.io.arrow import read_geoparquet as read_parquet
+from vibespatial.io.file import read_vector_file as read_file
 
 # Re-export vibespatial runtime/dispatch APIs so that code using
 # ``import vibespatial.api as geopandas`` can call

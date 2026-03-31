@@ -151,7 +151,7 @@ def test_default_broadcast_thresholds_are_defined_by_kernel_class() -> None:
         KernelClass.COARSE: 256,
         KernelClass.METRIC: 500,
         KernelClass.PREDICATE: 1_000,
-        KernelClass.CONSTRUCTIVE: 10_000,
+        KernelClass.CONSTRUCTIVE: 500,
     }
 
 
@@ -167,7 +167,7 @@ def test_default_crossover_policy_populates_broadcast_min_rows() -> None:
     assert policy.broadcast_min_rows == 1_000
 
     policy = default_crossover_policy("polygon_union", KernelClass.CONSTRUCTIVE)
-    assert policy.broadcast_min_rows == 10_000
+    assert policy.broadcast_min_rows == 500
 
 
 def test_kernel_override_still_gets_broadcast_threshold() -> None:
