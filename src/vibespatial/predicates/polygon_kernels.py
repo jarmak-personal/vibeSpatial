@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_KIND_DEVICE
 from vibespatial.cuda.device_functions.point_on_segment import (
     POINT_ON_SEGMENT_KIND_DEVICE,
 )
+from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
 
 _POLYGON_PREDICATES_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + """
+    ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE
+    + POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -29,23 +32,6 @@ _POLYGON_PREDICATES_KERNEL_SOURCE = (
 // ===================================================================
 // Device helpers
 // ===================================================================
-
-// Proper crossing test: returns true if segments P1→P2 and Q1→Q2
-// cross at a point that is interior to both segments.
-extern "C" __device__ inline bool segments_properly_cross(
-    double p1x, double p1y, double p2x, double p2y,
-    double q1x, double q1y, double q2x, double q2y
-) {
-  const double d1 = (q2x - q1x) * (p1y - q1y) - (q2y - q1y) * (p1x - q1x);
-  const double d2 = (q2x - q1x) * (p2y - q1y) - (q2y - q1y) * (p2x - q1x);
-  const double d3 = (p2x - p1x) * (q1y - p1y) - (p2y - p1y) * (q1x - p1x);
-  const double d4 = (p2x - p1x) * (q2y - p1y) - (p2y - p1y) * (q2x - p1x);
-  if (((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0)) &&
-      ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))) {
-    return true;
-  }
-  return false;
-}
 
 // Even-odd point-in-rings classification.
 // Returns 0 = outside, 1 = on boundary, 2 = interior.
@@ -106,7 +92,7 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
           for (int br = brs; br < bre; ++br) {
             const int bcs = b_ring_offsets[br], bce = b_ring_offsets[br + 1];
             for (int bi = bcs + 1; bi < bce; ++bi) {
-              if (segments_properly_cross(
+              if (vs_segments_properly_cross(
                       p1x, p1y, p2x, p2y,
                       bx[bi - 1], by[bi - 1], bx[bi], by[bi])) {
                 mask |= DE9IM_II | DE9IM_IB | DE9IM_BI | DE9IM_BB;
@@ -425,7 +411,7 @@ extern "C" __device__ inline unsigned short de9im_line_polygon(
         for (int br = brs; br < bre; ++br) {
           const int bcs = b_ring_offsets[br], bce = b_ring_offsets[br + 1];
           for (int bi = bcs + 1; bi < bce; ++bi) {
-            if (segments_properly_cross(l1x, l1y, l2x, l2y,
+            if (vs_segments_properly_cross(l1x, l1y, l2x, l2y,
                     bx[bi - 1], by[bi - 1], bx[bi], by[bi])) {
               mask |= DE9IM_II | DE9IM_IB;
               goto lp_crossing_done;
@@ -494,7 +480,7 @@ extern "C" __device__ inline unsigned short de9im_line_line(
       for (int bp = 0; bp < n_b_parts; ++bp) {
         const int bcs = b_part_starts[bp], bce = b_part_ends[bp];
         for (int bi = bcs + 1; bi < bce; ++bi) {
-          if (segments_properly_cross(p1x, p1y, p2x, p2y,
+          if (vs_segments_properly_cross(p1x, p1y, p2x, p2y,
                   bx[bi - 1], by[bi - 1], bx[bi], by[bi])) {
             mask |= DE9IM_II;
             goto ll_crossing_done;

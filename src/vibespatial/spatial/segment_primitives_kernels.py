@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
+from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS
 
@@ -238,20 +239,7 @@ __device__ inline compute_t abs_ct(compute_t value) {{{{
 }}}}
 
 /* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
-
-/* Check if point (px,py) is on segment (ax,ay)-(bx,by), assuming collinear.
-   Uses exact double comparisons (valid for fp64). */
-__device__ int point_on_segment_collinear(
-    double px, double py,
-    double ax, double ay,
-    double bx, double by
-) {{{{
-    double minx = ax < bx ? ax : bx;
-    double maxx = ax > bx ? ax : bx;
-    double miny = ay < by ? ay : by;
-    double maxy = ay > by ? ay : by;
-    return (px >= minx && px <= maxx && py >= miny && py <= maxy) ? 1 : 0;
-}}}}
+/* collinear containment provided by SEGMENT_CROSSING_DEVICE (vs_point_on_segment_collinear) */
 
 /* Classification codes */
 #define CLASS_DISJOINT 0
@@ -429,7 +417,7 @@ classify_segment_pairs_v2(
         return;
     }}}}
     if (a_is_point) {{{{
-        if (s3 == 0 && point_on_segment_collinear(ax, ay, cx, cy, dx, dy)) {{{{
+        if (s3 == 0 && vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy)) {{{{
             out_kind[row] = CLASS_TOUCH;
             out_point_x[row] = ax;
             out_point_y[row] = ay;
@@ -437,7 +425,7 @@ classify_segment_pairs_v2(
         return;
     }}}}
     if (c_is_point) {{{{
-        if (s1 == 0 && point_on_segment_collinear(cx, cy, ax, ay, bx, by)) {{{{
+        if (s1 == 0 && vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by)) {{{{
             out_kind[row] = CLASS_TOUCH;
             out_point_x[row] = cx;
             out_point_y[row] = cy;
@@ -461,10 +449,10 @@ classify_segment_pairs_v2(
     /* Collinear: all four orientations zero */
     if (s1 == 0 && s2 == 0 && s3 == 0 && s4 == 0) {{{{
         /* Find shared interval along the collinear segments */
-        int a_on_cd = point_on_segment_collinear(ax, ay, cx, cy, dx, dy);
-        int b_on_cd = point_on_segment_collinear(bx, by, cx, cy, dx, dy);
-        int c_on_ab = point_on_segment_collinear(cx, cy, ax, ay, bx, by);
-        int d_on_ab = point_on_segment_collinear(dx, dy, ax, ay, bx, by);
+        int a_on_cd = vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy);
+        int b_on_cd = vs_point_on_segment_collinear(bx, by, cx, cy, dx, dy);
+        int c_on_ab = vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by);
+        int d_on_ab = vs_point_on_segment_collinear(dx, dy, ax, ay, bx, by);
 
         /* Collect shared endpoints */
         double pts_x[4];
@@ -519,25 +507,25 @@ classify_segment_pairs_v2(
     }}}}
 
     /* Touch cases: one endpoint lies on the other segment */
-    if (s1 == 0 && point_on_segment_collinear(cx, cy, ax, ay, bx, by)) {{{{
+    if (s1 == 0 && vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by)) {{{{
         out_kind[row] = CLASS_TOUCH;
         out_point_x[row] = cx;
         out_point_y[row] = cy;
         return;
     }}}}
-    if (s2 == 0 && point_on_segment_collinear(dx, dy, ax, ay, bx, by)) {{{{
+    if (s2 == 0 && vs_point_on_segment_collinear(dx, dy, ax, ay, bx, by)) {{{{
         out_kind[row] = CLASS_TOUCH;
         out_point_x[row] = dx;
         out_point_y[row] = dy;
         return;
     }}}}
-    if (s3 == 0 && point_on_segment_collinear(ax, ay, cx, cy, dx, dy)) {{{{
+    if (s3 == 0 && vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy)) {{{{
         out_kind[row] = CLASS_TOUCH;
         out_point_x[row] = ax;
         out_point_y[row] = ay;
         return;
     }}}}
-    if (s4 == 0 && point_on_segment_collinear(bx, by, cx, cy, dx, dy)) {{{{
+    if (s4 == 0 && vs_point_on_segment_collinear(bx, by, cx, cy, dx, dy)) {{{{
         out_kind[row] = CLASS_TOUCH;
         out_point_x[row] = bx;
         out_point_y[row] = by;
@@ -639,7 +627,7 @@ def format_classify_source(compute_type: str = "double") -> str:
         compute_type=compute_type,
         errbound_val=f"{errbound:.20e}",
     )
-    return ORIENT2D_DEVICE + formatted
+    return ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE + formatted
 
 
 # Pre-formatted kernel sources for warmup

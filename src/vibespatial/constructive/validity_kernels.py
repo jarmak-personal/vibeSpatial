@@ -5,6 +5,7 @@ from __future__ import annotations
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_BOUNDARY_DEVICE
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
@@ -242,22 +243,9 @@ _HOLES_IN_SHELL_FP64 = (
 # orientation predicates (via cuda.device_functions.orient2d).
 # ---------------------------------------------------------------------------
 
-_RING_PAIR_INTERACTION_KERNEL_SOURCE = PRECISION_PREAMBLE + ORIENT2D_DEVICE + r"""
+_RING_PAIR_INTERACTION_KERNEL_SOURCE = PRECISION_PREAMBLE + ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE + r"""
 /* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
-
-/* Check if point (px,py) is on segment (ax,ay)-(bx,by), assuming collinear.
-   Uses exact double comparisons (valid for fp64). */
-__device__ int point_on_seg_collinear_rpi(
-    double px, double py,
-    double ax, double ay,
-    double bx, double by
-) {{
-    double minx = ax < bx ? ax : bx;
-    double maxx = ax > bx ? ax : bx;
-    double miny = ay < by ? ay : by;
-    double maxy = ay > by ? ay : by;
-    return (px >= minx && px <= maxx && py >= miny && py <= maxy) ? 1 : 0;
-}}
+/* collinear containment provided by SEGMENT_CROSSING_DEVICE (vs_point_on_segment_collinear) */
 
 /* Record a touch point in shared memory, returning 1 if recorded. */
 __device__ int record_touch(
@@ -383,10 +371,10 @@ ring_pair_interaction(
 
                 /* Case 2: Collinear -- all four orientations zero */
                 if (o1 == 0 && o2 == 0 && o3 == 0 && o4 == 0) {{
-                    int a_on_cd = point_on_seg_collinear_rpi(ax, ay, cx, cy, dx, dy);
-                    int b_on_cd = point_on_seg_collinear_rpi(bx, by, cx, cy, dx, dy);
-                    int c_on_ab = point_on_seg_collinear_rpi(cx, cy, ax, ay, bx, by);
-                    int d_on_ab = point_on_seg_collinear_rpi(dx, dy, ax, ay, bx, by);
+                    int a_on_cd = vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy);
+                    int b_on_cd = vs_point_on_segment_collinear(bx, by, cx, cy, dx, dy);
+                    int c_on_ab = vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by);
+                    int d_on_ab = vs_point_on_segment_collinear(dx, dy, ax, ay, bx, by);
 
                     int containments = a_on_cd + b_on_cd + c_on_ab + d_on_ab;
                     if (containments >= 3) {{
@@ -430,22 +418,22 @@ ring_pair_interaction(
                 }}
 
                 /* Case 3: T-intersection -- one endpoint on the other segment */
-                if (o1 == 0 && point_on_seg_collinear_rpi(cx, cy, ax, ay, bx, by)) {{
+                if (o1 == 0 && vs_point_on_segment_collinear(cx, cy, ax, ay, bx, by)) {{
                     record_touch(cx, cy, ri, rj,
                                  &touch_count, touch_x, touch_y,
                                  touch_ring_i, touch_ring_j);
                 }}
-                else if (o2 == 0 && point_on_seg_collinear_rpi(dx, dy, ax, ay, bx, by)) {{
+                else if (o2 == 0 && vs_point_on_segment_collinear(dx, dy, ax, ay, bx, by)) {{
                     record_touch(dx, dy, ri, rj,
                                  &touch_count, touch_x, touch_y,
                                  touch_ring_i, touch_ring_j);
                 }}
-                else if (o3 == 0 && point_on_seg_collinear_rpi(ax, ay, cx, cy, dx, dy)) {{
+                else if (o3 == 0 && vs_point_on_segment_collinear(ax, ay, cx, cy, dx, dy)) {{
                     record_touch(ax, ay, ri, rj,
                                  &touch_count, touch_x, touch_y,
                                  touch_ring_i, touch_ring_j);
                 }}
-                else if (o4 == 0 && point_on_seg_collinear_rpi(bx, by, cx, cy, dx, dy)) {{
+                else if (o4 == 0 && vs_point_on_segment_collinear(bx, by, cx, cy, dx, dy)) {{
                     record_touch(bx, by, ri, rj,
                                  &touch_count, touch_x, touch_y,
                                  touch_ring_i, touch_ring_j);

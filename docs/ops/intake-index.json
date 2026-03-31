@@ -23801,6 +23801,27 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/cuda/device_functions/segment_crossing.py",
+      "referenced_by": [],
+      "symbols": [
+        "SEGMENT_CROSSING_DEVICE"
+      ],
+      "tokens": [
+        "collinear",
+        "containment",
+        "crossing",
+        "cuda",
+        "device",
+        "functions",
+        "py",
+        "segment",
+        "shared",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/cuda/device_functions/signed_area.py",
       "referenced_by": [],
       "symbols": [
