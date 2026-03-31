@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
+from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_BOUNDARY_DEVICE
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
@@ -170,7 +171,9 @@ _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
 # PREDICATE class, fp64 only — no centering needed for validity checks.
 # ---------------------------------------------------------------------------
 
-_HOLES_IN_SHELL_KERNEL_SOURCE = PRECISION_PREAMBLE + POINT_ON_SEGMENT_DEVICE + r"""
+# The device function strings use raw braces and must NOT pass through
+# .format().  They are concatenated in the _HOLES_IN_SHELL_FP64 constant.
+_HOLES_IN_SHELL_KERNEL_TEMPLATE = PRECISION_PREAMBLE + r"""
 #define VALIDITY_BOUNDARY_TOLERANCE 1e-12
 
 extern "C" __device__ inline bool ring_contains_point_validity(
@@ -188,26 +191,10 @@ extern "C" __device__ inline bool ring_contains_point_validity(
         return false;
     }}
 
-    bool inside = false;
-    for (int coord = coord_start + 1; coord < coord_end; ++coord) {{
-        const double ax = x[coord - 1];
-        const double ay = y[coord - 1];
-        const double bx = x[coord];
-        const double by = y[coord];
-
-        /* Boundary test: point on edge counts as inside (OGC validity) */
-        if (vs_point_on_segment(px, py, ax, ay, bx, by, VALIDITY_BOUNDARY_TOLERANCE)) {{
-            return true;
-        }}
-
-        /* Even-odd crossing test */
-        const bool intersects = ((ay > py) != (by > py)) &&
-            (px < (((bx - ax) * (py - ay)) / (by - ay)) + ax);
-        if (intersects) {{
-            inside = !inside;
-        }}
-    }}
-    return inside;
+    bool on_boundary = false;
+    return vs_ring_contains_point_with_boundary(
+        px, py, x, y, coord_start, coord_end,
+        VALIDITY_BOUNDARY_TOLERANCE, &on_boundary);
 }}
 
 extern "C" __global__ void holes_in_shell(
@@ -237,7 +224,11 @@ extern "C" __global__ void holes_in_shell(
 }}
 """
 _HOLES_IN_SHELL_KERNEL_NAMES = ("holes_in_shell",)
-_HOLES_IN_SHELL_FP64 = _HOLES_IN_SHELL_KERNEL_SOURCE.format(compute_type="double")
+_HOLES_IN_SHELL_FP64 = (
+    POINT_ON_SEGMENT_DEVICE
+    + POINT_IN_RING_BOUNDARY_DEVICE
+    + _HOLES_IN_SHELL_KERNEL_TEMPLATE.format(compute_type="double")
+)
 # ---------------------------------------------------------------------------
 # NVRTC kernel: ring_pair_interaction — 1 block per polygon part (Tier 1)
 #

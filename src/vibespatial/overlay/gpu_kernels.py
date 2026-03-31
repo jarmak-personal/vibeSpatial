@@ -8,6 +8,10 @@ compile_kernel_group wrappers remain in gpu.py.
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_in_ring import (
+    POINT_IN_RING_BOUNDARY_DEVICE,
+    POINT_IN_RING_DEVICE,
+)
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
 
 # ---------------------------------------------------------------------------
@@ -470,35 +474,12 @@ _OVERLAY_FACE_WALK_KERNEL_NAMES = (
 # ---------------------------------------------------------------------------
 # Kernels: label_face_coverage_polygon, label_face_coverage_multipolygon
 
-_OVERLAY_FACE_LABEL_KERNEL_SOURCE = POINT_ON_SEGMENT_DEVICE + r"""
+_OVERLAY_FACE_LABEL_KERNEL_SOURCE = (
+    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + r"""
 // -------------------------------------------------------------------
 // Phase 2: GPU Face Labeling via Batch Point-in-Polygon
 // -------------------------------------------------------------------
 #define OVERLAY_BOUNDARY_TOLERANCE 1e-12
-
-extern "C" __device__ inline bool ring_contains_even_odd(
-    double px, double py,
-    const double* x, const double* y,
-    int coord_start, int coord_end,
-    bool* on_boundary
-) {
-  bool inside = false;
-  if ((coord_end - coord_start) < 2) return false;
-  for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-    const double ax = x[coord - 1];
-    const double ay = y[coord - 1];
-    const double bx = x[coord];
-    const double by = y[coord];
-    if (vs_point_on_segment(px, py, ax, ay, bx, by, OVERLAY_BOUNDARY_TOLERANCE)) {
-      *on_boundary = true;
-      return true;
-    }
-    const bool intersects = ((ay > py) != (by > py)) &&
-        (px <= (((bx - ax) * (py - ay)) / ((by - ay) + 0.0)) + ax);
-    if (intersects) inside = !inside;
-  }
-  return inside;
-}
 
 // Test face sample points against all polygons on one side.
 // One thread per face.
@@ -531,8 +512,9 @@ label_face_coverage_polygon(
       bool on_boundary = false;
       const int coord_start = polygon_ring_offsets[ring];
       const int coord_end = polygon_ring_offsets[ring + 1];
-      const bool ring_inside = ring_contains_even_odd(
-          px, py, polygon_x, polygon_y, coord_start, coord_end, &on_boundary);
+      const bool ring_inside = vs_ring_contains_point_with_boundary(
+          px, py, polygon_x, polygon_y, coord_start, coord_end,
+          OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
       if (on_boundary) { inside = true; break; }
       if (ring_inside) inside = !inside;
     }
@@ -572,8 +554,9 @@ label_face_coverage_multipolygon(
         bool on_boundary = false;
         const int coord_start = mp_ring_offsets[ring];
         const int coord_end = mp_ring_offsets[ring + 1];
-        const bool ring_inside = ring_contains_even_odd(
-            px, py, mp_x, mp_y, coord_start, coord_end, &on_boundary);
+        const bool ring_inside = vs_ring_contains_point_with_boundary(
+            px, py, mp_x, mp_y, coord_start, coord_end,
+            OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
         if (on_boundary) { inside = true; break; }
         if (ring_inside) inside = !inside;
       }
@@ -581,7 +564,7 @@ label_face_coverage_multipolygon(
     }
   }
 }
-"""
+""")
 
 _OVERLAY_FACE_LABEL_KERNEL_NAMES = (
     "label_face_coverage_polygon",
@@ -595,7 +578,7 @@ _OVERLAY_FACE_LABEL_KERNEL_NAMES = (
 #          scatter_ring_coordinates, assign_holes_to_exteriors,
 #          count_boundary_nesting_depth, count_sibling_hole_depth
 
-_OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE = r"""
+_OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
 // Identify boundary edges: edges where the face on this side is selected
 // but the twin face is not (or has no face).
 // boundary_next[e] = next boundary edge following e along the boundary.
@@ -753,18 +736,8 @@ assign_holes_to_exteriors(
     if (ext_area <= abs_hole_area) continue;
     // PIP test against exterior ring coordinates
     const int coord_start = ring_coord_offsets[ext];
-    const int n = ring_edge_counts[ext] + 1;  // +1 for closure
-    bool inside = false;
-    for (int k = 1; k < n; ++k) {
-      const double ax = all_x[coord_start + k - 1];
-      const double ay = all_y[coord_start + k - 1];
-      const double bx = all_x[coord_start + k];
-      const double by = all_y[coord_start + k];
-      const bool crosses = ((ay > py) != (by > py)) &&
-          (px < (((bx - ax) * (py - ay)) / (by - ay + 0.0)) + ax);
-      if (crosses) inside = !inside;
-    }
-    if (inside) {
+    const int coord_end = coord_start + ring_edge_counts[ext] + 1;
+    if (vs_ring_contains_point(px, py, all_x, all_y, coord_start, coord_end)) {
       best_area = ext_area;
       best_exterior = ext;
     }
@@ -812,18 +785,8 @@ count_boundary_nesting_depth(
 
     // PIP test: does ring c contain (px, py)?
     const int cs = coord_offsets[c];
-    const int n = edge_counts[c] + 1;  // +1 for closure
-    bool inside = false;
-    for (int k = 1; k < n; ++k) {
-      const double ax = all_x[cs + k - 1];
-      const double ay = all_y[cs + k - 1];
-      const double bx = all_x[cs + k];
-      const double by = all_y[cs + k];
-      if (((ay > py) != (by > py)) &&
-          (px < (((bx - ax) * (py - ay)) / (by - ay + 0.0)) + ax))
-        inside = !inside;
-    }
-    if (inside) depth += 1;
+    const int ce = cs + edge_counts[c] + 1;
+    if (vs_ring_contains_point(px, py, all_x, all_y, cs, ce)) depth += 1;
   }
   out_depth[r] = depth;
 }
@@ -871,18 +834,8 @@ count_sibling_hole_depth(
 
     // PIP test: does ring c contain (px, py)?
     const int cs = coord_offsets[c];
-    const int n = edge_counts[c] + 1;  // +1 for closure
-    bool inside = false;
-    for (int k = 1; k < n; ++k) {
-      const double ax = all_x[cs + k - 1];
-      const double ay = all_y[cs + k - 1];
-      const double bx = all_x[cs + k];
-      const double by = all_y[cs + k];
-      if (((ay > py) != (by > py)) &&
-          (px < (((bx - ax) * (py - ay)) / (by - ay + 0.0)) + ax))
-        inside = !inside;
-    }
-    if (inside) depth += 1;
+    const int ce = cs + edge_counts[c] + 1;
+    if (vs_ring_contains_point(px, py, all_x, all_y, cs, ce)) depth += 1;
   }
   out_depth[r] = depth;
 }
@@ -902,7 +855,7 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
 # ---------------------------------------------------------------------------
 # Kernel: batch_point_in_ring
 
-_BATCH_POINT_IN_RING_KERNEL_SOURCE = r"""
+_BATCH_POINT_IN_RING_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
 extern "C" __global__ void __launch_bounds__(256, 4)
 batch_point_in_ring(
     const double* __restrict__ sample_x,
@@ -923,24 +876,7 @@ batch_point_in_ring(
     const int cs = ring_offsets[ring];
     const int ce = ring_offsets[ring + 1];
 
-    // Even-odd (ray-casting) rule
-    bool inside = false;
-    for (int c = cs + 1; c < ce; ++c) {
-        const double ax = ring_x[c - 1];
-        const double ay = ring_y[c - 1];
-        const double bx = ring_x[c];
-        const double by = ring_y[c];
-        if (((ay > py) != (by > py))) {
-            const double denom = by - ay;
-            if (denom != 0.0) {
-                const double x_intersect = (bx - ax) * (py - ay) / denom + ax;
-                if (px < x_intersect) {
-                    inside = !inside;
-                }
-            }
-        }
-    }
-    results[pair] = inside ? 1 : 0;
+    results[pair] = vs_ring_contains_point(px, py, ring_x, ring_y, cs, ce) ? 1 : 0;
 }
 """
 
@@ -952,33 +888,7 @@ _BATCH_POINT_IN_RING_KERNEL_NAMES = ("batch_point_in_ring",)
 # Kernels: containment_poly_vs_poly, containment_poly_vs_mpoly,
 #          containment_mpoly_vs_poly, containment_mpoly_vs_mpoly
 
-_CONTAINMENT_BYPASS_KERNEL_SOURCE = r"""
-// Device helper: even-odd ring containment test.
-extern "C" __device__ inline bool _cb_ring_contains(
-    double px, double py,
-    const double* __restrict__ rx, const double* __restrict__ ry,
-    int coord_start, int coord_end
-) {
-    bool inside = false;
-    if ((coord_end - coord_start) < 2) return false;
-    for (int c = coord_start + 1; c < coord_end; ++c) {
-        const double ax = rx[c - 1];
-        const double ay = ry[c - 1];
-        const double bx = rx[c];
-        const double by = ry[c];
-        if (((ay > py) != (by > py))) {
-            const double denom = by - ay;
-            if (denom != 0.0) {
-                const double x_int = (bx - ax) * (py - ay) / denom + ax;
-                if (px < x_int) {
-                    inside = !inside;
-                }
-            }
-        }
-    }
-    return inside;
-}
-
+_CONTAINMENT_BYPASS_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
 // Device helper: polygon containment via even-odd rule across all rings.
 extern "C" __device__ inline bool _cb_polygon_contains(
     double px, double py,
@@ -993,7 +903,7 @@ extern "C" __device__ inline bool _cb_polygon_contains(
     for (int ring = ring_start; ring < ring_end; ++ring) {
         const int cs = corr_ring_offsets[ring];
         const int ce = corr_ring_offsets[ring + 1];
-        bool ring_inside = _cb_ring_contains(px, py, rx, ry, cs, ce);
+        bool ring_inside = vs_ring_contains_point(px, py, rx, ry, cs, ce);
         if (ring_inside) {
             inside = !inside;
         }
@@ -1019,7 +929,7 @@ extern "C" __device__ inline bool _cb_multipolygon_contains(
         for (int ring = ring_start; ring < ring_end; ++ring) {
             const int cs = corr_ring_offsets[ring];
             const int ce = corr_ring_offsets[ring + 1];
-            bool ring_inside = _cb_ring_contains(px, py, rx, ry, cs, ce);
+            bool ring_inside = vs_ring_contains_point(px, py, rx, ry, cs, ce);
             if (ring_inside) {
                 inside = !inside;
             }

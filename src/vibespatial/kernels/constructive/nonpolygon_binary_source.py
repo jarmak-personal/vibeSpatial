@@ -9,6 +9,8 @@ Extracted from nonpolygon_binary.py -- dispatch logic remains there.
 """
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_DEVICE
+
 _POINT_LINESTRING_KERNEL_SOURCE = r"""
 extern "C" __global__ __launch_bounds__(256, 4) void point_linestring_on_line(
     const double* __restrict__ pt_x,
@@ -89,32 +91,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void point_linestring_on_line(
 }
 """
 
-_LINESTRING_POLYGON_KERNEL_SOURCE = r"""
-/* ------------------------------------------------------------------ */
-/*  Device helper: point-in-polygon (even-odd rule, exterior only)    */
-/* ------------------------------------------------------------------ */
-__device__ bool point_in_polygon_simple(
-    double px, double py,
-    const double* __restrict__ poly_x,
-    const double* __restrict__ poly_y,
-    int coord_start, int coord_end
-) {
-    bool inside = false;
-    const int n = coord_end - coord_start;
-    if (n < 3) return false;
-    for (int i = 0, j = n - 1; i < n; j = i++) {
-        const double xi = poly_x[coord_start + i];
-        const double yi = poly_y[coord_start + i];
-        const double xj = poly_x[coord_start + j];
-        const double yj = poly_y[coord_start + j];
-        if (((yi > py) != (yj > py)) &&
-            (px < (xj - xi) * (py - yi) / (yj - yi) + xi)) {
-            inside = !inside;
-        }
-    }
-    return inside;
-}
-
+_LINESTRING_POLYGON_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
 /* ------------------------------------------------------------------ */
 /*  Device helper: segment-segment intersection                       */
 /* ------------------------------------------------------------------ */
@@ -194,8 +171,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_count(
         const double bx = ls_x[ls_start + s + 1];
         const double by = ls_y[ls_start + s + 1];
 
-        bool a_inside = point_in_polygon_simple(ax, ay, poly_x, poly_y, ring_start, ring_end);
-        bool b_inside = point_in_polygon_simple(bx, by, poly_x, poly_y, ring_start, ring_end);
+        bool a_inside = vs_ring_contains_point(ax, ay, poly_x, poly_y, ring_start, ring_end);
+        bool b_inside = vs_ring_contains_point(bx, by, poly_x, poly_y, ring_start, ring_end);
 
         /* For intersection mode (0): keep inside segments
            For difference mode (1): keep outside segments (invert) */
@@ -279,8 +256,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_scatter(
         const double bx = ls_x[ls_start + s + 1];
         const double by = ls_y[ls_start + s + 1];
 
-        bool a_inside = point_in_polygon_simple(ax, ay, poly_x, poly_y, ring_start, ring_end);
-        bool b_inside = point_in_polygon_simple(bx, by, poly_x, poly_y, ring_start, ring_end);
+        bool a_inside = vs_ring_contains_point(ax, ay, poly_x, poly_y, ring_start, ring_end);
+        bool b_inside = vs_ring_contains_point(bx, by, poly_x, poly_y, ring_start, ring_end);
 
         if (mode == 1) {
             a_inside = !a_inside;

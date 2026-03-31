@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_KIND_DEVICE
 from vibespatial.cuda.device_functions.point_on_segment import (
     POINT_ON_SEGMENT_KIND_DEVICE,
 )
@@ -9,48 +10,17 @@ from vibespatial.cuda.device_functions.point_on_segment import (
 # ---------------------------------------------------------------------------
 # CUDA kernel source -- shared device helpers
 # ---------------------------------------------------------------------------
-# These helper functions (vibespatial_abs, ring_contains_even_odd_kind,
-# polygon_point_location, multipolygon_point_location) are used by both
-# single-point and multipoint kernels.  Previously they were duplicated
-# across two kernel source strings (~140 lines each).  We now define them
-# once and compose via concatenation.  vs_point_on_segment_kind is provided
-# by the shared cuda.device_functions.point_on_segment module.
+# These helper functions (vibespatial_abs, polygon_point_location,
+# multipolygon_point_location) are used by both single-point and multipoint
+# kernels.  vs_point_on_segment_kind and vs_ring_point_classify are provided
+# by the shared cuda.device_functions modules.
 
-_SHARED_DEVICE_HELPERS = POINT_ON_SEGMENT_KIND_DEVICE + r"""
+_SHARED_DEVICE_HELPERS = (
+    POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + r"""
 #define POINT_RELATION_TOLERANCE 1e-12
 
 extern "C" __device__ inline double vibespatial_abs(double value) {
   return value < 0.0 ? -value : value;
-}
-
-extern "C" __device__ inline unsigned char ring_contains_even_odd_kind(
-    double px,
-    double py,
-    const double* x,
-    const double* y,
-    int coord_start,
-    int coord_end
-) {
-  bool inside = false;
-  if ((coord_end - coord_start) < 2) {
-    return 0;
-  }
-  for (int coord = coord_start + 1; coord < coord_end; ++coord) {
-    const double ax = x[coord - 1];
-    const double ay = y[coord - 1];
-    const double bx = x[coord];
-    const double by = y[coord];
-    const unsigned char segment_kind = vs_point_on_segment_kind(px, py, ax, ay, bx, by, POINT_RELATION_TOLERANCE);
-    if (segment_kind != 0) {
-      return 1;
-    }
-    const bool intersects = ((ay > py) != (by > py)) &&
-        (px <= (((bx - ax) * (py - ay)) / ((by - ay) + 0.0)) + ax);
-    if (intersects) {
-      inside = !inside;
-    }
-  }
-  return inside ? 2 : 0;
 }
 
 extern "C" __device__ inline unsigned char polygon_point_location(
@@ -68,7 +38,7 @@ extern "C" __device__ inline unsigned char polygon_point_location(
   for (int ring = ring_start; ring < ring_end; ++ring) {
     const int coord_start = ring_offsets[ring];
     const int coord_end = ring_offsets[ring + 1];
-    const unsigned char ring_kind = ring_contains_even_odd_kind(px, py, x, y, coord_start, coord_end);
+    const unsigned char ring_kind = vs_ring_point_classify(px, py, x, y, coord_start, coord_end, POINT_RELATION_TOLERANCE);
     if (ring_kind == 1) {
       return 1;
     }
@@ -98,7 +68,7 @@ extern "C" __device__ inline unsigned char multipolygon_point_location(
     for (int ring = ring_start; ring < ring_end; ++ring) {
       const int coord_start = ring_offsets[ring];
       const int coord_end = ring_offsets[ring + 1];
-      const unsigned char ring_kind = ring_contains_even_odd_kind(px, py, x, y, coord_start, coord_end);
+      const unsigned char ring_kind = vs_ring_point_classify(px, py, x, y, coord_start, coord_end, POINT_RELATION_TOLERANCE);
       if (ring_kind == 1) {
         return 1;
       }
@@ -112,7 +82,7 @@ extern "C" __device__ inline unsigned char multipolygon_point_location(
   }
   return 0;
 }
-"""
+""")
 
 # ---------------------------------------------------------------------------
 # Single-point kernel __global__ functions (appended after shared helpers)

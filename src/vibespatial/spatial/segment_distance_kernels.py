@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-_SEGMENT_DISTANCE_KERNEL_SOURCE = """
+from vibespatial.cuda.device_functions.point_in_ring import (
+    POINT_IN_RING_BOUNDARY_DEVICE,
+)
+from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+
+_SEGMENT_DISTANCE_KERNEL_SOURCE = (
+    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -104,27 +110,11 @@ extern "C" __device__ inline bool seg_point_in_rings(
     const int cs = ring_offsets[ring];
     const int ce = ring_offsets[ring + 1];
     if ((ce - cs) < 2) continue;
-    for (int c = cs + 1; c < ce; ++c) {
-      const double ax = x[c - 1], ay = y[c - 1];
-      const double bx = x[c],     by = y[c];
-      // Boundary check (collinear + in bbox).
-      const double cross_val = ((px - ax) * (by - ay)) - ((py - ay) * (bx - ax));
-      const double scale = fabs(bx - ax) + fabs(by - ay) + 1.0;
-      if (fabs(cross_val) <= (1e-12 * scale)) {
-        const double minx = ax < bx ? ax : bx;
-        const double maxx = ax > bx ? ax : bx;
-        const double miny = ay < by ? ay : by;
-        const double maxy = ay > by ? ay : by;
-        if (px >= (minx - 1e-12) && px <= (maxx + 1e-12) &&
-            py >= (miny - 1e-12) && py <= (maxy + 1e-12)) {
-          return true;
-        }
-      }
-      if (((ay > py) != (by > py)) &&
-          (px <= (((bx - ax) * (py - ay)) / ((by - ay) + 0.0)) + ax)) {
-        inside = !inside;
-      }
-    }
+    bool on_boundary = false;
+    bool ring_inside = vs_ring_contains_point_with_boundary(
+        px, py, x, y, cs, ce, 1e-12, &on_boundary);
+    if (on_boundary) return true;
+    if (ring_inside) inside = !inside;
   }
   return inside;
 }
@@ -495,7 +485,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void distance_mpg_mpg_from_owned
   }
   out[i] = sqrt(best);
 }
-"""
+""")
 
 _SEGMENT_DISTANCE_KERNEL_NAMES = (
     "distance_ls_ls_from_owned",

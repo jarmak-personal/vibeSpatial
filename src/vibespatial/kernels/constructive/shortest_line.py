@@ -13,6 +13,11 @@ The dispatch layer assembles these into 2-point LineString OGAs.
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_in_ring import (
+    POINT_IN_RING_BOUNDARY_DEVICE,
+)
+from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+
 # ---------------------------------------------------------------------------
 # Segment-segment closest-point pair (Ericson's closest-point algorithm)
 #
@@ -20,7 +25,8 @@ from __future__ import annotations
 # version returns the actual closest point coordinates on both segments.
 # ---------------------------------------------------------------------------
 
-_SHORTEST_LINE_KERNEL_SOURCE = r"""
+_SHORTEST_LINE_KERNEL_SOURCE = (
+    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + r"""
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -184,26 +190,11 @@ extern "C" __device__ inline bool sl_point_in_rings(
     const int cs = ring_offsets[ring];
     const int ce = ring_offsets[ring + 1];
     if ((ce - cs) < 2) continue;
-    for (int c = cs + 1; c < ce; ++c) {
-      const double ax = x[c - 1], ay = y[c - 1];
-      const double bx = x[c],     by = y[c];
-      const double cross_val = ((px - ax) * (by - ay)) - ((py - ay) * (bx - ax));
-      const double scale = fabs(bx - ax) + fabs(by - ay) + 1.0;
-      if (fabs(cross_val) <= (1e-12 * scale)) {
-        const double minx = ax < bx ? ax : bx;
-        const double maxx = ax > bx ? ax : bx;
-        const double miny = ay < by ? ay : by;
-        const double maxy = ay > by ? ay : by;
-        if (px >= (minx - 1e-12) && px <= (maxx + 1e-12) &&
-            py >= (miny - 1e-12) && py <= (maxy + 1e-12)) {
-          return true;
-        }
-      }
-      if (((ay > py) != (by > py)) &&
-          (px <= (((bx - ax) * (py - ay)) / ((by - ay) + 0.0)) + ax)) {
-        inside = !inside;
-      }
-    }
+    bool on_boundary = false;
+    bool ring_inside = vs_ring_contains_point_with_boundary(
+        px, py, x, y, cs, ce, 1e-12, &on_boundary);
+    if (on_boundary) return true;
+    if (ring_inside) inside = !inside;
   }
   return inside;
 }
@@ -821,7 +812,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void shortest_line_mpg_mpg(
   out_ax[i] = bax; out_ay[i] = bay;
   out_bx[i] = bbx; out_by[i] = bby;
 }
-"""
+""")
 
 SHORTEST_LINE_KERNEL_NAMES = (
     "shortest_line_pt_pt",

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-_POLYGON_PREDICATES_KERNEL_SOURCE = """
+from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_KIND_DEVICE
+from vibespatial.cuda.device_functions.point_on_segment import (
+    POINT_ON_SEGMENT_KIND_DEVICE,
+)
+
+_POLYGON_PREDICATES_KERNEL_SOURCE = (
+    POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -54,27 +60,10 @@ extern "C" __device__ inline unsigned char de9im_point_in_rings(
     const int cs = ring_offsets[ring];
     const int ce = ring_offsets[ring + 1];
     if ((ce - cs) < 2) continue;
-    for (int c = cs + 1; c < ce; ++c) {
-      const double ax = x[c - 1], ay = y[c - 1];
-      const double bx = x[c],     by = y[c];
-      // Boundary check.
-      const double cross_val = ((px - ax) * (by - ay)) - ((py - ay) * (bx - ax));
-      const double scale = fabs(bx - ax) + fabs(by - ay) + 1.0;
-      if (fabs(cross_val) <= (1e-12 * scale)) {
-        const double minx = ax < bx ? ax : bx;
-        const double maxx = ax > bx ? ax : bx;
-        const double miny = ay < by ? ay : by;
-        const double maxy = ay > by ? ay : by;
-        if (px >= (minx - 1e-12) && px <= (maxx + 1e-12) &&
-            py >= (miny - 1e-12) && py <= (maxy + 1e-12)) {
-          return 1;  // boundary
-        }
-      }
-      if (((ay > py) != (by > py)) &&
-          (px <= (((bx - ax) * (py - ay)) / ((by - ay) + 0.0)) + ax)) {
-        inside = !inside;
-      }
-    }
+    const unsigned char kind = vs_ring_point_classify(
+        px, py, x, y, cs, ce, 1e-12);
+    if (kind == 1) return 1;
+    if (kind == 2) inside = !inside;
   }
   return inside ? 2 : 0;
 }
@@ -752,7 +741,7 @@ extern "C" __global__ void mls_mpg_de9im_from_owned(
                                     right_x, right_y, right_ro,
                                     r_ring_starts, r_ring_ends, nr);
 }
-"""
+""")
 
 
 _POLYGON_PREDICATES_KERNEL_NAMES = (

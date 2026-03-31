@@ -8,9 +8,14 @@ Extracted from point_in_polygon.py -- dispatch logic remains there.
 """
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.point_in_ring import (
+    POINT_IN_RING_BOUNDARY_DEVICE,
+)
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
 
-_POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE = POINT_ON_SEGMENT_DEVICE + """
+# The device function strings use raw braces and must NOT pass through
+# .format().  They are concatenated in _format_pip_kernel_source() instead.
+_POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE = """
 typedef {compute_type} compute_t;
 
 #define CX(val) ((compute_t)((val) - center_x))
@@ -36,26 +41,14 @@ extern "C" __device__ inline bool ring_contains_even_odd(
     int coord_end,
     bool* on_boundary
 ) {{
-  bool inside = false;
-  if ((coord_end - coord_start) < 2) {{
-    return false;
-  }}
-  for (int coord = coord_start + 1; coord < coord_end; ++coord) {{
-    const compute_t ax = CX(x[coord - 1]);
-    const compute_t ay = CY(y[coord - 1]);
-    const compute_t bx = CX(x[coord]);
-    const compute_t by = CY(y[coord]);
-    if (vs_point_on_segment((double)px, (double)py, (double)ax, (double)ay, (double)bx, (double)by, PIP_BOUNDARY_TOLERANCE)) {{
-      *on_boundary = true;
-      return true;
-    }}
-    const bool intersects = ((ay > py) != (by > py)) &&
-        (px <= (((bx - ax) * (py - ay)) / ((by - ay) + (compute_t)0.0)) + ax);
-    if (intersects) {{
-      inside = !inside;
-    }}
-  }}
-  return inside;
+  /* Delegate to shared vs_ring_contains_point_with_boundary (fp64).
+     Convert centered compute_t point back to uncentered double coords
+     so the shared function can work on raw coordinate arrays. */
+  const double dpx = (double)px + center_x;
+  const double dpy = (double)py + center_y;
+  return vs_ring_contains_point_with_boundary(
+      dpx, dpy, x, y, coord_start, coord_end,
+      PIP_BOUNDARY_TOLERANCE, on_boundary);
 }}
 
 extern "C" __device__ inline bool polygon_contains_point(
@@ -851,4 +844,5 @@ _POINT_IN_POLYGON_KERNEL_NAMES = (
 
 
 def _format_pip_kernel_source(compute_type: str = "double") -> str:
-    return _POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE.format(compute_type=compute_type)
+    body = _POINT_IN_POLYGON_KERNEL_SOURCE_TEMPLATE.format(compute_type=compute_type)
+    return POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + body
