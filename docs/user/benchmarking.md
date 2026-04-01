@@ -30,13 +30,20 @@ Run a single operation benchmark at a given scale.
 vsbench run intersects --scale 10k --repeat 5
 vsbench run buffer --scale 1m --precision fp32 --gpu-sparkline
 vsbench run dissolve --compare geopandas --json
+vsbench run bounds-pairs --rows 20000 --arg dataset=uniform --arg tile_size=256
+vsbench run clip-rect --arg kind=polygon --arg rect=100,100,700,700
 ```
+
+Use `vsbench list operations --json` to discover typed operation-specific
+parameters. Operation arguments are passed with repeatable `--arg key=value`
+flags and validated against the operation schema before execution.
 
 **Common flags** (shared by `run`, `pipeline`, `suite`, `kernel`):
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--scale` | operation default | Input size: `1k`, `10k`, `100k`, `1m` |
+| `--rows` | none | Exact input row count override for `vsbench run` |
 | `--repeat` | 3 | Number of timed iterations |
 | `--precision` | `auto` | Force `fp32`, `fp64`, or `auto` |
 | `--compare` | none | Compare against `shapely` or `geopandas` |
@@ -111,6 +118,7 @@ Discover what benchmarks are available.
 
 ```bash
 vsbench list operations                # All registered operations
+vsbench list operations --json         # Includes operation parameter schemas
 vsbench list operations --category io  # Filter by category
 vsbench list pipelines                 # Available pipelines
 vsbench list fixtures                  # Fixture specs and scales

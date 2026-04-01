@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 159/220 lines
+Body Budget: 168/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -15,14 +15,14 @@ Section Map (Body Lines)
 | 6-12 | Intent |
 | 13-29 | Request Signals |
 | 30-44 | Open First |
-| 45-53 | Verify |
-| 54-62 | Risks |
-| 63-76 | Entry Points |
-| 77-91 | Pipelines |
-| 92-104 | Suites |
-| 105-113 | Regression Rules |
-| 114-140 | Trace Contract |
-| 141-159 | CI Workflow |
+| 45-54 | Verify |
+| 55-63 | Risks |
+| 64-85 | Entry Points |
+| 86-100 | Pipelines |
+| 101-113 | Suites |
+| 114-122 | Regression Rules |
+| 123-149 | Trace Contract |
+| 150-168 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -62,9 +62,9 @@ timers.
 - src/vibespatial/bench/fixtures.py
 - src/vibespatial/bench/fixture_loader.py
 - src/vibespatial/bench/pipeline.py
+- src/vibespatial/bench/compare.py
 - src/vibespatial/bench/shootout.py
 - scripts/benchmark_pipelines.py
-- scripts/check_pipeline_regressions.py
 - .github/workflows/pipeline-benchmarks.yml
 
 ## Verify
@@ -72,6 +72,7 @@ timers.
 - `uv run vsbench list operations`
 - `uv run vsbench run bounds --scale 1k --repeat 1 --quiet`
 - `uv run vsbench fixtures generate --scale 1k --format parquet`
+- `uv run vsbench compare baseline.json current.json`
 - `uv run pytest tests/test_pipeline_benchmarks.py tests/test_profiling_rails.py -q`
 - `uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2`
 - `uv run python scripts/check_docs.py --check`
@@ -96,7 +97,15 @@ uv run python scripts/benchmark_pipelines.py --suite smoke --repeat 2
 Compare a current run against a baseline artifact:
 
 ```bash
-uv run python scripts/check_pipeline_regressions.py --baseline baseline.json --current current.json
+uv run vsbench compare baseline.json current.json
+```
+
+Discover operation-specific arguments before running a benchmark:
+
+```bash
+uv run vsbench list operations --json
+uv run vsbench run clip-rect --arg kind=polygon --arg rect=100,100,700,700
+uv run vsbench run bounds-pairs --rows 20000 --arg dataset=uniform --arg tile_size=256
 ```
 
 ## Pipelines
@@ -175,7 +184,7 @@ timing.
 
 The workflow runs the current commit, attempts the same suite on the base
 commit in a detached worktree, stores both artifacts, and diffs them with
-`scripts/check_pipeline_regressions.py`.
+`uv run vsbench compare`.
 
 Bootstrap note:
 

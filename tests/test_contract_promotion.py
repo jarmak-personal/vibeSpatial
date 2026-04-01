@@ -27,7 +27,7 @@ def test_query_promotion_group_includes_benchmark_watch_commands() -> None:
     group = _resolve_group("vibeSpatial-o17.7.2")
 
     assert len(group.benchmark_commands) == 2
-    assert "benchmark_spatial_query.py" in group.benchmark_commands[1]
+    assert "vsbench run spatial-query" in group.benchmark_commands[1]
 
 
 def test_io_promotion_group_marks_optional_dependency_slices() -> None:

@@ -48,7 +48,7 @@ DOC_HEADER:END -->
 - `uv run pytest tests/test_spatial_query.py`
 - `uv run pytest tests/upstream/geopandas/tests/test_sindex.py -q`
 - `uv run pytest tests/upstream/geopandas/tools/tests/test_sjoin.py -k "predicate or nearest"`
-- `uv run python scripts/benchmark_spatial_query.py --rows 20000 --overlap-ratio 0.2`
+- `uv run vsbench run spatial-query --rows 20000 --arg overlap_ratio=0.2`
 - `uv run python scripts/profile_fixture_spatial_query.py --fixture polygons-regular-grid-rows100000 --operation query --ensure`
 - `uv run python scripts/check_docs.py --check`
 

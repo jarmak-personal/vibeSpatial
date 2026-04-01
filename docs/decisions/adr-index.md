@@ -46,4 +46,5 @@ context, the decision made, consequences, and alternatives considered.
 0038-gpu-byte-classify-geojson-parser
 0039-provenance-tagging-rewrites
 0040-tiered-gpu-memory-pool
+0041-gpu-text-parsing-framework
 ```

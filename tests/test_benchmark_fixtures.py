@@ -8,6 +8,7 @@ from vibespatial.bench.fixtures import (
     build_fixture_frame,
     ensure_fixture,
     fixture_path,
+    resolve_fixture_spec,
 )
 
 
@@ -53,3 +54,17 @@ def test_profile_fixture_query_uses_public_parquet_path(tmp_path: Path) -> None:
     assert trace.result_pairs >= 16
     assert any(event["operation"] == "read_parquet" for event in trace.dispatch_events)
     assert any(event["operation"] == "query" for event in trace.dispatch_events)
+
+
+def test_resolve_fixture_spec_keeps_shape_parameters_in_identity() -> None:
+    spec = resolve_fixture_spec(
+        "polygon",
+        "regular-grid",
+        10_000,
+        vertices=5,
+        hole_probability=0.25,
+    )
+
+    assert spec.vertices == 5
+    assert spec.hole_probability == 0.25
+    assert spec.name == "polygons-regular-grid-rows10000-vertices5-holes0p25"

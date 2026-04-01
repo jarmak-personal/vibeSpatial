@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Regression thresholds (aligned with existing check_pipeline_regressions.py)
+# Regression thresholds for pipeline benchmark comparisons.
 WALL_CLOCK_THRESHOLD = 0.05
 DEVICE_MEMORY_THRESHOLD = 0.10
 KERNEL_GPU_TIME_THRESHOLD = 0.05
@@ -59,10 +59,26 @@ def compare(baseline_path: Path, current_path: Path) -> ComparisonResult:
     """Compare two benchmark result files and detect regressions."""
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     current = json.loads(current_path.read_text(encoding="utf-8"))
-
-    result = ComparisonResult(
+    return compare_payloads(
+        baseline=baseline,
+        current=current,
         baseline_path=str(baseline_path),
         current_path=str(current_path),
+    )
+
+
+def compare_payloads(
+    *,
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    baseline_path: str = "<baseline>",
+    current_path: str = "<current>",
+) -> ComparisonResult:
+    """Compare two already-loaded benchmark payloads."""
+
+    result = ComparisonResult(
+        baseline_path=baseline_path,
+        current_path=current_path,
     )
 
     # Normalise: some files store raw lists or non-standard formats
@@ -77,6 +93,11 @@ def compare(baseline_path: Path, current_path: Path) -> ComparisonResult:
         result.findings.extend(_compare_v1(baseline, current))
 
     return result
+
+
+def compare_results(current: dict[str, Any], baseline: dict[str, Any]) -> list[RegressionFinding]:
+    """Compatibility helper for tests that compare in-memory payloads."""
+    return compare_payloads(baseline=baseline, current=current).findings
 
 
 # ---------------------------------------------------------------------------

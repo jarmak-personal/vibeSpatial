@@ -19,6 +19,19 @@ def main(argv: list[str] | None = None) -> int:
     # --- vsbench run <operation> -------------------------------------------
     p_run = sub.add_parser("run", help="Run a single operation benchmark")
     p_run.add_argument("operation", help="Operation name (see 'vsbench list operations')")
+    p_run.add_argument(
+        "--rows",
+        type=int,
+        default=None,
+        help="Exact input row count override (mutually exclusive with --scale)",
+    )
+    p_run.add_argument(
+        "--arg",
+        action="append",
+        dest="operation_args",
+        metavar="key=value",
+        help="Typed operation-specific argument; repeat as needed",
+    )
     _add_common_flags(p_run)
 
     # --- vsbench pipeline <name> -------------------------------------------
@@ -186,13 +199,27 @@ def _dispatch(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    from .catalog import ensure_operations_loaded, get_operation
+    from .catalog import ensure_operations_loaded, get_operation, resolve_operation_args
     from .output import render_result
     from .runner import resolve_scale, run_operation
 
     ensure_operations_loaded()
     spec = get_operation(args.operation)
-    scale = resolve_scale(args.scale, default=spec.default_scale)
+    if args.rows is not None and args.scale is not None:
+        print("vsbench run: use either --rows or --scale, not both", file=sys.stderr)
+        return 2
+    if args.rows is not None:
+        if args.rows <= 0:
+            print("vsbench run: --rows must be a positive integer", file=sys.stderr)
+            return 2
+        scale = args.rows
+    else:
+        scale = resolve_scale(args.scale, default=spec.default_scale)
+    try:
+        operation_args = resolve_operation_args(spec, args.operation_args)
+    except ValueError as exc:
+        print(f"vsbench run: {exc}", file=sys.stderr)
+        return 2
 
     result = run_operation(
         args.operation,
@@ -204,6 +231,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         nvtx=args.nvtx,
         gpu_sparkline=args.gpu_sparkline,
         trace=args.trace,
+        operation_args=operation_args,
     )
 
     text = render_result(result, mode=_output_mode(args))

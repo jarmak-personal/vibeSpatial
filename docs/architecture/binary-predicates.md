@@ -57,7 +57,7 @@ DOC_HEADER:END -->
 - `uv run pytest tests/upstream/geopandas/tests/test_geom_methods.py -k "contains or within or intersects or covers or covered_by or touches or crosses or equals"`
 - `uv run pytest tests/test_gpu_binary_predicates.py -q --run-gpu`
 - `VIBESPATIAL_STRICT_NATIVE=1 uv run pytest tests/upstream/geopandas/tests/test_array.py -k "test_predicates_vector_scalar or test_predicates_vector_vector or test_chaining or test_raise_on_bad_sizes" -q`
-- `uv run python scripts/benchmark_gpu_predicates.py --scale 100000`
+- `uv run vsbench run gpu-predicates --scale 100k`
 - `uv run python scripts/check_architecture_lints.py --all`
 - `uv run python scripts/check_docs.py --check`
 

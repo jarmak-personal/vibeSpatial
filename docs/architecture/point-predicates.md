@@ -44,8 +44,8 @@ DOC_HEADER:END -->
 ## Verify
 
 - `uv run pytest tests/test_point_within_bounds.py tests/test_point_in_polygon.py`
-- `uv run python scripts/benchmark_point_predicates.py --rows 2000`
-- `uv run python scripts/benchmark_gpu_pip.py --scale 1000000`
+- `uv run vsbench run point-predicates --scale 10k`
+- `uv run vsbench run gpu-pip --scale 1m`
 - `uv run python scripts/check_architecture_lints.py --all`
 - `uv run python scripts/check_docs.py --check`
 

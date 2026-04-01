@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from scripts.check_pipeline_regressions import compare_results
+from vibespatial.bench.compare import compare_results
 from vibespatial.bench.pipeline import benchmark_pipeline_suite, suite_to_json
 
 

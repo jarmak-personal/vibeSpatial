@@ -46,8 +46,8 @@ rectangle clipping.
 ## Verify
 
 - `uv run pytest tests/test_clip_rect.py tests/test_degeneracy_corpus.py`
-- `uv run python scripts/benchmark_clip_rect.py --kind line --rows 5000`
-- `uv run python scripts/benchmark_clip_rect.py --kind polygon --rows 5000`
+- `uv run vsbench run clip-rect --arg kind=line`
+- `uv run vsbench run clip-rect --arg kind=polygon`
 - `uv run pytest tests/upstream/geopandas/tests/test_geom_methods.py -k clip_by_rect`
 - `uv run pytest tests/upstream/geopandas/tools/tests/test_clip.py -k "test_clip_poly or test_clip_line_keep_slivers or test_clip_multipoly_keep_slivers"`
 - `uv run python scripts/check_docs.py --check`

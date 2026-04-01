@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from time import perf_counter
 from typing import Any
 
@@ -45,10 +46,12 @@ def run_operation(
     nvtx: bool = False,
     gpu_sparkline: bool = False,
     trace: bool = False,
+    operation_args: dict[str, Any] | None = None,
 ) -> BenchmarkResult:
     """Run a registered benchmark operation with warmup and repeat/median."""
     ensure_operations_loaded()
     spec = get_operation(name)
+    resolved_operation_args = dict(operation_args or {})
 
     # Clip scale to max_scale if the operation declares one
     effective_scale = min(scale, spec.max_scale) if spec.max_scale else scale
@@ -64,6 +67,7 @@ def run_operation(
             nvtx=False,
             gpu_sparkline=False,
             trace=False,
+            **resolved_operation_args,
         )
     except Exception:
         pass  # warmup failures are non-fatal
@@ -80,10 +84,16 @@ def run_operation(
             nvtx=nvtx,
             gpu_sparkline=gpu_sparkline,
             trace=trace,
+            **resolved_operation_args,
         )
         samples.append(result)
 
-    return _select_median(samples)
+    result = _select_median(samples)
+    if not resolved_operation_args:
+        return result
+    metadata = dict(result.metadata)
+    metadata["operation_args"] = resolved_operation_args
+    return replace(result, metadata=metadata)
 
 
 def _select_median(samples: list[BenchmarkResult]) -> BenchmarkResult:

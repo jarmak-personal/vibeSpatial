@@ -48,7 +48,7 @@ intersection classification.
 
 - `uv run pytest tests/test_segment_primitives.py tests/test_segment_filters.py`
 - `uv run pytest tests/test_segment_primitives.py -q --run-gpu`
-- `uv run python scripts/benchmark_segment_intersections.py --rows 10000`
+- `uv run vsbench run segment-intersections --scale 10k`
 - `uv run python scripts/check_architecture_lints.py --all`
 - `uv run python scripts/check_docs.py --check`
 

@@ -268,12 +268,19 @@ def resolve_fixture_spec(
             and spec.distribution == distribution
             and spec.rows == scale
             and spec.seed == seed
+            and spec.vertices == vertices
+            and spec.hole_probability == hole_probability
         ):
             return spec
     # Create dynamic spec
     name = f"{geometry_type}s-{distribution}-rows{scale}"
     if seed != 0:
         name += f"-seed{seed}"
+    if vertices != 8:
+        name += f"-vertices{vertices}"
+    if hole_probability != 0.0:
+        hole_label = str(hole_probability).replace(".", "p")
+        name += f"-holes{hole_label}"
     return BenchmarkFixtureSpec(
         name=name,
         geometry_type=geometry_type,

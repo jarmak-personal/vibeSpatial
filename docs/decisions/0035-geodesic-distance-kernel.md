@@ -426,7 +426,7 @@ uv run pytest tests/test_spatial_query.py -k "crs" -q
 
 # Phase 2: Haversine kernel
 uv run pytest tests/test_geodesic_distance.py -q
-uv run python scripts/benchmark_gpu_predicates.py  # include geodesic cases
+uv run vsbench run gpu-predicates --scale 100k  # replace with a geodesic-specific rail when landed
 
 # Phase 3: Vincenty kernel
 uv run pytest tests/test_geodesic_distance.py -k "vincenty" -q

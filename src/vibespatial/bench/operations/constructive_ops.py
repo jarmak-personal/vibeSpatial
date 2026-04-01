@@ -4,7 +4,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from vibespatial.bench.catalog import benchmark_operation
+from vibespatial.bench.catalog import OperationParameterSpec, benchmark_operation
 from vibespatial.bench.schema import (
     BenchmarkResult,
     timing_from_samples,
@@ -38,7 +38,21 @@ def _clip_rect_from_owned(owned: Any, fraction: float = 0.6) -> tuple[float, flo
     geometry_types=("line", "polygon"),
     default_scale=5_000,
     tier=4,
-    legacy_script="benchmark_clip_rect.py",
+    parameters=(
+        OperationParameterSpec(
+            name="kind",
+            value_type="choice",
+            description="Geometry workload to benchmark",
+            default="line",
+            choices=("line", "polygon"),
+        ),
+        OperationParameterSpec(
+            name="rect",
+            value_type="float_list",
+            description="Custom clip rectangle as xmin,ymin,xmax,ymax",
+            arity=4,
+        ),
+    ),
     tags=("gpu", "compare"),
     max_scale=50_000,
 )
@@ -55,7 +69,11 @@ def bench_clip_rect(
     from vibespatial.bench.fixture_loader import load_owned
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    spec = resolve_fixture_spec("line", "random-walk", scale)
+    kind = kwargs.get("kind", "line")
+    if kind == "polygon":
+        spec = resolve_fixture_spec("polygon", "regular-grid", scale)
+    else:
+        spec = resolve_fixture_spec("line", "random-walk", scale)
     owned, read_seconds = load_owned(spec, InputFormat(input_format))
 
     # Guard: if fixture produced 0 rows, report as error.
@@ -64,7 +82,7 @@ def bench_clip_rect(
             operation="clip-rect",
             tier=1,
             scale=scale,
-            geometry_type="line",
+            geometry_type=kind,
             precision=precision,
             status="error",
             status_reason="fixture produced 0 rows",
@@ -75,16 +93,16 @@ def bench_clip_rect(
 
     # Derive clip rectangle from actual data bounds (central 60%) to
     # guarantee overlap regardless of scale or fixture distribution.
-    rect = _clip_rect_from_owned(owned, fraction=0.6)
+    rect = tuple(kwargs["rect"]) if "rect" in kwargs else _clip_rect_from_owned(owned, fraction=0.6)
 
     try:
-        result = benchmark_clip_by_rect(owned, *rect, dataset=f"line-{scale}")
+        result = benchmark_clip_by_rect(owned, *rect, dataset=f"{kind}-{scale}")
     except (IndexError, ValueError) as exc:
         return BenchmarkResult(
             operation="clip-rect",
             tier=1,
             scale=scale,
-            geometry_type="line",
+            geometry_type=kind,
             precision=precision,
             status="error",
             status_reason=f"clip_by_rect crashed: {exc}",
@@ -108,7 +126,7 @@ def bench_clip_rect(
         operation="clip-rect",
         tier=1,
         scale=scale,
-        geometry_type="line",
+        geometry_type=kind,
         precision=precision,
         status="pass",
         status_reason="ok",
@@ -119,6 +137,8 @@ def bench_clip_rect(
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={
+            "kind": kind,
+            "rect": list(rect),
             "candidate_rows": result.candidate_rows,
             "fast_rows": result.fast_rows,
             "fallback_rows": result.fallback_rows,
@@ -133,7 +153,6 @@ def bench_clip_rect(
     geometry_types=("polygon",),
     default_scale=10_000,
     tier=4,
-    legacy_script="benchmark_gpu_constructive.py",
     tags=("gpu", "compare"),
 )
 def bench_gpu_constructive(
@@ -274,7 +293,6 @@ def bench_gpu_constructive(
     geometry_types=("polygon",),
     default_scale=10_000,
     tier=4,
-    legacy_script="benchmark_make_valid.py",
     tags=("gpu", "compare"),
 )
 def bench_make_valid(
@@ -336,7 +354,14 @@ def bench_make_valid(
     geometry_types=("polygon",),
     default_scale=50_000,
     tier=2,
-    legacy_script="benchmark_gpu_dissolve.py",
+    parameters=(
+        OperationParameterSpec(
+            name="groups",
+            value_type="int",
+            description="Number of dissolve groups in the grouped-box fixture",
+            default=100,
+        ),
+    ),
     tags=("gpu",),
 )
 def bench_gpu_dissolve(
@@ -358,7 +383,7 @@ def bench_gpu_dissolve(
     from vibespatial.overlay.dissolve import execute_grouped_box_union_gpu
 
     fmt = InputFormat(input_format)
-    groups = 100
+    groups = kwargs.get("groups", 100)
     spec, _ = ensure_grouped_boxes_fixture(scale, groups=groups, fmt=fmt)
     frame, read_seconds = load_geodataframe(spec, fmt)
 
@@ -371,7 +396,9 @@ def bench_gpu_dissolve(
         for _, positions in grouped.indices.items()
     ]
 
+    start = perf_counter()
     warmup_result = execute_grouped_box_union_gpu(values, group_positions)
+    cold_elapsed_seconds = perf_counter() - start
     if warmup_result is None:
         return BenchmarkResult(
             operation="gpu-dissolve",
@@ -387,9 +414,10 @@ def bench_gpu_dissolve(
         )
 
     times: list[float] = []
+    last_result = warmup_result
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        execute_grouped_box_union_gpu(values, group_positions)
+        last_result = execute_grouped_box_union_gpu(values, group_positions)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -398,14 +426,23 @@ def bench_gpu_dissolve(
     baseline_timing = None
     speedup = None
     baseline_name = None
+    baseline_elapsed_seconds = None
+    baseline_rows = None
     if compare == "shapely" or compare is None:
         shapely_times: list[float] = []
+        baseline = None
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            for positions in group_positions:
-                if positions.size > 0:
-                    shapely.union_all(values[positions])
+            baseline = [
+                shapely.union_all(values[positions])
+                for positions in group_positions
+                if positions.size > 0
+            ]
             shapely_times.append(perf_counter() - start)
+        if baseline is not None:
+            baseline_rows = len(baseline)
+        if shapely_times:
+            baseline_elapsed_seconds = shapely_times[-1]
         baseline_timing = timing_from_samples(shapely_times)
         baseline_name = "shapely"
         if timing.median_seconds > 0:
@@ -425,7 +462,15 @@ def bench_gpu_dissolve(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"repeat": repeat, "groups": groups},
+        metadata={
+            "repeat": repeat,
+            "groups": groups,
+            "accelerated_cold_elapsed_seconds": cold_elapsed_seconds,
+            "accelerated_warm_elapsed_seconds": timing.median_seconds,
+            "baseline_elapsed_seconds": baseline_elapsed_seconds,
+            "result_rows": int(len(last_result.geometries)),
+            "baseline_rows": baseline_rows,
+        },
     )
 
 
@@ -436,7 +481,15 @@ def bench_gpu_dissolve(
     geometry_types=("point", "line"),
     default_scale=1_000,
     tier=4,
-    legacy_script="benchmark_stroke_kernels.py",
+    parameters=(
+        OperationParameterSpec(
+            name="kind",
+            value_type="choice",
+            description="Stroke kernel workload to benchmark",
+            default="point-buffer",
+            choices=("point-buffer", "offset-curve"),
+        ),
+    ),
     tags=("gpu", "compare"),
     max_scale=50_000,
 )
@@ -449,15 +502,21 @@ def bench_stroke_kernels(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_point_buffer
+    from vibespatial import benchmark_offset_curve, benchmark_point_buffer
     from vibespatial.bench.fixture_loader import load_geodataframe
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
-    spec = resolve_fixture_spec("point", "grid", scale)
+    kind = kwargs.get("kind", "point-buffer")
+    geometry_type = "point" if kind == "point-buffer" else "line"
+    distribution = "grid" if geometry_type == "point" else "random-walk"
+    spec = resolve_fixture_spec(geometry_type, distribution, scale)
     gdf, read_seconds = load_geodataframe(spec, InputFormat(input_format))
     values = gdf.geometry.tolist()
 
-    result = benchmark_point_buffer(values, distance=1.0, quad_segs=8)
+    if kind == "offset-curve":
+        result = benchmark_offset_curve(values, distance=1.0, join_style="mitre")
+    else:
+        result = benchmark_point_buffer(values, distance=1.0, quad_segs=8)
 
     timing = timing_from_samples([result.owned_elapsed_seconds])
     speedup = result.speedup_vs_shapely
@@ -469,7 +528,7 @@ def bench_stroke_kernels(
         operation="stroke-kernels",
         tier=1,
         scale=scale,
-        geometry_type="point",
+        geometry_type=geometry_type,
         precision=precision,
         status="pass",
         status_reason="ok",
@@ -479,5 +538,9 @@ def bench_stroke_kernels(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"fast_rows": result.fast_rows, "fallback_rows": result.fallback_rows},
+        metadata={
+            "kind": kind,
+            "fast_rows": result.fast_rows,
+            "fallback_rows": result.fallback_rows,
+        },
     )

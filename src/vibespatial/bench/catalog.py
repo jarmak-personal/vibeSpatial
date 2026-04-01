@@ -33,6 +33,106 @@ class BenchmarkCallable(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Operation parameters
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class OperationParameterSpec:
+    """Typed operation-specific argument metadata for ``vsbench run``."""
+
+    name: str
+    value_type: str  # "str", "int", "float", "bool", "choice", "float_list"
+    description: str
+    default: Any | None = None
+    choices: tuple[str, ...] = ()
+    arity: int | None = None
+
+    def parse(self, raw: str) -> Any:
+        """Parse a CLI ``key=value`` string into the declared runtime type."""
+        if self.value_type == "str":
+            return raw
+        if self.value_type == "int":
+            return int(raw)
+        if self.value_type == "float":
+            return float(raw)
+        if self.value_type == "bool":
+            lowered = raw.strip().lower()
+            truthy = {"1", "true", "yes", "on"}
+            falsy = {"0", "false", "no", "off"}
+            if lowered in truthy:
+                return True
+            if lowered in falsy:
+                return False
+            raise ValueError(
+                f"invalid boolean value {raw!r} for {self.name}; expected one of "
+                f"{sorted(truthy | falsy)}"
+            )
+        if self.value_type == "choice":
+            if raw not in self.choices:
+                raise ValueError(
+                    f"invalid value {raw!r} for {self.name}; expected one of {list(self.choices)}"
+                )
+            return raw
+        if self.value_type == "float_list":
+            values = [float(part.strip()) for part in raw.split(",") if part.strip()]
+            if self.arity is not None and len(values) != self.arity:
+                raise ValueError(
+                    f"invalid value {raw!r} for {self.name}; expected {self.arity} comma-separated floats"
+                )
+            return tuple(values)
+        raise ValueError(f"unsupported operation parameter type: {self.value_type}")
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "name": self.name,
+            "type": self.value_type,
+            "description": self.description,
+        }
+        if self.default is not None:
+            d["default"] = self.default
+        if self.choices:
+            d["choices"] = list(self.choices)
+        if self.arity is not None:
+            d["arity"] = self.arity
+        return d
+
+
+def resolve_operation_args(
+    spec: OperationSpec,
+    raw_args: list[str] | tuple[str, ...] | None,
+) -> dict[str, Any]:
+    """Validate and coerce operation-specific CLI args against the operation schema."""
+    params = {param.name: param for param in spec.parameters}
+    resolved = {
+        param.name: param.default
+        for param in spec.parameters
+        if param.default is not None
+    }
+    if not raw_args:
+        return resolved
+
+    for item in raw_args:
+        if "=" not in item:
+            raise ValueError(
+                f"invalid operation arg {item!r}; expected key=value for operation {spec.name!r}"
+            )
+        key, raw_value = item.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        param = params.get(key)
+        if param is None:
+            available = ", ".join(sorted(params)) or "(none)"
+            raise ValueError(
+                f"unknown operation arg {key!r} for operation {spec.name!r}; available: {available}"
+            )
+        try:
+            resolved[key] = param.parse(raw_value)
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+    return resolved
+
+
+# ---------------------------------------------------------------------------
 # Operation spec
 # ---------------------------------------------------------------------------
 
@@ -48,6 +148,7 @@ class OperationSpec:
     tier: int  # performance tier 1-5
     callable: BenchmarkCallable
     legacy_script: str | None = None
+    parameters: tuple[OperationParameterSpec, ...] = ()
     tags: tuple[str, ...] = ()
     max_scale: int | None = None
 
@@ -63,6 +164,8 @@ class OperationSpec:
         }
         if self.legacy_script:
             d["legacy_script"] = self.legacy_script
+        if self.parameters:
+            d["parameters"] = [param.to_dict() for param in self.parameters]
         if self.max_scale is not None:
             d["max_scale"] = self.max_scale
         return d
@@ -84,6 +187,7 @@ def benchmark_operation(
     default_scale: int = 100_000,
     tier: int = 3,
     legacy_script: str | None = None,
+    parameters: tuple[OperationParameterSpec, ...] = (),
     tags: tuple[str, ...] = (),
     max_scale: int | None = None,
 ):
@@ -99,6 +203,7 @@ def benchmark_operation(
             tier=tier,
             callable=func,
             legacy_script=legacy_script,
+            parameters=parameters,
             tags=tags,
             max_scale=max_scale,
         )

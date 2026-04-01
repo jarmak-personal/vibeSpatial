@@ -151,10 +151,15 @@ def collect_health_report(root: Path, *, include_gpu_coverage: bool = False, gpu
     gpu_acceleration = collect_gpu_acceleration(root, include=include_gpu_coverage, timeout=gpu_coverage_timeout)
     profile_script = root / "scripts" / "profile_kernels.py"
     pipeline_script = root / "scripts" / "benchmark_pipelines.py"
-    pipeline_regression_script = root / "scripts" / "check_pipeline_regressions.py"
+    pipeline_compare_module = root / "src" / "vibespatial" / "bench" / "compare.py"
     pipeline_workflow = root / ".github" / "workflows" / "pipeline-benchmarks.yml"
     benchmarks = {
-        "ok": profile_script.exists() and pipeline_script.exists() and pipeline_regression_script.exists() and pipeline_workflow.exists(),
+        "ok": (
+            profile_script.exists()
+            and pipeline_script.exists()
+            and pipeline_compare_module.exists()
+            and pipeline_workflow.exists()
+        ),
         "available": profile_script.exists() or pipeline_script.exists(),
         "regressions": [],
         "profiling_rails": [
@@ -162,7 +167,7 @@ def collect_health_report(root: Path, *, include_gpu_coverage: bool = False, gpu
             for path in (
                 "scripts/profile_kernels.py" if profile_script.exists() else "",
                 "scripts/benchmark_pipelines.py" if pipeline_script.exists() else "",
-                "scripts/check_pipeline_regressions.py" if pipeline_regression_script.exists() else "",
+                "src/vibespatial/bench/compare.py" if pipeline_compare_module.exists() else "",
                 ".github/workflows/pipeline-benchmarks.yml" if pipeline_workflow.exists() else "",
             )
             if path

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vibespatial.bench.catalog import benchmark_operation
+from vibespatial.bench.catalog import OperationParameterSpec, benchmark_operation
 from vibespatial.bench.schema import (
     BenchmarkResult,
     timing_from_samples,
@@ -17,7 +17,26 @@ from vibespatial.bench.schema import (
     geometry_types=("point", "polygon"),
     default_scale=100_000,
     tier=4,
-    legacy_script="benchmark_gpu_pip.py",
+    parameters=(
+        OperationParameterSpec(
+            name="polygon_base_count",
+            value_type="int",
+            description="Base polygon fixture size before cyclic tiling to the point workload",
+            default=0,
+        ),
+        OperationParameterSpec(
+            name="hole_probability",
+            value_type="float",
+            description="Probability that a generated polygon includes an interior hole",
+            default=0.0,
+        ),
+        OperationParameterSpec(
+            name="skip_shapely",
+            value_type="bool",
+            description="Skip the Shapely baseline timing and correctness cross-check",
+            default=False,
+        ),
+    ),
     tags=("gpu", "compare"),
 )
 def bench_gpu_pip(
@@ -42,7 +61,10 @@ def bench_gpu_pip(
         OwnedGeometryArray,
         OwnedGeometryDeviceState,
     )
-    from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+    from vibespatial.kernels.predicates.point_in_polygon import (
+        get_last_gpu_substage_timings,
+        point_in_polygon,
+    )
     from vibespatial.runtime.residency import Residency
 
     if not has_gpu_runtime():
@@ -60,8 +82,18 @@ def bench_gpu_pip(
 
     fmt = InputFormat(input_format)
     points_spec = resolve_fixture_spec("point", "grid", scale)
-    polygon_base = max(scale // 8, 1)
-    polygons_spec = resolve_fixture_spec("polygon", "regular-grid", polygon_base, vertices=5)
+    polygon_base = max(int(kwargs.get("polygon_base_count", 0)) or scale // 8, 1)
+    hole_probability = float(kwargs.get("hole_probability", 0.0))
+    skip_shapely = bool(kwargs.get("skip_shapely", False))
+    if not 0.0 <= hole_probability <= 1.0:
+        raise ValueError(f"hole_probability must be within [0, 1], got {hole_probability}")
+    polygons_spec = resolve_fixture_spec(
+        "polygon",
+        "regular-grid",
+        polygon_base,
+        vertices=5,
+        hole_probability=hole_probability,
+    )
 
     points_owned, read_s1 = load_owned(points_spec, fmt)
     polygons_owned, read_s2 = load_owned(polygons_spec, fmt)
@@ -105,7 +137,9 @@ def bench_gpu_pip(
     baseline_timing = None
     speedup = None
     baseline_name = None
-    if compare == "shapely" or compare is None:
+    shapely_elapsed_seconds = None
+    shapely_true_rows = None
+    if not skip_shapely and (compare == "shapely" or compare is None):
         import shapely
 
         gdf_points, _ = load_geodataframe(points_spec, fmt)
@@ -118,21 +152,37 @@ def bench_gpu_pip(
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            shapely.covers(polys_arr, points_arr)
+            shapely_result = np.asarray(shapely.covers(polys_arr, points_arr), dtype=bool)
             shapely_times.append(perf_counter() - start)
+        shapely_elapsed_seconds = shapely_times[-1]
+        shapely_true_rows = int(np.count_nonzero(shapely_result))
         baseline_timing = timing_from_samples(shapely_times)
         baseline_name = "shapely"
 
-    # Warmup
-    point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
+    start = perf_counter()
+    cpu_result = point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.CPU)
+    cpu_elapsed_seconds = perf_counter() - start
+    cpu_values = np.asarray(cpu_result, dtype=object)
 
-    gpu_times: list[float] = []
-    for _ in range(max(1, repeat)):
-        start = perf_counter()
-        point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
-        gpu_times.append(perf_counter() - start)
+    start = perf_counter()
+    cold_gpu_result = point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
+    cold_gpu_elapsed_seconds = perf_counter() - start
+    cold_gpu_values = np.asarray(cold_gpu_result, dtype=object)
 
-    timing = timing_from_samples(gpu_times)
+    start = perf_counter()
+    warm_gpu_result = point_in_polygon(points_owned, polygons_owned, dispatch_mode=ExecutionMode.GPU)
+    warm_gpu_elapsed_seconds = perf_counter() - start
+    warm_gpu_values = np.asarray(warm_gpu_result, dtype=object)
+    gpu_substage_timings = get_last_gpu_substage_timings()
+
+    if not np.array_equal(cold_gpu_values, cpu_values):
+        raise RuntimeError("cold GPU point_in_polygon result diverged from CPU result")
+    if not np.array_equal(warm_gpu_values, cpu_values):
+        raise RuntimeError("warm GPU point_in_polygon result diverged from CPU result")
+    if shapely_true_rows is not None and int(np.count_nonzero(cpu_values == True)) != shapely_true_rows:  # noqa: E712
+        raise RuntimeError("CPU point_in_polygon result diverged from Shapely covers baseline")
+
+    timing = timing_from_samples([warm_gpu_elapsed_seconds])
     if baseline_timing and timing.median_seconds > 0:
         speedup = baseline_timing.median_seconds / timing.median_seconds
 
@@ -150,7 +200,23 @@ def bench_gpu_pip(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"repeat": repeat, "polygon_base_count": polygon_base},
+        metadata={
+            "repeat": repeat,
+            "polygon_base_count": polygon_base,
+            "hole_probability": hole_probability,
+            "skip_shapely": skip_shapely,
+            "cpu_true_rows": int(np.count_nonzero(cpu_values == True)),  # noqa: E712
+            "gpu_true_rows": int(np.count_nonzero(warm_gpu_values == True)),  # noqa: E712
+            "cpu_elapsed_seconds": cpu_elapsed_seconds,
+            "gpu_cold_elapsed_seconds": cold_gpu_elapsed_seconds,
+            "gpu_warm_elapsed_seconds": warm_gpu_elapsed_seconds,
+            "gpu_substage_timings": gpu_substage_timings,
+            "gpu_speedup_vs_cpu": (
+                cpu_elapsed_seconds / warm_gpu_elapsed_seconds if warm_gpu_elapsed_seconds else None
+            ),
+            "shapely_true_rows": shapely_true_rows,
+            "shapely_elapsed_seconds": shapely_elapsed_seconds,
+        },
     )
 
 
@@ -161,7 +227,26 @@ def bench_gpu_pip(
     geometry_types=("polygon",),
     default_scale=10_000,
     tier=3,
-    legacy_script="benchmark_binary_predicates.py",
+    parameters=(
+        OperationParameterSpec(
+            name="predicate",
+            value_type="choice",
+            description="Binary predicate to benchmark",
+            default="intersects",
+            choices=(
+                "intersects",
+                "contains",
+                "within",
+                "covers",
+                "covered_by",
+                "touches",
+                "crosses",
+                "overlaps",
+                "disjoint",
+                "equals",
+            ),
+        ),
+    ),
     tags=("gpu", "cpu", "compare"),
 )
 def bench_binary_predicates(
@@ -191,7 +276,7 @@ def bench_binary_predicates(
     right_owned, read_s2 = load_owned(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
-    predicate = "intersects"
+    predicate = kwargs.get("predicate", "intersects")
 
     evaluate_binary_predicate(predicate, left_owned, right_owned)
 
@@ -217,7 +302,7 @@ def bench_binary_predicates(
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            shapely.intersects(left_arr, right_arr)
+            getattr(shapely, predicate)(left_arr, right_arr)
             shapely_times.append(perf_counter() - start)
         baseline_timing = timing_from_samples(shapely_times)
         baseline_name = "shapely"
@@ -249,7 +334,6 @@ def bench_binary_predicates(
     geometry_types=("polygon", "point"),
     default_scale=100_000,
     tier=3,
-    legacy_script="benchmark_gpu_predicates.py",
     tags=("gpu", "compare"),
 )
 def bench_gpu_predicates(
@@ -331,7 +415,6 @@ def bench_gpu_predicates(
     geometry_types=("point", "polygon"),
     default_scale=10_000,
     tier=4,
-    legacy_script="benchmark_point_predicates.py",
     tags=("gpu", "cpu"),
 )
 def bench_point_predicates(

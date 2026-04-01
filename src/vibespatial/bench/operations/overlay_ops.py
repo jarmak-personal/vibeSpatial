@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from vibespatial.bench.catalog import benchmark_operation
+from vibespatial.bench.catalog import OperationParameterSpec, benchmark_operation
 from vibespatial.bench.schema import (
     BenchmarkResult,
     timing_from_samples,
@@ -17,7 +17,6 @@ from vibespatial.bench.schema import (
     geometry_types=("polygon",),
     default_scale=1_000,
     tier=2,
-    legacy_script="benchmark_gpu_overlay.py",
     tags=("gpu",),
     max_scale=10_000,
 )
@@ -147,7 +146,14 @@ def bench_gpu_overlay(
     geometry_types=("polygon",),
     default_scale=200,
     tier=3,
-    legacy_script="benchmark_segment_filters.py",
+    parameters=(
+        OperationParameterSpec(
+            name="tile_size",
+            value_type="int",
+            description="Tile size used for segment-level MBR filtering",
+            default=512,
+        ),
+    ),
     tags=("gpu",),
     max_scale=5_000,
 )
@@ -178,7 +184,8 @@ def bench_segment_filters(
     right_owned, read_s2 = load_owned(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
-    result = benchmark_segment_filter(left_owned, right_owned, tile_size=512)
+    tile_size = kwargs.get("tile_size", 512)
+    result = benchmark_segment_filter(left_owned, right_owned, tile_size=tile_size)
 
     timing = timing_from_samples([result.elapsed_seconds])
 
@@ -221,6 +228,7 @@ def bench_segment_filters(
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={
+            "tile_size": tile_size,
             "naive_segment_pairs": result.naive_segment_pairs,
             "filtered_segment_pairs": result.filtered_segment_pairs,
         },
@@ -234,7 +242,14 @@ def bench_segment_filters(
     geometry_types=("line",),
     default_scale=200,
     tier=3,
-    legacy_script="benchmark_segment_intersections.py",
+    parameters=(
+        OperationParameterSpec(
+            name="tile_size",
+            value_type="int",
+            description="Tile size used during segment candidate generation",
+            default=512,
+        ),
+    ),
     tags=("gpu",),
     max_scale=5_000,
 )
@@ -249,7 +264,12 @@ def bench_segment_intersections(
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import classify_segment_intersections, generate_segment_candidates
+    from vibespatial import (
+        ExecutionMode,
+        classify_segment_intersections,
+        generate_segment_candidates,
+        has_gpu_runtime,
+    )
     from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
     from vibespatial.bench.fixtures import (
         InputFormat,
@@ -258,24 +278,50 @@ def bench_segment_intersections(
     )
 
     fmt = InputFormat(input_format)
-    left_spec = resolve_fixture_spec("line", "random-walk", scale)
+    left_spec = resolve_fixture_spec("line", "grid", scale)
     right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.5, yoff=0.5, fmt=fmt)
 
     left_owned, read_s1 = load_owned(left_spec, fmt)
     right_owned, read_s2 = load_owned(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
-    candidates = generate_segment_candidates(left_owned, right_owned)
+    tile_size = kwargs.get("tile_size", 512)
+    candidates = generate_segment_candidates(left_owned, right_owned, tile_size=tile_size)
 
-    classify_segment_intersections(left_owned, right_owned, candidate_pairs=candidates)
-
-    times: list[float] = []
-    for _ in range(max(1, repeat)):
+    def _elapsed(*, dispatch_mode: ExecutionMode) -> tuple[float, dict[str, int | str]]:
         start = perf_counter()
-        classify_segment_intersections(left_owned, right_owned, candidate_pairs=candidates)
-        times.append(perf_counter() - start)
+        result = classify_segment_intersections(
+            left_owned,
+            right_owned,
+            candidate_pairs=candidates,
+            dispatch_mode=dispatch_mode,
+        )
+        elapsed = perf_counter() - start
+        return elapsed, {
+            "selected_runtime": result.runtime_selection.selected.value,
+            "candidate_pairs": int(result.candidate_pairs),
+            "proper_pairs": int((result.kinds == 1).sum()),
+            "touch_pairs": int((result.kinds == 2).sum()),
+            "overlap_pairs": int((result.kinds == 3).sum()),
+            "ambiguous_pairs": int(result.ambiguous_rows.size),
+        }
 
-    timing = timing_from_samples(times)
+    cpu_elapsed, cpu_stats = _elapsed(dispatch_mode=ExecutionMode.CPU)
+    gpu_metadata: dict[str, Any]
+    if has_gpu_runtime():
+        gpu_cold_elapsed, gpu_stats = _elapsed(dispatch_mode=ExecutionMode.GPU)
+        gpu_warm_elapsed, _ = _elapsed(dispatch_mode=ExecutionMode.GPU)
+        timing = timing_from_samples([gpu_warm_elapsed])
+        gpu_metadata = {
+            **gpu_stats,
+            "available": True,
+            "cold_elapsed_seconds": gpu_cold_elapsed,
+            "warm_elapsed_seconds": gpu_warm_elapsed,
+            "warm_speedup_vs_cpu": (cpu_elapsed / gpu_warm_elapsed) if gpu_warm_elapsed else None,
+        }
+    else:
+        timing = timing_from_samples([cpu_elapsed])
+        gpu_metadata = {"available": False}
 
     # Baseline: Shapely pairwise intersection on the same line geometries
     baseline_timing = None
@@ -313,7 +359,14 @@ def bench_segment_intersections(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"repeat": repeat},
+        metadata={
+            "repeat": repeat,
+            "tile_size": tile_size,
+            "cpu_elapsed_seconds": cpu_elapsed,
+            "cpu": cpu_stats,
+            "gpu": gpu_metadata,
+            "candidate_pairs": int(candidates.count),
+        },
     )
 
 
@@ -324,7 +377,14 @@ def bench_segment_intersections(
     geometry_types=("line",),
     default_scale=200,
     tier=3,
-    legacy_script="benchmark_segment_primitives.py",
+    parameters=(
+        OperationParameterSpec(
+            name="tile_size",
+            value_type="int",
+            description="Tile size used for the primitive benchmark",
+            default=512,
+        ),
+    ),
     tags=("gpu",),
     max_scale=5_000,
 )
@@ -348,14 +408,15 @@ def bench_segment_primitives(
     )
 
     fmt = InputFormat(input_format)
-    left_spec = resolve_fixture_spec("line", "random-walk", scale)
+    left_spec = resolve_fixture_spec("line", "grid", scale)
     right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.5, yoff=0.5, fmt=fmt)
 
     left_owned, read_s1 = load_owned(left_spec, fmt)
     right_owned, read_s2 = load_owned(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
-    result = benchmark_segment_intersections(left_owned, right_owned, tile_size=512)
+    tile_size = kwargs.get("tile_size", 512)
+    result = benchmark_segment_intersections(left_owned, right_owned, tile_size=tile_size)
 
     timing = timing_from_samples([result.elapsed_seconds])
 
@@ -397,7 +458,14 @@ def bench_segment_primitives(
         input_format=input_format,
         read_seconds=read_seconds,
         metadata={
+            "tile_size": tile_size,
+            "rows_left": result.rows_left,
+            "rows_right": result.rows_right,
             "candidate_pairs": result.candidate_pairs,
+            "disjoint_pairs": result.disjoint_pairs,
             "proper_pairs": result.proper_pairs,
+            "touch_pairs": result.touch_pairs,
+            "overlap_pairs": result.overlap_pairs,
+            "ambiguous_pairs": result.ambiguous_pairs,
         },
     )

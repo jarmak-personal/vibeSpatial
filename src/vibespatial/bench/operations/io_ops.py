@@ -17,7 +17,6 @@ from vibespatial.bench.schema import (
     geometry_types=("point", "polygon"),
     default_scale=100_000,
     tier=1,
-    legacy_script="benchmark_io_arrow.py",
     tags=("io",),
 )
 def bench_io_arrow(
@@ -94,7 +93,6 @@ def bench_io_arrow(
     geometry_types=("point",),
     default_scale=100_000,
     tier=1,
-    legacy_script="benchmark_io_file.py",
     tags=("io",),
 )
 def bench_io_file(
@@ -155,7 +153,6 @@ def bench_io_file(
     geometry_types=("point",),
     default_scale=100_000,
     tier=1,
-    legacy_script="benchmark_gpu_decode.py",
     tags=("gpu", "io"),
 )
 def bench_gpu_decode(
@@ -232,7 +229,6 @@ def bench_gpu_decode(
     geometry_types=("mixed",),
     default_scale=100_000,
     tier=3,
-    legacy_script="benchmark_mixed_layouts.py",
     tags=("layout",),
 )
 def bench_mixed_layouts(

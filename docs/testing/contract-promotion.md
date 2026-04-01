@@ -95,8 +95,8 @@ Tracked pass criteria:
 Performance watch commands:
 
 ```bash
-uv run python scripts/benchmark_bounds_pairs.py --rows 20000 --tile-size 256
-uv run python scripts/benchmark_spatial_query.py --rows 20000 --overlap-ratio 0.2
+uv run vsbench run bounds-pairs --rows 20000 --arg dataset=both --arg tile_size=256
+uv run vsbench run spatial-query --rows 20000 --arg overlap_ratio=0.2
 ```
 
 Current host baseline on this machine:
@@ -126,8 +126,8 @@ Tracked pass criteria:
 Performance watch commands:
 
 ```bash
-uv run python scripts/benchmark_clip_rect.py --kind polygon --rows 5000
-uv run python scripts/benchmark_make_valid.py --rows 10000 --invalid-every 20
+uv run vsbench run clip-rect --arg kind=polygon
+uv run vsbench run make-valid --scale 10k
 ```
 
 Current host baseline on this machine:
