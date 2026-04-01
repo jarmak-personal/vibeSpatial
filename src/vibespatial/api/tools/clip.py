@@ -15,7 +15,6 @@ from vibespatial.api.geometry_array import (
     _check_crs,
     _crs_mismatch_warn,
 )
-from vibespatial.runtime.fallbacks import strict_native_mode_enabled
 
 
 def _mask_is_list_like_rectangle(mask):
@@ -70,18 +69,11 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
     else:
         intersection_polygon = mask
 
-    if strict_native_mode_enabled():
-        candidate_rows = np.asarray(
-            gdf.sindex._tree.query(intersection_polygon, predicate="intersects"),
-            dtype=np.int32,
-        )
-        if sort:
-            candidate_rows = np.sort(candidate_rows)
-        gdf_sub = gdf.iloc[candidate_rows]
-    else:
-        gdf_sub = gdf.iloc[
-            gdf.sindex.query(intersection_polygon, predicate="intersects", sort=sort)
-        ]
+    candidate_rows = np.asarray(
+        gdf.sindex.query(intersection_polygon, predicate="intersects", sort=sort),
+        dtype=np.int32,
+    )
+    gdf_sub = gdf.iloc[candidate_rows]
 
     # For performance reasons points don't need to be intersected with poly
     non_point_mask = gdf_sub.geom_type != "Point"

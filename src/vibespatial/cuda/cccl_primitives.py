@@ -512,6 +512,34 @@ def lower_bound(
     return out
 
 
+def lower_bound_counting(
+    sorted_data: DeviceArray,
+    start: int,
+    count: int,
+    *,
+    dtype=np.int32,
+    synchronize: bool = True,
+) -> DeviceArray:
+    """Find insertion points for a lazy ``[start, start + count)`` sequence.
+
+    This avoids materializing a query array purely to drive binary search.
+    The current precompiled lower_bound fast path is array-specialized, so the
+    counting-iterator path uses the generic CCCL algorithm entry point.
+    """
+    cp_module, cccl_algorithms = _require_cccl_primitives()
+    _validate_vector("sorted_data", sorted_data)
+    out = cp_module.empty(int(count), dtype=np.uintp)
+    if int(count) == 0:
+        return out
+    query_values = counting_iterator(start=start, dtype=dtype)
+    n_sorted = int(sorted_data.size)
+    n_query = int(count)
+    cccl_algorithms.lower_bound(sorted_data, query_values, out, n_sorted, n_query)
+    if synchronize:
+        cp_module.cuda.Stream.null.synchronize()
+    return out
+
+
 def upper_bound(
     sorted_data: DeviceArray,
     query_values: DeviceArray,

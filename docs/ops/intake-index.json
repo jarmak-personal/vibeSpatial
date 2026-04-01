@@ -14999,6 +14999,23 @@
     },
     {
       "kind": "repo",
+      "path": "reports/debt-zero-working-order-2026-03-31.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "03",
+        "2026",
+        "31",
+        "debt",
+        "md",
+        "order",
+        "reports",
+        "working",
+        "zero"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "reports/dispatch-wiring-by-file-2026-03-22.md",
       "referenced_by": [],
       "symbols": [],
@@ -31997,10 +32014,9 @@
         "SegmentVerification",
         "SyntheticDataset",
         "SyntheticSpec",
-        "assert_matches_shapely"
+        "StrictApiCallResult"
       ],
       "tokens": [
-        "assert",
         "clipexpectation",
         "clipverification",
         "corpus",
@@ -32013,7 +32029,6 @@
         "guard",
         "init",
         "layoutbenchmarkresult",
-        "matches",
         "mixes",
         "oracle",
         "oracleassertionerror",
@@ -32031,8 +32046,8 @@
         "scenarios",
         "segmentexpectation",
         "segmentverification",
-        "shapely",
         "src",
+        "strictapicallresult",
         "syntheticdataset",
         "syntheticspec",
         "testing",
@@ -32344,6 +32359,58 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/testing/runtime_harness.py",
+      "referenced_by": [],
+      "symbols": [
+        "cuda_runtime_available",
+        "normalize_dispatch_modes",
+        "resolve_dispatch_modes"
+      ],
+      "tokens": [
+        "available",
+        "cuda",
+        "dispatch",
+        "harness",
+        "modes",
+        "normalize",
+        "py",
+        "resolve",
+        "runtime",
+        "src",
+        "testing",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/testing/strict_native.py",
+      "referenced_by": [],
+      "symbols": [
+        "StrictApiCallResult",
+        "StrictApiMatrixReport",
+        "capture_strict_api_call",
+        "run_strict_api_matrix",
+        "strict_native_environment"
+      ],
+      "tokens": [
+        "api",
+        "call",
+        "capture",
+        "environment",
+        "matrix",
+        "native",
+        "py",
+        "run",
+        "src",
+        "strict",
+        "strictapicallresult",
+        "strictapimatrixreport",
+        "testing",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/testing/synthetic.py",
       "referenced_by": [
         "docs/testing/synthetic-data.md"
@@ -32406,28 +32473,6 @@
       "tokens": [
         "init",
         "py",
-        "tests"
-      ]
-    },
-    {
-      "kind": "test",
-      "path": "tests/_runtime_harness.py",
-      "referenced_by": [],
-      "symbols": [
-        "cuda_runtime_available",
-        "normalize_dispatch_modes",
-        "resolve_dispatch_modes"
-      ],
-      "tokens": [
-        "available",
-        "cuda",
-        "dispatch",
-        "harness",
-        "modes",
-        "normalize",
-        "py",
-        "resolve",
-        "runtime",
         "tests"
       ]
     },
@@ -33158,11 +33203,13 @@
         "test_three_way_partition_splits_correctly",
         "test_three_way_partition_empty",
         "test_counting_iterator_returns_iterator_object",
-        "test_transform_iterator_returns_iterator_object"
+        "test_transform_iterator_returns_iterator_object",
+        "test_lower_bound_counting_matches_materialized_queries"
       ],
       "tokens": [
         "auto",
         "back",
+        "bound",
         "cccl",
         "compact",
         "complex",
@@ -33181,7 +33228,9 @@
         "iterator",
         "keeps",
         "keys",
+        "lower",
         "matches",
+        "materialized",
         "merge",
         "numeric",
         "numpy",
@@ -33191,6 +33240,7 @@
         "prefix",
         "primitives",
         "py",
+        "queries",
         "radix",
         "returns",
         "route",
@@ -40142,22 +40192,56 @@
       "path": "tests/test_strict_native_mode.py",
       "referenced_by": [],
       "symbols": [
+        "_build_viewport_fixture",
+        "_load_viewport_fixture",
+        "_viewport_call_matrix",
         "test_strict_native_mode_disabled_by_default",
-        "test_record_fallback_event_raises_in_strict_native_mode"
+        "test_record_fallback_event_raises_in_strict_native_mode",
+        "test_strict_viewport_matrix_documents_current_public_api_behavior",
+        "test_strict_clip_box_line_fixture_routes_through_public_sindex_query_without_strtree",
+        "test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_intersection_fallback",
+        "test_strict_api_matrix_report_is_structured_by_surface"
       ],
       "tokens": [
+        "api",
+        "before",
+        "behavior",
+        "box",
+        "build",
+        "call",
+        "clip",
+        "current",
         "default",
         "disabled",
+        "documents",
         "event",
         "fallback",
+        "fixture",
+        "intersection",
+        "line",
+        "load",
+        "matrix",
+        "mixed",
         "mode",
         "native",
+        "public",
         "py",
+        "query",
         "raises",
+        "reaches",
         "record",
+        "report",
+        "routes",
+        "sindex",
         "strict",
+        "strtree",
+        "structured",
+        "surface",
         "test",
-        "tests"
+        "tests",
+        "through",
+        "viewport",
+        "without"
       ]
     },
     {

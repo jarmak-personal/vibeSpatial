@@ -16,6 +16,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.cuda.cccl_precompile import request_warmup
+from vibespatial.cuda.cccl_primitives import lower_bound_counting
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -30,6 +32,23 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+
+request_warmup(["lower_bound_i32"])
+
+
+if cp is not None:
+    _EXTERIOR_GATHER_INDEX = cp.ElementwiseKernel(
+        "int32 geom_id, raw int32 ring_starts, raw int32 out_geom_offsets",
+        "int32 gather_idx",
+        """
+        const int row = static_cast<int>(geom_id);
+        gather_idx = ring_starts[row] + (static_cast<int>(i) - out_geom_offsets[row]);
+        """,
+        "vibespatial_exterior_gather_index",
+    )
+else:  # pragma: no cover - CPU-only install
+    _EXTERIOR_GATHER_INDEX = None
+
 
 # ---------------------------------------------------------------------------
 # GPU implementation
@@ -87,16 +106,17 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     if total_coords == 0:
         return from_shapely_geometries([None] * owned.row_count)
 
-    # Build gather index map on device via searchsorted:
+    # Build gather index map on device via lower_bound:
     # Map each output position to its owning geometry, then compute the
     # source coordinate index.  This is robust to zero-length segments
     # (degenerate rings) since no output position maps to an empty segment.
-    # TODO: Replace cp.arange + cp.searchsorted with CCCL lower_bound +
-    # CountingIterator to avoid materializing the full d_positions array
-    # (ADR-0033 Tier 3c opportunity).
-    d_positions = cp.arange(total_coords, dtype=cp.int32)
-    d_geom_ids = cp.searchsorted(d_out_geom_offsets[1:], d_positions, side="right")
-    d_idx = d_ring_starts[d_geom_ids] + (d_positions - d_out_geom_offsets[d_geom_ids])
+    d_geom_ids = lower_bound_counting(
+        d_out_geom_offsets[1:],
+        0,
+        total_coords,
+        dtype=np.int32,
+    ).astype(cp.int32, copy=False)
+    d_idx = _EXTERIOR_GATHER_INDEX(d_geom_ids, d_ring_starts, d_out_geom_offsets)
 
     # Gather coordinates on device (no host round-trip)
     d_x_out = d_poly.x[d_idx]

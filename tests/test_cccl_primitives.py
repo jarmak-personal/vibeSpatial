@@ -11,6 +11,8 @@ from vibespatial.cuda.cccl_primitives import (
     counting_iterator,
     exclusive_sum,
     has_cccl_primitives,
+    lower_bound,
+    lower_bound_counting,
     segmented_sort,
     select_pair_sort_strategy,
     sort_pairs,
@@ -206,3 +208,14 @@ def test_transform_iterator_returns_iterator_object() -> None:
 
     it = transform_iterator(arr, double)
     assert it is not None
+
+
+def test_lower_bound_counting_matches_materialized_queries() -> None:
+    cp = _cupy()
+    sorted_data = cp.asarray([2, 5, 5, 9, 14], dtype=cp.int32)
+    query_values = cp.arange(0, 12, dtype=cp.int32)
+
+    materialized = lower_bound(sorted_data, query_values)
+    counted = lower_bound_counting(sorted_data, 0, int(query_values.size), dtype=np.int32)
+
+    np.testing.assert_array_equal(counted.get(), materialized.get())

@@ -3,16 +3,17 @@ from __future__ import annotations
 import pytest
 
 import vibespatial.api as geopandas
-from tests._runtime_harness import cuda_runtime_available, resolve_dispatch_modes
 from vibespatial import ExecutionMode
 from vibespatial.testing import (
     SyntheticSpec,
     assert_matches_shapely,
+    cuda_runtime_available,
     device_residency_guard,
     generate_lines,
     generate_points,
     generate_polygons,
     get_oracle_config,
+    resolve_dispatch_modes,
 )
 
 

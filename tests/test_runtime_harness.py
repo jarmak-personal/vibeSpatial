@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from tests._runtime_harness import (
+from vibespatial import ExecutionMode
+from vibespatial import runtime as runtime_module
+from vibespatial.runtime import _runtime as _runtime_impl
+from vibespatial.testing import (
     cuda_runtime_available,
     normalize_dispatch_modes,
     resolve_dispatch_modes,
 )
-from vibespatial import ExecutionMode
-from vibespatial import runtime as runtime_module
-from vibespatial.runtime import _runtime as _runtime_impl
 
 
 def test_cuda_runtime_available_returns_bool() -> None:
