@@ -1136,9 +1136,13 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     # Post-difference make_valid: use GPU path when owned backing is
     # available to avoid Shapely materialisation on the critical path.
     differences = _make_valid_geoseries(differences)
-    non_empty = ~differences.is_empty
-    geom_diff = differences[non_empty].copy()
-    dfdiff = df1[non_empty].copy()
+    empty_mask = differences.is_empty
+    if empty_mask.any():
+        differences = differences.copy()
+        differences.loc[empty_mask] = None
+    keep_rows = ~empty_mask
+    geom_diff = differences[keep_rows].copy()
+    dfdiff = df1[keep_rows].copy()
     geo_col = dfdiff._geometry_column_name
     # Use set_geometry to replace the geometry column while preserving
     # owned backing and the original geometry column name.  The plain
@@ -1505,7 +1509,9 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
         elif how == "union":
             result, _used_owned = _overlay_union(df1, df2, left_owned, right_owned)
         elif how == "identity":
-            result, _used_owned = _overlay_identity(df1, df2, left_owned, right_owned)
+            result, _used_owned = _overlay_identity(
+                df1, df2, left_owned, right_owned,
+            )
 
         if how in ["intersection", "symmetric_difference", "union", "identity"]:
             result.drop(["__idx1", "__idx2"], axis=1, inplace=True)
@@ -1597,9 +1603,12 @@ def _collection_extract_owned(df, geom_type, keep_geom_type_warning):
             stacklevel=2,
         )
 
-    # Also drop null rows (tags == NULL_TAG) to match the Shapely-path
-    # behaviour where geom_type.isin() returns False for None geometries.
-    keep_mask &= owned.validity
+    # Preserve null geometries only on the default keep_geom_type=None path,
+    # which historically keeps bookkeeping rows that later warning-based
+    # filtering may expose.  Explicit keep_geom_type=True should continue to
+    # behave strictly and drop missing-geometry rows.
+    if keep_geom_type_warning:
+        keep_mask |= ~owned.validity
 
     if keep_mask.all():
         return df
@@ -1666,7 +1675,10 @@ def _collection_extract(df, geom_type, keep_geom_type_warning):
     # them out is probably more expensive as simply including them when this
     # is typically about only a few rows)
     orig_num_geoms = result.shape[0]
-    result = result.loc[result.geom_type.isin(geom_types)]
+    geom_keep_mask = result.geom_type.isin(geom_types)
+    if keep_geom_type_warning:
+        geom_keep_mask = geom_keep_mask | result.geometry.isna()
+    result = result.loc[geom_keep_mask]
     num_dropped = orig_num_geoms - result.shape[0]
 
     if (num_dropped > 0 or num_dropped_collection > 0) and keep_geom_type_warning:

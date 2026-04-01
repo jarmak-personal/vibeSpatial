@@ -65,6 +65,7 @@ from .query_utils import (  # noqa: F401
     _gpu_bounds_dispatch_mode,
     _indices_to_dense,
     _indices_to_sparse,
+    _reorder_scalar_tree_matches,
     _sort_indices,
     _to_owned,
     supports_owned_spatial_input,
@@ -681,6 +682,11 @@ def query_spatial_index(
         return (device_result, execution) if return_metadata else device_result
 
     if scalar:
+        if not sort:
+            right_idx = _reorder_scalar_tree_matches(
+                right_idx.astype(np.intp, copy=False),
+                flat_index.order,
+            )
         indices = right_idx.astype(np.intp, copy=False)
     else:
         indices = np.vstack(

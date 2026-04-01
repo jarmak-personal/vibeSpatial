@@ -41,9 +41,11 @@ from vibespatial import (
     select_row_groups,
     write_geoparquet,
 )
+from vibespatial.api.geometry_array import to_wkb as array_to_wkb
 from vibespatial.constructive.point import clip_points_rect_owned
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import DiagnosticKind, from_shapely_geometries
+from vibespatial.io.wkb import encode_owned_wkb_device
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 
@@ -611,6 +613,68 @@ def test_encode_owned_geoarrow_array_roundtrips_point_family() -> None:
     assert restored.to_shapely()[1].equals(Point(1, 1))
 
 
+def test_decode_geoarrow_point_nan_nan_roundtrips_empty_point() -> None:
+    import pyarrow as pa
+
+    arr = pa.StructArray.from_arrays(
+        [
+            pa.array([0.0, np.nan, None, 1.0], type=pa.float64()),
+            pa.array([0.0, np.nan, None, 1.0], type=pa.float64()),
+        ],
+        fields=[
+            pa.field("x", pa.float64(), nullable=False),
+            pa.field("y", pa.float64(), nullable=False),
+        ],
+        mask=pa.array([False, False, True, False], type=pa.bool_()),
+    )
+    field = pa.field(
+        "geometry",
+        arr.type,
+        metadata={b"ARROW:extension:name": b"geoarrow.point", b"ARROW:extension:metadata": b"{}"},
+    )
+
+    restored = io_arrow._decode_geoarrow_array_to_owned(field, arr).to_shapely()
+
+    assert restored[0].equals(Point(0, 0))
+    assert restored[1].is_empty
+    assert restored[2] is None
+    assert restored[3].equals(Point(1, 1))
+
+
+def test_encode_wkb_owned_preserves_empty_point_rows() -> None:
+    import shapely
+
+    owned = from_shapely_geometries([Point(0, 0), Point(), None, Point(1, 1)])
+
+    encoded = encode_wkb_owned(owned)
+    restored = [shapely.from_wkb(value) if value is not None else None for value in encoded]
+
+    assert restored[0].equals(Point(0, 0))
+    assert restored[1].is_empty
+    assert restored[2] is None
+    assert restored[3].equals(Point(1, 1))
+
+
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+def test_encode_owned_wkb_device_preserves_empty_point_rows() -> None:
+    import pyarrow as pa
+    import shapely
+
+    owned = from_shapely_geometries([Point(0, 0), Point(), None, Point(1, 1)])
+
+    column = encode_owned_wkb_device(owned)
+    arrow = column.to_arrow().cast(pa.binary())
+    restored = [
+        shapely.from_wkb(value.as_py()) if value.as_py() is not None else None
+        for value in arrow
+    ]
+
+    assert restored[0].equals(Point(0, 0))
+    assert restored[1].is_empty
+    assert restored[2] is None
+    assert restored[3].equals(Point(1, 1))
+
+
 def test_encode_owned_geoarrow_array_roundtrips_polygon_family() -> None:
     polygon = Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])
     owned = from_shapely_geometries([polygon, polygon.buffer(1)])
@@ -668,6 +732,17 @@ def test_geodataframe_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
 
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.point"
     assert geopandas.get_fallback_events(clear=True) == []
+
+
+def test_geodataframe_to_arrow_geoarrow_rejects_empty_or_all_missing_geometry() -> None:
+    empty = geopandas.GeoDataFrame(columns=["value", "geometry"], geometry="geometry")
+    all_missing = geopandas.GeoDataFrame({"value": [1], "geometry": [None]}, geometry="geometry")
+
+    with pytest.raises(NotImplementedError, match="infer the geometry type"):
+        io_arrow.geodataframe_to_arrow(empty, geometry_encoding="geoarrow")
+
+    with pytest.raises(NotImplementedError, match="infer the geometry type"):
+        io_arrow.geodataframe_to_arrow(all_missing, geometry_encoding="geoarrow")
 
 
 def test_native_geometry_benchmark_reports_host_and_native_paths() -> None:
@@ -843,6 +918,100 @@ def test_write_geoparquet_roundtrips_point_wkb(tmp_path) -> None:
 
 
 @pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+def test_write_geoparquet_falls_back_for_unsupported_device_compression(tmp_path) -> None:
+    geopandas.clear_fallback_events()
+    pts = [Point(i, i * 2) for i in range(5)]
+    gdf = _make_dga_gdf(pts)
+    path = tmp_path / "pts_gzip.parquet"
+
+    write_geoparquet(gdf, path, compression="gzip")
+    result = geopandas.read_parquet(path)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert any("compression codec" in event.reason for event in fallbacks)
+    for i, pt in enumerate(pts):
+        assert result.geometry.iloc[i].equals(pt)
+
+
+def test_read_geoparquet_restores_named_index_from_parquet_metadata(tmp_path) -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "iso": ["AAA", "BBB", "CCC"],
+            "value": [1, 2, 3],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)],
+        },
+        crs="EPSG:4326",
+    ).set_index("iso")
+    path = tmp_path / "indexed.parquet"
+
+    gdf.to_parquet(path, index=True)
+    result = geopandas.read_parquet(path)
+
+    assert result.index.name == "iso"
+    assert list(result.index) == ["AAA", "BBB", "CCC"]
+    assert list(result.columns) == ["value", "geometry"]
+    for left, right in zip(gdf.geometry, result.geometry, strict=True):
+        assert left.equals(right)
+
+
+def test_to_wkb_accepts_device_geometry_array_values() -> None:
+    gdf = geopandas.GeoDataFrame(
+        {"geometry": [Point(0, 0), Point(1, 1), None]},
+        crs="EPSG:4326",
+    )
+
+    values = array_to_wkb(gdf.geometry.values)
+
+    assert values[0] == Point(0, 0).wkb
+    assert values[1] == Point(1, 1).wkb
+    assert values[2] is None
+
+
+def test_read_parquet_partitioned_directory_recovers_fragment_geo_metadata(tmp_path) -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2, 3, 4],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        },
+        crs="EPSG:4326",
+    )
+    basedir = tmp_path / "partitioned_dataset"
+    basedir.mkdir()
+
+    gdf.iloc[:2].to_parquet(basedir / "part1.parquet")
+    gdf.iloc[2:].to_parquet(basedir / "part2.parquet")
+    result = geopandas.read_parquet(basedir)
+
+    assert list(result["value"]) == [1, 2, 3, 4]
+    assert result.crs == gdf.crs
+    for left, right in zip(gdf.geometry, result.geometry, strict=True):
+        assert left.equals(right)
+
+
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+def test_device_backed_to_parquet_preserves_arrow_schema_metadata(tmp_path) -> None:
+    import pyarrow.parquet as pq
+
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+    path = tmp_path / "device-backed.parquet"
+
+    gdf.to_parquet(path, write_covering_bbox=True)
+    table = pq.read_table(path)
+
+    assert table.schema.metadata is not None
+    assert b"geo" in table.schema.metadata
+    assert b"pandas" in table.schema.metadata
+
+
+def test_native_to_parquet_rejects_existing_bbox_column(tmp_path) -> None:
+    gdf = _make_dga_gdf([Point(0, 0), Point(1, 1)])
+    gdf = gdf.assign(bbox=[0, 0])
+
+    with pytest.raises(ValueError, match="An existing column 'bbox' already exists in the dataframe"):
+        gdf.to_parquet(tmp_path / "existing-bbox.parquet", write_covering_bbox=True)
+
+
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_write_geoparquet_roundtrips_polygon_geoarrow(tmp_path) -> None:
     """Polygon DGA → GeoArrow write → read roundtrip."""
     polys = [Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)]) for i in range(4)]
@@ -929,6 +1098,19 @@ def test_wkb_encode_from_owned_buffers_point() -> None:
     assert wkb_type == 1
     assert x == 1.5
     assert y == 2.5
+
+
+def test_wkb_encode_from_owned_buffers_point_preserves_empty_rows() -> None:
+    import shapely
+
+    owned = from_shapely_geometries([Point(0, 0), Point(), None, Point(1, 1)])
+    _field, arr = io_arrow._encode_owned_wkb_array(owned, field_name="g", crs=None)
+    restored = [shapely.from_wkb(value.as_py()) if value.as_py() is not None else None for value in arr]
+
+    assert restored[0].equals(Point(0, 0))
+    assert restored[1].is_empty
+    assert restored[2] is None
+    assert restored[3].equals(Point(1, 1))
 
 
 def test_wkb_encode_from_owned_buffers_polygon() -> None:

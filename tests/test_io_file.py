@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
@@ -13,6 +15,8 @@ from vibespatial import (
     read_geojson_owned,
     read_shapefile_owned,
 )
+from vibespatial.geometry.device_array import DeviceGeometryArray
+from vibespatial.geometry.owned import from_shapely_geometries
 
 
 def _sample_frame() -> geopandas.GeoDataFrame:
@@ -60,6 +64,52 @@ def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     assert result.geometry.iloc[1].equals(frame.geometry.iloc[1])
     assert "gpu" in events[-1].implementation.lower()
     assert not fallbacks
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_pyogrio_shapefile_write_passes_explicit_geometry_type_for_null_rows(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    owned = from_shapely_geometries([None, LineString([(0, 0), (1, 1)])])
+    geometry = geopandas.GeoSeries(DeviceGeometryArray._from_owned(owned), crs="EPSG:4326")
+    frame = geopandas.GeoDataFrame({"name": ["null", "line"], "geometry": geometry}, crs="EPSG:4326")
+    path = tmp_path / "null_geom.shp"
+    captured: dict[str, object] = {}
+    real_write_dataframe = pyogrio.write_dataframe
+
+    def capture_write_dataframe(df, filename, *args, **kwargs):
+        captured["geometry_type"] = kwargs.get("geometry_type")
+        return real_write_dataframe(df, filename, *args, **kwargs)
+
+    monkeypatch.setattr(pyogrio, "write_dataframe", capture_write_dataframe)
+
+    frame.to_file(path, driver="ESRI Shapefile", engine="pyogrio")
+    result = geopandas.read_file(path, engine="pyogrio")
+
+    assert captured["geometry_type"] == "LineString"
+    assert frame.geometry.dtype.name == "device_geometry"
+    assert len(result) == 2
+    assert result.geometry.iloc[0] is None
+    assert result.geometry.iloc[1].equals(LineString([(0, 0), (1, 1)]))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_pyogrio_write_preserves_geometry_alignment_for_sparse_indexes(tmp_path) -> None:
+    import pandas as pd
+
+    geometry = geopandas.GeoSeries([Point(i, i) for i in range(10)], crs="EPSG:4326")
+    frame = geopandas.GeoDataFrame({"geometry": geometry})
+    frame["data"] = pd.array([1, None] * 5, dtype=pd.Int32Dtype())
+    filtered = frame.dropna()
+    path = tmp_path / "sparse-index.gmt"
+
+    filtered.to_file(path, driver="OGR_GMT", engine="pyogrio")
+    result = geopandas.read_file(path, engine="pyogrio")
+
+    assert len(result) == len(filtered)
+    assert result["data"].tolist() == [1] * len(filtered)
+    for left, right in zip(filtered.geometry, result.geometry, strict=True):
+        assert right.equals(left)
 
 
 def test_plan_shapefile_ingest_uses_arrow_wkb_owned_path() -> None:

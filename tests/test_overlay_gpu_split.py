@@ -4,7 +4,7 @@ from collections import Counter
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, box
 
 from vibespatial import (
     ExecutionMode,
@@ -58,7 +58,7 @@ def test_gpu_split_events_and_atomic_edges_for_touch_and_overlap() -> None:
     overlap_events = build_gpu_split_events(overlap_left, overlap_right, dispatch_mode=ExecutionMode.GPU)
     overlap_edges = build_gpu_atomic_edges(overlap_events)
     assert _group_point_counts(overlap_events.source_segment_ids) == Counter({0: 3, 1: 3})
-    assert overlap_edges.count == 8
+    assert overlap_edges.count == 6
     assert np.allclose(overlap_events.x[:3], [0.0, 2.0, 5.0])
     assert np.allclose(overlap_events.x[3:], [2.0, 5.0, 7.0])
     assert np.allclose(overlap_events.y, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -86,3 +86,27 @@ def test_gpu_split_events_preserve_polygon_hole_ring_metadata() -> None:
     assert atomic_edges.count > 0
     assert all(event.kind.value != "materialization" for event in left.diagnostics)
     assert all(event.kind.value != "materialization" for event in right.diagnostics)
+
+
+@pytest.mark.gpu
+def test_gpu_atomic_edges_collapse_duplicate_overlap_segments() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries([box(0, 5, 2, 7)])
+    right = from_shapely_geometries([box(1, 5, 3, 7)])
+
+    split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
+    atomic_edges = build_gpu_atomic_edges(split_events)
+
+    forward_mask = atomic_edges.direction == 0
+    forward_segments = np.column_stack(
+        (
+            atomic_edges.src_x[forward_mask],
+            atomic_edges.src_y[forward_mask],
+            atomic_edges.dst_x[forward_mask],
+            atomic_edges.dst_y[forward_mask],
+        )
+    )
+    assert atomic_edges.count == 20
+    assert np.unique(np.round(forward_segments, 12), axis=0).shape[0] == forward_segments.shape[0]

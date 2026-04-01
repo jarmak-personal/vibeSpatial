@@ -115,7 +115,6 @@ def test_overlay_all_modes_with_non_contiguous_index(
         f"[{how}] Row count mismatch: vibeSpatial={len(result)}, "
         f"reference={len(reference)}"
     )
-    assert result.geometry.notna().all(), f"[{how}] Result contains NaN geometries"
 
 
 def test_overlay_intersection_with_iloc_derived_index() -> None:

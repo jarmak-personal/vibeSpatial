@@ -23,6 +23,7 @@ __device__ inline void write_f64_le(unsigned char* dst, double value) {
 __global__ void write_point_wkb(
     const int* row_indexes,
     const int* family_rows,
+    const int* geometry_offsets,
     const double* x,
     const double* y,
     const int* row_offsets,
@@ -33,11 +34,20 @@ __global__ void write_point_wkb(
     if (tid >= count) return;
     int row = row_indexes[tid];
     int family_row = family_rows[tid];
+    int start = geometry_offsets[family_row];
+    int stop = geometry_offsets[family_row + 1];
     unsigned char* out = payload + row_offsets[row];
     out[0] = 1;
     write_u32_le(out + 1, 1u);
-    write_f64_le(out + 5, x[family_row]);
-    write_f64_le(out + 13, y[family_row]);
+    if (stop == start) {
+        unsigned long long nan_bits = 0x7ff8000000000000ull;
+        double nan_value = *reinterpret_cast<double*>(&nan_bits);
+        write_f64_le(out + 5, nan_value);
+        write_f64_le(out + 13, nan_value);
+        return;
+    }
+    write_f64_le(out + 5, x[start]);
+    write_f64_le(out + 13, y[start]);
 }
 
 __global__ void write_linestring_wkb(

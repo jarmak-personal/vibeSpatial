@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
+import shapely
 
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -35,6 +36,16 @@ from .owned import (
 logger = logging.getLogger(__name__)
 
 _EQUALS_EXACT_GPU_THRESHOLD = 1000
+
+
+def requires_mixed_family_topology_fallback(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> bool:
+    valid_pairs = np.asarray(left.validity & right.validity, dtype=bool)
+    if not valid_pairs.any():
+        return False
+    return bool(np.any(left.tags[valid_pairs] != right.tags[valid_pairs]))
 
 
 def geom_equals_exact_owned(
@@ -237,8 +248,9 @@ def geom_equals_owned(
 ) -> np.ndarray:
     """Element-wise topological geometry equality.
 
-    Topological equality = structural equality after normalization.
-    Composes ``normalize_owned`` + ``geom_equals_exact_owned(tolerance=1e-12)``.
+    For same-family pairs, topological equality is implemented as structural
+    equality after normalization. Mixed-family valid pairs, such as ``Polygon``
+    vs single-part ``MultiPolygon``, require the full Shapely topology path.
 
     Both sub-operations have GPU paths, so the full pipeline runs on device
     when GPU is available.  Zero D2H transfers until the final bool array
@@ -251,9 +263,21 @@ def geom_equals_owned(
     if row_count != right.row_count:
         raise ValueError(
             f"left and right must have same row count, got {row_count} vs {right.row_count}"
-        )
+    )
     if row_count == 0:
         return np.empty(0, dtype=bool)
+    if requires_mixed_family_topology_fallback(left, right):
+        record_dispatch_event(
+            surface="geom_equals",
+            operation="geom_equals",
+            implementation="shapely_mixed_family_topology",
+            reason="mixed valid geometry families require full topological equality",
+            detail=f"rows={row_count}",
+            selected=ExecutionMode.CPU,
+        )
+        left_geoms = np.asarray(left.to_shapely(), dtype=object)
+        right_geoms = np.asarray(right.to_shapely(), dtype=object)
+        return shapely.equals(left_geoms, right_geoms).astype(bool, copy=False)
 
     from vibespatial.constructive.normalize import normalize_owned
 

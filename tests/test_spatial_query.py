@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from shapely.geometry import Point, box
+from shapely.geometry import LineString, Point, box
 
 import vibespatial.spatial.nearest as spatial_nearest_module
 import vibespatial.spatial.query as spatial_query_module
@@ -34,6 +34,57 @@ def test_query_spatial_index_supports_dwithin() -> None:
     indices = query_spatial_index(owned, flat, query, predicate="dwithin", distance=5.0, sort=True)
 
     assert indices.tolist() == [[0, 1], [0, 2]]
+
+
+def test_query_spatial_index_scalar_sort_false_preserves_flat_index_order() -> None:
+    tree = np.asarray(
+        [box(10, 0, 11, 1), box(0, 0, 1, 1), box(5, 0, 6, 1)],
+        dtype=object,
+    )
+    query = box(-1, -1, 20, 2)
+    owned, flat = build_owned_spatial_index(tree)
+
+    unsorted = query_spatial_index(owned, flat, query, predicate="intersects", sort=False)
+    sorted_indices = query_spatial_index(owned, flat, query, predicate="intersects", sort=True)
+    expected_unsorted = flat.query_bounds(query.bounds)
+
+    assert unsorted.tolist() == expected_unsorted.tolist()
+    assert sorted_indices.tolist() == [0, 1, 2]
+    assert unsorted.tolist() != sorted_indices.tolist()
+
+
+def test_query_spatial_index_line_polygon_boundary_overlap_matches_strtree() -> None:
+    from shapely.strtree import STRtree
+
+    tree = np.asarray(
+        [
+            box(1, 1, 3, 3),
+            box(3, 3, 5, 5),
+        ],
+        dtype=object,
+    )
+    query = np.asarray(
+        [
+            LineString([(2, 0), (2, 4), (6, 4)]),
+            LineString([(0, 3), (6, 3)]),
+        ],
+        dtype=object,
+    )
+    owned, flat = build_owned_spatial_index(tree)
+
+    result, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="intersects",
+        sort=True,
+        return_metadata=True,
+    )
+    reference = STRtree(tree).query(query, predicate="intersects")
+
+    assert result.tolist() == reference.tolist() == [[0, 0, 1, 1], [0, 1, 0, 1]]
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")

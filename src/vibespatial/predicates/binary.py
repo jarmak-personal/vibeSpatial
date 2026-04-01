@@ -1323,7 +1323,10 @@ def _evaluate_geopandas_equals(
     For scalar right operands, falls back to Shapely's vectorized C path
     to avoid O(N) Python-side geometry duplication.
     """
-    from vibespatial.geometry.equality import geom_equals_owned
+    from vibespatial.geometry.equality import (
+        geom_equals_owned,
+        requires_mixed_family_topology_fallback,
+    )
     from vibespatial.runtime import get_requested_mode
 
     # Scalar right: fall back to Shapely vectorized equals which
@@ -1366,16 +1369,25 @@ def _evaluate_geopandas_equals(
         right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
 
     dispatch_mode = get_requested_mode()
+    mixed_family_fallback = requires_mixed_family_topology_fallback(left_owned, right_owned)
     result = geom_equals_owned(
         left_owned, right_owned, dispatch_mode=dispatch_mode,
     )
     record_dispatch_event(
         surface="geopandas.array.equals",
         operation="equals",
-        implementation="geom_equals_owned",
-        reason="normalize-then-compare composition for topological equality",
+        implementation=(
+            "shapely_mixed_family_topology"
+            if mixed_family_fallback
+            else "geom_equals_owned"
+        ),
+        reason=(
+            "mixed valid geometry families require full topological equality"
+            if mixed_family_fallback
+            else "normalize-then-compare composition for topological equality"
+        ),
         detail=f"rows={left_owned.row_count}",
-        selected=dispatch_mode,
+        selected=ExecutionMode.CPU if mixed_family_fallback else dispatch_mode,
     )
     return result.astype(bool, copy=False)
 

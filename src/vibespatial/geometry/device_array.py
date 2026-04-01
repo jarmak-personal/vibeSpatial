@@ -377,7 +377,13 @@ class DeviceGeometryArray(ExtensionArray):
         """
         from vibespatial.constructive.validity import is_valid_owned
 
-        return is_valid_owned(self._owned)
+        result = np.asarray(is_valid_owned(self._owned), dtype=bool)
+        if not bool(np.all(self._owned.validity)):
+            # GeoPandas-facing is_valid treats missing rows as False even though
+            # the owned structural-validity helper treats null slots as valid.
+            result = result.copy()
+            result[~self._owned.validity] = False
+        return result
 
     @property
     def is_simple(self) -> np.ndarray:

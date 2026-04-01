@@ -91,3 +91,31 @@ def test_gpu_face_labeling_preserves_hole_semantics() -> None:
     assert (1, 1) in labels
     assert (0, 1) in labels
     assert np.all(np.abs(faces.signed_area[bounded]) > 1e-12)
+
+
+@pytest.mark.gpu
+def test_gpu_face_labels_include_overlap_band_for_collinear_rectangle_overlap() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left_polygon = Polygon([(0, 5), (2, 5), (2, 7), (0, 7), (0, 5)])
+    right_polygon = Polygon([(1, 5), (3, 5), (3, 7), (1, 7), (1, 5)])
+
+    _, _, _, atomic_edges, graph, faces = _build_face_table([left_polygon], [right_polygon])
+
+    assert graph.edge_count == atomic_edges.count
+    bounded = faces.bounded_mask.astype(bool, copy=False)
+    positive_areas = np.sort(np.round(faces.signed_area[bounded], 6))
+    assert np.array_equal(positive_areas, np.asarray([2.0, 2.0, 2.0], dtype=np.float64))
+
+    labels = {
+        (int(left_value), int(right_value))
+        for left_value, right_value, bounded_value in zip(
+            faces.left_covered,
+            faces.right_covered,
+            faces.bounded_mask,
+            strict=True,
+        )
+        if int(bounded_value) != 0
+    }
+    assert labels == {(1, 0), (1, 1), (0, 1)}

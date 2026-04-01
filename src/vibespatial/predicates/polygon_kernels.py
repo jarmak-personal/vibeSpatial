@@ -416,6 +416,33 @@ extern "C" __device__ inline unsigned short de9im_line_polygon(
               mask |= DE9IM_II | DE9IM_IB;
               goto lp_crossing_done;
             }
+            // Collinear positive-length overlap with a polygon boundary
+            // segment contributes Interior(line) ∩ Boundary(polygon).
+            // Vertex-only classification misses this when a single line
+            // segment straddles the polygon edge with both endpoints outside.
+            const double q1x = bx[bi - 1], q1y = by[bi - 1];
+            const double q2x = bx[bi],     q2y = by[bi];
+            const double d1 = (q2x - q1x) * (l1y - q1y) - (q2y - q1y) * (l1x - q1x);
+            const double d2 = (q2x - q1x) * (l2y - q1y) - (q2y - q1y) * (l2x - q1x);
+            const double scale = fabs(q2x - q1x) + fabs(q2y - q1y)
+                               + fabs(l2x - l1x) + fabs(l2y - l1y) + 1.0;
+            if (fabs(d1) <= 1e-12 * scale && fabs(d2) <= 1e-12 * scale) {
+              double llo, lhi, qlo, qhi;
+              if (fabs(l2x - l1x) + fabs(q2x - q1x)
+                  >= fabs(l2y - l1y) + fabs(q2y - q1y)) {
+                llo = l1x < l2x ? l1x : l2x; lhi = l1x > l2x ? l1x : l2x;
+                qlo = q1x < q2x ? q1x : q2x; qhi = q1x > q2x ? q1x : q2x;
+              } else {
+                llo = l1y < l2y ? l1y : l2y; lhi = l1y > l2y ? l1y : l2y;
+                qlo = q1y < q2y ? q1y : q2y; qhi = q1y > q2y ? q1y : q2y;
+              }
+              const double overlap_lo = llo > qlo ? llo : qlo;
+              const double overlap_hi = lhi < qhi ? lhi : qhi;
+              const double axis_scale = fabs(lhi - llo) + fabs(qhi - qlo) + 1.0;
+              if (overlap_hi - overlap_lo > 1e-12 * axis_scale) {
+                mask |= DE9IM_IB;
+              }
+            }
           }
         }
       }
@@ -448,6 +475,38 @@ extern "C" __device__ inline unsigned short de9im_line_polygon(
         any_line_outside = true;
         if (is_boundary) mask |= DE9IM_BE;
         else             mask |= DE9IM_IE;
+      }
+    }
+  }
+
+  // Phase 2b: Classify polygon boundary vertices w.r.t. the line.
+  // This catches the case where the line traverses polygon interior via
+  // polygon vertices, so proper-crossing never fires but the line still
+  // contacts polygon boundary along its interior.
+  for (int bp = 0; bp < n_b_polys; ++bp) {
+    const int brs = b_poly_ring_starts[bp], bre = b_poly_ring_ends[bp];
+    for (int br = brs; br < bre; ++br) {
+      const int bcs = b_ring_offsets[br], bce = b_ring_offsets[br + 1];
+      const int vlast = (bce > bcs + 1) ? bce - 1 : bce;
+      for (int vi = bcs; vi < vlast; ++vi) {
+        unsigned char best_kind = 0;
+        for (int ap = 0; ap < n_a_parts && best_kind < 2; ++ap) {
+          const int acs = a_part_starts[ap], ace = a_part_ends[ap];
+          if (ace - acs < 2) continue;
+          for (int ai = acs + 1; ai < ace; ++ai) {
+            const unsigned char kind = vs_point_on_segment_kind(
+                bx[vi], by[vi],
+                ax[ai - 1], ay[ai - 1], ax[ai], ay[ai],
+                1e-12);
+            if (kind > best_kind) best_kind = kind;
+            if (best_kind == 2) break;
+          }
+        }
+        if (best_kind == 2) {
+          mask |= DE9IM_IB;
+        } else if (best_kind == 1) {
+          mask |= DE9IM_BB;
+        }
       }
     }
   }
@@ -742,4 +801,3 @@ _POLYGON_PREDICATES_KERNEL_NAMES = (
     "mls_pg_de9im_from_owned",
     "mls_mpg_de9im_from_owned",
 )
-

@@ -19,7 +19,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.residency import Residency
@@ -190,6 +190,10 @@ def _supports_pylibcudf_geoparquet_read(
     to_pandas_kwargs,
     geo_metadata,
 ) -> tuple[bool, str]:
+    if not has_pylibcudf_support():
+        return False, "pylibcudf is not installed for the GPU GeoParquet reader"
+    if not has_gpu_runtime():
+        return False, "GPU GeoParquet reader requires an available CUDA runtime"
     if bbox is not None:
         return False, "bbox pushdown remains on the host path until the GPU filter expression path lands"
     if filesystem is not None or storage_options is not None:
@@ -229,7 +233,7 @@ def plan_geoparquet_scan(
     return GeoParquetScanPlan(
         selected_path=plan.selected_path,
         canonical_gpu=plan.canonical_gpu,
-        uses_pylibcudf=has_pylibcudf_support(),
+        uses_pylibcudf=has_pylibcudf_support() and has_gpu_runtime(),
         bbox_requested=bbox is not None,
         metadata_summary_available=metadata_summary is not None,
         metadata_source=metadata_summary.source if metadata_summary is not None else None,
@@ -888,6 +892,11 @@ def _read_geoparquet_table_with_pyarrow(
             table = table.filter(filters)
         if added_bbox_column is not None and added_bbox_column in table.column_names:
             table = table.drop([added_bbox_column])
+    if metadata is not None:
+        # `pq.read_table(..., use_pandas_metadata=True)` does not reliably
+        # carry file footer metadata onto the returned Table schema. Reattach
+        # it here so downstream `.to_pandas()` can restore index columns.
+        table = table.replace_schema_metadata(metadata)
     if metadata and b"PANDAS_ATTRS" in metadata:
         df_attrs = metadata[b"PANDAS_ATTRS"]
     else:
@@ -1043,6 +1052,12 @@ def write_geoparquet(
         reason="GeoParquet export routes through the repo-owned adapter and preserves the GPU-first metadata contract.",
         selected=ExecutionMode.CPU,
     )
+
+    if write_covering_bbox and "bbox" in df.columns:
+        raise ValueError(
+            "An existing column 'bbox' already exists in the dataframe. "
+            "Please rename to write covering bbox."
+        )
 
     # Check if any geometry column already has owned backing (either via
     # DeviceGeometryArray or a GeometryArray with _owned populated).  When

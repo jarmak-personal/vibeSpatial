@@ -1023,14 +1023,15 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
         x_device, y_device = _pylibcudf_point_xy_children(column)
         x_device = x_device[:row_count]
         y_device = y_device[:row_count]
-        geometry_offsets_device = cp.arange(row_count + 1, dtype=cp.int32)
         validity_device = cp.ones(row_count, dtype=cp.bool_)
-        empty_mask_device = cp.zeros(row_count, dtype=cp.bool_)
+        empty_mask_device = cp.isnan(x_device) | cp.isnan(y_device)
+        nonempty = ~empty_mask_device
+        geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
         owned = _build_device_single_family_owned(
             family=GeometryFamily.POINT,
             validity_device=validity_device,
-            x_device=x_device,
-            y_device=y_device,
+            x_device=x_device[nonempty],
+            y_device=y_device[nonempty],
             geometry_offsets_device=geometry_offsets_device,
             empty_mask_device=empty_mask_device,
             detail="zero-copy adopted device-resident point buffers from pylibcudf GeoArrow column",
@@ -1044,14 +1045,14 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
     x_all, y_all = _pylibcudf_point_xy_children(column)
     x_device = x_all[validity_device]
     y_device = y_all[validity_device]
-    valid_count = int(cp.asnumpy(validity_device.astype(cp.int32).sum()))
-    geometry_offsets_device = cp.arange(valid_count + 1, dtype=cp.int32)
-    empty_mask_device = cp.zeros(valid_count, dtype=cp.bool_)
+    empty_mask_device = cp.isnan(x_device) | cp.isnan(y_device)
+    nonempty = ~empty_mask_device
+    geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
     return _build_device_single_family_owned(
         family=GeometryFamily.POINT,
         validity_device=validity_device,
-        x_device=x_device,
-        y_device=y_device,
+        x_device=x_device[nonempty],
+        y_device=y_device[nonempty],
         geometry_offsets_device=geometry_offsets_device,
         empty_mask_device=empty_mask_device,
         detail="created device-resident owned geometry array from pylibcudf GeoParquet point scan",

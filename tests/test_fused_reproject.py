@@ -372,3 +372,19 @@ class TestFusedGeojsonReproject:
 
         np.testing.assert_allclose(x[0], 10.0, atol=1e-10)
         np.testing.assert_allclose(y[0], 20.0, atol=1e-10)
+
+
+def test_host_to_json_to_wgs84_matches_pyproj_for_nybb_fixture():
+    """Host-backed GeoDataFrame reprojection stays on the canonical pyproj path."""
+    pytest.importorskip("pyproj")
+
+    import geopandas
+    from tests.upstream.geopandas.tests.util import PACKAGE_DIR
+
+    path = Path(PACKAGE_DIR) / "geopandas" / "tests" / "data" / "nybb_16a.zip"
+    frame = geopandas.read_file(path)
+
+    payload = json.loads(frame.to_json(to_wgs84=True))
+    coord = payload["features"][0]["geometry"]["coordinates"][0][0][0]
+
+    np.testing.assert_allclose(coord, [-74.0505080640324, 40.5664220341941])

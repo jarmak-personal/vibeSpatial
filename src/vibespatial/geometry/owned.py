@@ -566,7 +566,19 @@ class OwnedGeometryArray:
             row_indexes = np.flatnonzero(self.tags == FAMILY_TAGS[family])
             if row_indexes.size == 0:
                 continue
-            family_bounds = bounds[row_indexes]
+            family_rows = self.family_row_offsets[row_indexes]
+            if buffer.row_count == row_indexes.size and np.array_equal(
+                family_rows,
+                np.arange(buffer.row_count, dtype=np.int32),
+            ):
+                family_bounds = np.ascontiguousarray(bounds[row_indexes], dtype=np.float64)
+            else:
+                # Broadcast and repeated-row views can map many logical rows
+                # to the same physical family row. Cache per-family bounds
+                # using physical family-row indices so the family buffer shape
+                # stays aligned with buffer.row_count.
+                family_bounds = np.full((buffer.row_count, 4), np.nan, dtype=np.float64)
+                family_bounds[family_rows] = bounds[row_indexes]
             self.families[family] = FamilyGeometryBuffer(
                 family=buffer.family,
                 schema=buffer.schema,
@@ -583,6 +595,9 @@ class OwnedGeometryArray:
             if self.device_state is not None:
                 device_buffer = self.device_state.families[family]
                 if device_buffer.bounds is None:
+                    device_buffer.bounds = runtime.from_host(family_bounds)
+                elif tuple(int(dim) for dim in device_buffer.bounds.shape) != family_bounds.shape:
+                    runtime.free(device_buffer.bounds)
                     device_buffer.bounds = runtime.from_host(family_bounds)
                 else:
                     runtime.copy_host_to_device(family_bounds, device_buffer.bounds)
@@ -1950,7 +1965,7 @@ def _adopt_bounds(
 
 
 def _iter_coords(linear: Any) -> list[tuple[float, float]]:
-    return [(float(x), float(y)) for x, y in linear.coords]
+    return [(float(coord[0]), float(coord[1])) for coord in linear.coords]
 
 
 def _family_for_geometry(geometry: object) -> GeometryFamily:

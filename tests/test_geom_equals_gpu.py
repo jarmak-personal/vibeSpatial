@@ -485,6 +485,49 @@ def test_geopandas_rotated_rings():
     np.testing.assert_array_equal(result.values, expected)
 
 
+@requires_gpu
+def test_geopandas_polygon_and_singlepart_multipolygon_are_topologically_equal():
+    """GeoSeries.geom_equals should treat single-part multi families as equal."""
+    import geopandas
+
+    left_geoms = [
+        MultiPolygon([Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])]),
+        Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
+    ]
+    right_geoms = [
+        Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+        MultiPolygon([Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)])]),
+    ]
+    gs_left = geopandas.GeoSeries(left_geoms)
+    gs_right = geopandas.GeoSeries(right_geoms)
+
+    result = gs_left.geom_equals(gs_right, align=False)
+    expected = _shapely_equals(left_geoms, right_geoms)
+    np.testing.assert_array_equal(result.values, expected)
+    assert result.all()
+
+
+def test_geopandas_multilinestring_z_geom_equals_ignores_extra_ordinates():
+    """GeoSeries.geom_equals should not crash on 3D multiline inputs."""
+    import geopandas
+
+    left_geoms = [
+        MultiLineString([[(30, 10, 40), (10, 30, 40), (40, 40, 80)]]),
+        MultiLineString([[(0, 0, 1), (1, 1, 2)]]),
+    ]
+    right_geoms = [
+        MultiLineString([[(30, 10, 5), (10, 30, 6), (40, 40, 7)]]),
+        MultiLineString([[(0, 0, 3), (1, 1, 4)]]),
+    ]
+    gs_left = geopandas.GeoSeries(left_geoms)
+    gs_right = geopandas.GeoSeries(right_geoms)
+
+    result = gs_left.geom_equals(gs_right, align=False)
+    expected = _shapely_equals(left_geoms, right_geoms)
+    np.testing.assert_array_equal(result.values, expected)
+    assert result.all()
+
+
 # ---------------------------------------------------------------------------
 # Predicate dispatch wiring
 # ---------------------------------------------------------------------------

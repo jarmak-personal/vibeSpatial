@@ -46,6 +46,20 @@ def test_gpu_overlay_union_matches_shapely_for_overlapping_rectangles() -> None:
 
 
 @pytest.mark.gpu
+def test_gpu_overlay_union_matches_shapely_for_collinear_overlap_rectangles() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries([box(0, 5, 2, 7)])
+    right = from_shapely_geometries([box(1, 5, 3, 7)])
+
+    actual = overlay_union_owned(left, right, dispatch_mode=ExecutionMode.GPU)
+    expected = shapely.union(np.asarray(left.to_shapely(), dtype=object), np.asarray(right.to_shapely(), dtype=object))
+
+    _assert_geometry_lists_equal(actual.to_shapely(), expected.tolist())
+
+
+@pytest.mark.gpu
 def test_gpu_overlay_difference_matches_shapely() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

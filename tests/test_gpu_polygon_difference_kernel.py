@@ -57,8 +57,11 @@ def _assert_geometries_equivalent(actual_owned: OwnedGeometryArray, expected: np
             continue
         if shapely.is_empty(act):
             pytest.fail(f"Row {i}: expected non-empty {exp.wkt}, got empty")
-        # Topological equality with tolerance for floating point
-        assert shapely.equals_exact(act, exp, tolerance=1e-6), (
+        # Normalize ring traversal/order before exact comparison so the
+        # oracle checks geometry content rather than incidental vertex order.
+        act_norm = shapely.normalize(act)
+        exp_norm = shapely.normalize(exp)
+        assert shapely.equals_exact(act_norm, exp_norm, tolerance=1e-6), (
             f"Row {i}: geometries differ.\n"
             f"  actual:   {act.wkt}\n"
             f"  expected: {exp.wkt}"

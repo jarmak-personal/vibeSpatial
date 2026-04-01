@@ -1242,6 +1242,10 @@ def read_vector_file(
     chosen_engine = engine
     if plan.format in {IOFormat.GEOJSON, IOFormat.SHAPEFILE} and engine is None:
         chosen_engine = "pyogrio"
+    if chosen_engine is not None:
+        from vibespatial.api.io import file as api_file
+
+        chosen_engine = api_file._check_engine(chosen_engine, "'read_file' function")
     from vibespatial.api.io.file import _read_file
 
     gdf = _read_file(
@@ -1277,6 +1281,10 @@ def write_vector_file(
     chosen_engine = kwargs.pop("engine", None)
     if plan.format in {IOFormat.GEOJSON, IOFormat.SHAPEFILE} and chosen_engine is None:
         chosen_engine = "pyogrio"
+    if chosen_engine is not None:
+        from vibespatial.api.io import file as api_file
+
+        chosen_engine = api_file._check_engine(chosen_engine, "'to_file' method")
     record_dispatch_event(
         surface="geopandas.geodataframe.to_file",
         operation="to_file",

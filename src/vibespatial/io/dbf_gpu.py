@@ -453,6 +453,12 @@ def _dbf_from_device_bytes(
     columns: list[str] | None = None,
 ) -> DbfGpuResult:
     """Core DBF extraction from pre-parsed header and device bytes."""
+    # Character-field extraction caches a single host copy of the current file's
+    # bytes to avoid repeated D->H transfers across multiple string columns.
+    # Reset that cache at the start of each new DBF read so separate files
+    # cannot observe stale host data through recycled device-array identities.
+    _dbf_host_cache.clear()
+
     if header.record_count == 0:
         return DbfGpuResult(
             columns={},

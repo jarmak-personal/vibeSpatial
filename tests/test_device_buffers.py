@@ -6,6 +6,9 @@ from shapely.geometry import LineString, Point, Polygon
 
 from vibespatial import Residency, TransferTrigger, from_shapely_geometries, has_gpu_runtime
 from vibespatial.cuda._runtime import get_cuda_runtime
+from vibespatial.geometry.owned import tile_single_row
+from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+from vibespatial.runtime import ExecutionMode
 
 
 def _sample_geometries():
@@ -80,5 +83,29 @@ def test_device_bounds_buffers_preserve_cached_values() -> None:
     assert np.allclose(
         get_cuda_runtime().copy_device_to_host(state.families[point_family].bounds),
         cached,
+        equal_nan=True,
+    )
+
+
+def test_broadcast_device_bounds_cache_uses_physical_family_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    base = from_shapely_geometries(
+        [Polygon([(0, 0), (3, 0), (3, 3), (0, 0)])],
+        residency=Residency.DEVICE,
+    )
+    broadcast = tile_single_row(base, 8)
+
+    bounds = compute_geometry_bounds(broadcast, dispatch_mode=ExecutionMode.GPU)
+    state = broadcast._ensure_device_state()
+    polygon_family = next(family for family in broadcast.families if family.value == "polygon")
+    family_bounds = get_cuda_runtime().copy_device_to_host(state.families[polygon_family].bounds)
+
+    assert bounds.shape == (8, 4)
+    assert family_bounds.shape == (1, 4)
+    np.testing.assert_allclose(
+        bounds,
+        np.repeat(family_bounds, 8, axis=0),
         equal_nan=True,
     )

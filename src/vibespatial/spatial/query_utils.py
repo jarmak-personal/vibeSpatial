@@ -194,6 +194,15 @@ def _sort_indices(indices: np.ndarray) -> np.ndarray:
     return indices[:, sort_indexer]
 
 
+def _reorder_scalar_tree_matches(indices: np.ndarray, order: np.ndarray) -> np.ndarray:
+    """Restore flat-index traversal order for scalar unsorted queries."""
+    if indices.ndim != 1 or indices.size <= 1:
+        return indices
+    rank = np.empty(order.size, dtype=np.int32)
+    rank[order] = np.arange(order.size, dtype=np.int32)
+    return indices[np.argsort(rank[indices], kind="stable")]
+
+
 def _indices_to_dense(indices: np.ndarray, tree_size: int, query_size: int, scalar: bool) -> np.ndarray:
     if scalar:
         dense = np.zeros(tree_size, dtype=bool)

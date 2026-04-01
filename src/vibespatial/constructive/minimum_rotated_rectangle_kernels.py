@@ -72,8 +72,10 @@ extern "C" __global__ void minimum_rotated_rectangle(
     /* Rotating calipers: for each edge, rotate into edge-aligned frame,
        compute AABB, track minimum area. */
     double best_area = 1.0e300;  /* sentinel: larger than any real area */
-    double best_c0x, best_c0y, best_c1x, best_c1y;
-    double best_c2x, best_c2y, best_c3x, best_c3y;
+    const double px0 = hull_x[cs];
+    const double py0 = hull_y[cs];
+    double best_c0x = px0, best_c0y = py0, best_c1x = px0, best_c1y = py0;
+    double best_c2x = px0, best_c2y = py0, best_c3x = px0, best_c3y = py0;
 
     for (int e = 0; e < n_verts; e++) {
         /* Edge from hull[e] to hull[(e+1) % n_verts] */

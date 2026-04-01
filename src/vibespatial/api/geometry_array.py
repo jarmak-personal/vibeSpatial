@@ -78,16 +78,11 @@ logger = logging.getLogger(__name__)
 
 
 def _make_transform_func(src_crs, dst_crs):
-    """Return a coordinate transform callable, preferring vibeProj over pyproj."""
-    try:
-        t = _VibeTransformer.from_crs(src_crs, dst_crs, always_xy=True)
+    """Return a host-side coordinate transform callable.
 
-        def _vibe_transform(x, y, z=None):
-            return t.transform(x, y, z=z)
-
-        return _vibe_transform
-    except Exception:
-        pass
+    Shapely-backed reprojection paths must use pyproj's canonical transformer.
+    The owned/device path is where vibeProj stays in play.
+    """
     transformer = TransformerFromCRS(src_crs, dst_crs, always_xy=True)
     return transformer.transform
 
@@ -363,6 +358,12 @@ def from_wkb(
 
 def to_wkb(geoms: GeometryArray, hex: bool = False, **kwargs):
     """Convert GeometryArray to a numpy object array of WKB objects."""
+    if (
+        hasattr(geoms, "dtype")
+        and hasattr(geoms.dtype, "name")
+        and geoms.dtype.name == "device_geometry"
+    ):
+        return geoms.to_wkb(hex=hex, **kwargs)
     if not isinstance(geoms, GeometryArray):
         raise ValueError("'geoms' must be a GeometryArray")
     return shapely.to_wkb(geoms, hex=hex, **kwargs)
@@ -401,6 +402,12 @@ def from_wkt(
 
 def to_wkt(geoms: GeometryArray, **kwargs):
     """Convert GeometryArray to a numpy object array of WKT objects."""
+    if (
+        hasattr(geoms, "dtype")
+        and hasattr(geoms.dtype, "name")
+        and geoms.dtype.name == "device_geometry"
+    ):
+        return geoms.to_wkt(**kwargs)
     if not isinstance(geoms, GeometryArray):
         raise ValueError("'geoms' must be a GeometryArray")
     return shapely.to_wkt(geoms, **kwargs)
@@ -762,7 +769,11 @@ class GeometryArray(ExtensionArray):
         if self._owned is not None:
             from vibespatial.constructive.validity import is_valid_owned
 
-            return is_valid_owned(self._owned)
+            result = np.asarray(is_valid_owned(self._owned), dtype=bool)
+            if not bool(np.all(self._owned.validity)):
+                result = result.copy()
+                result[~self._owned.validity] = False
+            return result
         return shapely.is_valid(self._data)
 
     def is_valid_reason(self):

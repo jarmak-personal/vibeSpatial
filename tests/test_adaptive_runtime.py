@@ -236,6 +236,20 @@ def test_invalidate_snapshot_cache_forces_new_object() -> None:
     assert first is not second
 
 
+def test_cached_snapshot_refreshes_when_runtime_availability_changes(monkeypatch) -> None:
+    import vibespatial.runtime.adaptive as adaptive_runtime
+
+    invalidate_snapshot_cache()
+    monkeypatch.setattr(adaptive_runtime, "has_gpu_runtime", lambda: False)
+    first = get_cached_snapshot()
+    assert first.gpu_available is False
+
+    monkeypatch.setattr(adaptive_runtime, "has_gpu_runtime", lambda: True)
+    second = get_cached_snapshot()
+    assert second.gpu_available is True
+    assert second is not first
+
+
 def test_detect_device_profile_returns_device_precision_profile() -> None:
     profile = _detect_device_profile()
     assert hasattr(profile, "fp64_to_fp32_ratio")

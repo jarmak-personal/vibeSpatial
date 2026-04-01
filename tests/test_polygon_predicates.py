@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import MultiPolygon, Polygon, box
+from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 
 from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
@@ -270,7 +270,6 @@ class TestLineDE9IM:
         assert _eval_predicate(masks, "disjoint")[0]
 
     def test_line_touching_polygon_boundary(self):
-        from shapely.geometry import LineString
         q = [LineString([(0.5, 1), (0.5, 2)])]
         t = [box(0.5, 0, 1.5, 1)]
         masks = _compute_de9im(
@@ -281,8 +280,17 @@ class TestLineDE9IM:
         assert _eval_predicate(masks, "touches")[0]
         assert not _eval_predicate(masks, "within")[0]
 
+    def test_line_intersects_tiny_buffer_polygon_at_large_coordinates(self):
+        q = [LineString([(970227.216003418, 145641.63360595703), (970273.9365844727, 145641.63360595703)])]
+        t = [Point(970264.7347596437, 145641.63360595703).buffer(1e-8)]
+        masks = _compute_de9im(
+            _make_owned(q), _make_owned(t),
+            [0], [0], GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
+        )
+        assert _eval_predicate(masks, "intersects")[0]
+        assert not _eval_predicate(masks, "disjoint")[0]
+
     def test_crossing_lines(self):
-        from shapely.geometry import LineString
         q = [LineString([(0, 0), (2, 2)])]
         t = [LineString([(0, 2), (2, 0)])]
         masks = _compute_de9im(

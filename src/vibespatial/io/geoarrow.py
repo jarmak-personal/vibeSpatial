@@ -319,6 +319,11 @@ def _construct_geoarrow_array_with_explicit_fallback(
 ):
     from vibespatial.api.io._geoarrow import construct_geometry_array, construct_wkb_array
 
+    if len(series) == 0 or bool(series.isna().all()):
+        raise NotImplementedError(
+            "GeoArrow export requires at least one non-missing geometry to infer the geometry type"
+        )
+
     fast_path_reason = _owned_geoarrow_fast_path_reason(series, include_z=include_z)
     if fast_path_reason is None:
         try:
@@ -427,12 +432,20 @@ def _decode_geoarrow_point(array, family):
     validity, tags, family_row_offsets, GeoArrowBufferView = _family_decode_state(family, array)
     row_count = int(validity.sum())
     x_all, y_all = _extract_point_xy(array)
+    x_valid = x_all[validity]
+    y_valid = y_all[validity]
+    empty_mask = np.isnan(x_valid) & np.isnan(y_valid)
+    non_empty_mask = ~empty_mask
+    geometry_offsets = np.empty(row_count + 1, dtype=np.int32)
+    geometry_offsets[0] = 0
+    if row_count:
+        geometry_offsets[1:] = np.cumsum(non_empty_mask.astype(np.int32), dtype=np.int32)
     view = GeoArrowBufferView(
         family=family,
-        x=x_all[validity],
-        y=y_all[validity],
-        geometry_offsets=np.arange(row_count + 1, dtype=np.int32),
-        empty_mask=np.zeros(row_count, dtype=bool),
+        x=x_valid[non_empty_mask],
+        y=y_valid[non_empty_mask],
+        geometry_offsets=geometry_offsets,
+        empty_mask=empty_mask,
     )
     return _build_single_family_owned(
         family=family,

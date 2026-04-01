@@ -398,6 +398,13 @@ class TestMaterializationWithDiagnostics:
         valid = dga_points.is_valid
         assert valid[0]  # Point(0,0) is valid
         assert valid[1]  # Point(1,2) is valid
+        assert not valid[3]  # Missing geometry is invalid at GeoPandas boundary
+        assert _has_no_materialization(dga_points)
+
+    def test_geoseries_is_valid_marks_missing_false(self, gs_points):
+        valid = gs_points.is_valid
+        assert bool(valid.iloc[0]) is True
+        assert bool(valid.iloc[3]) is False
 
     def test_to_wkb_no_materialization(self, dga_points):
         _ = dga_points.to_wkb()

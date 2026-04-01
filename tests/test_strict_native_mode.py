@@ -70,22 +70,46 @@ def test_record_fallback_event_raises_in_strict_native_mode(monkeypatch: pytest.
     (
         "fixture_kind",
         "expected_geometry_types",
+        "expected_clip_by_rect_ok",
+        "expected_clip_by_rect_len",
+        "expected_clip_by_rect_error_type",
+        "expected_clip_by_rect_strict_fallback",
         "expected_sindex_len",
+        "expected_cx_ok",
+        "expected_cx_len",
+        "expected_cx_error_type",
+        "expected_cx_strict_fallback",
+        "expected_intersects_ok",
+        "expected_intersects_len",
+        "expected_intersects_error_type",
+        "expected_intersects_strict_fallback",
         "expected_clip_ok",
         "expected_clip_len",
         "expected_clip_error_type",
         "expected_clip_strict_fallback",
     ),
     [
-        ("lines", ("LineString",), 0, True, 0, None, False),
-        ("mixed", ("LineString", "Point", "Polygon"), 2, False, None, "StrictNativeFallbackError", True),
+        ("lines", ("LineString",), False, None, "IndexError", False, 1, True, 1, None, False, True, 2, None, False, False, None, "StrictNativeFallbackError", True),
+        ("mixed", ("LineString", "Point", "Polygon"), False, None, "IndexError", False, 3, False, None, "NotImplementedError", False, False, None, "NotImplementedError", False, False, None, "StrictNativeFallbackError", True),
     ],
 )
 def test_strict_viewport_matrix_documents_current_public_api_behavior(
     tmp_path: Path,
     fixture_kind: str,
     expected_geometry_types: tuple[str, ...],
+    expected_clip_by_rect_ok: bool,
+    expected_clip_by_rect_len: int | None,
+    expected_clip_by_rect_error_type: str | None,
+    expected_clip_by_rect_strict_fallback: bool,
     expected_sindex_len: int,
+    expected_cx_ok: bool,
+    expected_cx_len: int | None,
+    expected_cx_error_type: str | None,
+    expected_cx_strict_fallback: bool,
+    expected_intersects_ok: bool,
+    expected_intersects_len: int | None,
+    expected_intersects_error_type: str | None,
+    expected_intersects_strict_fallback: bool,
     expected_clip_ok: bool,
     expected_clip_len: int | None,
     expected_clip_error_type: str | None,
@@ -107,21 +131,33 @@ def test_strict_viewport_matrix_documents_current_public_api_behavior(
 
     assert tuple(payload["geometry_types"]) == expected_geometry_types
 
-    assert by_surface["geometry.clip_by_rect"].ok is False
-    assert by_surface["geometry.clip_by_rect"].error_type == "IndexError"
-    assert by_surface["geometry.clip_by_rect"].strict_fallback is False
+    assert by_surface["geometry.clip_by_rect"].ok is expected_clip_by_rect_ok
+    assert by_surface["geometry.clip_by_rect"].result_len == expected_clip_by_rect_len
+    assert by_surface["geometry.clip_by_rect"].error_type == expected_clip_by_rect_error_type
+    assert by_surface["geometry.clip_by_rect"].strict_fallback is expected_clip_by_rect_strict_fallback
+    if expected_clip_by_rect_ok:
+        assert by_surface["geometry.clip_by_rect"].result_type == "GeoSeries"
 
-    assert by_surface["geodataframe.clip_by_rect"].ok is False
-    assert by_surface["geodataframe.clip_by_rect"].error_type == "IndexError"
-    assert by_surface["geodataframe.clip_by_rect"].strict_fallback is False
+    assert by_surface["geodataframe.clip_by_rect"].ok is expected_clip_by_rect_ok
+    assert by_surface["geodataframe.clip_by_rect"].result_len == expected_clip_by_rect_len
+    assert by_surface["geodataframe.clip_by_rect"].error_type == expected_clip_by_rect_error_type
+    assert by_surface["geodataframe.clip_by_rect"].strict_fallback is expected_clip_by_rect_strict_fallback
+    if expected_clip_by_rect_ok:
+        assert by_surface["geodataframe.clip_by_rect"].result_type == "GeoSeries"
 
-    assert by_surface["geodataframe.cx"].ok is False
-    assert by_surface["geodataframe.cx"].error_type == "StrictNativeFallbackError"
-    assert by_surface["geodataframe.cx"].strict_fallback is True
+    assert by_surface["geodataframe.cx"].ok is expected_cx_ok
+    assert by_surface["geodataframe.cx"].result_len == expected_cx_len
+    assert by_surface["geodataframe.cx"].error_type == expected_cx_error_type
+    assert by_surface["geodataframe.cx"].strict_fallback is expected_cx_strict_fallback
+    if expected_cx_ok:
+        assert by_surface["geodataframe.cx"].result_type == "GeoDataFrame"
 
-    assert by_surface["geometry.intersects(box)"].ok is False
-    assert by_surface["geometry.intersects(box)"].error_type == "StrictNativeFallbackError"
-    assert by_surface["geometry.intersects(box)"].strict_fallback is True
+    assert by_surface["geometry.intersects(box)"].ok is expected_intersects_ok
+    assert by_surface["geometry.intersects(box)"].result_len == expected_intersects_len
+    assert by_surface["geometry.intersects(box)"].error_type == expected_intersects_error_type
+    assert by_surface["geometry.intersects(box)"].strict_fallback is expected_intersects_strict_fallback
+    if expected_intersects_ok:
+        assert by_surface["geometry.intersects(box)"].result_type == "Series"
 
     assert by_surface["sindex.query(box, intersects)"].ok is True
     assert by_surface["sindex.query(box, intersects)"].result_type == "ndarray"
@@ -136,9 +172,10 @@ def test_strict_viewport_matrix_documents_current_public_api_behavior(
 
 
 @requires_gpu
-def test_strict_clip_box_line_fixture_routes_through_public_sindex_query_without_strtree(tmp_path: Path) -> None:
+def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_intersection_fallback(
+    tmp_path: Path,
+) -> None:
     _, calls = _viewport_call_matrix()
-    bbox = box(1.0, 1.0, 6.0, 6.0)
 
     with strict_native_environment():
         vibespatial.clear_dispatch_events()
@@ -153,14 +190,13 @@ def test_strict_clip_box_line_fixture_routes_through_public_sindex_query_without
             {"geodataframe.clip(box)": calls["geodataframe.clip(box)"]},
             geometry_types=tuple(sorted({str(value) for value in gdf.geometry.geom_type})),
         )
-
-        result = gdf.clip(bbox)
         events = vibespatial.get_dispatch_events(clear=True)
 
     by_surface = report.by_surface()
 
-    assert by_surface["geodataframe.clip(box)"].ok is True
-    assert len(result) == 0
+    assert by_surface["geodataframe.clip(box)"].ok is False
+    assert by_surface["geodataframe.clip(box)"].error_type == "StrictNativeFallbackError"
+    assert by_surface["geodataframe.clip(box)"].strict_fallback is True
     assert sindex._tree is None
     assert any(event.surface == "geopandas.sindex.query" for event in events)
 
@@ -212,5 +248,5 @@ def test_strict_api_matrix_report_is_structured_by_surface(tmp_path: Path) -> No
 
     assert payload["fixture"] == "lines"
     assert set(payload["calls"]) == set(calls)
-    assert payload["calls"]["geodataframe.cx"]["strict_fallback"] is True
+    assert payload["calls"]["geodataframe.cx"]["strict_fallback"] is False
     assert payload["calls"]["geometry.clip_by_rect"]["error_type"] == "IndexError"

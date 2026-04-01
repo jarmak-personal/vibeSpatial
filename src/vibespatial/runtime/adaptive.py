@@ -360,8 +360,11 @@ _cached_snapshot: DeviceSnapshot | None = None
 def get_cached_snapshot() -> DeviceSnapshot:
     """Return a session-scoped DeviceSnapshot, creating it on first call."""
     global _cached_snapshot
+    gpu_available = has_gpu_runtime()
     if _cached_snapshot is not None:
-        return _cached_snapshot
+        if _cached_snapshot.gpu_available == gpu_available:
+            return _cached_snapshot
+        _cached_snapshot = None
 
     try:
         from vibespatial.bench.profiling import _NvmlGpuSampler
@@ -371,7 +374,6 @@ def get_cached_snapshot() -> DeviceSnapshot:
 
     probe = _adapt_nvml_sampler(sampler) if sampler is not None else None
 
-    gpu_available = has_gpu_runtime()
     profile = _detect_device_profile() if gpu_available else DEFAULT_CONSUMER_PROFILE
 
     _cached_snapshot = capture_device_snapshot(

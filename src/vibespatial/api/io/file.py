@@ -5,7 +5,6 @@ import urllib.request
 import warnings
 from http import HTTPStatus
 from io import IOBase
-from packaging.version import Version
 from pathlib import Path
 
 # Adapted from pandas.io.common
@@ -15,14 +14,14 @@ from urllib.request import Request
 
 import numpy as np
 import pandas as pd
+import shapely
+from packaging.version import Version
 from pandas.api.types import (
     is_datetime64_any_dtype,
     is_integer_dtype,
     is_object_dtype,
     is_string_dtype,
 )
-
-import shapely
 from shapely.geometry import mapping
 from shapely.geometry.base import BaseGeometry
 
@@ -790,6 +789,25 @@ def _to_file_pyogrio(df, filename, driver, schema, crs, mode, metadata, **kwargs
     # for the fiona engine, this check is done in gdf.iterfeatures()
     if not df.columns.is_unique:
         raise ValueError("GeoDataFrame cannot contain duplicated column names.")
+
+    geometry_columns = df.columns[df.dtypes.map(lambda dtype: dtype.name in ("geometry", "device_geometry"))]
+    if len(geometry_columns) == 1:
+        geometry_column = geometry_columns[0]
+        crs_value = getattr(df, "crs", None)
+        geometry_series = GeoSeries(
+            list(df[geometry_column].array),
+            index=df.index,
+            crs=crs_value,
+            name=geometry_column,
+        )
+        normalized = pd.DataFrame(df.drop(columns=[geometry_column]).copy())
+        normalized[geometry_column] = geometry_series
+        df = GeoDataFrame(normalized, geometry=geometry_column, crs=crs_value)
+
+        if driver == "ESRI Shapefile" and "geometry_type" not in kwargs:
+            geometry_types = df[geometry_column].geom_type.dropna().unique()
+            if len(geometry_types) == 1:
+                kwargs["geometry_type"] = geometry_types[0]
 
     pyogrio.write_dataframe(df, filename, driver=driver, metadata=metadata, **kwargs)
 

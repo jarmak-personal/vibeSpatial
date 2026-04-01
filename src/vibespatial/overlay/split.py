@@ -50,6 +50,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
 
+_OVERLAY_COORDINATE_SCALE = 1_000_000_000.0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,6 +98,85 @@ def _free_atomic_edge_excess(atomic_edges: AtomicEdgeTable) -> None:
         return
     runtime.free(ds.dst_x)
     runtime.free(ds.dst_y)
+
+
+def _deduplicate_atomic_edge_geometry(
+    source_ids,
+    direction,
+    src_x,
+    src_y,
+    dst_x,
+    dst_y,
+):
+    """Collapse duplicate geometric segments before half-edge graph build.
+
+    Collinear overlap emits the same atomic segment once per source polygon.
+    The half-edge graph needs one geometric segment, not duplicate copies,
+    otherwise coincident spans produce malformed self-touching face cycles.
+
+    This helper keeps the first forward representative for each unique
+    quantized segment, then regenerates exactly one forward/reverse pair.
+    """
+    d_direction = cp.asarray(direction)
+    forward_indices = cp.flatnonzero(d_direction == 0).astype(cp.int32, copy=False)
+    if int(forward_indices.size) == 0:
+        return source_ids, direction, src_x, src_y, dst_x, dst_y
+
+    d_src_x = cp.asarray(src_x)[forward_indices]
+    d_src_y = cp.asarray(src_y)[forward_indices]
+    d_dst_x = cp.asarray(dst_x)[forward_indices]
+    d_dst_y = cp.asarray(dst_y)[forward_indices]
+
+    q_src_x = cp.rint(d_src_x * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    q_src_y = cp.rint(d_src_y * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    q_dst_x = cp.rint(d_dst_x * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    q_dst_y = cp.rint(d_dst_y * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    sort_order = cp.lexsort(cp.stack((forward_indices, q_dst_y, q_dst_x, q_src_y, q_src_x)))
+    sorted_forward = forward_indices[sort_order]
+    sorted_q_src_x = q_src_x[sort_order]
+    sorted_q_src_y = q_src_y[sort_order]
+    sorted_q_dst_x = q_dst_x[sort_order]
+    sorted_q_dst_y = q_dst_y[sort_order]
+
+    unique_mask = cp.empty(int(sorted_forward.size), dtype=cp.bool_)
+    unique_mask[0] = True
+    if int(sorted_forward.size) > 1:
+        unique_mask[1:] = (
+            (sorted_q_src_x[1:] != sorted_q_src_x[:-1])
+            | (sorted_q_src_y[1:] != sorted_q_src_y[:-1])
+            | (sorted_q_dst_x[1:] != sorted_q_dst_x[:-1])
+            | (sorted_q_dst_y[1:] != sorted_q_dst_y[:-1])
+        )
+    representatives = sorted_forward[unique_mask]
+    unique_count = int(representatives.size)
+
+    rep_source_ids = cp.asarray(source_ids)[representatives]
+    rep_src_x = cp.asarray(src_x)[representatives]
+    rep_src_y = cp.asarray(src_y)[representatives]
+    rep_dst_x = cp.asarray(dst_x)[representatives]
+    rep_dst_y = cp.asarray(dst_y)[representatives]
+
+    out_size = unique_count * 2
+    dedup_source_ids = cp.empty(out_size, dtype=cp.int32)
+    dedup_direction = cp.empty(out_size, dtype=cp.int8)
+    dedup_src_x = cp.empty(out_size, dtype=cp.float64)
+    dedup_src_y = cp.empty(out_size, dtype=cp.float64)
+    dedup_dst_x = cp.empty(out_size, dtype=cp.float64)
+    dedup_dst_y = cp.empty(out_size, dtype=cp.float64)
+
+    dedup_source_ids[0::2] = rep_source_ids
+    dedup_source_ids[1::2] = rep_source_ids
+    dedup_direction[0::2] = cp.int8(0)
+    dedup_direction[1::2] = cp.int8(1)
+    dedup_src_x[0::2] = rep_src_x
+    dedup_src_x[1::2] = rep_dst_x
+    dedup_src_y[0::2] = rep_src_y
+    dedup_src_y[1::2] = rep_dst_y
+    dedup_dst_x[0::2] = rep_dst_x
+    dedup_dst_x[1::2] = rep_src_x
+    dedup_dst_y[0::2] = rep_dst_y
+    dedup_dst_y[1::2] = rep_src_y
+    return dedup_source_ids, dedup_direction, dedup_src_x, dedup_src_y, dedup_dst_x, dedup_dst_y
 
 
 def _segment_metadata(
@@ -594,11 +675,27 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
             params=params,
         )
         runtime.synchronize()
+        dedup_source_ids, dedup_direction, dedup_src_x, dedup_src_y, dedup_dst_x, dedup_dst_y = (
+            _deduplicate_atomic_edge_geometry(
+                out_source_ids,
+                out_direction,
+                out_src_x,
+                out_src_y,
+                out_dst_x,
+                out_dst_y,
+            )
+        )
+        runtime.free(out_source_ids)
+        runtime.free(out_direction)
+        runtime.free(out_src_x)
+        runtime.free(out_src_y)
+        runtime.free(out_dst_x)
+        runtime.free(out_dst_y)
 
         # Derive source_side and row / part / ring indices on GPU via
         # searchsorted against split_events device metadata, avoiding
         # host round-trip.
-        d_out_ids = cp.asarray(out_source_ids)  # zcopy:ok(already device-resident — cp.asarray is a no-op)
+        d_out_ids = cp.asarray(dedup_source_ids)  # zcopy:ok(already device-resident — cp.asarray is a no-op)
         left_count = split_events.left_segment_count
         d_source_side = cp.where(d_out_ids < left_count, cp.int8(1), cp.int8(2))
 
@@ -624,18 +721,18 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
             right_segment_count=split_events.right_segment_count,
             runtime_selection=split_events.runtime_selection,
             device_state=AtomicEdgeDeviceState(
-                source_segment_ids=out_source_ids,
-                direction=out_direction,
-                src_x=out_src_x,
-                src_y=out_src_y,
-                dst_x=out_dst_x,
-                dst_y=out_dst_y,
+                source_segment_ids=dedup_source_ids,
+                direction=dedup_direction,
+                src_x=dedup_src_x,
+                src_y=dedup_src_y,
+                dst_x=dedup_dst_x,
+                dst_y=dedup_dst_y,
                 row_indices=d_row_indices,
                 part_indices=d_part_indices,
                 ring_indices=d_ring_indices,
                 source_side=d_source_side,
             ),
-            _count=pair_count * 2,
+            _count=int(dedup_source_ids.size),
         )
     finally:
         runtime.free(adjacency_mask)

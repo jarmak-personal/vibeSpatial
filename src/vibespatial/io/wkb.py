@@ -168,8 +168,26 @@ def _launch_device_wkb_write_kernel(
     if family is GeometryFamily.POINT:
         kernel = kernels["write_point_wkb"]
         params = (
-            (ptr(row_indexes), ptr(family_rows), ptr(device_buffer.x), ptr(device_buffer.y), ptr(row_offsets), ptr(payload), count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            (
+                ptr(row_indexes),
+                ptr(family_rows),
+                ptr(device_buffer.geometry_offsets),
+                ptr(device_buffer.x),
+                ptr(device_buffer.y),
+                ptr(row_offsets),
+                ptr(payload),
+                count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
         )
     elif family is GeometryFamily.LINESTRING:
         kernel = kernels["write_linestring_wkb"]
@@ -455,6 +473,11 @@ def _compression_type_from_name(name: str):
     return getattr(plc.io.types.CompressionType, str(name).upper(), plc.io.types.CompressionType.AUTO)
 
 
+def _native_parquet_compression_supported(name: str | None) -> bool:
+    normalized = None if name is None else str(name).lower()
+    return normalized in {None, "snappy", "lz4", "zstd"}
+
+
 def _attribute_column_to_plc(arrow_column, col_name, *, plc):
     """Convert attribute column to pylibcudf column, preferring device path.
 
@@ -488,6 +511,7 @@ def _write_geoparquet_native_device(
     **kwargs,
 ) -> bool:
     import json
+    import os
 
     import pandas as pd
     import pyarrow as pa
@@ -504,6 +528,27 @@ def _write_geoparquet_native_device(
     recognized_kwargs = {k: v for k, v in kwargs.items() if k in _RECOGNIZED_KWARGS}
     unrecognized_kwargs = {k: v for k, v in kwargs.items() if k not in _RECOGNIZED_KWARGS}
     if unrecognized_kwargs:
+        return False
+    if not _native_parquet_compression_supported(compression):
+        record_fallback_event(
+            surface="geopandas.geodataframe.to_parquet",
+            reason="device-side parquet writer does not support the requested compression codec",
+            detail=f"compression={compression!r}",
+            selected=ExecutionMode.CPU,
+            pipeline="io/to_parquet",
+            d2h_transfer=False,
+        )
+        return False
+    record_fallback_event(
+        surface="geopandas.geodataframe.to_parquet",
+        reason="device-side parquet writer does not preserve Arrow schema metadata on pyarrow.read_table",
+        detail="falling back to the owned-buffer pyarrow writer until native metadata parity lands",
+        selected=ExecutionMode.CPU,
+        pipeline="io/to_parquet",
+        d2h_transfer=False,
+    )
+    return False
+    if not isinstance(path, (str, bytes, os.PathLike)):
         return False
 
     geometry_columns = list(geometry_columns)
@@ -2199,8 +2244,12 @@ def _encode_family_row_wkb(
     wkb_type = WKB_TYPE_IDS[family]
 
     if family is GeometryFamily.POINT:
-        x = float(buf.x[frow])
-        y = float(buf.y[frow])
+        if bool(buf.empty_mask[frow]):
+            nan = float("nan")
+            return struct.pack("<BIdd", 1, wkb_type, nan, nan)
+        start = int(buf.geometry_offsets[frow])
+        x = float(buf.x[start])
+        y = float(buf.y[start])
         return struct.pack("<BIdd", 1, wkb_type, x, y)
 
     if family is GeometryFamily.LINESTRING:
@@ -2294,4 +2343,3 @@ def encode_owned_wkb_device(
     result stays on device.  Raises if GPU is unavailable.
     """
     return _encode_owned_wkb_column_device(owned)
-

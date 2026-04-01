@@ -675,8 +675,8 @@ def _validate_and_decode_metadata(metadata):
     # check for malformed metadata
     try:
         decoded_geo_metadata = _decode_metadata(metadata.get(b"geo", b""))
-    except (TypeError, json.decoder.JSONDecodeError):
-        raise ValueError("Missing or malformed geo metadata in Parquet/Feather file")
+    except (TypeError, json.decoder.JSONDecodeError) as err:
+        raise ValueError("Missing or malformed geo metadata in Parquet/Feather file") from err
 
     _validate_geo_metadata(decoded_geo_metadata)
     return decoded_geo_metadata
@@ -692,8 +692,10 @@ def _read_parquet_schema_and_metadata(path, filesystem):
     """
     from pyarrow import parquet
 
+    dataset = None
     try:
-        schema = parquet.ParquetDataset(path, filesystem=filesystem).schema
+        dataset = parquet.ParquetDataset(path, filesystem=filesystem)
+        schema = dataset.schema
     except Exception:
         schema = parquet.read_schema(path, filesystem=filesystem)
 
@@ -707,6 +709,14 @@ def _read_parquet_schema_and_metadata(path, filesystem):
             metadata = parquet.read_metadata(path, filesystem=filesystem).metadata
         except Exception:
             pass
+
+    if (metadata is None or b"geo" not in metadata) and dataset is not None:
+        for fragment in dataset.fragments:
+            fragment_metadata = getattr(fragment, "metadata", None)
+            if fragment_metadata is not None and fragment_metadata.metadata is not None:
+                metadata = fragment_metadata.metadata
+                if b"geo" in metadata:
+                    break
 
     return schema, metadata
 
