@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from scripts.upstream_native_coverage import compute_native_pass_rates, parse_pytest_summary
+from pathlib import Path
+
+from scripts.upstream_native_coverage import (
+    compute_native_pass_rates,
+    discover_group_targets,
+    parse_pytest_summary,
+)
 
 
 def test_parse_pytest_summary_extracts_counts_and_failures() -> None:
@@ -26,3 +32,14 @@ def test_compute_native_pass_rates_excludes_skips_from_native_rate() -> None:
 
     assert native_rate == 80.0
     assert suite_rate == 40.0
+
+
+def test_discover_group_targets_splits_upstream_tree_by_top_level_area() -> None:
+    grouped = discover_group_targets(("tests/upstream/geopandas",), cwd=Path.cwd())
+
+    assert tuple(grouped) == ("tests/upstream/geopandas",)
+    assert grouped["tests/upstream/geopandas"] == (
+        "tests/upstream/geopandas/tests",
+        "tests/upstream/geopandas/io",
+        "tests/upstream/geopandas/tools",
+    )

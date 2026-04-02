@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # Backward-compat alias for any external consumers
@@ -10,7 +11,7 @@ _PRECISION_PREAMBLE = PRECISION_PREAMBLE
 # Cooperative area kernel: 1 block per geometry (for complex polygons)
 # ---------------------------------------------------------------------------
 
-_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_POLYGON_AREA_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void polygon_area_cooperative(
     const double* __restrict__ x,
@@ -41,11 +42,7 @@ void polygon_area_cooperative(
         int n = ce - cs;
 
         /* Strip closure vertex if present. */
-        if (n >= 2) {{
-            double dx = x[cs] - x[ce - 1];
-            double dy = y[cs] - y[ce - 1];
-            if (dx * dx + dy * dy < 1e-24) n--;
-        }}
+        n = vs_strip_closure(x, y, cs, ce, n, 1e-24);
         if (n < 3) {{
             __syncthreads();  /* keep block synchronized even on skip */
             continue;
@@ -61,14 +58,8 @@ void polygon_area_cooperative(
             KAHAN_ADD(partial_sum, CX(x[cur]) * CY(y[nxt]) - CX(x[nxt]) * CY(y[cur]), partial_c);
         }}
 
-        /* Warp-level reduction via __shfl_down_sync */
-        const unsigned int FULL_MASK = 0xFFFFFFFF;
-        for (int offset = 16; offset > 0; offset >>= 1) {{
-            compute_t shfl_sum = __shfl_down_sync(FULL_MASK, partial_sum, offset);
-            compute_t shfl_c = __shfl_down_sync(FULL_MASK, partial_c, offset);
-            /* Kahan add the shuffled value */
-            KAHAN_ADD(partial_sum, shfl_sum - shfl_c, partial_c);
-        }}
+        /* Warp-level reduction via shared Kahan shuffle macro */
+        WARP_KAHAN_REDUCE(partial_sum, partial_c);
 
         /* Block-level reduction via shared memory */
         const int warp_id = threadIdx.x >> 5;
@@ -110,7 +101,7 @@ void polygon_area_cooperative(
 # Area kernel: Polygon (also used by MultiPolygon per-polygon-part)
 # ---------------------------------------------------------------------------
 
-_POLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_POLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
 extern "C" __global__ void polygon_area(
     const double* x,
     const double* y,
@@ -136,11 +127,7 @@ extern "C" __global__ void polygon_area(
         int n = ce - cs;
 
         /* Strip closure vertex if present. */
-        if (n >= 2) {{
-            double dx = x[cs] - x[ce - 1];
-            double dy = y[cs] - y[ce - 1];
-            if (dx * dx + dy * dy < 1e-24) n--;
-        }}
+        n = vs_strip_closure(x, y, cs, ce, n, 1e-24);
         if (n < 3) continue;
 
         compute_t sum_cross = (compute_t)0.0;
@@ -172,7 +159,7 @@ extern "C" __global__ void polygon_area(
 # Area kernel: MultiPolygon (triple indirection: geom -> part -> ring -> coord)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_MULTIPOLYGON_AREA_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
 extern "C" __global__ void multipolygon_area(
     const double* x,
     const double* y,
@@ -203,11 +190,7 @@ extern "C" __global__ void multipolygon_area(
             int n = ce - cs;
 
             /* Strip closure vertex if present. */
-            if (n >= 2) {{
-                double dx = x[cs] - x[ce - 1];
-                double dy = y[cs] - y[ce - 1];
-                if (dx * dx + dy * dy < 1e-24) n--;
-            }}
+            n = vs_strip_closure(x, y, cs, ce, n, 1e-24);
             if (n < 3) continue;
 
             compute_t sum_cross = (compute_t)0.0;

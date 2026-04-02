@@ -23,24 +23,22 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
-
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.set_precision_cpu import _set_precision_cpu
 from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
-    from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 logger = logging.getLogger(__name__)
 
@@ -166,28 +164,6 @@ def _set_precision_gpu(owned: OwnedGeometryArray, grid_size: float, mode: str):
 # CPU dispatch variant (registered)
 # ---------------------------------------------------------------------------
 
-@register_kernel_variant(
-    "set_precision",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("cpu", "shapely", "set_precision"),
-)
-def _set_precision_cpu(owned: OwnedGeometryArray, grid_size: float, mode: str):
-    """CPU set_precision via Shapely."""
-    import shapely as _shapely
-
-    geoms = owned.to_shapely()
-    geom_array = np.asarray(geoms, dtype=object)
-    results = _shapely.set_precision(geom_array, grid_size=grid_size, mode=mode)
-    return from_shapely_geometries(list(results))
-
-
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
@@ -246,15 +222,12 @@ def set_precision_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
         # Precision plan for observability (ADR-0002 CONSTRUCTIVE -> fp64)
-        _precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        _precision_plan = selection.precision_plan
         try:
             result = _set_precision_gpu(owned, grid_size, mode)
         except Exception:

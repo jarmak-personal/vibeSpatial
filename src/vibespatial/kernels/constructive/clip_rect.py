@@ -3,8 +3,6 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-import numpy as np  # hygiene:ok — used for type alias, not device computation
-
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
@@ -12,7 +10,7 @@ from vibespatial.runtime.precision import KernelClass, PrecisionMode
 if TYPE_CHECKING:
     from vibespatial.constructive.clip_rect import RectClipResult
 
-ClipInput = Sequence[object | None] | np.ndarray | object
+ClipInput = Sequence[object | None] | object
 
 
 @register_kernel_variant(

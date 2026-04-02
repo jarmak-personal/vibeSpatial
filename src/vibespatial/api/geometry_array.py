@@ -34,6 +34,7 @@ from vibespatial.constructive.stroke import (
     evaluate_geopandas_buffer,
     evaluate_geopandas_offset_curve,
 )
+from vibespatial.geometry.api_registry import register_host_transform_helpers
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -67,14 +68,15 @@ if typing.TYPE_CHECKING:
     else:
         CRS = Any
 
+from vibeproj import Transformer as _VibeTransformer
+
+logger = logging.getLogger(__name__)
+
+
 if HAS_PYPROJ:
     from pyproj import Transformer
 
     TransformerFromCRS = lru_cache(Transformer.from_crs)
-
-from vibeproj import Transformer as _VibeTransformer
-
-logger = logging.getLogger(__name__)
 
 
 def _make_transform_func(src_crs, dst_crs):
@@ -85,9 +87,6 @@ def _make_transform_func(src_crs, dst_crs):
     """
     transformer = TransformerFromCRS(src_crs, dst_crs, always_xy=True)
     return transformer.transform
-
-
-
 
 
 _names = {
@@ -740,16 +739,20 @@ class GeometryArray(ExtensionArray):
         if owned is None:
             owned = self.to_owned()
         if self._owned_flat_sindex is None:
-            from vibespatial.runtime import ExecutionMode, RuntimeSelection
+            from vibespatial.runtime import ExecutionMode
+            from vibespatial.runtime.adaptive import plan_dispatch_selection
+            from vibespatial.runtime.precision import KernelClass
             from vibespatial.spatial.indexing import build_flat_spatial_index
 
+            selection = plan_dispatch_selection(
+                kernel_name="flat_index_build",
+                kernel_class=KernelClass.COARSE,
+                row_count=owned.row_count,
+                requested_mode=ExecutionMode.CPU,
+            )
             self._owned_flat_sindex = build_flat_spatial_index(
                 owned,
-                runtime_selection=RuntimeSelection(
-                    requested=ExecutionMode.AUTO,
-                    selected=ExecutionMode.CPU,
-                    reason="cached GeometryArray owned flat spatial index",
-                ),
+                runtime_selection=selection.runtime_selection,
             )
         return owned, self._owned_flat_sindex
 
@@ -2939,3 +2942,9 @@ def transform(data, func) -> np.ndarray:
     )
 
     return result
+
+
+register_host_transform_helpers(
+    make_transform_func=_make_transform_func,
+    transform_geometry_array=transform,
+)

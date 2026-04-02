@@ -18,8 +18,10 @@ from vibespatial.constructive.centroid import (
     _centroid_gpu,
     centroid_owned,
 )
+from vibespatial.constructive.polygon import polygon_buffer_owned_array
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
 # ARCH005 coverage tokens: null_case, empty_geometry, mixed_type
 _ARCH005_COVERAGE = "null_empty_mixed"
@@ -391,3 +393,23 @@ def test_centroid_owned_10k_random_polygons():
     expect_cx, expect_cy = _shapely_centroids(polys)
     np.testing.assert_allclose(result_cx, expect_cx, atol=1e-10)
     np.testing.assert_allclose(result_cy, expect_cy, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_centroid_owned_device_resident_polygon_input_uses_device_stats() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    source = from_shapely_geometries([Polygon([(0, 0), (3, 0), (3, 2), (0, 2)])])
+    device_polys = polygon_buffer_owned_array(source, 0.25, dispatch_mode=ExecutionMode.GPU)
+
+    assert device_polys.device_state is not None
+    assert device_polys.families[GeometryFamily.POLYGON].host_materialized is False
+
+    expected_cx, expected_cy = _shapely_centroids(
+        [shapely.buffer(Polygon([(0, 0), (3, 0), (3, 2), (0, 2)]), 0.25, quad_segs=8)]
+    )
+    result_cx, result_cy = _extract_cx_cy(centroid_owned(device_polys, dispatch_mode=ExecutionMode.GPU))
+
+    np.testing.assert_allclose(result_cx, expected_cx, atol=1e-10)
+    np.testing.assert_allclose(result_cy, expected_cy, atol=1e-10)

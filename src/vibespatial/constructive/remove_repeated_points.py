@@ -28,6 +28,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.remove_repeated_points_cpu import (
+    _remove_repeated_points_cpu,
+)
 from vibespatial.constructive.remove_repeated_points_kernels import (
     _REMOVE_REPEATED_FP64,
     _REMOVE_REPEATED_KERNEL_NAMES,
@@ -42,16 +45,15 @@ from vibespatial.cuda._runtime import (
 from vibespatial.cuda.cccl_primitives import exclusive_sum
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
-    from_shapely_geometries,
+    build_updated_device_family_buffer,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 logger = logging.getLogger(__name__)
 
@@ -203,40 +205,13 @@ def _remove_repeated_family_gpu(runtime, device_buf, family, tolerance):
         d_new_offsets[:span_count] = cp.asarray(d_new_offsets_body)
         d_new_offsets[span_count] = total_kept
 
-    # 7. Build DeviceFamilyGeometryBuffer with updated span offsets
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=device_buf.geometry_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=device_buf.part_offsets,
-            ring_offsets=d_new_offsets,
-            bounds=None,
-        )
-    elif family is GeometryFamily.MULTILINESTRING:
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=device_buf.geometry_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=d_new_offsets,
-            ring_offsets=device_buf.ring_offsets,
-            bounds=None,
-        )
-    else:  # LineString
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=d_new_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=device_buf.part_offsets,
-            ring_offsets=device_buf.ring_offsets,
-            bounds=None,
-        )
+    return build_updated_device_family_buffer(
+        family,
+        device_buf,
+        d_x_out,
+        d_y_out,
+        d_new_offsets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,32 +258,6 @@ def _remove_repeated_points_gpu(owned, tolerance):
 
 
 # ---------------------------------------------------------------------------
-# CPU dispatch variant (registered)
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "remove_repeated_points",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "linestring", "multilinestring",
-        "polygon", "multipolygon", "multipoint",
-    ),
-    supports_mixed=True,
-    tags=("cpu", "shapely", "remove_repeated_points"),
-)
-def _remove_repeated_points_cpu(owned, tolerance):
-    """CPU remove_repeated_points via Shapely."""
-    import shapely as _shapely
-
-    geoms = owned.to_shapely()
-    geom_array = np.asarray(geoms, dtype=object)
-    results = _shapely.remove_repeated_points(geom_array, tolerance=tolerance)
-    return from_shapely_geometries(list(results))
-
-
-# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -351,15 +300,12 @@ def remove_repeated_points_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
         # Precision plan computed for observability (ADR-0002 CONSTRUCTIVE -> fp64).
-        _precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        _precision_plan = selection.precision_plan
         try:
             result = _remove_repeated_points_gpu(owned, tolerance)
         except Exception:

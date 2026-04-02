@@ -26,6 +26,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.extract_unique_points_cpu import (
+    _extract_unique_points_cpu,
+)
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -58,7 +61,6 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
-    select_precision_plan,
 )
 
 # ADR-0034: request warmup for CCCL primitives used in this module
@@ -435,34 +437,6 @@ def _build_empty_multipoint_output(
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "extract_unique_points",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "extract_unique_points"),
-)
-def _extract_unique_points_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """Compute extract_unique_points via Shapely."""
-    import shapely
-
-    geoms = owned.to_shapely()
-    results = [
-        shapely.extract_unique_points(g) if g is not None else None
-        for g in geoms
-    ]
-    return from_shapely_geometries(results)
-
-
-# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -501,39 +475,32 @@ def extract_unique_points_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
+        precision_plan = selection.precision_plan
+        result = _extract_unique_points_gpu(owned)
+        record_dispatch_event(
+            surface="geopandas.array.extract_unique_points",
+            operation="extract_unique_points",
+            implementation="extract_unique_points_gpu_nvrtc",
+            reason=selection.reason,
+            detail=(
+                f"rows={row_count}, "
+                f"precision={precision_plan.compute_precision.value}"
+            ),
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _extract_unique_points_gpu(owned)
-        except Exception:
-            pass
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.extract_unique_points",
-                operation="extract_unique_points",
-                implementation="extract_unique_points_gpu_nvrtc",
-                reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     result = _extract_unique_points_cpu(owned)
     record_dispatch_event(
         surface="geopandas.array.extract_unique_points",
         operation="extract_unique_points",
         implementation="extract_unique_points_cpu_shapely",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,

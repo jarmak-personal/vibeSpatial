@@ -310,28 +310,24 @@ def affine_transform_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            result = _affine_transform_gpu(owned, a, b, xoff, d, e, yoff)
-        except Exception:
-            pass
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.affine_transform",
-                operation="affine_transform",
-                implementation="affine_transform_gpu_nvrtc",
-                reason=selection.reason,
-                detail=f"rows={row_count}",
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        result = _affine_transform_gpu(owned, a, b, xoff, d, e, yoff)
+        record_dispatch_event(
+            surface="geopandas.array.affine_transform",
+            operation="affine_transform",
+            implementation="affine_transform_gpu_nvrtc",
+            reason=selection.reason,
+            detail=f"rows={row_count}",
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return result
 
     result = _affine_transform_cpu(owned, a, b, xoff, d, e, yoff)
     record_dispatch_event(
         surface="geopandas.array.affine_transform",
         operation="affine_transform",
         implementation="affine_transform_cpu_numpy",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,

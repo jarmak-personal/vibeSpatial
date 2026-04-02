@@ -698,11 +698,11 @@ def profile_spatial_query_stack(
     with profiler.stage(
         "compute_query_bounds",
         category="filter",
-        device=_gpu_bounds_dispatch_mode(),
+        device=_gpu_bounds_dispatch_mode(query_owned),
         rows_in=query_owned.row_count,
         detail="compute query bounds for generic candidate generation",
     ) as stage:
-        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
+        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
         stage.rows_out = int(query_bounds.shape[0])
 
     tree_bounds = flat_index.bounds

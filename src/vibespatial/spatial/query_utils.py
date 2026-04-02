@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -18,6 +19,8 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.predicates.binary import evaluate_binary_predicate
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
 
 from .query_types import (
@@ -238,8 +241,37 @@ def _expand_bounds(bounds: np.ndarray, distances: np.ndarray) -> np.ndarray:
     return expanded
 
 
-def _gpu_bounds_dispatch_mode() -> ExecutionMode:
-    return ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
+def _gpu_bounds_dispatch_mode(geometry_array: OwnedGeometryArray) -> ExecutionMode:
+    geometry_families = tuple(sorted(family.value for family in geometry_array.families))
+    selection = plan_dispatch_selection(
+        kernel_name="compute_geometry_bounds",
+        kernel_class=KernelClass.COARSE,
+        row_count=geometry_array.row_count,
+        geometry_families=geometry_families,
+        mixed_geometry=len(geometry_families) > 1,
+        current_residency=geometry_array.residency,
+        gpu_available=has_gpu_runtime(),
+    )
+    return selection.selected
+
+
+def _planned_query_runtime_selection(
+    *,
+    kernel_name: str,
+    kernel_class: KernelClass,
+    row_count: int,
+    requested_mode: ExecutionMode | str,
+    reason: str,
+    gpu_available: bool | None = None,
+) -> RuntimeSelection:
+    selection = plan_dispatch_selection(
+        kernel_name=kernel_name,
+        kernel_class=kernel_class,
+        row_count=row_count,
+        requested_mode=requested_mode,
+        gpu_available=gpu_available,
+    )
+    return replace(selection.runtime_selection, reason=reason)
 
 
 def _filter_predicate_pairs(
@@ -255,9 +287,11 @@ def _filter_predicate_pairs(
         return (
             left_indices,
             right_indices,
-            RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.CPU,
+            _planned_query_runtime_selection(
+                kernel_name="spatial_query_refine",
+                kernel_class=KernelClass.COARSE,
+                row_count=left_indices.size,
+                requested_mode=ExecutionMode.CPU,
                 reason="bbox-only query does not invoke exact predicate refinement",
             ),
         )
@@ -265,9 +299,11 @@ def _filter_predicate_pairs(
         return (
             left_indices,
             right_indices,
-            RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.CPU,
+            _planned_query_runtime_selection(
+                kernel_name="spatial_query_refine",
+                kernel_class=KernelClass.COARSE,
+                row_count=0,
+                requested_mode=ExecutionMode.CPU,
                 reason="no candidate pairs reached exact predicate refinement",
             ),
         )
@@ -278,9 +314,11 @@ def _filter_predicate_pairs(
             distance if np.isscalar(distance) else np.asarray(distance)[left_indices],
         )
         keep = np.asarray(exact, dtype=bool)
-        selection = RuntimeSelection(
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.CPU,
+        selection = _planned_query_runtime_selection(
+            kernel_name="dwithin_refine",
+            kernel_class=KernelClass.METRIC,
+            row_count=left_indices.size,
+            requested_mode=ExecutionMode.CPU,
             reason="dwithin exact refinement currently uses the Shapely host path",
         )
     else:
@@ -354,18 +392,22 @@ def _filter_predicate_pairs_owned(
             return (
                 left_indices,
                 right_indices,
-                RuntimeSelection(
-                    requested=ExecutionMode.AUTO,
-                    selected=ExecutionMode.CPU,
+                _planned_query_runtime_selection(
+                    kernel_name="spatial_query_refine",
+                    kernel_class=KernelClass.COARSE,
+                    row_count=_total,
+                    requested_mode=ExecutionMode.CPU,
                     reason="bbox-only query does not invoke exact predicate refinement",
                 ),
             )
         return (
             left_indices,
             right_indices,
-            RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.CPU,
+            _planned_query_runtime_selection(
+                kernel_name="spatial_query_refine",
+                kernel_class=KernelClass.COARSE,
+                row_count=_total,
+                requested_mode=ExecutionMode.CPU,
                 reason="no candidate pairs reached exact predicate refinement",
             ),
         )
@@ -472,9 +514,12 @@ def _filter_predicate_pairs_owned(
         return (
             left_indices[keep],
             right_indices[keep],
-            RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
+            _planned_query_runtime_selection(
+                kernel_name="predicate_refine",
+                kernel_class=KernelClass.PREDICATE,
+                row_count=left_indices.size,
+                requested_mode=ExecutionMode.GPU,
+                gpu_available=True,
                 reason=f"GPU indexed point-family {predicate} refinement (no take copy)",
             ),
         )
@@ -569,9 +614,12 @@ def _filter_predicate_pairs_owned(
         return (
             left_indices[keep],
             right_indices[keep],
-            RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
+            _planned_query_runtime_selection(
+                kernel_name="predicate_refine",
+                kernel_class=KernelClass.PREDICATE,
+                row_count=left_indices.size,
+                requested_mode=ExecutionMode.GPU,
+                gpu_available=True,
                 reason=f"GPU DE-9IM {predicate} refinement for non-point pairs",
             ),
         )
@@ -594,9 +642,11 @@ def _filter_predicate_pairs_owned(
         return (
             left_indices[keep],
             right_indices[keep],
-            RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.CPU,
+            _planned_query_runtime_selection(
+                kernel_name="predicate_refine",
+                kernel_class=KernelClass.PREDICATE,
+                row_count=left_indices.size,
+                requested_mode=ExecutionMode.CPU,
                 reason=f"direct indexed Shapely {predicate} refinement (no buffer copy)",
             ),
         )
@@ -626,9 +676,12 @@ def _filter_predicate_pairs_owned(
     return (
         left_indices[keep],
         right_indices[keep],
-        RuntimeSelection(
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.GPU,
+        _planned_query_runtime_selection(
+            kernel_name="predicate_refine",
+            kernel_class=KernelClass.PREDICATE,
+            row_count=left_indices.size,
+            requested_mode=ExecutionMode.GPU,
+            gpu_available=True,
             reason=f"mixed GPU/Shapely {predicate} refinement (GPU for point pairs, direct Shapely for remainder)",
         ),
     )

@@ -149,10 +149,7 @@ def reverse_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            return _reverse_gpu(owned)
-        except Exception:
-            pass
+        return _reverse_gpu(owned)
 
     # CPU fallback: reverse within offset spans
     new_families = {}

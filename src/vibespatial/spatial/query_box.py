@@ -5,8 +5,8 @@ from shapely.geometry.base import BaseGeometry
 
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import compact_indices, exclusive_sum
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
-from vibespatial.runtime.crossover import DispatchDecision
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 
 request_warmup(["select_i32", "select_i64", "exclusive_scan_i32", "exclusive_scan_i64"])
 from vibespatial.cuda._runtime import (  # noqa: E402
@@ -35,9 +35,17 @@ def _query_regular_grid_point_index(
     predicate: str | None,
 ) -> _DeviceCandidates | tuple[np.ndarray, np.ndarray] | None:
     metadata = getattr(flat_index, "regular_grid", None)
-    if metadata is None or predicate not in (None, "intersects") or not has_gpu_runtime():
+    if metadata is None or predicate not in (None, "intersects"):
         return None
     if GeometryFamily.POINT not in query_owned.families or len(query_owned.families) != 1:
+        return None
+    selection = plan_dispatch_selection(
+        kernel_name="point_regular_grid_candidates",
+        kernel_class=KernelClass.COARSE,
+        row_count=query_owned.row_count,
+        gpu_available=has_gpu_runtime(),
+    )
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     query_owned.move_to(
@@ -155,7 +163,7 @@ def _query_regular_grid_rect_box_index(
     predicate: str | None,
 ) -> _DeviceCandidates | tuple[np.ndarray, np.ndarray] | None:
     metadata = getattr(flat_index, "regular_grid", None)
-    if metadata is None or predicate not in (None, "intersects") or not has_gpu_runtime():
+    if metadata is None or predicate not in (None, "intersects"):
         return None
     if query_bounds is None:
         return None
@@ -164,14 +172,13 @@ def _query_regular_grid_rect_box_index(
         empty = np.empty(0, dtype=np.int32)
         return empty, empty
 
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
         row_count=query_count * flat_index.size,
         gpu_available=has_gpu_runtime(),
     )
-    dispatch_decision = plan.dispatch_decision
-    if dispatch_decision is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     runtime = get_cuda_runtime()
@@ -498,7 +505,7 @@ def _extract_box_query_bounds_from_owned(
     query_owned: OwnedGeometryArray,
 ) -> np.ndarray | None:
     if predicate is None:
-        return compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
+        return compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
     return _extract_owned_polygon_box_bounds(query_owned)
 
 
@@ -521,7 +528,7 @@ def _query_point_tree_box_index(
     force_gpu: bool = False,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     predicate_mode = _point_box_predicate_mode(predicate)
-    if predicate_mode is None or not has_gpu_runtime():
+    if predicate_mode is None:
         return None
     if GeometryFamily.POINT not in tree_owned.families or len(tree_owned.families) != 1:
         return None
@@ -531,16 +538,18 @@ def _query_point_tree_box_index(
     if box_bounds is None:
         return None
 
-    if not force_gpu:
-        plan = plan_kernel_dispatch(
+    try:
+        selection = plan_dispatch_selection(
             kernel_name="point_box_query",
             kernel_class=KernelClass.COARSE,
             row_count=tree_owned.row_count * query_row_count,
+            requested_mode=ExecutionMode.GPU if force_gpu else ExecutionMode.AUTO,
             gpu_available=has_gpu_runtime(),
         )
-        dispatch_decision = plan.dispatch_decision
-        if dispatch_decision is not DispatchDecision.GPU:
-            return None
+    except RuntimeError:
+        return None
+    if selection.selected is not ExecutionMode.GPU:
+        return None
 
     tree_owned.move_to(
         Residency.DEVICE,

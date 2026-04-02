@@ -3,8 +3,12 @@ from __future__ import annotations
 import pytest
 
 from vibespatial import (
+    DEFAULT_DATACENTER_PROFILE,
+    DeviceSnapshot,
     ExecutionMode,
     KernelClass,
+    MonitoringBackend,
+    PrecisionMode,
     invalidate_snapshot_cache,
     plan_dispatch_selection,
 )
@@ -20,11 +24,14 @@ def _clean_snapshot_cache():
 @pytest.mark.parametrize(
     "kernel_name,kernel_class,threshold",
     [
+        ("normalize", KernelClass.COARSE, 500),
         ("point_clip", KernelClass.CONSTRUCTIVE, 10_000),
         ("point_buffer", KernelClass.CONSTRUCTIVE, 10_000),
         ("linestring_buffer", KernelClass.CONSTRUCTIVE, 5_000),
+        ("polygon_centroid", KernelClass.METRIC, 500),
         ("polygon_buffer", KernelClass.CONSTRUCTIVE, 50_000),
         ("segment_classify", KernelClass.CONSTRUCTIVE, 4_096),
+        ("bbox_overlap_candidates", KernelClass.COARSE, 2_048),
         ("flat_index_build", KernelClass.COARSE, 0),
     ],
 )
@@ -77,3 +84,31 @@ def test_gpu_unavailable_falls_back_to_cpu() -> None:
         gpu_available=False,
     )
     assert selection.selected is ExecutionMode.CPU
+
+
+def test_precision_kernel_override_preserves_cached_device_profile(monkeypatch) -> None:
+    import vibespatial.runtime.adaptive as adaptive
+
+    monkeypatch.setattr(
+        adaptive,
+        "get_cached_snapshot",
+        lambda: DeviceSnapshot(
+            backend=MonitoringBackend.UNAVAILABLE,
+            gpu_available=True,
+            device_profile=DEFAULT_DATACENTER_PROFILE,
+            reason="test snapshot",
+        ),
+    )
+
+    selection = plan_dispatch_selection(
+        kernel_name="bbox_overlap_candidates",
+        kernel_class=KernelClass.COARSE,
+        precision_kernel_class=KernelClass.PREDICATE,
+        row_count=10_000,
+        requested_precision=PrecisionMode.AUTO,
+    )
+
+    assert selection.selected is ExecutionMode.GPU
+    assert selection.device_profile == DEFAULT_DATACENTER_PROFILE
+    assert selection.precision_plan.kernel_class is KernelClass.PREDICATE
+    assert selection.precision_plan.compute_precision is PrecisionMode.FP64

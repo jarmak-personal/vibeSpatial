@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
+
 # ---------------------------------------------------------------------------
 # GPU clip thresholds (ADR-0033 tier system)
 # ---------------------------------------------------------------------------
@@ -15,7 +17,7 @@ _LINE_CLIP_GPU_THRESHOLD = 1_000
 # into a pre-allocated output buffer using per-ring offsets computed via
 # exclusive_scan on a vertex-count pass.
 
-_SUTHERLAND_HODGMAN_KERNEL_SOURCE = r"""
+_SUTHERLAND_HODGMAN_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + r"""
 #define EPSILON 1e-12
 
 /* Clip a ring against one boundary edge.
@@ -105,11 +107,7 @@ extern "C" __global__ void sh_count_vertices(
   int n = end - start;
 
   /* Strip closure vertex */
-  if (n >= 2) {
-    double dx = ring_x[start] - ring_x[end - 1];
-    double dy = ring_y[start] - ring_y[end - 1];
-    if (dx * dx + dy * dy < 1e-24) n--;
-  }
+  n = vs_strip_closure(ring_x, ring_y, start, end, n, 1e-24);
   if (n < 3) { out_vertex_counts[ring] = 0; return; }
 
   /* Use local buffers (max reasonable ring size for GPU clip) */
@@ -163,11 +161,7 @@ extern "C" __global__ void sh_clip_rings(
   const int end = ring_offsets[ring + 1];
   int n = end - start;
 
-  if (n >= 2) {
-    double dx = ring_x[start] - ring_x[end - 1];
-    double dy = ring_y[start] - ring_y[end - 1];
-    if (dx * dx + dy * dy < 1e-24) n--;
-  }
+  n = vs_strip_closure(ring_x, ring_y, start, end, n, 1e-24);
   if (n < 3) return;
 
   const int MAX_VERTS = 256;

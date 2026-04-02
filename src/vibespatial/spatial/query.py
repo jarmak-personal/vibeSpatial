@@ -7,7 +7,9 @@ import numpy as np
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import KernelClass
 
 from .indexing import build_flat_spatial_index, generate_bounds_pairs
 from .nearest import (  # noqa: F401
@@ -38,6 +40,7 @@ from .query_candidates import (  # noqa: F401
     _generate_distance_pairs_gpu,
     _generate_distance_pairs_gpu_device,
 )
+from .query_cpu import shapely_bounds_array
 
 # ---------------------------------------------------------------------------
 # Re-exports from decomposed modules for backward compatibility.
@@ -65,6 +68,7 @@ from .query_utils import (  # noqa: F401
     _gpu_bounds_dispatch_mode,
     _indices_to_dense,
     _indices_to_sparse,
+    _planned_query_runtime_selection,
     _reorder_scalar_tree_matches,
     _sort_indices,
     _to_owned,
@@ -156,10 +160,8 @@ def query_spatial_index(
         and getattr(flat_index, "regular_grid", None) is not None
         and predicate in (None, "intersects")
     ):
-        import shapely as _shapely
-
         if predicate is None:
-            _rg_bounds = np.asarray(_shapely.bounds(query_values), dtype=np.float64)
+            _rg_bounds = shapely_bounds_array(query_values)
         else:
             _rg_bounds = _extract_box_query_bounds_shapely(query_values)
         regular_grid_box_pairs = _query_regular_grid_rect_box_index(
@@ -222,10 +224,7 @@ def query_spatial_index(
     # (~2ms) instead of _to_owned() (~200-500ms) for bounds extraction.
     # The owned conversion is deferred until predicate refinement needs it.
     if query_values is not None and query_owned is None and predicate is None:
-        import shapely as _shapely_bounds
-        _shapely_query_bounds = np.asarray(
-            _shapely_bounds.bounds(query_values), dtype=np.float64,
-        )
+        _shapely_query_bounds = shapely_bounds_array(query_values)
     else:
         _shapely_query_bounds = None
 
@@ -234,7 +233,7 @@ def query_spatial_index(
         if predicate is None and _shapely_query_bounds is not None:
             point_box_bounds = _shapely_query_bounds
         elif predicate is None and query_owned is not None:
-            point_box_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
+            point_box_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
         else:
             point_box_bounds = _extract_box_query_bounds(predicate, query_values)
         point_box_pairs = _query_point_tree_box_index(
@@ -288,10 +287,7 @@ def query_spatial_index(
         if _shapely_query_bounds is not None:
             regular_grid_box_bounds = _shapely_query_bounds
         else:
-            import shapely as _shapely_bounds_c
-            regular_grid_box_bounds = np.asarray(
-                _shapely_bounds_c.bounds(query_values), dtype=np.float64,
-            )
+            regular_grid_box_bounds = shapely_bounds_array(query_values)
     else:
         regular_grid_box_bounds = None
         if query_owned is not None:
@@ -437,7 +433,7 @@ def query_spatial_index(
     if _shapely_query_bounds is not None:
         query_bounds = _shapely_query_bounds
     else:
-        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
+        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
     tree_bounds = flat_index.bounds
     query_size = len(query_values) if query_values is not None else query_owned.row_count
 
@@ -481,9 +477,12 @@ def query_spatial_index(
         )
         if gpu_dwithin is not None:
             left_idx, right_idx = gpu_dwithin
-            refine_selection = RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
+            refine_selection = _planned_query_runtime_selection(
+                kernel_name="dwithin_refine",
+                kernel_class=KernelClass.METRIC,
+                row_count=left_idx.size,
+                requested_mode=ExecutionMode.GPU,
+                gpu_available=True,
                 reason="GPU dwithin refinement via distance kernels",
             )
             # When return_device is True and results are already device-
@@ -709,24 +708,19 @@ def query_spatial_index(
 
 def build_owned_spatial_index(geometry: np.ndarray) -> tuple[OwnedGeometryArray, Any]:
     owned = _to_owned(np.asarray(geometry, dtype=object))
-    use_gpu = has_gpu_runtime()
-    selection = RuntimeSelection(
-        requested=ExecutionMode.AUTO,
-        selected=ExecutionMode.GPU if use_gpu else ExecutionMode.CPU,
-        reason=(
-            "repo-owned spatial index build (GPU morton sort)"
-            if use_gpu
-            else "repo-owned spatial index build (CPU)"
-        ),
+    selection = plan_dispatch_selection(
+        kernel_name="flat_index_build",
+        kernel_class=KernelClass.COARSE,
+        row_count=owned.row_count,
     )
-    index = build_flat_spatial_index(owned, runtime_selection=selection)
+    index = build_flat_spatial_index(owned, runtime_selection=selection.runtime_selection)
 
     # ADR-0034 Level 3: eagerly import the spatial query kernel module so
     # its module-scope request_nvrtc_warmup() fires, then block until all
     # NVRTC and CCCL background compilations finish.  This front-loads JIT
     # cost (~1-2s) into the index build rather than the first query call,
     # eliminating the 400-500x cold-query penalty at small scales (20k).
-    if use_gpu:
+    if selection.selected is ExecutionMode.GPU:
         import vibespatial.spatial.query_candidates  # noqa: F401 — triggers warmup
         from vibespatial.cuda.cccl_precompile import ensure_pipelines_warm
 

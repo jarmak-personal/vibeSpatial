@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from vibespatial.constructive.polygon_kernels import _POLYGON_CENTROID_KERNEL_SOURCE
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # Cooperative polygon centroid kernel: 1 block per geometry (for complex polygons)
 # ---------------------------------------------------------------------------
 
-_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_POLYGON_CENTROID_COOPERATIVE_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
 extern "C" __global__ __launch_bounds__(256, 4)
 void polygon_centroid_cooperative(
     const double* __restrict__ x,
@@ -32,11 +33,7 @@ void polygon_centroid_cooperative(
     int n = coord_end - coord_start;
 
     /* Strip closure vertex if present. */
-    if (n >= 2) {{
-        double dx = x[coord_start] - x[coord_end - 1];
-        double dy = y[coord_start] - y[coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) n--;
-    }}
+    n = vs_strip_closure(x, y, coord_start, coord_end, n, 1e-24);
 
     if (n < 3) {{
         if (threadIdx.x == 0) {{
@@ -76,21 +73,10 @@ void polygon_centroid_cooperative(
         KAHAN_ADD(partial_cy, (yi + yi1) * cross, partial_cy_c);
     }}
 
-    /* Warp-level reduction via __shfl_down_sync */
-    const unsigned int FULL_MASK = 0xFFFFFFFF;
-    for (int offset = 16; offset > 0; offset >>= 1) {{
-        compute_t s_area = __shfl_down_sync(FULL_MASK, partial_area, offset);
-        compute_t s_area_c = __shfl_down_sync(FULL_MASK, partial_area_c, offset);
-        KAHAN_ADD(partial_area, s_area - s_area_c, partial_area_c);
-
-        compute_t s_cx = __shfl_down_sync(FULL_MASK, partial_cx, offset);
-        compute_t s_cx_c = __shfl_down_sync(FULL_MASK, partial_cx_c, offset);
-        KAHAN_ADD(partial_cx, s_cx - s_cx_c, partial_cx_c);
-
-        compute_t s_cy = __shfl_down_sync(FULL_MASK, partial_cy, offset);
-        compute_t s_cy_c = __shfl_down_sync(FULL_MASK, partial_cy_c, offset);
-        KAHAN_ADD(partial_cy, s_cy - s_cy_c, partial_cy_c);
-    }}
+    /* Warp-level reduction via shared Kahan shuffle macro */
+    WARP_KAHAN_REDUCE(partial_area, partial_area_c);
+    WARP_KAHAN_REDUCE(partial_cx, partial_cx_c);
+    WARP_KAHAN_REDUCE(partial_cy, partial_cy_c);
 
     /* Block-level reduction via shared memory */
     const int warp_id = threadIdx.x >> 5;

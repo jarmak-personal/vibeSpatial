@@ -32,6 +32,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vibespatial.constructive.minimum_clearance_cpu import (
+    _minimum_clearance_cpu,
+    _minimum_clearance_line_cpu,
+)
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -373,18 +377,6 @@ def _launch_multipolygon_clearance(
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback
-# ---------------------------------------------------------------------------
-
-def _minimum_clearance_cpu(owned: OwnedGeometryArray) -> np.ndarray:
-    """CPU fallback via Shapely."""
-    import shapely as _shapely
-
-    geoms = np.asarray(owned.to_shapely(), dtype=object)
-    return _shapely.minimum_clearance(geoms)
-
-
-# ---------------------------------------------------------------------------
 # Public dispatch entry point
 # ---------------------------------------------------------------------------
 
@@ -403,8 +395,6 @@ def minimum_clearance_owned(
     is populated (vibeFrame path), GPU kernels read directly from
     device pointers with no copy.
     """
-    from vibespatial.runtime import RuntimeSelection
-    from vibespatial.runtime.precision import select_precision_plan
 
     row_count = owned.row_count
     if row_count == 0:
@@ -415,40 +405,31 @@ def minimum_clearance_owned(
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
-                reason="minimum_clearance GPU dispatch",
-            ),
-            kernel_class=KernelClass.METRIC,
-            requested=precision,
+        precision_plan = selection.precision_plan
+        result = _minimum_clearance_gpu(owned, precision_plan=precision_plan)
+        result[~owned.validity] = np.nan
+        record_dispatch_event(
+            surface="geopandas.array.minimum_clearance",
+            operation="minimum_clearance",
+            implementation="gpu_nvrtc_segment_distance",
+            reason=selection.reason,
+            detail=f"rows={row_count}",
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _minimum_clearance_gpu(owned, precision_plan=precision_plan)
-            result[~owned.validity] = np.nan
-        except Exception:
-            pass  # fall through to CPU
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.minimum_clearance",
-                operation="minimum_clearance",
-                implementation="gpu_nvrtc_segment_distance",
-                reason="GPU NVRTC minimum clearance kernel",
-                detail=f"rows={row_count}",
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     record_dispatch_event(
         surface="geopandas.array.minimum_clearance",
         operation="minimum_clearance",
         implementation="shapely",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}",
+        requested=selection.requested,
         selected=ExecutionMode.CPU,
     )
     result = _minimum_clearance_cpu(owned)
@@ -878,19 +859,6 @@ def _build_clearance_line_oga(
 # ---------------------------------------------------------------------------
 # CPU fallback for clearance line
 # ---------------------------------------------------------------------------
-
-
-def _minimum_clearance_line_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """CPU fallback via Shapely."""
-    import shapely as _shapely
-
-    from vibespatial.geometry.owned import from_shapely_geometries
-
-    geoms = np.asarray(owned.to_shapely(), dtype=object)
-    result_geoms = _shapely.minimum_clearance_line(geoms)
-    return from_shapely_geometries(result_geoms)
-
-
 # ---------------------------------------------------------------------------
 # Public dispatch entry point for clearance line
 # ---------------------------------------------------------------------------
@@ -915,8 +883,6 @@ def minimum_clearance_line_owned(
     is populated (vibeFrame path), GPU kernels read directly from
     device pointers with no copy.
     """
-    from vibespatial.runtime import RuntimeSelection
-    from vibespatial.runtime.precision import select_precision_plan
 
     row_count = owned.row_count
     if row_count == 0:
@@ -934,39 +900,30 @@ def minimum_clearance_line_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
-                reason="minimum_clearance_line GPU dispatch",
-            ),
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
+        precision_plan = selection.precision_plan
+        result = _minimum_clearance_line_gpu(owned, precision_plan=precision_plan)
+        record_dispatch_event(
+            surface="geopandas.array.minimum_clearance_line",
+            operation="minimum_clearance_line",
+            implementation="gpu_nvrtc_segment_closest_points",
+            reason=selection.reason,
+            detail=f"rows={row_count}",
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _minimum_clearance_line_gpu(owned, precision_plan=precision_plan)
-        except Exception:
-            pass  # fall through to CPU
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.minimum_clearance_line",
-                operation="minimum_clearance_line",
-                implementation="gpu_nvrtc_segment_closest_points",
-                reason="GPU NVRTC minimum clearance line kernel",
-                detail=f"rows={row_count}",
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     record_dispatch_event(
         surface="geopandas.array.minimum_clearance_line",
         operation="minimum_clearance_line",
         implementation="shapely",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}",
+        requested=selection.requested,
         selected=ExecutionMode.CPU,
     )
     return _minimum_clearance_line_cpu(owned)

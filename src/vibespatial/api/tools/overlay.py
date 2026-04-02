@@ -18,8 +18,10 @@ from vibespatial.api.geometry_array import (
     _crs_mismatch_warn,
 )
 from vibespatial.runtime._runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
+from vibespatial.runtime.precision import KernelClass
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
 logger = logging.getLogger(__name__)
@@ -454,9 +456,12 @@ def _many_vs_one_intersection_owned(
     )
 
     n_pairs = left_sub.row_count
-    _pairwise_mode = (
-        ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
+    _pairwise_mode = plan_dispatch_selection(
+        kernel_name="overlay_pairwise",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=n_pairs,
     )
+    _pairwise_mode = _pairwise_mode.selected
 
     # Build the single-row right OGA for containment bypass / SH clip.
     right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
@@ -618,6 +623,15 @@ def _many_vs_one_intersection_owned(
             dispatch_mode=_pairwise_mode,
         )
 
+    def _remainder_intersection(left_rem_oga, right_one_oga):
+        """Choose one remainder path up front instead of falling back by exception."""
+        if (
+            left_rem_oga.row_count < _GPU_REMAINDER_THRESHOLD
+            or not has_gpu_runtime()
+        ):
+            return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
+        return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
+
     if sh_clip_result is not None and sh_eligible_mask is not None:
         # Some polygons were SH-clipped; overlay only the complex remainder.
         if len(sh_remainder_indices_local) > 0:
@@ -628,36 +642,12 @@ def _many_vs_one_intersection_owned(
                 left_complex = left_remainder.take(d_complex)
             else:
                 left_complex = left_remainder.take(sh_remainder_indices_local)
-            if left_complex.row_count < _GPU_REMAINDER_THRESHOLD:
-                complex_result = _shapely_remainder_intersection(
-                    left_complex, right_one,
-                )
-            else:
-                try:
-                    complex_result = _gpu_remainder_intersection(
-                        left_complex, right_one,
-                    )
-                except (NotImplementedError, Exception):
-                    complex_result = _shapely_remainder_intersection(
-                        left_complex, right_one,
-                    )
+            complex_result = _remainder_intersection(left_complex, right_one)
         else:
             complex_result = None
     else:
         # No SH clip -- overlay all remainder rows.
-        if left_remainder.row_count < _GPU_REMAINDER_THRESHOLD:
-            complex_result = _shapely_remainder_intersection(
-                left_remainder, right_one,
-            )
-        else:
-            try:
-                complex_result = _gpu_remainder_intersection(
-                    left_remainder, right_one,
-                )
-            except (NotImplementedError, Exception):
-                complex_result = _shapely_remainder_intersection(
-                    left_remainder, right_one,
-                )
+        complex_result = _remainder_intersection(left_remainder, right_one)
 
     # Release GPU pool memory after overlay on remainder polygons: SH clip
     # and per-pair GPU overlay produce large intermediates that are dead now.
@@ -895,35 +885,14 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
 
             if intersections is None and not _is_many_vs_one:
                 # Standard element-wise path for N-vs-M patterns.
-                try:
-                    result_owned = binary_constructive_owned(
-                        "intersection", left_sub, right_sub,
-                        dispatch_mode=_pairwise_mode,
-                    )
-                    intersections = GeoSeries(
-                        GeometryArray.from_owned(result_owned, crs=df1.crs),
-                    )
-                    used_owned = True
-                except NotImplementedError:
-                    # Phase 24: Guard — binary_constructive_owned raised
-                    # NotImplementedError (e.g. GeometryCollection results).
-                    # Record fallback event so this is never silent.
-                    record_fallback_event(
-                        surface="geopandas.overlay.intersection",
-                        reason="binary_constructive_owned raised NotImplementedError",
-                        detail=f"rows={len(idx1)}, falling back to Shapely intersection",
-                        requested=_pairwise_mode,
-                        selected=ExecutionMode.CPU,
-                        pipeline="_overlay_intersection",
-                        d2h_transfer=True,
-                    )
-                    # CPU-only mode: Shapely intersection on already-gathered subsets
-                    left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
-                    right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
-                    intersections = GeoSeries(
-                        shapely.intersection(left_shapely, right_shapely),
-                        crs=df1.crs,
-                    )
+                result_owned = binary_constructive_owned(
+                    "intersection", left_sub, right_sub,
+                    dispatch_mode=_pairwise_mode,
+                )
+                intersections = GeoSeries(
+                    GeometryArray.from_owned(result_owned, crs=df1.crs),
+                )
+                used_owned = True
 
             if intersections is None and _is_many_vs_one:
                 # Many-vs-one fast path failed -- fall back to element-wise.
@@ -934,36 +903,14 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                         right_sub = right_owned.device_take(d_idx2)
                     else:
                         right_sub = right_owned.take(np.asarray(idx2))
-                try:
-                    result_owned = binary_constructive_owned(
-                        "intersection", left_sub, right_sub,
-                        dispatch_mode=_pairwise_mode,
-                    )
-                    intersections = GeoSeries(
-                        GeometryArray.from_owned(result_owned, crs=df1.crs),
-                    )
-                    used_owned = True
-                except NotImplementedError:
-                    record_fallback_event(
-                        surface="geopandas.overlay.intersection",
-                        reason="binary_constructive_owned raised NotImplementedError",
-                        detail=f"rows={len(idx1)}, falling back to Shapely intersection",
-                        requested=_pairwise_mode,
-                        selected=ExecutionMode.CPU,
-                        pipeline="_overlay_intersection",
-                        d2h_transfer=True,
-                    )
-                    if right_sub is None:
-                        if _has_device_indices:
-                            right_sub = right_owned.device_take(d_idx2)
-                        else:
-                            right_sub = right_owned.take(np.asarray(idx2))
-                    left_shapely = np.asarray(left_sub.to_shapely(), dtype=object)
-                    right_shapely = np.asarray(right_sub.to_shapely(), dtype=object)
-                    intersections = GeoSeries(
-                        shapely.intersection(left_shapely, right_shapely),
-                        crs=df1.crs,
-                    )
+                result_owned = binary_constructive_owned(
+                    "intersection", left_sub, right_sub,
+                    dispatch_mode=_pairwise_mode,
+                )
+                intersections = GeoSeries(
+                    GeometryArray.from_owned(result_owned, crs=df1.crs),
+                )
+                used_owned = True
 
         if intersections is None:
             # ADR-0036 boundary: geometry operations on geometry arrays.
@@ -1043,50 +990,35 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     # instead of materializing via to_shapely().
     #
     if idx1.size > 0 and left_owned is not None and right_owned is not None:
-        try:
-            from vibespatial.geometry.owned import concat_owned_scatter
+        from vibespatial.geometry.owned import concat_owned_scatter
 
-            # The GPU polygon_intersection kernel uses Sutherland-Hodgman
-            # which only handles convex clip polygons.  The difference
-            # pipeline may produce concave intermediates (e.g., union of
-            # overlapping circles), so keep AUTO until the kernel supports
-            # concave clipping.
-            _pairwise_mode = ExecutionMode.AUTO
+        # The GPU polygon_intersection kernel uses Sutherland-Hodgman
+        # which only handles convex clip polygons.  The difference
+        # pipeline may produce concave intermediates (e.g., union of
+        # overlapping circles), so keep AUTO until the kernel supports
+        # concave clipping.
+        _pairwise_mode = ExecutionMode.AUTO
 
-            # Batched overlay difference: splits groups into VRAM-safe
-            # batches to prevent OOM at large scale (100K+).  At small
-            # scale the fast path processes everything in a single batch.
-            diff_owned, idx1_unique = _batched_overlay_difference_owned(
-                left_owned,
-                right_owned,
-                idx1,
-                idx2,
-                d_idx1,
-                d_idx2,
-                _has_device_indices,
-                _pairwise_mode,
-            )
+        # Batched overlay difference: splits groups into VRAM-safe
+        # batches to prevent OOM at large scale (100K+).  At small
+        # scale the fast path processes everything in a single batch.
+        diff_owned, idx1_unique = _batched_overlay_difference_owned(
+            left_owned,
+            right_owned,
+            idx1,
+            idx2,
+            d_idx1,
+            d_idx2,
+            _has_device_indices,
+            _pairwise_mode,
+        )
 
-            # Assemble full result: scatter differenced rows into the
-            # original left owned array.  No to_shapely() materialisation.
-            result_owned = concat_owned_scatter(
-                left_owned, diff_owned, idx1_unique,
-            )
-            used_owned = True
-        except (ImportError, NotImplementedError):
-            # Phase 24: Record fallback event when owned-path dispatch fails.
-            _fallback_requested = (
-                ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.AUTO
-            )
-            record_fallback_event(
-                surface="geopandas.overlay.difference",
-                reason="owned-path dispatch failed (ImportError or NotImplementedError)",
-                detail=f"left_rows={n_left}, idx1_size={idx1.size}",
-                requested=_fallback_requested,
-                selected=ExecutionMode.CPU,
-                pipeline="_overlay_difference",
-                d2h_transfer=True,
-            )
+        # Assemble full result: scatter differenced rows into the
+        # original left owned array.  No to_shapely() materialisation.
+        result_owned = concat_owned_scatter(
+            left_owned, diff_owned, idx1_unique,
+        )
+        used_owned = True
 
     if result_owned is not None:
         # Device-resident path: wrap the scattered OwnedGeometryArray

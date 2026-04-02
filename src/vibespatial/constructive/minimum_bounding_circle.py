@@ -76,7 +76,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
 
 logger = logging.getLogger(__name__)
@@ -620,14 +620,11 @@ def minimum_bounding_circle_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         families_with_rows = [
             fam for fam, buf in owned.families.items()
             if buf.row_count > 0
@@ -700,14 +697,11 @@ def minimum_bounding_radius_owned(
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.METRIC,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         families_with_rows = [
             fam for fam, buf in owned.families.items()
             if buf.row_count > 0

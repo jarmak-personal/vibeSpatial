@@ -36,6 +36,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.line_merge_cpu import _line_merge_cpu
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -65,7 +66,6 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
-    select_precision_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -361,35 +361,6 @@ def _build_empty_output(
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "line_merge",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("linestring", "multilinestring"),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "line_merge"),
-)
-def _line_merge_cpu(
-    owned: OwnedGeometryArray,
-    *,
-    directed: bool = False,
-) -> OwnedGeometryArray:
-    """Compute line_merge via Shapely."""
-    import shapely
-
-    geoms = owned.to_shapely()
-    results = [
-        shapely.line_merge(g, directed=directed) if g is not None else None
-        for g in geoms
-    ]
-    return from_shapely_geometries(results)
-
-
-# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -434,39 +405,32 @@ def line_merge_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
+        precision_plan = selection.precision_plan
+        result = _line_merge_gpu(owned, directed=directed)
+        record_dispatch_event(
+            surface="geopandas.array.line_merge",
+            operation="line_merge",
+            implementation="line_merge_gpu_nvrtc",
+            reason=selection.reason,
+            detail=(
+                f"rows={row_count}, directed={directed}, "
+                f"precision={precision_plan.compute_precision.value}"
+            ),
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _line_merge_gpu(owned, directed=directed)
-        except Exception:
-            pass
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.line_merge",
-                operation="line_merge",
-                implementation="line_merge_gpu_nvrtc",
-                reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, directed={directed}, "
-                    f"precision={precision_plan.compute_precision.value}"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     result = _line_merge_cpu(owned, directed=directed)
     record_dispatch_event(
         surface="geopandas.array.line_merge",
         operation="line_merge",
         implementation="line_merge_cpu_shapely",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}, directed={directed}",
         requested=selection.requested,
         selected=ExecutionMode.CPU,

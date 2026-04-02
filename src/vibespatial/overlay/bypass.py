@@ -486,10 +486,11 @@ def _is_clip_polygon_sh_eligible(
     if right.row_count != 1:
         return False, 0
 
-    # Must be Polygon family (not MultiPolygon).
-    right._ensure_host_state()
+    # Must be Polygon family (not MultiPolygon). Only small structural arrays
+    # are needed here; keep coordinate buffers lazy.
     if GeometryFamily.POLYGON not in right.families:
         return False, 0
+    right._ensure_host_family_structure(GeometryFamily.POLYGON)
     poly_buf = right.families[GeometryFamily.POLYGON]
     if poly_buf.row_count == 0:
         return False, 0
@@ -549,7 +550,8 @@ def _classify_remainder_sh_eligible(
     n = left.row_count
     sh_eligible = np.zeros(n, dtype=bool)
 
-    left._ensure_host_state()
+    if GeometryFamily.POLYGON in left.families:
+        left._ensure_host_family_structure(GeometryFamily.POLYGON)
 
     # Only Polygon family rows can be SH-eligible (not MultiPolygon).
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]

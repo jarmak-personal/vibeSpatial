@@ -28,3 +28,4 @@ from vibespatial.cuda.device_functions.segment_crossing import (  # noqa: F401
     SEGMENT_CROSSING_DEVICE,
 )
 from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE  # noqa: F401
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE  # noqa: F401

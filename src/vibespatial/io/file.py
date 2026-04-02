@@ -969,35 +969,32 @@ def _try_gpu_read_file(
         # GeoJSON GPU byte-classify fast path: direct GPU parsing of the
         # entire file for files > 10 MB.
         if plan.format is IOFormat.GEOJSON and file_size > _GPU_MIN_FILE_SIZE:
-            try:
-                from .geojson_gpu import read_geojson_gpu
+            from .geojson_gpu import read_geojson_gpu
 
-                gpu_result = read_geojson_gpu(file_path, target_crs=target_crs)
-                # GeoJSON is EPSG:4326 by spec (RFC 7946).  If target_crs
-                # was set, coordinates are already reprojected.
-                effective_crs = target_crs if target_crs is not None else "EPSG:4326"
-                geom_series = geoseries_from_owned(
-                    gpu_result.owned, name="geometry", crs=effective_crs,
-                )
-                props_df = gpu_result.extract_properties_dataframe()
-                import vibespatial.api as geopandas
+            gpu_result = read_geojson_gpu(file_path, target_crs=target_crs)
+            # GeoJSON is EPSG:4326 by spec (RFC 7946).  If target_crs
+            # was set, coordinates are already reprojected.
+            effective_crs = target_crs if target_crs is not None else "EPSG:4326"
+            geom_series = geoseries_from_owned(
+                gpu_result.owned, name="geometry", crs=effective_crs,
+            )
+            props_df = gpu_result.extract_properties_dataframe()
+            import vibespatial.api as geopandas
 
-                gdf = geopandas.GeoDataFrame(props_df, geometry=geom_series)
-                record_dispatch_event(
-                    surface="geopandas.read_file",
-                    operation="read_file",
-                    implementation="geojson_gpu_byte_classify_adapter",
-                    reason=(
-                        "GPU byte-classification: direct GPU parsing of GeoJSON with "
-                        "NVRTC kernels, bypassing pyogrio for geometry."
-                    ),
-                    selected=ExecutionMode.GPU,
-                )
-                if build_index:
-                    _attach_gpu_spatial_index(gdf)
-                return gdf
-            except Exception:
-                pass  # fall through to pyogrio GPU WKB path
+            gdf = geopandas.GeoDataFrame(props_df, geometry=geom_series)
+            record_dispatch_event(
+                surface="geopandas.read_file",
+                operation="read_file",
+                implementation="geojson_gpu_byte_classify_adapter",
+                reason=(
+                    "GPU byte-classification: direct GPU parsing of GeoJSON with "
+                    "NVRTC kernels, bypassing pyogrio for geometry."
+                ),
+                selected=ExecutionMode.GPU,
+            )
+            if build_index:
+                _attach_gpu_spatial_index(gdf)
+            return gdf
 
         # FlatGeobuf: direct GPU binary decode for files > 10 MB.
         # FGB stores coordinates as flat arrays -- almost our OGA format.

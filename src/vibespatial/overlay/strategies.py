@@ -5,7 +5,7 @@ overlay strategy.  Currently all strategies route to the existing per-group
 code path; future beads (lyy.16, lyy.18, lyy.21) will add strategy-specific
 GPU implementations (containment bypass, batched SH clip, batched overlay).
 
-Uses the shared ``WorkloadShape`` enum from ``vibespatial.runtime.workload``
+Uses the shared ``WorkloadShape`` enum from ``vibespatial.runtime.crossover``
 for broadcast detection (nsf.5), falling back to overlay-specific detection
 for ``broadcast_left`` (which the shared enum intentionally omits).
 """
@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vibespatial.geometry.owned import OwnedGeometryArray
-    from vibespatial.runtime.workload import WorkloadShape
+    from vibespatial.runtime.crossover import WorkloadShape
 
 
 @dataclass(frozen=True)
@@ -68,7 +68,7 @@ def select_overlay_strategy(
     OverlayStrategy
         The selected strategy descriptor.
     """
-    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+    from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
     # Use shared workload detection for broadcast-right and pairwise.
     # detect_workload_shape() raises ValueError for mismatched lengths

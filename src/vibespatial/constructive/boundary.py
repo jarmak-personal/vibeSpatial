@@ -29,6 +29,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.boundary_cpu import _boundary_cpu as _boundary_cpu
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -41,37 +42,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
-
-# ---------------------------------------------------------------------------
-# CPU fallback: boundary via Shapely
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "boundary",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "multipoint", "polygon", "linestring",
-        "multilinestring", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "boundary"),
-)
-def _boundary_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """Compute boundary of each geometry using Shapely as the reference
-    implementation.
-
-    Converts to Shapely geometries, calls ``shapely.boundary`` on each,
-    and converts back to an OwnedGeometryArray.
-    """
-    import shapely
-
-    geoms = owned.to_shapely()
-    results = [shapely.boundary(g) if g is not None else None for g in geoms]
-    return from_shapely_geometries(results)
-
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 # ---------------------------------------------------------------------------
 # GPU helpers: per-family boundary implementations
@@ -531,33 +502,26 @@ def boundary_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
+        precision_plan = selection.precision_plan
+        result = _boundary_gpu(owned)
+        record_dispatch_event(
+            surface="geopandas.array.boundary",
+            operation="boundary",
+            implementation="boundary_gpu_cupy",
+            reason=selection.reason,
+            detail=(
+                f"rows={row_count}, "
+                f"precision={precision_plan.compute_precision.value} "
+                f"(offset-only, not parameterized)"
+            ),
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _boundary_gpu(owned)
-        except Exception:
-            pass
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.boundary",
-                operation="boundary",
-                implementation="boundary_gpu_cupy",
-                reason=selection.reason,
-                detail=(
-                    f"rows={row_count}, "
-                    f"precision={precision_plan.compute_precision.value} "
-                    f"(offset-only, not parameterized)"
-                ),
-                requested=selection.requested,
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     result = _boundary_cpu(owned)
     record_dispatch_event(

@@ -29,6 +29,7 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    _compile_precision_kernel,
     compile_kernel_group,
     get_cuda_runtime,
 )
@@ -42,6 +43,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
 
+from .measurement import _coord_stats_from_owned
 from .polygon import (
     _POLYGON_CENTROID_KERNEL_NAMES,
     _polygon_centroids_cpu,
@@ -99,9 +101,13 @@ request_nvrtc_warmup([
 
 def _compile_kernel(name_prefix: str, fp64_source: str, fp32_source: str,
                     kernel_names: tuple[str, ...], compute_type: str = "double"):
-    source = fp64_source if compute_type == "double" else fp32_source
-    suffix = "fp64" if compute_type == "double" else "fp32"
-    return compile_kernel_group(f"{name_prefix}-{suffix}", source, kernel_names)
+    return _compile_precision_kernel(
+        name_prefix,
+        fp64_source,
+        fp32_source,
+        kernel_names,
+        compute_type,
+    )
 
 
 def _compile_polygon_centroid_kernel(compute_type: str = "double"):
@@ -650,7 +656,7 @@ def centroid_owned(
     """
     from vibespatial.geometry.owned import from_shapely_geometries
     from vibespatial.runtime.dispatch import record_dispatch_event
-    from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
+    from vibespatial.runtime.precision import CoordinateStats
 
     row_count = owned.row_count
     if row_count == 0:
@@ -664,14 +670,7 @@ def centroid_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        max_abs = 0.0
-        coord_min = np.inf
-        coord_max = -np.inf
-        for buf in owned.families.values():
-            if buf.row_count > 0 and buf.x.size > 0:
-                max_abs = max(max_abs, float(np.abs(buf.x).max()), float(np.abs(buf.y).max()))
-                coord_min = min(coord_min, float(buf.x.min()), float(buf.y.min()))
-                coord_max = max(coord_max, float(buf.x.max()), float(buf.y.max()))
+        max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
         span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
         # The centroid shoelace formula involves products of coordinates
         # (xi*yi1 - xi1*yi) which require constructive-level precision.
@@ -679,27 +678,27 @@ def centroid_owned(
         # summation and coordinate centering (observed >1 unit error for
         # coordinate ranges [0, 1000]).  Request CONSTRUCTIVE precision
         # planning to guarantee fp64 compute on consumer GPUs.
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
+        selection = plan_dispatch_selection(
+            kernel_name="geometry_centroid",
+            kernel_class=KernelClass.METRIC,
+            row_count=row_count,
+            requested_mode=dispatch_mode,
+            requested_precision=precision,
+            precision_kernel_class=KernelClass.CONSTRUCTIVE,
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
         )
-        try:
-            result = _centroid_gpu(owned, precision_plan=precision_plan)
-        except Exception:
-            pass  # fall through to CPU
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.centroid",
-                operation="centroid",
-                implementation="gpu_nvrtc_centroid",
-                reason="GPU NVRTC centroid kernel",
-                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
-                requested=dispatch_mode,
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        precision_plan = selection.precision_plan
+        result = _centroid_gpu(owned, precision_plan=precision_plan)
+        record_dispatch_event(
+            surface="geopandas.array.centroid",
+            operation="centroid",
+            implementation="gpu_nvrtc_centroid",
+            reason=selection.reason,
+            detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return result
 
     cx, cy = _centroid_cpu(owned)
     cx[~owned.validity] = np.nan
@@ -708,13 +707,12 @@ def centroid_owned(
         surface="geopandas.array.centroid",
         operation="centroid",
         implementation="numpy",
-        reason="CPU fallback",
+        reason="CPU selected by dispatch planner",
         detail=f"rows={row_count}",
         requested=dispatch_mode,
         selected=ExecutionMode.CPU,
     )
-    # Build host-resident Point OwnedGeometryArray from CPU results
-    import shapely as _shapely
+    # Build host-resident Point OwnedGeometryArray from CPU results.
+    from vibespatial.constructive.point import point_owned_from_xy
 
-    points = _shapely.points(cx, cy)
-    return from_shapely_geometries(points.tolist())
+    return point_owned_from_xy(cx, cy)

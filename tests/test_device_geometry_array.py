@@ -876,6 +876,36 @@ class TestClipByRectOwned:
         assert len(clip_events) == 1
         assert clip_events[0].implementation == "owned_clip_by_rect"
 
+    def test_clip_unsupported_gpu_family_routes_to_owned_cpu_path(self):
+        import shapely as shp
+        from shapely.geometry import MultiPoint
+
+        from vibespatial.runtime import ExecutionMode, set_requested_mode
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+        geoms = [MultiPoint([(1, 1), (5, 5)]), MultiPoint([(10, 10), (11, 11)])]
+        dga = DeviceGeometryArray._from_sequence(geoms)
+
+        clear_dispatch_events()
+        with set_requested_mode(ExecutionMode.AUTO):
+            result = dga.clip_by_rect(0, 0, 6, 6)
+
+        expected = shp.clip_by_rect(np.array(geoms, dtype=object), 0, 0, 6, 6)
+        for i in range(len(geoms)):
+            r = result[i]
+            e = expected[i]
+            r_empty = r is None or (hasattr(r, "is_empty") and r.is_empty)
+            e_empty = e is None or (hasattr(e, "is_empty") and e.is_empty)
+            if r_empty or e_empty:
+                assert r_empty and e_empty, f"row {i}: {r} vs {e}"
+            else:
+                assert shp.equals(r, e)
+
+        events = get_dispatch_events(clear=True)
+        clip_events = [e for e in events if e.surface == "DeviceGeometryArray.clip_by_rect"]
+        assert len(clip_events) == 1
+        assert clip_events[0].selected is ExecutionMode.CPU
+
 
 class TestConstructiveOpsReturnDGA:
     """Constructive / unary ops return DGA to maintain device residency."""

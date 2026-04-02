@@ -207,6 +207,78 @@
   },
   {
     "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "overlay_split",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-nvrtc"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "overlay_face_walk",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-nvrtc"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "overlay_face_label",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-nvrtc"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "overlay_face_assembly",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-nvrtc"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "overlay_batch_point_in_ring",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-nvrtc"
+    ]
+  },
+  {
+    "geom_types": [
+      "polygon",
+      "multipolygon"
+    ],
+    "kernel": "overlay_containment_bypass",
+    "module": "vibespatial.overlay.gpu",
+    "tier": 1,
+    "variants": [
+      "gpu-nvrtc"
+    ]
+  },
+  {
+    "geom_types": [
       "point"
     ],
     "kernel": "osm_varint_decode",

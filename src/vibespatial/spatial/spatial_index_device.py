@@ -41,14 +41,9 @@ from vibespatial.kernels.core.spatial_query_kernels import (
     _morton_range_kernels,
     _spatial_query_kernels,
 )
-from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
-from vibespatial.runtime.crossover import DispatchDecision
-from vibespatial.runtime.precision import (
-    KernelClass,
-    PrecisionMode,
-    select_precision_plan,
-)
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 from .query_types import SpatialQueryExecution, _DeviceCandidates
 
@@ -103,14 +98,6 @@ def spatial_index_device_query(
         ``candidates`` is None when GPU dispatch is skipped or no pairs
         are found.  ``execution`` carries the dispatch decision metadata.
     """
-    if not has_gpu_runtime():
-        return None, SpatialQueryExecution(
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.CPU,
-            implementation="owned_cpu_spatial_query",
-            reason="GPU runtime unavailable; skipping device spatial index query",
-        )
-
     query_count = query_bounds.shape[0]
     tree_count = flat_index.size
     if query_count == 0 or tree_count == 0:
@@ -121,38 +108,38 @@ def spatial_index_device_query(
             reason="empty input; no candidate pairs to generate",
         )
 
-    # ADR-0002: wire precision plan for observability.
-    # COARSE class on bounds — always fp64 (see module docstring).
-    runtime_selection = RuntimeSelection(
-        requested=ExecutionMode.AUTO,
-        selected=ExecutionMode.GPU,
-        reason="device spatial index query",
-    )
-    _precision_plan = select_precision_plan(
-        runtime_selection=runtime_selection,
-        kernel_class=KernelClass.COARSE,
-        requested=precision,
-    )
+    # This helper is already the GPU-only candidate-generation path.
+    # Use the planner for precision/device-profile wiring, but explicitly
+    # pin GPU so the caller's "try the device path first" intent remains
+    # visible instead of re-running AUTO crossover selection here.
+    try:
+        plan = plan_dispatch_selection(
+            kernel_name="bbox_overlap_candidates",
+            kernel_class=KernelClass.COARSE,
+            row_count=query_count * tree_count,
+            requested_mode=ExecutionMode.GPU,
+            requested_precision=precision,
+            gpu_available=has_gpu_runtime(),
+        )
+    except RuntimeError:
+        return None, SpatialQueryExecution(
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+            implementation="owned_cpu_spatial_query",
+            reason="GPU runtime unavailable; skipping device spatial index query",
+        )
+    _precision_plan = plan.precision_plan
     # Bounds kernels are memory-bound: fp64 is correct and necessary.
     assert _precision_plan.compute_precision in (
         PrecisionMode.FP64,
         PrecisionMode.FP32,
     ), "PrecisionPlan must resolve to a concrete mode"
-
-    # Dispatch check: the crossover threshold for bbox_overlap_candidates
-    # is 0, so GPU dispatch is always selected when GPU is available.
-    plan = plan_kernel_dispatch(
-        kernel_name="bbox_overlap_candidates",
-        kernel_class=KernelClass.COARSE,
-        row_count=query_count * tree_count,
-        gpu_available=True,
-    )
-    if plan.dispatch_decision is not DispatchDecision.GPU:
+    if plan.selected is not ExecutionMode.GPU:
         return None, SpatialQueryExecution(
-            requested=ExecutionMode.AUTO,
+            requested=ExecutionMode.GPU,
             selected=ExecutionMode.CPU,
             implementation="owned_cpu_spatial_query",
-            reason="dispatch decision selected CPU for this workload",
+            reason="device spatial index query planner did not resolve a GPU dispatch",
         )
 
     # Expand bounds for dwithin if distance is provided.

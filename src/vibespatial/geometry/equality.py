@@ -18,14 +18,10 @@ import logging
 import numpy as np
 import shapely
 
-from vibespatial.runtime import ExecutionMode, RuntimeSelection
-from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.precision import (
-    KernelClass,
-    PrecisionMode,
-    select_precision_plan,
-)
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 from .buffers import GeometryFamily
 from .owned import (
@@ -137,7 +133,7 @@ def _geom_equals_exact_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     tolerance: float,
-    runtime_selection: RuntimeSelection,
+    runtime_selection: AdaptivePlan,
 ) -> np.ndarray | None:
     """GPU path: NVRTC kernel coordinate comparison per geometry pair.
 
@@ -163,11 +159,7 @@ def _geom_equals_exact_gpu(
     row_count = left.row_count
 
     # --- ADR-0002: select precision plan ---
-    precision_plan = select_precision_plan(
-        runtime_selection=runtime_selection,
-        kernel_class=KernelClass.PREDICATE,
-        requested=PrecisionMode.AUTO,
-    )
+    precision_plan = runtime_selection.precision_plan
     compute_type = (
         "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"
     )

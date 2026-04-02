@@ -35,13 +35,12 @@ from vibespatial.cuda._runtime import (  # noqa: E402
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
-from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import (  # noqa: E402
     KernelClass,
     PrecisionMode,
     PrecisionPlan,
-    select_precision_plan,
 )
 from vibespatial.runtime.residency import Residency  # noqa: E402
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan  # noqa: E402
@@ -60,7 +59,6 @@ from vibespatial.spatial.segment_primitives_kernels import (  # noqa: E402
 
 _FLOAT_EPSILON = np.finfo(np.float64).eps
 _ORIENTATION_ERRBOUND = (3.0 + 16.0 * _FLOAT_EPSILON) * _FLOAT_EPSILON
-_SEGMENT_GPU_THRESHOLD = 4_096
 
 # ---------------------------------------------------------------------------
 # Family type codes matching GeometryFamily enum order (0-based)
@@ -1755,12 +1753,13 @@ def _select_segment_runtime(
     dispatch_mode: ExecutionMode | str,
     *,
     candidate_count: int,
-) -> RuntimeSelection:
+) -> AdaptivePlan:
     return plan_dispatch_selection(
-        kernel_name="segment_intersection",
+        kernel_name="segment_classify",
         kernel_class=KernelClass.PREDICATE,
         row_count=candidate_count,
         requested_mode=dispatch_mode,
+        requested_precision=PrecisionMode.AUTO,
     )
 
 
@@ -2236,11 +2235,17 @@ def classify_segment_intersections(
     runtime_selection = _select_segment_runtime(
         dispatch_mode, candidate_count=estimated_candidates,
     )
-    precision_plan = select_precision_plan(
-        runtime_selection=runtime_selection,
-        kernel_class=KernelClass.PREDICATE,
-        requested=precision,
-    )
+    if precision is PrecisionMode.AUTO:
+        precision_plan = runtime_selection.precision_plan
+    else:
+        runtime_selection = plan_dispatch_selection(
+            kernel_name="segment_classify",
+            kernel_class=KernelClass.PREDICATE,
+            row_count=estimated_candidates,
+            requested_mode=dispatch_mode,
+            requested_precision=precision,
+        )
+        precision_plan = runtime_selection.precision_plan
     robustness_plan = select_robustness_plan(
         kernel_class=KernelClass.PREDICATE,
         precision_plan=precision_plan,

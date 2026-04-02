@@ -5,37 +5,44 @@ from dataclasses import dataclass
 from time import perf_counter
 
 import numpy as np
-import shapely
-from shapely.geometry import (
-    GeometryCollection,
-    LineString,
-    MultiLineString,
-    MultiPoint,
-    Point,
-    Polygon,
-)
 
+from vibespatial.constructive.clip_rect_cpu import (
+    EMPTY,
+    benchmark_clip_by_rect_baseline,
+    clip_by_rect_array,
+    clip_rect_gpu_available,
+    reconstruct_polygon_result_from_rings,
+)
+from vibespatial.constructive.clip_rect_cpu import (
+    build_linestring_result as _build_linestring_result,
+)
+from vibespatial.constructive.clip_rect_cpu import (
+    clip_by_rect_cpu as _clip_by_rect_cpu,
+)
+from vibespatial.constructive.clip_rect_cpu import (
+    merge_clipped_segments as _merge_clipped_segments,
+)
+from vibespatial.constructive.clip_rect_cpu import (
+    normalize_values as _normalize_values,
+)
+from vibespatial.constructive.clip_rect_cpu import (
+    point_clip_result_template as _point_clip_result_template,
+)
+from vibespatial.constructive.clip_rect_cpu import (
+    polygon_ring_spans as _polygon_ring_spans,
+)
 from vibespatial.constructive.clip_rect_kernels import (
     _LB_KERNEL_NAMES,
     _LIANG_BARSKY_KERNEL_SOURCE,
-    _POLYGON_CLIP_GPU_THRESHOLD,
     _SEG_ARANGE_KERNEL_NAMES,
     _SEGMENTED_ARANGE_KERNEL_SOURCE,
     _SH_KERNEL_NAMES,
     _SUTHERLAND_HODGMAN_KERNEL_SOURCE,
 )
+from vibespatial.cuda._runtime import compile_kernel_group, count_scatter_total, get_cuda_runtime
 from vibespatial.cuda.cccl_precompile import request_warmup
-from vibespatial.runtime.adaptive import plan_dispatch_selection, plan_kernel_dispatch
-from vibespatial.runtime.crossover import DispatchDecision
-
-request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "segmented_reduce_sum_i32"])
-from vibespatial.cuda._runtime import (  # noqa: E402
-    compile_kernel_group,
-    count_scatter_total,
-    get_cuda_runtime,
-)
-from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
-from vibespatial.geometry.owned import (  # noqa: E402
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
@@ -43,23 +50,23 @@ from vibespatial.geometry.owned import (  # noqa: E402
     build_device_resident_owned,
     from_shapely_geometries,
 )
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds  # noqa: E402
-from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
-from vibespatial.runtime.precision import (  # noqa: E402
+from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
     PrecisionPlan,
-    select_precision_plan,
 )
-from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan  # noqa: E402
+from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
 
-from .point import (  # noqa: E402
+from .point import (
     _build_device_backed_point_output,
     _clip_points_rect_gpu_arrays,
     _empty_point_output,
 )
 
-EMPTY = GeometryCollection()
+request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "segmented_reduce_sum_i32"])
+
 _POINT_EPSILON = 1e-12
 _POINT_TYPE_ID = 0
 
@@ -160,21 +167,6 @@ class RectClipBenchmark:
         if self.owned_elapsed_seconds == 0.0:
             return float("inf")
         return self.shapely_elapsed_seconds / self.owned_elapsed_seconds
-
-
-def _normalize_values(values: Sequence[object | None] | np.ndarray | OwnedGeometryArray) -> tuple[np.ndarray, OwnedGeometryArray]:
-    if isinstance(values, OwnedGeometryArray):
-        shapely_values = np.asarray(values.to_shapely(), dtype=object)
-        return shapely_values, values
-    shapely_values = np.asarray(values, dtype=object)
-    return shapely_values, from_shapely_geometries(shapely_values.tolist())
-
-
-def _point_clip_result_template(owned: OwnedGeometryArray) -> np.ndarray:
-    result = np.empty(owned.row_count, dtype=object)
-    result[:] = EMPTY
-    result[~owned.validity] = None
-    return result
 
 
 def _rect_intersects_bounds(bounds: np.ndarray, rect: tuple[float, float, float, float]) -> np.ndarray:
@@ -284,174 +276,6 @@ def _sutherland_hodgman_ring(
     if len(unique) < 3:
         return []
     return deduped
-
-
-def _liang_barsky_segment(
-    x0: float,
-    y0: float,
-    x1: float,
-    y1: float,
-    rect: tuple[float, float, float, float],
-) -> tuple[float, float, float, float] | None:
-    xmin, ymin, xmax, ymax = rect
-    dx = x1 - x0
-    dy = y1 - y0
-    p = (-dx, dx, -dy, dy)
-    q = (x0 - xmin, xmax - x0, y0 - ymin, ymax - y0)
-    u1 = 0.0
-    u2 = 1.0
-    for pk, qk in zip(p, q, strict=True):
-        if abs(pk) <= _POINT_EPSILON:
-            if qk < 0.0:
-                return None
-            continue
-        t = qk / pk
-        if pk < 0.0:
-            u1 = max(u1, t)
-        else:
-            u2 = min(u2, t)
-        if u1 > u2:
-            return None
-    cx0 = x0 + u1 * dx
-    cy0 = y0 + u1 * dy
-    cx1 = x0 + u2 * dx
-    cy1 = y0 + u2 * dy
-    if np.allclose((cx0, cy0), (cx1, cy1), atol=_POINT_EPSILON, rtol=0.0):
-        return None
-    return float(cx0), float(cy0), float(cx1), float(cy1)
-
-
-def _merge_clipped_segments(parts: list[list[tuple[float, float]]], segment: tuple[float, float, float, float]) -> None:
-    start = (segment[0], segment[1])
-    end = (segment[2], segment[3])
-    if not parts:
-        parts.append([start, end])
-        return
-    current = parts[-1]
-    if np.allclose(current[-1], start, atol=_POINT_EPSILON, rtol=0.0):
-        if not np.allclose(current[-1], end, atol=_POINT_EPSILON, rtol=0.0):
-            current.append(end)
-        return
-    parts.append([start, end])
-
-
-def _build_linestring_result(parts: list[list[tuple[float, float]]]) -> object:
-    normalized = [part for part in parts if len(part) >= 2]
-    if not normalized:
-        return EMPTY
-    if len(normalized) == 1:
-        return LineString(normalized[0])
-    return MultiLineString(normalized)
-
-
-def _build_polygon_result(polygons: list[Polygon]) -> object:
-    non_empty = [polygon for polygon in polygons if not polygon.is_empty]
-    if not non_empty:
-        return EMPTY
-    if len(non_empty) == 1:
-        return non_empty[0]
-    return shapely.multipolygons(non_empty)
-
-
-def _clip_point_family(buffer, family_row: int, rect: tuple[float, float, float, float]) -> object:
-    start = int(buffer.geometry_offsets[family_row])
-    end = int(buffer.geometry_offsets[family_row + 1])
-    if end <= start:
-        return EMPTY
-    xmin, ymin, xmax, ymax = rect
-    if buffer.family.value == "point":
-        x = float(buffer.x[start])
-        y = float(buffer.y[start])
-        if xmin <= x <= xmax and ymin <= y <= ymax:
-            return Point(x, y)
-        return EMPTY
-
-    points = [
-        (float(buffer.x[index]), float(buffer.y[index]))
-        for index in range(start, end)
-        if xmin <= float(buffer.x[index]) <= xmax and ymin <= float(buffer.y[index]) <= ymax
-    ]
-    if not points:
-        return EMPTY
-    if len(points) == 1:
-        return Point(points[0])
-    return MultiPoint(points)
-
-
-def _clip_line_family(buffer, family_row: int, rect: tuple[float, float, float, float]) -> object:
-    parts: list[list[tuple[float, float]]] = []
-    if buffer.family.value == "linestring":
-        spans = [(int(buffer.geometry_offsets[family_row]), int(buffer.geometry_offsets[family_row + 1]))]
-    else:
-        part_start = int(buffer.geometry_offsets[family_row])
-        part_end = int(buffer.geometry_offsets[family_row + 1])
-        spans = [
-            (int(buffer.part_offsets[index]), int(buffer.part_offsets[index + 1]))
-            for index in range(part_start, part_end)
-        ]
-    for start, end in spans:
-        part_segments: list[list[tuple[float, float]]] = []
-        for index in range(start, end - 1):
-            segment = _liang_barsky_segment(
-                float(buffer.x[index]),
-                float(buffer.y[index]),
-                float(buffer.x[index + 1]),
-                float(buffer.y[index + 1]),
-                rect,
-            )
-            if segment is None:
-                continue
-            _merge_clipped_segments(part_segments, segment)
-        parts.extend(part_segments)
-    return _build_linestring_result(parts)
-
-
-def _polygon_ring_spans(buffer, family_row: int) -> list[list[tuple[float, float]]]:
-    def ring_lookup(ring_index: int) -> tuple[int, int]:
-        return int(buffer.ring_offsets[ring_index]), int(buffer.ring_offsets[ring_index + 1])
-
-    if buffer.family.value == "polygon":
-        polygon_indices = [(int(buffer.geometry_offsets[family_row]), int(buffer.geometry_offsets[family_row + 1]))]
-    else:
-        polygon_start = int(buffer.geometry_offsets[family_row])
-        polygon_end = int(buffer.geometry_offsets[family_row + 1])
-        polygon_indices = [
-            (int(buffer.part_offsets[polygon_index]), int(buffer.part_offsets[polygon_index + 1]))
-            for polygon_index in range(polygon_start, polygon_end)
-        ]
-
-    polygons: list[list[tuple[float, float]]] = []
-    for ring_start, ring_end in polygon_indices:
-        rings = []
-        for ring_index in range(ring_start, ring_end):
-            coord_start, coord_end = ring_lookup(ring_index)
-            rings.append(
-                [
-                    (float(buffer.x[index]), float(buffer.y[index]))
-                    for index in range(coord_start, coord_end)
-                ]
-            )
-        polygons.append(rings)
-    return polygons
-
-
-def _clip_polygon_family(buffer, family_row: int, rect: tuple[float, float, float, float]) -> object:
-    polygons: list[Polygon] = []
-    for rings in _polygon_ring_spans(buffer, family_row):
-        if not rings:
-            continue
-        exterior = _sutherland_hodgman_ring(rings[0], rect)
-        if not exterior:
-            continue
-        holes = []
-        for ring in rings[1:]:
-            clipped = _sutherland_hodgman_ring(ring, rect)
-            if clipped:
-                holes.append(clipped)
-        polygon = Polygon(exterior, holes=holes)
-        if not polygon.is_empty:
-            polygons.append(polygon)
-    return _build_polygon_result(polygons)
 
 
 # ---------------------------------------------------------------------------
@@ -642,47 +466,9 @@ def _clip_polygon_family_gpu(
     if out_x.size == 0:
         return EMPTY
 
-    # Reconstruct polygons from clipped rings
-    polygons: list[Polygon] = []
-    current_exterior = None
-    current_holes: list[list[tuple[float, float]]] = []
-
-    for ring_idx in range(len(ring_polygon_map)):
-        start = int(out_ring_offsets[ring_idx])
-        end = int(out_ring_offsets[ring_idx + 1])
-        verts = end - start
-        if verts < 4:
-            # Ring was clipped away
-            if ring_is_exterior[ring_idx]:
-                # Flush previous polygon if any
-                if current_exterior is not None:
-                    poly = Polygon(current_exterior, holes=current_holes)
-                    if not poly.is_empty:
-                        polygons.append(poly)
-                current_exterior = None
-                current_holes = []
-            continue
-
-        coords = [(float(out_x[i]), float(out_y[i])) for i in range(start, end)]
-
-        if ring_is_exterior[ring_idx]:
-            # Flush previous polygon
-            if current_exterior is not None:
-                poly = Polygon(current_exterior, holes=current_holes)
-                if not poly.is_empty:
-                    polygons.append(poly)
-            current_exterior = coords
-            current_holes = []
-        else:
-            current_holes.append(coords)
-
-    # Flush last polygon
-    if current_exterior is not None:
-        poly = Polygon(current_exterior, holes=current_holes)
-        if not poly.is_empty:
-            polygons.append(poly)
-
-    return _build_polygon_result(polygons)
+    return reconstruct_polygon_result_from_rings(
+        ring_polygon_map, ring_is_exterior, out_x, out_y, out_ring_offsets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1392,23 +1178,6 @@ def _row_family_and_local_index(owned: OwnedGeometryArray, row_index: int):
     return None, -1
 
 
-def _supported_fast_row(
-    family_name: str | None,
-    local_index: int,
-    owned: OwnedGeometryArray,
-    shapely_value: object | None,
-) -> bool:
-    if family_name is None or local_index < 0 or shapely_value is None:
-        return False
-    if shapely_value.is_empty:
-        return True
-    if family_name in {"point", "multipoint", "linestring", "multilinestring"}:
-        return True
-    if family_name in {"polygon", "multipolygon"} and shapely.is_valid(shapely_value):
-        return True
-    return False
-
-
 # ---------------------------------------------------------------------------
 # Batched GPU polygon clip — all polygons in a single kernel launch
 # ---------------------------------------------------------------------------
@@ -2048,153 +1817,6 @@ def _clip_all_polygons_gpu(
     return owned_result, validity_mask
 
 
-def _materialize_candidates_vectorized(
-    owned: OwnedGeometryArray,
-    candidate_rows: np.ndarray,
-) -> np.ndarray:
-    """Build a shapely object array for candidate rows using vectorized
-    constructors (shapely.linestrings / shapely.polygons / shapely.points)
-    when the candidates are homogeneous, falling back to per-row
-    materialization otherwise.
-
-    This is 3-4x faster than ``owned.to_shapely()`` + indexing because it
-    avoids Python-level per-row dispatch and exploits shapely's bulk C paths.
-    """
-    from vibespatial.geometry.owned import TAG_FAMILIES, _materialize_family_row
-
-    if candidate_rows.size == 0:
-        return np.empty(0, dtype=object)
-
-    # Determine if all candidates share a single family.
-    tags = owned.tags[candidate_rows]
-    unique_tags = np.unique(tags)
-
-    if len(unique_tags) == 1:
-        tag = int(unique_tags[0])
-        family = TAG_FAMILIES[tag]
-        buffer = owned.families[family]
-        local_rows = owned.family_row_offsets[candidate_rows].astype(np.int32)
-
-        if family in (GeometryFamily.LINESTRING,):
-            # Vectorized shapely.linestrings from flat coordinate buffers.
-            offsets = np.empty(len(local_rows) + 1, dtype=np.int32)
-            offsets[0] = 0
-            for idx, lr in enumerate(local_rows):
-                s = int(buffer.geometry_offsets[lr])
-                e = int(buffer.geometry_offsets[lr + 1])
-                offsets[idx + 1] = offsets[idx] + (e - s)
-            total_coords = int(offsets[-1])
-            flat_xy = np.empty((total_coords, 2), dtype=np.float64)
-            pos = 0
-            for lr in local_rows:
-                s = int(buffer.geometry_offsets[lr])
-                e = int(buffer.geometry_offsets[lr + 1])
-                n = e - s
-                flat_xy[pos:pos + n, 0] = buffer.x[s:e]
-                flat_xy[pos:pos + n, 1] = buffer.y[s:e]
-                pos += n
-            indices = np.repeat(np.arange(len(local_rows), dtype=np.int32), np.diff(offsets))
-            return shapely.linestrings(flat_xy, indices=indices)
-
-        if family in (GeometryFamily.POLYGON,):
-            # Vectorized path: build linearrings via shapely.linearrings,
-            # then group them into polygons via shapely.polygons(indices=).
-            ring_coords: list[float] = []
-            ring_coord_offsets = [0]
-            ring_geom_indices: list[int] = []
-            for geom_idx, lr in enumerate(local_rows):
-                ring_start = int(buffer.geometry_offsets[lr])
-                ring_end = int(buffer.geometry_offsets[lr + 1])
-                for ring_idx in range(ring_start, ring_end):
-                    cs = int(buffer.ring_offsets[ring_idx])
-                    ce = int(buffer.ring_offsets[ring_idx + 1])
-                    n = ce - cs
-                    for ci in range(cs, ce):
-                        ring_coords.append(float(buffer.x[ci]))
-                        ring_coords.append(float(buffer.y[ci]))
-                    ring_coord_offsets.append(ring_coord_offsets[-1] + n)
-                    ring_geom_indices.append(geom_idx)
-            flat_xy = np.asarray(ring_coords, dtype=np.float64).reshape(-1, 2)
-            coord_offsets = np.asarray(ring_coord_offsets, dtype=np.int32)
-            ring_indices_arr = np.repeat(
-                np.arange(len(coord_offsets) - 1, dtype=np.int32),
-                np.diff(coord_offsets),
-            )
-            rings = shapely.linearrings(flat_xy, indices=ring_indices_arr)
-            geom_indices_arr = np.asarray(ring_geom_indices, dtype=np.int32)
-            return shapely.polygons(rings, indices=geom_indices_arr)
-
-        if family in (GeometryFamily.POINT,):
-            xs = np.empty(len(local_rows), dtype=np.float64)
-            ys = np.empty(len(local_rows), dtype=np.float64)
-            for idx, lr in enumerate(local_rows):
-                s = int(buffer.geometry_offsets[lr])
-                xs[idx] = buffer.x[s]
-                ys[idx] = buffer.y[s]
-            return np.asarray(shapely.points(xs, ys), dtype=object)
-
-    # Fallback: per-row materialization for mixed families or unsupported
-    # types (multilinestring, multipolygon, multipoint).
-    candidate_geoms = []
-    for i in candidate_rows:
-        family = TAG_FAMILIES[int(owned.tags[i])]
-        buf = owned.families[family]
-        local_row = int(owned.family_row_offsets[i])
-        candidate_geoms.append(_materialize_family_row(buf, local_row))
-    return np.asarray(candidate_geoms, dtype=object)
-
-
-def _use_gpu_clip(owned: OwnedGeometryArray) -> bool:
-    """Check if GPU clip kernels should be used based on ADR-0033 tier thresholds."""
-    from vibespatial.runtime import has_gpu_runtime
-
-    if not has_gpu_runtime():
-        return False
-    total_coords = 0
-    for buffer in owned.families.values():
-        if hasattr(buffer, 'x') and buffer.x is not None:
-            total_coords += len(buffer.x)
-    return total_coords >= _POLYGON_CLIP_GPU_THRESHOLD
-
-
-# ---------------------------------------------------------------------------
-# CPU clip path (called from clip_by_rect_owned; public variant registration
-# lives in kernels/constructive/clip_rect.py)
-# ---------------------------------------------------------------------------
-
-def _clip_by_rect_cpu(
-    owned: OwnedGeometryArray,
-    rect: tuple[float, float, float, float],
-    shapely_values: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """CPU clip_by_rect using Shapely with bounds pre-filtering.
-
-    Returns (result_geometries, candidate_rows).
-    """
-    bounds = compute_geometry_bounds(owned)
-    candidate_rows = np.flatnonzero(
-        _rect_intersects_bounds(bounds, rect)
-    ).astype(np.int32, copy=False)
-
-    result = np.empty(owned.row_count, dtype=object)
-    result[:] = EMPTY
-    invalid_mask = ~owned.validity
-    if invalid_mask.any():
-        result[invalid_mask] = None
-
-    if candidate_rows.size > 0:
-        if shapely_values is not None:
-            candidate_shapely = shapely_values[candidate_rows]
-        else:
-            candidate_shapely = _materialize_candidates_vectorized(
-                owned, candidate_rows
-            )
-        clipped = shapely.clip_by_rect(candidate_shapely, *rect)
-        result[candidate_rows] = np.asarray(clipped, dtype=object)
-
-    return result, candidate_rows
-
-
 def clip_by_rect_owned(
     values: Sequence[object | None] | np.ndarray | OwnedGeometryArray,
     xmin: float,
@@ -2212,6 +1834,7 @@ def clip_by_rect_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=_row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
     has_polygon_families = False
     has_line_families = False
@@ -2254,11 +1877,7 @@ def clip_by_rect_owned(
         owned = values
     else:
         shapely_values, owned = _normalize_values(values)
-    precision_plan = select_precision_plan(
-        runtime_selection=runtime_selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = runtime_selection.precision_plan
     robustness_plan = select_robustness_plan(
         kernel_class=KernelClass.CONSTRUCTIVE,
         precision_plan=precision_plan,
@@ -2417,10 +2036,10 @@ def clip_by_rect_owned(
                 if _fallback_rows_arr_ref.size > 0:
                     shapely_geoms = _owned_ref.to_shapely()
                     fallback_shapely = shapely_geoms[_fallback_rows_arr_ref]
-                    clipped = shapely.clip_by_rect(
-                        np.asarray(fallback_shapely, dtype=object), *_rect_ref,
+                    clipped = clip_by_rect_array(
+                        np.asarray(fallback_shapely, dtype=object), _rect_ref,
                     )
-                    result[_fallback_rows_arr_ref] = np.asarray(clipped, dtype=object)
+                    result[_fallback_rows_arr_ref] = clipped
 
                 return result
 
@@ -2442,7 +2061,7 @@ def clip_by_rect_owned(
     # path.  The owned_result field defaults to None and callers that need
     # it (e.g. pipeline_benchmarks) already handle the None case.  This
     # avoids ~19ms of overhead that dominates the CPU clip path.
-    result, candidate_rows = _clip_by_rect_cpu(owned, rect, shapely_values)
+    result, candidate_rows = _clip_by_rect_cpu(owned, _rect_intersects_bounds, rect, shapely_values)
 
     return RectClipResult(
         geometries=result,
@@ -2469,19 +2088,14 @@ def evaluate_geopandas_clip_by_rect(
 
     with execution_trace("clip_by_rect"):
         geometries = np.asarray(values, dtype=object)
-        non_null = np.fromiter((geometry is not None for geometry in geometries), dtype=bool, count=len(geometries))
-        gpu_available = False
-        if np.any(non_null):
-            type_ids = np.asarray(shapely.get_type_id(geometries[non_null]), dtype=np.int32)
-            gpu_available = bool(np.all(type_ids == _POINT_TYPE_ID))
+        gpu_available = clip_rect_gpu_available(geometries, _POINT_TYPE_ID)
 
-        plan = plan_kernel_dispatch(
+        selection = plan_dispatch_selection(
             kernel_name="clip_by_rect",
             kernel_class=KernelClass.CONSTRUCTIVE,
             row_count=len(geometries),
             gpu_available=gpu_available,
         )
-        dispatch_mode = ExecutionMode.GPU if plan.dispatch_decision is DispatchDecision.GPU else ExecutionMode.CPU
         try:
             clip_input = prebuilt_owned if prebuilt_owned is not None else geometries
             result = clip_by_rect_owned(
@@ -2490,11 +2104,11 @@ def evaluate_geopandas_clip_by_rect(
                 ymin,
                 xmax,
                 ymax,
-                dispatch_mode=dispatch_mode,
+                dispatch_mode=selection.selected,
             )
         except NotImplementedError:
             return None, ExecutionMode.CPU
-        return np.asarray(result.geometries, dtype=object), dispatch_mode
+        return np.asarray(result.geometries, dtype=object), selection.selected
 
 
 def benchmark_clip_by_rect(
@@ -2519,9 +2133,9 @@ def benchmark_clip_by_rect(
 
     # Shapely baseline: materialize shapely array for the comparison.
     shapely_values = np.asarray(owned.to_shapely(), dtype=object)
-    started = perf_counter()
-    shapely.clip_by_rect(shapely_values, xmin, ymin, xmax, ymax)
-    shapely_elapsed = perf_counter() - started
+    shapely_elapsed = benchmark_clip_by_rect_baseline(
+        shapely_values, xmin, ymin, xmax, ymax,
+    )
 
     return RectClipBenchmark(
         dataset=dataset,

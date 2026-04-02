@@ -8,10 +8,11 @@ Extracted from polygon_intersection.py -- dispatch logic remains there.
 from __future__ import annotations
 
 from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 
 _MAX_CLIP_VERTS = 64  # 4 buffers * 64 * 8 bytes = 2KB per thread (vs 8KB at 256)
 
-_POLYGON_INTERSECTION_KERNEL_SOURCE = SIGNED_AREA_DEVICE + r"""
+_POLYGON_INTERSECTION_KERNEL_SOURCE = SIGNED_AREA_DEVICE + STRIP_CLOSURE_DEVICE + r"""
 #define MAX_CLIP_VERTS """ + str(_MAX_CLIP_VERTS) + r"""
 
 /* ------------------------------------------------------------------ */
@@ -105,16 +106,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
     int r_n = r_coord_end - r_coord_start;
 
     /* Strip closing vertex if present (last == first). */
-    if (l_n >= 2) {
-        double dx = left_x[l_coord_start] - left_x[l_coord_end - 1];
-        double dy = left_y[l_coord_start] - left_y[l_coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) l_n--;
-    }
-    if (r_n >= 2) {
-        double dx = right_x[r_coord_start] - right_x[r_coord_end - 1];
-        double dy = right_y[r_coord_start] - right_y[r_coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) r_n--;
-    }
+    l_n = vs_strip_closure(left_x, left_y, l_coord_start, l_coord_end, l_n, 1e-24);
+    r_n = vs_strip_closure(right_x, right_y, r_coord_start, r_coord_end, r_n, 1e-24);
 
     /* Degenerate inputs -> empty */
     if (l_n < 3 || r_n < 3) {
@@ -275,16 +268,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
     int r_n = r_coord_end - r_coord_start;
 
     /* Strip closing vertex if present. */
-    if (l_n >= 2) {
-        double dx = left_x[l_coord_start] - left_x[l_coord_end - 1];
-        double dy = left_y[l_coord_start] - left_y[l_coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) l_n--;
-    }
-    if (r_n >= 2) {
-        double dx = right_x[r_coord_start] - right_x[r_coord_end - 1];
-        double dy = right_y[r_coord_start] - right_y[r_coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) r_n--;
-    }
+    l_n = vs_strip_closure(left_x, left_y, l_coord_start, l_coord_end, l_n, 1e-24);
+    r_n = vs_strip_closure(right_x, right_y, r_coord_start, r_coord_end, r_n, 1e-24);
 
     /* Detect winding direction of the clip polygon (same as count pass). */
     const double clip_area2 = vs_ring_signed_area_2x_open(

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from vibespatial.constructive.linestring_buffer_cpu import (
+    build_linestring_buffers_cpu,
+)
 from vibespatial.constructive.linestring_kernels import (
     _LINESTRING_BUFFER_KERNEL_NAMES,
     _LINESTRING_BUFFER_KERNEL_SOURCE,
 )
+from vibespatial.constructive.polygon import _build_device_backed_polygon_output_variable
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -16,13 +20,10 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.cuda.cccl_primitives import exclusive_sum
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
-    DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -40,57 +41,6 @@ request_warmup(["exclusive_scan_i32"])
 
 def _linestring_buffer_kernels():
     return compile_kernel_group("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES)
-
-
-def _build_device_backed_polygon_output_variable(
-    device_x,
-    device_y,
-    *,
-    row_count: int,
-    ring_offsets: np.ndarray,
-    bounds: np.ndarray | None = None,
-) -> OwnedGeometryArray:
-    geometry_offsets = np.arange(row_count + 1, dtype=np.int32)
-    empty_mask = np.zeros(row_count, dtype=bool)
-    validity = np.ones(row_count, dtype=bool)
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    polygon_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.POLYGON,
-        schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
-        row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        ring_offsets=ring_offsets,
-        bounds=bounds,
-        host_materialized=False,
-    )
-    runtime = get_cuda_runtime()
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.POLYGON: polygon_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.POLYGON,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                    ring_offsets=runtime.from_host(ring_offsets),
-                    bounds=None if bounds is None else runtime.from_host(bounds),
-                )
-            },
-        ),
-    )
 
 
 _CAP_STYLE_MAP = {"round": 0, "flat": 1, "square": 2}
@@ -137,7 +87,7 @@ def linestring_buffer_owned_array(
     join_int = _JOIN_STYLE_MAP.get(join_style, 0)
 
     if selected_mode is not ExecutionMode.GPU:
-        return _build_linestring_buffers_cpu(
+        return build_linestring_buffers_cpu(
             lines, radii, quad_segs=quad_segs,
             cap_style=cap_style, join_style=join_style, mitre_limit=mitre_limit,
         )
@@ -146,32 +96,6 @@ def linestring_buffer_owned_array(
         lines, radii, quad_segs=quad_segs,
         cap_style=cap_int, join_style=join_int, mitre_limit=mitre_limit,
     )
-
-
-def _build_linestring_buffers_cpu(
-    lines: OwnedGeometryArray,
-    radii: np.ndarray,
-    *,
-    quad_segs: int,
-    cap_style: str = "round",
-    join_style: str = "round",
-    mitre_limit: float = 5.0,
-) -> OwnedGeometryArray:
-    import shapely
-    lines._ensure_host_state()
-    shapely_geoms = lines.to_shapely()
-    result_geoms = shapely.buffer(
-        np.asarray(shapely_geoms, dtype=object),
-        radii,
-        quad_segs=quad_segs,
-        cap_style=cap_style,
-        join_style=join_style,
-        mitre_limit=mitre_limit,
-    )
-    from vibespatial.geometry.owned import from_shapely_geometries
-    return from_shapely_geometries(list(result_geoms))
-
-
 def _build_linestring_buffers_gpu(
     lines: OwnedGeometryArray,
     radii: np.ndarray,
@@ -260,6 +184,7 @@ def _build_linestring_buffers_gpu(
             return _build_device_backed_polygon_output_variable(
                 device_x, device_y,
                 row_count=lines.row_count,
+                geometry_offsets=np.arange(lines.row_count + 1, dtype=np.int32),
                 ring_offsets=ring_offsets,
             )
 
@@ -321,6 +246,7 @@ def _build_linestring_buffers_gpu(
         return _build_device_backed_polygon_output_variable(
             device_x, device_y,
             row_count=lines.row_count,
+            geometry_offsets=np.arange(lines.row_count + 1, dtype=np.int32),
             ring_offsets=ring_offsets,
         )
     finally:

@@ -316,12 +316,7 @@ def bench_make_valid(
     gdf, read_seconds = load_geodataframe(spec, fmt)
     values = gdf.geometry.tolist()
 
-    owned = None
-    try:
-        owned_arr, _ = load_owned(spec, fmt)
-        owned = owned_arr
-    except Exception:
-        pass
+    owned, _ = load_owned(spec, fmt)
 
     result = benchmark_make_valid(values, owned=owned)
 

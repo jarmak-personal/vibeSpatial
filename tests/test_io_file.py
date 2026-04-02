@@ -49,6 +49,23 @@ def test_geojson_roundtrip_uses_gpu_adapter(tmp_path) -> None:
 
 
 @pytest.mark.gpu
+def test_geojson_gpu_adapter_failure_propagates(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "sample.geojson"
+    frame = _sample_frame()
+    frame.to_file(path, driver="GeoJSON")
+
+    monkeypatch.setattr("vibespatial.io.file._GPU_MIN_FILE_SIZE", 0)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("geojson-gpu-boom")
+
+    monkeypatch.setattr("vibespatial.io.geojson_gpu.read_geojson_gpu", _boom)
+
+    with pytest.raises(RuntimeError, match="geojson-gpu-boom"):
+        geopandas.read_file(path)
+
+
+@pytest.mark.gpu
 def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()

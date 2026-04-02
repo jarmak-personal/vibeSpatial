@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import numpy as np
+import pytest
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon
 
 import vibespatial.api as geopandas
@@ -11,6 +13,8 @@ from vibespatial import (
 )
 from vibespatial.api import GeoSeries
 from vibespatial.api.testing import assert_geoseries_equal
+from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.fusion import IntermediateDisposition
 
 
@@ -83,3 +87,47 @@ def test_make_valid_benchmark_reports_repaired_rows() -> None:
     assert benchmark.repaired_rows == 1
     assert benchmark.compact_elapsed_seconds >= 0.0
     assert benchmark.baseline_elapsed_seconds >= 0.0
+
+
+def test_make_valid_gpu_detection_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    bowtie = Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
+    owned = from_shapely_geometries([bowtie])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("gpu-detect-boom")
+
+    monkeypatch.setattr(
+        "vibespatial.constructive.validity.is_valid_owned",
+        lambda owned, **kwargs: np.array([False], dtype=bool),
+    )
+    monkeypatch.setattr(
+        "vibespatial.constructive.make_valid_pipeline._detect_self_intersections_gpu",
+        _boom,
+    )
+
+    with pytest.raises(RuntimeError, match="gpu-detect-boom"):
+        make_valid_owned(owned=owned, dispatch_mode=ExecutionMode.GPU)
+
+
+def test_make_valid_gpu_repair_failure_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    bowtie = Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])
+    owned = from_shapely_geometries([bowtie])
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("gpu-repair-boom")
+
+    monkeypatch.setattr(
+        "vibespatial.constructive.validity.is_valid_owned",
+        lambda owned, **kwargs: np.array([False], dtype=bool),
+    )
+    monkeypatch.setattr(
+        "vibespatial.constructive.make_valid_pipeline._detect_self_intersections_gpu",
+        lambda owned, valid_mask: valid_mask,
+    )
+    monkeypatch.setattr(
+        "vibespatial.constructive.make_valid_pipeline._make_valid_gpu_repair",
+        _boom,
+    )
+
+    with pytest.raises(RuntimeError, match="gpu-repair-boom"):
+        make_valid_owned(owned=owned, dispatch_mode=ExecutionMode.GPU)

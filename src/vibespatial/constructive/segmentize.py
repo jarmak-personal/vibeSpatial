@@ -21,10 +21,11 @@ import numpy as np
 
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    build_updated_device_family_buffer,
+    build_updated_host_family_buffer,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -191,40 +192,13 @@ def _segmentize_family_gpu(runtime, device_buf, family, max_segment_length):
             params=scatter_params,
         )
 
-    # 7. Build new DeviceFamilyGeometryBuffer with updated span offsets
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=device_buf.geometry_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=device_buf.part_offsets,
-            ring_offsets=d_out_offsets_full,
-            bounds=None,
-        )
-    elif family is GeometryFamily.MULTILINESTRING:
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=device_buf.geometry_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=d_out_offsets_full,
-            ring_offsets=device_buf.ring_offsets,
-            bounds=None,
-        )
-    else:  # LineString
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=d_out_offsets_full,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=device_buf.part_offsets,
-            ring_offsets=device_buf.ring_offsets,
-            bounds=None,
-        )
+    return build_updated_device_family_buffer(
+        family,
+        device_buf,
+        d_x_out,
+        d_y_out,
+        d_out_offsets_full,
+    )
 
 
 @register_kernel_variant(
@@ -348,46 +322,13 @@ def _segmentize_family_cpu(buf, family, max_segment_length):
     new_span_offsets_arr = np.asarray(new_span_offsets, dtype=np.int32)
 
     # Rebuild the family buffer with new coordinates and updated offsets
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        return FamilyGeometryBuffer(
-            family=family,
-            schema=buf.schema,
-            row_count=buf.row_count,
-            x=new_x,
-            y=new_y,
-            geometry_offsets=buf.geometry_offsets,
-            empty_mask=buf.empty_mask,
-            part_offsets=buf.part_offsets,
-            ring_offsets=new_span_offsets_arr,
-            bounds=None,
-        )
-    elif family is GeometryFamily.MULTILINESTRING:
-        return FamilyGeometryBuffer(
-            family=family,
-            schema=buf.schema,
-            row_count=buf.row_count,
-            x=new_x,
-            y=new_y,
-            geometry_offsets=buf.geometry_offsets,
-            empty_mask=buf.empty_mask,
-            part_offsets=new_span_offsets_arr,
-            ring_offsets=buf.ring_offsets,
-            bounds=None,
-        )
-    else:
-        # LineString: geometry_offsets change
-        return FamilyGeometryBuffer(
-            family=family,
-            schema=buf.schema,
-            row_count=buf.row_count,
-            x=new_x,
-            y=new_y,
-            geometry_offsets=new_span_offsets_arr,
-            empty_mask=buf.empty_mask,
-            part_offsets=buf.part_offsets,
-            ring_offsets=buf.ring_offsets,
-            bounds=None,
-        )
+    return build_updated_host_family_buffer(
+        family=family,
+        host_buf=buf,
+        x_out=new_x,
+        y_out=new_y,
+        new_offsets=new_span_offsets_arr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -433,10 +374,7 @@ def segmentize_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            return _segmentize_gpu(owned, max_segment_length)
-        except Exception:
-            pass  # fall through to CPU
+        return _segmentize_gpu(owned, max_segment_length)
 
     new_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
     for family, buf in owned.families.items():

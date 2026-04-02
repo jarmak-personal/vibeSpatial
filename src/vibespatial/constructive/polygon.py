@@ -4,6 +4,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from vibespatial.constructive.measurement import (
+    _coord_stats_from_owned,
+    _fp32_center_coords,
+)
+from vibespatial.constructive.polygon_buffer_cpu import build_polygon_buffers_cpu
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -32,7 +37,6 @@ if TYPE_CHECKING:
 
 
 from vibespatial.constructive.polygon_kernels import (
-    _CENTROID_GPU_THRESHOLD,
     _POLYGON_BUFFER_KERNEL_NAMES,
     _POLYGON_BUFFER_KERNEL_SOURCE,
     _POLYGON_CENTROID_FP32_SOURCE,
@@ -105,12 +109,7 @@ def _polygon_centroids_gpu(
     if precision_plan is not None and precision_plan.compute_precision is PrecisionMode.FP32:
         compute_type = "float"
         if precision_plan.center_coordinates:
-            # Compute coordinate centroid for centering
-            for buf in owned.families.values():
-                if buf.row_count > 0 and buf.x.size > 0:
-                    center_x = float((buf.x.min() + buf.x.max()) * 0.5)
-                    center_y = float((buf.y.min() + buf.y.max()) * 0.5)
-                    break
+            center_x, center_y = _fp32_center_coords(owned)
 
     runtime = get_cuda_runtime()
     kernels = _polygon_centroid_kernels(compute_type)
@@ -122,6 +121,7 @@ def _polygon_centroids_gpu(
     mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
+    device_state = owned.device_state
 
     # Collect per-family kernel results for the return_owned path.  When
     # return_owned is False we scatter into host numpy arrays as before.
@@ -139,7 +139,15 @@ def _polygon_centroids_gpu(
         if family_key not in owned.families:
             continue
         buf = owned.families[family_key]
-        if buf.row_count == 0 or buf.geometry_offsets is None or len(buf.geometry_offsets) < 2:
+        device_buffer = None
+        if device_state is not None and family_key in device_state.families:
+            device_buffer = device_state.families[family_key]
+        if buf.row_count == 0:
+            continue
+        if device_buffer is not None:
+            if int(device_buffer.geometry_offsets.size) < 2:
+                continue
+        elif buf.geometry_offsets is None or len(buf.geometry_offsets) < 2:
             continue
 
         family_rows_count = buf.row_count
@@ -148,10 +156,17 @@ def _polygon_centroids_gpu(
 
         # Build a compact mapping: for each family row that appears in this
         # batch, we launch the kernel once with family_rows_count items.
-        d_x = runtime.from_host(buf.x)
-        d_y = runtime.from_host(buf.y)
-        d_ring_offsets = runtime.from_host(buf.ring_offsets.astype(np.int32))
-        d_geom_offsets = runtime.from_host(buf.geometry_offsets.astype(np.int32))
+        needs_free = device_buffer is None
+        if not needs_free:
+            d_x = device_buffer.x
+            d_y = device_buffer.y
+            d_ring_offsets = device_buffer.ring_offsets
+            d_geom_offsets = device_buffer.geometry_offsets
+        else:
+            d_x = runtime.from_host(buf.x)
+            d_y = runtime.from_host(buf.y)
+            d_ring_offsets = runtime.from_host(buf.ring_offsets.astype(np.int32))
+            d_geom_offsets = runtime.from_host(buf.geometry_offsets.astype(np.int32))
         d_cx = runtime.allocate((family_rows_count,), np.float64)
         d_cy = runtime.allocate((family_rows_count,), np.float64)
 
@@ -180,10 +195,11 @@ def _polygon_centroids_gpu(
                 cx[global_rows] = family_cx[family_rows]
                 cy[global_rows] = family_cy[family_rows]
         finally:
-            runtime.free(d_x)
-            runtime.free(d_y)
-            runtime.free(d_ring_offsets)
-            runtime.free(d_geom_offsets)
+            if needs_free:
+                runtime.free(d_x)
+                runtime.free(d_y)
+                runtime.free(d_ring_offsets)
+                runtime.free(d_geom_offsets)
             if not cx_cy_owned:
                 runtime.free(d_cx)
                 runtime.free(d_cy)
@@ -334,7 +350,7 @@ def polygon_buffer_owned_array(
     ).selected
 
     if selected_mode is not ExecutionMode.GPU:
-        return _build_polygon_buffers_cpu(
+        return build_polygon_buffers_cpu(
             polygons, radii, quad_segs=quad_segs,
             join_style=join_style, mitre_limit=mitre_limit,
         )
@@ -343,30 +359,6 @@ def polygon_buffer_owned_array(
         polygons, radii, quad_segs=quad_segs,
         join_style=join_int, mitre_limit=mitre_limit,
     )
-
-
-def _build_polygon_buffers_cpu(
-    polygons: OwnedGeometryArray,
-    radii: np.ndarray,
-    *,
-    quad_segs: int,
-    join_style: str = "round",
-    mitre_limit: float = 5.0,
-) -> OwnedGeometryArray:
-    import shapely
-    polygons._ensure_host_state()
-    shapely_geoms = polygons.to_shapely()
-    result_geoms = shapely.buffer(
-        np.asarray(shapely_geoms, dtype=object),
-        radii,
-        quad_segs=quad_segs,
-        join_style=join_style,
-        mitre_limit=mitre_limit,
-    )
-    from vibespatial.geometry.owned import from_shapely_geometries
-    return from_shapely_geometries(list(result_geoms))
-
-
 def _build_polygon_buffers_gpu(
     polygons: OwnedGeometryArray,
     radii: np.ndarray,
@@ -609,8 +601,6 @@ def polygon_centroids_owned(
     GPU path uses ADR-0002 precision dispatch: fp32 with Kahan summation +
     coordinate centering on consumer GPUs, native fp64 on datacenter GPUs.
     """
-    from vibespatial.runtime import RuntimeSelection
-    from vibespatial.runtime.precision import select_precision_plan
 
     row_count = owned.row_count
     if row_count == 0:
@@ -626,17 +616,9 @@ def polygon_centroids_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
     )
-    if selection.selected is ExecutionMode.GPU and row_count >= _CENTROID_GPU_THRESHOLD:
+    if selection.selected is ExecutionMode.GPU:
         from vibespatial.runtime.precision import CoordinateStats
-        # Compute coordinate stats for centering decision
-        max_abs = 0.0
-        coord_min = np.inf
-        coord_max = -np.inf
-        for buf in owned.families.values():
-            if buf.row_count > 0 and buf.x.size > 0:
-                max_abs = max(max_abs, float(np.abs(buf.x).max()), float(np.abs(buf.y).max()))
-                coord_min = min(coord_min, float(buf.x.min()), float(buf.y.min()))
-                coord_max = max(coord_max, float(buf.x.max()), float(buf.y.max()))
+        max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
         span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
         # The centroid shoelace formula involves products of coordinates
         # (xi*yi1 - xi1*yi) which require constructive-level precision.
@@ -644,24 +626,21 @@ def polygon_centroids_owned(
         # summation and coordinate centering (observed >1 unit error for
         # coordinate ranges [0, 1000]).  Request CONSTRUCTIVE precision
         # planning to guarantee fp64 compute on consumer GPUs.
-        precision_plan = select_precision_plan(
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
-                reason="polygon_centroid GPU dispatch",
-            ),
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
+        selection = plan_dispatch_selection(
+            kernel_name="polygon_centroid",
+            kernel_class=KernelClass.METRIC,
+            row_count=row_count,
+            requested_mode=dispatch_mode,
+            requested_precision=precision,
+            precision_kernel_class=KernelClass.CONSTRUCTIVE,
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
         )
-        try:
-            result = _polygon_centroids_gpu(
-                owned, precision_plan=precision_plan, return_owned=return_owned,
-            )
-            if result is not None:
-                return result
-        except Exception:
-            pass  # fall through to CPU
+        precision_plan = selection.precision_plan
+        result = _polygon_centroids_gpu(
+            owned, precision_plan=precision_plan, return_owned=return_owned,
+        )
+        if result is not None:
+            return result
 
     # CPU fallback
     cx_cpu, cy_cpu = _polygon_centroids_cpu(owned)

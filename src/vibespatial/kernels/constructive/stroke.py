@@ -3,8 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-import numpy as np  # hygiene:ok — used for type alias and array construction, not device computation
-
+from vibespatial.constructive.stroke_cpu import empty_index_array, row_index_array
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
@@ -13,7 +12,7 @@ from vibespatial.runtime.residency import Residency
 if TYPE_CHECKING:
     from vibespatial.constructive.stroke import BufferKernelResult, OffsetCurveKernelResult
 
-StrokeInput = Sequence[object | None] | np.ndarray | object
+StrokeInput = Sequence[object | None] | object
 
 
 @register_kernel_variant(
@@ -60,15 +59,15 @@ def point_buffer_kernel_gpu(
     from vibespatial.constructive.stroke import BufferKernelResult  # lazy
     from vibespatial.geometry.owned import from_shapely_geometries
 
-    geometries = np.asarray(values, dtype=object)  # hygiene:ok — host Shapely objects
-    owned = from_shapely_geometries(list(geometries))
+    geometries = list(values)
+    owned = from_shapely_geometries(geometries)
     result = point_buffer_owned_array(owned, distance, quad_segs=quad_segs, dispatch_mode=ExecutionMode.GPU)
     row_count = result.row_count
     return BufferKernelResult(
         geometries=None,
         row_count=row_count,
-        fast_rows=np.arange(row_count, dtype=np.int32),
-        fallback_rows=np.asarray([], dtype=np.int32),  # hygiene:ok — host index array
+        fast_rows=row_index_array(row_count),
+        fallback_rows=empty_index_array(),
         owned_result=result,
     )
 

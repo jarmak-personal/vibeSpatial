@@ -39,8 +39,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
-import shapely
-
+from vibespatial.constructive.union_all_cpu import (
+    empty_owned,
+    merge_pair_cpu,
+    reduce_all_cpu,
+)
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -48,14 +51,13 @@ from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
-    from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
 
 if TYPE_CHECKING:
@@ -114,21 +116,18 @@ def disjoint_subset_union_all_owned(
 
     # Empty input -> empty geometry.
     if row_count == 0:
-        return _empty_result()
+        return empty_owned()
 
     selection = plan_dispatch_selection(
         kernel_name="disjoint_subset_union_all",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        precision_plan = select_precision_plan(  # noqa: F841 — called for ADR-0002 observability side-effects
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan  # noqa: F841 — called for ADR-0002 observability side-effects
         try:
             result = _disjoint_subset_union_all_gpu(owned)
             if result is not None:
@@ -211,7 +210,7 @@ def _disjoint_subset_union_all_gpu(
             valid_families.add(family)
 
     if not valid_families:
-        return _empty_result()
+        return empty_owned()
 
     # Check if all present families merge to the same multi-type.
     target_families = {_MERGE_TARGETS.get(f) for f in valid_families}
@@ -255,7 +254,7 @@ def _assemble_multipoint_gpu(
             all_y_parts.append(d_buf.y)
 
     if not all_x_parts:
-        return _empty_result()
+        return empty_owned()
 
     merged_x = cp.concatenate(all_x_parts) if len(all_x_parts) > 1 else all_x_parts[0]
     merged_y = cp.concatenate(all_y_parts) if len(all_y_parts) > 1 else all_y_parts[0]
@@ -313,7 +312,7 @@ def _assemble_multilinestring_gpu(
             )
 
     if not all_x_parts:
-        return _empty_result()
+        return empty_owned()
 
     merged_x = cp.concatenate(all_x_parts) if len(all_x_parts) > 1 else all_x_parts[0]
     merged_y = cp.concatenate(all_y_parts) if len(all_y_parts) > 1 else all_y_parts[0]
@@ -387,7 +386,7 @@ def _assemble_multipolygon_gpu(
             )
 
     if not all_x_parts:
-        return _empty_result()
+        return empty_owned()
 
     merged_x = cp.concatenate(all_x_parts) if len(all_x_parts) > 1 else all_x_parts[0]
     merged_y = cp.concatenate(all_y_parts) if len(all_y_parts) > 1 else all_y_parts[0]
@@ -477,15 +476,8 @@ def _build_single_row_oga(
 
 
 def _empty_result() -> OwnedGeometryArray:
-    """Produce an empty geometry as a 1-row OGA.
-
-    OwnedGeometryArray does not support GeometryCollection, so we use an
-    empty Polygon (consistent with ``_get_empty_owned`` in
-    ``segmented_union.py``).
-    """
-    from vibespatial.geometry.owned import from_shapely_geometries
-
-    return from_shapely_geometries([shapely.Polygon()])
+    """Produce an empty geometry as a 1-row OGA."""
+    return empty_owned()
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +515,7 @@ def _disjoint_subset_union_all_cpu(
             valid_families.add(family)
 
     if not valid_families:
-        return _empty_result()
+        return empty_owned()
 
     # Check if all families merge to the same multi-type.
     target_families = {_MERGE_TARGETS.get(f) for f in valid_families}
@@ -600,7 +592,7 @@ def _assemble_multipoint_host(
             all_y.append(buf.y)
 
     if not all_x:
-        return _empty_result()
+        return empty_owned()
 
     merged_x = np.concatenate(all_x) if len(all_x) > 1 else all_x[0]
     merged_y = np.concatenate(all_y) if len(all_y) > 1 else all_y[0]
@@ -651,7 +643,7 @@ def _assemble_multilinestring_host(
             )
 
     if not all_x:
-        return _empty_result()
+        return empty_owned()
 
     merged_x = np.concatenate(all_x) if len(all_x) > 1 else all_x[0]
     merged_y = np.concatenate(all_y) if len(all_y) > 1 else all_y[0]
@@ -714,7 +706,7 @@ def _assemble_multipolygon_host(
             )
 
     if not all_x:
-        return _empty_result()
+        return empty_owned()
 
     merged_x = np.concatenate(all_x) if len(all_x) > 1 else all_x[0]
     merged_y = np.concatenate(all_y) if len(all_y) > 1 else all_y[0]
@@ -754,28 +746,6 @@ def _assemble_multipolygon_host(
 # ADR-0002: CONSTRUCTIVE class -- fp64 on all devices per policy.
 # ADR-0033: Orchestrates Tier 1 overlay pipeline pairwise (no new NVRTC kernel).
 # ===========================================================================
-
-
-_EMPTY_POLYGON_SENTINEL = None  # lazily created
-
-
-def _get_empty_polygon():
-    """Lazily create a Shapely empty polygon."""
-    global _EMPTY_POLYGON_SENTINEL
-    if _EMPTY_POLYGON_SENTINEL is None:
-        _EMPTY_POLYGON_SENTINEL = shapely.Polygon()
-    return _EMPTY_POLYGON_SENTINEL
-
-
-_EMPTY_OWNED_SENTINEL = None
-
-
-def _get_empty_owned():
-    """Lazily create a 1-row OGA containing an empty polygon."""
-    global _EMPTY_OWNED_SENTINEL
-    if _EMPTY_OWNED_SENTINEL is None:
-        _EMPTY_OWNED_SENTINEL = from_shapely_geometries([shapely.Polygon()])
-    return _EMPTY_OWNED_SENTINEL
 
 
 def _is_owned_empty(owned: OwnedGeometryArray) -> bool:
@@ -857,31 +827,12 @@ def _tree_reduce_global(
 
                 if not gpu_ok:
                     # CPU fallback for this pair.
-                    try:
-                        left_g = current[i].to_shapely()[0]
-                    except Exception:
-                        left_g = _get_empty_polygon()
-                    try:
-                        right_g = current[i + 1].to_shapely()[0]
-                    except Exception:
-                        right_g = _get_empty_polygon()
-                    try:
-                        if op == "union":
-                            merged_g = shapely.union(left_g, right_g)
-                        else:
-                            merged_g = shapely.intersection(left_g, right_g)
-                        if merged_g is not None and not shapely.is_valid(merged_g):
-                            merged_g = shapely.make_valid(merged_g)
-                    except Exception:
-                        merged_g = _get_empty_polygon()
-                    next_round.append(from_shapely_geometries(
-                        [merged_g if merged_g is not None else _get_empty_polygon()],
-                    ))
+                    next_round.append(merge_pair_cpu(current[i], current[i + 1], op=op))
 
                 # Early termination: if result is empty and op is intersection,
                 # the final result must be empty regardless of remaining elements.
                 if early_termination_on_empty and _is_owned_empty(next_round[-1]):
-                    return _get_empty_owned()
+                    return empty_owned()
             else:
                 # Odd element passes through.
                 next_round.append(current[i])
@@ -944,20 +895,17 @@ def union_all_gpu_owned(
 
     # Empty input -> empty geometry.
     if row_count == 0:
-        return _get_empty_owned()
+        return empty_owned()
 
     selection = plan_dispatch_selection(
         kernel_name="union_all_gpu",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     # Apply grid_size snapping if requested.
     if grid_size is not None and grid_size > 0:
@@ -968,7 +916,7 @@ def union_all_gpu_owned(
     # Filter out null rows.
     keep = np.flatnonzero(owned.validity)
     if keep.size == 0:
-        return _get_empty_owned()
+        return empty_owned()
     if keep.size < owned.row_count:
         owned = owned.take(keep)
 
@@ -1007,12 +955,6 @@ def union_all_gpu_owned(
             )
 
     # CPU fallback: Shapely union_all.
-    geoms = owned.to_shapely()
-    arr = np.empty(len(geoms), dtype=object)
-    arr[:] = geoms
-    result_g = shapely.union_all(arr, grid_size=grid_size)
-    if result_g is None:
-        result_g = _get_empty_polygon()
     record_dispatch_event(
         surface="constructive.union_all_gpu",
         operation="union_all",
@@ -1021,7 +963,7 @@ def union_all_gpu_owned(
         requested=dispatch_mode,
         selected=ExecutionMode.CPU,
     )
-    return from_shapely_geometries([result_g])
+    return reduce_all_cpu(owned, op="union_all", grid_size=grid_size)
 
 
 # ---------------------------------------------------------------------------
@@ -1069,25 +1011,22 @@ def coverage_union_all_gpu_owned(
     row_count = owned.row_count
 
     if row_count == 0:
-        return _get_empty_owned()
+        return empty_owned()
 
     selection = plan_dispatch_selection(
         kernel_name="coverage_union_all_gpu",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     # Filter nulls.
     keep = np.flatnonzero(owned.validity)
     if keep.size == 0:
-        return _get_empty_owned()
+        return empty_owned()
     if keep.size < owned.row_count:
         owned = owned.take(keep)
 
@@ -1128,12 +1067,6 @@ def coverage_union_all_gpu_owned(
             )
 
     # CPU fallback: Shapely coverage_union_all.
-    geoms = owned.to_shapely()
-    arr = np.empty(len(geoms), dtype=object)
-    arr[:] = geoms
-    result_g = shapely.coverage_union_all(arr)
-    if result_g is None:
-        result_g = _get_empty_polygon()
     record_dispatch_event(
         surface="constructive.coverage_union_all_gpu",
         operation="coverage_union_all",
@@ -1142,7 +1075,7 @@ def coverage_union_all_gpu_owned(
         requested=dispatch_mode,
         selected=ExecutionMode.CPU,
     )
-    return from_shapely_geometries([result_g])
+    return reduce_all_cpu(owned, op="coverage_union_all")
 
 
 # ---------------------------------------------------------------------------
@@ -1190,26 +1123,23 @@ def intersection_all_gpu_owned(
     row_count = owned.row_count
 
     if row_count == 0:
-        return _get_empty_owned()
+        return empty_owned()
 
     selection = plan_dispatch_selection(
         kernel_name="intersection_all_gpu",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     # Filter nulls: null rows are skipped (intersection_all of [A, null, B]
     # should be intersection(A, B), matching Shapely semantics).
     keep = np.flatnonzero(owned.validity)
     if keep.size == 0:
-        return _get_empty_owned()
+        return empty_owned()
     if keep.size < owned.row_count:
         owned = owned.take(keep)
 
@@ -1249,12 +1179,6 @@ def intersection_all_gpu_owned(
             )
 
     # CPU fallback: Shapely intersection_all.
-    geoms = owned.to_shapely()
-    arr = np.empty(len(geoms), dtype=object)
-    arr[:] = geoms
-    result_g = shapely.intersection_all(arr)
-    if result_g is None:
-        result_g = _get_empty_polygon()
     record_dispatch_event(
         surface="constructive.intersection_all_gpu",
         operation="intersection_all",
@@ -1263,7 +1187,7 @@ def intersection_all_gpu_owned(
         requested=dispatch_mode,
         selected=ExecutionMode.CPU,
     )
-    return from_shapely_geometries([result_g])
+    return reduce_all_cpu(owned, op="intersection_all")
 
 
 # ---------------------------------------------------------------------------

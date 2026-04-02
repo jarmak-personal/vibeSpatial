@@ -27,8 +27,11 @@ from vibespatial.geometry.owned import (  # noqa: E402
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
+from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
+from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
+from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency  # noqa: E402
 from vibespatial.spatial.segment_primitives import (  # noqa: E402
     DeviceSegmentTable,
@@ -112,26 +115,86 @@ request_nvrtc_warmup([
 ])
 
 
+@register_kernel_variant(
+    "overlay_split",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    preferred_residency=Residency.DEVICE,
+    tags=("nvrtc", "overlay", "split"),
+)
 def _overlay_split_kernels():
     return compile_kernel_group("overlay-split", _OVERLAY_SPLIT_KERNEL_SOURCE, _OVERLAY_SPLIT_KERNEL_NAMES)
 
 
+@register_kernel_variant(
+    "overlay_face_walk",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    preferred_residency=Residency.DEVICE,
+    tags=("nvrtc", "overlay", "face-walk"),
+)
 def _overlay_face_walk_kernels():
     return compile_kernel_group("overlay-face-walk", _OVERLAY_FACE_WALK_KERNEL_SOURCE, _OVERLAY_FACE_WALK_KERNEL_NAMES)
 
 
+@register_kernel_variant(
+    "overlay_face_label",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    preferred_residency=Residency.DEVICE,
+    tags=("nvrtc", "overlay", "face-label"),
+)
 def _overlay_face_label_kernels():
     return compile_kernel_group("overlay-face-label", _OVERLAY_FACE_LABEL_KERNEL_SOURCE, _OVERLAY_FACE_LABEL_KERNEL_NAMES)
 
 
+@register_kernel_variant(
+    "overlay_face_assembly",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    preferred_residency=Residency.DEVICE,
+    tags=("nvrtc", "overlay", "face-assembly"),
+)
 def _overlay_face_assembly_kernels():
     return compile_kernel_group("overlay-face-assembly", _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE, _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES)
 
 
+@register_kernel_variant(
+    "overlay_batch_point_in_ring",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    preferred_residency=Residency.DEVICE,
+    tags=("nvrtc", "overlay", "batch-pip"),
+)
 def _batch_pip_kernels():
     return compile_kernel_group("overlay-batch-pip", _BATCH_POINT_IN_RING_KERNEL_SOURCE, _BATCH_POINT_IN_RING_KERNEL_NAMES)
 
 
+@register_kernel_variant(
+    "overlay_containment_bypass",
+    "gpu-nvrtc",
+    kernel_class=KernelClass.CONSTRUCTIVE,
+    execution_modes=(ExecutionMode.GPU,),
+    geometry_families=("polygon", "multipolygon"),
+    supports_mixed=False,
+    preferred_residency=Residency.DEVICE,
+    tags=("nvrtc", "overlay", "containment-bypass"),
+)
 def _containment_bypass_kernels():
     return compile_kernel_group(
         "overlay-containment-bypass",
@@ -332,14 +395,6 @@ def _overlay_owned(
             d2h_transfer=False,
         )
         return _overlay_owned(left, right, operation=operation, dispatch_mode=ExecutionMode.CPU)
-
-    # Ensure host-side coordinate buffers are materialised.  Device-resident
-    # inputs from pylibcudf I/O have structural metadata on host but empty
-    # x/y stubs (host_materialized=False).  The overlay pipeline accesses
-    # polygon_buffer.x/y on host in multiple places (rectangle detection,
-    # _extract_segments_gpu via device state).
-    left._ensure_host_state()
-    right._ensure_host_state()
 
     if operation == "intersection":
         rectangle_fast_path = _overlay_intersection_rectangles_gpu(left, right, requested=requested)
@@ -864,8 +919,14 @@ def spatial_overlay_owned(
         # use GPU to avoid the 50K CONSTRUCTIVE crossover threshold
         # routing small pair batches to CPU (which triggers a fallback
         # event per batch and forces a D->H->D round-trip through Shapely).
-        from vibespatial.runtime import has_gpu_runtime
-        _pairwise_mode = ExecutionMode.GPU if has_gpu_runtime() else requested
+        _pairwise_selection = plan_dispatch_selection(
+            kernel_name="overlay_pairwise",
+            kernel_class=KernelClass.CONSTRUCTIVE,
+            row_count=candidate_pairs.count,
+            requested_mode=ExecutionMode.GPU if _pairs_on_device else requested,
+            gpu_available=cp is not None,
+        )
+        _pairwise_mode = _pairwise_selection.selected
 
         if how in ("difference", "symmetric_difference"):
             # Union all right neighbours per left group, then compute one
@@ -1231,7 +1292,19 @@ def spatial_overlay_owned(
             if right_geom is not None and not right_geom.is_empty:
                 from vibespatial.constructive.polygon import polygon_centroids_owned
                 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-                try:
+                _centroid_selection = plan_dispatch_selection(
+                    kernel_name="polygon_centroid",
+                    kernel_class=KernelClass.METRIC,
+                    row_count=left_subset.row_count,
+                    geometry_families=tuple(
+                        sorted(family.value for family in left_subset.families)
+                    ),
+                    mixed_geometry=len(left_subset.families) > 1,
+                    current_residency=left_subset.residency,
+                    requested_mode=ExecutionMode.GPU,
+                    gpu_available=cp is not None,
+                )
+                if _centroid_selection.selected is ExecutionMode.GPU:
                     cx, cy = polygon_centroids_owned(left_subset)
                     centroids = shapely.points(cx, cy)
                     inside_mask = np.asarray(shapely.within(centroids, right_geom), dtype=bool)
@@ -1261,8 +1334,6 @@ def spatial_overlay_owned(
                             result_parts_shapely.extend(clipped.tolist())
                         result_geoms = np.asarray(result_parts_shapely, dtype=object)
                         _used_centroid_filter = True
-                except Exception:
-                    pass  # fall through to general path
 
         if not _used_clip_by_rect and not _used_centroid_filter:
             # Per-left-group Shapely path: process each left geometry against

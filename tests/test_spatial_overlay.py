@@ -5,6 +5,8 @@ geopandas.overlay fallback for mismatched row-count inputs.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import shapely
 from shapely.geometry import box
@@ -270,6 +272,41 @@ class TestSpatialOverlayEdgeCases:
         for i, g in enumerate(result_geoms):
             assert abs(g.area - left_geoms[i].area) < 1e-10
 
+    def test_centroid_filter_failure_propagates(self, monkeypatch):
+        left = from_shapely_geometries([box(i, 0, i + 0.8, 0.8) for i in range(120)])
+        right = from_shapely_geometries([shapely.Polygon([(0, 0), (120, 0), (60, 20)])])
+
+        from vibespatial.overlay import gpu as overlay_gpu
+
+        def _force_owned_dispatch_fallback(*args, **kwargs):
+            raise NotImplementedError("force shapely overlay fallback")
+
+        monkeypatch.setattr(
+            overlay_gpu,
+            "_combine_bypass_results",
+            _force_owned_dispatch_fallback,
+        )
+
+        real_plan_dispatch_selection = overlay_gpu.plan_dispatch_selection
+
+        def _force_gpu_centroid_plan(**kwargs):
+            if kwargs.get("kernel_name") == "polygon_centroid":
+                return SimpleNamespace(selected=overlay_gpu.ExecutionMode.GPU)
+            return real_plan_dispatch_selection(**kwargs)
+
+        monkeypatch.setattr(overlay_gpu, "plan_dispatch_selection", _force_gpu_centroid_plan)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("centroid-filter-boom")
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.polygon.polygon_centroids_owned",
+            _boom,
+        )
+
+        with pytest.raises(RuntimeError, match="centroid-filter-boom"):
+            spatial_overlay_owned(left, right, how="intersection")
+
 
 class TestOverlayDispatchEventWorkloadShape:
     """Verify dispatch events for overlay include workload_shape in detail (nsf.5)."""
@@ -328,7 +365,7 @@ class TestSelectOverlayStrategyWorkloadShape:
 
     def test_broadcast_right_uses_shared_enum(self):
         from vibespatial.overlay.strategies import select_overlay_strategy
-        from vibespatial.runtime.workload import WorkloadShape
+        from vibespatial.runtime.crossover import WorkloadShape
 
         left = from_shapely_geometries([box(i, 0, i + 1, 1) for i in range(5)])
         right = from_shapely_geometries([box(0, 0, 10, 10)])
@@ -349,7 +386,7 @@ class TestSelectOverlayStrategyWorkloadShape:
 
     def test_pairwise_uses_shared_enum(self):
         from vibespatial.overlay.strategies import select_overlay_strategy
-        from vibespatial.runtime.workload import WorkloadShape
+        from vibespatial.runtime.crossover import WorkloadShape
 
         left = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
         right = from_shapely_geometries([box(0, 0, 2, 2), box(2, 0, 4, 2)])

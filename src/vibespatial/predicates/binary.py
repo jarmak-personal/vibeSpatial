@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -13,7 +13,6 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     TAG_FAMILIES,
-    DeviceMetadataState,
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
     from_shapely_geometries,
@@ -21,7 +20,8 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import WorkloadShape
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.precision import (
@@ -32,7 +32,6 @@ from vibespatial.runtime.precision import (
 )
 from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
-from vibespatial.runtime.workload import WorkloadShape
 
 from .point_relations import (
     POINT_LOCATION_BOUNDARY,
@@ -114,10 +113,44 @@ _DE9IM_PREDICATES = frozenset({
 
 
 _SPECIAL_PREDICATES = frozenset({"equals", "equals_exact", "equals_identical"})
+_OWNED_EXACT_GEOMETRY_TYPES = frozenset({
+    "Point",
+    "LineString",
+    "Polygon",
+    "MultiPoint",
+    "MultiLineString",
+    "MultiPolygon",
+})
 
 
 def supports_binary_predicate(name: str) -> bool:
     return name in PREDICATE_SPECS or name in _SPECIAL_PREDICATES
+
+
+def _unsupported_owned_exact_family(values: PredicateInput) -> str | None:
+    if isinstance(values, OwnedGeometryArray):
+        return None
+    array, _ = _coerce_array(values, arg_name="values")
+    assert array is not None
+    missing = shapely.is_missing(array)
+    for geometry in array[~missing]:
+        geom_type = getattr(geometry, "geom_type", None)
+        if geom_type not in _OWNED_EXACT_GEOMETRY_TYPES:
+            return str(geom_type)
+    return None
+
+
+def _unsupported_owned_exact_operands(
+    left: PredicateInput,
+    right: object | PredicateInput,
+) -> str | None:
+    if not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple)):
+        return None
+    for side, values in (("left", left), ("right", right)):
+        unsupported = _unsupported_owned_exact_family(values)
+        if unsupported is not None:
+            return f"{side} contains unsupported geometry family {unsupported}"
+    return None
 
 
 def _coerce_array(
@@ -177,7 +210,7 @@ def _ensure_registered_kernel(
     requested_mode: ExecutionMode,
     row_count: int,
 ) -> RuntimeSelection:
-    plan = plan_kernel_dispatch(
+    plan = plan_dispatch_selection(
         kernel_name=predicate,
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
@@ -189,12 +222,36 @@ def _ensure_registered_kernel(
         if requested_mode is ExecutionMode.GPU:
             raise NotImplementedError(f"{predicate} has no GPU variant registered yet")
         if selection.selected is ExecutionMode.GPU:
-            return RuntimeSelection(
-                requested=requested_mode,
-                selected=ExecutionMode.CPU,
+            return _explicit_cpu_fallback_selection(
+                predicate=predicate,
+                requested_mode=requested_mode,
+                row_count=row_count,
                 reason=f"{predicate} has no GPU variant registered; using explicit CPU fallback",
             )
     return selection
+
+
+def _explicit_cpu_fallback_selection(
+    *,
+    predicate: str,
+    requested_mode: ExecutionMode,
+    row_count: int,
+    reason: str,
+    workload_shape: WorkloadShape | None = None,
+) -> RuntimeSelection:
+    cpu_plan = plan_dispatch_selection(
+        kernel_name=predicate,
+        kernel_class=KernelClass.PREDICATE,
+        row_count=row_count,
+        requested_mode=ExecutionMode.CPU,
+        requested_precision=PrecisionMode.AUTO,
+        workload_shape=workload_shape,
+    )
+    return replace(
+        cpu_plan.runtime_selection,
+        requested=requested_mode,
+        reason=reason,
+    )
 
 
 def _record_runtime_selection(
@@ -260,11 +317,6 @@ def _broadcast_right_owned(
         d_validity = runtime.from_host(validity)
         d_tags = runtime.from_host(tags)
         d_fro = runtime.from_host(family_row_offsets)
-        d_meta = DeviceMetadataState(
-            validity=d_validity,
-            tags=d_tags,
-            family_row_offsets=d_fro,
-        )
         d_state = OwnedGeometryDeviceState(
             validity=d_validity,
             tags=d_tags,
@@ -278,7 +330,6 @@ def _broadcast_right_owned(
             families=right_1row.families,
             residency=Residency.DEVICE,
             device_state=d_state,
-            device_metadata=d_meta,
         )
 
     return OwnedGeometryArray(
@@ -861,38 +912,20 @@ def _fused_gpu_binary_predicate(
     )
 
     # Compute bounds on device if not cached.
-    # compute_geometry_bounds(dispatch_mode=GPU) may silently fall back to
-    # CPU (its GPU path has a bare ``except Exception: pass``).  When that
-    # happens, the returned numpy bounds are correct but state.row_bounds
-    # remains None.  Recover by uploading the CPU-computed bounds to device
-    # so the rest of the fused pipeline can proceed without bailing out.
     import cupy as cp
 
     for arr, state_ref in ((left, "left"), (right, "right")):
         state = arr._ensure_device_state()
         if state.row_bounds is None:
-            host_bounds = compute_geometry_bounds(arr, dispatch_mode=ExecutionMode.GPU)
+            compute_geometry_bounds(arr, dispatch_mode=ExecutionMode.GPU)
             state = arr._ensure_device_state()
             if state.row_bounds is None:
-                # GPU bounds failed; upload CPU-computed bounds to device.
-                # The CPU fallback in compute_geometry_bounds may have moved
-                # the array to HOST; restore DEVICE residency so the rest
-                # of the fused pipeline can proceed.
                 record_fallback_event(
                     surface="vibespatial.predicates.binary._fused_gpu_binary_predicate",
-                    reason=f"GPU bounds kernel failed for {state_ref}; uploading CPU bounds to device",
+                    reason=f"GPU bounds kernel unavailable for {state_ref}; using the non-fused predicate path",
                     d2h_transfer=False,
                 )
-                arr.move_to(
-                    Residency.DEVICE,
-                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                    reason=f"fused GPU {predicate}: restore {state_ref} residency after bounds fallback",
-                )
-                state = arr._ensure_device_state()
-                state.row_bounds = cp.asarray(
-                    host_bounds.reshape(arr.row_count, 4),
-                    dtype=np.float64,
-                )
+                return None
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
 
@@ -1195,19 +1228,23 @@ def evaluate_binary_predicate(
             if not _point_ok and not _de9im_ok:
                 if requested_mode is ExecutionMode.GPU:
                     raise NotImplementedError(gpu_reason)
-                runtime_selection = RuntimeSelection(
-                    requested=requested_mode,
-                    selected=ExecutionMode.CPU,
+                runtime_selection = _explicit_cpu_fallback_selection(
+                    predicate=predicate,
+                    requested_mode=requested_mode,
+                    row_count=row_count,
                     reason=f"{gpu_reason}; using explicit CPU fallback",
+                    workload_shape=workload_shape,
                 )
         else:
             # Cannot build owned arrays -- fall back to CPU
             if requested_mode is ExecutionMode.GPU:
                 raise NotImplementedError(gpu_reason)
-            runtime_selection = RuntimeSelection(
-                requested=requested_mode,
-                selected=ExecutionMode.CPU,
+            runtime_selection = _explicit_cpu_fallback_selection(
+                predicate=predicate,
+                requested_mode=requested_mode,
+                row_count=row_count,
                 reason=f"{gpu_reason}; using explicit CPU fallback",
+                workload_shape=workload_shape,
             )
 
     _record_runtime_selection(runtime_selection, (left_gpu_owned or left_owned, right_gpu_owned or right_owned))
@@ -1539,16 +1576,16 @@ def evaluate_geopandas_binary_predicate(
         # Topological equality = structural equality after normalization.
         # Routes to normalize-then-compare composition in equality.py.
         if predicate == "equals":
-            try:
-                return _evaluate_geopandas_equals(left, right, **kwargs)
-            except NotImplementedError:
+            unsupported = _unsupported_owned_exact_operands(left, right)
+            if unsupported is not None:
                 record_fallback_event(
                     surface="geopandas.array.equals",
                     reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
-                    detail="NotImplementedError from from_shapely_geometries",
+                    detail=unsupported,
                     pipeline="predicate",
                 )
                 return None
+            return _evaluate_geopandas_equals(left, right, **kwargs)
 
         # --- equals_exact special path ---
         # Tolerance invalidates the standard bbox coarse filter (two
@@ -1556,31 +1593,31 @@ def evaluate_geopandas_binary_predicate(
         # don't overlap).  Route directly to the dedicated coordinate-
         # comparison dispatch in geometry/equality.py.
         if predicate == "equals_exact":
-            try:
-                return _evaluate_geopandas_equals_exact(left, right, **kwargs)
-            except NotImplementedError:
+            unsupported = _unsupported_owned_exact_operands(left, right)
+            if unsupported is not None:
                 record_fallback_event(
                     surface="geopandas.array.equals_exact",
                     reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
-                    detail="NotImplementedError from from_shapely_geometries",
+                    detail=unsupported,
                     pipeline="predicate",
                 )
                 return None
+            return _evaluate_geopandas_equals_exact(left, right, **kwargs)
 
         # --- equals_identical special path ---
         # Strict coordinate-level identity (tolerance=0).  Routes through
         # the same NVRTC kernel infrastructure as equals_exact.
         if predicate == "equals_identical":
-            try:
-                return _evaluate_geopandas_equals_identical(left, right, **kwargs)
-            except NotImplementedError:
+            unsupported = _unsupported_owned_exact_operands(left, right)
+            if unsupported is not None:
                 record_fallback_event(
                     surface="geopandas.array.equals_identical",
                     reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
-                    detail="NotImplementedError from from_shapely_geometries",
+                    detail=unsupported,
                     pipeline="predicate",
                 )
                 return None
+            return _evaluate_geopandas_equals_identical(left, right, **kwargs)
 
         left_coerced = left if isinstance(left, OwnedGeometryArray) else np.asarray(left, dtype=object)
         if isinstance(right, OwnedGeometryArray) or np.isscalar(right) or right is None:

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
+
 # ---------------------------------------------------------------------------
 # NVRTC kernel sources (Tier 1)
 # ---------------------------------------------------------------------------
 
-_RING_KERNEL_SOURCE = r"""
+_RING_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + r"""
 typedef {compute_type} compute_t;
 
 extern "C" __global__ void normalize_ring_find_min(
@@ -26,11 +28,7 @@ extern "C" __global__ void normalize_ring_find_min(
     int n = coord_end - coord_start;
 
     // Strip closing vertex if present (last == first)
-    if (n >= 2) {{
-        double dx = x[coord_start] - x[coord_end - 1];
-        double dy = y[coord_start] - y[coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) n--;
-    }}
+    n = vs_strip_closure(x, y, coord_start, coord_end, n, 1e-24);
 
     if (n <= 0) {{
         min_index[ring] = coord_start;
@@ -74,11 +72,7 @@ extern "C" __global__ void normalize_ring_rotate(
 
     // Determine unique vertex count (strip closing vertex)
     int n = total;
-    if (n >= 2) {{
-        double dx = x_in[coord_start] - x_in[coord_end - 1];
-        double dy = y_in[coord_start] - y_in[coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) n--;
-    }}
+    n = vs_strip_closure(x_in, y_in, coord_start, coord_end, n, 1e-24);
 
     const int best = min_index[ring];
     const int offset_in_ring = best - coord_start;

@@ -56,14 +56,40 @@ _SHAPELY_ALLOWLIST: dict[str, str] = {
     # spatial/ — vectorized shapely C ops + fallback paths
     "spatial/query_utils.py": "Vectorized shapely.get_type_id/get_coordinates (C-accelerated)",
     "spatial/query_box.py": "BaseGeometry type check for input validation",
+    "spatial/query_cpu.py": "CPU-only Shapely bounds extraction helpers for spatial query fast paths",
     "spatial/distance_owned.py": "Fallback distance computation",
     "spatial/nearest.py": "Fallback nearest-neighbor computation",
     # predicates/ — predicate definitions reference shapely
     "predicates/binary.py": "Shapely predicate names and fallback evaluation",
     "predicates/relate.py": "DE-9IM mask computation via shapely fallback",
-    # kernels/ — tracked debt (should be eliminated)
-    "kernels/constructive/nonpolygon_binary.py": "Host-side point/multipoint assembly (debt)",
-    "kernels/constructive/polygon_difference.py": "Shapely fallback for difference (debt)",
+    "predicates/point_in_polygon_cpu.py": "CPU-only point-in-polygon variant registration module",
+    # constructive/ — CPU-only variant registration modules and host-side constructive boundaries
+    "constructive/polygon_difference_cpu.py": "CPU-only polygon difference variant registration module",
+    "constructive/polygon_intersection_cpu.py": "CPU-only polygon intersection variant registration module",
+    "constructive/segmented_union_cpu.py": "CPU-only segmented union variant registration module",
+    "constructive/binary_constructive_cpu.py": "CPU-only binary constructive variant registration module",
+    "constructive/boundary_cpu.py": "CPU-only boundary variant registration module",
+    "constructive/exterior_cpu.py": "CPU-only exterior-ring variant registration module",
+    "constructive/interiors_cpu.py": "CPU-only interior-rings variant registration module",
+    "constructive/extract_unique_points_cpu.py": "CPU-only extract-unique-points variant registration module",
+    "constructive/normalize_cpu.py": "CPU-only normalize variant registration module",
+    "constructive/linestring_buffer_cpu.py": "CPU-only linestring buffer helper",
+    "constructive/line_merge_cpu.py": "CPU-only line-merge variant registration module",
+    "constructive/remove_repeated_points_cpu.py": "CPU-only remove-repeated-points variant registration module",
+    "constructive/minimum_rotated_rectangle_cpu.py": "CPU-only minimum-rotated-rectangle helper and variant",
+    "constructive/minimum_clearance_cpu.py": "CPU-only minimum-clearance helper",
+    "constructive/polygon_buffer_cpu.py": "CPU-only polygon buffer helper",
+    "constructive/set_precision_cpu.py": "CPU-only set-precision variant registration module",
+    "constructive/simplify_cpu.py": "CPU-only simplify variant registration module",
+    "constructive/snap_cpu.py": "CPU-only snap variant registration module",
+    "constructive/shared_paths_cpu.py": "CPU-only shared-paths assembly and variant registration module",
+    "constructive/shortest_line_cpu.py": "CPU-only shortest-line variant registration module",
+    "constructive/stroke_cpu.py": "CPU-only stroke buffer and offset-curve helper module",
+    "constructive/union_all_cpu.py": "CPU-only union-all reduction helpers and empty-result sentinels",
+    "constructive/make_valid_pipeline_cpu.py": "CPU-only make-valid helpers and warmup geometry builder",
+    "constructive/properties_cpu.py": "CPU-only get-geometry variant registration module",
+    "constructive/clip_rect_cpu.py": "CPU-only clip-by-rect host assembly and baseline module",
+    "constructive/multipoint_polygon_constructive.py": "Host-side multipoint-polygon constructive boundary",
     # io/ boundary — format-specific needs
     "io/postgis_gpu.py": "WKB decode for PostGIS binary format",
     "io/geoarrow.py": "GeoArrow metadata requires shapely geometry type IDs",
@@ -87,8 +113,8 @@ _NUMPY_ALLOWLIST: dict[str, str] = {
 # Decrease as debt is paid.  Fails only if current count EXCEEDS baseline.
 # These are shapely/numpy imports in GPU-path code that predate the guard.
 # Every file here is tracked debt — the baseline MUST only go down.
-_SHAPELY_VIOLATION_BASELINE = 34
-_NUMPY_VIOLATION_BASELINE = 17
+_SHAPELY_VIOLATION_BASELINE = 0
+_NUMPY_VIOLATION_BASELINE = 0
 
 
 @dataclass(frozen=True)

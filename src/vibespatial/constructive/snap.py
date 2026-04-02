@@ -37,6 +37,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.snap_cpu import _snap_cpu
 from vibespatial.constructive.snap_kernels import _SNAP_FP64, _SNAP_KERNEL_NAMES
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
@@ -50,19 +51,19 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     TAG_FAMILIES,
-    DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    build_updated_device_family_buffer,
     from_shapely_geometries,
     tile_single_row,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
-from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 logger = logging.getLogger(__name__)
 
@@ -496,40 +497,13 @@ def _snap_and_dedup_family_gpu(
         d_new_offsets[:a_span_count] = cp.asarray(d_new_offsets_body)
         d_new_offsets[a_span_count] = total_kept
 
-    # Build new DeviceFamilyGeometryBuffer with updated span offsets
-    if a_family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        return DeviceFamilyGeometryBuffer(
-            family=a_family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=a_buf.geometry_offsets,
-            empty_mask=a_buf.empty_mask,
-            part_offsets=a_buf.part_offsets,
-            ring_offsets=d_new_offsets,
-            bounds=None,
-        )
-    elif a_family is GeometryFamily.MULTILINESTRING:
-        return DeviceFamilyGeometryBuffer(
-            family=a_family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=a_buf.geometry_offsets,
-            empty_mask=a_buf.empty_mask,
-            part_offsets=d_new_offsets,
-            ring_offsets=a_buf.ring_offsets,
-            bounds=None,
-        )
-    else:
-        return DeviceFamilyGeometryBuffer(
-            family=a_family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=d_new_offsets,
-            empty_mask=a_buf.empty_mask,
-            part_offsets=a_buf.part_offsets,
-            ring_offsets=a_buf.ring_offsets,
-            bounds=None,
-        )
+    return build_updated_device_family_buffer(
+        a_family,
+        a_buf,
+        d_x_out,
+        d_y_out,
+        d_new_offsets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -663,31 +637,6 @@ def _snap_gpu(
 # CPU fallback (registered variant)
 # ---------------------------------------------------------------------------
 
-@register_kernel_variant(
-    "snap",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "linestring", "multilinestring",
-        "polygon", "multipolygon", "multipoint",
-    ),
-    supports_mixed=True,
-    tags=("cpu", "shapely", "snap"),
-)
-def _snap_cpu(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-    tolerance: float,
-) -> np.ndarray:
-    """CPU snap via Shapely."""
-    import shapely as _shapely
-
-    left_geoms = np.asarray(left.to_shapely(), dtype=object)
-    right_geoms = np.asarray(right.to_shapely(), dtype=object)
-    return _shapely.snap(left_geoms, right_geoms, tolerance=tolerance)
-
-
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
@@ -745,13 +694,10 @@ def snap_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     if selection.selected is ExecutionMode.GPU:
         try:

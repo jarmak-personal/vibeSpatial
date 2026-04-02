@@ -54,7 +54,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
 
 if TYPE_CHECKING:
@@ -641,16 +641,13 @@ def convex_hull_owned(
         kernel_class=KernelClass.COARSE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     # Check if GPU path is viable
     if selection.selected is ExecutionMode.GPU and cp is not None:
         # COARSE class: always fp64, precision_plan used only for event metadata.
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.COARSE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         # GPU path supports single-family non-MultiPolygon inputs.
         # Use family_has_rows() which checks device buffers when present,
         # avoiding false negatives from unmaterialized host stubs.

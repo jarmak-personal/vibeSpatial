@@ -15,7 +15,7 @@ from vibespatial import (
     select_dispatch_for_rows,
     select_residency_plan,
 )
-from vibespatial.runtime.workload import WorkloadShape
+from vibespatial.runtime.crossover import WorkloadShape
 
 
 def test_user_materialization_is_explicit_and_visible() -> None:

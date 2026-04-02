@@ -293,6 +293,28 @@ def test_query_spatial_index_uses_gpu_for_point_tree_box_queries(predicate: str 
         assert execution.selected is ExecutionMode.CPU
 
 
+def test_query_spatial_index_uses_gpu_for_small_point_tree_box_queries() -> None:
+    tree = np.asarray([Point(0.0, 0.0), Point(1.0, 0.0), Point(2.0, 0.0)], dtype=object)
+    query = box(0.5, -1.0, 1.5, 1.0)
+    owned, flat = build_owned_spatial_index(tree)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="contains",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == [1]
+    if has_gpu_runtime():
+        assert execution.selected is ExecutionMode.GPU
+        assert execution.implementation == "owned_gpu_spatial_query"
+    else:
+        assert execution.selected is ExecutionMode.CPU
+
+
 @pytest.mark.parametrize(
     ("predicate", "expected"),
     [

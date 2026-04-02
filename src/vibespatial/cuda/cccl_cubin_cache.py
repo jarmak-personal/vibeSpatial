@@ -41,6 +41,13 @@ _disk_cache_writes_disabled = False
 # ---------------------------------------------------------------------------
 
 
+def _is_host_array_like(value: Any) -> bool:
+    """Return True for host-backed array objects accepted by CCCL value init."""
+    return hasattr(value, "__array_interface__") and not hasattr(
+        value, "__cuda_array_interface__",
+    )
+
+
 @lru_cache(maxsize=1)
 def _cccl_cache_enabled() -> bool:
     value = os.environ.get(_CACHE_ENV_VAR, "")
@@ -956,8 +963,7 @@ class _CachedScanReduce(_CachedAlgorithm):
             op_adapter.update_op_state(self._op_cccl)
 
             if hasattr(self._init_cccl, 'state') and init_value is not None:
-                import numpy as np
-                if isinstance(init_value, np.ndarray):
+                if _is_host_array_like(init_value):
                     self._init_cccl.state = to_cccl_value_state(init_value)
 
             stream_handle = validate_and_get_stream(stream)
@@ -1058,8 +1064,7 @@ class _CachedSegmentedReduce(_CachedAlgorithm):
             set_cccl_iterator_state(self._d_ends_cccl, d_ends)
             op_adapter = make_op_adapter(op)
             op_adapter.update_op_state(self._op_cccl)
-            import numpy as np
-            if isinstance(init_value, np.ndarray):
+            if _is_host_array_like(init_value):
                 self._init_cccl.state = to_cccl_value_state(init_value)
             stream_handle = validate_and_get_stream(stream)
 
@@ -1245,9 +1250,8 @@ class _CachedRadixSort(_CachedAlgorithm):
             OpT = _get_opaque_type("Op", self._op_size)
             selector = ctypes.c_int(0)
 
-            import numpy as np
-            key_dtype = d_keys_in.dtype if hasattr(d_keys_in, 'dtype') else np.int32
-            end_bit = key_dtype.itemsize * 8
+            key_dtype = getattr(d_keys_in, "dtype", None)
+            end_bit = int(getattr(key_dtype, "itemsize", 4)) * 8
 
             err = self._cfunc(
                 self._build.struct,

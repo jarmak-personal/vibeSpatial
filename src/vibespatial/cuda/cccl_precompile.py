@@ -16,11 +16,16 @@ import sys
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from enum import StrEnum
 from time import perf_counter
 from typing import Any
 
-import numpy as np
+from vibespatial.cccl_host import get_host_init
+from vibespatial.runtime.cccl_warmup_specs import (
+    AlgorithmFamily,
+    CCCLWarmupSpec,
+    WarmupDiagnostic,
+    build_spec_registry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,34 +41,8 @@ def precompile_enabled() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Algorithm families
-# ---------------------------------------------------------------------------
-
-class AlgorithmFamily(StrEnum):
-    EXCLUSIVE_SCAN = "exclusive_scan"
-    SELECT = "select"
-    REDUCE_INTO = "reduce_into"
-    SEGMENTED_REDUCE = "segmented_reduce"
-    LOWER_BOUND = "lower_bound"
-    UPPER_BOUND = "upper_bound"
-    RADIX_SORT = "radix_sort"
-    MERGE_SORT = "merge_sort"
-    UNIQUE_BY_KEY = "unique_by_key"
-    SEGMENTED_SORT = "segmented_sort"
-
-
-# ---------------------------------------------------------------------------
 # Spec and result types
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True, slots=True)
-class CCCLWarmupSpec:
-    """Specification for a CCCL make_* pre-compilation target."""
-    name: str
-    family: AlgorithmFamily
-    key_dtype: np.dtype[Any]
-    value_dtype: np.dtype[Any] | None  # for sort / unique_by_key
-    op_name: str  # key into _OPS table
 
 
 @dataclass(slots=True)
@@ -77,61 +56,7 @@ class PrecompiledPrimitive:
     warmup_ms: float
 
 
-@dataclass(frozen=True, slots=True)
-class WarmupDiagnostic:
-    name: str
-    elapsed_ms: float
-    success: bool
-    error: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Spec registry (all 18 specs from ADR-0034)
-# ---------------------------------------------------------------------------
-
-def _build_spec_registry() -> dict[str, CCCLWarmupSpec]:
-    S = CCCLWarmupSpec
-    F = AlgorithmFamily
-    i32 = np.dtype(np.int32)
-    i64 = np.dtype(np.int64)
-    u64 = np.dtype(np.uint64)
-    f64 = np.dtype(np.float64)
-    return {
-        # Exclusive scan
-        "exclusive_scan_i32": S("exclusive_scan_i32", F.EXCLUSIVE_SCAN, i32, None, "sum"),
-        "exclusive_scan_i64": S("exclusive_scan_i64", F.EXCLUSIVE_SCAN, i64, None, "sum"),
-        # Select (compaction)
-        "select_i32": S("select_i32", F.SELECT, i32, None, "select_predicate"),
-        "select_i64": S("select_i64", F.SELECT, i64, None, "select_predicate"),
-        # Reduce
-        "reduce_sum_f64": S("reduce_sum_f64", F.REDUCE_INTO, f64, None, "sum"),
-        "reduce_sum_i32": S("reduce_sum_i32", F.REDUCE_INTO, i32, None, "sum"),
-        # Segmented reduce
-        "segmented_reduce_sum_i32": S("segmented_reduce_sum_i32", F.SEGMENTED_REDUCE, i32, None, "sum"),
-        "segmented_reduce_sum_f64": S("segmented_reduce_sum_f64", F.SEGMENTED_REDUCE, f64, None, "sum"),
-        "segmented_reduce_min_f64": S("segmented_reduce_min_f64", F.SEGMENTED_REDUCE, f64, None, "min"),
-        "segmented_reduce_max_f64": S("segmented_reduce_max_f64", F.SEGMENTED_REDUCE, f64, None, "max"),
-        # Binary search
-        "lower_bound_i32": S("lower_bound_i32", F.LOWER_BOUND, i32, None, "none"),
-        "lower_bound_i64": S("lower_bound_i64", F.LOWER_BOUND, i64, None, "none"),
-        "lower_bound_u64": S("lower_bound_u64", F.LOWER_BOUND, u64, None, "none"),
-        "upper_bound_i32": S("upper_bound_i32", F.UPPER_BOUND, i32, None, "none"),
-        "upper_bound_u64": S("upper_bound_u64", F.UPPER_BOUND, u64, None, "none"),
-        # Sort
-        "radix_sort_i32_i32": S("radix_sort_i32_i32", F.RADIX_SORT, i32, i32, "ascending"),
-        "radix_sort_i64_i32": S("radix_sort_i64_i32", F.RADIX_SORT, np.dtype(np.int64), i32, "ascending"),
-        "radix_sort_u64_i32": S("radix_sort_u64_i32", F.RADIX_SORT, u64, i32, "ascending"),
-        "merge_sort_u64_i32": S("merge_sort_u64_i32", F.MERGE_SORT, u64, i32, "less_than"),
-        # Unique by key
-        "unique_by_key_i32_i32": S("unique_by_key_i32_i32", F.UNIQUE_BY_KEY, i32, i32, "equal_to"),
-        "unique_by_key_u64_i32": S("unique_by_key_u64_i32", F.UNIQUE_BY_KEY, u64, i32, "equal_to"),
-        # Segmented sort (Tier 3a: half-edge angle sort, ring vertex sort)
-        "segmented_sort_asc_f64": S("segmented_sort_asc_f64", F.SEGMENTED_SORT, f64, i32, "less_than"),
-        "segmented_sort_asc_i32": S("segmented_sort_asc_i32", F.SEGMENTED_SORT, i32, i32, "less_than"),
-    }
-
-
-SPEC_REGISTRY: dict[str, CCCLWarmupSpec] = _build_spec_registry()
+SPEC_REGISTRY: dict[str, CCCLWarmupSpec] = build_spec_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -159,22 +84,6 @@ def _get_op(op_name: str, *, algorithms: Any = None, cp_module: Any = None, dtyp
     if op_name == "ascending" and algorithms is not None:
         return algorithms.SortOrder.ASCENDING
     return None
-
-
-def _get_h_init(op_name: str, dtype: np.dtype[Any]) -> np.ndarray | None:
-    """Return the host initial value for the given op and dtype."""
-    if op_name == "sum":
-        return np.asarray(0, dtype=dtype)
-    if op_name == "min":
-        if dtype.kind == "f":
-            return np.asarray(np.inf, dtype=dtype)
-        return np.asarray(np.iinfo(dtype).max, dtype=dtype)
-    if op_name == "max":
-        if dtype.kind == "f":
-            return np.asarray(-np.inf, dtype=dtype)
-        return np.asarray(np.iinfo(dtype).min, dtype=dtype)
-    return None
-
 
 # ---------------------------------------------------------------------------
 # CCCL warning suppression
@@ -272,7 +181,7 @@ def _compile_exclusive_scan(
     d_in = cp_module.empty(_N, dtype=spec.key_dtype)
     d_out = cp_module.empty(_N, dtype=spec.key_dtype)
     op = _get_op(spec.op_name)
-    h_init = _get_h_init(spec.op_name, spec.key_dtype)
+    h_init = get_host_init(spec.op_name, spec.key_dtype)
     t0 = perf_counter()
     callable_obj = make_fn(d_in, d_out, op, h_init)
     temp_bytes = callable_obj(None, d_in, d_out, op, _N, h_init)
@@ -318,7 +227,7 @@ def _compile_reduce_into(
     d_in = cp_module.empty(_N, dtype=spec.key_dtype)
     d_out = cp_module.empty(1, dtype=spec.key_dtype)
     op = _get_op(spec.op_name)
-    h_init = _get_h_init(spec.op_name, spec.key_dtype)
+    h_init = get_host_init(spec.op_name, spec.key_dtype)
     t0 = perf_counter()
     callable_obj = make_fn(d_in, d_out, op, h_init)
     temp_bytes = callable_obj(None, d_in, d_out, op, _N, h_init)
@@ -343,7 +252,7 @@ def _compile_segmented_reduce(
     d_starts = cp_module.arange(0, _N, seg_size, dtype=cp_module.int32)
     d_ends = d_starts + seg_size
     op = _get_op(spec.op_name)
-    h_init = _get_h_init(spec.op_name, spec.key_dtype)
+    h_init = get_host_init(spec.op_name, spec.key_dtype)
     t0 = perf_counter()
     callable_obj = make_fn(d_values, d_out, d_starts, d_ends, op, h_init)
     temp_bytes = callable_obj(
@@ -408,7 +317,7 @@ def _compile_lower_bound(
     make_fn = algorithms.make_lower_bound
     d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
     d_query = cp_module.empty(_N, dtype=spec.key_dtype)
-    d_out = cp_module.empty(_N, dtype=np.uintp)
+    d_out = cp_module.empty(_N, dtype=cp_module.uintp)
     t0 = perf_counter()
     raw_callable = make_fn(d_sorted, d_query, d_out)
     # Validate the compiled callable by executing it once.
@@ -430,7 +339,7 @@ def _compile_upper_bound(
     make_fn = algorithms.make_upper_bound
     d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
     d_query = cp_module.empty(_N, dtype=spec.key_dtype)
-    d_out = cp_module.empty(_N, dtype=np.uintp)
+    d_out = cp_module.empty(_N, dtype=cp_module.uintp)
     t0 = perf_counter()
     raw_callable = make_fn(d_sorted, d_query, d_out)
     # Validate the compiled callable by executing it once.
@@ -617,7 +526,7 @@ def _build_cached_callable(
             dtype=spec.key_dtype,
         )
         op = _get_op(spec.op_name)
-        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        h_init = get_host_init(spec.op_name, spec.key_dtype)
         d_in_cccl = to_cccl_input_iter(d_in)
         d_out_cccl = to_cccl_output_iter(d_out)
         op_adapter = make_op_adapter(op)
@@ -644,7 +553,7 @@ def _build_cached_callable(
         d_starts = cp_module.arange(0, _N, seg_size, dtype=cp_module.int32)
         d_ends = d_starts + seg_size
         op = _get_op(spec.op_name)
-        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        h_init = get_host_init(spec.op_name, spec.key_dtype)
         d_in_cccl = to_cccl_input_iter(d_values)
         d_out_cccl = to_cccl_output_iter(d_out)
         d_starts_cccl = to_cccl_input_iter(d_starts)
@@ -663,7 +572,7 @@ def _build_cached_callable(
     if family in (AlgorithmFamily.LOWER_BOUND, AlgorithmFamily.UPPER_BOUND):
         d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
         d_query = cp_module.empty(_N, dtype=spec.key_dtype)
-        d_out = cp_module.empty(_N, dtype=np.uintp)
+        d_out = cp_module.empty(_N, dtype=cp_module.uintp)
         d_data_cccl = to_cccl_input_iter(d_sorted)
         d_values_cccl = to_cccl_input_iter(d_query)
         d_out_cccl = to_cccl_output_iter(d_out)
@@ -764,7 +673,7 @@ def _query_cached_temp(
             dtype=spec.key_dtype,
         )
         op = _get_op(spec.op_name)
-        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        h_init = get_host_init(spec.op_name, spec.key_dtype)
         return cached_callable(None, d_in, d_out, op, _N, h_init)
 
     if family == AlgorithmFamily.SEGMENTED_REDUCE:
@@ -775,7 +684,7 @@ def _query_cached_temp(
         d_starts = cp_module.arange(0, _N, seg_size, dtype=cp_module.int32)
         d_ends = d_starts + seg_size
         op = _get_op(spec.op_name)
-        h_init = _get_h_init(spec.op_name, spec.key_dtype)
+        h_init = get_host_init(spec.op_name, spec.key_dtype)
         return cached_callable(
             None, d_values, d_out, d_starts, d_ends, op, n_segs, h_init,
         )
@@ -783,7 +692,7 @@ def _query_cached_temp(
     if family in (AlgorithmFamily.LOWER_BOUND, AlgorithmFamily.UPPER_BOUND):
         d_sorted = cp_module.arange(_N, dtype=spec.key_dtype)
         d_query = cp_module.empty(_N, dtype=spec.key_dtype)
-        d_out = cp_module.empty(_N, dtype=np.uintp)
+        d_out = cp_module.empty(_N, dtype=cp_module.uintp)
         return cached_callable(None, d_sorted, d_query, d_out, _N, _N)
 
     if family == AlgorithmFamily.RADIX_SORT:

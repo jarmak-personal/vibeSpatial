@@ -252,7 +252,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
-    compile_kernel_group,
+    _compile_precision_kernel,
     get_cuda_runtime,
 )
 from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
@@ -298,9 +298,13 @@ def _build_flat_coord_offsets(device_buf, family):
 def _compile_distance_kernel(name_prefix, fp64_source, fp32_source,
                              kernel_names, compute_type="double"):
     """Compile and cache the fp64 or fp32 variant of a distance kernel."""
-    source = fp64_source if compute_type == "double" else fp32_source
-    suffix = "fp64" if compute_type == "double" else "fp32"
-    return compile_kernel_group(f"{name_prefix}-{suffix}", source, kernel_names)
+    return _compile_precision_kernel(
+        name_prefix,
+        fp64_source,
+        fp32_source,
+        kernel_names,
+        compute_type,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +617,7 @@ def hausdorff_distance_owned(
     Works directly on OwnedGeometryArray coordinate buffers -- no Shapely
     round-trip.
     """
-    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+    from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
     n = owned_a.row_count
     workload = detect_workload_shape(n, owned_b.row_count)
@@ -679,7 +683,7 @@ def frechet_distance_owned(
     Works directly on OwnedGeometryArray coordinate buffers -- no Shapely
     round-trip.
     """
-    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+    from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
     n = owned_a.row_count
     workload = detect_workload_shape(n, owned_b.row_count)

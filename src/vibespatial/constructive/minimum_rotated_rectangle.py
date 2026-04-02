@@ -32,6 +32,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.minimum_rotated_rectangle_cpu import (
+    _min_rect_cpu as _min_rect_cpu,
+)
+from vibespatial.constructive.minimum_rotated_rectangle_cpu import (
+    _minimum_rotated_rectangle_cpu,
+)
 from vibespatial.constructive.minimum_rotated_rectangle_kernels import (
     _MIN_RECT_KERNEL_NAMES,
     _MIN_RECT_KERNEL_SOURCE,
@@ -50,7 +56,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 if TYPE_CHECKING:
     pass
@@ -65,53 +71,6 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 request_nvrtc_warmup([
     ("min-rotated-rect", _MIN_RECT_KERNEL_SOURCE, _MIN_RECT_KERNEL_NAMES),
 ])
-
-
-# ---------------------------------------------------------------------------
-# CPU fallback implementation
-# ---------------------------------------------------------------------------
-
-def _minimum_rotated_rectangle_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """CPU minimum rotated rectangle via Shapely oriented_envelope.
-
-    Returns a host-resident Polygon OwnedGeometryArray.
-    """
-    import shapely
-
-    from vibespatial.geometry.owned import (
-        from_shapely_geometries,
-    )
-
-    row_count = owned.row_count
-    if row_count == 0:
-        return from_shapely_geometries([])
-
-    # Materialize to Shapely geometries and use oriented_envelope
-    geoms = owned.to_shapely()
-    result_geoms = shapely.oriented_envelope(geoms)
-
-    return from_shapely_geometries(result_geoms)
-
-
-# ---------------------------------------------------------------------------
-# CPU kernel variant (registered)
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "minimum_rotated_rectangle",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "multipoint", "linestring", "multilinestring",
-        "polygon", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "minimum_rotated_rectangle"),
-)
-def _min_rect_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """CPU minimum rotated rectangle using Shapely oriented_envelope."""
-    return _minimum_rotated_rectangle_cpu(owned)
 
 
 # ---------------------------------------------------------------------------
@@ -242,14 +201,11 @@ def minimum_rotated_rectangle_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         # GPU path supports single-family non-MultiPolygon inputs
         families_with_rows = [
             fam for fam, buf in owned.families.items()

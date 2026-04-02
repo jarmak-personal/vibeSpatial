@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from vibespatial.constructive.multipoint_polygon_constructive import (
+    multipoint_polygon_difference,
+    multipoint_polygon_intersection,
+)
+
 from .clip_rect import clip_by_rect_kernel
 from .make_valid import make_valid_kernel
 from .nonpolygon_binary import (
     linestring_linestring_intersection,
     linestring_polygon_difference,
     linestring_polygon_intersection,
-    multipoint_polygon_difference,
-    multipoint_polygon_intersection,
     point_linestring_difference,
     point_linestring_intersection,
     point_point_difference,

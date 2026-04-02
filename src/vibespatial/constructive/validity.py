@@ -67,7 +67,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 request_nvrtc_warmup([
     ("is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES),
@@ -1727,16 +1727,13 @@ def is_valid_owned(
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons
     # (ring closure, self-intersection, hole containment, ring-pair interaction).  select_precision_plan is called for
     # observability only -- the kernel source is always _FP64.
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.PREDICATE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     use_gpu = (
         selection.selected is ExecutionMode.GPU
@@ -1845,15 +1842,12 @@ def is_simple_owned(
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons.
     # select_precision_plan is called for observability only.
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.PREDICATE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     use_gpu = (
         selection.selected is ExecutionMode.GPU

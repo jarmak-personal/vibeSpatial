@@ -23,6 +23,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.simplify_cpu import _simplify_cpu
 from vibespatial.constructive.simplify_kernels import _VW_AREA_FP64, _VW_AREA_KERNEL_NAMES
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
@@ -33,16 +34,16 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    build_updated_device_family_buffer,
+    build_updated_host_family_buffer,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 logger = logging.getLogger(__name__)
 
@@ -196,40 +197,13 @@ def _simplify_family_gpu(runtime, device_buf, family, tolerance):
         d_new_offsets[:span_count] = cp.asarray(d_new_offsets_body)
         d_new_offsets[span_count] = total_kept
 
-    # 9. Build DeviceFamilyGeometryBuffer with updated span offsets
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=device_buf.geometry_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=device_buf.part_offsets,
-            ring_offsets=d_new_offsets,
-            bounds=None,
-        )
-    elif family is GeometryFamily.MULTILINESTRING:
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=device_buf.geometry_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=d_new_offsets,
-            ring_offsets=device_buf.ring_offsets,
-            bounds=None,
-        )
-    else:  # LineString
-        return DeviceFamilyGeometryBuffer(
-            family=family,
-            x=d_x_out,
-            y=d_y_out,
-            geometry_offsets=d_new_offsets,
-            empty_mask=device_buf.empty_mask,
-            part_offsets=device_buf.part_offsets,
-            ring_offsets=device_buf.ring_offsets,
-            bounds=None,
-        )
+    return build_updated_device_family_buffer(
+        family,
+        device_buf,
+        d_x_out,
+        d_y_out,
+        d_new_offsets,
+    )
 
 
 @register_kernel_variant(
@@ -359,73 +333,13 @@ def _simplify_family_cpu(buf, family, tolerance, preserve_topology=True):
     new_y = np.concatenate(new_y_parts) if new_y_parts else np.empty(0, dtype=np.float64)
     new_span_offsets = np.asarray(new_span_offsets, dtype=np.int32)
 
-    # Rebuild the family buffer with new coordinates and offsets
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        return FamilyGeometryBuffer(
-            family=family,
-            schema=buf.schema,
-            row_count=buf.row_count,
-            x=new_x,
-            y=new_y,
-            geometry_offsets=buf.geometry_offsets,
-            empty_mask=buf.empty_mask,
-            part_offsets=buf.part_offsets,
-            ring_offsets=new_span_offsets,
-            bounds=None,
-        )
-    elif family is GeometryFamily.MULTILINESTRING:
-        return FamilyGeometryBuffer(
-            family=family,
-            schema=buf.schema,
-            row_count=buf.row_count,
-            x=new_x,
-            y=new_y,
-            geometry_offsets=buf.geometry_offsets,
-            empty_mask=buf.empty_mask,
-            part_offsets=new_span_offsets,
-            ring_offsets=buf.ring_offsets,
-            bounds=None,
-        )
-    else:
-        # LineString: geometry_offsets change
-        return FamilyGeometryBuffer(
-            family=family,
-            schema=buf.schema,
-            row_count=buf.row_count,
-            x=new_x,
-            y=new_y,
-            geometry_offsets=new_span_offsets,
-            empty_mask=buf.empty_mask,
-            part_offsets=buf.part_offsets,
-            ring_offsets=buf.ring_offsets,
-            bounds=None,
-        )
-
-
-# ---------------------------------------------------------------------------
-# CPU dispatch variant (registered)
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "geometry_simplify",
-    "cpu",
-    kernel_class=KernelClass.COARSE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "linestring", "multilinestring", "polygon", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("cpu", "shapely", "simplify"),
-)
-def _simplify_cpu(owned, tolerance, preserve_topology=True):
-    """CPU simplify via Shapely's optimized C implementation."""
-    import shapely as _shapely
-
-    from vibespatial.geometry.owned import from_shapely_geometries
-
-    geoms = owned.to_shapely()
-    results = _shapely.simplify(geoms, tolerance, preserve_topology=preserve_topology)
-    return from_shapely_geometries(list(results))
+    return build_updated_host_family_buffer(
+        family=family,
+        host_buf=buf,
+        x_out=new_x,
+        y_out=new_y,
+        new_offsets=new_span_offsets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,16 +385,13 @@ def simplify_owned(
         kernel_class=KernelClass.COARSE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
         # Precision plan computed for future fp32 kernel wiring (ADR-0002 COARSE).
         # The GPU kernel currently runs fp64-only; the plan is not yet consumed.
-        _precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.COARSE,
-            requested=precision,
-        )
+        _precision_plan = selection.precision_plan
         try:
             result = _simplify_gpu(owned, tolerance)
         except Exception:

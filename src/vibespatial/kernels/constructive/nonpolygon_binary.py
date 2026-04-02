@@ -23,8 +23,13 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
-
+from vibespatial.constructive.nonpolygon_binary_output import (
+    build_device_backed_linestring_output,
+    build_device_backed_multipoint_output,
+    build_point_result_from_source,
+    empty_linestring_output,
+    host_prefix_offsets,
+)
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -35,13 +40,9 @@ from vibespatial.cuda._runtime import (
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import exclusive_sum
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    FAMILY_TAGS,
-    DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
     from_shapely_geometries,
 )
 from vibespatial.kernels.constructive.nonpolygon_binary_source import (
@@ -96,151 +97,6 @@ def _linestring_linestring_kernels():
         "linestring-linestring-isect",
         _LINESTRING_LINESTRING_KERNEL_SOURCE,
         _LINESTRING_LINESTRING_KERNEL_NAMES,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Device-backed OwnedGeometryArray builders
-# ---------------------------------------------------------------------------
-
-def _build_device_backed_point_output(
-    device_x,
-    device_y,
-    *,
-    row_count: int,
-    validity: np.ndarray,
-    geometry_offsets: np.ndarray,
-) -> OwnedGeometryArray:
-    """Build a device-resident Point OwnedGeometryArray."""
-    runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    point_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.POINT,
-        schema=get_geometry_buffer_schema(GeometryFamily.POINT),
-        row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.POINT: point_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.POINT,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                )
-            },
-        ),
-    )
-
-
-def _build_device_backed_linestring_output(
-    device_x,
-    device_y,
-    *,
-    row_count: int,
-    validity: np.ndarray,
-    geometry_offsets: np.ndarray,
-) -> OwnedGeometryArray:
-    """Build a device-resident LineString OwnedGeometryArray."""
-    runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    ls_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.LINESTRING,
-        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
-        row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.LINESTRING: ls_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.LINESTRING,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                )
-            },
-        ),
-    )
-
-
-def _build_device_backed_multipoint_output(
-    device_x,
-    device_y,
-    *,
-    row_count: int,
-    validity: np.ndarray,
-    geometry_offsets: np.ndarray,
-) -> OwnedGeometryArray:
-    """Build a device-resident MultiPoint OwnedGeometryArray."""
-    runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    mp_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.MULTIPOINT,
-        schema=get_geometry_buffer_schema(GeometryFamily.MULTIPOINT),
-        row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.MULTIPOINT: mp_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.MULTIPOINT: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.MULTIPOINT,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                )
-            },
-        ),
     )
 
 
@@ -340,7 +196,7 @@ def point_point_intersection(
     h_match = runtime.copy_device_to_host(d_match).astype(bool)
 
     # Build output: same Point buffers as left, with match-based validity
-    return _build_point_polygon_result_from_source(left, h_match)
+    return build_point_result_from_source(left, h_match)
 
 
 def point_point_difference(
@@ -398,7 +254,7 @@ def point_point_difference(
 
     runtime = get_cuda_runtime()
     h_keep = runtime.copy_device_to_host(d_keep).astype(bool)
-    return _build_point_polygon_result_from_source(left, h_keep)
+    return build_point_result_from_source(left, h_keep)
 
 
 def point_point_union(
@@ -476,9 +332,7 @@ def point_point_union(
     # Prefix sum for output coordinate offsets
     runtime = get_cuda_runtime()
     h_counts = runtime.copy_device_to_host(d_counts)
-    h_offsets = np.empty(n + 1, dtype=np.int32)
-    h_offsets[0] = 0
-    np.cumsum(h_counts, out=h_offsets[1:])
+    h_offsets = host_prefix_offsets(h_counts)
     total_coords = int(h_offsets[-1])
 
     if total_coords == 0:
@@ -486,8 +340,8 @@ def point_point_union(
         return from_shapely_geometries([None] * n)
 
     # Allocate output coordinates on device
-    d_out_x = runtime.allocate((total_coords,), np.float64)
-    d_out_y = runtime.allocate((total_coords,), np.float64)
+    d_out_x = runtime.allocate((total_coords,), cp.float64)
+    d_out_y = runtime.allocate((total_coords,), cp.float64)
     d_out_x_cp = cp.asarray(d_out_x)
     d_out_y_cp = cp.asarray(d_out_y)
 
@@ -530,7 +384,7 @@ def point_point_union(
     h_validity = runtime.copy_device_to_host(d_any_valid).astype(bool)
     geometry_offsets = h_offsets
 
-    return _build_device_backed_multipoint_output(
+    return build_device_backed_multipoint_output(
         d_out_x, d_out_y,
         row_count=n,
         validity=h_validity,
@@ -599,9 +453,7 @@ def point_point_symmetric_difference(
 
     runtime = get_cuda_runtime()
     h_counts = runtime.copy_device_to_host(d_counts)
-    h_offsets = np.empty(n + 1, dtype=np.int32)
-    h_offsets[0] = 0
-    np.cumsum(h_counts, out=h_offsets[1:])
+    h_offsets = host_prefix_offsets(h_counts)
     total_coords = int(h_offsets[-1])
 
     # Validity: row is valid if it has any output points
@@ -611,8 +463,8 @@ def point_point_symmetric_difference(
     if total_coords == 0:
         return from_shapely_geometries([None] * n)
 
-    d_out_x = runtime.allocate((total_coords,), np.float64)
-    d_out_y = runtime.allocate((total_coords,), np.float64)
+    d_out_x = runtime.allocate((total_coords,), cp.float64)
+    d_out_y = runtime.allocate((total_coords,), cp.float64)
     d_out_x_cp = cp.asarray(d_out_x)
     d_out_y_cp = cp.asarray(d_out_y)
     d_offsets_cp = cp.asarray(h_offsets)
@@ -645,207 +497,12 @@ def point_point_symmetric_difference(
         d_out_x_cp[out_pos + 1] = d_r_x[r_ci]
         d_out_y_cp[out_pos + 1] = d_r_y[r_ci]
 
-    return _build_device_backed_multipoint_output(
+    return build_device_backed_multipoint_output(
         d_out_x, d_out_y,
         row_count=n,
         validity=h_validity,
         geometry_offsets=h_offsets,
     )
-
-
-# ---------------------------------------------------------------------------
-# MultiPoint-Polygon constructive operations (Tier 2 over Tier 1 PIP)
-# ---------------------------------------------------------------------------
-
-def multipoint_polygon_intersection(
-    multipoints: OwnedGeometryArray,
-    polygons: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """MultiPoint-Polygon intersection: keep points inside polygon.
-
-    Uses the PIP kernel on exploded points, then compacts and rebuilds
-    MultiPoint offsets.  All validity/offset reads are bulk D2H transfers
-    (no per-element .get() in loops).
-    """
-    import cupy as cp
-
-    n = multipoints.row_count
-    multipoints.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                        reason="multipoint_polygon_intersection GPU")
-    polygons.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                     reason="multipoint_polygon_intersection GPU")
-
-    mp_state = multipoints.device_state
-    poly_state = polygons.device_state
-
-    mp_buf = mp_state.families[GeometryFamily.MULTIPOINT]
-    # Determine polygon family
-    if GeometryFamily.POLYGON in poly_state.families:
-        poly_buf = poly_state.families[GeometryFamily.POLYGON]
-    elif GeometryFamily.MULTIPOLYGON in poly_state.families:
-        poly_buf = poly_state.families[GeometryFamily.MULTIPOLYGON]
-    else:
-        return from_shapely_geometries([None] * n)
-
-    d_mp_valid = mp_state.validity.astype(cp.bool_) & ~mp_buf.empty_mask.astype(cp.bool_)
-    d_poly_valid = poly_state.validity.astype(cp.bool_) & ~poly_buf.empty_mask.astype(cp.bool_)
-    d_both_valid = d_mp_valid & d_poly_valid
-
-    # Single bulk D2H transfers for offsets and validity
-    runtime = get_cuda_runtime()
-    h_mp_offsets = runtime.copy_device_to_host(cp.asarray(mp_buf.geometry_offsets))
-    h_both_valid = runtime.copy_device_to_host(d_both_valid)
-    total_points = int(h_mp_offsets[-1])
-
-    if total_points == 0:
-        return from_shapely_geometries([None] * n)
-
-    # Build row_ids on host (no per-element D2H)
-    row_ids_h = np.empty(total_points, dtype=np.int32)
-    for i in range(n):
-        row_ids_h[h_mp_offsets[i]:h_mp_offsets[i + 1]] = i
-
-    # Get coordinates on host for Shapely geometry construction
-    h_mp_x = mp_buf.x if mp_buf.host_materialized else get_cuda_runtime().copy_device_to_host(mp_buf.x)
-    h_mp_y = mp_buf.y if mp_buf.host_materialized else get_cuda_runtime().copy_device_to_host(mp_buf.y)
-
-    from shapely.geometry import Point as ShapelyPoint
-
-    # Build exploded point geometries and replicated polygon geometries
-    poly_shapely = polygons.to_shapely()
-
-    point_geoms = []
-    poly_geoms = []
-    for i in range(n):
-        start = h_mp_offsets[i]
-        end = h_mp_offsets[i + 1]
-        for j in range(start, end):
-            point_geoms.append(ShapelyPoint(float(h_mp_x[j]), float(h_mp_y[j])))
-            poly_geoms.append(poly_shapely[i])
-
-    if len(point_geoms) == 0:
-        return from_shapely_geometries([None] * n)
-
-    # Use PIP on exploded arrays
-    from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
-
-    pt_oga = from_shapely_geometries(point_geoms)
-    poly_oga = from_shapely_geometries(poly_geoms)
-    pip_mask = point_in_polygon(pt_oga, poly_oga, _return_device=True)
-    if hasattr(pip_mask, "__cuda_array_interface__"):
-        h_pip = runtime.copy_device_to_host(pip_mask)
-    else:
-        h_pip = np.asarray(pip_mask, dtype=bool)
-
-    # Compact: for each row, keep only points that are inside
-    # Uses bulk h_both_valid array instead of per-element .get()
-    result_geoms = []
-    for i in range(n):
-        if not h_both_valid[i]:
-            result_geoms.append(None)
-            continue
-        start = h_mp_offsets[i]
-        end = h_mp_offsets[i + 1]
-        kept = [point_geoms[j] for j in range(start, end) if h_pip[j]]
-        if len(kept) == 0:
-            result_geoms.append(None)
-        elif len(kept) == 1:
-            result_geoms.append(kept[0])
-        else:
-            from shapely.geometry import MultiPoint as ShapelyMultiPoint
-            result_geoms.append(ShapelyMultiPoint(kept))
-
-    return from_shapely_geometries(result_geoms)
-
-
-def multipoint_polygon_difference(
-    multipoints: OwnedGeometryArray,
-    polygons: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """MultiPoint-Polygon difference: keep points outside polygon.
-
-    All validity/offset reads are bulk D2H transfers
-    (no per-element .get() in loops).
-    """
-    import cupy as cp
-
-    n = multipoints.row_count
-    multipoints.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                        reason="multipoint_polygon_difference GPU")
-    polygons.move_to(Residency.DEVICE, trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                     reason="multipoint_polygon_difference GPU")
-
-    mp_state = multipoints.device_state
-    poly_state = polygons.device_state
-
-    mp_buf = mp_state.families[GeometryFamily.MULTIPOINT]
-
-    d_mp_valid = mp_state.validity.astype(cp.bool_) & ~mp_buf.empty_mask.astype(cp.bool_)
-    d_poly_valid = poly_state.validity.astype(cp.bool_)
-    d_both_valid = d_mp_valid & d_poly_valid
-
-    # Single bulk D2H transfers
-    runtime = get_cuda_runtime()
-    h_mp_offsets = runtime.copy_device_to_host(cp.asarray(mp_buf.geometry_offsets))
-    h_mp_valid = runtime.copy_device_to_host(d_mp_valid)
-    h_both_valid = runtime.copy_device_to_host(d_both_valid)
-    total_points = int(h_mp_offsets[-1])
-
-    if total_points == 0:
-        return from_shapely_geometries([None] * n)
-
-    h_mp_x = mp_buf.x if mp_buf.host_materialized else get_cuda_runtime().copy_device_to_host(mp_buf.x)
-    h_mp_y = mp_buf.y if mp_buf.host_materialized else get_cuda_runtime().copy_device_to_host(mp_buf.y)
-
-    from shapely.geometry import Point as ShapelyPoint
-
-    poly_shapely = polygons.to_shapely()
-
-    point_geoms = []
-    poly_geoms = []
-    for i in range(n):
-        start = h_mp_offsets[i]
-        end = h_mp_offsets[i + 1]
-        for j in range(start, end):
-            point_geoms.append(ShapelyPoint(float(h_mp_x[j]), float(h_mp_y[j])))
-            poly_geoms.append(poly_shapely[i])
-
-    if len(point_geoms) == 0:
-        return from_shapely_geometries([None] * n)
-
-    from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
-
-    pt_oga = from_shapely_geometries(point_geoms)
-    poly_oga = from_shapely_geometries(poly_geoms)
-    pip_mask = point_in_polygon(pt_oga, poly_oga, _return_device=True)
-    if hasattr(pip_mask, "__cuda_array_interface__"):
-        h_pip = runtime.copy_device_to_host(pip_mask)
-    else:
-        h_pip = np.asarray(pip_mask, dtype=bool)
-
-    # Difference: keep points NOT inside.
-    # Uses bulk h_mp_valid/h_both_valid arrays instead of per-element .get()
-    result_geoms = []
-    for i in range(n):
-        if not h_mp_valid[i]:
-            result_geoms.append(None)
-            continue
-        start = h_mp_offsets[i]
-        end = h_mp_offsets[i + 1]
-        if h_both_valid[i]:
-            kept = [point_geoms[j] for j in range(start, end) if not h_pip[j]]
-        else:
-            # Right is NULL: difference with NULL = identity
-            kept = [point_geoms[j] for j in range(start, end)]
-        if len(kept) == 0:
-            result_geoms.append(None)
-        elif len(kept) == 1:
-            result_geoms.append(kept[0])
-        else:
-            from shapely.geometry import MultiPoint as ShapelyMultiPoint
-            result_geoms.append(ShapelyMultiPoint(kept))
-
-    return from_shapely_geometries(result_geoms)
 
 
 # ---------------------------------------------------------------------------
@@ -897,7 +554,7 @@ def _point_linestring_constructive(
     d_both_valid = (d_pt_valid & d_ls_valid).astype(cp.int32)
 
     runtime = get_cuda_runtime()
-    d_on_line = runtime.allocate((n,), np.int32, zero=True)
+    d_on_line = runtime.allocate((n,), cp.int32, zero=True)
 
     kernels = _point_linestring_kernels()
     ptr = runtime.pointer
@@ -930,7 +587,7 @@ def _point_linestring_constructive(
         h_ls_valid = runtime.copy_device_to_host(d_ls_valid).astype(bool)
         new_validity = h_pt_valid & (~h_on_line | ~h_ls_valid)
 
-    return _build_point_polygon_result_from_source(points, new_validity)
+    return build_point_result_from_source(points, new_validity)
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +649,7 @@ def _linestring_polygon_constructive(
     d_both_valid = (d_ls_valid & d_poly_valid).astype(cp.int32)
 
     runtime = get_cuda_runtime()
-    d_counts = runtime.allocate((n,), np.int32, zero=True)
+    d_counts = runtime.allocate((n,), cp.int32, zero=True)
 
     kernels = _linestring_polygon_kernels()
     ptr = runtime.pointer
@@ -1019,17 +676,16 @@ def _linestring_polygon_constructive(
     total_verts = count_scatter_total(runtime, d_counts, d_offsets)
 
     if total_verts == 0:
-        validity = np.zeros(n, dtype=bool)
-        geometry_offsets = np.zeros(n + 1, dtype=np.int32)
-        d_out_x = runtime.allocate((0,), np.float64)
-        d_out_y = runtime.allocate((0,), np.float64)
-        return _build_device_backed_linestring_output(
+        validity, geometry_offsets = empty_linestring_output(n)
+        d_out_x = runtime.allocate((0,), cp.float64)
+        d_out_y = runtime.allocate((0,), cp.float64)
+        return build_device_backed_linestring_output(
             d_out_x, d_out_y,
             row_count=n, validity=validity, geometry_offsets=geometry_offsets,
         )
 
-    d_out_x = runtime.allocate((total_verts,), np.float64)
-    d_out_y = runtime.allocate((total_verts,), np.float64)
+    d_out_x = runtime.allocate((total_verts,), cp.float64)
+    d_out_y = runtime.allocate((total_verts,), cp.float64)
 
     scatter_params = (
         (
@@ -1068,7 +724,7 @@ def _linestring_polygon_constructive(
     h_counts_arr = runtime.copy_device_to_host(d_counts)
     validity = h_counts_arr >= 2
 
-    return _build_device_backed_linestring_output(
+    return build_device_backed_linestring_output(
         d_out_x, d_out_y,
         row_count=n, validity=validity, geometry_offsets=h_geom_offsets,
     )
@@ -1106,7 +762,7 @@ def linestring_linestring_intersection(
     d_both_valid = (d_l_valid & d_r_valid).astype(cp.int32)
 
     runtime = get_cuda_runtime()
-    d_counts = runtime.allocate((n,), np.int32, zero=True)
+    d_counts = runtime.allocate((n,), cp.int32, zero=True)
 
     kernels = _linestring_linestring_kernels()
     ptr = runtime.pointer
@@ -1135,8 +791,8 @@ def linestring_linestring_intersection(
     if total_points == 0:
         return from_shapely_geometries([None] * n)
 
-    d_out_x = runtime.allocate((total_points,), np.float64)
-    d_out_y = runtime.allocate((total_points,), np.float64)
+    d_out_x = runtime.allocate((total_points,), cp.float64)
+    d_out_y = runtime.allocate((total_points,), cp.float64)
 
     scatter_params = (
         (
@@ -1172,7 +828,7 @@ def linestring_linestring_intersection(
     h_counts_arr = runtime.copy_device_to_host(d_counts)
     validity = h_counts_arr > 0
 
-    return _build_device_backed_multipoint_output(
+    return build_device_backed_multipoint_output(
         d_out_x, d_out_y,
         row_count=n, validity=validity, geometry_offsets=h_geom_offsets,
     )
@@ -1181,33 +837,3 @@ def linestring_linestring_intersection(
 # ---------------------------------------------------------------------------
 # Helper: build result from source Point array with new validity mask
 # ---------------------------------------------------------------------------
-
-def _build_point_polygon_result_from_source(
-    points: OwnedGeometryArray,
-    new_validity: np.ndarray,
-) -> OwnedGeometryArray:
-    """Build an OwnedGeometryArray sharing Point buffers with new validity.
-
-    Mirrors _build_point_polygon_result from binary_constructive.py.
-    """
-    from vibespatial.geometry.owned import OwnedGeometryDeviceState
-
-    new_device_state = None
-    if points.device_state is not None:
-        runtime = get_cuda_runtime()
-        new_device_state = OwnedGeometryDeviceState(
-            validity=runtime.from_host(new_validity),
-            tags=points.device_state.tags,
-            family_row_offsets=points.device_state.family_row_offsets,
-            families=dict(points.device_state.families),
-        )
-
-    result = OwnedGeometryArray(
-        validity=new_validity,
-        tags=points.tags.copy(),
-        family_row_offsets=points.family_row_offsets.copy(),
-        families=dict(points.families),
-        residency=points.residency,
-        device_state=new_device_state,
-    )
-    return result

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
 
 class TestWorkloadShapeEnum:
@@ -67,15 +67,15 @@ class TestDetectWorkloadShape:
             detect_workload_shape(100, 50)
 
 
-class TestImportFromRuntime:
-    """WorkloadShape and detect_workload_shape importable from vibespatial.runtime."""
+class TestImportFromCrossover:
+    """WorkloadShape and detect_workload_shape importable from vibespatial.runtime.crossover."""
 
     def test_import_enum(self) -> None:
-        from vibespatial.runtime import WorkloadShape as WS
+        from vibespatial.runtime.crossover import WorkloadShape as WS
 
         assert WS.PAIRWISE == "pairwise"
 
     def test_import_function(self) -> None:
-        from vibespatial.runtime import detect_workload_shape as dws
+        from vibespatial.runtime.crossover import detect_workload_shape as dws
 
         assert dws(10, 10) is WorkloadShape.PAIRWISE

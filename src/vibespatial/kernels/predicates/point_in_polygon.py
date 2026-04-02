@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from time import perf_counter
 
-import numpy as np
+import cupy as cp
 
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
@@ -23,6 +23,42 @@ from vibespatial.kernels.predicates.point_in_polygon_source import (
     _POINT_IN_POLYGON_KERNEL_NAMES,
     _format_block_per_pair_source,
     _format_pip_kernel_source,
+)
+from vibespatial.predicates.point_in_polygon_cpu import (
+    point_in_polygon_cpu_variant as _point_in_polygon_cpu_variant,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    candidate_rows_by_family as _candidate_rows_by_family_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    candidate_rows_from_coarse,
+    cpu_return_device_fallback,
+    dense_true_mask,
+    empty_bool_mask_like,
+    empty_gpu_bounds_placeholder,
+    initialize_coarse_result,
+    work_cv,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    compute_pip_center as _compute_pip_center_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    compute_work_estimates_for_candidates as _compute_work_estimates_for_candidates_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    estimate_pip_work_multipolygon as _estimate_pip_work_multipolygon_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    estimate_pip_work_polygon as _estimate_pip_work_polygon_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    select_gpu_strategy as _select_gpu_strategy_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    should_bin_dispatch as _should_bin_dispatch_host,
+)
+from vibespatial.predicates.point_in_polygon_host import (
+    to_python_result as _to_python_result_host,
 )
 from vibespatial.predicates.support import (
     PointSequence,
@@ -76,47 +112,33 @@ _PIP_WORK_BINS = [64, 1024]
 
 
 def _estimate_pip_work_polygon(
-    polygon_geometry_offsets: np.ndarray,
-    polygon_ring_offsets: np.ndarray,
-    candidate_right_family_rows: np.ndarray,
-) -> np.ndarray:
-    """Estimate work per candidate pair based on polygon vertex count."""
-    ring_start = polygon_geometry_offsets[candidate_right_family_rows]
-    ring_end = polygon_geometry_offsets[candidate_right_family_rows + 1]
-    coord_start = polygon_ring_offsets[ring_start]
-    coord_end = polygon_ring_offsets[ring_end]
-    return (coord_end - coord_start).astype(np.int32)
+    polygon_geometry_offsets,
+    polygon_ring_offsets,
+    candidate_right_family_rows,
+):
+    return _estimate_pip_work_polygon_host(
+        polygon_geometry_offsets,
+        polygon_ring_offsets,
+        candidate_right_family_rows,
+    )
 
 
 def _estimate_pip_work_multipolygon(
-    multipolygon_geometry_offsets: np.ndarray,
-    multipolygon_part_offsets: np.ndarray,
-    multipolygon_ring_offsets: np.ndarray,
-    candidate_right_family_rows: np.ndarray,
-) -> np.ndarray:
-    """Estimate work per candidate pair based on multipolygon vertex count."""
-    poly_start = multipolygon_geometry_offsets[candidate_right_family_rows]
-    poly_end = multipolygon_geometry_offsets[candidate_right_family_rows + 1]
-    ring_start = multipolygon_part_offsets[poly_start]
-    ring_end = multipolygon_part_offsets[poly_end]
-    coord_start = multipolygon_ring_offsets[ring_start]
-    coord_end = multipolygon_ring_offsets[ring_end]
-    return (coord_end - coord_start).astype(np.int32)
+    multipolygon_geometry_offsets,
+    multipolygon_part_offsets,
+    multipolygon_ring_offsets,
+    candidate_right_family_rows,
+):
+    return _estimate_pip_work_multipolygon_host(
+        multipolygon_geometry_offsets,
+        multipolygon_part_offsets,
+        multipolygon_ring_offsets,
+        candidate_right_family_rows,
+    )
 
 
-def _should_bin_dispatch(work_estimates: np.ndarray) -> bool:
-    """Use binned dispatch when work variance is high.
-
-    Returns True when the coefficient of variation exceeds 2.0 and there are
-    enough candidates to amortise the overhead of multiple kernel launches.
-    """
-    if len(work_estimates) < 1024:
-        return False
-    mean_work = work_estimates.mean()
-    if mean_work < 1:
-        return False
-    cv = work_estimates.std() / mean_work
-    return cv > 2.0
+def _should_bin_dispatch(work_estimates) -> bool:
+    return _should_bin_dispatch_host(work_estimates)
 
 
 def _scatter_bin_results(
@@ -158,7 +180,7 @@ def _binned_polygon_dispatch(
     candidate_count: int,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    work_estimates: np.ndarray,
+    work_estimates,
     compute_type: str = "double",
     center_x: float = 0.0,
     center_y: float = 0.0,
@@ -180,7 +202,7 @@ def _binned_polygon_dispatch(
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
 
-    device_out = runtime.allocate((candidate_count,), np.uint8)
+    device_out = runtime.allocate((candidate_count,), cp.uint8)
 
     # Move work estimates to device once for all bins.
     d_work = _cp.asarray(work_estimates)
@@ -202,7 +224,7 @@ def _binned_polygon_dispatch(
         # Device-side binning: no D->H or H->D transfers.
         device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
         device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
-        device_bin_out = runtime.allocate((bin_count,), np.uint8)
+        device_bin_out = runtime.allocate((bin_count,), cp.uint8)
 
         try:
             use_block_per_pair = lo >= _PIP_WORK_BINS[-1]
@@ -288,7 +310,7 @@ def _binned_multipolygon_dispatch(
     candidate_count: int,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    work_estimates: np.ndarray,
+    work_estimates,
     compute_type: str = "double",
     center_x: float = 0.0,
     center_y: float = 0.0,
@@ -306,7 +328,7 @@ def _binned_multipolygon_dispatch(
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
 
-    device_out = runtime.allocate((candidate_count,), np.uint8)
+    device_out = runtime.allocate((candidate_count,), cp.uint8)
 
     # Move work estimates to device once for all bins.
     d_work = _cp.asarray(work_estimates)
@@ -325,7 +347,7 @@ def _binned_multipolygon_dispatch(
         # Device-side binning: no D->H or H->D transfers.
         device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
         device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
-        device_bin_out = runtime.allocate((bin_count,), np.uint8)
+        device_bin_out = runtime.allocate((bin_count,), cp.uint8)
 
         try:
             use_block_per_pair = lo >= _PIP_WORK_BINS[-1]
@@ -409,48 +431,10 @@ def _binned_multipolygon_dispatch(
 
 
 def _compute_work_estimates_for_candidates(
-    candidate_rows_host: np.ndarray,
+    candidate_rows_host,
     right_array: OwnedGeometryArray,
-) -> np.ndarray:
-    """Compute work estimates for all candidates across families.
-
-    Returns a single array with the vertex count per candidate.  Uses the
-    host-side offset arrays which are small metadata and cheap to index.
-    """
-    tags = right_array.tags[candidate_rows_host]
-    family_row_offsets = right_array.family_row_offsets[candidate_rows_host]
-    work = np.zeros(len(candidate_rows_host), dtype=np.int32)
-
-    if GeometryFamily.POLYGON in right_array.families:
-        poly_buf = right_array.families[GeometryFamily.POLYGON]
-        poly_mask = tags == FAMILY_TAGS[GeometryFamily.POLYGON]
-        poly_family_rows = family_row_offsets[poly_mask]
-        valid = poly_family_rows >= 0
-        if valid.any():
-            poly_work = _estimate_pip_work_polygon(
-                poly_buf.geometry_offsets,
-                poly_buf.ring_offsets,
-                poly_family_rows[valid],
-            )
-            poly_indices = np.flatnonzero(poly_mask)
-            work[poly_indices[valid]] = poly_work
-
-    if GeometryFamily.MULTIPOLYGON in right_array.families:
-        mp_buf = right_array.families[GeometryFamily.MULTIPOLYGON]
-        mp_mask = tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
-        mp_family_rows = family_row_offsets[mp_mask]
-        valid = mp_family_rows >= 0
-        if valid.any():
-            mp_work = _estimate_pip_work_multipolygon(
-                mp_buf.geometry_offsets,
-                mp_buf.part_offsets,
-                mp_buf.ring_offsets,
-                mp_family_rows[valid],
-            )
-            mp_indices = np.flatnonzero(mp_mask)
-            work[mp_indices[valid]] = mp_work
-
-    return work
+):
+    return _compute_work_estimates_for_candidates_host(candidate_rows_host, right_array)
 
 
 
@@ -472,32 +456,15 @@ def _point_in_polygon_kernels(compute_type: str = "double"):
     )
 
 
-def _to_python_result(values: np.ndarray) -> list[bool | None]:
-    """Convert object-dtype ndarray of {True, False, None} to list[bool | None].
-
-    Uses numpy vectorized ops instead of per-element Python iteration.
-    At 1M elements: ~2ms (numpy .tolist()) vs ~74ms (list comprehension).
-    """
-    null_mask = np.equal(values, None)
-    result = np.empty(len(values), dtype=object)
-    result[:] = np.where(null_mask, False, values).astype(bool)
-    result[null_mask] = None
-    return list(result)  # public API materialization boundary
+def _to_python_result(values) -> list[bool | None]:
+    return _to_python_result_host(values)
 
 
 def _candidate_rows_by_family(
     right: OwnedGeometryArray,
-    candidate_rows: np.ndarray,
-) -> dict[GeometryFamily, np.ndarray]:
-    rows_by_family: dict[GeometryFamily, np.ndarray] = {}
-    if candidate_rows.size == 0:
-        return rows_by_family
-    candidate_tags = right.tags[candidate_rows]
-    for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        rows = candidate_rows[candidate_tags == FAMILY_TAGS[family]]
-        if rows.size:
-            rows_by_family[family] = rows.astype(np.int32, copy=False)
-    return rows_by_family
+    candidate_rows,
+):
+    return _candidate_rows_by_family_host(right, candidate_rows)
 
 
 def _select_gpu_strategy(
@@ -506,44 +473,11 @@ def _select_gpu_strategy(
     strategy: str,
     right_array: OwnedGeometryArray | None = None,
 ) -> str:
-    del row_count
-    if strategy != "auto":
-        return strategy
-    # Check if work-size binning would help.
-    if right_array is not None:
-        try:
-            work_samples: list[np.ndarray] = []
-            if GeometryFamily.POLYGON in right_array.families:
-                buf = right_array.families[GeometryFamily.POLYGON]
-                if buf.row_count > 0:
-                    ring_s = buf.geometry_offsets[:-1]
-                    ring_e = buf.geometry_offsets[1:]
-                    coord_s = buf.ring_offsets[ring_s]
-                    coord_e = buf.ring_offsets[ring_e]
-                    work_samples.append((coord_e - coord_s).astype(np.int32))
-            if GeometryFamily.MULTIPOLYGON in right_array.families:
-                buf = right_array.families[GeometryFamily.MULTIPOLYGON]
-                if buf.row_count > 0:
-                    poly_s = buf.geometry_offsets[:-1]
-                    poly_e = buf.geometry_offsets[1:]
-                    ring_s = buf.part_offsets[poly_s]
-                    ring_e = buf.part_offsets[poly_e]
-                    coord_s = buf.ring_offsets[ring_s]
-                    coord_e = buf.ring_offsets[ring_e]
-                    work_samples.append((coord_e - coord_s).astype(np.int32))
-            if work_samples:
-                all_work = np.concatenate(work_samples)
-                if _should_bin_dispatch(all_work):
-                    return "binned"
-        except Exception:
-            pass
-    # Fused bounds+PIP kernel: single kernel launch replaces bounds mask +
-    # compact_indices + per-family PIP + scatter (5-6 launches → 1).
-    return "fused"
+    return _select_gpu_strategy_host(row_count, strategy=strategy, right_array=right_array)
 
 
 def _launch_polygon_dense(
-    candidate_indices: np.ndarray,
+    candidate_indices,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     device_out,
@@ -558,9 +492,9 @@ def _launch_polygon_dense(
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
     n = left.row_count
-    device_mask = runtime.allocate((n,), np.uint8, zero=True)
-    device_indices = runtime.from_host(candidate_indices.astype(np.int32, copy=False))
-    device_mask[device_indices] = np.uint8(1)
+    device_mask = runtime.allocate((n,), cp.uint8, zero=True)
+    device_indices = runtime.from_host(candidate_indices.astype("int32", copy=False))
+    device_mask[device_indices] = cp.uint8(1)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_polygon_dense"]
         params = (
@@ -621,7 +555,7 @@ def _launch_polygon_compacted(
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
-    device_out = runtime.allocate((candidate_count,), np.uint8)
+    device_out = runtime.allocate((candidate_count,), cp.uint8)
     kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_polygon_compacted_tagged"]
     params = (
         (
@@ -670,7 +604,7 @@ def _launch_polygon_compacted(
 
 
 def _launch_multipolygon_dense(
-    candidate_indices: np.ndarray,
+    candidate_indices,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     device_out,
@@ -685,9 +619,9 @@ def _launch_multipolygon_dense(
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
     n = left.row_count
-    device_mask = runtime.allocate((n,), np.uint8, zero=True)
-    device_indices = runtime.from_host(candidate_indices.astype(np.int32, copy=False))
-    device_mask[device_indices] = np.uint8(1)
+    device_mask = runtime.allocate((n,), cp.uint8, zero=True)
+    device_indices = runtime.from_host(candidate_indices.astype("int32", copy=False))
+    device_mask[device_indices] = cp.uint8(1)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_dense"]
         params = (
@@ -750,7 +684,7 @@ def _launch_multipolygon_compacted(
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
-    device_out = runtime.allocate((candidate_count,), np.uint8)
+    device_out = runtime.allocate((candidate_count,), cp.uint8)
     kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_compacted_tagged"]
     params = (
         (
@@ -858,10 +792,10 @@ def _launch_fused(
     for family, device_buffer in ((GeometryFamily.POLYGON, polygon_buffer), (GeometryFamily.MULTIPOLYGON, multipolygon_buffer)):
         if device_buffer is not None and device_buffer.bounds is None:
             row_count = right.families[family].row_count
-            device_buffer.bounds = runtime.allocate((row_count, 4), np.float64)
+            device_buffer.bounds = runtime.allocate((row_count, 4), cp.float64)
             _launch_family_bounds_kernel(family, device_buffer, row_count=row_count)
 
-    device_out = runtime.allocate((points.row_count,), np.uint8)
+    device_out = runtime.allocate((points.row_count,), cp.uint8)
 
     kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_fused"]
     params = (
@@ -953,7 +887,7 @@ def _launch_bounds_candidate_rows(
         if GeometryFamily.MULTIPOLYGON not in right_state.families
         else right_state.families[GeometryFamily.MULTIPOLYGON].bounds
     )
-    device_mask = runtime.allocate((points.row_count,), np.uint8)
+    device_mask = runtime.allocate((points.row_count,), cp.uint8)
     try:
         kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_bounds_mask"]
         params = (
@@ -1006,29 +940,6 @@ def launch_point_region_candidate_rows(
     """Return device-resident candidate rows for aligned point/region bounds hits."""
     return _launch_bounds_candidate_rows(points, regions)
 
-
-def _evaluate_point_in_polygon_cpu(
-    points: OwnedGeometryArray,
-    right: NormalizedBoundsInput,
-) -> np.ndarray:
-    coarse = _evaluate_point_within_bounds(points, right)
-    candidate_rows = np.flatnonzero(coarse == True)  # noqa: E712  # object-dtype array
-    if candidate_rows.size == 0:
-        return coarse
-
-    point_values = points.to_shapely()
-    polygon_values = right.geometry_array.to_shapely()
-    refined = np.asarray(
-        [
-            bool(polygon_values[row_index].covers(point_values[row_index]))
-            for row_index in candidate_rows
-        ],
-        dtype=bool,
-    )
-    coarse[candidate_rows] = refined
-    return coarse
-
-
 _log = logging.getLogger("vibespatial.kernels.point_in_polygon")
 
 _last_gpu_substage_timings: dict[str, float] | None = None
@@ -1043,21 +954,7 @@ def _compute_pip_center(
     points: OwnedGeometryArray,
     right_array: OwnedGeometryArray,
 ) -> tuple[float, float]:
-    """Compute the centroid of the combined coordinate extent for centering."""
-    all_x: list[np.ndarray] = []
-    all_y: list[np.ndarray] = []
-    for owned in (points, right_array):
-        for buffer in owned.families.values():
-            if buffer.x.size > 0:
-                all_x.append(buffer.x)
-                all_y.append(buffer.y)
-    if not all_x:
-        return 0.0, 0.0
-    combined_x = np.concatenate(all_x)
-    combined_y = np.concatenate(all_y)
-    cx = (float(np.nanmin(combined_x)) + float(np.nanmax(combined_x))) * 0.5
-    cy = (float(np.nanmin(combined_y)) + float(np.nanmax(combined_y))) * 0.5
-    return cx, cy
+    return _compute_pip_center_host(points, right_array)
 
 
 def _evaluate_point_in_polygon_gpu(
@@ -1066,15 +963,13 @@ def _evaluate_point_in_polygon_gpu(
     *,
     strategy: str = "auto",
     return_device: bool = False,
-) -> np.ndarray:
+):
     global _last_gpu_substage_timings
     timings: dict[str, float] = {}
 
     right_array = right.geometry_array
     assert right_array is not None
-    coarse = np.zeros(points.row_count, dtype=object)
-    coarse[:] = False
-    coarse[~points.validity | right.null_mask] = None
+    coarse = initialize_coarse_result(points, ~points.validity | right.null_mask)
 
     # Determine compute precision from device profile.
     from vibespatial.runtime.adaptive import get_cached_snapshot
@@ -1104,7 +999,7 @@ def _evaluate_point_in_polygon_gpu(
         timings["coarse_filter_s"] = perf_counter() - t0
 
         t0 = perf_counter()
-        candidate_rows = np.flatnonzero(coarse == True)  # noqa: E712  # object-dtype array
+        candidate_rows = candidate_rows_from_coarse(coarse)
         timings["candidate_mask_s"] = perf_counter() - t0
         timings["candidate_count"] = int(candidate_rows.size)
         timings["total_rows"] = int(points.row_count)
@@ -1122,7 +1017,7 @@ def _evaluate_point_in_polygon_gpu(
 
         t0 = perf_counter()
         runtime = get_cuda_runtime()
-        device_dense_out = runtime.allocate((points.row_count,), np.uint8, zero=True)
+        device_dense_out = runtime.allocate((points.row_count,), cp.uint8, zero=True)
         _returned = False
         try:
             if GeometryFamily.POLYGON in rows_by_family:
@@ -1149,7 +1044,7 @@ def _evaluate_point_in_polygon_gpu(
                 if device_buffer.bounds is None:
                     fam_row_count = right_array.families[family].row_count
                     device_buffer.bounds = runtime.allocate(
-                        (fam_row_count, 4), np.float64,
+                        (fam_row_count, 4), cp.float64,
                     )
                     _launch_family_bounds_kernel(
                         family, device_buffer, row_count=fam_row_count,
@@ -1167,7 +1062,7 @@ def _evaluate_point_in_polygon_gpu(
             return coarse
 
         runtime = get_cuda_runtime()
-        device_dense_out = runtime.allocate((points.row_count,), np.uint8)
+        device_dense_out = runtime.allocate((points.row_count,), cp.uint8)
         device_dense_out[...] = 0
         _returned = False
         try:
@@ -1228,7 +1123,7 @@ def _evaluate_point_in_polygon_gpu(
             if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
-        coarse[np.asarray(dense_out, dtype=bool)] = True
+        coarse[dense_true_mask(dense_out)] = True
     elif selected_strategy == "binned":
         # Binned: bounds filter first, then dispatch PIP in work-balanced bins
         # with a block-per-pair kernel for the complex (>1024 vertex) bin.
@@ -1241,7 +1136,7 @@ def _evaluate_point_in_polygon_gpu(
                 if device_buffer.bounds is None:
                     fam_row_count = right_array.families[family].row_count
                     device_buffer.bounds = runtime.allocate(
-                        (fam_row_count, 4), np.float64,
+                        (fam_row_count, 4), cp.float64,
                     )
                     _launch_family_bounds_kernel(
                         family, device_buffer, row_count=fam_row_count,
@@ -1268,11 +1163,9 @@ def _evaluate_point_in_polygon_gpu(
             candidate_rows_host, right_array,
         )
         timings["work_estimation_s"] = perf_counter() - t0
-        timings["work_cv"] = float(
-            work_estimates.std() / max(work_estimates.mean(), 1e-9)
-        )
+        timings["work_cv"] = work_cv(work_estimates)
 
-        device_dense_out = runtime.allocate((points.row_count,), np.uint8)
+        device_dense_out = runtime.allocate((points.row_count,), cp.uint8)
         device_dense_out[...] = 0
         _returned = False
         try:
@@ -1335,7 +1228,7 @@ def _evaluate_point_in_polygon_gpu(
             if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
-        coarse[np.asarray(dense_out, dtype=bool)] = True
+        coarse[dense_true_mask(dense_out)] = True
     else:
         # Fused: single kernel does bounds check + PIP in one launch.
         runtime = get_cuda_runtime()
@@ -1356,9 +1249,8 @@ def _evaluate_point_in_polygon_gpu(
             runtime.free(device_out)
         null_mask = ~points.validity | right.null_mask
         # Normalize to object-dtype ndarray matching dense/compacted paths.
-        coarse = np.empty(points.row_count, dtype=object)
-        coarse[:] = False
-        coarse[np.asarray(dense_out, dtype=bool)] = True
+        coarse = initialize_coarse_result(points, null_mask)
+        coarse[dense_true_mask(dense_out)] = True
         coarse[null_mask] = None
 
     _last_gpu_substage_timings = timings
@@ -1370,22 +1262,6 @@ def _evaluate_point_in_polygon_gpu(
         ),
     )
     return coarse
-
-
-@register_kernel_variant(
-    "point_in_polygon",
-    "cpu",
-    kernel_class=KernelClass.PREDICATE,
-    geometry_families=("point", "polygon", "multipolygon"),
-    execution_modes=(ExecutionMode.CPU,),
-    supports_mixed=True,
-    tags=("coarse-filter", "refine", "covers"),
-)
-def _point_in_polygon_cpu_variant(
-    points: OwnedGeometryArray,
-    right: NormalizedBoundsInput,
-) -> np.ndarray:
-    return _evaluate_point_in_polygon_cpu(points, right)
 
 
 @register_kernel_variant(
@@ -1403,7 +1279,7 @@ def _point_in_polygon_gpu_variant(
     right: NormalizedBoundsInput,
     *,
     strategy: str = "auto",
-) -> np.ndarray:
+):
     return _evaluate_point_in_polygon_gpu(points, right, strategy=strategy)
 
 
@@ -1453,9 +1329,9 @@ def point_in_polygon(
     if context.runtime_selection.selected is ExecutionMode.GPU:
         # Build lightweight NormalizedBoundsInput without CPU bounds.
         right = NormalizedBoundsInput(
-            bounds=np.empty(0),
+            bounds=empty_gpu_bounds_placeholder(),
             null_mask=~right_array.validity,
-            empty_mask=np.zeros(right_array.row_count, dtype=bool),
+            empty_mask=empty_bool_mask_like(right_array.validity),
             geometry_array=right_array,
         )
         t0 = perf_counter()
@@ -1504,7 +1380,5 @@ def point_in_polygon(
     cpu_out = _point_in_polygon_cpu_variant(left, right)
     if _return_device:
         # CPU fallback for _return_device: return numpy bool array
-        return np.array([bool(v) if v is not None else False for v in cpu_out], dtype=bool)
+        return cpu_return_device_fallback(cpu_out)
     return _to_python_result(cpu_out)
-
-

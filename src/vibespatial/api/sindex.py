@@ -6,16 +6,16 @@ from shapely.geometry.base import BaseGeometry
 
 from vibespatial.api import geometry_array as array
 from vibespatial.api import geoseries
-from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.geometry.api_registry import register_device_spatial_index_factory
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
     query_spatial_index,
     supports_owned_spatial_input,
 )
-from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 from vibespatial.spatial.query_utils import _to_owned
 
 from . import _compat as compat
@@ -717,7 +717,7 @@ geometries}
         # the old API uses tuples of bound, but Shapely uses geometries
         try:
             iter(coordinates)
-        except TypeError:
+        except TypeError as err:
             # likely not an iterable
             # this is a check that rtree does, we mimic it
             # to ensure a useful failure message
@@ -725,7 +725,7 @@ geometries}
                 "Invalid coordinates, must be iterable in format "
                 "(minx, miny, maxx, maxy) (for bounds) or (x, y) (for points). "
                 f"Got `coordinates` = {coordinates}."
-            )
+            ) from err
 
         # need to convert tuple of bounds to a geometry object
         if len(coordinates) == 4:
@@ -809,3 +809,6 @@ geometries}
         if self._tree is None:
             return len(self._geometry_array)
         return len(self._tree)
+
+
+register_device_spatial_index_factory(SpatialIndex._from_device_geometry_array)

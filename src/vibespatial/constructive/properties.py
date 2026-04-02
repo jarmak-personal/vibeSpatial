@@ -29,6 +29,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.properties_cpu import get_geometry_cpu
 from vibespatial.constructive.properties_kernels import (
     _IS_CCW_FP64,
     _IS_CCW_KERNEL_NAMES,
@@ -61,7 +62,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 request_nvrtc_warmup([
     ("is-closed-fp64", _IS_CLOSED_FP64, _IS_CLOSED_KERNEL_NAMES),
@@ -914,34 +915,6 @@ _SIMPLE_FAMILIES: frozenset[GeometryFamily] = frozenset({
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback: get_geometry via Shapely
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "get_geometry",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "multipoint", "polygon", "linestring",
-        "multilinestring", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "get_geometry"),
-)
-def _get_geometry_cpu(
-    owned: OwnedGeometryArray,
-    index: int | np.ndarray,
-) -> OwnedGeometryArray:
-    """Extract i-th sub-geometry using Shapely as the reference implementation."""
-    import shapely
-
-    geoms = owned.to_shapely()
-    results = shapely.get_geometry(geoms, index=index)
-    return from_shapely_geometries(list(results))
-
-
-# ---------------------------------------------------------------------------
 # GPU helpers: per-family sub-geometry extraction
 # ---------------------------------------------------------------------------
 
@@ -1597,7 +1570,7 @@ def get_geometry_owned(
     # Array-like index: fall back to CPU (element-wise different indices
     # per row is not easily vectorisable with pure offset arithmetic).
     if not isinstance(index, (int, np.integer)):
-        result = _get_geometry_cpu(owned, index)
+        result = get_geometry_cpu(owned, index)
         record_fallback_event(
             surface="geopandas.array.get_geometry",
             reason="array-like index requires element-wise Shapely dispatch",
@@ -1621,19 +1594,13 @@ def get_geometry_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
-        try:
-            result = _get_geometry_gpu(owned, int(index))
-        except Exception:
-            pass
-        else:
+        precision_plan = selection.precision_plan
+        result = _get_geometry_gpu(owned, int(index))
+        if result is not None:
             record_dispatch_event(
                 surface="geopandas.array.get_geometry",
                 operation="get_geometry",
@@ -1650,7 +1617,7 @@ def get_geometry_owned(
             return result
 
     # CPU fallback
-    result = _get_geometry_cpu(owned, int(index))
+    result = get_geometry_cpu(owned, int(index))
     record_fallback_event(
         surface="geopandas.array.get_geometry",
         reason="CPU fallback for get_geometry",

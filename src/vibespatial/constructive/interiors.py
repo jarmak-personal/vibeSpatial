@@ -19,6 +19,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.interiors_cpu import _interiors_cpu as _interiors_cpu
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
@@ -26,14 +27,13 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
-    from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
@@ -299,44 +299,6 @@ def _build_all_empty_multilinestring(
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback: interiors via Shapely
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "interior_rings",
-    "cpu",
-    kernel_class=KernelClass.COARSE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon"),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "interiors"),
-)
-def _interiors_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """Compute interior rings using Shapely as reference implementation.
-
-    Returns MultiLineString OGA where each row's parts are the interior rings.
-    Non-polygon rows produce None.
-    """
-    from shapely.geometry import MultiLineString as ShapelyMultiLineString
-
-    geoms = owned.to_shapely()
-    results = []
-    for g in geoms:
-        if g is None:
-            results.append(None)
-            continue
-        if hasattr(g, "interiors"):
-            interior_rings = list(g.interiors)
-            if len(interior_rings) == 0:
-                results.append(ShapelyMultiLineString())
-            else:
-                results.append(ShapelyMultiLineString(interior_rings))
-        else:
-            results.append(None)
-    return from_shapely_geometries(results)
-
-
-# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -379,14 +341,11 @@ def interiors_owned(
         kernel_class=KernelClass.COARSE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.COARSE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         try:
             result = _interiors_gpu(owned)
         except Exception:

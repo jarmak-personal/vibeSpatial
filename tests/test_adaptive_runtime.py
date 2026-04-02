@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import importlib
+import sys
+import types
+
 from vibespatial import (
     DEFAULT_CONSUMER_PROFILE,
     CoordinateStats,
@@ -54,6 +58,28 @@ def test_capture_device_snapshot_uses_nvml_probe_when_available() -> None:
     assert snapshot.backend is MonitoringBackend.NVML
     assert snapshot.sm_utilization_pct == 71.0
     assert snapshot.memory_utilization_pct == 54.0
+
+
+def test_get_cached_snapshot_does_not_depend_on_bench_profiling(monkeypatch) -> None:
+    import vibespatial.runtime.adaptive as adaptive
+
+    class _UnavailableSampler:
+        available = False
+
+        def sample(self):
+            return None
+
+    monkeypatch.setitem(sys.modules, "vibespatial.bench.profiling", types.ModuleType("blocked_bench_profiling"))
+    monkeypatch.setattr(adaptive, "has_gpu_runtime", lambda: False)
+    monkeypatch.setattr("vibespatial.runtime.gpu_sampling.NvmlGpuSampler", _UnavailableSampler)
+    adaptive.invalidate_snapshot_cache()
+    try:
+        snapshot = adaptive.get_cached_snapshot()
+    finally:
+        adaptive.invalidate_snapshot_cache()
+
+    assert snapshot.backend is MonitoringBackend.UNAVAILABLE
+    assert snapshot.gpu_available is False
 
 
 def test_auto_planner_stays_on_cpu_below_crossover() -> None:
@@ -197,7 +223,33 @@ def test_registry_decorator_records_structured_variant_metadata() -> None:
     assert variants[0].preferred_residency is Residency.DEVICE
 
 
+def test_overlay_kernel_groups_are_registered() -> None:
+    importlib.import_module("vibespatial.overlay.gpu")
+    for kernel_name, tag in (
+        ("overlay_split", "split"),
+        ("overlay_face_walk", "face-walk"),
+        ("overlay_face_label", "face-label"),
+        ("overlay_face_assembly", "face-assembly"),
+        ("overlay_batch_point_in_ring", "batch-pip"),
+        ("overlay_containment_bypass", "containment-bypass"),
+    ):
+        variants = get_kernel_variants(kernel_name)
+
+        assert len(variants) == 1
+        assert variants[0].variant == "gpu-nvrtc"
+        assert variants[0].kernel_class is KernelClass.CONSTRUCTIVE
+        assert variants[0].execution_modes == (ExecutionMode.GPU,)
+        assert variants[0].geometry_families == ("polygon", "multipolygon")
+        assert variants[0].preferred_residency is Residency.DEVICE
+        assert "overlay" in variants[0].tags
+        assert tag in variants[0].tags
+
+
 def test_crossover_override_returns_kernel_specific_threshold() -> None:
+    policy = default_crossover_policy("normalize", KernelClass.COARSE)
+    assert policy.auto_min_rows == 500
+    assert "kernel-specific" in policy.reason
+
     policy = default_crossover_policy("point_clip", KernelClass.CONSTRUCTIVE)
     assert policy.auto_min_rows == 10_000
     assert "kernel-specific" in policy.reason
@@ -205,8 +257,14 @@ def test_crossover_override_returns_kernel_specific_threshold() -> None:
     policy = default_crossover_policy("point_buffer", KernelClass.CONSTRUCTIVE)
     assert policy.auto_min_rows == 10_000
 
+    policy = default_crossover_policy("polygon_centroid", KernelClass.METRIC)
+    assert policy.auto_min_rows == 500
+
     policy = default_crossover_policy("segment_classify", KernelClass.CONSTRUCTIVE)
     assert policy.auto_min_rows == 4_096
+
+    policy = default_crossover_policy("bbox_overlap_candidates", KernelClass.COARSE)
+    assert policy.auto_min_rows == 2_048
 
     policy = default_crossover_policy("flat_index_build", KernelClass.COARSE)
     assert policy.auto_min_rows == 0

@@ -42,9 +42,8 @@ from vibespatial.cuda.cccl_primitives import (
     upper_bound,
 )
 from vibespatial.geometry.owned import OwnedGeometryArray
-from vibespatial.runtime import has_gpu_runtime
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
-from vibespatial.runtime.crossover import DispatchDecision
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 from .query_candidates import _generate_candidates_gpu_device
@@ -366,14 +365,14 @@ def spatial_index_knn_device(
         )
 
     # Dispatch check: assess whether GPU is profitable for this workload.
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="spatial_index_knn",
         kernel_class=KernelClass.METRIC,
         row_count=n_queries * min(n_tree, 100),  # estimate work per query
         requested_precision=precision,
         gpu_available=True,
     )
-    if plan.dispatch_decision is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     # Check that we have a GPU distance strategy for this family combination.

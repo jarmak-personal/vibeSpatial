@@ -15,8 +15,6 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
-
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -134,6 +132,8 @@ def launch_equals_exact_family(
     DeviceArray[int32]
         Per-row result (0 or 1) for each row in row_indices_device.
     """
+    import cupy as cp
+
     runtime = get_cuda_runtime()
     kernels = _compile_equals_exact_kernels(compute_type)
     kernel_name = _FAMILY_KERNEL_NAME[family]
@@ -141,10 +141,10 @@ def launch_equals_exact_family(
 
     n = int(row_indices_device.shape[0])
     if n == 0:
-        return runtime.allocate((0,), np.int32)
+        return runtime.allocate((0,), cp.int32)
 
     # Allocate output buffer (zero-filled so default is False)
-    d_out = runtime.allocate((n,), np.int32, zero=True)
+    d_out = runtime.allocate((n,), cp.int32, zero=True)
 
     ptr = runtime.pointer
     grid, block = runtime.launch_config(kernel, n)

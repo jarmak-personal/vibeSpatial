@@ -30,7 +30,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 # ---------------------------------------------------------------------------
@@ -72,7 +72,7 @@ def distance_owned(
     On GPU: zero geometry H/D transfers.  Only small index arrays and the
     final float64 result cross the bus.
     """
-    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+    from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
     n = left.row_count
     workload = detect_workload_shape(n, right.row_count)
@@ -166,15 +166,12 @@ def evaluate_geopandas_dwithin(
         kernel_class=KernelClass.METRIC,
         row_count=n,
         requested_mode=ExecutionMode.AUTO,
+        requested_precision=PrecisionMode.AUTO,
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.METRIC,
-        requested=PrecisionMode.AUTO,
-    )
+    precision_plan = selection.precision_plan
 
     try:
         left_owned = left if left_is_owned else from_shapely_geometries(left.tolist())

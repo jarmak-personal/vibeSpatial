@@ -19,7 +19,7 @@ Tier 2: CuPy for element-wise ops.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -70,6 +70,8 @@ from vibespatial.overlay.types import (  # noqa: E402
     OverlayFaceTable,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
+from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency  # noqa: E402
 
 try:
@@ -86,6 +88,22 @@ request_nvrtc_warmup([
 
 def _compile_repair_kernels():
     return compile_kernel_group("make-valid-repair", _REPAIR_KERNEL_SOURCE, _REPAIR_KERNEL_NAMES)
+
+
+def _planned_make_valid_runtime_selection(
+    *,
+    kernel_name: str,
+    row_count: int,
+    reason: str,
+) -> RuntimeSelection:
+    selection = plan_dispatch_selection(
+        kernel_name=kernel_name,
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=row_count,
+        requested_mode=ExecutionMode.GPU,
+        gpu_available=cp is not None,
+    )
+    return replace(selection.runtime_selection, reason=reason)
 
 
 # ---------------------------------------------------------------------------
@@ -795,9 +813,9 @@ def _repolygonize_from_split_rings(
     if the GPU pipeline produces no valid faces.
     """
     if runtime_selection is None:
-        runtime_selection = RuntimeSelection(
-            requested=ExecutionMode.GPU,
-            selected=ExecutionMode.GPU,
+        runtime_selection = _planned_make_valid_runtime_selection(
+            kernel_name="make_valid_repolygonize",
+            row_count=polygon_count,
             reason="make_valid GPU repolygonize",
         )
 
@@ -1436,9 +1454,9 @@ def gpu_repair_invalid_polygons(
         )
     )
 
-    runtime_sel = RuntimeSelection(
-        requested=ExecutionMode.GPU,
-        selected=ExecutionMode.GPU,
+    runtime_sel = _planned_make_valid_runtime_selection(
+        kernel_name="make_valid_gpu_batch_repair",
+        row_count=int(invalid_rows.size),
         reason="make_valid GPU batch repair pipeline (Phase 16)",
     )
 
@@ -1478,99 +1496,94 @@ def gpu_repair_invalid_polygons(
         for gi, fro in zip(global_invalid, fam_row_offsets):
             fam_to_global.setdefault(int(fro), int(gi))
 
-        try:
-            if use_device_path:
-                # --- Device-resident path: no D->H transfers ---
-                ds = owned.device_state
-                family = GeometryFamily(family_name)
-                d_buf = ds.families[family]
+        if use_device_path:
+            # --- Device-resident path: no D->H transfers ---
+            ds = owned.device_state
+            family = GeometryFamily(family_name)
+            d_buf = ds.families[family]
 
-                batch = _extract_batch_coords_device(d_buf, invalid_family_rows)
-                if batch is None:
-                    continue
-                d_x, d_y, d_ring_offsets, d_geom_offsets = batch
-            else:
-                # --- Host fallback path (no device_state) ---
-                ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
-                geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
-                batch = _extract_batch_coords(
-                    buffer, geom_offsets, ring_offsets, invalid_family_rows,
-                )
-                if batch is None:
-                    continue
-                batch_x, batch_y, batch_ring_offsets, batch_geom_offsets = batch
-                d_x = cp.asarray(np.ascontiguousarray(batch_x))
-                d_y = cp.asarray(np.ascontiguousarray(batch_y))
-                d_ring_offsets = cp.asarray(batch_ring_offsets)
-                d_geom_offsets = cp.asarray(batch_geom_offsets)
-
-            batch_ring_count = int(d_ring_offsets.size) - 1
-            batch_poly_count = int(d_geom_offsets.size) - 1
-
-            if batch_ring_count == 0 or batch_poly_count == 0:
+            batch = _extract_batch_coords_device(d_buf, invalid_family_rows)
+            if batch is None:
                 continue
+            d_x, d_y, d_ring_offsets, d_geom_offsets = batch
+        else:
+            # --- Host fallback path (no device_state) ---
+            ring_offsets = np.asarray(buffer.ring_offsets, dtype=np.int32)
+            geom_offsets = np.asarray(buffer.geometry_offsets, dtype=np.int32)
+            batch = _extract_batch_coords(
+                buffer, geom_offsets, ring_offsets, invalid_family_rows,
+            )
+            if batch is None:
+                continue
+            batch_x, batch_y, batch_ring_offsets, batch_geom_offsets = batch
+            d_x = cp.asarray(np.ascontiguousarray(batch_x))
+            d_y = cp.asarray(np.ascontiguousarray(batch_y))
+            d_ring_offsets = cp.asarray(batch_ring_offsets)
+            d_geom_offsets = cp.asarray(batch_geom_offsets)
 
-            # --- Step 2: Phase B — batched simple repair ---
-            d_x, d_y, d_ring_offsets = _gpu_close_rings(
+        batch_ring_count = int(d_ring_offsets.size) - 1
+        batch_poly_count = int(d_geom_offsets.size) - 1
+
+        if batch_ring_count == 0 or batch_poly_count == 0:
+            continue
+
+        # --- Step 2: Phase B — batched simple repair ---
+        d_x, d_y, d_ring_offsets = _gpu_close_rings(
+            d_x, d_y, d_ring_offsets,
+            batch_ring_count, kernels,
+        )
+        phases_used.append("close_rings")
+
+        d_x, d_y, d_ring_offsets = _gpu_remove_duplicate_vertices(
+            d_x, d_y, d_ring_offsets,
+            batch_ring_count, kernels,
+        )
+        phases_used.append("remove_duplicates")
+
+        d_x, d_y = _gpu_fix_ring_orientation(
+            d_x, d_y, d_ring_offsets,
+            d_geom_offsets, batch_ring_count, batch_poly_count, kernels,
+        )
+        phases_used.append("fix_orientation")
+
+        # --- Step 3: Phase A+C — batched intersection detection + splitting ---
+        d_x, d_y, d_ring_offsets, had_splits = \
+            _split_self_intersections_gpu(
                 d_x, d_y, d_ring_offsets,
                 batch_ring_count, kernels,
             )
-            phases_used.append("close_rings")
+        if had_splits:
+            phases_used.append("split_intersections")
 
-            d_x, d_y, d_ring_offsets = _gpu_remove_duplicate_vertices(
+        # --- Step 4: Phase D — batched repolygonization ---
+        if had_splits:
+            batch_ring_count = int(d_ring_offsets.size) - 1
+            batch_result = _repolygonize_from_split_rings(
                 d_x, d_y, d_ring_offsets,
-                batch_ring_count, kernels,
+                d_geom_offsets, batch_ring_count, batch_poly_count,
+                runtime_selection=runtime_sel,
             )
-            phases_used.append("remove_duplicates")
-
-            d_x, d_y = _gpu_fix_ring_orientation(
-                d_x, d_y, d_ring_offsets,
-                d_geom_offsets, batch_ring_count, batch_poly_count, kernels,
+            phases_used.append("repolygonize")
+        else:
+            # No self-intersections — simple repairs were sufficient.
+            batch_result = _build_batch_repaired_device(
+                d_x, d_y, d_ring_offsets, d_geom_offsets,
+                batch_ring_count, batch_poly_count, runtime_sel,
             )
-            phases_used.append("fix_orientation")
 
-            # --- Step 3: Phase A+C — batched intersection detection + splitting ---
-            d_x, d_y, d_ring_offsets, had_splits = \
-                _split_self_intersections_gpu(
-                    d_x, d_y, d_ring_offsets,
-                    batch_ring_count, kernels,
-                )
-            if had_splits:
-                phases_used.append("split_intersections")
+        # --- Step 5: Merge repaired batch back into owned on device ---
+        if batch_result is not None:
+            merged_owned = _device_scatter_repaired(
+                merged_owned, batch_result, family_name,
+                invalid_family_rows, fam_to_global,
+            )
+            gpu_repaired_count += batch_poly_count
+            for fro in invalid_family_rows:
+                g = fam_to_global.get(int(fro))
+                if g is not None:
+                    repaired_global_rows.add(g)
 
-            # --- Step 4: Phase D — batched repolygonization ---
-            if had_splits:
-                batch_ring_count = int(d_ring_offsets.size) - 1
-                batch_result = _repolygonize_from_split_rings(
-                    d_x, d_y, d_ring_offsets,
-                    d_geom_offsets, batch_ring_count, batch_poly_count,
-                    runtime_selection=runtime_sel,
-                )
-                phases_used.append("repolygonize")
-            else:
-                # No self-intersections — simple repairs were sufficient.
-                batch_result = _build_batch_repaired_device(
-                    d_x, d_y, d_ring_offsets, d_geom_offsets,
-                    batch_ring_count, batch_poly_count, runtime_sel,
-                )
-
-            # --- Step 5: Merge repaired batch back into owned on device ---
-            if batch_result is not None:
-                merged_owned = _device_scatter_repaired(
-                    merged_owned, batch_result, family_name,
-                    invalid_family_rows, fam_to_global,
-                )
-                gpu_repaired_count += batch_poly_count
-                for fro in invalid_family_rows:
-                    g = fam_to_global.get(int(fro))
-                    if g is not None:
-                        repaired_global_rows.add(g)
-
-        except Exception:
-            # GPU batch repair failed for this family; rows stay in still_invalid
-            pass
-
-    # Collect rows that GPU couldn't fix (non-polygon families, GPU exceptions)
+    # Collect rows that GPU couldn't fix explicitly (e.g. non-polygon families)
     still_invalid = np.asarray(
         [int(r) for r in invalid_rows if r not in repaired_global_rows],
         dtype=np.int32,
@@ -1582,4 +1595,3 @@ def gpu_repair_invalid_polygons(
         gpu_phases_used=tuple(set(phases_used)),
         still_invalid_rows=still_invalid,
     )
-

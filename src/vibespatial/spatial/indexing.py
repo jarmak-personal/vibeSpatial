@@ -36,8 +36,6 @@ from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
 
-_GPU_BOUNDS_PAIRS_THRESHOLD = 2_048
-
 logger = logging.getLogger(__name__)
 
 
@@ -280,13 +278,15 @@ def generate_bounds_pairs(
     left_bounds = compute_geometry_bounds(left)
     right_bounds = left_bounds if same_input else compute_geometry_bounds(right_array)
 
-    # GPU path: use sweep-plane NVRTC kernel when geometry count exceeds threshold
     total_geom_count = left.row_count + (0 if same_input else right_array.row_count)
-    use_gpu = (
-        total_geom_count >= _GPU_BOUNDS_PAIRS_THRESHOLD
-        and has_gpu_runtime()
-        and cp is not None
+    selection = plan_dispatch_selection(
+        kernel_name="bbox_overlap_candidates",
+        kernel_class=KernelClass.COARSE,
+        row_count=total_geom_count,
+        requested_mode=ExecutionMode.AUTO,
+        gpu_available=has_gpu_runtime(),
     )
+    use_gpu = selection.selected is ExecutionMode.GPU and cp is not None
     if use_gpu:
         d_left, d_right, pairs_examined = _generate_bounds_pairs_gpu(
             left_bounds,
@@ -1108,8 +1108,14 @@ def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
     Dispatches to GPU when available, falling back to CPU otherwise.
     The GPU path returns device-resident CuPy arrays (no D->H transfer).
     """
-    use_gpu = has_gpu_runtime() and cp is not None
-    if use_gpu:
+    selection = plan_dispatch_selection(
+        kernel_name="segment_mbr_extract",
+        kernel_class=KernelClass.COARSE,
+        row_count=geometry_array.row_count,
+        requested_mode=ExecutionMode.GPU,
+        gpu_available=has_gpu_runtime() and cp is not None,
+    )
+    if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
             return _extract_segment_mbrs_gpu(geometry_array)
         except Exception:
@@ -1443,13 +1449,19 @@ def generate_segment_mbr_pairs(
     left_segments = extract_segment_mbrs(left)
     right_segments = extract_segment_mbrs(right)
 
-    use_gpu = (
-        has_gpu_runtime()
-        and cp is not None
-        and left_segments.residency is Residency.DEVICE
-        and right_segments.residency is Residency.DEVICE
+    selection = plan_dispatch_selection(
+        kernel_name="segment_mbr_pairs",
+        kernel_class=KernelClass.COARSE,
+        row_count=left_segments.count + right_segments.count,
+        requested_mode=ExecutionMode.GPU,
+        gpu_available=(
+            has_gpu_runtime()
+            and cp is not None
+            and left_segments.residency is Residency.DEVICE
+            and right_segments.residency is Residency.DEVICE
+        ),
     )
-    if use_gpu:
+    if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
             return _generate_segment_mbr_pairs_gpu(left_segments, right_segments)
         except Exception:

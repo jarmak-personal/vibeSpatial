@@ -22,9 +22,13 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-import shapely
-from shapely.geometry import GeometryCollection, MultiLineString
 
+from vibespatial.constructive.shared_paths_cpu import (
+    empty_shared_paths_result,
+    init_shared_paths_result_array,
+    merge_shared_paths_segments,
+    shared_paths_cpu,
+)
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -48,12 +52,12 @@ from vibespatial.kernels.constructive.shared_paths import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency, TransferTrigger
-from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
 
 logger = logging.getLogger(__name__)
 
@@ -307,11 +311,7 @@ def _shared_paths_gpu(
     both_valid = left_valid & right_valid
     valid_idx = np.flatnonzero(both_valid)
 
-    # Pre-fill results with empty GeometryCollections
-    empty_gc = GeometryCollection([MultiLineString(), MultiLineString()])
-    results = np.empty(n, dtype=object)
-    for i in range(n):
-        results[i] = empty_gc
+    results = init_shared_paths_result_array(n)
 
     if valid_idx.size == 0:
         return results
@@ -405,15 +405,11 @@ def _shared_paths_gpu(
 
             # Merge with any existing segments from previous sub-groups
             existing = results[row_idx]
-            if existing is not empty_gc:
-                existing_fwd = list(existing.geoms[0].geoms) if not existing.geoms[0].is_empty else []
-                existing_bwd = list(existing.geoms[1].geoms) if not existing.geoms[1].is_empty else []
-                forward_segs = [list(g.coords) for g in existing_fwd] + forward_segs
-                backward_segs = [list(g.coords) for g in existing_bwd] + backward_segs
-
-            fwd = MultiLineString(forward_segs) if forward_segs else MultiLineString()
-            bwd = MultiLineString(backward_segs) if backward_segs else MultiLineString()
-            results[row_idx] = GeometryCollection([fwd, bwd])
+            results[row_idx] = merge_shared_paths_segments(
+                existing if existing is not None else empty_shared_paths_result(),
+                forward_segs,
+                backward_segs,
+            )
 
     if not all_ok:
         # Some rows had unsupported family pairs — reject the entire batch
@@ -423,45 +419,6 @@ def _shared_paths_gpu(
             "falling back to CPU variant"
         )
 
-    return results
-
-
-# ---------------------------------------------------------------------------
-# CPU fallback
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "shared_paths",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "linestring", "multilinestring",
-    ),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "shared_paths"),
-)
-def _shared_paths_cpu(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-) -> np.ndarray:
-    """CPU shared_paths via Shapely."""
-    left_shapely = np.asarray(left.to_shapely(), dtype=object)
-    right_shapely = np.asarray(right.to_shapely(), dtype=object)
-    n = len(left_shapely)
-    results = np.empty(n, dtype=object)
-    empty_gc = GeometryCollection([MultiLineString(), MultiLineString()])
-    for i in range(n):
-        l_geom = left_shapely[i]
-        r_geom = right_shapely[i]
-        if l_geom is None or r_geom is None:
-            results[i] = None
-            continue
-        try:
-            sp = shapely.shared_paths(l_geom, r_geom)
-            results[i] = sp if sp is not None else empty_gc
-        except Exception:
-            results[i] = empty_gc
     return results
 
 
@@ -502,13 +459,10 @@ def shared_paths_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     if selection.selected is ExecutionMode.GPU:
         try:
@@ -541,4 +495,4 @@ def shared_paths_owned(
         detail=f"rows={n}",
         selected=ExecutionMode.CPU,
     )
-    return _shared_paths_cpu(left, right)
+    return shared_paths_cpu(left, right)

@@ -11,6 +11,7 @@ from vibespatial.constructive.polygon import (
     polygon_buffer_owned_array,
     polygon_centroids_owned,
 )
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
@@ -170,6 +171,25 @@ def test_polygon_buffer_gpu_device_resident() -> None:
     # Materialization on to_shapely
     _ = gpu.to_shapely()
     assert gpu.families[GeometryFamily.POLYGON].host_materialized is True
+
+
+@pytest.mark.gpu
+def test_polygon_centroids_device_resident_input_uses_device_stats() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    source_poly = Polygon([(0, 0), (3, 0), (3, 2), (0, 2)])
+    source = from_shapely_geometries([source_poly])
+    device_polys = polygon_buffer_owned_array(source, 0.25, dispatch_mode=ExecutionMode.GPU)
+
+    assert device_polys.device_state is not None
+    assert device_polys.families[GeometryFamily.POLYGON].host_materialized is False
+
+    expected = shapely.buffer(source_poly, 0.25, quad_segs=8).centroid
+    cx, cy = polygon_centroids_owned(device_polys, dispatch_mode=ExecutionMode.GPU)
+
+    np.testing.assert_allclose(cx, np.asarray([expected.x]), atol=1e-10)
+    np.testing.assert_allclose(cy, np.asarray([expected.y]), atol=1e-10)
 
 
 @pytest.mark.gpu

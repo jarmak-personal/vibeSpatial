@@ -16,6 +16,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.exterior_cpu import _exterior_cpu as _exterior_cpu
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import lower_bound_counting
 from vibespatial.geometry.buffers import GeometryFamily
@@ -31,7 +32,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
 request_warmup(["lower_bound_i32"])
 
@@ -157,27 +158,6 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
 # ---------------------------------------------------------------------------
 # CPU fallback: exterior via Shapely
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "exterior_ring",
-    "cpu",
-    kernel_class=KernelClass.COARSE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon"),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "exterior"),
-)
-def _exterior_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """Compute exterior ring using Shapely as reference implementation."""
-    import shapely
-
-    geoms = owned.to_shapely()
-    results = [shapely.get_exterior_ring(g) if g is not None else None for g in geoms]
-    return from_shapely_geometries(results)
-
-
-# ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
 
@@ -221,14 +201,11 @@ def exterior_owned(
         kernel_class=KernelClass.COARSE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.COARSE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         try:
             result = _exterior_gpu(owned)
         except Exception as exc:

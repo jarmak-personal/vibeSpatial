@@ -20,6 +20,7 @@ from shapely.geometry import (
 )
 
 from vibespatial.constructive.properties import (
+    get_geometry_owned,
     get_x_owned,
     get_y_owned,
     is_ccw_owned,
@@ -215,6 +216,39 @@ class TestNumGeometries:
         result = num_geometries_owned(owned)
         expected = _shapely_num_geometries(geoms)
         np.testing.assert_array_equal(result, expected)
+
+
+class TestGetGeometry:
+    def test_scalar_index_matches_shapely(self):
+        geoms = [
+            MultiPoint([(0, 0), (1, 1), (2, 2)]),
+            MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]]),
+        ]
+        owned = from_shapely_geometries(geoms)
+        result = get_geometry_owned(owned, 1)
+        expected = from_shapely_geometries(
+            [
+                shapely.get_geometry(geoms[0], 1),
+                shapely.get_geometry(geoms[1], 1),
+            ]
+        )
+        np.testing.assert_array_equal(result.tags, expected.tags)
+        np.testing.assert_array_equal(result.validity, expected.validity)
+
+    def test_gpu_failure_propagates_for_scalar_index(self, monkeypatch: pytest.MonkeyPatch):
+        geoms = [MultiPoint([(0, 0), (1, 1), (2, 2)])]
+        owned = from_shapely_geometries(geoms)
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("get-geometry-gpu-boom")
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.properties._get_geometry_gpu",
+            _boom,
+        )
+
+        with pytest.raises(RuntimeError, match="get-geometry-gpu-boom"):
+            get_geometry_owned(owned, 0, dispatch_mode="gpu")
 
     def test_multi_types(self):
         geoms = [

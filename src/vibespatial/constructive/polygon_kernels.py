@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 from vibespatial.cuda.preamble import PRECISION_PREAMBLE
 
 _POLYGON_BUFFER_KERNEL_SOURCE = r"""
@@ -333,7 +334,7 @@ _RING_WINDING_KERNEL_NAMES = ("compute_ring_winding",)
 #   cx = sum((x_i + x_{i+1}) * cross_i) / (6 * signed_area)
 #   cy = sum((y_i + y_{i+1}) * cross_i) / (6 * signed_area)
 
-_POLYGON_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+_POLYGON_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
 extern "C" __global__ void polygon_centroid(
     const double* x,
     const double* y,
@@ -355,11 +356,7 @@ extern "C" __global__ void polygon_centroid(
     int n = coord_end - coord_start;
 
     /* Strip closure vertex if present. */
-    if (n >= 2) {{
-        double dx = x[coord_start] - x[coord_end - 1];
-        double dy = y[coord_start] - y[coord_end - 1];
-        if (dx * dx + dy * dy < 1e-24) n--;
-    }}
+    n = vs_strip_closure(x, y, coord_start, coord_end, n, 1e-24);
 
     if (n < 3) {{
         cx[row] = 0.0 / 0.0;  /* NaN */
@@ -411,4 +408,3 @@ extern "C" __global__ void polygon_centroid(
 _POLYGON_CENTROID_KERNEL_NAMES = ("polygon_centroid",)
 _POLYGON_CENTROID_FP64_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_CENTROID_FP32_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="float")
-_CENTROID_GPU_THRESHOLD = 500

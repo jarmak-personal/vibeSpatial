@@ -8,6 +8,7 @@ from ._runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from .crossover import (
     CrossoverPolicy,
     DispatchDecision,
+    WorkloadShape,
     default_crossover_policy,
     select_dispatch_for_rows,
 )
@@ -22,7 +23,6 @@ from .precision import (
     select_precision_plan,
 )
 from .residency import Residency
-from .workload import WorkloadShape
 
 
 class MonitoringBackend(StrEnum):
@@ -78,11 +78,24 @@ class AdaptivePlan:
     runtime_selection: RuntimeSelection
     dispatch_decision: DispatchDecision
     crossover_policy: CrossoverPolicy
+    device_profile: DevicePrecisionProfile
     precision_plan: PrecisionPlan
     variant: KernelVariantSpec | None
     chunk_rows: int
     replan_after_chunk: bool
     diagnostics: tuple[str, ...]
+
+    @property
+    def requested(self) -> ExecutionMode:
+        return self.runtime_selection.requested
+
+    @property
+    def selected(self) -> ExecutionMode:
+        return self.runtime_selection.selected
+
+    @property
+    def reason(self) -> str:
+        return self.runtime_selection.reason
 
 
 def capture_device_snapshot(
@@ -308,6 +321,7 @@ def plan_adaptive_execution(
         runtime_selection=runtime_selection,
         dispatch_decision=dispatch_decision,
         crossover_policy=crossover_policy,
+        device_profile=snapshot.device_profile,
         precision_plan=precision_plan,
         variant=variant,
         chunk_rows=chunk_rows,
@@ -337,7 +351,7 @@ def _detect_device_profile() -> DevicePrecisionProfile:
 
 
 def _adapt_nvml_sampler(sampler: object) -> MonitoringProbe | None:
-    """Wrap a profiling._NvmlGpuSampler as a MonitoringProbe."""
+    """Wrap a runtime NVML sampler as a MonitoringProbe."""
     if not getattr(sampler, "available", False):
         return None
 
@@ -367,8 +381,9 @@ def get_cached_snapshot() -> DeviceSnapshot:
         _cached_snapshot = None
 
     try:
-        from vibespatial.bench.profiling import _NvmlGpuSampler
-        sampler = _NvmlGpuSampler()
+        from vibespatial.runtime.gpu_sampling import NvmlGpuSampler
+
+        sampler = NvmlGpuSampler()
     except Exception:
         sampler = None  # type: ignore[assignment]
 
@@ -462,18 +477,70 @@ def plan_dispatch_selection(
     kernel_class: KernelClass | str,
     row_count: int,
     requested_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    requested_precision: PrecisionMode | str = PrecisionMode.AUTO,
+    precision_kernel_class: KernelClass | str | None = None,
+    geometry_families: tuple[str, ...] = (),
+    mixed_geometry: bool = False,
+    current_residency: Residency = Residency.HOST,
+    coordinate_stats: CoordinateStats | None = None,
+    is_streaming: bool = False,
+    chunk_index: int = 0,
     gpu_available: bool | None = None,
     workload_shape: WorkloadShape | None = None,
-) -> RuntimeSelection:
-    """Thin wrapper: plan dispatch and return just the RuntimeSelection."""
-    return plan_kernel_dispatch(
+) -> AdaptivePlan:
+    """Plan dispatch while preserving compatibility with RuntimeSelection-style access."""
+    plan = plan_kernel_dispatch(
         kernel_name=kernel_name,
         kernel_class=kernel_class,
         row_count=row_count,
         requested_mode=requested_mode,
+        requested_precision=requested_precision,
+        geometry_families=geometry_families,
+        mixed_geometry=mixed_geometry,
+        current_residency=current_residency,
+        coordinate_stats=coordinate_stats,
+        is_streaming=is_streaming,
+        chunk_index=chunk_index,
         gpu_available=gpu_available,
         workload_shape=workload_shape,
-    ).runtime_selection
+    )
+
+    if (
+        precision_kernel_class is None
+        or (
+            isinstance(precision_kernel_class, KernelClass)
+            and precision_kernel_class is plan.precision_plan.kernel_class
+        )
+        or (
+            isinstance(precision_kernel_class, str)
+            and KernelClass(precision_kernel_class) is plan.precision_plan.kernel_class
+        )
+    ):
+        return plan
+
+    normalized_precision_kernel_class = (
+        precision_kernel_class
+        if isinstance(precision_kernel_class, KernelClass)
+        else KernelClass(precision_kernel_class)
+    )
+    precision_plan = select_precision_plan(
+        runtime_selection=plan.runtime_selection,
+        kernel_class=normalized_precision_kernel_class,
+        requested=requested_precision,
+        coordinate_stats=coordinate_stats,
+        device_profile=plan.device_profile,
+    )
+    return AdaptivePlan(
+        runtime_selection=plan.runtime_selection,
+        dispatch_decision=plan.dispatch_decision,
+        crossover_policy=plan.crossover_policy,
+        device_profile=plan.device_profile,
+        precision_plan=precision_plan,
+        variant=plan.variant,
+        chunk_rows=plan.chunk_rows,
+        replan_after_chunk=plan.replan_after_chunk,
+        diagnostics=plan.diagnostics,
+    )
 
 
 # ---------------------------------------------------------------------------

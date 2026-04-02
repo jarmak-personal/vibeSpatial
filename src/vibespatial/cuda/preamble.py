@@ -25,4 +25,14 @@ typedef {compute_type} compute_t;
     (c) = (_t - (sum)) - _y; \
     (sum) = _t; \
 }} while(0)
+
+/* Warp-level Kahan reduction for a (sum, compensation) pair. */
+#define VS_WARP_FULL_MASK 0xFFFFFFFFu
+#define WARP_KAHAN_REDUCE(sum, c) do {{ \
+    for (int _vs_offset = 16; _vs_offset > 0; _vs_offset >>= 1) {{ \
+        const compute_t _vs_shfl_sum = __shfl_down_sync(VS_WARP_FULL_MASK, (sum), _vs_offset); \
+        const compute_t _vs_shfl_c = __shfl_down_sync(VS_WARP_FULL_MASK, (c), _vs_offset); \
+        KAHAN_ADD((sum), _vs_shfl_sum - _vs_shfl_c, (c)); \
+    }} \
+}} while(0)
 """

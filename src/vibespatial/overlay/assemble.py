@@ -151,6 +151,12 @@ def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
         return None
     if np.any(polygon_buffer.empty_mask):
         return None
+    if not polygon_buffer.host_materialized:
+        # Rectangle detection is the host-only fast path that actually needs
+        # x/y. Keep the D->H transfer local instead of forcing it at overlay
+        # entry.
+        values._ensure_host_state()
+        polygon_buffer = values.families[GeometryFamily.POLYGON]
 
     x = polygon_buffer.x.reshape(row_count, 5)
     y = polygon_buffer.y.reshape(row_count, 5)

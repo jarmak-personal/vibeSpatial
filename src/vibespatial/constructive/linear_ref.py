@@ -565,10 +565,7 @@ def interpolate_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            return _interpolate_gpu(owned, dist_arr, normalized)
-        except Exception:
-            pass
+        return _interpolate_gpu(owned, dist_arr, normalized)
 
     # CPU fallback
     owned._ensure_host_state()
@@ -679,10 +676,7 @@ def project_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            return _project_gpu(owned, point_owned)
-        except Exception:
-            pass
+        return _project_gpu(owned, point_owned)
 
     # CPU fallback
     owned._ensure_host_state()

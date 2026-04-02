@@ -23,10 +23,16 @@ from shapely.geometry.base import BaseGeometry
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
+from .api_registry import (
+    apply_host_transform,
+    build_device_spatial_index,
+    build_host_transform_func,
+)
 from .buffers import GeometryFamily
 from .owned import (
     FAMILY_TAGS,
     NULL_TAG,
+    TAG_FAMILIES,
     DeviceFamilyGeometryBuffer,
     DiagnosticEvent,
     DiagnosticKind,
@@ -48,7 +54,10 @@ _TAG_TO_GEOM_TYPE_NAME: dict[int, str] = {
     FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]: "MultiPolygon",
 }
 
-TAG_FAMILIES = {value: key for key, value in FAMILY_TAGS.items()}
+
+def _is_host_geometry_array_like(value: Any) -> bool:
+    dtype = getattr(value, "dtype", None)
+    return getattr(dtype, "name", None) == "geometry" and hasattr(value, "_data")
 
 
 class DeviceGeometryDtype(ExtensionDtype):
@@ -323,12 +332,9 @@ class DeviceGeometryArray(ExtensionArray):
 
         if get_requested_mode() is ExecutionMode.CPU:
             # CPU fallback: materialize Shapely, transform on host, rebuild.
-            from vibespatial.api.geometry_array import _make_transform_func
-            from vibespatial.api.geometry_array import transform as _ga_transform
-
             shapely_geoms = self._ensure_shapely_cache()
-            transform_func = _make_transform_func(self._crs, crs)
-            new_data = _ga_transform(shapely_geoms, transform_func)
+            transform_func = build_host_transform_func(self._crs, crs)
+            new_data = apply_host_transform(shapely_geoms, transform_func)
             new_owned = from_shapely_geometries(new_data)
             return DeviceGeometryArray._from_owned(new_owned, crs=crs)
 
@@ -849,17 +855,18 @@ class DeviceGeometryArray(ExtensionArray):
         if self._owned_flat_sindex_cache is not None:
             return self._owned, self._owned_flat_sindex_cache
 
-        from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+        from vibespatial.runtime.adaptive import plan_dispatch_selection
+        from vibespatial.runtime.precision import KernelClass
         from vibespatial.spatial.indexing import build_flat_spatial_index
 
-        use_gpu = has_gpu_runtime()
+        selection = plan_dispatch_selection(
+            kernel_name="flat_index_build",
+            kernel_class=KernelClass.COARSE,
+            row_count=self._owned.row_count,
+        )
         self._owned_flat_sindex_cache = build_flat_spatial_index(
             self._owned,
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU if use_gpu else ExecutionMode.CPU,
-                reason="DeviceGeometryArray owned flat spatial index",
-            ),
+            runtime_selection=selection.runtime_selection,
         )
         return self._owned, self._owned_flat_sindex_cache
 
@@ -872,15 +879,13 @@ class DeviceGeometryArray(ExtensionArray):
         non-owned query) and eagerly caches the owned flat index.
         """
         if self._sindex_cache is None:
-            from vibespatial.api.sindex import SpatialIndex
-
             # Build a lightweight SpatialIndex.  We must supply a numpy
             # Shapely array for the STRtree, but we defer materialization
             # by passing an empty array and relying on the owned dispatch
             # path for all actual queries.  The ``geometry_array=self``
             # lets SpatialIndex call our ``owned_flat_sindex()`` and
             # ``supports_owned_spatial_input()`` directly.
-            self._sindex_cache = SpatialIndex._from_device_geometry_array(self)
+            self._sindex_cache = build_device_spatial_index(self)
         return self._sindex_cache
 
     @property
@@ -1062,13 +1067,13 @@ class DeviceGeometryArray(ExtensionArray):
                     f"Lengths do not match: {len(self)} vs {len(other)}"
                 )
             return other._owned
-        from vibespatial.api.geometry_array import GeometryArray
-        if isinstance(other, GeometryArray):
+        other_values = getattr(other, "values", other)
+        if _is_host_geometry_array_like(other_values):
             if len(other) != len(self):
                 raise ValueError(
                     f"Lengths do not match: {len(self)} vs {len(other)}"
                 )
-            return from_shapely_geometries(other._data.tolist())
+            return from_shapely_geometries(other_values._data.tolist())
         from shapely.geometry.base import BaseGeometry as _BG
         if isinstance(other, _BG):
             return from_shapely_geometries([other])
@@ -1162,50 +1167,50 @@ class DeviceGeometryArray(ExtensionArray):
 
     def clip_by_rect(self, xmin, ymin, xmax, ymax):
         from vibespatial.constructive.clip_rect import clip_by_rect_owned
-        from vibespatial.runtime import get_requested_mode
+        from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.runtime.dispatch import record_dispatch_event
 
-        try:
-            result = clip_by_rect_owned(
-                self._owned,
-                xmin, ymin, xmax, ymax,
-                dispatch_mode=get_requested_mode(),
-            )
-            selected = result.runtime_selection.selected
-            record_dispatch_event(
-                surface="DeviceGeometryArray.clip_by_rect",
-                operation="clip_by_rect",
-                implementation="owned_clip_by_rect",
-                reason="DeviceGeometryArray owned shortcut for clip_by_rect",
-                detail=f"rows={len(self)}, selected={selected.value}",
-                selected=selected,
-            )
-            # result.geometries is np.ndarray of Shapely objects; convert to owned
-            # clip_by_rect returns GEOMETRYCOLLECTION EMPTY for clipped-away rows;
-            # from_shapely_geometries doesn't support GeometryCollection, so treat
-            # empties as None.
-            geoms = []
-            for g in result.geometries:
-                if g is None or g.is_empty:
-                    geoms.append(None)
-                else:
-                    geoms.append(g)
-            new_owned = from_shapely_geometries(geoms)
-            return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
-        except NotImplementedError:
-            import shapely
+        requested_mode = get_requested_mode()
+        families = set(self._owned.families)
+        gpu_family_supported = (
+            (GeometryFamily.POINT in families and len(families) == 1)
+            or GeometryFamily.LINESTRING in families
+            or GeometryFamily.MULTILINESTRING in families
+            or GeometryFamily.POLYGON in families
+            or GeometryFamily.MULTIPOLYGON in families
+        )
+        dispatch_mode = (
+            ExecutionMode.CPU
+            if requested_mode is not ExecutionMode.GPU and not gpu_family_supported
+            else requested_mode
+        )
 
-            from vibespatial.api.geometry_array import GeometryArray
-
-            self._owned._record(
-                DiagnosticKind.MATERIALIZATION,
-                "DeviceGeometryArray.clip_by_rect: Shapely materialization required (owned path unavailable)",
-                visible=True,
-            )
-            return GeometryArray(
-                shapely.clip_by_rect(self._ensure_shapely_cache(), xmin, ymin, xmax, ymax),
-                crs=self._crs,
-            )
+        result = clip_by_rect_owned(
+            self._owned,
+            xmin, ymin, xmax, ymax,
+            dispatch_mode=dispatch_mode,
+        )
+        selected = result.runtime_selection.selected
+        record_dispatch_event(
+            surface="DeviceGeometryArray.clip_by_rect",
+            operation="clip_by_rect",
+            implementation="owned_clip_by_rect",
+            reason="DeviceGeometryArray owned shortcut for clip_by_rect",
+            detail=f"rows={len(self)}, selected={selected.value}",
+            selected=selected,
+        )
+        # result.geometries is np.ndarray of Shapely objects; convert to owned
+        # clip_by_rect returns GEOMETRYCOLLECTION EMPTY for clipped-away rows;
+        # from_shapely_geometries doesn't support GeometryCollection, so treat
+        # empties as None.
+        geoms = []
+        for g in result.geometries:
+            if g is None or g.is_empty:
+                geoms.append(None)
+            else:
+                geoms.append(g)
+        new_owned = from_shapely_geometries(geoms)
+        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def _binary_constructive(self, op: str, other, *args, **kwargs):
         """Shared dispatch for binary constructive ops (intersection, union, etc.)."""

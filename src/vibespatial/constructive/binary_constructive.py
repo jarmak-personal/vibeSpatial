@@ -26,8 +26,8 @@ import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
-import shapely
 
+from vibespatial.constructive.binary_constructive_cpu import binary_constructive_cpu
 from vibespatial.cuda._runtime import DeviceArray
 
 if TYPE_CHECKING:
@@ -48,7 +48,6 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
-    select_precision_plan,
 )
 
 logger = logging.getLogger(__name__)
@@ -126,12 +125,19 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
     )
 
     for side_label, side in (("right", right), ("left", left)):
-        side._ensure_host_state()
-        for buf in side.families.values():
+        for family, buf in side.families.items():
             if buf.row_count == 0:
                 continue
+            side._ensure_host_family_structure(family)
+            buf = side.families[family]
             geom_offsets = buf.geometry_offsets
             ring_offsets = buf.ring_offsets
+            if ring_offsets is None:
+                logger.debug(
+                    "SH kernel skip: %s %s family is missing ring offsets",
+                    side_label, family.value,
+                )
+                return False
 
             # Vectorized ring-count check: rings_per_row = geom_offsets[1:] - geom_offsets[:-1]
             rings_per_row = np.diff(geom_offsets)
@@ -187,10 +193,9 @@ def _build_point_polygon_result(
     reflects the new mask -- ensuring downstream GPU consumers see the
     correct null rows without re-uploading coordinates.
     """
-    from vibespatial.geometry.owned import DeviceMetadataState, OwnedGeometryDeviceState
+    from vibespatial.geometry.owned import OwnedGeometryDeviceState
 
     new_device_state = None
-    new_device_metadata = None
 
     if points.device_state is not None:
         # Determine the device validity array
@@ -211,15 +216,10 @@ def _build_point_polygon_result(
             family_row_offsets=points.device_state.family_row_offsets,
             families=dict(points.device_state.families),
         )
-        new_device_metadata = DeviceMetadataState(
-            validity=d_validity_out,
-            tags=points.device_state.tags,
-            family_row_offsets=points.device_state.family_row_offsets,
-        )
 
     # When device metadata is available and no host validity was provided,
     # keep host arrays None for lazy materialisation.
-    if d_new_validity is not None and new_device_metadata is not None:
+    if d_new_validity is not None and new_device_state is not None:
         # Device-resident result: host metadata is lazy
         h_validity = None
         h_tags = None
@@ -239,7 +239,6 @@ def _build_point_polygon_result(
         families=dict(points.families),
         residency=points.residency,
         device_state=new_device_state,
-        device_metadata=new_device_metadata,
         _row_count=points.row_count,
     )
     return result
@@ -357,42 +356,6 @@ def _dispatch_overlay_gpu(
 # ---------------------------------------------------------------------------
 # Registered kernel variants
 # ---------------------------------------------------------------------------
-
-
-@register_kernel_variant(
-    "binary_constructive",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "linestring", "polygon",
-        "multipoint", "multilinestring", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("shapely",),
-)
-def _binary_constructive_cpu(
-    op: str,
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-    *,
-    grid_size: float | None = None,
-) -> OwnedGeometryArray:
-    """CPU-only mode: Shapely element-wise binary constructive."""
-    left_geoms = left.to_shapely()  # CPU-only mode
-    right_geoms = right.to_shapely()  # CPU-only mode
-
-    left_arr = np.empty(len(left_geoms), dtype=object)
-    left_arr[:] = left_geoms
-    right_arr = np.empty(len(right_geoms), dtype=object)
-    right_arr[:] = right_geoms
-
-    kwargs = {}
-    if grid_size is not None:
-        kwargs["grid_size"] = grid_size
-
-    result_arr = getattr(shapely, op)(left_arr, right_arr, **kwargs)  # CPU-only mode
-    return from_shapely_geometries(result_arr.tolist())
 
 
 @register_kernel_variant(
@@ -641,7 +604,7 @@ def _dispatch_multipoint_polygon_gpu(
     polygons: OwnedGeometryArray,
 ) -> OwnedGeometryArray:
     """Dispatch MultiPoint-Polygon GPU constructive."""
-    from vibespatial.kernels.constructive.nonpolygon_binary import (
+    from vibespatial.constructive.multipoint_polygon_constructive import (
         multipoint_polygon_difference,
         multipoint_polygon_intersection,
     )
@@ -732,7 +695,7 @@ def binary_constructive_owned(
     if op not in _CONSTRUCTIVE_OPS:
         raise ValueError(f"unsupported constructive operation: {op}")
 
-    from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
+    from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 
     workload = detect_workload_shape(left.row_count, right.row_count)
 
@@ -757,6 +720,7 @@ def binary_constructive_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=left.row_count,
         requested_mode=effective_mode,
+        requested_precision=precision,
         workload_shape=workload,
     )
 
@@ -771,11 +735,7 @@ def binary_constructive_owned(
         # ADR-0002: CONSTRUCTIVE kernels stay fp64.  precision_plan is
         # computed for observability (dispatch event detail) only; the
         # overlay and PIP kernels manage their own precision internally.
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
         gpu_attempted = True
         result = _binary_constructive_gpu(
             op, left, right, dispatch_mode=selection.selected,
@@ -826,7 +786,7 @@ def binary_constructive_owned(
         d2h_transfer=gpu_attempted,  # D2H transfer occurs when GPU was attempted but fell back
     )
 
-    result = _binary_constructive_cpu(op, left, right, grid_size=grid_size)  # CPU-only mode: Shapely
+    result = binary_constructive_cpu(op, left, right, grid_size=grid_size)
     record_dispatch_event(
         surface=f"geopandas.array.{op}",
         operation=op,

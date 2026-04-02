@@ -20,7 +20,7 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
-    compile_kernel_group,
+    _compile_precision_kernel,
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily
@@ -88,9 +88,13 @@ request_nvrtc_warmup([
 
 def _compile_kernel(name_prefix: str, fp64_source: str, fp32_source: str,
                     kernel_names: tuple[str, ...], compute_type: str = "double"):
-    source = fp64_source if compute_type == "double" else fp32_source
-    suffix = "fp64" if compute_type == "double" else "fp32"
-    return compile_kernel_group(f"{name_prefix}-{suffix}", source, kernel_names)
+    return _compile_precision_kernel(
+        name_prefix,
+        fp64_source,
+        fp32_source,
+        kernel_names,
+        compute_type,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -775,55 +779,45 @@ def area_owned(
     is populated (vibeFrame path), GPU kernels read directly from
     device pointers with no copy.
     """
-    from vibespatial.runtime import RuntimeSelection
-    from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
+    from vibespatial.runtime.precision import CoordinateStats
 
     row_count = owned.row_count
     if row_count == 0:
         return np.empty(0, dtype=np.float64)
 
+    max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
+    span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
     selection = plan_dispatch_selection(
         kernel_name="geometry_area",
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
+        coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
     )
 
     if selection.selected is ExecutionMode.GPU:
-        max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
-        span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
-        precision_plan = select_precision_plan(
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
-                reason="geometry_area GPU dispatch",
-            ),
-            kernel_class=KernelClass.METRIC,
-            requested=precision,
-            coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+        precision_plan = selection.precision_plan
+        result = _area_gpu(owned, precision_plan=precision_plan)
+        result[~owned.validity] = np.nan
+        record_dispatch_event(
+            surface="geopandas.array.area",
+            operation="area",
+            implementation="gpu_nvrtc_shoelace",
+            reason=selection.reason,
+            detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _area_gpu(owned, precision_plan=precision_plan)
-            result[~owned.validity] = np.nan
-        except Exception:
-            pass  # fall through to CPU
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.area",
-                operation="area",
-                implementation="gpu_nvrtc_shoelace",
-                reason="GPU NVRTC area kernel",
-                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     record_dispatch_event(
         surface="geopandas.array.area",
         operation="area",
         implementation="numpy",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}",
+        requested=selection.requested,
         selected=ExecutionMode.CPU,
     )
     result = _area_cpu(owned)
@@ -850,55 +844,45 @@ def length_owned(
     is populated (vibeFrame path), GPU kernels read directly from
     device pointers with no copy.
     """
-    from vibespatial.runtime import RuntimeSelection
-    from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
+    from vibespatial.runtime.precision import CoordinateStats
 
     row_count = owned.row_count
     if row_count == 0:
         return np.empty(0, dtype=np.float64)
 
+    max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
+    span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
     selection = plan_dispatch_selection(
         kernel_name="geometry_length",
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
+        coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
     )
 
     if selection.selected is ExecutionMode.GPU:
-        max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
-        span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
-        precision_plan = select_precision_plan(
-            runtime_selection=RuntimeSelection(
-                requested=ExecutionMode.AUTO,
-                selected=ExecutionMode.GPU,
-                reason="geometry_length GPU dispatch",
-            ),
-            kernel_class=KernelClass.METRIC,
-            requested=precision,
-            coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+        precision_plan = selection.precision_plan
+        result = _length_gpu(owned, precision_plan=precision_plan)
+        result[~owned.validity] = np.nan
+        record_dispatch_event(
+            surface="geopandas.array.length",
+            operation="length",
+            implementation="gpu_nvrtc_segment_length",
+            reason=selection.reason,
+            detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
+            requested=selection.requested,
+            selected=ExecutionMode.GPU,
         )
-        try:
-            result = _length_gpu(owned, precision_plan=precision_plan)
-            result[~owned.validity] = np.nan
-        except Exception:
-            pass  # fall through to CPU
-        else:
-            record_dispatch_event(
-                surface="geopandas.array.length",
-                operation="length",
-                implementation="gpu_nvrtc_segment_length",
-                reason="GPU NVRTC length kernel",
-                detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
-                selected=ExecutionMode.GPU,
-            )
-            return result
+        return result
 
     record_dispatch_event(
         surface="geopandas.array.length",
         operation="length",
         implementation="numpy",
-        reason="CPU fallback",
+        reason=selection.reason,
         detail=f"rows={row_count}",
+        requested=selection.requested,
         selected=ExecutionMode.CPU,
     )
     result = _length_cpu(owned)

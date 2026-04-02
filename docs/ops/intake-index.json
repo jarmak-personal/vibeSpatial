@@ -14205,6 +14205,22 @@
     },
     {
       "kind": "repo",
+      "path": "reports/strict-native-sweep-2026-04-01.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "01",
+        "04",
+        "2026",
+        "md",
+        "native",
+        "reports",
+        "strict",
+        "sweep"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "reports/zero-copy-gap-analysis-2026-03-20.md",
       "referenced_by": [],
       "symbols": [],
@@ -14847,6 +14863,103 @@
     },
     {
       "kind": "script",
+      "path": "scripts/check_dispatch_once.py",
+      "referenced_by": [],
+      "symbols": [
+        "Violation",
+        "iter_python_files",
+        "parse_module",
+        "_handler_name",
+        "_call_name",
+        "_is_import_guard",
+        "_expr_contains_to_shapely",
+        "_node_contains_gpu_calls",
+        "_node_contains_cpu_fallback_calls",
+        "_is_bare_exception_pass",
+        "run_checks",
+        "main"
+      ],
+      "tokens": [
+        "allowed",
+        "anti",
+        "are",
+        "bare",
+        "baselined",
+        "below",
+        "blocks",
+        "body",
+        "call",
+        "calls",
+        "check",
+        "checker",
+        "checks",
+        "closed",
+        "conservative",
+        "contains",
+        "cpu",
+        "cycle",
+        "detect",
+        "dispatch",
+        "do",
+        "enforces",
+        "except",
+        "exception",
+        "exceptions",
+        "explicit",
+        "expr",
+        "fallback",
+        "flags",
+        "front",
+        "function",
+        "gpu",
+        "guard",
+        "guards",
+        "handler",
+        "ignored",
+        "import",
+        "inside",
+        "intentionally",
+        "ish",
+        "iter",
+        "list",
+        "main",
+        "materialization",
+        "mid",
+        "module",
+        "must",
+        "name",
+        "node",
+        "not",
+        "once",
+        "only",
+        "parse",
+        "pass",
+        "patterns",
+        "py",
+        "python",
+        "recover",
+        "rule",
+        "run",
+        "same",
+        "scripts",
+        "select",
+        "shapely",
+        "shrink",
+        "silently",
+        "src",
+        "structurally",
+        "then",
+        "try",
+        "unless",
+        "vibespatial",
+        "violation",
+        "vs",
+        "whose",
+        "work"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/check_docs.py",
       "referenced_by": [],
       "symbols": [
@@ -15462,6 +15575,28 @@
     },
     {
       "kind": "script",
+      "path": "scripts/debug_segmented_sort.py",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "compilation",
+        "debug",
+        "failure",
+        "full",
+        "py",
+        "python",
+        "reproduce",
+        "run",
+        "scripts",
+        "segmented",
+        "sort",
+        "traceback",
+        "usage",
+        "uv"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/extract_vendor_to_api.py",
       "referenced_by": [],
       "symbols": [
@@ -15888,6 +16023,42 @@
     },
     {
       "kind": "script",
+      "path": "scripts/time_precompile.py",
+      "referenced_by": [],
+      "symbols": [
+        "_clear_caches",
+        "_run_serial",
+        "main"
+      ],
+      "tokens": [
+        "all",
+        "caches",
+        "cccl",
+        "clear",
+        "clears",
+        "cold",
+        "compilation",
+        "disk",
+        "during",
+        "every",
+        "first",
+        "main",
+        "nvrtc",
+        "precompile",
+        "py",
+        "python",
+        "run",
+        "scripts",
+        "serial",
+        "time",
+        "usage",
+        "uses",
+        "uv",
+        "warm"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/update_doc_headers.py",
       "referenced_by": [],
       "symbols": [
@@ -15948,15 +16119,23 @@
       ],
       "symbols": [
         "NativeCoverageReport",
+        "GroupedNativeCoverageReport",
         "parse_pytest_summary",
         "compute_native_pass_rates",
+        "discover_group_targets",
         "run_native_coverage",
+        "run_grouped_native_coverage",
         "print_human_summary",
+        "print_grouped_human_summary",
         "main"
       ],
       "tokens": [
         "compute",
         "coverage",
+        "discover",
+        "group",
+        "grouped",
+        "groupednativecoveragereport",
         "human",
         "main",
         "native",
@@ -15970,6 +16149,7 @@
         "run",
         "scripts",
         "summary",
+        "targets",
         "upstream"
       ]
     },
@@ -18240,11 +18420,9 @@
         "docs/testing/profiling-rails.md"
       ],
       "symbols": [
-        "GpuTelemetrySample",
         "_format_percent",
         "_format_bytes_mib",
         "_sparkline",
-        "_NvmlGpuSampler",
         "_StageGpuTelemetryCollector",
         "StageMeasurement",
         "ProfileStageTrace",
@@ -18257,10 +18435,8 @@
         "bytes",
         "context",
         "format",
-        "gputelemetrysample",
         "maybe",
         "mib",
-        "nvmlgpusampler",
         "nvtx",
         "percent",
         "profilestagetrace",
@@ -18441,6 +18617,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/cccl_host.py",
+      "referenced_by": [],
+      "symbols": [
+        "get_host_init"
+      ],
+      "tokens": [
+        "cccl",
+        "get",
+        "host",
+        "init",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/__init__.py",
       "referenced_by": [],
       "symbols": [],
@@ -18566,7 +18759,6 @@
         "_intersection_point_polygon_gpu",
         "_difference_point_polygon_gpu",
         "_dispatch_overlay_gpu",
-        "_binary_constructive_cpu",
         "_binary_constructive_gpu",
         "_dispatch_point_point_gpu",
         "_dispatch_point_linestring_gpu",
@@ -18592,7 +18784,6 @@
         "complex",
         "constructive",
         "coordinate",
-        "cpu",
         "cupy",
         "device",
         "devices",
@@ -18651,10 +18842,29 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/binary_constructive_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "binary_constructive_cpu"
+      ],
+      "tokens": [
+        "binary",
+        "constructive",
+        "cpu",
+        "module",
+        "only",
+        "py",
+        "registration",
+        "src",
+        "variant",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/boundary.py",
       "referenced_by": [],
       "symbols": [
-        "_boundary_cpu",
         "_boundary_polygon_gpu",
         "_boundary_linestring_gpu",
         "_boundary_multilinestring_gpu",
@@ -18683,7 +18893,6 @@
         "convention",
         "coordinates",
         "copy",
-        "cpu",
         "cupy",
         "custom",
         "design",
@@ -18742,6 +18951,22 @@
         "vibespatial",
         "wired",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/boundary_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_boundary_cpu"
+      ],
+      "tokens": [
+        "boundary",
+        "constructive",
+        "cpu",
+        "py",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -18871,8 +19096,6 @@
         "_compile_seg_arange_kernels",
         "RectClipResult",
         "RectClipBenchmark",
-        "_normalize_values",
-        "_point_clip_result_template",
         "_rect_intersects_bounds",
         "_inside_left",
         "_inside_right",
@@ -18881,42 +19104,43 @@
         "_intersect_vertical",
         "_intersect_horizontal",
         "_sutherland_hodgman_ring",
-        "_liang_barsky_segment",
-        "_merge_clipped_segments",
-        "_build_linestring_result",
-        "_build_polygon_result",
-        "_clip_point_family",
-        "_clip_line_family",
-        "_polygon_ring_spans",
-        "_clip_polygon_family",
-        "_clip_polygon_rings_gpu"
+        "_clip_polygon_rings_gpu",
+        "_clip_polygon_rings_gpu_device",
+        "_clip_polygon_family_gpu",
+        "_clip_line_segments_gpu",
+        "_clip_line_segments_gpu_device",
+        "_clip_line_family_gpu",
+        "_extract_segments_vectorized",
+        "_build_line_clip_device_result",
+        "_clip_all_lines_gpu",
+        "_row_family_and_local_index",
+        "_extract_polygon_rings_single_family"
       ],
       "tokens": [
+        "all",
         "arange",
-        "barsky",
         "bottom",
         "bounds",
         "build",
         "clip",
-        "clipped",
         "compile",
         "constructive",
+        "device",
+        "extract",
         "family",
         "gpu",
         "hodgman",
         "horizontal",
+        "index",
         "inside",
         "intersect",
         "intersects",
         "kernels",
         "lb",
         "left",
-        "liang",
         "line",
-        "linestring",
-        "merge",
-        "normalize",
-        "point",
+        "lines",
+        "local",
         "polygon",
         "py",
         "rect",
@@ -18926,16 +19150,101 @@
         "right",
         "ring",
         "rings",
+        "row",
         "seg",
-        "segment",
         "segments",
         "sh",
+        "single",
+        "src",
+        "sutherland",
+        "top",
+        "vectorized",
+        "vertical",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/clip_rect_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "normalize_values",
+        "point_clip_result_template",
+        "inside_left",
+        "inside_right",
+        "inside_bottom",
+        "inside_top",
+        "intersect_vertical",
+        "intersect_horizontal",
+        "sutherland_hodgman_ring",
+        "liang_barsky_segment",
+        "merge_clipped_segments",
+        "build_linestring_result",
+        "build_polygon_result",
+        "clip_point_family",
+        "clip_line_family",
+        "polygon_ring_spans",
+        "clip_polygon_family",
+        "reconstruct_polygon_result_from_rings",
+        "supported_fast_row",
+        "materialize_candidates_vectorized",
+        "clip_by_rect_cpu",
+        "clip_by_rect_array",
+        "clip_rect_gpu_available",
+        "benchmark_clip_by_rect_baseline"
+      ],
+      "tokens": [
+        "array",
+        "assembly",
+        "available",
+        "barsky",
+        "baseline",
+        "baselines",
+        "benchmark",
+        "bottom",
+        "build",
+        "candidates",
+        "clip",
+        "clipped",
+        "constructive",
+        "cpu",
+        "family",
+        "fast",
+        "gpu",
+        "helpers",
+        "hodgman",
+        "horizontal",
+        "host",
+        "inside",
+        "intersect",
+        "left",
+        "liang",
+        "line",
+        "linestring",
+        "materialize",
+        "merge",
+        "normalize",
+        "only",
+        "point",
+        "polygon",
+        "py",
+        "reconstruct",
+        "rect",
+        "result",
+        "right",
+        "ring",
+        "rings",
+        "row",
+        "segment",
+        "segments",
         "spans",
         "src",
+        "supported",
         "sutherland",
         "template",
         "top",
         "values",
+        "vectorized",
         "vertical",
         "vibespatial"
       ]
@@ -19157,7 +19466,6 @@
       "referenced_by": [],
       "symbols": [
         "_exterior_gpu",
-        "_exterior_cpu",
         "exterior_owned"
       ],
       "tokens": [
@@ -19204,13 +19512,28 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/exterior_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_exterior_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "exterior",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/extract_unique_points.py",
       "referenced_by": [],
       "symbols": [
         "_compile_kernels",
         "_extract_unique_points_gpu",
         "_build_empty_multipoint_output",
-        "_extract_unique_points_cpu",
         "extract_unique_points_owned"
       ],
       "tokens": [
@@ -19237,7 +19560,6 @@
         "coordinates",
         "coords",
         "count",
-        "cpu",
         "cupy",
         "deduplicates",
         "deduplication",
@@ -19301,13 +19623,30 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/extract_unique_points_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_extract_unique_points_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "extract",
+        "points",
+        "py",
+        "src",
+        "unique",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/interiors.py",
       "referenced_by": [],
       "symbols": [
         "_build_all_null_oga",
         "_interiors_gpu",
         "_build_all_empty_multilinestring",
-        "_interiors_cpu",
         "interiors_owned"
       ],
       "tokens": [
@@ -19319,7 +19658,6 @@
         "arithmetic",
         "build",
         "constructive",
-        "cpu",
         "cupy",
         "custom",
         "device",
@@ -19366,13 +19704,28 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/interiors_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_interiors_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "interiors",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/line_merge.py",
       "referenced_by": [],
       "symbols": [
         "_compile_kernels",
         "_line_merge_gpu",
         "_build_empty_output",
-        "_line_merge_cpu",
         "line_merge_owned"
       ],
       "tokens": [
@@ -19405,7 +19758,6 @@
         "constructive",
         "coordinate",
         "coordinates",
-        "cpu",
         "cupy",
         "d2h",
         "data",
@@ -19488,6 +19840,23 @@
         "wired",
         "wise",
         "zero"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/line_merge_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_line_merge_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "line",
+        "merge",
+        "py",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -19584,29 +19953,40 @@
       "referenced_by": [],
       "symbols": [
         "_linestring_buffer_kernels",
-        "_build_device_backed_polygon_output_variable",
         "linestring_buffer_owned_array",
-        "_build_linestring_buffers_cpu",
         "_build_linestring_buffers_gpu"
       ],
       "tokens": [
         "array",
-        "backed",
+        "buffer",
+        "buffers",
+        "build",
+        "constructive",
+        "gpu",
+        "kernels",
+        "linestring",
+        "owned",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/linestring_buffer_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "build_linestring_buffers_cpu"
+      ],
+      "tokens": [
         "buffer",
         "buffers",
         "build",
         "constructive",
         "cpu",
-        "device",
-        "gpu",
-        "kernels",
         "linestring",
-        "output",
-        "owned",
-        "polygon",
         "py",
         "src",
-        "variable",
         "vibespatial"
       ]
     },
@@ -19633,6 +20013,7 @@
       "referenced_by": [],
       "symbols": [
         "_compile_repair_kernels",
+        "_planned_make_valid_runtime_selection",
         "_gpu_close_rings",
         "_gpu_remove_duplicate_vertices",
         "_gpu_fix_ring_orientation",
@@ -19716,6 +20097,7 @@
         "per",
         "phase",
         "pipeline",
+        "planned",
         "polygon",
         "polygonization",
         "polygonize",
@@ -19734,9 +20116,11 @@
         "resident",
         "ring",
         "rings",
+        "runtime",
         "scan",
         "scatter",
         "segments",
+        "selection",
         "self",
         "shapely",
         "simple",
@@ -19795,9 +20179,7 @@
         "plan_make_valid_pipeline",
         "fusion_plan_for_make_valid",
         "_non_polygon_validity_from_owned",
-        "_compute_validity_mask_gpu",
         "_make_valid_gpu_repair",
-        "_make_valid_cpu_repair",
         "make_valid_owned",
         "evaluate_geopandas_make_valid",
         "_warmup_gpu_make_valid_pipeline",
@@ -19806,9 +20188,7 @@
       "tokens": [
         "benchmark",
         "compile",
-        "compute",
         "constructive",
-        "cpu",
         "detect",
         "evaluate",
         "fusion",
@@ -19834,6 +20214,34 @@
         "src",
         "valid",
         "validity",
+        "vibespatial",
+        "warmup"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/make_valid_pipeline_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "make_valid_cpu_repair",
+        "make_valid_cpu_is_valid",
+        "make_valid_cpu_baseline",
+        "build_make_valid_warmup_owned"
+      ],
+      "tokens": [
+        "baseline",
+        "build",
+        "constructive",
+        "cpu",
+        "helpers",
+        "make",
+        "only",
+        "owned",
+        "pipeline",
+        "py",
+        "repair",
+        "src",
+        "valid",
         "vibespatial",
         "warmup"
       ]
@@ -20142,7 +20550,6 @@
         "_launch_multilinestring_clearance",
         "_launch_polygon_clearance",
         "_launch_multipolygon_clearance",
-        "_minimum_clearance_cpu",
         "minimum_clearance_owned",
         "_minimum_clearance_line_gpu",
         "_launch_linestring_clearance_line",
@@ -20150,7 +20557,6 @@
         "_launch_polygon_clearance_line",
         "_launch_multipolygon_clearance_line",
         "_build_clearance_line_oga",
-        "_minimum_clearance_line_cpu",
         "minimum_clearance_line_owned"
       ],
       "tokens": [
@@ -20182,7 +20588,6 @@
         "connecting",
         "constructive",
         "coordinate",
-        "cpu",
         "cross",
         "distance",
         "edges",
@@ -20251,6 +20656,25 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/minimum_clearance_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_minimum_clearance_cpu",
+        "_minimum_clearance_line_cpu"
+      ],
+      "tokens": [
+        "clearance",
+        "constructive",
+        "cpu",
+        "line",
+        "minimum",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/minimum_clearance_kernels.py",
       "referenced_by": [],
       "symbols": [],
@@ -20272,8 +20696,6 @@
       "path": "src/vibespatial/constructive/minimum_rotated_rectangle.py",
       "referenced_by": [],
       "symbols": [
-        "_minimum_rotated_rectangle_cpu",
-        "_min_rect_cpu",
         "_min_rect_gpu",
         "minimum_rotated_rectangle_owned"
       ],
@@ -20300,7 +20722,6 @@
         "convex",
         "coordinates",
         "corners",
-        "cpu",
         "degenerate",
         "devices",
         "each",
@@ -20354,6 +20775,27 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/minimum_rotated_rectangle_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_minimum_rotated_rectangle_cpu",
+        "_min_rect_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "min",
+        "minimum",
+        "py",
+        "rect",
+        "rectangle",
+        "rotated",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/minimum_rotated_rectangle_kernels.py",
       "referenced_by": [],
       "symbols": [],
@@ -20373,11 +20815,63 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/multipoint_polygon_constructive.py",
+      "referenced_by": [],
+      "symbols": [
+        "multipoint_polygon_intersection",
+        "multipoint_polygon_difference"
+      ],
+      "tokens": [
+        "constructive",
+        "difference",
+        "intersection",
+        "multipoint",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/nonpolygon_binary_output.py",
+      "referenced_by": [],
+      "symbols": [
+        "build_device_backed_point_output",
+        "build_device_backed_linestring_output",
+        "build_device_backed_multipoint_output",
+        "build_point_result_from_source",
+        "host_prefix_offsets",
+        "empty_linestring_output"
+      ],
+      "tokens": [
+        "backed",
+        "binary",
+        "build",
+        "constructive",
+        "device",
+        "empty",
+        "host",
+        "linestring",
+        "multipoint",
+        "nonpolygon",
+        "offsets",
+        "output",
+        "point",
+        "prefix",
+        "py",
+        "result",
+        "source",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/normalize.py",
       "referenced_by": [],
       "symbols": [
         "normalize_owned",
-        "_normalize_cpu",
         "_normalize_gpu",
         "_normalize_polygon_family_gpu",
         "_normalize_linestring_family_gpu"
@@ -20400,7 +20894,6 @@
         "compute",
         "constructive",
         "coordinate",
-        "cpu",
         "double",
         "dual",
         "endpoint",
@@ -20447,6 +20940,22 @@
         "uses",
         "vertex",
         "via",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/normalize_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_normalize_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "normalize",
+        "py",
+        "src",
         "vibespatial"
       ]
     },
@@ -20552,7 +21061,6 @@
         "point_owned_from_xy",
         "point_owned_from_xy_device",
         "_empty_point_output",
-        "_select_constructive_mode",
         "_build_point_buffers_cpu",
         "_build_polygon_output",
         "_build_device_backed_point_output",
@@ -20575,7 +21083,6 @@
         "empty",
         "gpu",
         "kernels",
-        "mode",
         "output",
         "owned",
         "point",
@@ -20584,7 +21091,6 @@
         "py",
         "rect",
         "rows",
-        "select",
         "src",
         "vibespatial",
         "xy"
@@ -20618,7 +21124,6 @@
         "_polygon_buffer_kernels",
         "_build_device_backed_polygon_output_variable",
         "polygon_buffer_owned_array",
-        "_build_polygon_buffers_cpu",
         "_build_polygon_buffers_gpu",
         "polygon_centroids_owned",
         "_polygon_centroids_cpu"
@@ -20645,6 +21150,81 @@
         "variable",
         "vibespatial",
         "winding"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/polygon_buffer_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "build_polygon_buffers_cpu"
+      ],
+      "tokens": [
+        "buffer",
+        "buffers",
+        "build",
+        "constructive",
+        "cpu",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/polygon_difference_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "polygon_difference_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "difference",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/polygon_intersection_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "polygon_intersection_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "intersection",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/polygon_intersection_output.py",
+      "referenced_by": [],
+      "symbols": [
+        "build_device_backed_polygon_intersection_output",
+        "build_empty_device_backed_polygon_intersection_output"
+      ],
+      "tokens": [
+        "backed",
+        "build",
+        "constructive",
+        "device",
+        "empty",
+        "intersection",
+        "output",
+        "polygon",
+        "py",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -20681,7 +21261,6 @@
         "is_closed_owned",
         "is_ring_owned",
         "is_ccw_owned",
-        "_get_geometry_cpu",
         "_get_geometry_multipoint_gpu",
         "_get_geometry_multilinestring_gpu",
         "_get_geometry_multipolygon_gpu",
@@ -20711,7 +21290,6 @@
         "coordinates",
         "coords",
         "count",
-        "cpu",
         "cupy",
         "custom",
         "device",
@@ -20776,6 +21354,27 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/properties_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "get_geometry_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "geometry",
+        "get",
+        "helpers",
+        "only",
+        "properties",
+        "py",
+        "src",
+        "surfaces",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/properties_kernels.py",
       "referenced_by": [],
       "symbols": [],
@@ -20798,7 +21397,6 @@
       "symbols": [
         "_remove_repeated_family_gpu",
         "_remove_repeated_points_gpu",
-        "_remove_repeated_points_cpu",
         "remove_repeated_points_owned"
       ],
       "tokens": [
@@ -20824,7 +21422,6 @@
         "coordinate",
         "coordinates",
         "counts",
-        "cpu",
         "cupy",
         "dependency",
         "devices",
@@ -20890,6 +21487,24 @@
         "warmup",
         "wired",
         "within"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/remove_repeated_points_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_remove_repeated_points_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "points",
+        "py",
+        "remove",
+        "repeated",
+        "src",
+        "vibespatial"
       ]
     },
     {
@@ -21097,6 +21712,70 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/segmented_union_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "get_empty_owned",
+        "segmented_union_pair_cpu",
+        "segmented_union_cpu_variant",
+        "segmented_union_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "empty",
+        "get",
+        "owned",
+        "pair",
+        "py",
+        "segmented",
+        "src",
+        "union",
+        "variant",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/segmented_union_host.py",
+      "referenced_by": [],
+      "symbols": [
+        "normalize_group_offsets",
+        "group_has_only_polygon_families",
+        "singleton_indices",
+        "group_indices",
+        "valid_row_indices",
+        "concat_owned_arrays",
+        "concat_family_buffers"
+      ],
+      "tokens": [
+        "arrays",
+        "buffers",
+        "concat",
+        "constructive",
+        "families",
+        "family",
+        "group",
+        "has",
+        "host",
+        "indices",
+        "normalize",
+        "offsets",
+        "only",
+        "owned",
+        "polygon",
+        "py",
+        "row",
+        "segmented",
+        "singleton",
+        "src",
+        "union",
+        "valid",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/segmentize.py",
       "referenced_by": [],
       "symbols": [
@@ -21201,7 +21880,6 @@
         "_quantize_family_coords",
         "_quantize_owned",
         "_set_precision_gpu",
-        "_set_precision_cpu",
         "set_precision_owned"
       ],
       "tokens": [
@@ -21218,7 +21896,6 @@
         "coordinate",
         "coordinates",
         "coords",
-        "cpu",
         "cupy",
         "d2h",
         "dedup",
@@ -21286,6 +21963,23 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/set_precision_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_set_precision_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "precision",
+        "py",
+        "set",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/shared_paths.py",
       "referenced_by": [],
       "symbols": [
@@ -21293,7 +21987,6 @@
         "_family_args",
         "_launch_shared_paths_subgroup",
         "_shared_paths_gpu",
-        "_shared_paths_cpu",
         "shared_paths_owned"
       ],
       "tokens": [
@@ -21318,7 +22011,6 @@
         "constructive",
         "containing",
         "coordinates",
-        "cpu",
         "cross",
         "d2h",
         "data",
@@ -21386,6 +22078,36 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/shared_paths_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "empty_shared_paths_result",
+        "init_shared_paths_result_array",
+        "merge_shared_paths_segments",
+        "shared_paths_cpu"
+      ],
+      "tokens": [
+        "array",
+        "assembly",
+        "constructive",
+        "cpu",
+        "empty",
+        "host",
+        "init",
+        "merge",
+        "py",
+        "registration",
+        "result",
+        "segments",
+        "shared",
+        "side",
+        "src",
+        "variant",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/shortest_line.py",
       "referenced_by": [],
       "symbols": [
@@ -21394,7 +22116,6 @@
         "_build_linestring_oga",
         "_launch_shortest_line_subgroup",
         "_shortest_line_gpu",
-        "_shortest_line_cpu",
         "shortest_line_owned"
       ],
       "tokens": [
@@ -21417,7 +22138,6 @@
         "connecting",
         "constructive",
         "coordinate",
-        "cpu",
         "d2h",
         "data",
         "device",
@@ -21480,6 +22200,26 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/shortest_line_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "shortest_line_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "line",
+        "module",
+        "py",
+        "registration",
+        "shortest",
+        "src",
+        "variant",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/simplify.py",
       "referenced_by": [],
       "symbols": [
@@ -21487,7 +22227,6 @@
         "_simplify_gpu",
         "_vw_simplify_span",
         "_simplify_family_cpu",
-        "_simplify_cpu",
         "simplify_owned"
       ],
       "tokens": [
@@ -21552,6 +22291,22 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/simplify_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_simplify_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "py",
+        "simplify",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/simplify_kernels.py",
       "referenced_by": [],
       "symbols": [],
@@ -21581,7 +22336,6 @@
         "_upload_virtual_b_to_device",
         "_snap_and_dedup_family_gpu",
         "_snap_gpu",
-        "_snap_cpu",
         "snap_owned"
       ],
       "tokens": [
@@ -21607,7 +22361,6 @@
         "coord",
         "coordinate",
         "counts",
-        "cpu",
         "cupy",
         "d2h",
         "data",
@@ -21713,6 +22466,22 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/constructive/snap_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "_snap_cpu"
+      ],
+      "tokens": [
+        "constructive",
+        "cpu",
+        "py",
+        "snap",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/constructive/snap_kernels.py",
       "referenced_by": [],
       "symbols": [],
@@ -21742,49 +22511,29 @@
         "StrokeBenchmark",
         "plan_stroke_kernel",
         "fusion_plan_for_stroke",
-        "_normalize_distances",
-        "_point_ring",
         "point_buffer_owned",
-        "_cross",
-        "_batch_mitre_offset_uniform",
-        "_offset_from_coords_mitre",
-        "_offset_single_linestring",
         "offset_curve_owned",
-        "_non_null_mask",
-        "_supports_point_buffer_surface",
-        "_supports_point_buffer_gpu_surface",
-        "_supports_linestring_buffer_surface",
-        "_supports_linestring_buffer_gpu_surface",
-        "_supports_polygon_buffer_surface",
-        "_supports_polygon_buffer_gpu_surface"
+        "evaluate_geopandas_buffer",
+        "evaluate_geopandas_offset_curve",
+        "benchmark_point_buffer",
+        "benchmark_offset_curve"
       ],
       "tokens": [
-        "batch",
+        "benchmark",
         "buffer",
         "bufferkernelresult",
         "constructive",
-        "coords",
-        "cross",
         "curve",
-        "distances",
+        "evaluate",
         "fusion",
-        "gpu",
+        "geopandas",
         "kernel",
-        "linestring",
-        "mask",
-        "mitre",
-        "non",
-        "normalize",
-        "null",
         "offset",
         "offsetcurvekernelresult",
         "owned",
         "plan",
         "point",
-        "polygon",
         "py",
-        "ring",
-        "single",
         "src",
         "stroke",
         "strokebenchmark",
@@ -21792,6 +22541,66 @@
         "strokekernelstage",
         "strokeoperation",
         "strokeprimitive",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/stroke_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "empty_index_array",
+        "row_index_array",
+        "normalize_distances",
+        "_point_ring",
+        "point_buffer_owned_cpu",
+        "_cross",
+        "_batch_mitre_offset_uniform",
+        "_offset_from_coords_mitre",
+        "_offset_single_linestring",
+        "offset_curve_owned_cpu",
+        "_non_null_mask",
+        "supports_point_buffer_surface",
+        "supports_point_buffer_gpu_surface",
+        "supports_linestring_buffer_surface",
+        "supports_linestring_buffer_gpu_surface",
+        "supports_polygon_buffer_surface",
+        "supports_polygon_buffer_gpu_surface",
+        "supports_offset_curve_surface",
+        "benchmark_point_buffer_baseline",
+        "benchmark_offset_curve_baseline"
+      ],
+      "tokens": [
+        "array",
+        "baseline",
+        "batch",
+        "benchmark",
+        "buffer",
+        "constructive",
+        "coords",
+        "cpu",
+        "cross",
+        "curve",
+        "distances",
+        "empty",
+        "gpu",
+        "index",
+        "linestring",
+        "mask",
+        "mitre",
+        "non",
+        "normalize",
+        "null",
+        "offset",
+        "owned",
+        "point",
+        "polygon",
+        "py",
+        "ring",
+        "row",
+        "single",
+        "src",
+        "stroke",
         "supports",
         "surface",
         "uniform",
@@ -21817,8 +22626,6 @@
         "_assemble_multipoint_host",
         "_assemble_multilinestring_host",
         "_assemble_multipolygon_host",
-        "_get_empty_polygon",
-        "_get_empty_owned",
         "_is_owned_empty",
         "_tree_reduce_global",
         "union_all_gpu_owned",
@@ -21866,7 +22673,6 @@
         "fp64",
         "geometries",
         "geometry",
-        "get",
         "global",
         "gpu",
         "homogeneous",
@@ -21926,6 +22732,36 @@
         "via",
         "vibespatial",
         "wrapper"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/constructive/union_all_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "empty_polygon",
+        "empty_owned",
+        "merge_pair_cpu",
+        "reduce_all_cpu"
+      ],
+      "tokens": [
+        "all",
+        "constructive",
+        "cpu",
+        "empty",
+        "helpers",
+        "merge",
+        "only",
+        "owned",
+        "pair",
+        "polygon",
+        "py",
+        "reduce",
+        "reductions",
+        "src",
+        "style",
+        "union",
+        "vibespatial"
       ]
     },
     {
@@ -22133,6 +22969,7 @@
       "symbols": [
         "_require_bindings",
         "_require_gpu_arrays",
+        "_free_cupy_pinned_memory_pool",
         "_check_driver",
         "_check_nvrtc",
         "cuda_device_count",
@@ -22153,8 +22990,7 @@
         "CudaStream",
         "CompiledKernel",
         "CudaDriverRuntime",
-        "get_cuda_runtime",
-        "count_scatter_total"
+        "get_cuda_runtime"
       ],
       "tokens": [
         "arrays",
@@ -22170,6 +23006,7 @@
         "cuda",
         "cudadriverruntime",
         "cudastream",
+        "cupy",
         "d2h",
         "delete",
         "device",
@@ -22177,23 +23014,25 @@
         "disk",
         "driver",
         "enabled",
+        "free",
         "get",
         "gpu",
         "has",
         "increment",
         "key",
         "make",
+        "memory",
         "nvrtc",
         "oom",
+        "pinned",
+        "pool",
         "py",
         "read",
         "require",
         "reset",
         "runtime",
-        "scatter",
         "src",
         "support",
-        "total",
         "transfer",
         "transfers",
         "version",
@@ -22207,6 +23046,7 @@
       "path": "src/vibespatial/cuda/cccl_cubin_cache.py",
       "referenced_by": [],
       "symbols": [
+        "_is_host_array_like",
         "_cccl_cache_enabled",
         "_get_cache_dir",
         "_cccl_version",
@@ -22229,13 +23069,13 @@
         "CacheEntry",
         "_find_build_data_offset",
         "_read_build_struct",
-        "_read_runtime_policy",
-        "_map_kernel_names"
+        "_read_runtime_policy"
       ],
       "tokens": [
         "2ms",
         "300ms",
         "after",
+        "array",
         "build",
         "builds",
         "cache",
@@ -22274,16 +23114,17 @@
         "first",
         "functions",
         "get",
+        "host",
         "just",
         "kernel",
         "libc",
         "libcccl",
         "libcuda",
         "library",
+        "like",
         "load",
         "logic",
         "make",
-        "map",
         "metadata",
         "names",
         "near",
@@ -22329,13 +23170,8 @@
       "referenced_by": [],
       "symbols": [
         "precompile_enabled",
-        "AlgorithmFamily",
-        "CCCLWarmupSpec",
         "PrecompiledPrimitive",
-        "WarmupDiagnostic",
-        "_build_spec_registry",
         "_get_op",
-        "_get_h_init",
         "get_real_stderr",
         "_suppress_cccl_warnings",
         "_compile_exclusive_scan",
@@ -22351,14 +23187,18 @@
         "_compile_segmented_sort",
         "_build_cached_callable",
         "_query_cached_temp",
-        "CCCLPrecompiler"
+        "CCCLPrecompiler",
+        "request_warmup",
+        "precompile_status",
+        "ensure_pipelines_warm",
+        "precompile_all"
       ],
       "tokens": [
         "0034",
         "accumulates",
         "achieve",
         "adr",
-        "algorithmfamily",
+        "all",
         "at",
         "background",
         "binarysearchadapter",
@@ -22370,7 +23210,6 @@
         "callables",
         "cccl",
         "ccclprecompiler",
-        "ccclwarmupspec",
         "compilation",
         "compile",
         "compiles",
@@ -22384,12 +23223,12 @@
         "driven",
         "each",
         "enabled",
+        "ensure",
         "env",
         "exclusive",
         "get",
         "gil",
         "incrementally",
-        "init",
         "jit",
         "key",
         "lower",
@@ -22400,6 +23239,7 @@
         "nogil",
         "op",
         "parallelism",
+        "pipelines",
         "pre",
         "precompile",
         "precompiledprimitive",
@@ -22409,7 +23249,6 @@
         "radix",
         "real",
         "reduce",
-        "registry",
         "releases",
         "request",
         "scan",
@@ -22419,9 +23258,9 @@
         "singleton",
         "so",
         "sort",
-        "spec",
         "specs",
         "src",
+        "status",
         "stderr",
         "suppress",
         "temp",
@@ -22435,8 +23274,8 @@
         "var",
         "via",
         "vibespatial",
+        "warm",
         "warmup",
-        "warmupdiagnostic",
         "warnings",
         "which"
       ]
@@ -22772,6 +23611,31 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/cuda/device_functions/strip_closure.py",
+      "referenced_by": [],
+      "symbols": [
+        "STRIP_CLOSURE_DEVICE"
+      ],
+      "tokens": [
+        "closing",
+        "closure",
+        "cuda",
+        "device",
+        "function",
+        "functions",
+        "present",
+        "py",
+        "ring",
+        "shared",
+        "src",
+        "strip",
+        "vertex",
+        "vibespatial",
+        "when"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/cuda/nvrtc_precompile.py",
       "referenced_by": [],
       "symbols": [
@@ -22890,6 +23754,37 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/geometry/api_registry.py",
+      "referenced_by": [],
+      "symbols": [
+        "register_host_transform_helpers",
+        "build_host_transform_func",
+        "apply_host_transform",
+        "register_device_spatial_index_factory",
+        "build_device_spatial_index"
+      ],
+      "tokens": [
+        "api",
+        "apply",
+        "build",
+        "device",
+        "factory",
+        "func",
+        "geometry",
+        "helpers",
+        "host",
+        "index",
+        "py",
+        "register",
+        "registry",
+        "spatial",
+        "src",
+        "transform",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/geometry/buffers.py",
       "referenced_by": [
         "docs/architecture/geometry-buffers.md"
@@ -22923,6 +23818,7 @@
         "docs/architecture/api-dispatch.md"
       ],
       "symbols": [
+        "_is_host_geometry_array_like",
         "DeviceGeometryDtype",
         "DeviceGeometryArray",
         "_concat_family_buffers",
@@ -22945,8 +23841,7 @@
         "_compute_total_bounds_from_owned_device",
         "_compute_total_bounds_from_owned_host",
         "_compute_total_bounds_from_owned",
-        "_compute_bounds_from_owned_host",
-        "_compute_bounds_from_owned"
+        "_compute_bounds_from_owned_host"
       ],
       "tokens": [
         "0005",
@@ -22985,6 +23880,7 @@
         "inverts",
         "kwargs",
         "lazily",
+        "like",
         "materialized",
         "model",
         "module",
@@ -23088,6 +23984,49 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/geometry/geometry_analysis_host.py",
+      "referenced_by": [],
+      "symbols": [
+        "family_bounds_scalar",
+        "assemble_cached_bounds",
+        "slice_bounds_vectorized",
+        "family_bounds_vectorized",
+        "compute_geometry_bounds_cpu_scalar",
+        "compute_geometry_bounds_cpu_vectorized",
+        "compute_total_bounds_from_bounds",
+        "compute_offset_spans_cpu",
+        "_spread_bits",
+        "_morton_code",
+        "compute_morton_keys_cpu"
+      ],
+      "tokens": [
+        "analysis",
+        "assemble",
+        "bits",
+        "bounds",
+        "cached",
+        "code",
+        "compute",
+        "cpu",
+        "family",
+        "geometry",
+        "host",
+        "keys",
+        "morton",
+        "offset",
+        "py",
+        "scalar",
+        "slice",
+        "spans",
+        "spread",
+        "src",
+        "total",
+        "vectorized",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/geometry/owned.py",
       "referenced_by": [
         "docs/architecture/geometry-buffers.md"
@@ -23101,7 +24040,8 @@
         "GeoArrowBufferView",
         "MixedGeoArrowView",
         "DeviceFamilyGeometryBuffer",
-        "DeviceMetadataState",
+        "build_updated_device_family_buffer",
+        "build_updated_host_family_buffer",
         "OwnedGeometryDeviceState",
         "OwnedGeometryArray",
         "_gather_offset_slices",
@@ -23115,8 +24055,7 @@
         "normalize_buffer_sharing_mode",
         "_is_shareable_vector",
         "_is_shareable_bounds",
-        "_adopt_vector",
-        "_adopt_bounds"
+        "_adopt_vector"
       ],
       "tokens": [
         "adopt",
@@ -23125,10 +24064,10 @@
         "buffer",
         "buffers",
         "buffersharingmode",
+        "build",
         "concat",
         "device",
         "devicefamilygeometrybuffer",
-        "devicemetadatastate",
         "diagnosticevent",
         "diagnostickind",
         "family",
@@ -23136,6 +24075,7 @@
         "gather",
         "geoarrowbufferview",
         "geometry",
+        "host",
         "mixedgeoarrowview",
         "mode",
         "normalize",
@@ -23152,6 +24092,7 @@
         "tag",
         "take",
         "unique",
+        "updated",
         "vector",
         "vibespatial"
       ]
@@ -24032,6 +24973,7 @@
         "_encode_list_family",
         "encode_owned_geoarrow_array",
         "_owned_geoarrow_fast_path_reason",
+        "_geoarrow_constructor_fallback_reason",
         "_construct_geoarrow_array_with_explicit_fallback",
         "_arrow_validity_mask",
         "_child_selection_mask",
@@ -24041,8 +24983,7 @@
         "_decode_geoarrow_point",
         "_decode_geoarrow_linestring_like",
         "_decode_geoarrow_polygon",
-        "_decode_geoarrow_multilinestring",
-        "_decode_geoarrow_multipolygon"
+        "_decode_geoarrow_multilinestring"
       ],
       "tokens": [
         "array",
@@ -24051,6 +24992,7 @@
         "child",
         "codec",
         "construct",
+        "constructor",
         "decode",
         "encode",
         "explicit",
@@ -24071,7 +25013,6 @@
         "mask",
         "metadata",
         "multilinestring",
-        "multipolygon",
         "nativegeometrybenchmark",
         "offsets",
         "owned",
@@ -24308,6 +25249,7 @@
         "GeoParquetChunkPlan",
         "GeoParquetEnginePlan",
         "GeoParquetEngineBenchmark",
+        "_unsupported_pylibcudf_geoparquet_encoding",
         "_rebuild_arrow_array_with_schema_type",
         "_rebuild_arrow_table_with_schema",
         "_project_arrow_schema",
@@ -24326,8 +25268,7 @@
         "_read_geoparquet_table_with_pylibcudf",
         "_parquet_column_path",
         "_load_geoparquet_metadata",
-        "_build_geoparquet_metadata_summary_from_pyarrow",
-        "_read_geoparquet_with_pyarrow"
+        "_build_geoparquet_metadata_summary_from_pyarrow"
       ],
       "tokens": [
         "array",
@@ -24340,6 +25281,7 @@
         "concat",
         "concatenate",
         "crs",
+        "encoding",
         "engine",
         "geometry",
         "geopandas",
@@ -24370,6 +25312,7 @@
         "supports",
         "table",
         "type",
+        "unsupported",
         "vibespatial"
       ]
     },
@@ -26765,24 +27708,18 @@
         "_point_linestring_kernels",
         "_linestring_polygon_kernels",
         "_linestring_linestring_kernels",
-        "_build_device_backed_point_output",
-        "_build_device_backed_linestring_output",
-        "_build_device_backed_multipoint_output",
         "_nonpolygon_binary_constructive_gpu",
         "point_point_intersection",
         "point_point_difference",
         "point_point_union",
         "point_point_symmetric_difference",
-        "multipoint_polygon_intersection",
-        "multipoint_polygon_difference",
         "point_linestring_intersection",
         "point_linestring_difference",
         "_point_linestring_constructive",
         "linestring_polygon_intersection",
         "linestring_polygon_difference",
         "_linestring_polygon_constructive",
-        "linestring_linestring_intersection",
-        "_build_point_polygon_result_from_source"
+        "linestring_linestring_intersection"
       ],
       "tokens": [
         "0002",
@@ -26792,11 +27729,9 @@
         "against",
         "all",
         "at",
-        "backed",
         "batch",
         "binary",
         "boundary",
-        "build",
         "class",
         "clipping",
         "combinations",
@@ -26834,7 +27769,6 @@
         "not",
         "nvrtc",
         "operations",
-        "output",
         "over",
         "ownedgeometryarray",
         "pairs",
@@ -26847,12 +27781,10 @@
         "py",
         "request",
         "resident",
-        "result",
         "return",
         "ring",
         "scope",
         "segment",
-        "source",
         "specific",
         "src",
         "stays",
@@ -26913,7 +27845,6 @@
       "symbols": [
         "_is_polygon_only",
         "_polygon_difference_gpu",
-        "_polygon_difference_cpu",
         "_polygon_difference_gpu_variant",
         "polygon_difference"
       ],
@@ -26934,7 +27865,6 @@
         "computes",
         "constructive",
         "covered",
-        "cpu",
         "critical",
         "device",
         "difference",
@@ -26998,11 +27928,9 @@
       "referenced_by": [],
       "symbols": [
         "_polygon_intersection_kernels",
-        "_build_device_backed_polygon_intersection_output",
         "_extract_polygon_family_buffers",
         "_polygon_intersection_gpu",
         "_build_empty_result",
-        "_polygon_intersection_cpu",
         "_polygon_intersection_gpu_variant",
         "polygon_intersection"
       ],
@@ -27015,7 +27943,6 @@
         "all",
         "any",
         "at",
-        "backed",
         "buffers",
         "build",
         "class",
@@ -27027,7 +27954,6 @@
         "containing",
         "count",
         "counts",
-        "cpu",
         "custom",
         "degenerate",
         "device",
@@ -27146,15 +28072,10 @@
       "path": "src/vibespatial/kernels/constructive/segmented_union.py",
       "referenced_by": [],
       "symbols": [
-        "_get_empty_owned",
         "segmented_union_all",
-        "_segmented_union_cpu_variant",
-        "_segmented_union_cpu",
         "_segmented_union_gpu_variant",
         "_segmented_union_gpu",
-        "_tree_reduce_group",
-        "_concat_owned_arrays",
-        "_concat_family_buffers"
+        "_tree_reduce_group"
       ],
       "tokens": [
         "0002",
@@ -27169,7 +28090,6 @@
         "at",
         "binary",
         "buffer",
-        "buffers",
         "call",
         "cccl",
         "ceil",
@@ -27178,7 +28098,6 @@
         "concat",
         "concatenated",
         "constructive",
-        "cpu",
         "csr",
         "cupy",
         "defined",
@@ -27189,10 +28108,8 @@
         "dispatch",
         "each",
         "empty",
-        "family",
         "final",
         "fp64",
-        "get",
         "gpu",
         "group",
         "groups",
@@ -27459,10 +28376,6 @@
         "docs/architecture/geometry-buffers.md"
       ],
       "symbols": [
-        "_family_bounds_scalar",
-        "_assemble_cached_bounds",
-        "_slice_bounds_vectorized",
-        "_family_bounds_vectorized",
         "_compute_geometry_bounds_cpu_scalar",
         "_compute_geometry_bounds_cpu_vectorized",
         "_bounds_kernels",
@@ -27476,18 +28389,12 @@
         "compute_geometry_bounds",
         "compute_total_bounds",
         "compute_offset_spans",
-        "_spread_bits",
-        "_morton_code",
         "compute_morton_keys"
       ],
       "tokens": [
         "analysis",
-        "assemble",
         "avg",
-        "bits",
         "bounds",
-        "cached",
-        "code",
         "compute",
         "cooperative",
         "coords",
@@ -27507,9 +28414,7 @@
         "per",
         "py",
         "scalar",
-        "slice",
         "spans",
-        "spread",
         "src",
         "total",
         "vectorized",
@@ -27640,8 +28545,7 @@
         "_decode_multipolygon_family",
         "_assemble_single_family",
         "_assemble_mixed",
-        "decode_wkb_device_pipeline",
-        "_prepare_device_wkb_input"
+        "decode_wkb_device_pipeline"
       ],
       "tokens": [
         "0033",
@@ -27673,7 +28577,6 @@
         "helpers",
         "host",
         "implements",
-        "input",
         "io",
         "kernel",
         "kernels",
@@ -27693,7 +28596,6 @@
         "point",
         "polygon",
         "prefix",
-        "prepare",
         "produces",
         "py",
         "pylibcudf",
@@ -28001,10 +28903,10 @@
         "_launch_fused",
         "_launch_bounds_candidate_rows",
         "launch_point_region_candidate_rows",
-        "_evaluate_point_in_polygon_cpu",
         "get_last_gpu_substage_timings",
         "_compute_pip_center",
-        "_evaluate_point_in_polygon_gpu"
+        "_evaluate_point_in_polygon_gpu",
+        "_point_in_polygon_gpu_variant"
       ],
       "tokens": [
         "bin",
@@ -28016,7 +28918,6 @@
         "center",
         "compacted",
         "compute",
-        "cpu",
         "dense",
         "dispatch",
         "estimate",
@@ -28050,6 +28951,7 @@
         "strategy",
         "substage",
         "timings",
+        "variant",
         "vibespatial",
         "work"
       ]
@@ -28106,11 +29008,10 @@
         "docs/architecture/point-predicates.md"
       ],
       "symbols": [
+        "point_within_bounds",
         "NormalizedBoundsInput",
-        "_normalize_bounds_tuple",
-        "_normalize_right_input",
         "_evaluate_point_within_bounds",
-        "point_within_bounds"
+        "_normalize_right_input"
       ],
       "tokens": [
         "bounds",
@@ -28124,7 +29025,6 @@
         "py",
         "right",
         "src",
-        "tuple",
         "vibespatial",
         "within"
       ]
@@ -28773,6 +29673,7 @@
         "clip",
         "code",
         "containment",
+        "crossover",
         "currently",
         "detection",
         "detects",
@@ -28906,9 +29807,12 @@
         "BinaryPredicateSpec",
         "BinaryPredicateResult",
         "supports_binary_predicate",
+        "_unsupported_owned_exact_family",
+        "_unsupported_owned_exact_operands",
         "_coerce_array",
         "_coerce_right",
         "_ensure_registered_kernel",
+        "_explicit_cpu_fallback_selection",
         "_record_runtime_selection",
         "_owned_from_values",
         "_broadcast_right_owned",
@@ -28921,13 +29825,9 @@
         "_result_to_bool_array",
         "_point_relation_to_predicate",
         "_point_equals_to_predicate",
-        "_unsupported_gpu_reason",
-        "_candidate_pairs_supported",
-        "_de9im_candidate_pairs_supported",
-        "_apply_relation_rows"
+        "_unsupported_gpu_reason"
       ],
       "tokens": [
-        "apply",
         "array",
         "bbox",
         "binary",
@@ -28940,9 +29840,13 @@
         "coarserelation",
         "coerce",
         "contains",
-        "de9im",
+        "cpu",
         "ensure",
         "equals",
+        "exact",
+        "explicit",
+        "fallback",
+        "family",
         "fill",
         "gpu",
         "intersects",
@@ -28950,9 +29854,9 @@
         "mask",
         "materialize",
         "nullbehavior",
+        "operands",
         "output",
         "owned",
-        "pairs",
         "point",
         "predicate",
         "predicates",
@@ -28963,17 +29867,100 @@
         "relation",
         "result",
         "right",
-        "rows",
         "runtime",
         "selection",
         "shapely",
         "src",
-        "supported",
         "supports",
         "unsupported",
         "values",
         "vibespatial",
         "within"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/predicates/point_in_polygon_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "evaluate_point_in_polygon_cpu",
+        "point_in_polygon_cpu_variant"
+      ],
+      "tokens": [
+        "cpu",
+        "evaluate",
+        "point",
+        "polygon",
+        "predicates",
+        "py",
+        "src",
+        "variant",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/predicates/point_in_polygon_host.py",
+      "referenced_by": [],
+      "symbols": [
+        "estimate_pip_work_polygon",
+        "estimate_pip_work_multipolygon",
+        "should_bin_dispatch",
+        "compute_work_estimates_for_candidates",
+        "to_python_result",
+        "candidate_rows_by_family",
+        "select_gpu_strategy",
+        "compute_pip_center",
+        "initialize_coarse_result",
+        "candidate_rows_from_coarse",
+        "dense_true_mask",
+        "empty_gpu_bounds_placeholder",
+        "empty_bool_mask_like",
+        "cpu_return_device_fallback",
+        "work_cv"
+      ],
+      "tokens": [
+        "bin",
+        "bool",
+        "bounds",
+        "candidate",
+        "candidates",
+        "center",
+        "coarse",
+        "compute",
+        "cpu",
+        "cv",
+        "dense",
+        "device",
+        "dispatch",
+        "empty",
+        "estimate",
+        "estimates",
+        "fallback",
+        "family",
+        "gpu",
+        "host",
+        "initialize",
+        "like",
+        "mask",
+        "multipolygon",
+        "pip",
+        "placeholder",
+        "point",
+        "polygon",
+        "predicates",
+        "py",
+        "python",
+        "result",
+        "return",
+        "rows",
+        "select",
+        "should",
+        "src",
+        "strategy",
+        "true",
+        "vibespatial",
+        "work"
       ]
     },
     {
@@ -29045,6 +30032,34 @@
         "sources",
         "src",
         "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/predicates/point_within_bounds_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "NormalizedBoundsInput",
+        "normalize_bounds_tuple",
+        "normalize_right_input",
+        "evaluate_point_within_bounds",
+        "point_within_bounds_cpu"
+      ],
+      "tokens": [
+        "bounds",
+        "cpu",
+        "evaluate",
+        "input",
+        "normalize",
+        "normalizedboundsinput",
+        "point",
+        "predicates",
+        "py",
+        "right",
+        "src",
+        "tuple",
+        "vibespatial",
+        "within"
       ]
     },
     {
@@ -29260,12 +30275,9 @@
         "has_gpu_runtime",
         "select_runtime",
         "set_execution_mode",
-        "get_requested_mode",
-        "WorkloadShape",
-        "detect_workload_shape"
+        "get_requested_mode"
       ],
       "tokens": [
-        "detect",
         "execution",
         "executionmode",
         "get",
@@ -29279,11 +30291,8 @@
         "runtimeselection",
         "select",
         "set",
-        "shape",
         "src",
-        "vibespatial",
-        "workload",
-        "workloadshape"
+        "vibespatial"
       ]
     },
     {
@@ -29389,11 +30398,39 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/runtime/cccl_warmup_specs.py",
+      "referenced_by": [],
+      "symbols": [
+        "AlgorithmFamily",
+        "CCCLWarmupSpec",
+        "WarmupDiagnostic",
+        "build_spec_registry"
+      ],
+      "tokens": [
+        "algorithmfamily",
+        "build",
+        "cccl",
+        "ccclwarmupspec",
+        "py",
+        "registry",
+        "runtime",
+        "spec",
+        "specs",
+        "src",
+        "vibespatial",
+        "warmup",
+        "warmupdiagnostic"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/runtime/crossover.py",
       "referenced_by": [
         "docs/architecture/crossover.md"
       ],
       "symbols": [
+        "WorkloadShape",
+        "detect_workload_shape",
         "DispatchDecision",
         "CrossoverPolicy",
         "default_crossover_policy",
@@ -29403,6 +30440,7 @@
         "crossover",
         "crossoverpolicy",
         "default",
+        "detect",
         "dispatch",
         "dispatchdecision",
         "policy",
@@ -29410,8 +30448,11 @@
         "rows",
         "runtime",
         "select",
+        "shape",
         "src",
-        "vibespatial"
+        "vibespatial",
+        "workload",
+        "workloadshape"
       ]
     },
     {
@@ -29565,6 +30606,25 @@
         "runtime",
         "src",
         "stepkind",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
+      "path": "src/vibespatial/runtime/gpu_sampling.py",
+      "referenced_by": [],
+      "symbols": [
+        "GpuTelemetrySample",
+        "NvmlGpuSampler"
+      ],
+      "tokens": [
+        "gpu",
+        "gputelemetrysample",
+        "nvmlgpusampler",
+        "py",
+        "runtime",
+        "sampling",
+        "src",
         "vibespatial"
       ]
     },
@@ -29813,25 +30873,6 @@
         "src",
         "topologypolicy",
         "vibespatial"
-      ]
-    },
-    {
-      "kind": "source",
-      "path": "src/vibespatial/runtime/workload.py",
-      "referenced_by": [],
-      "symbols": [
-        "WorkloadShape",
-        "detect_workload_shape"
-      ],
-      "tokens": [
-        "detect",
-        "py",
-        "runtime",
-        "shape",
-        "src",
-        "vibespatial",
-        "workload",
-        "workloadshape"
       ]
     },
     {
@@ -30352,6 +31393,28 @@
     },
     {
       "kind": "source",
+      "path": "src/vibespatial/spatial/query_cpu.py",
+      "referenced_by": [],
+      "symbols": [
+        "shapely_bounds_array"
+      ],
+      "tokens": [
+        "array",
+        "bounds",
+        "cpu",
+        "extraction",
+        "helpers",
+        "only",
+        "py",
+        "query",
+        "shapely",
+        "spatial",
+        "src",
+        "vibespatial"
+      ]
+    },
+    {
+      "kind": "source",
       "path": "src/vibespatial/spatial/query_types.py",
       "referenced_by": [],
       "symbols": [
@@ -30392,6 +31455,7 @@
         "_indices_to_sparse",
         "_expand_bounds",
         "_gpu_bounds_dispatch_mode",
+        "_planned_query_runtime_selection",
         "_filter_predicate_pairs",
         "_filter_predicate_pairs_owned",
         "_format_query_indices"
@@ -30413,12 +31477,15 @@
         "mode",
         "owned",
         "pairs",
+        "planned",
         "points",
         "predicate",
         "py",
         "query",
         "reorder",
+        "runtime",
         "scalar",
+        "selection",
         "sort",
         "sparse",
         "spatial",
@@ -31337,10 +32404,12 @@
       "symbols": [
         "test_capture_device_snapshot_without_probe_uses_static_heuristics",
         "test_capture_device_snapshot_uses_nvml_probe_when_available",
+        "test_get_cached_snapshot_does_not_depend_on_bench_profiling",
         "test_auto_planner_stays_on_cpu_below_crossover",
         "test_planner_picks_specialized_point_variant_then_replans_for_polygons",
         "test_memory_pressure_reduces_chunk_hint",
         "test_registry_decorator_records_structured_variant_metadata",
+        "test_overlay_kernel_groups_are_registered",
         "test_crossover_override_returns_kernel_specific_threshold",
         "test_crossover_override_falls_through_to_class_default",
         "test_cached_snapshot_returns_same_object",
@@ -31356,11 +32425,13 @@
         "above",
         "adaptive",
         "all",
+        "are",
         "auto",
         "availability",
         "available",
         "batch",
         "below",
+        "bench",
         "bypasses",
         "cache",
         "cached",
@@ -31374,12 +32445,16 @@
         "crossover",
         "decorator",
         "default",
+        "depend",
         "detect",
         "device",
+        "does",
         "explicit",
         "falls",
         "forces",
+        "get",
         "gpu",
+        "groups",
         "heuristics",
         "hint",
         "invalidate",
@@ -31388,8 +32463,10 @@
         "metadata",
         "mode",
         "new",
+        "not",
         "nvml",
         "object",
+        "overlay",
         "override",
         "picks",
         "planner",
@@ -31399,10 +32476,12 @@
         "pressure",
         "probe",
         "profile",
+        "profiling",
         "py",
         "records",
         "reduces",
         "refreshes",
+        "registered",
         "registry",
         "replans",
         "respects",
@@ -32169,7 +33248,8 @@
         "test_large_coordinates_gpu",
         "test_centroid_owned_auto_dispatch",
         "test_centroid_owned_empty_array",
-        "test_centroid_owned_10k_random_polygons"
+        "test_centroid_owned_10k_random_polygons",
+        "test_centroid_owned_device_resident_polygon_input_uses_device_stats"
       ],
       "tokens": [
         "10k",
@@ -32185,11 +33265,13 @@
         "cx",
         "cy",
         "delegation",
+        "device",
         "dispatch",
         "empty",
         "extract",
         "geometry",
         "gpu",
+        "input",
         "kernels",
         "large",
         "linestring",
@@ -32203,10 +33285,55 @@
         "polygons",
         "py",
         "random",
+        "resident",
         "shapely",
+        "stats",
         "test",
         "tests",
-        "types"
+        "types",
+        "uses"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_check_dispatch_once.py",
+      "referenced_by": [],
+      "symbols": [
+        "_write_file",
+        "test_import_guard_is_ignored",
+        "test_gpu_to_cpu_fallback_is_flagged",
+        "f",
+        "test_gpu_to_cpu_fallback_via_cpu_helper_is_flagged",
+        "f",
+        "test_bare_exception_pass_is_flagged",
+        "f",
+        "test_non_cpu_except_body_is_not_flagged",
+        "f"
+      ],
+      "tokens": [
+        "bare",
+        "body",
+        "check",
+        "cpu",
+        "dispatch",
+        "except",
+        "exception",
+        "fallback",
+        "flagged",
+        "gpu",
+        "guard",
+        "helper",
+        "ignored",
+        "import",
+        "non",
+        "not",
+        "once",
+        "pass",
+        "py",
+        "test",
+        "tests",
+        "via",
+        "write"
       ]
     },
     {
@@ -32608,7 +33735,8 @@
         "test_owned_geometry_can_allocate_device_buffers",
         "test_owned_geometry_round_trips_through_device_residency",
         "test_device_bounds_buffers_preserve_cached_values",
-        "test_broadcast_device_bounds_cache_uses_physical_family_rows"
+        "test_broadcast_device_bounds_cache_uses_physical_family_rows",
+        "test_ensure_host_family_structure_hydrates_offsets_without_coordinates"
       ],
       "tokens": [
         "allocate",
@@ -32618,10 +33746,15 @@
         "cache",
         "cached",
         "can",
+        "coordinates",
         "device",
+        "ensure",
         "family",
         "geometries",
         "geometry",
+        "host",
+        "hydrates",
+        "offsets",
         "owned",
         "physical",
         "preserve",
@@ -32630,12 +33763,14 @@
         "round",
         "rows",
         "sample",
+        "structure",
         "test",
         "tests",
         "through",
         "trips",
         "uses",
-        "values"
+        "values",
+        "without"
       ]
     },
     {
@@ -32869,19 +34004,27 @@
         "test_threshold_equivalence",
         "test_explicit_gpu_pin_respected",
         "test_explicit_cpu_pin_respected",
-        "test_gpu_unavailable_falls_back_to_cpu"
+        "test_gpu_unavailable_falls_back_to_cpu",
+        "test_precision_kernel_override_preserves_cached_device_profile"
       ],
       "tokens": [
         "back",
         "cache",
+        "cached",
         "clean",
         "cpu",
+        "device",
         "dispatch",
         "equivalence",
         "explicit",
         "falls",
         "gpu",
+        "kernel",
+        "override",
         "pin",
+        "precision",
+        "preserves",
+        "profile",
         "py",
         "respected",
         "snapshot",
@@ -34070,7 +35213,8 @@
         "test_gpu_point_buffer_matches_shapely_for_quad_segs_1",
         "test_gpu_clip_by_rect_accepts_device_backed_point_input_without_full_host_materialization",
         "test_exterior_gpu_coordinates_stay_device_resident",
-        "test_exterior_gpu_moderate_scale_with_nulls"
+        "test_exterior_gpu_moderate_scale_with_nulls",
+        "test_normalize_owned_device_resident_polygon_input_uses_device_stats"
       ],
       "tokens": [
         "accepts",
@@ -34092,9 +35236,12 @@
         "matches",
         "materialization",
         "moderate",
+        "normalize",
         "nulls",
         "only",
+        "owned",
         "point",
+        "polygon",
         "py",
         "quad",
         "rect",
@@ -34102,9 +35249,11 @@
         "scale",
         "segs",
         "shapely",
+        "stats",
         "stay",
         "test",
         "tests",
+        "uses",
         "without"
       ]
     },
@@ -35151,6 +36300,7 @@
       "symbols": [
         "_sample_frame",
         "test_geojson_roundtrip_uses_gpu_adapter",
+        "test_geojson_gpu_adapter_failure_propagates",
         "test_shapefile_roundtrip_uses_gpu_adapter",
         "test_pyogrio_shapefile_write_passes_explicit_geometry_type_for_null_rows",
         "test_pyogrio_write_preserves_geometry_alignment_for_sparse_indexes",
@@ -35171,8 +36321,7 @@
         "test_read_geojson_owned_supports_pylibcudf_strategy",
         "test_read_geojson_owned_pylibcudf_default_does_not_use_experimental_rowizer",
         "test_read_geojson_owned_experimental_arrays_can_bypass_host_splitter_for_points",
-        "test_read_geojson_owned_experimental_arrays_support_polygons",
-        "test_read_geojson_owned_experimental_rowized_can_bypass_host_splitter_for_points"
+        "test_read_geojson_owned_experimental_arrays_support_polygons"
       ],
       "tokens": [
         "adapter",
@@ -35194,6 +36343,7 @@
         "does",
         "experimental",
         "explicit",
+        "failure",
         "fast",
         "feature",
         "frame",
@@ -35217,6 +36367,7 @@
         "polygon",
         "polygons",
         "preserves",
+        "propagates",
         "py",
         "pylibcudf",
         "pyogrio",
@@ -35799,17 +36950,22 @@
         "test_make_valid_fusion_plan_persists_final_geometry_only",
         "test_make_valid_owned_repairs_only_invalid_subset",
         "test_geopandas_make_valid_uses_compacted_pipeline",
-        "test_make_valid_benchmark_reports_repaired_rows"
+        "test_make_valid_benchmark_reports_repaired_rows",
+        "test_make_valid_gpu_detection_failure_propagates",
+        "test_make_valid_gpu_repair_failure_propagates"
       ],
       "tokens": [
         "before",
         "benchmark",
         "compacted",
         "compacts",
+        "detection",
+        "failure",
         "final",
         "fusion",
         "geometry",
         "geopandas",
+        "gpu",
         "invalid",
         "make",
         "only",
@@ -35817,6 +36973,7 @@
         "persists",
         "pipeline",
         "plan",
+        "propagates",
         "py",
         "repair",
         "repaired",
@@ -37265,6 +38422,7 @@
         "test_polygon_buffer_gpu_mitre_limit_exceeded",
         "test_polygon_buffer_gpu_quad_segs_1",
         "test_polygon_buffer_gpu_device_resident",
+        "test_polygon_centroids_device_resident_input_uses_device_stats",
         "test_polygon_buffer_gpu_bevel_multiple_rows",
         "test_polygon_buffer_gpu_square_negative_round",
         "test_polygon_buffer_gpu_square_negative_mitre",
@@ -37278,12 +38436,12 @@
         "test_polygon_buffer_gpu_square_with_hole_negative",
         "test_polygon_buffer_gpu_polygon_with_multiple_holes",
         "test_polygon_buffer_gpu_hole_collapse_large_distance",
-        "test_polygon_buffer_gpu_mixed_holes_and_simple",
-        "test_polygon_buffer_gpu_hole_join_styles"
+        "test_polygon_buffer_gpu_mixed_holes_and_simple"
       ],
       "tokens": [
         "bevel",
         "buffer",
+        "centroids",
         "collapse",
         "concave",
         "constructive",
@@ -37295,6 +38453,7 @@
         "gpu",
         "hole",
         "holes",
+        "input",
         "join",
         "large",
         "limit",
@@ -37316,10 +38475,12 @@
         "shapely",
         "simple",
         "square",
+        "stats",
         "styles",
         "test",
         "tests",
         "triangle",
+        "uses",
         "vertices"
       ]
     },
@@ -37531,6 +38692,7 @@
         "_expected_is_ccw",
         "TestNumCoordinates",
         "TestNumGeometries",
+        "TestGetGeometry",
         "TestNumInteriorRings",
         "TestIsClosed",
         "TestIsCCW",
@@ -37570,6 +38732,7 @@
         "shapely",
         "state",
         "test",
+        "testgetgeometry",
         "testgetx",
         "testgetxynohostmaterialization",
         "testgety",
@@ -39030,6 +40193,7 @@
         "test_query_spatial_index_reports_execution_metadata",
         "test_query_spatial_index_uses_gpu_for_point_tree_box_contains_when_large_enough",
         "test_query_spatial_index_uses_gpu_for_point_tree_box_queries",
+        "test_query_spatial_index_uses_gpu_for_small_point_tree_box_queries",
         "test_query_spatial_index_uses_gpu_for_point_tree_box_boundary_sensitive_predicates",
         "test_query_spatial_index_point_tree_box_scalar_avoids_owned_conversion",
         "test_query_spatial_index_point_tree_box_owned_queries_avoid_to_shapely",
@@ -39043,8 +40207,7 @@
         "test_gpu_bbox_candidate_generation_polygon_tree_triangle_query",
         "test_owned_refine_eliminates_shapely_roundtrip",
         "test_gpu_bbox_candidate_generation_multi_query",
-        "test_dwithin_routes_through_owned_path",
-        "test_small_input_dispatches_correctly"
+        "test_dwithin_routes_through_owned_path"
       ],
       "tokens": [
         "avoid",
@@ -39059,8 +40222,6 @@
         "contains",
         "conversion",
         "coordinate",
-        "correctly",
-        "dispatches",
         "distance",
         "distances",
         "dwithin",
@@ -39079,7 +40240,6 @@
         "handles",
         "host",
         "index",
-        "input",
         "intersects",
         "large",
         "line",
@@ -39138,6 +40298,7 @@
         "_viewport_call_matrix",
         "test_strict_native_mode_disabled_by_default",
         "test_record_fallback_event_raises_in_strict_native_mode",
+        "test_strict_bounds_surfaces_succeed_for_viewport_fixtures",
         "test_strict_viewport_matrix_documents_current_public_api_behavior",
         "test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_intersection_fallback",
         "test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_intersection_fallback",
@@ -39147,6 +40308,7 @@
         "api",
         "before",
         "behavior",
+        "bounds",
         "box",
         "build",
         "call",
@@ -39158,6 +40320,7 @@
         "event",
         "fallback",
         "fixture",
+        "fixtures",
         "intersection",
         "line",
         "load",
@@ -39175,7 +40338,9 @@
         "sindex",
         "strict",
         "structured",
+        "succeed",
         "surface",
+        "surfaces",
         "test",
         "tests",
         "viewport"
@@ -39364,15 +40529,20 @@
       "referenced_by": [],
       "symbols": [
         "test_parse_pytest_summary_extracts_counts_and_failures",
-        "test_compute_native_pass_rates_excludes_skips_from_native_rate"
+        "test_compute_native_pass_rates_excludes_skips_from_native_rate",
+        "test_discover_group_targets_splits_upstream_tree_by_top_level_area"
       ],
       "tokens": [
+        "area",
         "compute",
         "counts",
         "coverage",
+        "discover",
         "excludes",
         "extracts",
         "failures",
+        "group",
+        "level",
         "native",
         "parse",
         "pass",
@@ -39381,9 +40551,13 @@
         "rate",
         "rates",
         "skips",
+        "splits",
         "summary",
+        "targets",
         "test",
         "tests",
+        "top",
+        "tree",
         "upstream"
       ]
     },
@@ -39445,14 +40619,14 @@
       "symbols": [
         "TestWorkloadShapeEnum",
         "TestDetectWorkloadShape",
-        "TestImportFromRuntime"
+        "TestImportFromCrossover"
       ],
       "tokens": [
         "py",
         "shape",
         "test",
         "testdetectworkloadshape",
-        "testimportfromruntime",
+        "testimportfromcrossover",
         "tests",
         "testworkloadshapeenum",
         "workload"

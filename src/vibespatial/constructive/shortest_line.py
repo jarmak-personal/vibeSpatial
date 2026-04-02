@@ -19,8 +19,8 @@ arrays.
 from __future__ import annotations
 
 import numpy as np
-import shapely
 
+from vibespatial.constructive.shortest_line_cpu import shortest_line_cpu
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -44,12 +44,12 @@ from vibespatial.kernels.constructive.shortest_line import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency, TransferTrigger
-from vibespatial.runtime.workload import WorkloadShape, detect_workload_shape
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034)
@@ -421,32 +421,6 @@ def _shortest_line_gpu(
 
 
 # ---------------------------------------------------------------------------
-# CPU fallback
-# ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "shortest_line",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=(
-        "point", "linestring", "polygon",
-        "multipoint", "multilinestring", "multipolygon",
-    ),
-    supports_mixed=True,
-    tags=("shapely", "constructive", "shortest_line"),
-)
-def _shortest_line_cpu(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-) -> np.ndarray:
-    """CPU shortest_line via Shapely."""
-    left_shapely = np.asarray(left.to_shapely(), dtype=object)
-    right_shapely = np.asarray(right.to_shapely(), dtype=object)
-    return shapely.shortest_line(left_shapely, right_shapely)
-
-
-# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -482,13 +456,10 @@ def shortest_line_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     if selection.selected is ExecutionMode.GPU:
         try:
@@ -521,4 +492,4 @@ def shortest_line_owned(
         detail=f"rows={n}",
         selected=ExecutionMode.CPU,
     )
-    return _shortest_line_cpu(left, right)
+    return shortest_line_cpu(left, right)

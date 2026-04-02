@@ -6,7 +6,13 @@ from shapely.geometry import LineString, Point, Polygon
 
 from vibespatial import Residency, TransferTrigger, from_shapely_geometries, has_gpu_runtime
 from vibespatial.cuda._runtime import get_cuda_runtime
-from vibespatial.geometry.owned import tile_single_row
+from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
+    DeviceFamilyGeometryBuffer,
+    build_device_resident_owned,
+    tile_single_row,
+)
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.runtime import ExecutionMode
 
@@ -109,3 +115,47 @@ def test_broadcast_device_bounds_cache_uses_physical_family_rows() -> None:
         np.repeat(family_bounds, 8, axis=0),
         equal_nan=True,
     )
+
+
+def test_ensure_host_family_structure_hydrates_offsets_without_coordinates() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    runtime = get_cuda_runtime()
+    polygon_family = GeometryFamily.POLYGON
+    tags = np.asarray([FAMILY_TAGS[polygon_family]], dtype=np.int8)
+    validity = np.asarray([True], dtype=np.bool_)
+    family_row_offsets = np.asarray([0], dtype=np.int32)
+
+    owned = build_device_resident_owned(
+        device_families={
+            polygon_family: DeviceFamilyGeometryBuffer(
+                family=polygon_family,
+                x=runtime.from_host(np.asarray([0.0, 2.0, 2.0, 0.0, 0.0], dtype=np.float64)),
+                y=runtime.from_host(np.asarray([0.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float64)),
+                geometry_offsets=runtime.from_host(np.asarray([0, 1], dtype=np.int32)),
+                empty_mask=runtime.from_host(np.asarray([False], dtype=np.bool_)),
+                ring_offsets=runtime.from_host(np.asarray([0, 5], dtype=np.int32)),
+            )
+        },
+        row_count=1,
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+    )
+
+    stub = owned.families[polygon_family]
+    assert not stub.host_materialized
+    assert stub.x.size == 0
+    assert stub.geometry_offsets.size == 0
+    assert stub.ring_offsets is None
+
+    owned._ensure_host_family_structure(polygon_family)
+
+    hydrated = owned.families[polygon_family]
+    assert hydrated.schema is get_geometry_buffer_schema(polygon_family)
+    assert not hydrated.host_materialized
+    assert hydrated.x.size == 0
+    np.testing.assert_array_equal(hydrated.geometry_offsets, np.asarray([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(hydrated.empty_mask, np.asarray([False], dtype=np.bool_))
+    np.testing.assert_array_equal(hydrated.ring_offsets, np.asarray([0, 5], dtype=np.int32))

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
+
 # ---------------------------------------------------------------------------
 # NVRTC kernel: segment-to-segment distance device helper
 # ---------------------------------------------------------------------------
@@ -283,7 +285,7 @@ extern "C" __global__ void linestring_minimum_clearance(
 # index within the same ring.  Cross-ring segment pairs are never adjacent.
 # ---------------------------------------------------------------------------
 
-_POLYGON_CLEARANCE_KERNEL_SOURCE = _SEGMENT_DISTANCE_HELPER + r"""
+_POLYGON_CLEARANCE_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + _SEGMENT_DISTANCE_HELPER + r"""
 extern "C" __global__ void polygon_minimum_clearance(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -307,11 +309,7 @@ extern "C" __global__ void polygon_minimum_clearance(
         int ni = ci_end - ci_start;
 
         /* Strip closure vertex if present */
-        if (ni >= 2) {
-            double dx = x[ci_start] - x[ci_end - 1];
-            double dy = y[ci_start] - y[ci_end - 1];
-            if (dx * dx + dy * dy < 1e-30) ni--;
-        }
+        ni = vs_strip_closure(x, y, ci_start, ci_end, ni, 1e-30);
         if (ni < 2) continue;  /* need at least 1 segment */
 
         for (int rj = ri; rj < last_ring; rj++) {
@@ -320,11 +318,7 @@ extern "C" __global__ void polygon_minimum_clearance(
             int nj = cj_end - cj_start;
 
             /* Strip closure vertex */
-            if (nj >= 2) {
-                double dx = x[cj_start] - x[cj_end - 1];
-                double dy = y[cj_start] - y[cj_end - 1];
-                if (dx * dx + dy * dy < 1e-30) nj--;
-            }
+            nj = vs_strip_closure(x, y, cj_start, cj_end, nj, 1e-30);
             if (nj < 2) continue;
 
             const int nsegs_i = ni - 1;
@@ -367,7 +361,7 @@ extern "C" __global__ void polygon_minimum_clearance(
 # NVRTC kernel: MultiPolygon minimum clearance (1 thread per geometry)
 # ---------------------------------------------------------------------------
 
-_MULTIPOLYGON_CLEARANCE_KERNEL_SOURCE = _SEGMENT_DISTANCE_HELPER + r"""
+_MULTIPOLYGON_CLEARANCE_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + _SEGMENT_DISTANCE_HELPER + r"""
 extern "C" __global__ void multipolygon_minimum_clearance(
     const double* __restrict__ x,
     const double* __restrict__ y,
@@ -398,11 +392,7 @@ extern "C" __global__ void multipolygon_minimum_clearance(
         int ni = ci_end - ci_start;
 
         /* Strip closure vertex */
-        if (ni >= 2) {
-            double dx = x[ci_start] - x[ci_end - 1];
-            double dy = y[ci_start] - y[ci_end - 1];
-            if (dx * dx + dy * dy < 1e-30) ni--;
-        }
+        ni = vs_strip_closure(x, y, ci_start, ci_end, ni, 1e-30);
         if (ni < 2) continue;
 
         for (int rj = ri; rj < last_ring; rj++) {
@@ -411,11 +401,7 @@ extern "C" __global__ void multipolygon_minimum_clearance(
             int nj = cj_end - cj_start;
 
             /* Strip closure vertex */
-            if (nj >= 2) {
-                double dx = x[cj_start] - x[cj_end - 1];
-                double dy = y[cj_start] - y[cj_end - 1];
-                if (dx * dx + dy * dy < 1e-30) nj--;
-            }
+            nj = vs_strip_closure(x, y, cj_start, cj_end, nj, 1e-30);
             if (nj < 2) continue;
 
             const int nsegs_i = ni - 1;

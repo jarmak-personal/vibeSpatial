@@ -67,6 +67,37 @@ def test_record_fallback_event_raises_in_strict_native_mode(monkeypatch: pytest.
 
 @requires_gpu
 @pytest.mark.parametrize(
+    ("fixture_kind", "expected_bounds", "expected_total_bounds"),
+    [
+        (
+            "lines",
+            [[0.0, 0.0, 10.0, 10.0], [20.0, 20.0, 30.0, 30.0]],
+            [0.0, 0.0, 30.0, 30.0],
+        ),
+        (
+            "mixed",
+            [[0.0, 0.0, 10.0, 10.0], [2.0, 2.0, 9.0, 7.0], [4.0, 4.0, 4.0, 4.0]],
+            [0.0, 0.0, 10.0, 10.0],
+        ),
+    ],
+)
+def test_strict_bounds_surfaces_succeed_for_viewport_fixtures(
+    tmp_path: Path,
+    fixture_kind: str,
+    expected_bounds: list[list[float]],
+    expected_total_bounds: list[float],
+) -> None:
+    with strict_native_environment():
+        gdf = _load_viewport_fixture(tmp_path, fixture_kind)
+        bounds = gdf.geometry.bounds
+        total_bounds = gdf.geometry.total_bounds
+
+    assert bounds.values.tolist() == expected_bounds
+    assert total_bounds.tolist() == expected_total_bounds
+
+
+@requires_gpu
+@pytest.mark.parametrize(
     (
         "fixture_kind",
         "expected_geometry_types",

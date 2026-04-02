@@ -308,6 +308,38 @@ def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str |
         return str(exc)
     return None
 
+
+def _geoarrow_constructor_fallback_reason(series) -> str | None:
+    import shapely
+
+    values = np.asarray(series.array)
+    if len(values) == 0:
+        return None
+    missing = shapely.is_missing(values)
+    if bool(missing.all()):
+        return None
+    present = values[~missing]
+    geom_types = {geometry.geom_type for geometry in present}
+    if len(geom_types) == 2 and geom_types in (
+        {"Point", "MultiPoint"},
+        {"LineString", "MultiLineString"},
+        {"Polygon", "MultiPolygon"},
+    ):
+        return None
+    if len(geom_types) != 1:
+        return "Geometry type combination is not supported for native GeoArrow encoding"
+    geom_type = next(iter(geom_types))
+    if geom_type not in {
+        "Point",
+        "LineString",
+        "Polygon",
+        "MultiPoint",
+        "MultiLineString",
+        "MultiPolygon",
+    }:
+        return f"Geometry type combination is not supported for native GeoArrow encoding: {geom_type}"
+    return None
+
 def _construct_geoarrow_array_with_explicit_fallback(
     series,
     *,
@@ -336,21 +368,14 @@ def _construct_geoarrow_array_with_explicit_fallback(
         except Exception as exc:
             fast_path_reason = str(exc)
     values = np.asarray(series.array)
-    try:
-        return construct_geometry_array(
-            values,
-            include_z=include_z,
-            field_name=field_name,
-            crs=series.crs,
-            interleaved=interleaved,
-        )
-    except Exception as exc:
+    constructor_fallback_reason = _geoarrow_constructor_fallback_reason(series)
+    if constructor_fallback_reason is not None:
         if not fallback_to_wkb_on_error:
-            raise
+            raise ValueError(constructor_fallback_reason)
         record_fallback_event(
             surface=surface,
             reason="explicit CPU fallback to WKB until native GeoArrow encoder covers this geometry mix",
-            detail=str(exc),
+            detail=constructor_fallback_reason,
             selected=ExecutionMode.CPU,
             pipeline="io/geoarrow_encode",
             d2h_transfer=True,
@@ -360,6 +385,13 @@ def _construct_geoarrow_array_with_explicit_fallback(
             field_name=field_name,
             crs=series.crs,
         )
+    return construct_geometry_array(
+        values,
+        include_z=include_z,
+        field_name=field_name,
+        crs=series.crs,
+        interleaved=interleaved,
+    )
 
 def _arrow_validity_mask(array) -> np.ndarray:
     if array.null_count == 0:

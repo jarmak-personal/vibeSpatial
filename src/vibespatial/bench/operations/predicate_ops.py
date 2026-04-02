@@ -57,7 +57,6 @@ def bench_gpu_pip(
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
     from vibespatial.cuda._runtime import get_cuda_runtime
     from vibespatial.geometry.owned import (
-        DeviceMetadataState,
         OwnedGeometryArray,
         OwnedGeometryDeviceState,
     )
@@ -116,7 +115,6 @@ def bench_gpu_pip(
             d_v = runtime.from_host(_validity)
             d_t = runtime.from_host(_tags)
             d_f = runtime.from_host(_fro)
-            d_meta = DeviceMetadataState(validity=d_v, tags=d_t, family_row_offsets=d_f)
             d_state = OwnedGeometryDeviceState(
                 validity=d_v, tags=d_t, family_row_offsets=d_f,
                 families=dict(polygons_owned.device_state.families),
@@ -124,7 +122,7 @@ def bench_gpu_pip(
             polygons_owned = OwnedGeometryArray(
                 validity=_validity, tags=_tags, family_row_offsets=_fro,
                 families=polygons_owned.families,
-                residency=Residency.DEVICE, device_state=d_state, device_metadata=d_meta,
+                residency=Residency.DEVICE, device_state=d_state,
             )
         else:
             polygons_owned = OwnedGeometryArray(

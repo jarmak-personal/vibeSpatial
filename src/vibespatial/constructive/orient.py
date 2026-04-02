@@ -256,10 +256,7 @@ def orient_owned(
     )
 
     if selection.selected is ExecutionMode.GPU:
-        try:
-            return _orient_gpu(owned, exterior_cw=exterior_cw)
-        except Exception:
-            pass
+        return _orient_gpu(owned, exterior_cw=exterior_cw)
 
     # CPU fallback (correct exterior/interior handling)
     new_families = {}

@@ -98,6 +98,36 @@ class GeoParquetEngineBenchmark:
     decode_elapsed_seconds: float = 0.0
     concat_elapsed_seconds: float = 0.0
 
+
+_PYLIBCUDF_GEOPARQUET_ENCODINGS = frozenset({
+    "point",
+    "linestring",
+    "polygon",
+    "multipoint",
+    "multilinestring",
+    "multipolygon",
+    "wkb",
+})
+
+
+def _unsupported_pylibcudf_geoparquet_encoding(
+    geo_metadata: dict[str, Any] | None,
+    columns: list[str] | tuple[str, ...] | None = None,
+) -> tuple[str, str | None] | None:
+    if geo_metadata is None:
+        return None
+    requested = set(columns or ())
+    geometry_columns = [
+        name for name in geo_metadata["columns"]
+        if not requested or name in requested
+    ]
+    for column_name in geometry_columns:
+        encoding = geo_metadata["columns"][column_name].get("encoding")
+        normalized = None if encoding is None else str(encoding).lower()
+        if normalized not in _PYLIBCUDF_GEOPARQUET_ENCODINGS:
+            return column_name, normalized
+    return None
+
 def _rebuild_arrow_array_with_schema_type(array, expected_type):
     import pyarrow as pa
 
@@ -208,6 +238,13 @@ def _supports_pylibcudf_geoparquet_read(
             return False, "GeoParquet metadata without a readable primary geometry routes through host pyarrow"
         if "covering" in geo_metadata["columns"][primary]:
             return False, "covering-bbox columns still route through host pyarrow to preserve default projection"
+        unsupported = _unsupported_pylibcudf_geoparquet_encoding(geo_metadata, columns)
+        if unsupported is not None:
+            column_name, encoding = unsupported
+            return (
+                False,
+                f"geometry column {column_name!r} with GeoParquet encoding {encoding!r} still routes through host pyarrow",
+            )
     if not _is_local_geoparquet_file(path):
         return False, "dataset and non-local GeoParquet paths still route through host pyarrow"
     return True, "local single-file GeoParquet scan can use the pylibcudf reader"
@@ -569,37 +606,16 @@ def _read_geoparquet_with_pylibcudf(
         )
         metadata = schema.metadata
         df_attrs = None if metadata is None else metadata.get(b"PANDAS_ATTRS")
-    try:
-        return _pylibcudf_table_to_geopandas(
-            gpu_table,
-            path=path,
-            row_groups=row_groups,
-            filesystem=filesystem,
-            geo_metadata=geo_metadata,
-            schema=schema,
-            to_pandas_kwargs=to_pandas_kwargs,
-            df_attrs=df_attrs,
-        )
-    except NotImplementedError as exc:
-        record_fallback_event(
-            surface="geopandas.read_parquet",
-            reason="explicit CPU fallback until pylibcudf device decode covers the written WKB family",
-            detail=str(exc),
-            selected=ExecutionMode.CPU,
-            pipeline="io/read_parquet",
-            d2h_transfer=True,
-        )
-        pyarrow_table = gpu_table.to_arrow()
-        if schema is not None:
-            pyarrow_table = _rebuild_arrow_table_with_schema(pyarrow_table, schema)
-        from vibespatial.api.io.arrow import _arrow_to_geopandas
-
-        return _arrow_to_geopandas(
-            pyarrow_table,
-            geo_metadata=geo_metadata,
-            to_pandas_kwargs=to_pandas_kwargs,
-            df_attrs=df_attrs,
-        )
+    return _pylibcudf_table_to_geopandas(
+        gpu_table,
+        path=path,
+        row_groups=row_groups,
+        filesystem=filesystem,
+        geo_metadata=geo_metadata,
+        schema=schema,
+        to_pandas_kwargs=to_pandas_kwargs,
+        df_attrs=df_attrs,
+    )
 
 def _read_non_geometry_geoparquet_columns_as_arrow(
     path,
@@ -910,22 +926,24 @@ def _decode_geoparquet_table_to_owned(
     column_index: int | None = None,
 ) -> OwnedGeometryArray:
     if _is_pylibcudf_table(table):
-        try:
-            return _decode_pylibcudf_geoparquet_table_to_owned(
-                table,
-                geo_metadata,
-                column_index=column_index,
-            )
-        except NotImplementedError as exc:
+        unsupported = _unsupported_pylibcudf_geoparquet_encoding(geo_metadata)
+        if unsupported is not None:
+            column_name, encoding = unsupported
             record_fallback_event(
                 surface="vibespatial.io.geoparquet",
-                reason="explicit CPU fallback until pylibcudf device decode covers the current GeoParquet shape",
-                detail=str(exc),
+                reason="explicit CPU fallback until pylibcudf device decode covers the current GeoParquet encoding",
+                detail=f"column={column_name}, encoding={encoding!r}",
                 selected=ExecutionMode.CPU,
                 pipeline="io/read_parquet",
                 d2h_transfer=True,
             )
             table = table.to_arrow()
+        else:
+            return _decode_pylibcudf_geoparquet_table_to_owned(
+                table,
+                geo_metadata,
+                column_index=column_index,
+            )
 
     primary = geo_metadata["primary_column"]
     field_index = table.schema.get_field_index(primary) if column_index is None else int(column_index)

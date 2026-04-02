@@ -21,9 +21,9 @@ from __future__ import annotations
 
 import logging
 
-import numpy as np
-import shapely
-
+from vibespatial.constructive.polygon_difference_cpu import (
+    polygon_difference_cpu as _polygon_difference_cpu,
+)
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
@@ -36,7 +36,6 @@ from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
-    select_precision_plan,
 )
 from vibespatial.runtime.residency import Residency
 
@@ -110,32 +109,6 @@ def _polygon_difference_gpu(
 
 @register_kernel_variant(
     "polygon_difference",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon"),
-    supports_mixed=True,
-    tags=("shapely", "constructive"),
-)
-def _polygon_difference_cpu(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-) -> OwnedGeometryArray:
-    """CPU fallback: Shapely element-wise polygon difference."""
-    left_geoms = left.to_shapely()
-    right_geoms = right.to_shapely()
-
-    left_arr = np.empty(len(left_geoms), dtype=object)
-    left_arr[:] = left_geoms
-    right_arr = np.empty(len(right_geoms), dtype=object)
-    right_arr[:] = right_geoms
-
-    result_arr = shapely.difference(left_arr, right_arr)
-    return from_shapely_geometries(list(result_arr))
-
-
-@register_kernel_variant(
-    "polygon_difference",
     "gpu-overlay",
     kernel_class=KernelClass.CONSTRUCTIVE,
     execution_modes=(ExecutionMode.GPU,),
@@ -204,15 +177,12 @@ def polygon_difference(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=left.row_count,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     # ADR-0002: CONSTRUCTIVE kernels stay fp64. precision_plan is computed
     # for observability (dispatch event detail) only.
-    precision_plan = select_precision_plan(
-        runtime_selection=selection,
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        requested=precision,
-    )
+    precision_plan = selection.precision_plan
 
     gpu_attempted = False
     if selection.selected is ExecutionMode.GPU:

@@ -19,8 +19,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import numpy as np
-
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -149,7 +147,7 @@ def _stage2_partition(
 
     partitions: dict[GeometryFamily, Any] = {}
     for tag, family in _TAG_TO_FAMILY.items():
-        mask = (family_tags == np.int8(tag)) & (is_native == np.uint8(1))
+        mask = (family_tags == cp.int8(tag)) & (is_native == cp.uint8(1))
         row_indexes = cp.flatnonzero(mask).astype(cp.int32, copy=False)
         if int(row_indexes.size) > 0:
             partitions[family] = row_indexes
@@ -628,7 +626,7 @@ def _assemble_mixed(
     tags_device = cp.where(
         valid_mask,
         family_tags.astype(cp.int8, copy=False),
-        np.int8(-1),
+        cp.int8(-1),
     ).astype(cp.int8, copy=False)
 
     family_row_offsets_device = cp.full(record_count, -1, dtype=cp.int32)
@@ -773,53 +771,3 @@ def decode_wkb_device_pipeline(
     return _assemble_mixed(
         partitions, family_buffers, family_tags, is_native, record_count,
     )
-
-
-# ---------------------------------------------------------------------------
-# Input preparation helper
-# ---------------------------------------------------------------------------
-
-def _prepare_device_wkb_input(
-    values: list[bytes | None],
-) -> tuple[Any, Any, np.ndarray]:
-    """Concatenate WKB byte arrays and transfer to device.
-
-    Parameters
-    ----------
-    values : list of bytes or None
-        WKB byte arrays.  None entries produce null rows.
-
-    Returns
-    -------
-    (payload_device, offsets_device, validity_host)
-        payload_device : CuPy uint8 array on device
-        offsets_device : CuPy int32 array on device (length = len(values) + 1)
-        validity_host : numpy bool array (True = non-null)
-    """
-    import cupy as cp
-
-    record_count = len(values)
-    validity_host = np.array([v is not None for v in values], dtype=np.bool_)
-
-    # Build byte offsets and concatenated payload
-    offsets_host = np.empty(record_count + 1, dtype=np.int32)
-    offsets_host[0] = 0
-    total_bytes = 0
-    for i, v in enumerate(values):
-        size = len(v) if v is not None else 0
-        total_bytes += size
-        offsets_host[i + 1] = total_bytes
-
-    if total_bytes > 0:
-        payload_host = np.empty(total_bytes, dtype=np.uint8)
-        for i, v in enumerate(values):
-            if v is not None and len(v) > 0:
-                start = offsets_host[i]
-                payload_host[start:start + len(v)] = np.frombuffer(v, dtype=np.uint8)
-    else:
-        payload_host = np.empty(0, dtype=np.uint8)
-
-    payload_device = cp.asarray(payload_host)
-    offsets_device = cp.asarray(offsets_host)
-
-    return payload_device, offsets_device, validity_host

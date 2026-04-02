@@ -24,8 +24,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import numpy as np
-
+from vibespatial.constructive.polygon_intersection_cpu import (
+    polygon_intersection_cpu as _polygon_intersection_cpu,
+)
+from vibespatial.constructive.polygon_intersection_output import (
+    build_device_backed_polygon_intersection_output,
+    build_empty_device_backed_polygon_intersection_output,
+)
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
@@ -36,13 +41,9 @@ from vibespatial.cuda._runtime import (
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import exclusive_sum
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
-    FAMILY_TAGS,
-    DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
     from_shapely_geometries,
 )
 from vibespatial.kernels.constructive.polygon_intersection_source import (
@@ -54,7 +55,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
-from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
+from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 if TYPE_CHECKING:
@@ -101,69 +102,6 @@ def _polygon_intersection_kernels():
         "polygon-intersection",
         _POLYGON_INTERSECTION_KERNEL_SOURCE,
         _KERNEL_NAMES,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Device-backed OwnedGeometryArray builder
-# ---------------------------------------------------------------------------
-
-def _build_device_backed_polygon_intersection_output(
-    device_x,
-    device_y,
-    *,
-    row_count: int,
-    validity: np.ndarray,
-    geometry_offsets: np.ndarray,
-    ring_offsets: np.ndarray,
-    runtime_selection: RuntimeSelection,
-) -> OwnedGeometryArray:
-    """Build a device-resident OwnedGeometryArray from GPU coordinate buffers.
-
-    Follows the DeviceFamilyGeometryBuffer pattern from
-    ``_build_device_backed_fixed_polygon_output`` but handles variable-length
-    output and per-row validity.
-    """
-    runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    polygon_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.POLYGON,
-        schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
-        row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        ring_offsets=ring_offsets,
-        bounds=None,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.POLYGON: polygon_buffer},
-        residency=Residency.DEVICE,
-        runtime_history=[runtime_selection],
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.POLYGON,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                    ring_offsets=runtime.from_host(ring_offsets),
-                    bounds=None,
-                )
-            },
-        ),
     )
 
 
@@ -246,8 +184,8 @@ def _polygon_intersection_gpu(
     ).astype(cp.int32)
 
     # Allocate output arrays for the count pass
-    d_counts = runtime.allocate((n,), np.int32, zero=True)
-    d_valid = runtime.allocate((n,), np.int32, zero=True)
+    d_counts = runtime.allocate((n,), cp.int32, zero=True)
+    d_valid = runtime.allocate((n,), cp.int32, zero=True)
 
     # Compile and launch count kernel
     kernels = _polygon_intersection_kernels()
@@ -302,8 +240,8 @@ def _polygon_intersection_gpu(
         return _build_empty_result(n, runtime_selection)
 
     # Allocate output coordinate arrays
-    d_out_x = runtime.allocate((total_verts,), np.float64)
-    d_out_y = runtime.allocate((total_verts,), np.float64)
+    d_out_x = runtime.allocate((total_verts,), cp.float64)
+    d_out_y = runtime.allocate((total_verts,), cp.float64)
 
     # Launch scatter kernel
     scatter_params = (
@@ -370,15 +308,13 @@ def _polygon_intersection_gpu(
     # d_valid is already a CuPy array (returned by runtime.allocate), so
     # pass it directly to copy_device_to_host -- no cp.asarray() needed.
     validity = runtime.copy_device_to_host(d_valid).astype(bool)
-    geometry_offsets = np.arange(n + 1, dtype=np.int32)
     ring_offsets = runtime.copy_device_to_host(d_ring_offsets)
 
-    return _build_device_backed_polygon_intersection_output(
+    return build_device_backed_polygon_intersection_output(
         d_out_x,
         d_out_y,
         row_count=n,
         validity=validity,
-        geometry_offsets=geometry_offsets,
         ring_offsets=ring_offsets,
         runtime_selection=runtime_selection,
     )
@@ -386,16 +322,8 @@ def _polygon_intersection_gpu(
 
 def _build_empty_result(n: int, runtime_selection: RuntimeSelection) -> OwnedGeometryArray:
     """Build an all-empty polygon result."""
-    runtime = get_cuda_runtime()
-    d_x = runtime.allocate((0,), np.float64)
-    d_y = runtime.allocate((0,), np.float64)
-    return _build_device_backed_polygon_intersection_output(
-        d_x,
-        d_y,
+    return build_empty_device_backed_polygon_intersection_output(
         row_count=n,
-        validity=np.zeros(n, dtype=bool),
-        geometry_offsets=np.arange(n + 1, dtype=np.int32),
-        ring_offsets=np.zeros(n + 1, dtype=np.int32),
         runtime_selection=runtime_selection,
     )
 
@@ -403,36 +331,6 @@ def _build_empty_result(n: int, runtime_selection: RuntimeSelection) -> OwnedGeo
 # ---------------------------------------------------------------------------
 # Registered kernel variants
 # ---------------------------------------------------------------------------
-
-@register_kernel_variant(
-    "polygon_intersection",
-    "cpu",
-    kernel_class=KernelClass.CONSTRUCTIVE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon"),
-    supports_mixed=False,
-    tags=("shapely", "constructive", "intersection"),
-)
-def _polygon_intersection_cpu(
-    left: OwnedGeometryArray,
-    right: OwnedGeometryArray,
-    *,
-    precision: PrecisionMode | str = PrecisionMode.AUTO,
-) -> OwnedGeometryArray:
-    """CPU fallback: Shapely element-wise polygon intersection."""
-    import shapely
-
-    left_geoms = left.to_shapely()
-    right_geoms = right.to_shapely()
-
-    left_arr = np.empty(len(left_geoms), dtype=object)
-    left_arr[:] = left_geoms
-    right_arr = np.empty(len(right_geoms), dtype=object)
-    right_arr[:] = right_geoms
-
-    result_arr = shapely.intersection(left_arr, right_arr)
-    return from_shapely_geometries(list(result_arr))
-
 
 @register_kernel_variant(
     "polygon_intersection",
@@ -502,15 +400,12 @@ def polygon_intersection(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n,
         requested_mode=dispatch_mode,
+        requested_precision=precision,
     )
 
     if selection.selected is ExecutionMode.GPU:
         # ADR-0002: CONSTRUCTIVE stays fp64; plan is for observability.
-        precision_plan = select_precision_plan(
-            runtime_selection=selection,
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            requested=precision,
-        )
+        precision_plan = selection.precision_plan
 
         try:
             result = _polygon_intersection_gpu(

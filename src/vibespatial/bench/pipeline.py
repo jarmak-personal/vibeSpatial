@@ -17,8 +17,6 @@ from vibespatial.constructive.clip_rect import clip_by_rect_owned
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
 from vibespatial.constructive.make_valid_pipeline import make_valid_owned
 from vibespatial.constructive.point import (
-    POINT_BUFFER_GPU_THRESHOLD,
-    POINT_CLIP_GPU_THRESHOLD,
     clip_points_rect_owned,
     point_buffer_owned_array,
 )
@@ -42,8 +40,10 @@ from vibespatial.kernels.predicates.point_in_polygon import (
 )
 from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, union_all_gpu_owned
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+from vibespatial.runtime.precision import KernelClass
 from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import query_spatial_index
 from vibespatial.testing.synthetic import (
@@ -680,11 +680,13 @@ def _profile_constructive_pipeline(
         with profiler.stage(
             "clip_points",
             category="filter",
-            device=(
-                ExecutionMode.GPU
-                if has_gpu_runtime() and owned.row_count >= POINT_CLIP_GPU_THRESHOLD
-                else ExecutionMode.CPU
-            ),
+            device=plan_dispatch_selection(
+                kernel_name="point_clip",
+                kernel_class=KernelClass.CONSTRUCTIVE,
+                row_count=owned.row_count,
+                requested_mode=ExecutionMode.AUTO,
+                gpu_available=has_gpu_runtime(),
+            ).selected,
             rows_in=owned.row_count,
             detail="clip point rows to an axis-aligned rectangle before buffer expansion",
         ) as stage:
@@ -703,11 +705,13 @@ def _profile_constructive_pipeline(
         with profiler.stage(
             "buffer_points",
             category="refine",
-            device=(
-                ExecutionMode.GPU
-                if has_gpu_runtime() and clipped.row_count >= POINT_BUFFER_GPU_THRESHOLD
-                else ExecutionMode.CPU
-            ),
+            device=plan_dispatch_selection(
+                kernel_name="point_buffer",
+                kernel_class=KernelClass.CONSTRUCTIVE,
+                row_count=clipped.row_count,
+                requested_mode=ExecutionMode.AUTO,
+                gpu_available=has_gpu_runtime(),
+            ).selected,
             rows_in=int(clipped.row_count),
             detail="expand surviving point rows into buffer polygons",
         ) as stage:
@@ -1537,20 +1541,14 @@ def _profile_vegetation_corridor_pipeline(
         # Ensure both corridor and vegetation are valid before overlay —
         # buffer+dissolve can produce ring edge artifacts that cause
         # TopologyException or IllegalArgumentException in GEOS.
-        try:
-            _corridor_valid = make_valid_owned(owned=corridor_owned)
-            if _corridor_valid.owned is not None:
-                corridor_owned = _corridor_valid.owned
-            del _corridor_valid
-        except Exception:
-            pass  # keep original corridor if make_valid fails
-        try:
-            _veg_valid = make_valid_owned(owned=veg_owned)
-            if _veg_valid.owned is not None:
-                veg_owned = _veg_valid.owned
-            del _veg_valid
-        except Exception:
-            pass  # keep original vegetation if make_valid fails
+        _corridor_valid = make_valid_owned(owned=corridor_owned)
+        if _corridor_valid.owned is not None:
+            corridor_owned = _corridor_valid.owned
+        del _corridor_valid
+        _veg_valid = make_valid_owned(owned=veg_owned)
+        if _veg_valid.owned is not None:
+            veg_owned = _veg_valid.owned
+        del _veg_valid
         # Release make_valid intermediates before the overlay stage;
         # overlay allocates large device buffers and needs headroom.
         _free_gpu_pool_memory()

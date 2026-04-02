@@ -137,18 +137,94 @@ class DeviceFamilyGeometryBuffer:
     bounds: DeviceArray | None = None
 
 
-@dataclass
-class DeviceMetadataState:
-    """Device-resident copies of the three routing metadata arrays.
+def build_updated_device_family_buffer(
+    family: GeometryFamily,
+    device_buf: DeviceFamilyGeometryBuffer,
+    d_x_out: DeviceArray,
+    d_y_out: DeviceArray,
+    d_new_offsets: DeviceArray,
+) -> DeviceFamilyGeometryBuffer:
+    """Rebuild a device family buffer after a span-preserving coordinate rewrite."""
+    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=d_x_out,
+            y=d_y_out,
+            geometry_offsets=device_buf.geometry_offsets,
+            empty_mask=device_buf.empty_mask,
+            part_offsets=device_buf.part_offsets,
+            ring_offsets=d_new_offsets,
+            bounds=None,
+        )
+    if family is GeometryFamily.MULTILINESTRING:
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=d_x_out,
+            y=d_y_out,
+            geometry_offsets=device_buf.geometry_offsets,
+            empty_mask=device_buf.empty_mask,
+            part_offsets=d_new_offsets,
+            ring_offsets=device_buf.ring_offsets,
+            bounds=None,
+        )
+    return DeviceFamilyGeometryBuffer(
+        family=family,
+        x=d_x_out,
+        y=d_y_out,
+        geometry_offsets=d_new_offsets,
+        empty_mask=device_buf.empty_mask,
+        part_offsets=device_buf.part_offsets,
+        ring_offsets=device_buf.ring_offsets,
+        bounds=None,
+    )
 
-    When ``residency=DEVICE``, these arrays live on GPU and the
-    corresponding host numpy arrays in :class:`OwnedGeometryArray` may be
-    ``None``.  Accessing the host properties triggers a lazy D->H transfer.
-    """
 
-    validity: DeviceArray      # bool
-    tags: DeviceArray          # int8
-    family_row_offsets: DeviceArray  # int32
+def build_updated_host_family_buffer(
+    family: GeometryFamily,
+    host_buf: FamilyGeometryBuffer,
+    x_out: np.ndarray,
+    y_out: np.ndarray,
+    new_offsets: np.ndarray,
+) -> FamilyGeometryBuffer:
+    """Rebuild a host family buffer after a span-preserving coordinate rewrite."""
+    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+        return FamilyGeometryBuffer(
+            family=family,
+            schema=host_buf.schema,
+            row_count=host_buf.row_count,
+            x=x_out,
+            y=y_out,
+            geometry_offsets=host_buf.geometry_offsets,
+            empty_mask=host_buf.empty_mask,
+            part_offsets=host_buf.part_offsets,
+            ring_offsets=new_offsets,
+            bounds=None,
+        )
+    if family is GeometryFamily.MULTILINESTRING:
+        return FamilyGeometryBuffer(
+            family=family,
+            schema=host_buf.schema,
+            row_count=host_buf.row_count,
+            x=x_out,
+            y=y_out,
+            geometry_offsets=host_buf.geometry_offsets,
+            empty_mask=host_buf.empty_mask,
+            part_offsets=new_offsets,
+            ring_offsets=host_buf.ring_offsets,
+            bounds=None,
+        )
+    return FamilyGeometryBuffer(
+        family=family,
+        schema=host_buf.schema,
+        row_count=host_buf.row_count,
+        x=x_out,
+        y=y_out,
+        geometry_offsets=new_offsets,
+        empty_mask=host_buf.empty_mask,
+        part_offsets=host_buf.part_offsets,
+        ring_offsets=host_buf.ring_offsets,
+        bounds=None,
+    )
 
 
 @dataclass
@@ -185,7 +261,6 @@ class OwnedGeometryArray:
         shares_geoarrow_memory: bool = False,
         device_adopted: bool = False,
         device_state: OwnedGeometryDeviceState | None = None,
-        device_metadata: DeviceMetadataState | None = None,
         _row_count: int | None = None,
     ) -> None:
         self._validity = validity
@@ -199,7 +274,6 @@ class OwnedGeometryArray:
         self.shares_geoarrow_memory = shares_geoarrow_memory
         self.device_adopted = device_adopted
         self.device_state = device_state
-        self._device_metadata = device_metadata
         # Indexed-view support: when take() detects high index repetition,
         # the result stores a compact base array plus an index map instead
         # of physically copying all coordinate data.  This avoids OOM when
@@ -217,14 +291,12 @@ class OwnedGeometryArray:
             self._row_count = _row_count
         elif validity is not None:
             self._row_count = int(validity.size)
-        elif device_metadata is not None:
-            self._row_count = int(device_metadata.validity.size)
         elif device_state is not None:
             self._row_count = int(device_state.validity.size)
         else:
             raise ValueError(
                 "Cannot determine row_count: provide validity or "
-                "device_metadata or _row_count"
+                "device_state or _row_count"
             )
 
     # ------------------------------------------------------------------
@@ -235,23 +307,94 @@ class OwnedGeometryArray:
         """Transfer device metadata arrays to host if not already present."""
         if self._validity is not None:
             return  # already materialised
-        dm = self._device_metadata
-        if dm is None and self.device_state is not None:
-            # Fall back to device_state (pre-existing arrays)
-            dm = DeviceMetadataState(
-                validity=self.device_state.validity,
-                tags=self.device_state.tags,
-                family_row_offsets=self.device_state.family_row_offsets,
-            )
-        if dm is None:
+        if self.device_state is None:
             raise RuntimeError(
                 "Host metadata is None and no device metadata available "
                 "for lazy materialisation"
             )
         runtime = get_cuda_runtime()
-        self._validity = runtime.copy_device_to_host(dm.validity)
-        self._tags = runtime.copy_device_to_host(dm.tags)
-        self._family_row_offsets = runtime.copy_device_to_host(dm.family_row_offsets)
+        self._validity = runtime.copy_device_to_host(self.device_state.validity)
+        self._tags = runtime.copy_device_to_host(self.device_state.tags)
+        self._family_row_offsets = runtime.copy_device_to_host(self.device_state.family_row_offsets)
+
+    def _ensure_host_family_structure(self, family: GeometryFamily) -> None:
+        """Materialize host-side structural arrays for one family without x/y."""
+        if family not in self.families:
+            return
+        buffer = self.families[family]
+        if buffer.host_materialized:
+            return
+        if self.device_state is None or family not in self.device_state.families:
+            return
+
+        device_buffer = self.device_state.families[family]
+        need_geometry_offsets = buffer.geometry_offsets.size == 0
+        need_empty_mask = buffer.empty_mask.size == 0
+        need_part_offsets = buffer.part_offsets is None and device_buffer.part_offsets is not None
+        need_ring_offsets = buffer.ring_offsets is None and device_buffer.ring_offsets is not None
+        need_bounds = buffer.bounds is None and device_buffer.bounds is not None
+        if not any(
+            (
+                need_geometry_offsets,
+                need_empty_mask,
+                need_part_offsets,
+                need_ring_offsets,
+                need_bounds,
+            )
+        ):
+            return
+
+        runtime = get_cuda_runtime()
+        geometry_offsets = (
+            runtime.copy_device_to_host(device_buffer.geometry_offsets)
+            if need_geometry_offsets
+            else buffer.geometry_offsets
+        )
+        empty_mask = (
+            runtime.copy_device_to_host(device_buffer.empty_mask)
+            if need_empty_mask
+            else buffer.empty_mask
+        )
+        part_offsets = (
+            runtime.copy_device_to_host(device_buffer.part_offsets)
+            if need_part_offsets
+            else buffer.part_offsets
+        )
+        ring_offsets = (
+            runtime.copy_device_to_host(device_buffer.ring_offsets)
+            if need_ring_offsets
+            else buffer.ring_offsets
+        )
+        bounds = (
+            runtime.copy_device_to_host(device_buffer.bounds)
+            if need_bounds
+            else buffer.bounds
+        )
+        self.families[family] = FamilyGeometryBuffer(
+            family=buffer.family,
+            schema=buffer.schema,
+            row_count=buffer.row_count,
+            x=buffer.x,
+            y=buffer.y,
+            geometry_offsets=np.ascontiguousarray(geometry_offsets, dtype=np.int32),
+            empty_mask=np.ascontiguousarray(empty_mask, dtype=np.bool_),
+            part_offsets=(
+                None
+                if part_offsets is None
+                else np.ascontiguousarray(part_offsets, dtype=np.int32)
+            ),
+            ring_offsets=(
+                None
+                if ring_offsets is None
+                else np.ascontiguousarray(ring_offsets, dtype=np.int32)
+            ),
+            bounds=(
+                None
+                if bounds is None
+                else np.ascontiguousarray(bounds, dtype=np.float64)
+            ),
+            host_materialized=False,
+        )
 
     @property
     def validity(self) -> np.ndarray:
@@ -331,11 +474,11 @@ class OwnedGeometryArray:
             d_expanded_validity = ds.validity[index_map]
             d_expanded_tags = ds.tags[index_map]
             d_expanded_fro = ds.family_row_offsets[index_map]
-
-            d_meta = DeviceMetadataState(
+            d_state = OwnedGeometryDeviceState(
                 validity=d_expanded_validity,
                 tags=d_expanded_tags,
                 family_row_offsets=d_expanded_fro,
+                families=dict(ds.families),
             )
 
             view = cls(
@@ -344,8 +487,7 @@ class OwnedGeometryArray:
                 family_row_offsets=None,
                 families=base.families,
                 residency=Residency.DEVICE,
-                device_state=base.device_state,
-                device_metadata=d_meta,
+                device_state=d_state,
                 _row_count=index_map_size,
             )
             view._base = base
@@ -370,7 +512,6 @@ class OwnedGeometryArray:
                 families=base.families,
                 residency=base.residency,
                 device_state=base.device_state,
-                device_metadata=base._device_metadata,
                 _row_count=index_map_size,
             )
             view._base = base
@@ -421,7 +562,6 @@ class OwnedGeometryArray:
         self.families = resolved.families
         self.residency = resolved.residency
         self.device_state = resolved.device_state
-        self._device_metadata = resolved._device_metadata
         self._base = None
         self._index_map = None
         self._record(
@@ -455,7 +595,6 @@ class OwnedGeometryArray:
         self.families = resolved.families
         self.residency = resolved.residency
         self.device_state = resolved.device_state
-        self._device_metadata = resolved._device_metadata
         self._base = None
         self._index_map = None
         self._record(
@@ -656,11 +795,6 @@ class OwnedGeometryArray:
         d_validity = runtime.from_host(self.validity)
         d_tags = runtime.from_host(self.tags)
         d_family_row_offsets = runtime.from_host(self.family_row_offsets)
-        self._device_metadata = DeviceMetadataState(
-            validity=d_validity,
-            tags=d_tags,
-            family_row_offsets=d_family_row_offsets,
-        )
         self.device_state = OwnedGeometryDeviceState(
             validity=d_validity,
             tags=d_tags,
@@ -960,11 +1094,6 @@ class OwnedGeometryArray:
 
         # 6. Assemble device-resident OGA -- host metadata arrays are None;
         #    lazy _ensure_host_metadata() will transfer on first access.
-        d_meta = DeviceMetadataState(
-            validity=d_all_validity,
-            tags=d_all_tags,
-            family_row_offsets=d_all_family_row_offsets,
-        )
         result = OwnedGeometryArray(
             validity=None,
             tags=None,
@@ -977,7 +1106,6 @@ class OwnedGeometryArray:
                 family_row_offsets=d_all_family_row_offsets,
                 families=new_device_families,
             ),
-            device_metadata=d_meta,
             _row_count=total_rows,
         )
         result._record(
@@ -1210,12 +1338,6 @@ class OwnedGeometryArray:
 
         # Keep metadata device-only — host arrays stay None.
         # Lazy _ensure_host_metadata() will transfer on first property access.
-        d_meta = DeviceMetadataState(
-            validity=d_new_validity,
-            tags=d_new_tags,
-            family_row_offsets=d_new_family_row_offsets,
-        )
-
         result = OwnedGeometryArray(
             validity=None,
             tags=None,
@@ -1228,7 +1350,6 @@ class OwnedGeometryArray:
                 family_row_offsets=d_new_family_row_offsets,
                 families=new_device_families,
             ),
-            device_metadata=d_meta,
             _row_count=int(d_indices.size),
         )
         result._record(
@@ -2669,12 +2790,6 @@ def build_device_resident_owned(
     d_tags = runtime.from_host(tags)
     d_family_row_offsets = runtime.from_host(family_row_offsets)
 
-    d_meta = DeviceMetadataState(
-        validity=d_validity,
-        tags=d_tags,
-        family_row_offsets=d_family_row_offsets,
-    )
-
     result = OwnedGeometryArray(
         validity=validity,
         tags=tags,
@@ -2687,7 +2802,6 @@ def build_device_resident_owned(
             family_row_offsets=d_family_row_offsets,
             families=device_families,
         ),
-        device_metadata=d_meta,
     )
     result._record(
         DiagnosticKind.CREATED,
@@ -2759,11 +2873,6 @@ def tile_single_row(
         d_validity = runtime.from_host(validity)
         d_tags = runtime.from_host(tags)
         d_fro = runtime.from_host(family_row_offsets)
-        d_meta = DeviceMetadataState(
-            validity=d_validity,
-            tags=d_tags,
-            family_row_offsets=d_fro,
-        )
         d_state = OwnedGeometryDeviceState(
             validity=d_validity,
             tags=d_tags,
@@ -2777,7 +2886,6 @@ def tile_single_row(
             families=owned.families,  # shared reference (read-only usage)
             residency=Residency.DEVICE,
             device_state=d_state,
-            device_metadata=d_meta,
         )
     else:
         result = OwnedGeometryArray(

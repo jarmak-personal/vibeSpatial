@@ -9,8 +9,8 @@ from vibespatial.cuda.cccl_primitives import (
     lower_bound,
     upper_bound,
 )
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
-from vibespatial.runtime.crossover import DispatchDecision
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
@@ -338,9 +338,6 @@ def _generate_candidates_gpu(
     Returns (left_indices, right_indices) as host np.int32 arrays,
     or None if GPU dispatch is skipped (not available or below crossover).
     """
-    if not has_gpu_runtime():
-        return None
-
     query_count = query_bounds.shape[0]
     tree_count = tree_bounds.shape[0]
 
@@ -349,14 +346,13 @@ def _generate_candidates_gpu(
         return empty, empty
 
     # Crossover check: total bbox overlap work must justify GPU launch
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
         row_count=query_count * tree_count,
-        gpu_available=True,
+        gpu_available=has_gpu_runtime(),
     )
-    dispatch = plan.dispatch_decision
-    if dispatch is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     if query_count == 1:
@@ -404,22 +400,19 @@ def _count_candidates_gpu(
     dispatch is skipped.  This is the optimal path for ``output_format="count"``
     queries where the caller needs only the total, not the pair arrays.
     """
-    if not has_gpu_runtime():
-        return None
-
     query_count = query_bounds.shape[0]
     tree_count = tree_bounds.shape[0]
 
     if query_count == 0 or tree_count == 0:
         return 0
 
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
         row_count=query_count * tree_count,
-        gpu_available=True,
+        gpu_available=has_gpu_runtime(),
     )
-    if plan.dispatch_decision is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     runtime = get_cuda_runtime()
@@ -477,23 +470,19 @@ def _generate_candidates_gpu_device(
 
     Returns _DeviceCandidates or None if GPU dispatch is skipped.
     """
-    if not has_gpu_runtime():
-        return None
-
     query_count = query_bounds.shape[0]
     tree_count = tree_bounds.shape[0]
 
     if query_count == 0 or tree_count == 0:
         return None
 
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="bbox_overlap_candidates",
         kernel_class=KernelClass.COARSE,
         row_count=query_count * tree_count,
-        gpu_available=True,
+        gpu_available=has_gpu_runtime(),
     )
-    dispatch = plan.dispatch_decision
-    if dispatch is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     if query_count == 1:
@@ -531,12 +520,18 @@ def _generate_candidates_morton_range_gpu(
     Uses the FlatSpatialIndex's sorted Morton keys to narrow candidates via
     LCP-based range binary search, then refines with bbox overlap.
     """
-    if not has_gpu_runtime():
-        return None
-
     query_count = query_bounds.shape[0]
     tree_count = flat_index.size
     if query_count == 0 or tree_count == 0:
+        return None
+
+    selection = plan_dispatch_selection(
+        kernel_name="morton_range_candidates",
+        kernel_class=KernelClass.COARSE,
+        row_count=query_count * tree_count,
+        gpu_available=has_gpu_runtime(),
+    )
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     total_bounds = flat_index.total_bounds

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from vibespatial.constructive.measurement import _coord_stats_from_owned
+from vibespatial.constructive.normalize_cpu import _normalize_cpu
 from vibespatial.constructive.normalize_kernels import (
     _LINE_KERNEL_NAMES,
     _LINE_KERNEL_SOURCE,
@@ -28,22 +30,18 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
+from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup as _request_nvrtc
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
-    from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.crossover import default_crossover_policy
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-
-_NORMALIZE_GPU_THRESHOLD = 500
-
-# Precompile both precision variants (ADR-0034)
-from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup as _request_nvrtc  # noqa: E402
 
 for _ct in ("float", "double"):
     _ring_src = _RING_KERNEL_SOURCE.format(compute_type=_ct)
@@ -79,49 +77,20 @@ def normalize_owned(
         requested_mode=dispatch_mode,
     )
 
-    if selection.selected is ExecutionMode.GPU and row_count >= _NORMALIZE_GPU_THRESHOLD:
-        try:
-            result = _normalize_gpu(owned, precision=precision)
-            if result is not None:
-                record_dispatch_event(
-                    surface="normalize",
-                    operation="normalize",
-                    implementation="gpu_nvrtc_ring_rotate",
-                    reason="GPU ring rotation + linestring reversal",
-                    detail=f"rows={row_count}",
-                    selected=ExecutionMode.GPU,
-                )
-                return result
-        except Exception:
-            pass
+    if selection.selected is ExecutionMode.GPU:
+        result = _normalize_gpu(owned, precision=precision)
+        if result is not None:
+            record_dispatch_event(
+                surface="normalize",
+                operation="normalize",
+                implementation="gpu_nvrtc_ring_rotate",
+                reason="GPU ring rotation + linestring reversal",
+                detail=f"rows={row_count}",
+                selected=ExecutionMode.GPU,
+            )
+            return result
 
     return _normalize_cpu(owned)
-
-
-@register_kernel_variant(
-    "normalize",
-    "cpu",
-    kernel_class=KernelClass.COARSE,
-    execution_modes=(ExecutionMode.CPU,),
-    geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
-    supports_mixed=True,
-    tags=("shapely",),
-)
-def _normalize_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
-    """CPU fallback: Shapely normalize."""
-    import shapely
-
-    record_dispatch_event(
-        surface="normalize",
-        operation="normalize",
-        implementation="shapely",
-        reason="CPU fallback",
-        detail=f"rows={owned.row_count}",
-        selected=ExecutionMode.CPU,
-    )
-    geoms = owned.to_shapely()
-    result = shapely.normalize(np.asarray(geoms, dtype=object))
-    return from_shapely_geometries(result.tolist())
 
 
 @register_kernel_variant(
@@ -131,7 +100,7 @@ def _normalize_cpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=("polygon", "multipolygon", "linestring", "multilinestring", "point", "multipoint"),
     supports_mixed=True,
-    min_rows=_NORMALIZE_GPU_THRESHOLD,
+    min_rows=default_crossover_policy("normalize", KernelClass.COARSE).auto_min_rows,
     tags=("cuda-python", "ring-rotation", "linestring-reversal"),
 )
 def _normalize_gpu(
@@ -140,33 +109,24 @@ def _normalize_gpu(
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> OwnedGeometryArray | None:
     """GPU path: NVRTC ring rotation + linestring reversal."""
-    from vibespatial.runtime import RuntimeSelection, has_gpu_runtime
-    from vibespatial.runtime.precision import CoordinateStats, select_precision_plan
+    from vibespatial.runtime import has_gpu_runtime
+    from vibespatial.runtime.precision import CoordinateStats
 
     if not has_gpu_runtime():
         return None
 
-    # ADR-0002: select compute precision
-    runtime_sel = RuntimeSelection(
-        requested=ExecutionMode.AUTO,
-        selected=ExecutionMode.GPU,
-        reason="normalize GPU dispatch",
-    )
-    max_abs = 0.0
-    coord_min, coord_max = np.inf, -np.inf
-    for buf in owned.families.values():
-        if buf.row_count > 0 and buf.x.size > 0:
-            max_abs = max(max_abs, float(np.abs(buf.x).max()), float(np.abs(buf.y).max()))
-            coord_min = min(coord_min, float(buf.x.min()), float(buf.y.min()))
-            coord_max = max(coord_max, float(buf.x.max()), float(buf.y.max()))
+    max_abs, coord_min, coord_max = _coord_stats_from_owned(owned)
     span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
 
-    precision_plan = select_precision_plan(
-        runtime_selection=runtime_sel,
+    selection = plan_dispatch_selection(
+        kernel_name="normalize",
         kernel_class=KernelClass.COARSE,
-        requested=precision,
+        row_count=owned.row_count,
+        requested_mode=ExecutionMode.GPU,
+        requested_precision=precision,
         coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
     )
+    precision_plan = selection.precision_plan
     compute_type = "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"
     center_x, center_y = 0.0, 0.0
     if precision_plan.center_coordinates:
@@ -179,11 +139,30 @@ def _normalize_gpu(
         if buf.row_count == 0:
             new_families[family_key] = buf
             continue
+        device_buffer = None
+        if owned.device_state is not None and family_key in owned.device_state.families:
+            device_buffer = owned.device_state.families[family_key]
+            owned._ensure_host_family_structure(family_key)
+            buf = owned.families[family_key]
 
         if family_key in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-            new_buf = _normalize_polygon_family_gpu(buf, family_key, compute_type, center_x, center_y)
+            new_buf = _normalize_polygon_family_gpu(
+                buf,
+                family_key,
+                compute_type,
+                center_x,
+                center_y,
+                device_buffer=device_buffer,
+            )
         elif family_key in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING):
-            new_buf = _normalize_linestring_family_gpu(buf, family_key, compute_type, center_x, center_y)
+            new_buf = _normalize_linestring_family_gpu(
+                buf,
+                family_key,
+                compute_type,
+                center_x,
+                center_y,
+                device_buffer=device_buffer,
+            )
         else:
             # Points: no normalization needed
             new_buf = buf
@@ -198,14 +177,32 @@ def _normalize_gpu(
     )
 
 
-def _normalize_polygon_family_gpu(buf, family, compute_type, center_x, center_y):
+def _normalize_polygon_family_gpu(
+    buf,
+    family,
+    compute_type,
+    center_x,
+    center_y,
+    *,
+    device_buffer=None,
+):
     """Rotate all rings in a polygon family to start at lex-smallest vertex."""
-    if buf.ring_offsets is None or len(buf.ring_offsets) < 2:
-        return buf
-
     runtime = get_cuda_runtime()
-    ring_offsets = buf.ring_offsets.astype(np.int32)
-    total_rings = len(ring_offsets) - 1
+    needs_free = device_buffer is None
+    if device_buffer is not None:
+        if device_buffer.ring_offsets is None or int(device_buffer.ring_offsets.size) < 2:
+            return buf
+        d_x = device_buffer.x
+        d_y = device_buffer.y
+        d_ring_offsets = device_buffer.ring_offsets
+        total_rings = int(d_ring_offsets.size) - 1
+        total_coords = int(d_x.size)
+    else:
+        if buf.ring_offsets is None or len(buf.ring_offsets) < 2:
+            return buf
+        ring_offsets = buf.ring_offsets.astype(np.int32)
+        total_rings = len(ring_offsets) - 1
+        total_coords = len(buf.x)
 
     if total_rings <= 0:
         return buf
@@ -214,17 +211,17 @@ def _normalize_polygon_family_gpu(buf, family, compute_type, center_x, center_y)
     ring_src = _RING_KERNEL_SOURCE.format(compute_type=compute_type)
     kernels = compile_kernel_group(f"normalize-ring-{compute_type}", ring_src, _RING_KERNEL_NAMES)
 
-    # Upload data
-    d_x = runtime.from_host(buf.x)
-    d_y = runtime.from_host(buf.y)
-    d_ring_offsets = runtime.from_host(ring_offsets)
     d_min_index = runtime.allocate((total_rings,), np.int32, zero=True)
 
     # Allocate output coordinate buffers
-    d_x_out = runtime.allocate((len(buf.x),), np.float64)
-    d_y_out = runtime.allocate((len(buf.y),), np.float64)
+    d_x_out = runtime.allocate((total_coords,), np.float64)
+    d_y_out = runtime.allocate((total_coords,), np.float64)
 
     try:
+        if needs_free:
+            d_x = runtime.from_host(buf.x)
+            d_y = runtime.from_host(buf.y)
+            d_ring_offsets = runtime.from_host(ring_offsets)
         ptr = runtime.pointer
 
         # Pass 1: find lex-min vertex per ring
@@ -250,7 +247,10 @@ def _normalize_polygon_family_gpu(buf, family, compute_type, center_x, center_y)
         x_out = runtime.copy_device_to_host(d_x_out)
         y_out = runtime.copy_device_to_host(d_y_out)
     finally:
-        for d in (d_x, d_y, d_ring_offsets, d_min_index, d_x_out, d_y_out):
+        if needs_free:
+            for d in (d_x, d_y, d_ring_offsets):
+                runtime.free(d)
+        for d in (d_min_index, d_x_out, d_y_out):
             runtime.free(d)
 
     return FamilyGeometryBuffer(
@@ -266,12 +266,29 @@ def _normalize_polygon_family_gpu(buf, family, compute_type, center_x, center_y)
     )
 
 
-def _normalize_linestring_family_gpu(buf, family, compute_type, center_x, center_y):
+def _normalize_linestring_family_gpu(
+    buf,
+    family,
+    compute_type,
+    center_x,
+    center_y,
+    *,
+    device_buffer=None,
+):
     """Reverse linestrings where endpoint < startpoint (lex order)."""
+    import cupy as cp
+
     runtime = get_cuda_runtime()
 
     # For multi-linestrings, use part_offsets as the geometry boundaries
-    if buf.part_offsets is not None:
+    needs_free = device_buffer is None
+    if device_buffer is not None and device_buffer.part_offsets is not None:
+        d_offsets = device_buffer.part_offsets
+        row_count = int(d_offsets.size) - 1
+    elif device_buffer is not None:
+        d_offsets = device_buffer.geometry_offsets
+        row_count = buf.row_count
+    elif buf.part_offsets is not None:
         offsets = buf.part_offsets.astype(np.int32)
         row_count = len(offsets) - 1
     else:
@@ -285,11 +302,15 @@ def _normalize_linestring_family_gpu(buf, family, compute_type, center_x, center
     kernels = compile_kernel_group(f"normalize-linestring-{compute_type}", line_src, _LINE_KERNEL_NAMES)
 
     # Copy coordinates (kernel reverses in-place)
-    x_out = buf.x.copy()
-    y_out = buf.y.copy()
-    d_x = runtime.from_host(x_out)
-    d_y = runtime.from_host(y_out)
-    d_offsets = runtime.from_host(offsets)
+    if device_buffer is not None:
+        d_x = cp.asarray(device_buffer.x).copy()
+        d_y = cp.asarray(device_buffer.y).copy()
+    else:
+        x_out = buf.x.copy()
+        y_out = buf.y.copy()
+        d_x = runtime.from_host(x_out)
+        d_y = runtime.from_host(y_out)
+        d_offsets = runtime.from_host(offsets)
 
     try:
         ptr = runtime.pointer
@@ -306,7 +327,8 @@ def _normalize_linestring_family_gpu(buf, family, compute_type, center_x, center
     finally:
         runtime.free(d_x)
         runtime.free(d_y)
-        runtime.free(d_offsets)
+        if needs_free:
+            runtime.free(d_offsets)
 
     return FamilyGeometryBuffer(
         family=buf.family,

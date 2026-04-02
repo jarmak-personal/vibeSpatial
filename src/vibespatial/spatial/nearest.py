@@ -15,8 +15,8 @@ from vibespatial.cuda.cccl_primitives import (
     sort_pairs,
     upper_bound,
 )
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
-from vibespatial.runtime.crossover import DispatchDecision
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
@@ -1114,14 +1114,13 @@ def _nearest_indexed_point_gpu(
     if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
         return None
 
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="nearest_knn_indexed",
         kernel_class=KernelClass.COARSE,
         row_count=query_owned.row_count + tree_owned.row_count,
         gpu_available=True,
     )
-    dispatch = plan.dispatch_decision
-    if dispatch is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     import cupy as cp
@@ -1332,14 +1331,13 @@ def _generate_point_nearest_candidates_gpu(
     if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
         return None
 
-    plan = plan_kernel_dispatch(
+    selection = plan_dispatch_selection(
         kernel_name="point_nearest_candidates",
         kernel_class=KernelClass.METRIC,
         row_count=query_owned.row_count * tree_owned.row_count,
         gpu_available=True,
     )
-    dispatch = plan.dispatch_decision
-    if dispatch is not DispatchDecision.GPU:
+    if selection.selected is not ExecutionMode.GPU:
         return None
 
     import cupy as cp
@@ -2335,14 +2333,13 @@ def nearest_spatial_index(
         return result, "owned_cpu_nearest"
 
     # --- NEW: Try zero-copy GPU grid nearest (bypasses _to_owned entirely) ---
-    if has_gpu_runtime():
-        grid_result = _nearest_grid_gpu(
-            tree_geometries, query_values,
-            return_all=return_all, return_distance=return_distance,
-            exclusive=exclusive, max_distance=max_distance,
-        )
-        if grid_result is not None:
-            return grid_result
+    grid_result = _nearest_grid_gpu(
+        tree_geometries, query_values,
+        return_all=return_all, return_distance=return_distance,
+        exclusive=exclusive, max_distance=max_distance,
+    )
+    if grid_result is not None:
+        return grid_result
 
     # --- Convert owned arrays and compute bounds (shared by both paths) ---
     query_owned = _to_owned(query_values)
@@ -2361,39 +2358,38 @@ def nearest_spatial_index(
     if indexed_result is not None:
         return indexed_result
 
-    query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
-    tree_bounds = compute_geometry_bounds(tree_owned, dispatch_mode=_gpu_bounds_dispatch_mode())
+    query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
+    tree_bounds = compute_geometry_bounds(tree_owned, dispatch_mode=_gpu_bounds_dispatch_mode(tree_owned))
 
     # --- Try device-side k-NN query (vibeSpatial-247.7.2) ---------------------
     # Unified GPU pipeline: candidate generation -> exact distance -> top-k.
-    if has_gpu_runtime():
-        from .spatial_index_knn_device import spatial_index_knn_device
+    from .spatial_index_knn_device import spatial_index_knn_device
 
-        knn_result = spatial_index_knn_device(
-            query_owned,
-            tree_owned,
-            query_bounds,
-            tree_bounds,
-            k=1,
-            max_distance=max_distance,
-            exclusive=exclusive,
-            return_all=return_all,
-        )
-        if knn_result is not None and knn_result.total_pairs > 0:
-            runtime = get_cuda_runtime()
-            h_left = runtime.copy_device_to_host(
-                knn_result.d_query_idx,
-            ).astype(np.intp, copy=False)
-            h_right = runtime.copy_device_to_host(
-                knn_result.d_target_idx,
-            ).astype(np.intp, copy=False)
-            indices = np.vstack((h_left, h_right))
-            if return_distance:
-                h_dist = runtime.copy_device_to_host(
-                    knn_result.d_distances,
-                ).astype(np.float64, copy=False)
-                return (indices, h_dist), "owned_gpu_nearest"
-            return indices, "owned_gpu_nearest"
+    knn_result = spatial_index_knn_device(
+        query_owned,
+        tree_owned,
+        query_bounds,
+        tree_bounds,
+        k=1,
+        max_distance=max_distance,
+        exclusive=exclusive,
+        return_all=return_all,
+    )
+    if knn_result is not None and knn_result.total_pairs > 0:
+        runtime = get_cuda_runtime()
+        h_left = runtime.copy_device_to_host(
+            knn_result.d_query_idx,
+        ).astype(np.intp, copy=False)
+        h_right = runtime.copy_device_to_host(
+            knn_result.d_target_idx,
+        ).astype(np.intp, copy=False)
+        indices = np.vstack((h_left, h_right))
+        if return_distance:
+            h_dist = runtime.copy_device_to_host(
+                knn_result.d_distances,
+            ).astype(np.float64, copy=False)
+            return (indices, h_dist), "owned_gpu_nearest"
+        return indices, "owned_gpu_nearest"
 
     # --- Effective max_distance -----------------------------------------------
     # When max_distance is None (unbounded nearest) compute an effective ceiling
@@ -2408,14 +2404,13 @@ def nearest_spatial_index(
     else:
         n_queries = len(query_values)
         n_tree = len(tree_geometries)
-        plan = plan_kernel_dispatch(
+        selection = plan_dispatch_selection(
             kernel_name="nearest_knn_brute",
             kernel_class=KernelClass.COARSE,
             row_count=n_queries * n_tree,
             gpu_available=has_gpu_runtime(),
         )
-        dispatch = plan.dispatch_decision
-        if dispatch is not DispatchDecision.GPU:
+        if selection.selected is not ExecutionMode.GPU:
             # Below crossover -- STRtree kNN is more efficient for small data.
             result = tree_query_nearest(
                 query_values,
@@ -2493,22 +2488,21 @@ def nearest_spatial_index(
     # When GPU is available and both arrays contain only points, run the entire
     # distance/reduce/filter pipeline on device to avoid the Shapely host path.
     # Works for both GPU-generated and CPU-generated candidate pairs.
-    if has_gpu_runtime():
-        gpu_result = _nearest_refine_gpu(
-            query_owned,
-            tree_owned,
-            left_idx,
-            right_idx,
-            len(query_values),
-            max_distance=effective_max_distance,
-            return_all=return_all,
-            exclusive=exclusive,
-            return_distance=return_distance,
-        )
-        if gpu_result is not None:
-            result, _ = gpu_result
-            # Upgrade impl to GPU when refine ran on device.
-            return result, "owned_gpu_nearest"
+    gpu_result = _nearest_refine_gpu(
+        query_owned,
+        tree_owned,
+        left_idx,
+        right_idx,
+        len(query_values),
+        max_distance=effective_max_distance,
+        return_all=return_all,
+        exclusive=exclusive,
+        return_distance=return_distance,
+    )
+    if gpu_result is not None:
+        result, _ = gpu_result
+        # Upgrade impl to GPU when refine ran on device.
+        return result, "owned_gpu_nearest"
 
     # --- CPU Shapely refinement fallback -------------------------------------
     left_values = query_values[left_idx]

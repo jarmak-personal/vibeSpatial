@@ -7,7 +7,9 @@ from shapely.geometry import Point, Polygon
 
 from vibespatial import ExecutionMode, clip_by_rect_owned, from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.exterior import exterior_owned
+from vibespatial.constructive.normalize import normalize_owned
 from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.constructive.polygon import polygon_buffer_owned_array
 from vibespatial.geometry.buffers import GeometryFamily
 
 
@@ -174,3 +176,22 @@ def test_exterior_gpu_moderate_scale_with_nulls() -> None:
         else:
             assert a is not None and a.geom_type == "LineString", f"row {i}"
             assert list(a.coords) == list(g.exterior.coords), f"row {i} coords"
+
+
+@pytest.mark.gpu
+def test_normalize_owned_device_resident_polygon_input_uses_device_stats() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    source_poly = Polygon([(0, 0), (3, 0), (3, 2), (0, 2)])
+    source = from_shapely_geometries([source_poly])
+    device_polys = polygon_buffer_owned_array(source, 0.25, dispatch_mode=ExecutionMode.GPU)
+
+    assert device_polys.device_state is not None
+    assert device_polys.families[GeometryFamily.POLYGON].host_materialized is False
+
+    normalized = normalize_owned(device_polys, dispatch_mode=ExecutionMode.GPU)
+    expected = shapely.normalize(shapely.buffer(source_poly, 0.25, quad_segs=8))
+    actual = shapely.normalize(normalized.to_shapely()[0])
+
+    assert bool(shapely.equals_exact(actual, expected, tolerance=1e-12))

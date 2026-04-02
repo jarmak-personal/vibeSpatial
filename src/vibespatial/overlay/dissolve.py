@@ -338,18 +338,14 @@ def _gpu_union_group(group_geoms: np.ndarray) -> object:
         next_round: list[object] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
-                try:
-                    left_owned = from_shapely_geometries([current[i]])
-                    right_owned = from_shapely_geometries([current[i + 1]])
-                    result = overlay_union_owned(left_owned, right_owned, dispatch_mode=ExecutionMode.GPU)
-                    result_geoms = result.to_shapely()
-                    if result_geoms:
-                        next_round.append(result_geoms[0])
-                    else:
-                        next_round.append(_EMPTY)
-                except Exception:
-                    # Fallback to shapely for this pair if GPU union fails
-                    next_round.append(shapely.union(current[i], current[i + 1]))
+                left_owned = from_shapely_geometries([current[i]])
+                right_owned = from_shapely_geometries([current[i + 1]])
+                result = overlay_union_owned(left_owned, right_owned, dispatch_mode=ExecutionMode.GPU)
+                result_geoms = result.to_shapely()
+                if result_geoms:
+                    next_round.append(result_geoms[0])
+                else:
+                    next_round.append(_EMPTY)
             else:
                 next_round.append(current[i])
         current = next_round
@@ -661,21 +657,18 @@ def union_all_gpu(
             polygon_tags.add(FAMILY_TAGS[fam])
         valid_tags = np.isin(owned.tags[owned.validity], list(polygon_tags))
         if np.all(valid_tags):
-            try:
-                result = _union_all_tree_reduce_gpu(owned, return_owned=return_owned)
-                if result is not None:
-                    impl = "gpu_tree_reduce_overlay_owned" if return_owned else "gpu_tree_reduce_overlay"
-                    record_dispatch_event(
-                        surface="union_all",
-                        operation="union_all",
-                        implementation=impl,
-                        reason=f"tree-reduce via overlay_union_owned, {int(np.ceil(np.log2(row_count)))} rounds",
-                        detail=f"rows={row_count}",
-                        selected=ExecutionMode.GPU,
-                    )
-                    return result
-            except Exception:
-                pass  # fall through to CPU
+            result = _union_all_tree_reduce_gpu(owned, return_owned=return_owned)
+            if result is not None:
+                impl = "gpu_tree_reduce_overlay_owned" if return_owned else "gpu_tree_reduce_overlay"
+                record_dispatch_event(
+                    surface="union_all",
+                    operation="union_all",
+                    implementation=impl,
+                    reason=f"tree-reduce via overlay_union_owned, {int(np.ceil(np.log2(row_count)))} rounds",
+                    detail=f"rows={row_count}",
+                    selected=ExecutionMode.GPU,
+                )
+                return result
 
     # CPU fallback: Shapely union_all
     record_dispatch_event(

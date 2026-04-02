@@ -46,6 +46,14 @@ def _require_gpu_arrays() -> None:
         raise RuntimeError("CuPy is not installed; canonical GPU array support is unavailable")
 
 
+def _free_cupy_pinned_memory_pool() -> None:
+    if cp is None:
+        return
+    pool = cp.get_default_pinned_memory_pool()
+    if pool is not None:
+        pool.free_all_blocks()
+
+
 def _check_driver(result: tuple[Any, ...]) -> tuple[Any, ...]:
     err = result[0]
     if err != cu.CUresult.CUDA_SUCCESS:
@@ -271,10 +279,7 @@ def _make_oom_callback(max_retries: int = 3):
         gc.collect()
         # Also free pinned memory — pinned allocations can hold
         # significant host+device resources.
-        try:
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-        except Exception:
-            pass
+        _free_cupy_pinned_memory_pool()
         return True  # tell RMM to retry the allocation
 
     return _callback
@@ -447,11 +452,7 @@ class CudaDriverRuntime:
             import gc
             gc.collect()
         # Clear pinned memory pool (separate from device pool)
-        if cp is not None:
-            try:
-                cp.get_default_pinned_memory_pool().free_all_blocks()
-            except Exception:
-                pass
+        _free_cupy_pinned_memory_pool()
 
     def available(self) -> bool:
         return has_cuda_device() and cp is not None
@@ -960,6 +961,19 @@ def compile_kernel_group(name: str, source: str, kernel_names: tuple[str, ...]):
     runtime = get_cuda_runtime()
     cache_key = make_kernel_cache_key(name, source)
     return runtime.compile_kernels(cache_key=cache_key, source=source, kernel_names=kernel_names)
+
+
+def _compile_precision_kernel(
+    name_prefix: str,
+    fp64_source: str,
+    fp32_source: str,
+    kernel_names: tuple[str, ...],
+    compute_type: str = "double",
+):
+    """Compile the fp64 or fp32 kernel variant for a named kernel group."""
+    source = fp64_source if compute_type == "double" else fp32_source
+    suffix = "fp64" if compute_type == "double" else "fp32"
+    return compile_kernel_group(f"{name_prefix}-{suffix}", source, kernel_names)
 
 
 def make_kernel_cache_key(prefix: str, source: str) -> str:

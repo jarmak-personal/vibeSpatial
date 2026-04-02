@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
-from vibespatial.runtime.adaptive import plan_kernel_dispatch
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
@@ -104,7 +104,7 @@ def resolve_predicate_context(
 
     requested_mode = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     geometry_families = tuple(sorted({family.value for family in left.families | right.families}))
-    plan = plan_kernel_dispatch(
+    plan = plan_dispatch_selection(
         kernel_name=kernel_name,
         kernel_class=KernelClass.PREDICATE,
         row_count=left.row_count,
@@ -120,9 +120,19 @@ def resolve_predicate_context(
         if requested_mode is ExecutionMode.GPU:
             raise NotImplementedError(f"{kernel_name} has no GPU variant registered yet")
         if runtime_selection.selected is ExecutionMode.GPU:
-            runtime_selection = RuntimeSelection(
+            cpu_plan = plan_dispatch_selection(
+                kernel_name=kernel_name,
+                kernel_class=KernelClass.PREDICATE,
+                row_count=left.row_count,
+                geometry_families=geometry_families,
+                mixed_geometry=len(geometry_families) > 1,
+                current_residency=left.residency,
+                requested_mode=ExecutionMode.CPU,
+                requested_precision=precision,
+            )
+            runtime_selection = replace(
+                cpu_plan.runtime_selection,
                 requested=requested_mode,
-                selected=ExecutionMode.CPU,
                 reason=f"{kernel_name} has no GPU variant registered; using explicit CPU fallback",
             )
 
