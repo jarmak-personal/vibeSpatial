@@ -7,7 +7,9 @@ import numpy as np
 import shapely
 from shapely.geometry import LineString, Polygon
 
-_EPSILON = 1e-12
+from vibespatial.runtime.config import SPATIAL_EPSILON
+
+_EPSILON = SPATIAL_EPSILON
 _POINT_TYPE_ID = 0
 _LINESTRING_TYPE_ID = 1
 _POLYGON_TYPE_ID = 3
@@ -367,7 +369,7 @@ def offset_curve_owned_cpu(
 
 
 def _non_null_mask(values: np.ndarray) -> np.ndarray:
-    return np.fromiter((geometry is not None for geometry in values), dtype=bool, count=len(values))
+    return np.asarray([geometry is not None for geometry in values], dtype=bool)
 
 
 def supports_point_buffer_surface(

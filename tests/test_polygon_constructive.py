@@ -174,6 +174,21 @@ def test_polygon_buffer_gpu_device_resident() -> None:
 
 
 @pytest.mark.gpu
+def test_polygon_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    poly = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    polys = from_shapely_geometries([poly])
+    gpu = polygon_buffer_owned_array(polys, 1.0, quad_segs=4, dispatch_mode=ExecutionMode.GPU)
+
+    assert gpu.residency is Residency.DEVICE
+    assert gpu._validity is None
+    assert gpu._tags is None
+    assert gpu._family_row_offsets is None
+
+
+@pytest.mark.gpu
 def test_polygon_centroids_device_resident_input_uses_device_stats() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

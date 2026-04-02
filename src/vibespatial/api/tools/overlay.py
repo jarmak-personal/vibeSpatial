@@ -19,6 +19,10 @@ from vibespatial.api.geometry_array import (
 )
 from vibespatial.runtime._runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import (
+    OVERLAY_GPU_REMAINDER_THRESHOLD,
+    OVERLAY_PAIR_BATCH_THRESHOLD,
+)
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.precision import KernelClass
@@ -65,11 +69,6 @@ _MIN_GROUPS_PER_BATCH = 64
 # MAX_GROUPS_PER_BATCH: upper bound; larger batches reduce dispatch overhead
 # but risk OOM on skewed group-size distributions.
 _MAX_GROUPS_PER_BATCH = 10_000
-# PAIR_THRESHOLD: below this total pair count, skip batching entirely (the
-# unbatched path is faster due to fewer dispatch overheads).
-_PAIR_THRESHOLD = 200_000
-
-
 def _estimate_bytes_per_pair(right_owned) -> int:
     """Estimate average device bytes consumed per gathered right-side pair.
 
@@ -113,10 +112,10 @@ def _compute_batch_groups(
     _MAX_GROUPS_PER_BATCH].
 
     If VRAM query fails or the total pair count is below
-    _PAIR_THRESHOLD, returns n_groups (process everything in one batch).
+    OVERLAY_PAIR_BATCH_THRESHOLD, returns n_groups (process everything in one batch).
     """
     n_groups = len(h_group_offsets) - 1
-    if total_pairs < _PAIR_THRESHOLD:
+    if total_pairs < OVERLAY_PAIR_BATCH_THRESHOLD:
         return n_groups  # single-batch fast path
 
     try:
@@ -169,8 +168,10 @@ def _batched_overlay_difference_owned(
     from vibespatial.constructive.binary_constructive import (
         binary_constructive_owned,
     )
+    from vibespatial.constructive.segmented_union_host import (
+        concat_owned_arrays,
+    )
     from vibespatial.kernels.constructive.segmented_union import (
-        _concat_owned_arrays,
         segmented_union_all,
     )
 
@@ -285,7 +286,7 @@ def _batched_overlay_difference_owned(
         diff_owned = batch_results[0]
         all_unique = batch_unique_indices[0]
     else:
-        diff_owned = _concat_owned_arrays(batch_results)
+        diff_owned = concat_owned_arrays(batch_results)
         all_unique = np.concatenate(batch_unique_indices)
 
     # Return in the same format as idx1_unique (host numpy)
@@ -586,8 +587,6 @@ def _many_vs_one_intersection_owned(
     # extraction, split-event classification, and face reconstruction).
     # The crossover to GPU overlay is beneficial when the remainder set
     # is large (>= 1000 rows) AND the clip polygon is moderately complex.
-    _GPU_REMAINDER_THRESHOLD = 1000
-
     def _shapely_remainder_intersection(left_rem_oga, right_one_oga):
         """Intersect remainder polygons via vectorized Shapely (CPU)."""
         from vibespatial.geometry.owned import from_shapely_geometries
@@ -626,7 +625,7 @@ def _many_vs_one_intersection_owned(
     def _remainder_intersection(left_rem_oga, right_one_oga):
         """Choose one remainder path up front instead of falling back by exception."""
         if (
-            left_rem_oga.row_count < _GPU_REMAINDER_THRESHOLD
+            left_rem_oga.row_count < OVERLAY_GPU_REMAINDER_THRESHOLD
             or not has_gpu_runtime()
         ):
             return _shapely_remainder_intersection(left_rem_oga, right_one_oga)

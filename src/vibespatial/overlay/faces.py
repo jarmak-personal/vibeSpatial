@@ -24,6 +24,7 @@ from vibespatial.cuda._runtime import (
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.spatial.segment_primitives import SegmentIntersectionResult
 
 from .types import (
@@ -358,7 +359,7 @@ def build_gpu_overlay_faces(
         sample_x, sample_y = _face_sample_point(points)
         label_x_values.append(sample_x)
         label_y_values.append(sample_y)
-        bounded_mask_values.append(1 if signed_area > 1e-12 else 0)
+        bounded_mask_values.append(1 if signed_area > SPATIAL_EPSILON else 0)
 
     # Track whether coverage was computed on device (avoids D->H->D roundtrip).
     _gpu_coverage = False

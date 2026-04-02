@@ -119,6 +119,19 @@ def _three_segment_chain():
     ])
 
 
+@requires_gpu
+def test_line_merge_stays_device_resident(strict_device_guard):
+    """line_merge keeps single-family metadata on device."""
+    from vibespatial.constructive.line_merge import line_merge_owned
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries([_three_segment_chain()], residency=Residency.DEVICE)
+    result = line_merge_owned(owned, directed=False, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency == Residency.DEVICE
+
+
 def _disconnected_mls():
     """Two disconnected components."""
     return MultiLineString([

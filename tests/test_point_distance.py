@@ -7,13 +7,9 @@ from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, P
 
 from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.testing import build_owned as _make_owned
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
-
-
-def _make_owned(geoms):
-    return from_shapely_geometries(geoms)
 
 
 def _compute_distances(query_owned, tree_owned, left_idx, right_idx, tree_family, exclusive=False):
@@ -41,15 +37,15 @@ def _compute_distances(query_owned, tree_owned, left_idx, right_idx, tree_family
 
 
 class TestPointLinestringDistance:
-    def test_basic_distances(self):
+    def test_basic_distances(self, make_owned):
         points = [Point(0, 0), Point(1, 1), Point(3, 0)]
         lines = [
             LineString([(0, 1), (2, 1)]),  # horizontal line at y=1
             LineString([(0, 0), (2, 0)]),  # horizontal line at y=0
             LineString([(0, 1), (2, 1)]),  # same as first
         ]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(lines)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(lines)
 
         left_idx = np.array([0, 1, 2], dtype=np.int32)
         right_idx = np.array([0, 1, 2], dtype=np.int32)
@@ -66,12 +62,12 @@ class TestPointLinestringDistance:
         ])
         np.testing.assert_allclose(gpu_dist, expected, atol=1e-10)
 
-    def test_point_on_segment(self):
+    def test_point_on_segment(self, make_owned):
         """Point exactly on a segment → distance 0."""
         points = [Point(1, 1)]
         lines = [LineString([(0, 0), (2, 2)])]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(lines)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(lines)
 
         gpu_dist = _compute_distances(
             query_owned, tree_owned,
@@ -80,12 +76,12 @@ class TestPointLinestringDistance:
         )
         assert gpu_dist[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_point_nearest_segment_endpoint(self):
+    def test_point_nearest_segment_endpoint(self, make_owned):
         """Point closest to a segment endpoint (projection clamps to t=0 or t=1)."""
         points = [Point(5, 0)]
         lines = [LineString([(0, 0), (2, 0)])]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(lines)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(lines)
 
         gpu_dist = _compute_distances(
             query_owned, tree_owned,
@@ -95,12 +91,12 @@ class TestPointLinestringDistance:
         # Closest point is (2,0), distance = 3.0
         assert gpu_dist[0] == pytest.approx(3.0, abs=1e-10)
 
-    def test_multi_segment_linestring(self):
+    def test_multi_segment_linestring(self, make_owned):
         """Min distance across multiple segments."""
         points = [Point(1, 2)]
         lines = [LineString([(0, 0), (2, 0), (2, 3)])]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(lines)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(lines)
 
         gpu_dist = _compute_distances(
             query_owned, tree_owned,
@@ -112,14 +108,14 @@ class TestPointLinestringDistance:
 
 
 class TestPointMultiLinestringDistance:
-    def test_basic(self):
+    def test_basic(self, make_owned):
         points = [Point(0, 0), Point(5, 5)]
         multilines = [
             MultiLineString([[(1, 0), (1, 2)], [(3, 0), (3, 2)]]),
             MultiLineString([[(4, 4), (6, 6)]]),
         ]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(multilines)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(multilines)
 
         left_idx = np.array([0, 1], dtype=np.int32)
         right_idx = np.array([0, 1], dtype=np.int32)
@@ -136,11 +132,11 @@ class TestPointMultiLinestringDistance:
 
 
 class TestPointPolygonDistance:
-    def test_point_inside_polygon_distance_zero(self):
+    def test_point_inside_polygon_distance_zero(self, make_owned):
         points = [Point(1, 1)]
         polygons = [box(0, 0, 2, 2)]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(polygons)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(polygons)
 
         gpu_dist = _compute_distances(
             query_owned, tree_owned,
@@ -149,11 +145,11 @@ class TestPointPolygonDistance:
         )
         assert gpu_dist[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_point_on_boundary_distance_zero(self):
+    def test_point_on_boundary_distance_zero(self, make_owned):
         points = [Point(0, 1)]
         polygons = [box(0, 0, 2, 2)]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(polygons)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(polygons)
 
         gpu_dist = _compute_distances(
             query_owned, tree_owned,
@@ -162,11 +158,11 @@ class TestPointPolygonDistance:
         )
         assert gpu_dist[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_point_outside_polygon(self):
+    def test_point_outside_polygon(self, make_owned):
         points = [Point(3, 1), Point(0, 5)]
         polygons = [box(0, 0, 2, 2), box(0, 0, 2, 2)]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(polygons)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(polygons)
 
         left_idx = np.array([0, 1], dtype=np.int32)
         right_idx = np.array([0, 1], dtype=np.int32)
@@ -181,15 +177,15 @@ class TestPointPolygonDistance:
         ])
         np.testing.assert_allclose(gpu_dist, expected, atol=1e-10)
 
-    def test_polygon_with_hole(self):
+    def test_polygon_with_hole(self, make_owned):
         """Point inside hole → positive distance to nearest ring edge."""
         outer = [(0, 0), (10, 0), (10, 10), (0, 10)]
         hole = [(3, 3), (7, 3), (7, 7), (3, 7)]
         polygon = Polygon(outer, [hole])
         point = Point(5, 5)  # center of the hole
 
-        query_owned = _make_owned([point])
-        tree_owned = _make_owned([polygon])
+        query_owned = make_owned([point])
+        tree_owned = make_owned([polygon])
 
         gpu_dist = _compute_distances(
             query_owned, tree_owned,
@@ -201,14 +197,14 @@ class TestPointPolygonDistance:
 
 
 class TestPointMultiPolygonDistance:
-    def test_basic(self):
+    def test_basic(self, make_owned):
         points = [Point(3, 3), Point(11, 11)]
         multipolys = [
             MultiPolygon([box(0, 0, 2, 2), box(10, 10, 12, 12)]),
             MultiPolygon([box(0, 0, 2, 2), box(10, 10, 12, 12)]),
         ]
-        query_owned = _make_owned(points)
-        tree_owned = _make_owned(multipolys)
+        query_owned = make_owned(points)
+        tree_owned = make_owned(multipolys)
 
         left_idx = np.array([0, 1], dtype=np.int32)
         right_idx = np.array([0, 1], dtype=np.int32)

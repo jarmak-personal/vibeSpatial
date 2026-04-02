@@ -19,9 +19,10 @@ from shapely.geometry import (
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+from vibespatial.runtime.config import SPATIAL_EPSILON
 
 EMPTY = GeometryCollection()
-_POINT_EPSILON = 1e-12
+_POINT_EPSILON = SPATIAL_EPSILON
 
 
 def normalize_values(values: Sequence[object | None] | np.ndarray | OwnedGeometryArray) -> tuple[np.ndarray, OwnedGeometryArray]:
@@ -482,7 +483,7 @@ def clip_by_rect_array(candidate_shapely: np.ndarray, rect: tuple[float, float, 
 
 
 def clip_rect_gpu_available(geometries: np.ndarray, point_type_id: int) -> bool:
-    non_null = np.fromiter((geometry is not None for geometry in geometries), dtype=bool, count=len(geometries))
+    non_null = np.asarray([geometry is not None for geometry in geometries], dtype=bool)
     if not np.any(non_null):
         return False
     type_ids = np.asarray(shapely.get_type_id(geometries[non_null]), dtype=np.int32)

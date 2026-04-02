@@ -120,8 +120,8 @@ def test_strict_bounds_surfaces_succeed_for_viewport_fixtures(
         "expected_clip_strict_fallback",
     ),
     [
-        ("lines", ("LineString",), False, None, "IndexError", False, 1, True, 1, None, False, True, 2, None, False, False, None, "StrictNativeFallbackError", True),
-        ("mixed", ("LineString", "Point", "Polygon"), False, None, "IndexError", False, 3, False, None, "NotImplementedError", False, False, None, "NotImplementedError", False, False, None, "StrictNativeFallbackError", True),
+        ("lines", ("LineString",), True, 2, None, False, 1, True, 1, None, False, True, 2, None, False, False, None, "StrictNativeFallbackError", True),
+        ("mixed", ("LineString", "Point", "Polygon"), True, 3, None, False, 3, False, None, "NotImplementedError", False, False, None, "NotImplementedError", False, False, None, "StrictNativeFallbackError", True),
     ],
 )
 def test_strict_viewport_matrix_documents_current_public_api_behavior(
@@ -280,4 +280,5 @@ def test_strict_api_matrix_report_is_structured_by_surface(tmp_path: Path) -> No
     assert payload["fixture"] == "lines"
     assert set(payload["calls"]) == set(calls)
     assert payload["calls"]["geodataframe.cx"]["strict_fallback"] is False
-    assert payload["calls"]["geometry.clip_by_rect"]["error_type"] == "IndexError"
+    assert payload["calls"]["geometry.clip_by_rect"]["ok"] is True
+    assert payload["calls"]["geometry.clip_by_rect"]["error_type"] is None

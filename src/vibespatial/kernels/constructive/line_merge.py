@@ -21,6 +21,8 @@ all adjacency data fits in thread-local arrays.  No shared memory needed.
 
 from __future__ import annotations
 
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+
 # Maximum segments (LineString parts) per geometry that the kernel supports.
 # Geometries exceeding this are left unmerged (parts copied as-is).
 MAX_SEGMENTS = 256
@@ -30,7 +32,7 @@ MAX_SEGMENTS = 256
 MAX_COORDS = 8192
 
 
-_LINE_MERGE_KERNEL_SOURCE = r"""
+_LINE_MERGE_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 /* ------------------------------------------------------------------ */
 /* line_merge NVRTC kernel                                            */
 /*                                                                    */
@@ -45,7 +47,7 @@ _LINE_MERGE_KERNEL_SOURCE = r"""
 
 #define MAX_SEGMENTS """ + str(MAX_SEGMENTS) + r"""
 #define MAX_COORDS """ + str(MAX_COORDS) + r"""
-#define COORD_EQ_TOL 1e-12
+#define COORD_EQ_TOL VS_SPATIAL_EPSILON
 
 /* ------------------------------------------------------------------ */
 /* Device helpers                                                      */

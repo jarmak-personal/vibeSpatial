@@ -52,6 +52,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
@@ -67,7 +68,7 @@ from .point import (
 
 request_warmup(["exclusive_scan_i32", "exclusive_scan_i64", "segmented_reduce_sum_i32"])
 
-_POINT_EPSILON = 1e-12
+_POINT_EPSILON = SPATIAL_EPSILON
 _POINT_TYPE_ID = 0
 
 # ---------------------------------------------------------------------------
@@ -510,7 +511,7 @@ def _clip_line_segments_gpu_device(
 ):
     """Clip line segments on GPU using Liang-Barsky (device I/O).
 
-    Accepts host numpy arrays for input segments.  Returns
+    Accepts host numpy arrays or device-backed arrays for input segments. Returns
     (d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid) as CuPy device
     arrays.  No D2H transfer; kernel outputs stay on device.
     """
@@ -522,11 +523,16 @@ def _clip_line_segments_gpu_device(
     xmin, ymin, xmax, ymax = rect
     segment_count = len(seg_x0)
 
-    # Upload inputs to device via CuPy (managed by memory pool)
-    d_x0 = cp.asarray(np.ascontiguousarray(seg_x0, dtype=np.float64))
-    d_y0 = cp.asarray(np.ascontiguousarray(seg_y0, dtype=np.float64))
-    d_x1 = cp.asarray(np.ascontiguousarray(seg_x1, dtype=np.float64))
-    d_y1 = cp.asarray(np.ascontiguousarray(seg_y1, dtype=np.float64))
+    def _to_device_f64(values):
+        if hasattr(values, "__cuda_array_interface__"):
+            return cp.ascontiguousarray(values, dtype=cp.float64)
+        return cp.asarray(np.ascontiguousarray(values, dtype=np.float64))
+
+    # Upload host inputs or preserve existing device residency.
+    d_x0 = _to_device_f64(seg_x0)
+    d_y0 = _to_device_f64(seg_y0)
+    d_x1 = _to_device_f64(seg_x1)
+    d_y1 = _to_device_f64(seg_y1)
 
     # Allocate output buffers on device via CuPy
     d_out_x0 = cp.empty(segment_count, dtype=cp.float64)
@@ -661,14 +667,24 @@ def _extract_segments_vectorized(
     all_part_row_map: list[np.ndarray] = []
     global_row_indices_parts: list[np.ndarray] = []
     family_buffers: list[object] = []
+    device_family_buffers: list[DeviceFamilyGeometryBuffer | None] = []
     row_base = 0  # running offset into global_row_indices
 
     for family in line_families:
+        owned._ensure_host_family_structure(family)
         buffer = owned.families[family]
         tag = FAMILY_TAGS[family]
         family_rows = np.flatnonzero(owned.tags == tag)
         fam_idx = len(family_buffers)
         family_buffers.append(buffer)
+        device_family_buffer = None
+        if (
+            not buffer.host_materialized
+            and owned.device_state is not None
+            and family in owned.device_state.families
+        ):
+            device_family_buffer = owned.device_state.families[family]
+        device_family_buffers.append(device_family_buffer)
 
         n_fam_rows = len(family_rows)
         if n_fam_rows == 0:
@@ -808,35 +824,88 @@ def _extract_segments_vectorized(
     gather_p0 = np.repeat(starts_arr, seg_counts) + local_offsets
     gather_p1 = gather_p0 + 1
 
-    # Gather coordinates.  When all spans come from a single family
-    # buffer (common case), do a single fancy-index gather.  Otherwise
-    # gather per-family and scatter into the output.
-    seg_x0 = np.empty(total_segments, dtype=np.float64)
-    seg_y0 = np.empty(total_segments, dtype=np.float64)
-    seg_x1 = np.empty(total_segments, dtype=np.float64)
-    seg_y1 = np.empty(total_segments, dtype=np.float64)
-
     unique_fam = np.unique(span_family_idx)
+    missing_device = [
+        int(fi)
+        for fi in unique_fam
+        if (
+            not family_buffers[int(fi)].host_materialized
+            and device_family_buffers[int(fi)] is None
+        )
+    ]
+    if missing_device:
+        raise RuntimeError(
+            "line segment extraction requires device buffers for unmaterialized host families"
+        )
+
+    use_device_gather = any(
+        not family_buffers[int(fi)].host_materialized
+        and device_family_buffers[int(fi)] is not None
+        for fi in unique_fam
+    )
+
+    if use_device_gather:
+        import cupy as cp
+
+        seg_x0 = cp.empty(total_segments, dtype=cp.float64)
+        seg_y0 = cp.empty(total_segments, dtype=cp.float64)
+        seg_x1 = cp.empty(total_segments, dtype=cp.float64)
+        seg_y1 = cp.empty(total_segments, dtype=cp.float64)
+    else:
+        seg_x0 = np.empty(total_segments, dtype=np.float64)
+        seg_y0 = np.empty(total_segments, dtype=np.float64)
+        seg_x1 = np.empty(total_segments, dtype=np.float64)
+        seg_y1 = np.empty(total_segments, dtype=np.float64)
+
+    # Gather coordinates. When all spans come from a single family
+    # buffer (common case), do a single fancy-index gather. Otherwise
+    # gather per-family and scatter into the output.
     if len(unique_fam) == 1:
         # Fast path: single family buffer.
-        buf = family_buffers[int(unique_fam[0])]
-        seg_x0[:] = buf.x[gather_p0]
-        seg_y0[:] = buf.y[gather_p0]
-        seg_x1[:] = buf.x[gather_p1]
-        seg_y1[:] = buf.y[gather_p1]
+        fam_idx = int(unique_fam[0])
+        buf = family_buffers[fam_idx]
+        dev_buf = device_family_buffers[fam_idx]
+        if use_device_gather:
+            d_gather_p0 = cp.asarray(gather_p0.astype(np.int64, copy=False))
+            d_gather_p1 = cp.asarray(gather_p1.astype(np.int64, copy=False))
+            seg_x0 = cp.asarray(dev_buf.x)[d_gather_p0]
+            seg_y0 = cp.asarray(dev_buf.y)[d_gather_p0]
+            seg_x1 = cp.asarray(dev_buf.x)[d_gather_p1]
+            seg_y1 = cp.asarray(dev_buf.y)[d_gather_p1]
+        else:
+            seg_x0[:] = np.asarray(buf.x, dtype=np.float64)[gather_p0]
+            seg_y0[:] = np.asarray(buf.y, dtype=np.float64)[gather_p0]
+            seg_x1[:] = np.asarray(buf.x, dtype=np.float64)[gather_p1]
+            seg_y1[:] = np.asarray(buf.y, dtype=np.float64)[gather_p1]
     else:
         # Multi-family: gather per family using segment-level mask.
         seg_fam_idx = np.repeat(span_family_idx, seg_counts)
         for fi in unique_fam:
             fi_int = int(fi)
             buf = family_buffers[fi_int]
-            mask = seg_fam_idx == fi_int
-            idx0 = gather_p0[mask]
-            idx1 = gather_p1[mask]
-            seg_x0[mask] = buf.x[idx0]
-            seg_y0[mask] = buf.y[idx0]
-            seg_x1[mask] = buf.x[idx1]
-            seg_y1[mask] = buf.y[idx1]
+            dev_buf = device_family_buffers[fi_int]
+            positions = np.flatnonzero(seg_fam_idx == fi_int)
+            idx0 = gather_p0[positions]
+            idx1 = gather_p1[positions]
+            if use_device_gather:
+                d_positions = cp.asarray(positions.astype(np.int64, copy=False))
+                if dev_buf is not None and not buf.host_materialized:
+                    d_idx0 = cp.asarray(idx0.astype(np.int64, copy=False))
+                    d_idx1 = cp.asarray(idx1.astype(np.int64, copy=False))
+                    seg_x0[d_positions] = cp.asarray(dev_buf.x)[d_idx0]
+                    seg_y0[d_positions] = cp.asarray(dev_buf.y)[d_idx0]
+                    seg_x1[d_positions] = cp.asarray(dev_buf.x)[d_idx1]
+                    seg_y1[d_positions] = cp.asarray(dev_buf.y)[d_idx1]
+                else:
+                    seg_x0[d_positions] = cp.asarray(np.asarray(buf.x, dtype=np.float64)[idx0])
+                    seg_y0[d_positions] = cp.asarray(np.asarray(buf.y, dtype=np.float64)[idx0])
+                    seg_x1[d_positions] = cp.asarray(np.asarray(buf.x, dtype=np.float64)[idx1])
+                    seg_y1[d_positions] = cp.asarray(np.asarray(buf.y, dtype=np.float64)[idx1])
+            else:
+                seg_x0[positions] = np.asarray(buf.x, dtype=np.float64)[idx0]
+                seg_y0[positions] = np.asarray(buf.y, dtype=np.float64)[idx0]
+                seg_x1[positions] = np.asarray(buf.x, dtype=np.float64)[idx1]
+                seg_y1[positions] = np.asarray(buf.y, dtype=np.float64)[idx1]
 
     # Build per-row segment offsets from part data (np.bincount — truly vectorized C loop).
     row_segment_offsets = np.zeros(n_rows + 1, dtype=np.int32)
@@ -1095,9 +1164,13 @@ def _build_line_clip_device_result(
     # ---------------------------------------------------------------
     # Create metadata arrays directly on device to avoid H2D re-uploads.
     d_empty_mask = cp.zeros(line_count, dtype=cp.bool_)
-    output_validity = np.ones(line_count, dtype=np.bool_)
-    output_tags = np.full(line_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
-    output_family_row_offsets = np.arange(line_count, dtype=np.int32)
+    output_validity = cp.ones(line_count, dtype=cp.bool_)
+    output_tags = cp.full(
+        line_count,
+        FAMILY_TAGS[GeometryFamily.LINESTRING],
+        dtype=cp.int8,
+    )
+    output_family_row_offsets = cp.arange(line_count, dtype=cp.int32)
 
     device_families = {
         GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
@@ -1115,6 +1188,7 @@ def _build_line_clip_device_result(
         tags=output_tags,
         validity=output_validity,
         family_row_offsets=output_family_row_offsets,
+        execution_mode="gpu",
     )
     return oga, global_row_map
 
@@ -1721,11 +1795,15 @@ def _build_polygon_clip_owned_result(
         gathered_x = cp.empty(0, dtype=cp.float64)
         gathered_y = cp.empty(0, dtype=cp.float64)
 
-    output_empty_mask = np.zeros(output_row_count, dtype=bool)
+    output_empty_mask = cp.zeros(output_row_count, dtype=cp.bool_)
 
-    output_validity = np.ones(output_row_count, dtype=bool)
-    output_tags = np.full(output_row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    output_family_row_offsets = np.arange(output_row_count, dtype=np.int32)
+    output_validity = cp.ones(output_row_count, dtype=cp.bool_)
+    output_tags = cp.full(
+        output_row_count,
+        FAMILY_TAGS[GeometryFamily.POLYGON],
+        dtype=cp.int8,
+    )
+    output_family_row_offsets = cp.arange(output_row_count, dtype=cp.int32)
 
     device_families = {
         GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
@@ -1733,7 +1811,7 @@ def _build_polygon_clip_owned_result(
             x=gathered_x,
             y=gathered_y,
             geometry_offsets=runtime.from_host(h_geom_offsets),
-            empty_mask=runtime.from_host(output_empty_mask),
+            empty_mask=output_empty_mask,
             ring_offsets=runtime.from_host(h_ring_offsets),
             bounds=None,
         )
@@ -1745,6 +1823,7 @@ def _build_polygon_clip_owned_result(
             tags=output_tags,
             validity=output_validity,
             family_row_offsets=output_family_row_offsets,
+            execution_mode="gpu",
         ),
         validity_mask,
     )
@@ -2034,7 +2113,7 @@ def clip_by_rect_owned(
 
                 # Handle fallback rows (non-polygon, non-line families)
                 if _fallback_rows_arr_ref.size > 0:
-                    shapely_geoms = _owned_ref.to_shapely()
+                    shapely_geoms = np.asarray(_owned_ref.to_shapely(), dtype=object)
                     fallback_shapely = shapely_geoms[_fallback_rows_arr_ref]
                     clipped = clip_by_rect_array(
                         np.asarray(fallback_shapely, dtype=object), _rect_ref,

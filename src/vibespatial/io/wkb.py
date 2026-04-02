@@ -35,6 +35,7 @@ from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.residency import Residency
 
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
+from .wkb_cpu import iter_geometry_parts
 
 request_warmup(["exclusive_scan_i32", "exclusive_scan_i64"])
 
@@ -873,7 +874,11 @@ def _append_shapely_geometry_state(
             state["y_payload"].append(float(geometry.y))
     elif family in {GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
         state["geometry_offsets"].append(len(state["x_payload"]))
-        coords = list(geometry.coords) if family is GeometryFamily.LINESTRING else [(float(p.x), float(p.y)) for p in geometry.geoms]
+        coords = (
+            list(geometry.coords)
+            if family is GeometryFamily.LINESTRING
+            else [(float(p.x), float(p.y)) for p in iter_geometry_parts(geometry)]
+        )
         state["x_payload"].extend([float(x) for x, _ in coords])
         state["y_payload"].extend([float(y) for _, y in coords])
     elif family is GeometryFamily.POLYGON:
@@ -888,7 +893,7 @@ def _append_shapely_geometry_state(
     elif family is GeometryFamily.MULTILINESTRING:
         state["geometry_offsets"].append(len(state["part_offsets"]))
         if not geometry.is_empty:
-            for part in geometry.geoms:
+            for part in iter_geometry_parts(geometry):
                 state["part_offsets"].append(len(state["x_payload"]))
                 coords = list(part.coords)
                 state["x_payload"].extend([float(x) for x, _ in coords])
@@ -896,7 +901,7 @@ def _append_shapely_geometry_state(
     elif family is GeometryFamily.MULTIPOLYGON:
         state["geometry_offsets"].append(len(state["part_offsets"]))
         if not geometry.is_empty:
-            for polygon in geometry.geoms:
+            for polygon in iter_geometry_parts(geometry):
                 state["part_offsets"].append(len(state["ring_offsets"]))
                 rings = [polygon.exterior, *polygon.interiors]
                 for ring in rings:

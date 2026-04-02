@@ -91,8 +91,10 @@ _SHAPELY_ALLOWLIST: dict[str, str] = {
     "constructive/clip_rect_cpu.py": "CPU-only clip-by-rect host assembly and baseline module",
     "constructive/multipoint_polygon_constructive.py": "Host-side multipoint-polygon constructive boundary",
     # io/ boundary — format-specific needs
+    "io/wkb_cpu.py": "CPU-only WKB multipart extraction helper",
     "io/postgis_gpu.py": "WKB decode for PostGIS binary format",
     "io/geoarrow.py": "GeoArrow metadata requires shapely geometry type IDs",
+    "spatial/indexing_cpu.py": "CPU-only Shapely multipart extraction helper for segment MBR fallback",
     # runtime/ — provenance tracking
     "runtime/provenance.py": "Geometry type pattern matching for rewrite rules",
 }

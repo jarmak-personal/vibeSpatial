@@ -27,8 +27,6 @@ from vibespatial.constructive.nonpolygon_binary_output import (
     build_device_backed_linestring_output,
     build_device_backed_multipoint_output,
     build_point_result_from_source,
-    empty_linestring_output,
-    host_prefix_offsets,
 )
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
@@ -43,7 +41,6 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
-    from_shapely_geometries,
 )
 from vibespatial.kernels.constructive.nonpolygon_binary_source import (
     _LINESTRING_LINESTRING_KERNEL_NAMES,
@@ -192,11 +189,8 @@ def point_point_intersection(
         close = (dx * dx + dy * dy) < (tol * tol)
         d_match[valid_indices] = close
 
-    runtime = get_cuda_runtime()
-    h_match = runtime.copy_device_to_host(d_match).astype(bool)
-
     # Build output: same Point buffers as left, with match-based validity
-    return build_point_result_from_source(left, h_match)
+    return build_point_result_from_source(left, None, d_new_validity=d_match)
 
 
 def point_point_difference(
@@ -252,9 +246,7 @@ def point_point_difference(
         # Where both valid and same coords: don't keep
         d_keep[valid_indices] = ~same
 
-    runtime = get_cuda_runtime()
-    h_keep = runtime.copy_device_to_host(d_keep).astype(bool)
-    return build_point_result_from_source(left, h_keep)
+    return build_point_result_from_source(left, None, d_new_validity=d_keep)
 
 
 def point_point_union(
@@ -329,15 +321,22 @@ def point_point_union(
         same = (dx * dx + dy * dy) < (tol * tol)
         d_counts[both_indices] = cp.where(same, cp.int32(1), cp.int32(2))
 
-    # Prefix sum for output coordinate offsets
     runtime = get_cuda_runtime()
-    h_counts = runtime.copy_device_to_host(d_counts)
-    h_offsets = host_prefix_offsets(h_counts)
-    total_coords = int(h_offsets[-1])
+    d_offsets = exclusive_sum(d_counts, synchronize=False)
+    total_coords = count_scatter_total(runtime, d_counts, d_offsets)
 
     if total_coords == 0:
-        # All empty
-        return from_shapely_geometries([None] * n)
+        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
+        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
+        d_empty_x = runtime.allocate((0,), cp.float64)
+        d_empty_y = runtime.allocate((0,), cp.float64)
+        return build_device_backed_multipoint_output(
+            d_empty_x,
+            d_empty_y,
+            row_count=n,
+            validity=d_empty_validity,
+            geometry_offsets=d_empty_offsets,
+        )
 
     # Allocate output coordinates on device
     d_out_x = runtime.allocate((total_coords,), cp.float64)
@@ -345,7 +344,7 @@ def point_point_union(
     d_out_x_cp = cp.asarray(d_out_x)
     d_out_y_cp = cp.asarray(d_out_y)
 
-    d_offsets_cp = cp.asarray(h_offsets)
+    d_offsets_cp = cp.asarray(d_offsets)
 
     # Scatter coordinates (Tier 2: CuPy element-wise)
     # Only-left rows
@@ -381,14 +380,15 @@ def point_point_union(
             d_out_x_cp[out_pos2] = d_r_x[r_ci2]
             d_out_y_cp[out_pos2] = d_r_y[r_ci2]
 
-    h_validity = runtime.copy_device_to_host(d_any_valid).astype(bool)
-    geometry_offsets = h_offsets
+    d_geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
+    d_geometry_offsets[:n] = d_offsets_cp
+    d_geometry_offsets[n] = total_coords
 
     return build_device_backed_multipoint_output(
         d_out_x, d_out_y,
         row_count=n,
-        validity=h_validity,
-        geometry_offsets=geometry_offsets,
+        validity=d_any_valid,
+        geometry_offsets=d_geometry_offsets,
     )
 
 
@@ -452,22 +452,29 @@ def point_point_symmetric_difference(
         d_counts[both_indices] = cp.where(same, cp.int32(0), cp.int32(2))
 
     runtime = get_cuda_runtime()
-    h_counts = runtime.copy_device_to_host(d_counts)
-    h_offsets = host_prefix_offsets(h_counts)
-    total_coords = int(h_offsets[-1])
+    d_offsets = exclusive_sum(d_counts, synchronize=False)
+    total_coords = count_scatter_total(runtime, d_counts, d_offsets)
 
     # Validity: row is valid if it has any output points
     d_has_output = d_counts > 0
-    h_validity = runtime.copy_device_to_host(d_has_output).astype(bool)
 
     if total_coords == 0:
-        return from_shapely_geometries([None] * n)
+        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
+        d_empty_x = runtime.allocate((0,), cp.float64)
+        d_empty_y = runtime.allocate((0,), cp.float64)
+        return build_device_backed_multipoint_output(
+            d_empty_x,
+            d_empty_y,
+            row_count=n,
+            validity=d_has_output,
+            geometry_offsets=d_empty_offsets,
+        )
 
     d_out_x = runtime.allocate((total_coords,), cp.float64)
     d_out_y = runtime.allocate((total_coords,), cp.float64)
     d_out_x_cp = cp.asarray(d_out_x)
     d_out_y_cp = cp.asarray(d_out_y)
-    d_offsets_cp = cp.asarray(h_offsets)
+    d_offsets_cp = cp.asarray(d_offsets)
 
     # Only-left
     only_left_idx = cp.flatnonzero(only_left)
@@ -497,11 +504,15 @@ def point_point_symmetric_difference(
         d_out_x_cp[out_pos + 1] = d_r_x[r_ci]
         d_out_y_cp[out_pos + 1] = d_r_y[r_ci]
 
+    d_geometry_offsets = cp.empty(n + 1, dtype=cp.int32)
+    d_geometry_offsets[:n] = d_offsets_cp
+    d_geometry_offsets[n] = total_coords
+
     return build_device_backed_multipoint_output(
         d_out_x, d_out_y,
         row_count=n,
-        validity=h_validity,
-        geometry_offsets=h_offsets,
+        validity=d_has_output,
+        geometry_offsets=d_geometry_offsets,
     )
 
 
@@ -575,19 +586,20 @@ def _point_linestring_constructive(
     runtime.launch(kernels["point_linestring_on_line"], grid=grid, block=block, params=params)
     runtime.synchronize()
 
-    h_on_line = runtime.copy_device_to_host(d_on_line).astype(bool)
-
+    d_on_line_mask = cp.asarray(d_on_line).astype(cp.bool_)
     if mode == "intersection":
         # Keep points that are on the line
-        new_validity = h_on_line
+        d_new_validity = d_on_line_mask
     else:
         # Difference: keep points NOT on line, but only if left is valid.
         # If right is NULL, difference = identity (keep left).
-        h_pt_valid = runtime.copy_device_to_host(d_pt_valid).astype(bool)
-        h_ls_valid = runtime.copy_device_to_host(d_ls_valid).astype(bool)
-        new_validity = h_pt_valid & (~h_on_line | ~h_ls_valid)
+        d_new_validity = d_pt_valid & (~d_on_line_mask | ~d_ls_valid)
 
-    return build_point_result_from_source(points, new_validity)
+    return build_point_result_from_source(
+        points,
+        None,
+        d_new_validity=d_new_validity,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +654,17 @@ def _linestring_polygon_constructive(
         # A full implementation would iterate all parts.
         poly_buf = poly_state.families[GeometryFamily.MULTIPOLYGON]
     else:
-        return from_shapely_geometries([None] * n)
+        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
+        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
+        d_out_x = get_cuda_runtime().allocate((0,), cp.float64)
+        d_out_y = get_cuda_runtime().allocate((0,), cp.float64)
+        return build_device_backed_linestring_output(
+            d_out_x,
+            d_out_y,
+            row_count=n,
+            validity=d_empty_validity,
+            geometry_offsets=d_empty_offsets,
+        )
 
     d_ls_valid = ls_state.validity.astype(cp.bool_) & ~ls_buf.empty_mask.astype(cp.bool_)
     d_poly_valid = poly_state.validity.astype(cp.bool_) & ~poly_buf.empty_mask.astype(cp.bool_)
@@ -676,12 +698,15 @@ def _linestring_polygon_constructive(
     total_verts = count_scatter_total(runtime, d_counts, d_offsets)
 
     if total_verts == 0:
-        validity, geometry_offsets = empty_linestring_output(n)
+        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
+        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
         d_out_x = runtime.allocate((0,), cp.float64)
         d_out_y = runtime.allocate((0,), cp.float64)
         return build_device_backed_linestring_output(
             d_out_x, d_out_y,
-            row_count=n, validity=validity, geometry_offsets=geometry_offsets,
+            row_count=n,
+            validity=d_empty_validity,
+            geometry_offsets=d_empty_offsets,
         )
 
     d_out_x = runtime.allocate((total_verts,), cp.float64)
@@ -713,20 +738,15 @@ def _linestring_polygon_constructive(
 
     runtime.synchronize()
 
-    # Build geometry_offsets from d_offsets
     d_offsets_cp = cp.asarray(d_offsets)
     d_geom_offsets = cp.empty(n + 1, dtype=cp.int32)
     d_geom_offsets[:n] = d_offsets_cp
     d_geom_offsets[n] = total_verts
-    h_geom_offsets = runtime.copy_device_to_host(d_geom_offsets)
-
-    # Validity: rows with at least 2 output vertices form valid linestrings
-    h_counts_arr = runtime.copy_device_to_host(d_counts)
-    validity = h_counts_arr >= 2
+    validity = d_counts >= 2
 
     return build_device_backed_linestring_output(
         d_out_x, d_out_y,
-        row_count=n, validity=validity, geometry_offsets=h_geom_offsets,
+        row_count=n, validity=validity, geometry_offsets=d_geom_offsets,
     )
 
 
@@ -789,7 +809,17 @@ def linestring_linestring_intersection(
     total_points = count_scatter_total(runtime, d_counts, d_offsets)
 
     if total_points == 0:
-        return from_shapely_geometries([None] * n)
+        d_empty_validity = cp.zeros(n, dtype=cp.bool_)
+        d_empty_offsets = cp.zeros(n + 1, dtype=cp.int32)
+        d_empty_x = runtime.allocate((0,), cp.float64)
+        d_empty_y = runtime.allocate((0,), cp.float64)
+        return build_device_backed_multipoint_output(
+            d_empty_x,
+            d_empty_y,
+            row_count=n,
+            validity=d_empty_validity,
+            geometry_offsets=d_empty_offsets,
+        )
 
     d_out_x = runtime.allocate((total_points,), cp.float64)
     d_out_y = runtime.allocate((total_points,), cp.float64)
@@ -818,19 +848,15 @@ def linestring_linestring_intersection(
 
     runtime.synchronize()
 
-    # Build output: MultiPoint per row (0 or more intersection points)
     d_offsets_cp = cp.asarray(d_offsets)
     d_geom_offsets = cp.empty(n + 1, dtype=cp.int32)
     d_geom_offsets[:n] = d_offsets_cp
     d_geom_offsets[n] = total_points
-    h_geom_offsets = runtime.copy_device_to_host(d_geom_offsets)
-
-    h_counts_arr = runtime.copy_device_to_host(d_counts)
-    validity = h_counts_arr > 0
+    validity = d_counts > 0
 
     return build_device_backed_multipoint_output(
         d_out_x, d_out_y,
-        row_count=n, validity=validity, geometry_offsets=h_geom_offsets,
+        row_count=n, validity=validity, geometry_offsets=d_geom_offsets,
     )
 
 

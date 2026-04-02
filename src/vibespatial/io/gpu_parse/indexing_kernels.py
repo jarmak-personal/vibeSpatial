@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+
 _BOUNDS_KERNEL_SOURCE = r"""
 // Per-feature bounding box computation from flat coordinate arrays.
 // Input: d_x (float64), d_y (float64), geometry_offsets (int32)
@@ -58,7 +60,7 @@ compute_feature_bounds(
 _BOUNDS_KERNEL_NAMES = ("compute_feature_bounds",)
 
 
-_HILBERT_KERNEL_SOURCE = r"""
+_HILBERT_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 // 32-bit Hilbert curve encoding from (x, y) integer coordinates on [0, 2^16).
 // Input: d_bounds (float64, N*4), extent (minx, miny, maxx, maxy)
 // Output: d_hilbert_codes (uint32, N)
@@ -101,8 +103,8 @@ compute_hilbert_codes(
     const double cy = (by0 + by1) * 0.5;
 
     // Normalize to [0, 65535] integer grid
-    const double span_x = fmax(extent_maxx - extent_minx, 1e-12);
-    const double span_y = fmax(extent_maxy - extent_miny, 1e-12);
+    const double span_x = fmax(extent_maxx - extent_minx, VS_SPATIAL_EPSILON);
+    const double span_y = fmax(extent_maxy - extent_miny, VS_SPATIAL_EPSILON);
     unsigned int x = (unsigned int)llround(((cx - extent_minx) / span_x) * 65535.0);
     unsigned int y = (unsigned int)llround(((cy - extent_miny) / span_y) * 65535.0);
 

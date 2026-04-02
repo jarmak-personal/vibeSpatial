@@ -11,14 +11,18 @@ point pair.
 Precision (ADR-0002): CONSTRUCTIVE class -- stays fp64 on all devices per
 policy.  PrecisionPlan wired through dispatch for observability.
 
-Zero D2H transfers in the hot path.  Geometry data stays device-resident;
-only the final output OGA is assembled on host from four fp64 coordinate
-arrays.
+Zero D2H transfers in the hot path. Geometry data and output assembly stay
+device-resident, including all-empty result branches.
 """
 
 from __future__ import annotations
 
 import numpy as np
+
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover
+    cp = None
 
 from vibespatial.constructive.shortest_line_cpu import shortest_line_cpu
 from vibespatial.cuda._runtime import (
@@ -28,12 +32,13 @@ from vibespatial.cuda._runtime import (
     get_cuda_runtime,
 )
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     TAG_FAMILIES,
-    FamilyGeometryBuffer,
+    DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
+    build_device_resident_owned,
     from_shapely_geometries,
     tile_single_row,
     unique_tag_pairs,
@@ -145,10 +150,10 @@ def _family_args(state, family, runtime):
 # ---------------------------------------------------------------------------
 
 def _build_linestring_oga(
-    out_ax: np.ndarray,
-    out_ay: np.ndarray,
-    out_bx: np.ndarray,
-    out_by: np.ndarray,
+    out_ax,
+    out_ay,
+    out_bx,
+    out_by,
     validity: np.ndarray,
 ) -> OwnedGeometryArray:
     """Build a LineString OwnedGeometryArray from closest point pairs.
@@ -157,50 +162,60 @@ def _build_linestring_oga(
     Invalid rows (null geometry) produce null entries.
     """
     n = len(validity)
-    valid_mask = validity & np.isfinite(out_ax) & np.isfinite(out_bx)
-    n_valid = int(valid_mask.sum())
+    d_validity = cp.asarray(validity, dtype=cp.bool_)
+    valid_mask = d_validity & cp.isfinite(out_ax) & cp.isfinite(out_bx)
+    n_valid = int(valid_mask.sum().item())
 
     if n_valid == 0:
-        # All null/invalid -- return empty OGA
-        return from_shapely_geometries([None] * n)
+        return _empty_linestring_oga(n)
 
     # Build LineString buffers: each valid row contributes 2 coordinates
     # Interleave: x = [ax0, bx0, ax1, bx1, ...], y = [ay0, by0, ay1, by1, ...]
-    valid_idx = np.flatnonzero(valid_mask)
+    valid_idx = cp.flatnonzero(valid_mask)
 
-    ls_x = np.empty(n_valid * 2, dtype=np.float64)
-    ls_y = np.empty(n_valid * 2, dtype=np.float64)
+    ls_x = cp.empty(n_valid * 2, dtype=cp.float64)
+    ls_y = cp.empty(n_valid * 2, dtype=cp.float64)
     ls_x[0::2] = out_ax[valid_idx]
     ls_x[1::2] = out_bx[valid_idx]
     ls_y[0::2] = out_ay[valid_idx]
     ls_y[1::2] = out_by[valid_idx]
 
     # geometry_offsets: [0, 2, 4, 6, ...] for valid rows
-    ls_geom_offsets = np.arange(n_valid + 1, dtype=np.int32) * 2
-
-    ls_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.LINESTRING,
-        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
-        row_count=n_valid,
-        x=ls_x,
-        y=ls_y,
-        geometry_offsets=ls_geom_offsets,
-        empty_mask=np.zeros(n_valid, dtype=bool),
-    )
+    ls_geom_offsets = cp.arange(n_valid + 1, dtype=cp.int32) * 2
 
     # Build OGA routing arrays
-    tags = np.full(n, -1, dtype=np.int8)
+    tags = cp.full(n, -1, dtype=cp.int8)
     tags[valid_mask] = FAMILY_TAGS[GeometryFamily.LINESTRING]
 
-    family_row_offsets = np.full(n, -1, dtype=np.int32)
-    family_row_offsets[valid_idx] = np.arange(n_valid, dtype=np.int32)
+    family_row_offsets = cp.full(n, -1, dtype=cp.int32)
+    family_row_offsets[valid_idx] = cp.arange(n_valid, dtype=cp.int32)
 
-    return OwnedGeometryArray(
-        validity=valid_mask.copy(),
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=ls_x,
+                y=ls_y,
+                geometry_offsets=ls_geom_offsets,
+                empty_mask=cp.zeros(n_valid, dtype=cp.bool_),
+            ),
+        },
+        row_count=n,
         tags=tags,
+        validity=valid_mask,
         family_row_offsets=family_row_offsets,
-        families={GeometryFamily.LINESTRING: ls_buffer},
-        residency=Residency.HOST,
+        execution_mode="gpu",
+    )
+
+
+def _empty_linestring_oga(row_count: int) -> OwnedGeometryArray:
+    return build_device_resident_owned(
+        device_families={},
+        row_count=row_count,
+        tags=cp.full(row_count, -1, dtype=cp.int8),
+        validity=cp.zeros(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.full(row_count, -1, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
 
@@ -315,8 +330,7 @@ def _shortest_line_gpu(
     NVRTC kernel per group.  Geometry data stays device-resident; only
     small index sub-arrays and per-group result sub-arrays cross the bus.
 
-    Output assembly is done on host since the result is a new
-    OwnedGeometryArray of LineStrings with fixed 2-point structure.
+    Output assembly stays device-resident, including all-empty result rows.
     """
     n = left.row_count
     runtime = get_cuda_runtime()
@@ -341,13 +355,13 @@ def _shortest_line_gpu(
     both_valid = left_valid & right_valid
     valid_idx = np.flatnonzero(both_valid)
     if valid_idx.size == 0:
-        return from_shapely_geometries([None] * n)
+        return _empty_linestring_oga(n)
 
-    # Host-side result arrays: INFINITY sentinel for uncomputed rows
-    out_ax = np.full(n, np.inf, dtype=np.float64)
-    out_ay = np.full(n, np.inf, dtype=np.float64)
-    out_bx = np.full(n, np.inf, dtype=np.float64)
-    out_by = np.full(n, np.inf, dtype=np.float64)
+    # Device-side result arrays: INFINITY sentinel for uncomputed rows
+    out_ax = cp.full(n, cp.inf, dtype=cp.float64)
+    out_ay = cp.full(n, cp.inf, dtype=cp.float64)
+    out_bx = cp.full(n, cp.inf, dtype=cp.float64)
+    out_by = cp.full(n, cp.inf, dtype=cp.float64)
 
     valid_left_tags = left_tags[valid_idx]
     valid_right_tags = right_tags[valid_idx]
@@ -369,13 +383,13 @@ def _shortest_line_gpu(
             continue
 
         # Upload global row indices for this sub-group
-        d_idx = runtime.from_host(sub_idx.astype(np.int32))
+        d_idx = cp.asarray(sub_idx, dtype=cp.int32)
 
         # Allocate sub-output arrays: kernel writes at positions 0..sub_count-1
-        d_sub_ax = runtime.allocate((sub_count,), np.float64)
-        d_sub_ay = runtime.allocate((sub_count,), np.float64)
-        d_sub_bx = runtime.allocate((sub_count,), np.float64)
-        d_sub_by = runtime.allocate((sub_count,), np.float64)
+        d_sub_ax = cp.empty((sub_count,), dtype=cp.float64)
+        d_sub_ay = cp.empty((sub_count,), dtype=cp.float64)
+        d_sub_bx = cp.empty((sub_count,), dtype=cp.float64)
+        d_sub_by = cp.empty((sub_count,), dtype=cp.float64)
 
         ok = _launch_shortest_line_subgroup(
             left, right,
@@ -386,28 +400,12 @@ def _shortest_line_gpu(
 
         if ok:
             runtime.synchronize()
-            # Transfer sub-results to host and scatter into full arrays
-            h_sub_ax = np.empty(sub_count, dtype=np.float64)
-            h_sub_ay = np.empty(sub_count, dtype=np.float64)
-            h_sub_bx = np.empty(sub_count, dtype=np.float64)
-            h_sub_by = np.empty(sub_count, dtype=np.float64)
-            runtime.copy_device_to_host(d_sub_ax, h_sub_ax)
-            runtime.copy_device_to_host(d_sub_ay, h_sub_ay)
-            runtime.copy_device_to_host(d_sub_bx, h_sub_bx)
-            runtime.copy_device_to_host(d_sub_by, h_sub_by)
-
-            out_ax[sub_idx] = h_sub_ax
-            out_ay[sub_idx] = h_sub_ay
-            out_bx[sub_idx] = h_sub_bx
-            out_by[sub_idx] = h_sub_by
+            out_ax[d_idx] = d_sub_ax
+            out_ay[d_idx] = d_sub_ay
+            out_bx[d_idx] = d_sub_bx
+            out_by[d_idx] = d_sub_by
         else:
             all_ok = False
-
-        runtime.free(d_sub_ax)
-        runtime.free(d_sub_ay)
-        runtime.free(d_sub_bx)
-        runtime.free(d_sub_by)
-        runtime.free(d_idx)
 
     if not all_ok:
         # Some family pairs were unsupported — reject the entire batch and

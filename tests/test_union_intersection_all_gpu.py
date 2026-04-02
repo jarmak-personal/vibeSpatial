@@ -184,6 +184,21 @@ class TestUnionAllGPU:
 
         assert _geom_equiv(result_geom, expected)
 
+    def test_multipolygon_assembly_stays_device_resident(self, strict_device_guard):
+        """Single-row union assembly helper should keep routing metadata on device."""
+        from vibespatial.constructive.union_all import _assemble_multipolygon_gpu
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.runtime.residency import Residency
+
+        polys = [box(0, 0, 2, 2), box(1, 1, 3, 3)]
+        owned = from_shapely_geometries(polys, residency=Residency.DEVICE)
+        result = _assemble_multipolygon_gpu(owned.device_state, {GeometryFamily.POLYGON})
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
 
 # ---------------------------------------------------------------------------
 # coverage_union_all_gpu tests

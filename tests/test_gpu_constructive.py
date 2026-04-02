@@ -127,6 +127,9 @@ def test_exterior_gpu_coordinates_stay_device_resident() -> None:
     result = exterior_owned(polys, dispatch_mode=ExecutionMode.GPU)
 
     assert result.residency is Residency.DEVICE, "output should be device-resident"
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
     assert result.device_state is not None
     ls_buf = result.device_state.families[GeometryFamily.LINESTRING]
     assert isinstance(ls_buf.x, cp.ndarray), "x should be CuPy"
@@ -176,6 +179,46 @@ def test_exterior_gpu_moderate_scale_with_nulls() -> None:
         else:
             assert a is not None and a.geom_type == "LineString", f"row {i}"
             assert list(a.coords) == list(g.exterior.coords), f"row {i} coords"
+
+
+@pytest.mark.gpu
+def test_exterior_gpu_all_nonpolygon_rows_stay_device_resident(strict_device_guard) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries([Point(0, 0), None], residency=Residency.DEVICE)
+    result = exterior_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+
+
+@pytest.mark.gpu
+def test_boundary_gpu_metadata_stays_device_resident() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.boundary import boundary_owned
+    from vibespatial.runtime.residency import Residency
+
+    geoms = [
+        Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
+        shapely.MultiPolygon([
+            Polygon([(10, 0), (14, 0), (14, 4), (10, 4), (10, 0)]),
+            Polygon([(20, 0), (24, 0), (24, 4), (20, 4), (20, 0)]),
+        ]),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
 
 
 @pytest.mark.gpu

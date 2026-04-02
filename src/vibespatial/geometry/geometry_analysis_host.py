@@ -11,6 +11,7 @@ from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
 )
+from vibespatial.runtime.config import BOUNDS_SPAN_EPSILON
 
 
 def family_bounds_scalar(buffer: FamilyGeometryBuffer, row_index: int) -> tuple[float, float, float, float]:
@@ -197,8 +198,8 @@ def compute_morton_keys_cpu(bounds: np.ndarray, total: tuple[float, float, float
     keys = np.full(row_count, np.iinfo(np.uint64).max, dtype=np.uint64)
     if any(math.isnan(value) for value in total):
         return keys
-    span_x = max(maxx - minx, 1e-12)
-    span_y = max(maxy - miny, 1e-12)
+    span_x = max(maxx - minx, BOUNDS_SPAN_EPSILON)
+    span_y = max(maxy - miny, BOUNDS_SPAN_EPSILON)
     scale = (1 << bits) - 1
     for row_index, row_bounds in enumerate(bounds):
         if np.isnan(row_bounds).any():

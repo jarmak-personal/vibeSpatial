@@ -25,7 +25,7 @@ ADR_0032 = "docs/decisions/0032-point-in-polygon-gpu-utilization-diagnosis.md"
 # Known pre-existing violations as of 2026-03-17.
 # Decrease this number as debt is paid.  The check fails only if
 # the current count EXCEEDS the baseline (new violations introduced).
-_VIOLATION_BASELINE = 10  # reduced from 11: zero-copy polygon clip eliminated a perf violation
+_VIOLATION_BASELINE = 0
 
 # Attribute names that, when iterated, indicate Python-level geometry looping.
 GEOMETRY_ITER_ATTRS = {"geoms", "geometry", "geometries", "exterior", "interiors"}

@@ -7,13 +7,9 @@ from shapely.geometry import LineString, MultiPolygon, Point, Polygon, box
 
 from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.testing import build_owned as _make_owned
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
-
-
-def _make_owned(geoms):
-    return from_shapely_geometries(geoms)
 
 
 def _compute_de9im(query_owned, tree_owned, left_idx, right_idx, query_family, tree_family):
@@ -33,21 +29,21 @@ def _eval_predicate(masks, predicate):
 
 
 class TestDE9IMBitmask:
-    def test_disjoint_boxes(self):
+    def test_disjoint_boxes(self, make_owned):
         q = [box(0, 0, 1, 1)]
         t = [box(3, 0, 4, 1)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "disjoint")[0]
         assert not _eval_predicate(masks, "intersects")[0]
 
-    def test_overlapping_boxes(self):
+    def test_overlapping_boxes(self, make_owned):
         q = [box(0, 0, 2, 2)]
         t = [box(1, 1, 3, 3)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "intersects")[0]
@@ -56,11 +52,11 @@ class TestDE9IMBitmask:
         assert not _eval_predicate(masks, "within")[0]
         assert not _eval_predicate(masks, "disjoint")[0]
 
-    def test_contained_box(self):
+    def test_contained_box(self, make_owned):
         q = [box(0, 0, 10, 10)]
         t = [box(2, 2, 3, 3)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "intersects")[0]
@@ -69,33 +65,33 @@ class TestDE9IMBitmask:
         assert not _eval_predicate(masks, "within")[0]
         assert _eval_predicate(masks, "covers")[0]
 
-    def test_within(self):
+    def test_within(self, make_owned):
         q = [box(2, 2, 3, 3)]
         t = [box(0, 0, 10, 10)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "within")[0]
         assert not _eval_predicate(masks, "contains")[0]
         assert _eval_predicate(masks, "covered_by")[0]
 
-    def test_touching_boxes(self):
+    def test_touching_boxes(self, make_owned):
         q = [box(0, 0, 1, 1)]
         t = [box(1, 0, 2, 1)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "touches")[0]
         assert _eval_predicate(masks, "intersects")[0]
         assert not _eval_predicate(masks, "overlaps")[0]
 
-    def test_identical_boxes(self):
+    def test_identical_boxes(self, make_owned):
         q = [box(0, 0, 1, 1)]
         t = [box(0, 0, 1, 1)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "intersects")[0]
@@ -107,13 +103,13 @@ class TestDE9IMBitmask:
         assert not _eval_predicate(masks, "disjoint")[0]
         assert not _eval_predicate(masks, "touches")[0]
 
-    def test_polygon_with_hole(self):
+    def test_polygon_with_hole(self, make_owned):
         outer = [(0, 0), (10, 0), (10, 10), (0, 10)]
         hole = [(3, 3), (7, 3), (7, 7), (3, 7)]
         q = [Polygon(outer, [hole])]
         t = [box(4, 4, 6, 6)]  # inside the hole
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "disjoint")[0]
@@ -121,30 +117,30 @@ class TestDE9IMBitmask:
 
 
 class TestMultiPolygonDE9IM:
-    def test_mpg_mpg_overlapping(self):
+    def test_mpg_mpg_overlapping(self, make_owned):
         q = [MultiPolygon([box(0, 0, 2, 2), box(10, 10, 12, 12)])]
         t = [MultiPolygon([box(1, 1, 3, 3)])]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.MULTIPOLYGON, GeometryFamily.MULTIPOLYGON,
         )
         assert _eval_predicate(masks, "intersects")[0]
 
-    def test_pg_mpg_contained(self):
+    def test_pg_mpg_contained(self, make_owned):
         q = [box(0, 0, 10, 10)]
         t = [MultiPolygon([box(1, 1, 2, 2), box(3, 3, 4, 4)])]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON,
         )
         assert _eval_predicate(masks, "contains")[0]
 
-    def test_mpg_pg_swap(self):
+    def test_mpg_pg_swap(self, make_owned):
         """MPG × PG swap: within should work correctly after transpose."""
         q = [MultiPolygon([box(1, 1, 2, 2)])]
         t = [box(0, 0, 10, 10)]
         masks = _compute_de9im(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             [0], [0], GeometryFamily.MULTIPOLYGON, GeometryFamily.POLYGON,
         )
         assert _eval_predicate(masks, "within")[0]
@@ -154,9 +150,9 @@ class TestMultiPolygonDE9IM:
 class TestBatchPredicates:
     """Test multiple candidate pairs in a single kernel launch."""
 
-    def test_batch_intersects(self):
+    def test_batch_intersects(self, make_owned):
         polys = [box(0, 0, 1, 1), box(2, 2, 3, 3), box(0, 0, 5, 5), box(10, 10, 11, 11)]
-        owned = _make_owned(polys)
+        owned = make_owned(polys)
 
         left = np.array([0, 0, 2, 3], dtype=np.int32)
         right = np.array([1, 2, 3, 0], dtype=np.int32)

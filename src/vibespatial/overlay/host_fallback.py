@@ -22,6 +22,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
 )
 from vibespatial.runtime import RuntimeSelection
+from vibespatial.runtime.config import OVERLAY_BATCH_PIP_GPU_THRESHOLD
 from vibespatial.runtime.residency import Residency
 
 from .types import HalfEdgeGraph, OverlayFaceTable
@@ -341,7 +342,6 @@ def _build_polygon_output_from_faces(
     # Lazy imports to avoid circular dependency with gpu.py
     from vibespatial.overlay.assemble import _empty_polygon_output
     from vibespatial.overlay.bypass import (
-        _BATCH_PIP_GPU_THRESHOLD,
         _batch_point_in_ring_gpu,
     )
 
@@ -456,7 +456,7 @@ def _build_polygon_output_from_faces(
                 if container_index != cycle_index and cycle_areas[container_index] > ca:
                     depth_pairs.append((cycle_index, container_index))
 
-    if len(depth_pairs) >= _BATCH_PIP_GPU_THRESHOLD and cp is not None:
+    if len(depth_pairs) >= OVERLAY_BATCH_PIP_GPU_THRESHOLD and cp is not None:
         gpu_results = _batch_point_in_ring_gpu(depth_pairs, cycle_samples, cycle_rings)
         for i, (cycle_index, _) in enumerate(depth_pairs):
             if gpu_results[i]:
@@ -503,7 +503,7 @@ def _build_polygon_output_from_faces(
     hole_map: dict[int, list[int]] = {cycle_index: [] for cycle_index in exterior_indices}
     candidate_holes: dict[int, int] = {}
 
-    if len(hole_assign_pairs) >= _BATCH_PIP_GPU_THRESHOLD and cp is not None:
+    if len(hole_assign_pairs) >= OVERLAY_BATCH_PIP_GPU_THRESHOLD and cp is not None:
         gpu_results = _batch_point_in_ring_gpu(hole_assign_pairs, cycle_samples, cycle_rings)
         for cycle_index in cycle_rings:
             if cycle_index in exterior_indices_set:
@@ -550,7 +550,7 @@ def _build_polygon_output_from_faces(
                     local_depth_pairs.append((cycle_index, other_index))
                     local_depth_map[cycle_index].append(pair_idx)
 
-    if len(local_depth_pairs) >= _BATCH_PIP_GPU_THRESHOLD and cp is not None:
+    if len(local_depth_pairs) >= OVERLAY_BATCH_PIP_GPU_THRESHOLD and cp is not None:
         gpu_results = _batch_point_in_ring_gpu(local_depth_pairs, cycle_samples, cycle_rings)
         for cycle_index, container in candidate_holes.items():
             local_depth = sum(

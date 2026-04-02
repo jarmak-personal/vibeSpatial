@@ -843,11 +843,9 @@ def _repolygonize_from_split_rings(
     # For make_valid, we want all bounded faces with positive area — these
     # are the valid polygon faces extracted from the self-intersection split.
     d_select_mask = (bounded_mask != 0) & (signed_area > 0)
-    selected_face_indices = cp.asnumpy(
-        cp.flatnonzero(d_select_mask).astype(cp.int32)
-    )
+    selected_face_indices = cp.flatnonzero(d_select_mask).astype(cp.int32)
 
-    if selected_face_indices.size == 0:
+    if int(selected_face_indices.size) == 0:
         return None
 
     # Build OverlayFaceTable for the assembly function
@@ -970,9 +968,8 @@ def _build_batch_repaired_device(
 
     # Validity: polygons with zero valid rings are invalid
     d_poly_valid = d_rings_per_poly > 0
-    h_validity = cp.asnumpy(d_poly_valid)  # tiny: polygon_count bools
-    h_tags = np.full(polygon_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    h_family_row_offsets = np.arange(polygon_count, dtype=np.int32)
+    d_tags = cp.full(polygon_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8)
+    d_family_row_offsets = cp.arange(polygon_count, dtype=cp.int32)
 
     device_families = {
         GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
@@ -988,9 +985,10 @@ def _build_batch_repaired_device(
     result = build_device_resident_owned(
         device_families=device_families,
         row_count=polygon_count,
-        tags=h_tags,
-        validity=h_validity,
-        family_row_offsets=h_family_row_offsets,
+        tags=d_tags,
+        validity=d_poly_valid,
+        family_row_offsets=d_family_row_offsets,
+        execution_mode="gpu",
     )
     result.runtime_history.append(runtime_selection)
     return result
@@ -1095,10 +1093,10 @@ def _device_scatter_repaired(
         else:
             new_device_families[rfam] = rbuf
 
-    # Rebuild metadata: tags and validity need remapping.
-    h_tags = original_owned.tags.copy()
-    h_validity = original_owned.validity.copy()
-    h_fro = original_owned.family_row_offsets.copy()
+    # Rebuild metadata on device so the merged result stays fully device-resident.
+    d_tags = cp.asarray(ds.tags).copy()
+    d_validity = cp.asarray(ds.validity).copy()
+    d_fro = cp.asarray(ds.family_row_offsets).copy()
 
     # Count same-family repair rows
     same_family_repair_count = (
@@ -1107,9 +1105,10 @@ def _device_scatter_repaired(
     )
 
     # Build old->new position mapping for the original family
-    old_to_new = np.empty(orig_polygon_count, dtype=np.int32)
-    for i, vr in enumerate(valid_family_rows):
-        old_to_new[vr] = i
+    old_to_new = cp.full(orig_polygon_count, -1, dtype=cp.int32)
+    if valid_family_rows.size > 0:
+        d_valid_family_rows = cp.asarray(valid_family_rows, dtype=cp.int32)
+        old_to_new[d_valid_family_rows] = cp.arange(d_valid_family_rows.size, dtype=cp.int32)
 
     # Track which repaired rows went to a different family
     # Build a map: batch_repair_index -> (target_family, family_row_offset)
@@ -1128,8 +1127,8 @@ def _device_scatter_repaired(
             cross_family_map[i] = (rfam, existing_count + i)
 
     # Remap family_row_offsets and tags for repaired rows
-    poly_global_mask = h_tags == family_tag
-    poly_globals = np.flatnonzero(poly_global_mask)
+    poly_global_mask = d_tags == family_tag
+    poly_globals = cp.flatnonzero(poly_global_mask)
 
     if cross_family_map:
         # The repaired batch has rows in a different family.
@@ -1148,54 +1147,56 @@ def _device_scatter_repaired(
                 existing_in_target = int(ds.families[target_fam].geometry_offsets.size) - 1
 
             # Remap valid original rows
-            if poly_globals.size > 0:
-                old_offsets = h_fro[poly_globals]
+            if int(poly_globals.size) > 0:
+                old_offsets = d_fro[poly_globals]
                 valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
-                h_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+                d_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
 
             # Remap repaired rows: change tag and family_row_offset
             for i, rr in enumerate(invalid_family_rows):
                 g = fam_to_global.get(int(rr))
                 if g is not None:
-                    h_tags[g] = target_tag
-                    h_fro[g] = existing_in_target + i
+                    d_tags[g] = target_tag
+                    d_fro[g] = existing_in_target + i
                     if i < target_count:
-                        h_validity[g] = True
+                        d_validity[g] = True
         else:
             # Mixed output: some same-family, some cross-family.
             # Fall through to same-family-only mapping for now.
             for i, rr in enumerate(invalid_family_rows):
                 old_to_new[rr] = valid_count + i
-            if poly_globals.size > 0:
-                old_offsets = h_fro[poly_globals]
+            if int(poly_globals.size) > 0:
+                old_offsets = d_fro[poly_globals]
                 valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
-                h_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+                d_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
     else:
         # All repairs stayed in the same family
         for i, rr in enumerate(invalid_family_rows):
             old_to_new[rr] = valid_count + i
-        if poly_globals.size > 0:
-            old_offsets = h_fro[poly_globals]
+        if int(poly_globals.size) > 0:
+            old_offsets = d_fro[poly_globals]
             valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
-            h_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+            d_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
 
         # Update validity for repaired rows that produced empty/invalid output
         merged_family_buf = new_device_families.get(family)
         if same_family_buf is not None and merged_family_buf is not None and hasattr(merged_family_buf, "empty_mask"):
             d_merged_empty = merged_family_buf.empty_mask
-            h_merged_empty = cp.asnumpy(d_merged_empty)  # tiny: polygon_count bools
-            for gi, fro_val in zip(
-                np.flatnonzero(poly_global_mask), h_fro[poly_globals],
-            ):
-                if 0 <= fro_val < len(h_merged_empty) and h_merged_empty[fro_val]:
-                    h_validity[gi] = False
+            if int(poly_globals.size) > 0:
+                mapped_offsets = d_fro[poly_globals]
+                valid_mapped = (mapped_offsets >= 0) & (mapped_offsets < d_merged_empty.size)
+                if bool(cp.any(valid_mapped)):
+                    mapped_globals = poly_globals[valid_mapped]
+                    mapped_offsets = mapped_offsets[valid_mapped]
+                    d_validity[mapped_globals[d_merged_empty[mapped_offsets]]] = False
 
     return build_device_resident_owned(
         device_families=new_device_families,
         row_count=original_owned.row_count,
-        tags=h_tags,
-        validity=h_validity,
-        family_row_offsets=h_fro,
+        tags=d_tags,
+        validity=d_validity,
+        family_row_offsets=d_fro,
+        execution_mode="gpu",
     )
 
 
@@ -1521,8 +1522,8 @@ def gpu_repair_invalid_polygons(
             d_ring_offsets = cp.asarray(batch_ring_offsets)
             d_geom_offsets = cp.asarray(batch_geom_offsets)
 
-        batch_ring_count = int(d_ring_offsets.size) - 1
-        batch_poly_count = int(d_geom_offsets.size) - 1
+        batch_ring_count = d_ring_offsets.size - 1
+        batch_poly_count = d_geom_offsets.size - 1
 
         if batch_ring_count == 0 or batch_poly_count == 0:
             continue
@@ -1557,7 +1558,7 @@ def gpu_repair_invalid_polygons(
 
         # --- Step 4: Phase D — batched repolygonization ---
         if had_splits:
-            batch_ring_count = int(d_ring_offsets.size) - 1
+            batch_ring_count = d_ring_offsets.size - 1
             batch_result = _repolygonize_from_split_rings(
                 d_x, d_y, d_ring_offsets,
                 d_geom_offsets, batch_ring_count, batch_poly_count,

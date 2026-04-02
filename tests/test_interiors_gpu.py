@@ -176,6 +176,28 @@ def test_mixed_holes_and_no_holes():
     _compare_interiors(geoms, result)
 
 
+@requires_gpu
+def test_interiors_gpu_metadata_stays_device_resident():
+    """GPU interiors keeps routing metadata on device."""
+    from vibespatial.constructive.interiors import interiors_owned
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    poly = Polygon(
+        [(0, 0), (8, 0), (8, 8), (0, 8), (0, 0)],
+        [[(2, 2), (6, 2), (6, 6), (2, 6), (2, 2)]],
+    )
+
+    owned = from_shapely_geometries([poly], residency=Residency.DEVICE)
+    result = interiors_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency == Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+
+
 # ---------------------------------------------------------------------------
 # Null and empty handling
 # ---------------------------------------------------------------------------

@@ -294,11 +294,13 @@ def _line_merge_gpu(
         d_out_empty[d_non_eligible] = 1
 
     # Build output metadata
-    out_validity = validity.copy()
-    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=np.int8)
-    out_tags[~validity] = -1
-    out_family_row_offsets = np.arange(row_count, dtype=np.int32)
-    out_family_row_offsets[~validity] = -1
+    d_validity = cp.asarray(d_state.validity)
+    out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=cp.int8)
+    out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
+    d_null = ~d_validity
+    if int(d_null.any()) != 0:
+        out_tags[d_null] = -1
+        out_family_row_offsets[d_null] = -1
 
     device_families = {
         GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
@@ -315,8 +317,9 @@ def _line_merge_gpu(
         device_families=device_families,
         row_count=row_count,
         tags=out_tags,
-        validity=out_validity,
+        validity=d_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -328,11 +331,13 @@ def _build_empty_output(
     """Build an all-empty MultiLineString OGA."""
     runtime = get_cuda_runtime()
 
-    out_validity = validity.copy()
-    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=np.int8)
-    out_tags[~validity] = -1
-    out_family_row_offsets = np.arange(row_count, dtype=np.int32)
-    out_family_row_offsets[~validity] = -1
+    d_validity = cp.asarray(validity, dtype=cp.bool_)
+    out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=cp.int8)
+    out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
+    d_null = ~d_validity
+    if int(d_null.any()) != 0:
+        out_tags[d_null] = -1
+        out_family_row_offsets[d_null] = -1
 
     d_x = runtime.allocate((0,), np.float64)
     d_y = runtime.allocate((0,), np.float64)
@@ -355,8 +360,9 @@ def _build_empty_output(
         device_families=device_families,
         row_count=row_count,
         tags=out_tags,
-        validity=out_validity,
+        validity=d_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

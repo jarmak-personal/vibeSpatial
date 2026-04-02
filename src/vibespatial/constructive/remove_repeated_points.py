@@ -48,6 +48,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     build_device_resident_owned,
     build_updated_device_family_buffer,
+    forward_result_metadata,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -248,12 +249,15 @@ def _remove_repeated_points_gpu(owned, tolerance):
             runtime, device_buf, family, tolerance,
         )
 
+    tags, validity, family_row_offsets = forward_result_metadata(owned)
+
     return build_device_resident_owned(
         device_families=new_device_families,
         row_count=owned.row_count,
-        tags=owned.tags.copy(),
-        validity=owned.validity.copy(),
-        family_row_offsets=owned.family_row_offsets.copy(),
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
 
 

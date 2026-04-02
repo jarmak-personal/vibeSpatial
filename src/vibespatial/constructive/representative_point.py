@@ -51,16 +51,18 @@ def _representative_point_kernels():
     )
 
 
-def _build_point_oga_metadata(
-    row_count: int,
-    validity: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Build tags and family_row_offsets arrays for a Point OGA."""
-    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
-    out_tags[~validity] = -1
-    out_family_row_offsets = np.arange(row_count, dtype=np.int32)
-    out_family_row_offsets[~validity] = -1
-    return out_tags, out_family_row_offsets
+def _build_point_oga_metadata(row_count: int, validity):
+    """Build device-resident validity, tags, and family row offsets for Point OGA."""
+    import cupy as cp
+
+    d_validity = cp.asarray(validity, dtype=cp.bool_)
+    out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8)
+    out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
+    d_null = ~d_validity
+    if int(d_null.any()) != 0:
+        out_tags[d_null] = -1
+        out_family_row_offsets[d_null] = -1
+    return d_validity, out_tags, out_family_row_offsets
 
 
 def _build_device_resident_point_output_from_device(
@@ -83,7 +85,7 @@ def _build_device_resident_point_output_from_device(
     d_geom_offsets = cp.arange(row_count + 1, dtype=cp.int32)
     d_empty = cp.zeros(row_count, dtype=cp.uint8)
 
-    out_tags, out_family_row_offsets = _build_point_oga_metadata(
+    d_validity, out_tags, out_family_row_offsets = _build_point_oga_metadata(
         row_count, validity,
     )
 
@@ -101,8 +103,9 @@ def _build_device_resident_point_output_from_device(
         device_families=device_families,
         row_count=row_count,
         tags=out_tags,
-        validity=validity.copy(),
+        validity=d_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -129,7 +132,7 @@ def _build_device_resident_point_output_from_host(
     d_geom_offsets = cp.arange(row_count + 1, dtype=cp.int32)
     d_empty = cp.zeros(row_count, dtype=cp.uint8)
 
-    out_tags, out_family_row_offsets = _build_point_oga_metadata(
+    d_validity, out_tags, out_family_row_offsets = _build_point_oga_metadata(
         row_count, validity,
     )
 
@@ -147,8 +150,9 @@ def _build_device_resident_point_output_from_host(
         device_families=device_families,
         row_count=row_count,
         tags=out_tags,
-        validity=validity.copy(),
+        validity=d_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

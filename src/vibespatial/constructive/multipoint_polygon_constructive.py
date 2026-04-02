@@ -2,10 +2,25 @@ from __future__ import annotations
 
 import numpy as np
 
+from vibespatial.constructive.nonpolygon_binary_output import (
+    build_device_backed_multipoint_output,
+)
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime.residency import Residency, TransferTrigger
+
+
+def _empty_multipoint_output(row_count: int) -> OwnedGeometryArray:
+    import cupy as cp
+
+    return build_device_backed_multipoint_output(
+        cp.empty(0, dtype=cp.float64),
+        cp.empty(0, dtype=cp.float64),
+        row_count=row_count,
+        validity=cp.zeros(row_count, dtype=cp.bool_),
+        geometry_offsets=cp.zeros(row_count + 1, dtype=cp.int32),
+    )
 
 
 def multipoint_polygon_intersection(
@@ -38,19 +53,21 @@ def multipoint_polygon_intersection(
     elif GeometryFamily.MULTIPOLYGON in poly_state.families:
         poly_buf = poly_state.families[GeometryFamily.MULTIPOLYGON]
     else:
-        return from_shapely_geometries([None] * n)
+        return _empty_multipoint_output(n)
 
     d_mp_valid = mp_state.validity.astype(cp.bool_) & ~mp_buf.empty_mask.astype(cp.bool_)
     d_poly_valid = poly_state.validity.astype(cp.bool_) & ~poly_buf.empty_mask.astype(cp.bool_)
     d_both_valid = d_mp_valid & d_poly_valid
 
     runtime = get_cuda_runtime()
-    h_mp_offsets = runtime.copy_device_to_host(cp.asarray(mp_buf.geometry_offsets))
-    h_both_valid = runtime.copy_device_to_host(d_both_valid)
-    total_points = int(h_mp_offsets[-1])
+    d_mp_offsets = cp.asarray(mp_buf.geometry_offsets)
+    total_points = int(d_mp_offsets[-1])
 
     if total_points == 0:
-        return from_shapely_geometries([None] * n)
+        return _empty_multipoint_output(n)
+
+    h_mp_offsets = runtime.copy_device_to_host(d_mp_offsets)
+    h_both_valid = runtime.copy_device_to_host(d_both_valid)
 
     h_mp_x = mp_buf.x if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.x)
     h_mp_y = mp_buf.y if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.y)
@@ -66,7 +83,7 @@ def multipoint_polygon_intersection(
             poly_geoms.append(poly_shapely[i])
 
     if len(point_geoms) == 0:
-        return from_shapely_geometries([None] * n)
+        return _empty_multipoint_output(n)
 
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
 
@@ -126,13 +143,15 @@ def multipoint_polygon_difference(
     d_both_valid = d_mp_valid & d_poly_valid
 
     runtime = get_cuda_runtime()
-    h_mp_offsets = runtime.copy_device_to_host(cp.asarray(mp_buf.geometry_offsets))
-    h_mp_valid = runtime.copy_device_to_host(d_mp_valid)
-    h_both_valid = runtime.copy_device_to_host(d_both_valid)
-    total_points = int(h_mp_offsets[-1])
+    d_mp_offsets = cp.asarray(mp_buf.geometry_offsets)
+    total_points = int(d_mp_offsets[-1])
 
     if total_points == 0:
-        return from_shapely_geometries([None] * n)
+        return _empty_multipoint_output(n)
+
+    h_mp_offsets = runtime.copy_device_to_host(d_mp_offsets)
+    h_mp_valid = runtime.copy_device_to_host(d_mp_valid)
+    h_both_valid = runtime.copy_device_to_host(d_both_valid)
 
     h_mp_x = mp_buf.x if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.x)
     h_mp_y = mp_buf.y if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.y)
@@ -148,7 +167,7 @@ def multipoint_polygon_difference(
             poly_geoms.append(poly_shapely[i])
 
     if len(point_geoms) == 0:
-        return from_shapely_geometries([None] * n)
+        return _empty_multipoint_output(n)
 
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
 

@@ -116,6 +116,18 @@ def _make_triangle():
     return Polygon([(0, 0), (4, 0), (2, 3)])
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+def test_representative_point_stays_device_resident(strict_device_guard):
+    """representative_point keeps single-family metadata on device."""
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries([_make_concave_l_shape()], residency=Residency.DEVICE)
+    result = representative_point_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency == Residency.DEVICE
+
+
 # ---------------------------------------------------------------------------
 # Tests: Basic Functionality
 # ---------------------------------------------------------------------------

@@ -1355,7 +1355,8 @@ def _evaluate_geopandas_equals(
 
     Topological equality = structural equality after normalization.  Both
     normalize and equals_exact already have GPU paths.  This function
-    composes them: normalize both inputs, then compare with tolerance 1e-12.
+    composes them: normalize both inputs, then compare with the shared
+    geometry-equality tolerance.
 
     For scalar right operands, falls back to Shapely's vectorized C path
     to avoid O(N) Python-side geometry duplication.

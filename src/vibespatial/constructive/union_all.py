@@ -54,6 +54,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import OVERLAY_GPU_FAILURE_THRESHOLD
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -457,9 +458,9 @@ def _build_single_row_oga(
 ) -> OwnedGeometryArray:
     """Build a 1-row device-resident OwnedGeometryArray from a single device buffer."""
     tag_value = FAMILY_TAGS[family]
-    tags = np.array([tag_value], dtype=np.int8)
-    validity = np.array([True], dtype=np.bool_)
-    family_row_offsets = np.array([0], dtype=np.int32)
+    tags = cp.asarray([tag_value], dtype=cp.int8)
+    validity = cp.asarray([True], dtype=cp.bool_)
+    family_row_offsets = cp.asarray([0], dtype=cp.int32)
 
     return build_device_resident_owned(
         device_families={family: d_buf},
@@ -467,6 +468,7 @@ def _build_single_row_oga(
         tags=tags,
         validity=validity,
         family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -805,14 +807,12 @@ def _tree_reduce_global(
     rounds = 0
     max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
     consecutive_gpu_failures = 0
-    _GPU_FAILURE_THRESHOLD = 3
-
     while len(current) > 1 and rounds < max_rounds:
         next_round: list[OwnedGeometryArray] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
                 gpu_ok = False
-                if consecutive_gpu_failures < _GPU_FAILURE_THRESHOLD:
+                if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
                     try:
                         merged = overlay_fn(
                             current[i],

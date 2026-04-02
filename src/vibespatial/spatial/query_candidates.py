@@ -11,6 +11,7 @@ from vibespatial.cuda.cccl_primitives import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
@@ -41,7 +42,7 @@ def _generate_distance_pairs(
     tree_bounds: np.ndarray,
     distances: np.ndarray,
     *,
-    tile_size: int = 256,
+    tile_size: int = COARSE_BOUNDS_TILE_SIZE,
 ) -> tuple[np.ndarray, np.ndarray]:
     valid_left = np.flatnonzero(~np.isnan(query_bounds).any(axis=1))
     valid_right = np.flatnonzero(~np.isnan(tree_bounds).any(axis=1))

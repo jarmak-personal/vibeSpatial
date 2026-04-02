@@ -34,7 +34,7 @@ def _clear_caches() -> None:
 
 def _run_serial(args: argparse.Namespace) -> None:
     """Compile every CCCL spec one-by-one on the main thread."""
-    from vibespatial.cuda.cccl_precompile import CCCLPrecompiler, SPEC_REGISTRY
+    from vibespatial.cuda.cccl_precompile import SPEC_REGISTRY, CCCLPrecompiler
 
     comp = CCCLPrecompiler.get()
     results = []
@@ -100,8 +100,8 @@ def main() -> None:
     import importlib
 
     from vibespatial.cuda.cccl_precompile import (
-        SPEC_REGISTRY,
         _NVRTC_CONSUMER_MODULES,
+        SPEC_REGISTRY,
         ensure_pipelines_warm,
         precompile_status,
         request_warmup,

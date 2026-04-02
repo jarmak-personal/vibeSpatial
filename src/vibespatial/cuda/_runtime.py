@@ -577,10 +577,12 @@ class CudaDriverRuntime:
                 return cp.zeros(normalized_shape, dtype=normalized_dtype)
             return cp.empty(normalized_shape, dtype=normalized_dtype)
 
-    def from_host(self, host_array: np.ndarray) -> DeviceArray:
+    def from_host(self, host_array: np.ndarray | DeviceArray) -> DeviceArray:
         _require_gpu_arrays()
-        host = np.ascontiguousarray(host_array)
         with self.activate():
+            if hasattr(host_array, "__cuda_array_interface__"):
+                return cp.asarray(host_array)
+            host = np.ascontiguousarray(host_array)
             return cp.asarray(host)
 
     def copy_host_to_device(self, host_array: np.ndarray, device_array: DeviceArray) -> None:

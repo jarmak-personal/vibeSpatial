@@ -20,6 +20,7 @@ import shapely
 
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection
+from vibespatial.runtime.config import GEOM_EQUALS_DEFAULT_TOLERANCE
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
@@ -275,4 +276,9 @@ def geom_equals_owned(
 
     left_norm = normalize_owned(left, dispatch_mode=dispatch_mode)
     right_norm = normalize_owned(right, dispatch_mode=dispatch_mode)
-    return geom_equals_exact_owned(left_norm, right_norm, tolerance=1e-12, dispatch_mode=dispatch_mode)
+    return geom_equals_exact_owned(
+        left_norm,
+        right_norm,
+        tolerance=GEOM_EQUALS_DEFAULT_TOLERANCE,
+        dispatch_mode=dispatch_mode,
+    )

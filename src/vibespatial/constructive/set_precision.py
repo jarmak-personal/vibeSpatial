@@ -33,6 +33,7 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    forward_result_metadata,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -93,12 +94,15 @@ def _quantize_owned(owned: OwnedGeometryArray, grid_size: float) -> OwnedGeometr
             continue
         new_device_families[family] = _quantize_family_coords(device_buf, grid_size)
 
+    tags, validity, family_row_offsets = forward_result_metadata(owned)
+
     return build_device_resident_owned(
         device_families=new_device_families,
         row_count=owned.row_count,
-        tags=owned.tags.copy(),
-        validity=owned.validity.copy(),
-        family_row_offsets=owned.family_row_offsets.copy(),
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
 
 

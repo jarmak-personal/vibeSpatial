@@ -23,17 +23,10 @@ from shapely.geometry import (
     Polygon,
 )
 
-from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.testing import build_owned as _make_owned
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
-
-
-def _make_owned(geoms: list) -> OwnedGeometryArray:
-    """Create an OwnedGeometryArray from Shapely geometries."""
-    return from_shapely_geometries(geoms)
-
-
 def _shapely_equals_exact_tol0(left_geoms, right_geoms):
     """Shapely oracle: equals_exact with tolerance=0."""
     left_arr = np.asarray(left_geoms, dtype=object)
@@ -46,12 +39,12 @@ def _shapely_equals_exact_tol0(left_geoms, right_geoms):
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_identical_points_match():
+def test_identical_points_match(make_owned):
     """Identical points should return True."""
     n = 1200  # above GPU threshold
     geoms = [Point(i * 0.1, i * 0.2) for i in range(n)]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)
@@ -61,13 +54,13 @@ def test_identical_points_match():
 
 
 @requires_gpu
-def test_different_points_do_not_match():
+def test_different_points_do_not_match(make_owned):
     """Points with different coordinates should return False."""
     n = 1200
     left_geoms = [Point(i, i) for i in range(n)]
     right_geoms = [Point(i + 0.001, i) for i in range(n)]
-    left = _make_owned(left_geoms)
-    right = _make_owned(right_geoms)
+    left = make_owned(left_geoms)
+    right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)
@@ -81,12 +74,12 @@ def test_different_points_do_not_match():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_identical_linestrings_match():
+def test_identical_linestrings_match(make_owned):
     """Identical linestrings should return True."""
     n = 1200
     geoms = [LineString([(i, 0), (i + 1, 1), (i + 2, 0)]) for i in range(n)]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)
@@ -96,13 +89,13 @@ def test_identical_linestrings_match():
 
 
 @requires_gpu
-def test_linestrings_different_vertex_count():
+def test_linestrings_different_vertex_count(make_owned):
     """LineStrings with different vertex counts should return False."""
     n = 1200
     left_geoms = [LineString([(i, 0), (i + 1, 1)]) for i in range(n)]
     right_geoms = [LineString([(i, 0), (i + 1, 1), (i + 2, 0)]) for i in range(n)]
-    left = _make_owned(left_geoms)
-    right = _make_owned(right_geoms)
+    left = make_owned(left_geoms)
+    right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)
@@ -116,15 +109,15 @@ def test_linestrings_different_vertex_count():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_identical_polygons_match():
+def test_identical_polygons_match(make_owned):
     """Identical polygons should return True."""
     n = 1200
     geoms = [
         Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)])
         for i in range(n)
     ]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)
@@ -134,15 +127,15 @@ def test_identical_polygons_match():
 
 
 @requires_gpu
-def test_polygons_different_ring_structure():
+def test_polygons_different_ring_structure(make_owned):
     """Polygons with vs without holes should return False."""
     n = 1200
     outer = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
     hole = [(2, 2), (8, 2), (8, 8), (2, 8), (2, 2)]
     geoms_with_hole = [Polygon(outer, [hole]) for _ in range(n)]
     geoms_no_hole = [Polygon(outer) for _ in range(n)]
-    left = _make_owned(geoms_with_hole)
-    right = _make_owned(geoms_no_hole)
+    left = make_owned(geoms_with_hole)
+    right = make_owned(geoms_no_hole)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)
@@ -156,12 +149,12 @@ def test_polygons_different_ring_structure():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_identical_multipoints_match():
+def test_identical_multipoints_match(make_owned):
     """Identical MultiPoints should return True."""
     n = 1200
     geoms = [MultiPoint([(i, 0), (i + 1, 1)]) for i in range(n)]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_identical_owned
     result = geom_equals_identical_owned(left, right, dispatch_mode=ExecutionMode.GPU)

@@ -43,6 +43,7 @@ from .oracle import (
     mock_point_in_polygon,
     point_in_polygon_reference,
 )
+from .owned import build_owned
 from .runtime_harness import (
     cuda_runtime_available,
     normalize_dispatch_modes,
@@ -96,6 +97,7 @@ __all__ = [
     "assert_matches_shapely",
     "benchmark_matrix",
     "benchmark_mixed_layout",
+    "build_owned",
     "build_payload_model",
     "build_point_in_polygon_scenario",
     "capture_strict_api_call",

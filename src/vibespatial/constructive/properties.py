@@ -22,6 +22,8 @@ ADR-0033:
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 try:
@@ -528,7 +530,7 @@ def is_closed_owned(owned: OwnedGeometryArray) -> np.ndarray:
         ):
             d_buf = owned.device_state.families[family]
             d_family_rows = cp.asarray(family_rows)
-            n = int(d_family_rows.size)
+            n = d_family_rows.size
 
             runtime = get_cuda_runtime()
             kernel_group = compile_kernel_group(
@@ -831,7 +833,7 @@ def is_ccw_owned(owned: OwnedGeometryArray) -> np.ndarray:
         ):
             d_buf = owned.device_state.families[family]
             d_family_rows = cp.asarray(family_rows)
-            n = int(d_family_rows.size)
+            n = d_family_rows.size
 
             runtime = get_cuda_runtime()
             kernel_group = compile_kernel_group(
@@ -922,7 +924,7 @@ def _get_geometry_multipoint_gpu(
     device_buf: DeviceFamilyGeometryBuffer,
     index: int,
     family_rows: np.ndarray,
-) -> tuple[DeviceFamilyGeometryBuffer, np.ndarray]:
+) -> tuple[DeviceFamilyGeometryBuffer, Any]:
     """Extract i-th Point from each MultiPoint row on device.
 
     Returns the device buffer for Point family and a boolean mask of which
@@ -951,8 +953,7 @@ def _get_geometry_multipoint_gpu(
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
 
     # Device-side early-exit check — avoid D2H transfer when all OOB
-    if not d_valid.any():
-        valid_mask = cp.asnumpy(d_valid)
+    if int(d_valid.sum().item()) == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -963,7 +964,7 @@ def _get_geometry_multipoint_gpu(
             y=d_empty_y,
             geometry_offsets=d_empty_geom_offsets,
             empty_mask=d_empty_mask,
-        ), valid_mask
+        ), d_valid
 
     d_valid_local = cp.flatnonzero(d_valid)
     n_valid = int(d_valid_local.size)
@@ -979,23 +980,20 @@ def _get_geometry_multipoint_gpu(
     d_out_geom_offsets = cp.arange(n_valid + 1, dtype=cp.int32)
     d_out_empty = cp.zeros(n_valid, dtype=cp.bool_)
 
-    # Transfer validity to host for caller's numpy indexing
-    valid_mask = cp.asnumpy(d_valid)
-
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POINT,
         x=d_out_x,
         y=d_out_y,
         geometry_offsets=d_out_geom_offsets,
         empty_mask=d_out_empty,
-    ), valid_mask
+    ), d_valid
 
 
 def _get_geometry_multilinestring_gpu(
     device_buf: DeviceFamilyGeometryBuffer,
     index: int,
     family_rows: np.ndarray,
-) -> tuple[DeviceFamilyGeometryBuffer, np.ndarray]:
+) -> tuple[DeviceFamilyGeometryBuffer, Any]:
     """Extract i-th LineString from each MultiLineString row on device.
 
     MultiLineString layout:
@@ -1021,8 +1019,7 @@ def _get_geometry_multilinestring_gpu(
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
 
     # Device-side early-exit check — avoid D2H transfer when all OOB
-    if not d_valid.any():
-        valid_mask = cp.asnumpy(d_valid)
+    if int(d_valid.sum().item()) == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1033,7 +1030,7 @@ def _get_geometry_multilinestring_gpu(
             y=d_empty_y,
             geometry_offsets=d_empty_geom_offsets,
             empty_mask=d_empty_mask,
-        ), valid_mask
+        ), d_valid
 
     d_valid_local = cp.flatnonzero(d_valid)
     n_valid = int(d_valid_local.size)
@@ -1073,23 +1070,20 @@ def _get_geometry_multilinestring_gpu(
 
     d_out_empty = d_coord_lengths == 0
 
-    # Transfer validity to host for caller's numpy indexing
-    valid_mask = cp.asnumpy(d_valid)
-
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.LINESTRING,
         x=d_out_x,
         y=d_out_y,
         geometry_offsets=d_out_geom_offsets,
         empty_mask=d_out_empty,
-    ), valid_mask
+    ), d_valid
 
 
 def _get_geometry_multipolygon_gpu(
     device_buf: DeviceFamilyGeometryBuffer,
     index: int,
     family_rows: np.ndarray,
-) -> tuple[DeviceFamilyGeometryBuffer, np.ndarray]:
+) -> tuple[DeviceFamilyGeometryBuffer, Any]:
     """Extract i-th Polygon from each MultiPolygon row on device.
 
     MultiPolygon layout:
@@ -1117,8 +1111,7 @@ def _get_geometry_multipolygon_gpu(
     d_valid = (d_eff_index >= 0) & (d_eff_index < d_part_counts)
 
     # Device-side early-exit check — avoid D2H transfer when all OOB
-    if not d_valid.any():
-        valid_mask = cp.asnumpy(d_valid)
+    if int(d_valid.sum().item()) == 0:
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_empty_geom_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1131,7 +1124,7 @@ def _get_geometry_multipolygon_gpu(
             geometry_offsets=d_empty_geom_offsets,
             empty_mask=d_empty_mask,
             ring_offsets=d_empty_ring_offsets,
-        ), valid_mask
+        ), d_valid
 
     d_valid_local = cp.flatnonzero(d_valid)
     n_valid = int(d_valid_local.size)
@@ -1150,7 +1143,6 @@ def _get_geometry_multipolygon_gpu(
     total_rings = int(d_out_geom_offsets[-1])
 
     if total_rings == 0:
-        valid_mask = cp.asnumpy(d_valid)
         d_empty_x = cp.empty(0, dtype=cp.float64)
         d_empty_y = cp.empty(0, dtype=cp.float64)
         d_out_ring_offsets = cp.zeros(1, dtype=cp.int32)
@@ -1162,7 +1154,7 @@ def _get_geometry_multipolygon_gpu(
             geometry_offsets=d_out_geom_offsets,
             empty_mask=d_out_empty,
             ring_offsets=d_out_ring_offsets,
-        ), valid_mask
+        ), d_valid
 
     # Build flat ring index array to gather source ring indices
     # CuPy repeat requires a Python list; transfer small offset arrays.
@@ -1195,9 +1187,6 @@ def _get_geometry_multipolygon_gpu(
 
     d_out_empty = d_ring_counts == 0
 
-    # Transfer validity to host for caller's numpy indexing
-    valid_mask = cp.asnumpy(d_valid)
-
     return DeviceFamilyGeometryBuffer(
         family=GeometryFamily.POLYGON,
         x=d_out_x,
@@ -1205,7 +1194,7 @@ def _get_geometry_multipolygon_gpu(
         geometry_offsets=d_out_geom_offsets,
         empty_mask=d_out_empty,
         ring_offsets=d_out_ring_offsets,
-    ), valid_mask
+    ), d_valid
 
 
 def _pass_through_simple_gpu(
@@ -1213,21 +1202,22 @@ def _pass_through_simple_gpu(
     family: GeometryFamily,
     family_rows: np.ndarray,
     index: int,
-) -> tuple[DeviceFamilyGeometryBuffer, np.ndarray]:
+) -> tuple[DeviceFamilyGeometryBuffer, Any]:
     """Pass through simple geometries at index 0; mark invalid otherwise.
 
     For simple types (Point, LineString, Polygon), index=0 returns the
     geometry itself.  Negative indices are resolved: -1 also maps to 0
     since the collection length is 1.  All other indices are out-of-bounds.
     """
-    n = len(family_rows)
+    d_family_rows = cp.asarray(family_rows)
+    n = int(d_family_rows.size)
     # Simple types act as collections of length 1.
     eff_index = index
     if eff_index < 0:
         eff_index = 1 + eff_index  # length=1, so -1 -> 0, -2 -> -1 (invalid)
-    valid_mask = np.full(n, eff_index == 0)
+    d_valid = cp.full(n, eff_index == 0, dtype=cp.bool_)
 
-    if not np.any(valid_mask):
+    if int(d_valid.sum().item()) == 0:
         if family is GeometryFamily.POLYGON:
             return DeviceFamilyGeometryBuffer(
                 family=family,
@@ -1236,7 +1226,7 @@ def _pass_through_simple_gpu(
                 geometry_offsets=cp.zeros(1, dtype=cp.int32),
                 empty_mask=cp.empty(0, dtype=cp.bool_),
                 ring_offsets=cp.zeros(1, dtype=cp.int32),
-            ), valid_mask
+            ), d_valid
         else:
             return DeviceFamilyGeometryBuffer(
                 family=family,
@@ -1244,11 +1234,10 @@ def _pass_through_simple_gpu(
                 y=cp.empty(0, dtype=cp.float64),
                 geometry_offsets=cp.zeros(1, dtype=cp.int32),
                 empty_mask=cp.empty(0, dtype=cp.bool_),
-            ), valid_mask
+            ), d_valid
 
     # All rows are valid (eff_index == 0): pass through entire buffer
     # for the given family rows.
-    d_family_rows = cp.asarray(family_rows)
     d_geom_offsets = device_buf.geometry_offsets
 
     d_starts = d_geom_offsets[d_family_rows]
@@ -1305,7 +1294,7 @@ def _pass_through_simple_gpu(
             geometry_offsets=d_out_geom_offsets,
             empty_mask=d_out_empty,
             ring_offsets=d_out_ring_offsets,
-        ), valid_mask
+        ), d_valid
 
     # Point or LineString: geometry_offsets -> coordinate indices directly.
     total_coords = int(d_out_geom_offsets[-1])
@@ -1328,7 +1317,7 @@ def _pass_through_simple_gpu(
         y=d_out_y,
         geometry_offsets=d_out_geom_offsets,
         empty_mask=d_out_empty,
-    ), valid_mask
+    ), d_valid
 
 
 # ---------------------------------------------------------------------------
@@ -1374,27 +1363,27 @@ def _get_geometry_gpu(
     d_state = owned._ensure_device_state()
 
     row_count = owned.row_count
-    out_tags = owned.tags.copy()
-    out_validity = owned.validity.copy()
-    src_tags = owned.tags
+    out_tags = cp.asarray(d_state.tags).copy()
+    out_validity = cp.asarray(d_state.validity).copy()
+    src_tags = cp.asarray(d_state.tags)
+    src_family_row_offsets = cp.asarray(d_state.family_row_offsets)
 
     new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
     # Track the ordered global rows for each output family so that
     # family_row_offsets match the merge order of the device buffers.
-    family_global_rows_ordered: dict[GeometryFamily, list[np.ndarray]] = {}
+    family_global_rows_ordered: dict[GeometryFamily, list[Any]] = {}
 
     for family, device_buf in d_state.families.items():
-        geom_count = int(device_buf.geometry_offsets.shape[0]) - 1
+        geom_count = device_buf.geometry_offsets.shape[0] - 1
         if geom_count == 0:
             continue
 
         tag = FAMILY_TAGS[family]
-        mask = src_tags == tag
-        if not np.any(mask):
+        global_rows = cp.flatnonzero(src_tags == tag)
+        if global_rows.size == 0:
             continue
 
-        global_rows = np.flatnonzero(mask)
-        family_rows = owned.family_row_offsets[global_rows]
+        family_rows = src_family_row_offsets[global_rows]
 
         if family in _MULTI_TO_SIMPLE:
             simple_family = _MULTI_TO_SIMPLE[family]
@@ -1453,11 +1442,11 @@ def _get_geometry_gpu(
     # Recompute family_row_offsets.  The merge order determines which
     # family-local index each global row maps to -- we must follow the
     # same concatenation order used in _merge_device_family_buffers.
-    new_family_row_offsets = np.full(row_count, -1, dtype=np.int32)
+    new_family_row_offsets = cp.full(row_count, -1, dtype=cp.int32)
     for row_chunks in family_global_rows_ordered.values():
-        ordered_rows = np.concatenate(row_chunks) if len(row_chunks) > 1 else row_chunks[0]
-        new_family_row_offsets[ordered_rows] = np.arange(
-            len(ordered_rows), dtype=np.int32,
+        ordered_rows = cp.concatenate(row_chunks) if len(row_chunks) > 1 else row_chunks[0]
+        new_family_row_offsets[ordered_rows] = cp.arange(
+            int(ordered_rows.size), dtype=cp.int32,
         )
 
     return build_device_resident_owned(
@@ -1466,6 +1455,7 @@ def _get_geometry_gpu(
         tags=out_tags,
         validity=out_validity,
         family_row_offsets=new_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

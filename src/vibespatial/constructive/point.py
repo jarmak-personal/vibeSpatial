@@ -25,7 +25,6 @@ from vibespatial.geometry.owned import (  # noqa: E402
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
     build_device_resident_owned,
 )
 from vibespatial.runtime import ExecutionMode  # noqa: E402
@@ -109,31 +108,37 @@ def point_owned_from_xy_device(x: np.ndarray, y: np.ndarray) -> OwnedGeometryArr
     if row_count == 0:
         return _empty_point_output()
 
+    import cupy as cp
+
     geom_offsets = np.arange(row_count + 1, dtype=np.int32)
-    validity = np.ones(row_count, dtype=bool)
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
     empty_mask = np.zeros(row_count, dtype=bool)
     bounds = np.column_stack((x, y, x, y))
 
     runtime = get_cuda_runtime()
     device_x = runtime.from_host(x)
     device_y = runtime.from_host(y)
+    d_geom_offsets = cp.arange(row_count + 1, dtype=cp.int32)
+    d_empty_mask = cp.zeros(row_count, dtype=cp.bool_)
+    d_bounds = cp.column_stack((device_x, device_y, device_x, device_y))
+    d_validity = cp.ones(row_count, dtype=cp.bool_)
+    d_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8)
+    d_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
     result = build_device_resident_owned(
         device_families={
             GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
                 family=GeometryFamily.POINT,
                 x=device_x,
                 y=device_y,
-                geometry_offsets=runtime.from_host(geom_offsets),
-                empty_mask=runtime.from_host(empty_mask),
-                bounds=runtime.from_host(bounds),
+                geometry_offsets=d_geom_offsets,
+                empty_mask=d_empty_mask,
+                bounds=d_bounds,
             )
         },
         row_count=row_count,
-        tags=tags,
-        validity=validity,
-        family_row_offsets=family_row_offsets,
+        tags=d_tags,
+        validity=d_validity,
+        family_row_offsets=d_family_row_offsets,
+        execution_mode="gpu",
     )
     result.families[GeometryFamily.POINT] = FamilyGeometryBuffer(
         family=GeometryFamily.POINT,
@@ -244,9 +249,9 @@ def _build_device_backed_point_output(
 ) -> OwnedGeometryArray:
     import cupy as cp
 
-    validity = np.ones(row_count, dtype=bool)
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
+    validity = cp.ones(row_count, dtype=cp.bool_)
+    tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8)
+    family_row_offsets = cp.arange(row_count, dtype=cp.int32)
     device_families = {
         GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
             family=GeometryFamily.POINT,
@@ -263,6 +268,7 @@ def _build_device_backed_point_output(
         tags=tags,
         validity=validity,
         family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -274,48 +280,52 @@ def _build_device_backed_polygon_output(
     bounds: np.ndarray | None,
     verts_per_ring: int = 5,
 ) -> OwnedGeometryArray:
-    geometry_offsets = np.arange(row_count + 1, dtype=np.int32)
-    ring_offsets = np.arange(0, (row_count + 1) * verts_per_ring, verts_per_ring, dtype=np.int32)
-    empty_mask = np.zeros(row_count, dtype=bool)
-    validity = np.ones(row_count, dtype=bool)
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
+    import cupy as cp
+
+    d_geometry_offsets = cp.arange(row_count + 1, dtype=cp.int32)
+    d_ring_offsets = cp.arange(
+        0,
+        (row_count + 1) * verts_per_ring,
+        verts_per_ring,
+        dtype=cp.int32,
+    )
+    d_empty_mask = cp.zeros(row_count, dtype=cp.bool_)
+    d_validity = cp.ones(row_count, dtype=cp.bool_)
+    d_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8)
+    d_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
     polygon_buffer = FamilyGeometryBuffer(
         family=GeometryFamily.POLYGON,
         schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
         row_count=row_count,
         x=np.empty(0, dtype=np.float64),
         y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        ring_offsets=ring_offsets,
+        geometry_offsets=np.empty(0, dtype=np.int32),
+        empty_mask=np.empty(0, dtype=np.bool_),
+        ring_offsets=None,
         bounds=bounds,
         host_materialized=False,
     )
     runtime = get_cuda_runtime()
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.POLYGON: polygon_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.POLYGON,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                    ring_offsets=runtime.from_host(ring_offsets),
-                    bounds=None if bounds is None else runtime.from_host(bounds),
-                )
-            },
-        ),
+    result = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POLYGON,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=d_geometry_offsets,
+                empty_mask=d_empty_mask,
+                ring_offsets=d_ring_offsets,
+                bounds=None if bounds is None else runtime.from_host(bounds),
+            )
+        },
+        row_count=row_count,
+        tags=d_tags,
+        validity=d_validity,
+        family_row_offsets=d_family_row_offsets,
+        execution_mode="gpu",
     )
+    result.families[GeometryFamily.POLYGON] = polygon_buffer
+    return result
 
 
 def clip_points_rect_owned(

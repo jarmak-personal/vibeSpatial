@@ -24,8 +24,17 @@ from shapely.geometry import (
     box,
 )
 
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.constructive.multipoint_polygon_constructive import (
+    multipoint_polygon_difference,
+    multipoint_polygon_intersection,
+)
+from vibespatial.kernels.constructive.nonpolygon_binary import (
+    linestring_linestring_intersection,
+    linestring_polygon_intersection,
+)
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.residency import Residency
+from vibespatial.testing import build_owned as _make_owned
 
 try:
     from vibespatial.cuda._runtime import has_cuda_device
@@ -35,12 +44,6 @@ except (ImportError, ModuleNotFoundError):
     _has_gpu = False
 
 requires_gpu = pytest.mark.skipif(not _has_gpu, reason="GPU not available")
-
-
-def _make_owned(geoms: list):
-    return from_shapely_geometries(geoms)
-
-
 def _shapely_op(op_name, left_geoms, right_geoms):
     """Shapely oracle: element-wise binary constructive."""
     left_arr = np.empty(len(left_geoms), dtype=object)
@@ -71,11 +74,11 @@ def _assert_geom_close(gpu_geom, ref_geom, *, tol=1e-6, msg=""):
 
 class TestPointPointIntersection:
     @requires_gpu
-    def test_matching_points(self):
+    def test_matching_points(self, make_owned):
         left_geoms = [Point(1, 2), Point(3, 4), Point(5, 6)]
         right_geoms = [Point(1, 2), Point(7, 8), Point(5, 6)]
-        left = _make_owned(left_geoms)
-        right = _make_owned(right_geoms)
+        left = make_owned(left_geoms)
+        right = make_owned(right_geoms)
 
         from vibespatial.constructive.binary_constructive import binary_constructive_owned
         result = binary_constructive_owned("intersection", left, right, dispatch_mode=ExecutionMode.GPU)
@@ -91,11 +94,11 @@ class TestPointPointIntersection:
         _assert_geom_close(result_geoms[2], ref_geoms[2], msg="row 2")
 
     @requires_gpu
-    def test_all_different(self):
+    def test_all_different(self, make_owned):
         left_geoms = [Point(0, 0), Point(1, 1)]
         right_geoms = [Point(2, 2), Point(3, 3)]
-        left = _make_owned(left_geoms)
-        right = _make_owned(right_geoms)
+        left = make_owned(left_geoms)
+        right = make_owned(right_geoms)
 
         from vibespatial.constructive.binary_constructive import binary_constructive_owned
         result = binary_constructive_owned("intersection", left, right, dispatch_mode=ExecutionMode.GPU)
@@ -103,6 +106,19 @@ class TestPointPointIntersection:
 
         for g in result_geoms:
             assert g is None or g.is_empty
+
+    @requires_gpu
+    def test_matching_points_stay_device_resident(self, make_owned, strict_device_guard):
+        left = make_owned([Point(1, 2), Point(3, 4)])
+        right = make_owned([Point(1, 2), Point(7, 8)])
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned("intersection", left, right, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
 
 class TestPointPointDifference:
@@ -123,6 +139,35 @@ class TestPointPointDifference:
         _assert_geom_close(result_geoms[1], Point(3, 4), msg="row 1")
         # Row 2: same -> empty
         assert result_geoms[2] is None or result_geoms[2].is_empty
+
+
+class TestPointPolygonIntersection:
+    @requires_gpu
+    def test_points_inside_outside(self):
+        left_geoms = [Point(1, 1), Point(5, 5)]
+        right_geoms = [box(0, 0, 3, 3), box(0, 0, 3, 3)]
+        left = _make_owned(left_geoms)
+        right = _make_owned(right_geoms)
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned("intersection", left, right, dispatch_mode=ExecutionMode.GPU)
+        result_geoms = result.to_shapely()
+
+        _assert_geom_close(result_geoms[0], Point(1, 1), msg="row 0")
+        assert result_geoms[1] is None or result_geoms[1].is_empty
+
+    @requires_gpu
+    def test_points_inside_outside_stay_device_resident(self, strict_device_guard):
+        left = _make_owned([Point(1, 1), Point(5, 5)])
+        right = _make_owned([box(0, 0, 3, 3), box(0, 0, 3, 3)])
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned("intersection", left, right, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
 
 class TestPointPointUnion:
@@ -162,6 +207,24 @@ class TestPointPointSymmetricDifference:
         # Row 1: different -> 2-point MultiPoint
         assert result_geoms[1] is not None and not result_geoms[1].is_empty
 
+    @requires_gpu
+    def test_same_points_empty_result_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([Point(1, 2)])
+        right = _make_owned([Point(1, 2)])
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned(
+            "symmetric_difference",
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
 
 # ---------------------------------------------------------------------------
 # Point-LineString tests
@@ -200,6 +263,19 @@ class TestPointLineStringIntersection:
 
         assert result_geoms[0] is not None and not result_geoms[0].is_empty
 
+    @requires_gpu
+    def test_point_line_intersection_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([Point(0.5, 0.5)])
+        right = _make_owned([LineString([(0, 0), (1, 1)])])
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned("intersection", left, right, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
 
 class TestPointLineStringDifference:
     @requires_gpu
@@ -215,6 +291,30 @@ class TestPointLineStringDifference:
         result_geoms = result.to_shapely()
 
         _assert_geom_close(result_geoms[0], Point(2, 0))
+
+    @requires_gpu
+    def test_point_off_line_stays_device_resident_without_d2h(
+        self,
+        strict_device_guard,
+    ):
+        left = _make_owned([Point(2, 0)])
+        right = _make_owned([LineString([(0, 0), (1, 1)])])
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+        with assert_zero_d2h_transfers():
+            result = binary_constructive_owned(
+                "difference",
+                left,
+                right,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +351,28 @@ class TestLineStringPolygonIntersection:
 
         assert result_geoms[0] is None or result_geoms[0].is_empty
 
+    @requires_gpu
+    def test_line_inside_polygon_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([LineString([(1, 1), (2, 2)])])
+        right = _make_owned([box(0, 0, 4, 4)])
+        result = linestring_polygon_intersection(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
+    @requires_gpu
+    def test_nonpolygon_right_empty_result_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([LineString([(1, 1), (2, 2)])])
+        right = _make_owned([Point(0, 0)])
+        result = linestring_polygon_intersection(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
 
 class TestLineStringPolygonDifference:
     @requires_gpu
@@ -267,6 +389,21 @@ class TestLineStringPolygonDifference:
 
         assert len(result_geoms) == 1
         assert result_geoms[0] is not None and not result_geoms[0].is_empty
+
+    @requires_gpu
+    def test_nonpolygon_right_empty_result_stays_device_resident(self, strict_device_guard):
+        from vibespatial.kernels.constructive.nonpolygon_binary import (
+            linestring_polygon_difference,
+        )
+
+        left = _make_owned([LineString([(1, 1), (2, 2)])])
+        right = _make_owned([Point(0, 0)])
+        result = linestring_polygon_difference(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +440,18 @@ class TestMultiPointPolygonIntersection:
             n_ref = 1
         assert n_result == n_ref, f"Expected {n_ref} points, got {n_result}"
 
+    @requires_gpu
+    def test_empty_multipoint_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([MultiPoint([])])
+        right = _make_owned([box(0, 0, 3, 3)])
+
+        result = multipoint_polygon_intersection(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
 
 class TestMultiPointPolygonDifference:
     @requires_gpu
@@ -321,6 +470,18 @@ class TestMultiPointPolygonDifference:
         result_geom = result_geoms[0]
         # Only (5,5) should remain
         assert result_geom is not None and not result_geom.is_empty
+
+    @requires_gpu
+    def test_empty_multipoint_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([MultiPoint([])])
+        right = _make_owned([box(0, 0, 3, 3)])
+
+        result = multipoint_polygon_difference(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +539,28 @@ class TestLineStringLineStringIntersection:
         result_geoms = result.to_shapely()
 
         assert result_geoms[0] is not None and not result_geoms[0].is_empty
+
+    @requires_gpu
+    def test_crossing_lines_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([LineString([(0, 0), (2, 2)])])
+        right = _make_owned([LineString([(0, 2), (2, 0)])])
+        result = linestring_linestring_intersection(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
+    @requires_gpu
+    def test_disjoint_lines_empty_result_stays_device_resident(self, strict_device_guard):
+        left = _make_owned([LineString([(0, 0), (1, 0)])])
+        right = _make_owned([LineString([(0, 1), (1, 1)])])
+        result = linestring_linestring_intersection(left, right)
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------

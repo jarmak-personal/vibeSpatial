@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
@@ -2089,6 +2090,10 @@ def _iter_coords(linear: Any) -> list[tuple[float, float]]:
     return [(float(coord[0]), float(coord[1])) for coord in linear.coords]
 
 
+def _iter_geometry_parts(geometry: Any) -> list[Any]:
+    return shapely.get_parts(np.asarray([geometry], dtype=object)).tolist()
+
+
 def _family_for_geometry(geometry: object) -> GeometryFamily:
     geom_type = geometry.geom_type
     mapping = {
@@ -2125,7 +2130,7 @@ def _append_family_geometry(
         if family is GeometryFamily.LINESTRING:
             coords = _iter_coords(geometry)
         else:
-            coords = [(float(point.x), float(point.y)) for point in geometry.geoms]
+            coords = [(float(point.x), float(point.y)) for point in _iter_geometry_parts(geometry)]
         state["geometry_offsets_payload"].extend(coords)
         return
 
@@ -2141,7 +2146,7 @@ def _append_family_geometry(
     if family is GeometryFamily.MULTILINESTRING:
         state["geometry_offsets"].append(len(state["part_offsets"]))
         if not empty:
-            for part in geometry.geoms:
+            for part in _iter_geometry_parts(geometry):
                 state["part_offsets"].append(len(state["geometry_offsets_payload"]))
                 state["geometry_offsets_payload"].extend(_iter_coords(part))
         return
@@ -2149,7 +2154,7 @@ def _append_family_geometry(
     if family is GeometryFamily.MULTIPOLYGON:
         state["geometry_offsets"].append(len(state["part_offsets"]))
         if not empty:
-            for polygon in geometry.geoms:
+            for polygon in _iter_geometry_parts(geometry):
                 state["part_offsets"].append(len(state["ring_offsets_payload"]))
                 rings = [polygon.exterior, *polygon.interiors]
                 for ring in rings:
@@ -2742,9 +2747,10 @@ def build_device_resident_owned(
     *,
     device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer],
     row_count: int,
-    tags: np.ndarray,
-    validity: np.ndarray,
-    family_row_offsets: np.ndarray,
+    tags: np.ndarray | DeviceArray,
+    validity: np.ndarray | DeviceArray,
+    family_row_offsets: np.ndarray | DeviceArray,
+    execution_mode: str | None = None,
 ) -> OwnedGeometryArray:
     """Construct an OwnedGeometryArray from device buffers without touching host.
 
@@ -2766,10 +2772,31 @@ def build_device_resident_owned(
         bool array, length ``row_count``.
     family_row_offsets
         int32 array mapping global row index to family-local row index.
+    execution_mode
+        Optional execution mode marker. When set to ``"gpu"``, host numpy
+        metadata arrays are rejected so GPU-path callers cannot silently
+        re-upload metadata through this factory.
     """
     from vibespatial.cuda._runtime import get_cuda_runtime
 
     runtime = get_cuda_runtime()
+
+    if execution_mode == "gpu":
+        host_metadata = [
+            name
+            for name, value in (
+                ("tags", tags),
+                ("validity", validity),
+                ("family_row_offsets", family_row_offsets),
+            )
+            if isinstance(value, np.ndarray)
+        ]
+        if host_metadata:
+            caller = inspect.stack()[1]
+            raise AssertionError(
+                "GPU build_device_resident_owned() received host metadata "
+                f"{', '.join(host_metadata)} from {caller.filename}:{caller.lineno}"
+            )
 
     # Build host-side placeholder families with host_materialized=False
     host_families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
@@ -2778,7 +2805,7 @@ def build_device_resident_owned(
         host_families[family] = FamilyGeometryBuffer(
             family=family,
             schema=schema,
-            row_count=int(np.sum(tags == FAMILY_TAGS[family])),
+            row_count=int(device_families[family].geometry_offsets.size - 1),
             x=np.empty(0, dtype=np.float64),
             y=np.empty(0, dtype=np.float64),
             geometry_offsets=np.empty(0, dtype=np.int32),
@@ -2790,10 +2817,18 @@ def build_device_resident_owned(
     d_tags = runtime.from_host(tags)
     d_family_row_offsets = runtime.from_host(family_row_offsets)
 
+    host_validity = None if hasattr(validity, "__cuda_array_interface__") else np.ascontiguousarray(validity, dtype=np.bool_)
+    host_tags = None if hasattr(tags, "__cuda_array_interface__") else np.ascontiguousarray(tags, dtype=np.int8)
+    host_family_row_offsets = (
+        None
+        if hasattr(family_row_offsets, "__cuda_array_interface__")
+        else np.ascontiguousarray(family_row_offsets, dtype=np.int32)
+    )
+
     result = OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
+        validity=host_validity,
+        tags=host_tags,
+        family_row_offsets=host_family_row_offsets,
         families=host_families,
         residency=Residency.DEVICE,
         device_state=OwnedGeometryDeviceState(
@@ -2802,6 +2837,7 @@ def build_device_resident_owned(
             family_row_offsets=d_family_row_offsets,
             families=device_families,
         ),
+        _row_count=int(row_count),
     )
     result._record(
         DiagnosticKind.CREATED,
@@ -2810,6 +2846,29 @@ def build_device_resident_owned(
         visible=False,
     )
     return result
+
+
+def forward_result_metadata(
+    owned: OwnedGeometryArray,
+) -> tuple[np.ndarray | DeviceArray, np.ndarray | DeviceArray, np.ndarray | DeviceArray]:
+    """Forward metadata for a device result without forcing host copies.
+
+    When the source already has device metadata, reuse those arrays directly so
+    downstream device-resident builders do not pay a D->H->D round-trip.
+    Otherwise, preserve the historical host-copy behavior for host-only inputs.
+    """
+    if owned.device_state is not None:
+        return (
+            owned.device_state.tags,
+            owned.device_state.validity,
+            owned.device_state.family_row_offsets,
+        )
+
+    return (
+        owned.tags.copy(),
+        owned.validity.copy(),
+        owned.family_row_offsets.copy(),
+    )
 
 
 # ---------------------------------------------------------------------------

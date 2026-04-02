@@ -13,6 +13,7 @@ from vibespatial.cuda.device_functions.point_in_ring import (
     POINT_IN_RING_DEVICE,
 )
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # 1. Split event emission kernels
@@ -297,7 +298,7 @@ _OVERLAY_SPLIT_KERNEL_NAMES = (
 # Kernels: compute_shoelace_contributions, compute_face_sample_points,
 #          list_rank_within_cycle
 
-_OVERLAY_FACE_WALK_KERNEL_SOURCE = r"""
+_OVERLAY_FACE_WALK_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 // -------------------------------------------------------------------
 // Phase 1: GPU Face Walk via Pointer Jumping
 // -------------------------------------------------------------------
@@ -357,7 +358,7 @@ compute_face_sample_points(
   if (f >= face_count) return;
 
   const double area = signed_area[f];
-  if (area <= 1e-12) {
+  if (area <= VS_SPATIAL_EPSILON) {
     out_bounded[f] = 0;
     out_label_x[f] = 0.0;
     out_label_y[f] = 0.0;
@@ -475,11 +476,11 @@ _OVERLAY_FACE_WALK_KERNEL_NAMES = (
 # Kernels: label_face_coverage_polygon, label_face_coverage_multipolygon
 
 _OVERLAY_FACE_LABEL_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + r"""
+    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + r"""
 // -------------------------------------------------------------------
 // Phase 2: GPU Face Labeling via Batch Point-in-Polygon
 // -------------------------------------------------------------------
-#define OVERLAY_BOUNDARY_TOLERANCE 1e-12
+#define OVERLAY_BOUNDARY_TOLERANCE VS_SPATIAL_EPSILON
 
 // Test face sample points against all polygons on one side.
 // One thread per face.

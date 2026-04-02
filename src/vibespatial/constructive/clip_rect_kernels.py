@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # GPU clip thresholds (ADR-0033 tier system)
@@ -17,8 +18,8 @@ _LINE_CLIP_GPU_THRESHOLD = 1_000
 # into a pre-allocated output buffer using per-ring offsets computed via
 # exclusive_scan on a vertex-count pass.
 
-_SUTHERLAND_HODGMAN_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + r"""
-#define EPSILON 1e-12
+_SUTHERLAND_HODGMAN_KERNEL_SOURCE = STRIP_CLOSURE_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + r"""
+#define EPSILON VS_SPATIAL_EPSILON
 
 /* Clip a ring against one boundary edge.
    Returns the number of output vertices written to out_x/out_y. */
@@ -203,8 +204,8 @@ _SH_KERNEL_NAMES = ("sh_count_vertices", "sh_clip_rings")
 # ---------------------------------------------------------------------------
 # Per-segment clip against a rectangle.  Each thread processes one segment.
 
-_LIANG_BARSKY_KERNEL_SOURCE = r"""
-#define LB_EPSILON 1e-12
+_LIANG_BARSKY_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
+#define LB_EPSILON VS_SPATIAL_EPSILON
 
 extern "C" __global__ void lb_clip_segments(
     const double* seg_x0,

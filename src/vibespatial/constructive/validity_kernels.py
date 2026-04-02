@@ -143,8 +143,8 @@ void is_simple_segments(
                 const double dy_ab = by0 - ay0;
                 const double t = (dx_ab * dy_b - dy_ab * dx_b) / denom;
                 const double u = (dx_ab * dy_a - dy_ab * dx_a) / denom;
-                if (t > 1e-12 && t < (1.0 - 1e-12) &&
-                    u > 1e-12 && u < (1.0 - 1e-12)) {{
+                if (t > VS_SPATIAL_EPSILON && t < (1.0 - VS_SPATIAL_EPSILON) &&
+                    u > VS_SPATIAL_EPSILON && u < (1.0 - VS_SPATIAL_EPSILON)) {{
                     atomicExch(&found_crossing, 1);
                 }}
             }}
@@ -175,7 +175,7 @@ _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
 # The device function strings use raw braces and must NOT pass through
 # .format().  They are concatenated in the _HOLES_IN_SHELL_FP64 constant.
 _HOLES_IN_SHELL_KERNEL_TEMPLATE = PRECISION_PREAMBLE + r"""
-#define VALIDITY_BOUNDARY_TOLERANCE 1e-12
+#define VALIDITY_BOUNDARY_TOLERANCE VS_SPATIAL_EPSILON
 
 extern "C" __device__ inline bool ring_contains_point_validity(
     double px,

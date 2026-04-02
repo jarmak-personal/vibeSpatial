@@ -6,6 +6,7 @@ from pathlib import Path
 from scripts.check_zero_copy import (
     _VIOLATION_BASELINE,
     REPO_ROOT,
+    _collect_device_names,
     _collect_numpy_names,
     _find_empty_suppression_lines,
     _parse_suppression_comments,
@@ -505,6 +506,22 @@ def f(offsets: np.ndarray):
     assert "rebased" in names
 
 
+def test_collect_device_names_device_prefix_and_cupy_call() -> None:
+    import ast
+
+    source = """\
+def f(host):
+    d_values = cp.arange(10)
+    d_last = d_values[-1]
+    total = int(d_last)
+"""
+    tree = ast.parse(source)
+    func = tree.body[0]
+    names = _collect_device_names(func)
+    assert "d_values" in names
+    assert "d_last" in names
+
+
 # ---------------------------------------------------------------------------
 # INFRA-04: PyArrow to_pylist() false positive elimination
 # ---------------------------------------------------------------------------
@@ -688,3 +705,94 @@ def process(data, pred, total):
     errors, suppressed = check_pingpong_transfers(tmp_path)
     assert errors == []
     assert suppressed == 0
+
+
+def test_builtin_int_on_device_subscript_flagged_in_loop(tmp_path: Path) -> None:
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+import cupy as cp
+
+def process():
+    d_offsets = cp.arange(4, dtype=cp.int32)
+    for _ in range(3):
+        total = int(d_offsets[-1])
+        use(total)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert len(errors) == 1
+    assert errors[0].code == "ZCOPY002"
+    assert suppressed == 0
+
+
+def test_builtin_int_on_device_attribute_flagged_in_loop(tmp_path: Path) -> None:
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+import cupy as cp
+
+def process():
+    d_arr = cp.arange(4)
+    for _ in range(3):
+        size = int(d_arr.size)
+        use(size)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert len(errors) == 1
+    assert errors[0].code == "ZCOPY002"
+    assert suppressed == 0
+
+
+def test_builtin_len_on_device_name_flagged_in_loop(tmp_path: Path) -> None:
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+import cupy as cp
+
+def process():
+    d_arr = cp.arange(4)
+    for _ in range(3):
+        size = len(d_arr)
+        use(size)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert len(errors) == 1
+    assert errors[0].code == "ZCOPY002"
+    assert suppressed == 0
+
+
+def test_builtin_int_on_host_value_not_flagged(tmp_path: Path) -> None:
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+def process():
+    size_of_python_list = len([1, 2, 3])
+    for _ in range(3):
+        total = int(size_of_python_list)
+        use(total)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 0
+
+
+def test_builtin_int_suppression_still_works(tmp_path: Path) -> None:
+    _write_file(
+        tmp_path / "src" / "vibespatial" / "mod.py",
+        """\
+import cupy as cp
+
+def process():
+    d_offsets = cp.arange(4, dtype=cp.int32)
+    for _ in range(3):
+        total = int(d_offsets[-1])  # zcopy:ok(allocation fence scalar)
+        use(total)
+""",
+    )
+    errors, suppressed = check_loop_transfers(tmp_path)
+    assert errors == []
+    assert suppressed == 1

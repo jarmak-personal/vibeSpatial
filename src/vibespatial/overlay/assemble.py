@@ -22,16 +22,15 @@ from vibespatial.cuda.cccl_primitives import (
     segmented_reduce_sum,
     sort_pairs,
 )
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
     build_device_resident_owned,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.residency import Residency
 
 from .types import (
@@ -60,19 +59,17 @@ def _empty_polygon_output(runtime_selection: RuntimeSelection) -> OwnedGeometryA
     empty_validity = np.asarray([], dtype=bool)
     empty_tags = np.asarray([], dtype=np.int8)
     empty_offsets = np.asarray([], dtype=np.int32)
-    device_state = None
     if residency is Residency.DEVICE:
-        try:
-            rt = get_cuda_runtime()
-            device_state = OwnedGeometryDeviceState(
-                validity=rt.from_host(empty_validity),
-                tags=rt.from_host(empty_tags),
-                family_row_offsets=rt.from_host(empty_offsets),
-                families={},
-            )
-        except Exception:
-            residency = Residency.HOST
-            device_state = None
+        result = build_device_resident_owned(
+            device_families={},
+            row_count=0,
+            tags=cp.empty(0, dtype=cp.int8),
+            validity=cp.empty(0, dtype=cp.bool_),
+            family_row_offsets=cp.empty(0, dtype=cp.int32),
+            execution_mode="gpu",
+        )
+        result.runtime_history.append(runtime_selection)
+        return result
     return OwnedGeometryArray(
         validity=empty_validity,
         tags=empty_tags,
@@ -80,7 +77,6 @@ def _empty_polygon_output(runtime_selection: RuntimeSelection) -> OwnedGeometryA
         families={},
         residency=residency,
         runtime_history=[runtime_selection],
-        device_state=device_state,
     )
 
 
@@ -91,49 +87,26 @@ def _build_device_backed_fixed_polygon_output(
     row_count: int,
     runtime_selection: RuntimeSelection,
 ) -> OwnedGeometryArray:
-    runtime = get_cuda_runtime()
-    geometry_offsets = np.arange(row_count + 1, dtype=np.int32)
-    ring_offsets = np.arange(0, (row_count + 1) * 5, 5, dtype=np.int32)
-    empty_mask = np.zeros(row_count, dtype=bool)
-    validity = np.ones(row_count, dtype=bool)
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    polygon_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.POLYGON,
-        schema=get_geometry_buffer_schema(GeometryFamily.POLYGON),
+    result = build_device_resident_owned(
+        device_families={
+            GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POLYGON,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=cp.arange(row_count + 1, dtype=cp.int32),
+                empty_mask=cp.zeros(row_count, dtype=cp.bool_),
+                ring_offsets=cp.arange(0, (row_count + 1) * 5, 5, dtype=cp.int32),
+                bounds=None,
+            )
+        },
         row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        ring_offsets=ring_offsets,
-        bounds=None,
-        host_materialized=False,
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8),
+        validity=cp.ones(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
     )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.POLYGON: polygon_buffer},
-        residency=Residency.DEVICE,
-        runtime_history=[runtime_selection],
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.POLYGON: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.POLYGON,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                    ring_offsets=runtime.from_host(ring_offsets),
-                    bounds=None,
-                )
-            },
-        ),
-    )
+    result.runtime_history.append(runtime_selection)
+    return result
 
 
 def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
@@ -165,7 +138,7 @@ def _axis_aligned_box_bounds(values: OwnedGeometryArray) -> np.ndarray | None:
 
     dx = np.diff(x, axis=1)
     dy = np.diff(y, axis=1)
-    axis_aligned = ((np.abs(dx) < 1e-12) ^ (np.abs(dy) < 1e-12))
+    axis_aligned = ((np.abs(dx) < SPATIAL_EPSILON) ^ (np.abs(dy) < SPATIAL_EPSILON))
     if not np.all(axis_aligned):
         return None
     return np.column_stack(
@@ -522,8 +495,8 @@ def _build_polygon_output_from_faces_gpu(
             h_centroid_y = h_cy_sum * h_factor
             del h_cx_sum, h_cy_sum, h_safe_twice, h_factor
 
-            # Filter degenerate holes on device (|area| < 1e-12)
-            d_nondegenerate = cp.abs(h_area) >= 1e-12
+            # Filter degenerate holes on device (|area| < SPATIAL_EPSILON)
+            d_nondegenerate = cp.abs(h_area) >= SPATIAL_EPSILON
             d_nondegen_idx = cp.flatnonzero(d_nondegenerate).astype(cp.int32)
             n_valid_nondegenerate = int(d_nondegen_idx.size)
             del d_nondegenerate
@@ -792,28 +765,15 @@ def _build_polygon_output_from_faces_gpu(
     d_polys_per_row = d_row_ends - d_row_starts
     n_output_rows = int(d_row_starts.size)
 
-    # Transfer only small O(ring_count) structural metadata to host.
-    # Coordinate arrays d_all_x/d_all_y stay on device (Phase 14 zero-copy).
-    # ADR-0005 materialization boundary: structural offsets are O(ring_count)
-    # integers; coordinate data stays device-resident.
-    h_sorted_output_ids = cp.asnumpy(d_sorted_output_ids)  # hygiene:ok(ADR-0005 materialization boundary: O(ring_count) structural metadata)
-    h_rings_per_poly = cp.asnumpy(d_rings_per_poly)  # hygiene:ok(ADR-0005 materialization boundary)
-    h_polys_per_row = cp.asnumpy(d_polys_per_row)  # hygiene:ok(ADR-0005 materialization boundary)
-    h_row_source_ids = cp.asnumpy(d_poly_source_row[d_row_starts])  # hygiene:ok(ADR-0005 materialization boundary)
-    h_poly_starts = cp.asnumpy(d_poly_starts)  # hygiene:ok(ADR-0005 materialization boundary)
-    h_all_coord_offsets = cp.asnumpy(d_all_coord_offsets)  # hygiene:ok(ADR-0005 materialization boundary)
-    h_all_edge_counts = cp.asnumpy(d_all_edge_counts)  # hygiene:ok(ADR-0005 materialization boundary)
-
     return _build_device_resident_polygon_output(
         d_all_x=d_all_x,
         d_all_y=d_all_y,
-        h_all_coord_offsets=h_all_coord_offsets,
-        h_all_edge_counts=h_all_edge_counts,
-        h_sorted_output_ids=h_sorted_output_ids,
-        h_rings_per_poly=h_rings_per_poly,
-        h_polys_per_row=h_polys_per_row,
-        h_row_source_ids=h_row_source_ids,
-        h_poly_starts=h_poly_starts,
+        d_all_coord_offsets=d_all_coord_offsets,
+        d_all_edge_counts=d_all_edge_counts,
+        d_sorted_output_ids=d_sorted_output_ids,
+        d_rings_per_poly=d_rings_per_poly,
+        d_polys_per_row=d_polys_per_row,
+        d_poly_starts=d_poly_starts,
         n_output_rows=n_output_rows,
         runtime_selection=faces.runtime_selection,
     )
@@ -823,74 +783,72 @@ def _build_device_resident_polygon_output(
     *,
     d_all_x: cp.ndarray,
     d_all_y: cp.ndarray,
-    h_all_coord_offsets: np.ndarray,
-    h_all_edge_counts: np.ndarray,
-    h_sorted_output_ids: np.ndarray,
-    h_rings_per_poly: np.ndarray,
-    h_polys_per_row: np.ndarray,
-    h_row_source_ids: np.ndarray,
-    h_poly_starts: np.ndarray,
+    d_all_coord_offsets: cp.ndarray,
+    d_all_edge_counts: cp.ndarray,
+    d_sorted_output_ids: cp.ndarray,
+    d_rings_per_poly: cp.ndarray,
+    d_polys_per_row: cp.ndarray,
+    d_poly_starts: cp.ndarray,
     n_output_rows: int,
     runtime_selection: RuntimeSelection,
 ) -> OwnedGeometryArray:
     """Build device-resident OwnedGeometryArray from GPU face assembly results.
 
     Accepts GPU-computed ring grouping (Phase 12 sibling hole nesting) and
-    builds GeoArrow offset arrays on host via vectorised NumPy, then gathers
-    coordinates on device via CuPy fancy indexing.
+    builds GeoArrow offset arrays on device via CuPy vectorisation.
 
     Phase 14 (ADR-0005): eliminates dominant D->H coordinate transfer.
     Phase 26: Vectorised output assembly -- eliminates per-row and per-ring
     Python loops that dominated wall time for large polygon counts.
+    Phase KPI: structural metadata also stays on device for device-resident
+    callers like GPU make_valid repolygonization.
     """
-    runtime = get_cuda_runtime()
-
     # --- Vectorised classification: polygon vs multipolygon per row ---
     # A row with exactly 1 polygon is a POLYGON; otherwise MULTIPOLYGON.
-    is_polygon_row = h_polys_per_row == 1
+    is_polygon_row = d_polys_per_row == 1
     output_row_count = n_output_rows
     if output_row_count == 0:
         return _empty_polygon_output(runtime_selection)
 
-    validity = np.ones(output_row_count, dtype=bool)
-    tags = np.full(output_row_count, -1, dtype=np.int8)
-    family_row_offsets = np.full(output_row_count, -1, dtype=np.int32)
+    validity = cp.ones(output_row_count, dtype=cp.bool_)
+    tags = cp.full(output_row_count, -1, dtype=cp.int8)
+    family_row_offsets = cp.full(output_row_count, -1, dtype=cp.int32)
 
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
 
     # Total polygon count: sum of polys_per_row for polygon-type rows (== 1).
     # Total multipolygon count: number of multipolygon rows.
-    n_total_polys = int(h_rings_per_poly.size)  # total output polygons
+    n_total_polys = int(d_rings_per_poly.size)  # total output polygons
 
     # Expand polygon index -> its output rings (all sorted_output_ids entries
     # are already in [exterior, hole0, hole1, ...] order from GPU sort).
     # Flat ring order for ALL polygons (both POLYGON and MULTIPOLYGON families):
     # ring_indices[i] = the i-th ring in output order across all polygons.
     # Use vectorised expansion: repeat each polygon's ring range.
-    ring_counts_per_poly = h_rings_per_poly.astype(np.int32)
-    total_output_rings = int(ring_counts_per_poly.sum())
+    ring_counts_per_poly = d_rings_per_poly.astype(cp.int32, copy=False)
+    total_output_rings = int(ring_counts_per_poly.sum(dtype=cp.int64).item())
     if total_output_rings == 0:
         return _empty_polygon_output(runtime_selection)
 
     # Build per-polygon -> row mapping: polygon p belongs to the row
     # determined by cumulative polys_per_row.
     # poly_to_row[p] = which output row polygon p belongs to.
-    poly_to_row = np.repeat(np.arange(output_row_count, dtype=np.int32), h_polys_per_row)
+    poly_to_row = _expand_by_counts(d_polys_per_row)
 
     # For each polygon, the rings in sorted_output_ids
     # are at positions [poly_starts[p], poly_starts[p]+rings_per_poly[p]).
     # Vectorised expansion: for each ring slot, compute which polygon it
     # belongs to and its offset within that polygon's ring list.
-    ring_poly_ids = np.repeat(np.arange(n_total_polys, dtype=np.int32), ring_counts_per_poly)
-    poly_ring_offsets_prefix = np.zeros(n_total_polys + 1, dtype=np.int32)
-    np.cumsum(ring_counts_per_poly, out=poly_ring_offsets_prefix[1:])
-    ring_local_offsets = np.arange(total_output_rings, dtype=np.int32) - poly_ring_offsets_prefix[ring_poly_ids]
+    ring_poly_ids = _expand_by_counts(ring_counts_per_poly)
+    poly_ring_offsets_prefix = cp.zeros(n_total_polys + 1, dtype=cp.int32)
+    cp.cumsum(ring_counts_per_poly, out=poly_ring_offsets_prefix[1:])
+    ring_local_offsets = cp.arange(total_output_rings, dtype=cp.int32) - poly_ring_offsets_prefix[ring_poly_ids]
     # Global ring indices in the all-rings coordinate arrays
-    all_ring_order = h_sorted_output_ids[h_poly_starts[ring_poly_ids] + ring_local_offsets]
+    all_ring_order = d_sorted_output_ids[d_poly_starts[ring_poly_ids] + ring_local_offsets]
 
     # Coord counts per ring: edge_count + 1
-    all_ring_coord_counts = h_all_edge_counts[all_ring_order].astype(np.int32) + 1
+    all_ring_coord_counts = d_all_edge_counts[all_ring_order].astype(cp.int32, copy=False) + 1
 
     # --- Separate POLYGON and MULTIPOLYGON families ---
     # Polygon family: rows with exactly 1 polygon
@@ -909,83 +867,81 @@ def _build_device_resident_polygon_output(
     # Assign family tags and family_row_offsets (vectorised, no Python loop)
     tags[poly_row_mask] = poly_tag
     tags[mpoly_row_mask] = mpoly_tag
-    polygon_count = int(poly_row_mask.sum())
-    multipolygon_count = int(mpoly_row_mask.sum())
+    polygon_count = int(poly_row_mask.sum().item())
+    multipolygon_count = int(mpoly_row_mask.sum().item())
     # Family-local sequential index: polygon rows get 0..polygon_count-1,
     # multipolygon rows get 0..multipolygon_count-1.
     if polygon_count > 0:
-        family_row_offsets[poly_row_mask] = np.arange(polygon_count, dtype=np.int32)
+        family_row_offsets[poly_row_mask] = cp.arange(polygon_count, dtype=cp.int32)
     if multipolygon_count > 0:
-        family_row_offsets[mpoly_row_mask] = np.arange(multipolygon_count, dtype=np.int32)
+        family_row_offsets[mpoly_row_mask] = cp.arange(multipolygon_count, dtype=cp.int32)
 
     device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
 
     if polygon_count > 0:
         # Extract polygon rings
-        poly_ring_indices = np.flatnonzero(ring_is_poly)
+        poly_ring_indices = cp.flatnonzero(ring_is_poly).astype(cp.int32, copy=False)
         poly_ring_order = all_ring_order[poly_ring_indices]
         poly_coord_counts = all_ring_coord_counts[poly_ring_indices]
         # Ring offsets = cumulative coord counts
-        h_poly_ring_offsets = np.zeros(len(poly_ring_indices) + 1, dtype=np.int32)
-        np.cumsum(poly_coord_counts, out=h_poly_ring_offsets[1:])
+        d_poly_ring_offsets = cp.zeros(int(poly_ring_indices.size) + 1, dtype=cp.int32)
+        cp.cumsum(poly_coord_counts, out=d_poly_ring_offsets[1:])
         # Geometry offsets: each polygon has rings_per_poly rings.
         # Since polygon rows have exactly 1 polygon each, geometry offsets
         # are just the cumulative ring-per-polygon counts for polygon family.
         rings_per_family_poly = ring_counts_per_poly[poly_mask_per_polygon]
-        h_poly_geom_offsets = np.zeros(polygon_count + 1, dtype=np.int32)
-        np.cumsum(rings_per_family_poly, out=h_poly_geom_offsets[1:])
+        d_poly_geom_offsets = cp.zeros(polygon_count + 1, dtype=cp.int32)
+        cp.cumsum(rings_per_family_poly, out=d_poly_geom_offsets[1:])
         # Vectorised coordinate gather
         d_poly_x, d_poly_y = _gather_coords_vectorised(
-            d_all_x, d_all_y, h_all_coord_offsets, poly_ring_order, poly_coord_counts,
+            d_all_x, d_all_y, d_all_coord_offsets, poly_ring_order, poly_coord_counts,
         )
         device_families[GeometryFamily.POLYGON] = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.POLYGON,
             x=d_poly_x,
             y=d_poly_y,
-            geometry_offsets=runtime.from_host(h_poly_geom_offsets),
-            empty_mask=runtime.from_host(np.zeros(polygon_count, dtype=np.bool_)),
-            ring_offsets=runtime.from_host(h_poly_ring_offsets),
+            geometry_offsets=d_poly_geom_offsets,
+            empty_mask=cp.zeros(polygon_count, dtype=cp.bool_),
+            ring_offsets=d_poly_ring_offsets,
             bounds=None,
         )
 
     if multipolygon_count > 0:
         # Extract multipolygon rings
-        mpoly_ring_indices = np.flatnonzero(ring_is_mpoly)
+        mpoly_ring_indices = cp.flatnonzero(ring_is_mpoly).astype(cp.int32, copy=False)
         mpoly_ring_order = all_ring_order[mpoly_ring_indices]
         mpoly_coord_counts = all_ring_coord_counts[mpoly_ring_indices]
         # Ring offsets
-        h_mpoly_ring_offsets = np.zeros(len(mpoly_ring_indices) + 1, dtype=np.int32)
-        np.cumsum(mpoly_coord_counts, out=h_mpoly_ring_offsets[1:])
+        d_mpoly_ring_offsets = cp.zeros(int(mpoly_ring_indices.size) + 1, dtype=cp.int32)
+        cp.cumsum(mpoly_coord_counts, out=d_mpoly_ring_offsets[1:])
         # Part offsets: each polygon (part) within a multipolygon
         # has rings_per_poly rings. Cumulative within each multipolygon row.
-        mpoly_polygons = np.flatnonzero(mpoly_mask_per_polygon)
+        mpoly_polygons = cp.flatnonzero(mpoly_mask_per_polygon).astype(cp.int32, copy=False)
         rings_per_mpoly_part = ring_counts_per_poly[mpoly_polygons]
-        h_mpoly_part_offsets = np.zeros(len(mpoly_polygons) + 1, dtype=np.int32)
-        np.cumsum(rings_per_mpoly_part, out=h_mpoly_part_offsets[1:])
+        d_mpoly_part_offsets = cp.zeros(int(mpoly_polygons.size) + 1, dtype=cp.int32)
+        cp.cumsum(rings_per_mpoly_part, out=d_mpoly_part_offsets[1:])
         # Geometry offsets: parts per multipolygon row
         mpoly_row_indices = poly_to_row[mpoly_polygons]
         # Map row indices to family-local multipolygon index
-        mpoly_row_to_family = np.full(output_row_count, -1, dtype=np.int32)
-        mpoly_rows = np.flatnonzero(mpoly_row_mask)
-        mpoly_row_to_family[mpoly_rows] = np.arange(multipolygon_count, dtype=np.int32)
+        mpoly_row_to_family = cp.full(output_row_count, -1, dtype=cp.int32)
+        mpoly_rows = cp.flatnonzero(mpoly_row_mask).astype(cp.int32, copy=False)
+        mpoly_row_to_family[mpoly_rows] = cp.arange(multipolygon_count, dtype=cp.int32)
         mpoly_family_ids = mpoly_row_to_family[mpoly_row_indices]
-        parts_per_geom = np.bincount(mpoly_family_ids, minlength=multipolygon_count).astype(np.int32)
-        h_mpoly_geom_offsets = np.zeros(multipolygon_count + 1, dtype=np.int32)
-        np.cumsum(parts_per_geom, out=h_mpoly_geom_offsets[1:])
+        parts_per_geom = cp.bincount(mpoly_family_ids, minlength=multipolygon_count).astype(cp.int32, copy=False)
+        d_mpoly_geom_offsets = cp.zeros(multipolygon_count + 1, dtype=cp.int32)
+        cp.cumsum(parts_per_geom, out=d_mpoly_geom_offsets[1:])
         # Vectorised coordinate gather
         d_mpoly_x, d_mpoly_y = _gather_coords_vectorised(
-            d_all_x, d_all_y, h_all_coord_offsets, mpoly_ring_order, mpoly_coord_counts,
+            d_all_x, d_all_y, d_all_coord_offsets, mpoly_ring_order, mpoly_coord_counts,
         )
         device_families[GeometryFamily.MULTIPOLYGON] = DeviceFamilyGeometryBuffer(
             family=GeometryFamily.MULTIPOLYGON,
             x=d_mpoly_x,
             y=d_mpoly_y,
-            geometry_offsets=runtime.from_host(h_mpoly_geom_offsets),
-            empty_mask=runtime.from_host(
-                np.zeros(multipolygon_count, dtype=np.bool_),
-            ),
-            part_offsets=runtime.from_host(h_mpoly_part_offsets),
-            ring_offsets=runtime.from_host(h_mpoly_ring_offsets),
+            geometry_offsets=d_mpoly_geom_offsets,
+            empty_mask=cp.zeros(multipolygon_count, dtype=cp.bool_),
+            part_offsets=d_mpoly_part_offsets,
+            ring_offsets=d_mpoly_ring_offsets,
             bounds=None,
         )
 
@@ -995,6 +951,7 @@ def _build_device_resident_polygon_output(
         tags=tags,
         validity=validity,
         family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
     result.runtime_history.append(runtime_selection)
     return result
@@ -1003,29 +960,41 @@ def _build_device_resident_polygon_output(
 def _gather_coords_vectorised(
     d_all_x: cp.ndarray,
     d_all_y: cp.ndarray,
-    h_all_coord_offsets: np.ndarray,
-    ring_order: np.ndarray,
-    coord_counts: np.ndarray,
+    d_all_coord_offsets: cp.ndarray,
+    ring_order: cp.ndarray,
+    coord_counts: cp.ndarray,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """Vectorised coordinate gather: build flat index array without Python loops.
 
     For each ring in ring_order, gathers coord_counts[i] consecutive
-    coordinates starting at h_all_coord_offsets[ring_order[i]].
+    coordinates starting at d_all_coord_offsets[ring_order[i]].
     """
     if ring_order.size == 0:
         return cp.empty(0, dtype=cp.float64), cp.empty(0, dtype=cp.float64)
-    total_coords = int(coord_counts.sum())
+    total_coords = int(coord_counts.sum(dtype=cp.int64).item())
     # Build per-ring start positions in source coordinate array
-    ring_starts = h_all_coord_offsets[ring_order].astype(np.int64)
+    ring_starts = d_all_coord_offsets[ring_order].astype(cp.int64, copy=False)
     # Expand: for each coordinate slot, compute source index.
     # slot_ring[i] = which ring does coordinate slot i belong to?
-    ring_offsets = np.zeros(len(ring_order) + 1, dtype=np.int64)
-    np.cumsum(coord_counts, out=ring_offsets[1:])
-    slot_ring = np.repeat(np.arange(len(ring_order), dtype=np.int32), coord_counts)
-    slot_local = np.arange(total_coords, dtype=np.int64) - ring_offsets[slot_ring]
-    h_gather = ring_starts[slot_ring] + slot_local
-    d_gather = cp.asarray(h_gather)
+    ring_offsets = cp.zeros(int(ring_order.size) + 1, dtype=cp.int64)
+    cp.cumsum(coord_counts.astype(cp.int64, copy=False), out=ring_offsets[1:])
+    slot_ring = _expand_by_counts(coord_counts.astype(cp.int32, copy=False))
+    slot_local = cp.arange(total_coords, dtype=cp.int64) - ring_offsets[slot_ring]
+    d_gather = ring_starts[slot_ring] + slot_local
     return d_all_x[d_gather], d_all_y[d_gather]
+
+
+def _expand_by_counts(counts: cp.ndarray) -> cp.ndarray:
+    """Return the repeated source index for each slot implied by ``counts``."""
+    if counts.size == 0:
+        return cp.empty(0, dtype=cp.int32)
+    total = int(counts.sum(dtype=cp.int64).item())
+    if total == 0:
+        return cp.empty(0, dtype=cp.int32)
+    offsets = cp.zeros(int(counts.size) + 1, dtype=cp.int64)
+    cp.cumsum(counts.astype(cp.int64, copy=False), out=offsets[1:])
+    slots = cp.arange(total, dtype=cp.int64)
+    return cp.searchsorted(offsets[1:], slots, side="right").astype(cp.int32, copy=False)
 
 
 def _overlay_intersection_rectangles_gpu(

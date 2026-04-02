@@ -20,6 +20,7 @@ from shapely.geometry import (
 
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 
 requires_gpu = pytest.mark.skipif(
     not has_gpu_runtime(), reason="GPU not available",
@@ -68,6 +69,37 @@ def test_shortest_line_point_point():
     result = shortest_line_owned(left, right, dispatch_mode="gpu")
     assert isinstance(result, OwnedGeometryArray)
     _assert_shortest_line_matches(result, left_geoms, right_geoms)
+
+
+@requires_gpu
+def test_shortest_line_stays_device_resident():
+    """GPU shortest_line keeps output residency and routing metadata on device."""
+    from vibespatial.constructive.shortest_line import shortest_line_owned
+    left = from_shapely_geometries([Point(0, 0)], residency=Residency.DEVICE)
+    right = from_shapely_geometries([Point(3, 4)], residency=Residency.DEVICE)
+
+    result = shortest_line_owned(left, right, dispatch_mode="gpu")
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+
+
+@requires_gpu
+def test_shortest_line_all_invalid_rows_stays_device_resident(strict_device_guard):
+    """GPU shortest_line keeps the all-empty result branch device-resident."""
+    from vibespatial.constructive.shortest_line import shortest_line_owned
+
+    left = from_shapely_geometries([None], residency=Residency.DEVICE)
+    right = from_shapely_geometries([Point(3, 4)], residency=Residency.DEVICE)
+
+    result = shortest_line_owned(left, right, dispatch_mode="gpu")
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------

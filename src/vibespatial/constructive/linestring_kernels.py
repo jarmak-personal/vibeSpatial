@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-_LINESTRING_BUFFER_KERNEL_SOURCE = r"""
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+
+_LINESTRING_BUFFER_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 #define PI 3.14159265358979323846
-#define EPSILON 1e-12
+#define EPSILON VS_SPATIAL_EPSILON
 
 /* Join/cap style constants — must match Python-side encoding */
 #define JOIN_ROUND 0

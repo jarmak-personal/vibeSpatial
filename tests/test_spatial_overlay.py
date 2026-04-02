@@ -12,7 +12,10 @@ import shapely
 from shapely.geometry import box
 
 from vibespatial import from_shapely_geometries, spatial_overlay_owned
+from vibespatial.overlay.assemble import _overlay_intersection_rectangles_gpu
+from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+from vibespatial.runtime.residency import Residency
 
 
 def _non_empty_geoms(owned):
@@ -22,6 +25,41 @@ def _non_empty_geoms(owned):
 
 class TestSpatialOverlayIntersection:
     """Intersection overlay tests."""
+
+    def test_rectangle_fast_path_stays_device_resident(self, strict_device_guard):
+        """Rectangle fast path should build device-resident output with lazy host metadata."""
+        left = from_shapely_geometries([box(0, 0, 2, 2)], residency=Residency.DEVICE)
+        right = from_shapely_geometries([box(1, 1, 3, 3)], residency=Residency.DEVICE)
+
+        result = _overlay_intersection_rectangles_gpu(
+            left,
+            right,
+            requested=ExecutionMode.GPU,
+        )
+
+        assert result is not None
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
+    def test_rectangle_fast_path_empty_stays_device_resident(self, strict_device_guard):
+        """Disjoint rectangle fast path should return an empty device-resident result."""
+        left = from_shapely_geometries([box(0, 0, 1, 1)], residency=Residency.DEVICE)
+        right = from_shapely_geometries([box(2, 2, 3, 3)], residency=Residency.DEVICE)
+
+        result = _overlay_intersection_rectangles_gpu(
+            left,
+            right,
+            requested=ExecutionMode.GPU,
+        )
+
+        assert result is not None
+        assert result.row_count == 0
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
 
     def test_many_left_vs_one_right_clip(self):
         """10 polygons clipped against 1 larger polygon (vegetation-corridor pattern)."""

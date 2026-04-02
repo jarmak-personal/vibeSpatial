@@ -8,9 +8,11 @@ from vibespatial.cuda.device_functions.point_on_segment import (
     POINT_ON_SEGMENT_KIND_DEVICE,
 )
 from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 _POLYGON_PREDICATES_KERNEL_SOURCE = (
     ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE
+    + SPATIAL_TOLERANCE_PREAMBLE
     + POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
@@ -47,7 +49,7 @@ extern "C" __device__ inline unsigned char de9im_point_in_rings(
     const int ce = ring_offsets[ring + 1];
     if ((ce - cs) < 2) continue;
     const unsigned char kind = vs_ring_point_classify(
-        px, py, x, y, cs, ce, 1e-12);
+        px, py, x, y, cs, ce, VS_SPATIAL_EPSILON);
     if (kind == 1) return 1;
     if (kind == 2) inside = !inside;
   }
@@ -364,14 +366,16 @@ extern "C" __device__ inline unsigned char de9im_point_on_line(
       const double bx = lx[c],     by = ly[c];
       const double cross_val = (px - ax) * (by - ay) - (py - ay) * (bx - ax);
       const double scale = fabs(bx - ax) + fabs(by - ay) + 1.0;
-      if (fabs(cross_val) <= 1e-12 * scale) {
+      if (fabs(cross_val) <= VS_SPATIAL_EPSILON * scale) {
         const double minx = ax < bx ? ax : bx, maxx = ax > bx ? ax : bx;
         const double miny = ay < by ? ay : by, maxy = ay > by ? ay : by;
-        if (px >= minx - 1e-12 && px <= maxx + 1e-12 &&
-            py >= miny - 1e-12 && py <= maxy + 1e-12) {
+        if (px >= minx - VS_SPATIAL_EPSILON && px <= maxx + VS_SPATIAL_EPSILON &&
+            py >= miny - VS_SPATIAL_EPSILON && py <= maxy + VS_SPATIAL_EPSILON) {
           // On this segment — is it at a linestring endpoint?
-          if ((fabs(px - lx[cs]) < 1e-12 && fabs(py - ly[cs]) < 1e-12) ||
-              (fabs(px - lx[ce - 1]) < 1e-12 && fabs(py - ly[ce - 1]) < 1e-12)) {
+          if (
+              (fabs(px - lx[cs]) < VS_SPATIAL_EPSILON && fabs(py - ly[cs]) < VS_SPATIAL_EPSILON)
+              || (fabs(px - lx[ce - 1]) < VS_SPATIAL_EPSILON && fabs(py - ly[ce - 1]) < VS_SPATIAL_EPSILON)
+          ) {
             return 1;  // boundary
           }
           return 2;  // interior
@@ -426,7 +430,7 @@ extern "C" __device__ inline unsigned short de9im_line_polygon(
             const double d2 = (q2x - q1x) * (l2y - q1y) - (q2y - q1y) * (l2x - q1x);
             const double scale = fabs(q2x - q1x) + fabs(q2y - q1y)
                                + fabs(l2x - l1x) + fabs(l2y - l1y) + 1.0;
-            if (fabs(d1) <= 1e-12 * scale && fabs(d2) <= 1e-12 * scale) {
+            if (fabs(d1) <= VS_SPATIAL_EPSILON * scale && fabs(d2) <= VS_SPATIAL_EPSILON * scale) {
               double llo, lhi, qlo, qhi;
               if (fabs(l2x - l1x) + fabs(q2x - q1x)
                   >= fabs(l2y - l1y) + fabs(q2y - q1y)) {
@@ -439,7 +443,7 @@ extern "C" __device__ inline unsigned short de9im_line_polygon(
               const double overlap_lo = llo > qlo ? llo : qlo;
               const double overlap_hi = lhi < qhi ? lhi : qhi;
               const double axis_scale = fabs(lhi - llo) + fabs(qhi - qlo) + 1.0;
-              if (overlap_hi - overlap_lo > 1e-12 * axis_scale) {
+              if (overlap_hi - overlap_lo > VS_SPATIAL_EPSILON * axis_scale) {
                 mask |= DE9IM_IB;
               }
             }
@@ -497,7 +501,7 @@ extern "C" __device__ inline unsigned short de9im_line_polygon(
             const unsigned char kind = vs_point_on_segment_kind(
                 bx[vi], by[vi],
                 ax[ai - 1], ay[ai - 1], ax[ai], ay[ai],
-                1e-12);
+                VS_SPATIAL_EPSILON);
             if (kind > best_kind) best_kind = kind;
             if (best_kind == 2) break;
           }
@@ -609,7 +613,7 @@ extern "C" __device__ inline unsigned short de9im_line_line(
             const double d1 = (q2x - q1x) * (p1y - q1y) - (q2y - q1y) * (p1x - q1x);
             const double d2 = (q2x - q1x) * (p2y - q1y) - (q2y - q1y) * (p2x - q1x);
             const double scale = fabs(q2x - q1x) + fabs(q2y - q1y) + fabs(p2x - p1x) + fabs(p2y - p1y) + 1.0;
-            if (fabs(d1) <= 1e-12 * scale && fabs(d2) <= 1e-12 * scale) {
+            if (fabs(d1) <= VS_SPATIAL_EPSILON * scale && fabs(d2) <= VS_SPATIAL_EPSILON * scale) {
               // Collinear — check overlap on the dominant axis.
               double plo, phi, qlo, qhi;
               if (fabs(p2x - p1x) + fabs(q2x - q1x) >= fabs(p2y - p1y) + fabs(q2y - q1y)) {
@@ -621,7 +625,7 @@ extern "C" __device__ inline unsigned short de9im_line_line(
               }
               const double olo = plo > qlo ? plo : qlo;
               const double ohi = phi < qhi ? phi : qhi;
-              if (ohi > olo + 1e-12) {
+              if (ohi > olo + VS_SPATIAL_EPSILON) {
                 mask |= DE9IM_II;
               }
             }

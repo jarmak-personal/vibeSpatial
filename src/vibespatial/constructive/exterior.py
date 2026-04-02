@@ -33,6 +33,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.residency import Residency
 
 request_warmup(["lower_bound_i32"])
 
@@ -54,6 +55,19 @@ else:  # pragma: no cover - CPU-only install
 # ---------------------------------------------------------------------------
 # GPU implementation
 # ---------------------------------------------------------------------------
+
+
+def _empty_exterior_output(row_count: int, *, residency: Residency) -> OwnedGeometryArray:
+    if residency is Residency.DEVICE and cp is not None:
+        return build_device_resident_owned(
+            device_families={},
+            row_count=row_count,
+            tags=cp.full(row_count, -1, dtype=cp.int8),
+            validity=cp.zeros(row_count, dtype=cp.bool_),
+            family_row_offsets=cp.full(row_count, -1, dtype=cp.int32),
+            execution_mode="gpu",
+        )
+    return from_shapely_geometries([None] * row_count)
 
 @register_kernel_variant(
     "exterior_ring",
@@ -78,7 +92,7 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     d_state = owned._ensure_device_state()
 
     if GeometryFamily.POLYGON not in d_state.families:
-        return from_shapely_geometries([None] * owned.row_count)
+        return _empty_exterior_output(owned.row_count, residency=Residency.DEVICE)
 
     d_poly = d_state.families[GeometryFamily.POLYGON]
 
@@ -105,7 +119,7 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # Single scalar D2H to get total output size (unavoidable for allocation)
     total_coords = int(d_out_geom_offsets[-1])
     if total_coords == 0:
-        return from_shapely_geometries([None] * owned.row_count)
+        return _empty_exterior_output(owned.row_count, residency=Residency.DEVICE)
 
     # Build gather index map on device via lower_bound:
     # Map each output position to its owning geometry, then compute the
@@ -125,15 +139,14 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     # Build LineString output
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-    poly_mask = owned.tags == poly_tag
+    d_poly_valid = (d_state.tags == poly_tag) & d_state.validity
 
     # Build validity/tags for output (same row structure as input)
-    out_validity = owned.validity.copy()
-    out_tags = np.full(owned.row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
-    out_tags[~poly_mask] = -1  # non-polygon rows are null
-    out_validity[~poly_mask] = False
-    out_family_row_offsets = np.full(owned.row_count, -1, dtype=np.int32)
-    out_family_row_offsets[poly_mask] = np.arange(poly_count, dtype=np.int32)
+    out_validity = d_poly_valid.copy()
+    out_tags = cp.full(owned.row_count, -1, dtype=cp.int8)
+    out_tags[d_poly_valid] = FAMILY_TAGS[GeometryFamily.LINESTRING]
+    out_family_row_offsets = cp.full(owned.row_count, -1, dtype=cp.int32)
+    out_family_row_offsets[d_poly_valid] = d_state.family_row_offsets[d_poly_valid]
 
     d_empty_mask = cp.zeros(poly_count, dtype=cp.bool_)
 
@@ -153,6 +166,7 @@ def _exterior_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         tags=out_tags,
         validity=out_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -191,11 +205,6 @@ def exterior_owned(
     if row_count == 0:
         return from_shapely_geometries([])
 
-    # Short-circuit: no polygons means all-null output without touching device
-    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-    if not np.any(owned.tags == poly_tag):
-        return from_shapely_geometries([None] * row_count)
-
     selection = plan_dispatch_selection(
         kernel_name="exterior_ring",
         kernel_class=KernelClass.COARSE,
@@ -203,6 +212,16 @@ def exterior_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
     )
+
+    # Short-circuit: no polygons means all-null output.
+    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    if not np.any(owned.tags == poly_tag):
+        residency = (
+            Residency.DEVICE
+            if selection.selected is ExecutionMode.GPU
+            else Residency.HOST
+        )
+        return _empty_exterior_output(row_count, residency=residency)
 
     if selection.selected is ExecutionMode.GPU:
         precision_plan = selection.precision_plan

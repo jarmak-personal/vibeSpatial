@@ -301,21 +301,12 @@ def _polygon_intersection_gpu(
     d_ring_offsets[:n] = _cp.asarray(d_offsets)
     d_ring_offsets[n] = total_verts
 
-    # geometry_offsets: one ring per polygon = [0, 1, 2, ..., n]
-    # (host-side only; device state uses the same pattern implicitly)
-
-    # Host copies for OwnedGeometryArray metadata (small: O(n) int/bool).
-    # d_valid is already a CuPy array (returned by runtime.allocate), so
-    # pass it directly to copy_device_to_host -- no cp.asarray() needed.
-    validity = runtime.copy_device_to_host(d_valid).astype(bool)
-    ring_offsets = runtime.copy_device_to_host(d_ring_offsets)
-
     return build_device_backed_polygon_intersection_output(
         d_out_x,
         d_out_y,
         row_count=n,
-        validity=validity,
-        ring_offsets=ring_offsets,
+        validity=d_valid.astype(_cp.bool_),
+        ring_offsets=d_ring_offsets,
         runtime_selection=runtime_selection,
     )
 

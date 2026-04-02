@@ -32,9 +32,11 @@ from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE, SEGMENT_TILE_SIZE  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
 from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
+from vibespatial.spatial.indexing_cpu import iter_geometry_parts  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -266,7 +268,7 @@ def generate_bounds_pairs(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray | None = None,
     *,
-    tile_size: int = 256,
+    tile_size: int = COARSE_BOUNDS_TILE_SIZE,
     include_self: bool = False,
 ) -> CandidatePairs:
     if tile_size <= 0:
@@ -383,7 +385,7 @@ def benchmark_bounds_pairs(
     geometry_array: OwnedGeometryArray,
     *,
     dataset: str,
-    tile_size: int = 256,
+    tile_size: int = COARSE_BOUNDS_TILE_SIZE,
 ) -> BoundsPairBenchmark:
     started = perf_counter()
     pairs = generate_bounds_pairs(geometry_array, tile_size=tile_size)
@@ -455,7 +457,7 @@ class FlatSpatialIndex:
         self,
         other: OwnedGeometryArray,
         *,
-        tile_size: int = 256,
+        tile_size: int = COARSE_BOUNDS_TILE_SIZE,
     ) -> CandidatePairs:
         ordered = self.geometry_array
         result = generate_bounds_pairs(other, ordered, tile_size=tile_size)
@@ -886,10 +888,10 @@ def _extract_segment_mbrs_cpu(geometry_array: OwnedGeometryArray) -> SegmentMBRT
         elif geom_type == "Polygon":
             lines = [geometry.exterior, *geometry.interiors]
         elif geom_type == "MultiLineString":
-            lines = list(geometry.geoms)
+            lines = iter_geometry_parts(geometry)
         elif geom_type == "MultiPolygon":
             lines = []
-            for polygon in geometry.geoms:
+            for polygon in iter_geometry_parts(geometry):
                 lines.append(polygon.exterior)
                 lines.extend(polygon.interiors)
         else:
@@ -1380,7 +1382,7 @@ def _generate_segment_mbr_pairs_cpu(
     left_segments: SegmentMBRTable,
     right_segments: SegmentMBRTable,
     *,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
 ) -> SegmentCandidatePairs:
     """CPU fallback: tiled numpy MBR overlap on host."""
     # Ensure host arrays
@@ -1438,7 +1440,7 @@ def generate_segment_mbr_pairs(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     *,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
 ) -> SegmentCandidatePairs:
     """Generate candidate segment pairs by MBR overlap filtering.
 
@@ -1488,7 +1490,7 @@ def benchmark_segment_filter(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     *,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
 ) -> SegmentFilterBenchmark:
     left_segments = extract_segment_mbrs(left)
     right_segments = extract_segment_mbrs(right)

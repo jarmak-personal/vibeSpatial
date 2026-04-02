@@ -20,7 +20,9 @@ from shapely.geometry import (
     Polygon,
 )
 
+from vibespatial import from_shapely_geometries
 from vibespatial.api.geometry_array import GeometryArray
+from vibespatial.constructive.minimum_clearance import minimum_clearance_line_owned
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -314,3 +316,21 @@ def test_clearance_line_length_matches_clearance():
     if line_geom is not None and not line_geom.is_empty:
         line_length = line_geom.length
         np.testing.assert_allclose(line_length, clearance[0], rtol=1e-10)
+
+
+@requires_gpu
+def test_minimum_clearance_line_stays_device_resident(strict_device_guard):
+    """GPU minimum_clearance_line keeps routing metadata on device."""
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries(
+        [LineString([(0, 0), (10, 0), (10, 0.5), (0, 0.5)])],
+        residency=Residency.DEVICE,
+    )
+
+    result = minimum_clearance_line_owned(owned, dispatch_mode="gpu")
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None

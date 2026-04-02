@@ -6,6 +6,7 @@ from vibespatial.cuda.device_functions.point_in_ring import POINT_IN_RING_KIND_D
 from vibespatial.cuda.device_functions.point_on_segment import (
     POINT_ON_SEGMENT_KIND_DEVICE,
 )
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 # ---------------------------------------------------------------------------
 # CUDA kernel source -- shared device helpers
@@ -16,8 +17,8 @@ from vibespatial.cuda.device_functions.point_on_segment import (
 # by the shared cuda.device_functions modules.
 
 _SHARED_DEVICE_HELPERS = (
-    POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + r"""
-#define POINT_RELATION_TOLERANCE 1e-12
+    POINT_ON_SEGMENT_KIND_DEVICE + POINT_IN_RING_KIND_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + r"""
+#define POINT_RELATION_TOLERANCE VS_SPATIAL_EPSILON
 
 extern "C" __device__ inline double vibespatial_abs(double value) {
   return value < 0.0 ? -value : value;
@@ -118,8 +119,8 @@ extern "C" __global__ void point_equals_compacted(
   const int left_coord = left_geometry_offsets[left_row];
   const int right_coord = right_geometry_offsets[right_row];
   const bool same =
-      vibespatial_abs(left_x[left_coord] - right_x[right_coord]) <= 1e-12 &&
-      vibespatial_abs(left_y[left_coord] - right_y[right_coord]) <= 1e-12;
+      vibespatial_abs(left_x[left_coord] - right_x[right_coord]) <= POINT_RELATION_TOLERANCE &&
+      vibespatial_abs(left_y[left_coord] - right_y[right_coord]) <= POINT_RELATION_TOLERANCE;
   out[index] = same ? 2 : 0;
 }
 
@@ -363,8 +364,8 @@ extern "C" __global__ void multipoint_point_relation_compacted(
   const int end = mp_geometry_offsets[mp_row + 1];
   unsigned char bits = 0;
   for (int c = start; c < end; ++c) {
-    const bool same = vibespatial_abs(mp_x[c] - px) <= 1e-12 &&
-                      vibespatial_abs(mp_y[c] - py) <= 1e-12;
+    const bool same = vibespatial_abs(mp_x[c] - px) <= POINT_RELATION_TOLERANCE &&
+                      vibespatial_abs(mp_y[c] - py) <= POINT_RELATION_TOLERANCE;
     bits |= same ? 4 : 1;
   }
   out[index] = bits;
@@ -566,8 +567,8 @@ extern "C" __global__ void multipoint_multipoint_relation_compacted(
     const double ly = left_y[lc];
     bool matched = false;
     for (int rc = r_start; rc < r_end; ++rc) {
-      if (vibespatial_abs(lx - right_x[rc]) <= 1e-12 &&
-          vibespatial_abs(ly - right_y[rc]) <= 1e-12) {
+      if (vibespatial_abs(lx - right_x[rc]) <= POINT_RELATION_TOLERANCE &&
+          vibespatial_abs(ly - right_y[rc]) <= POINT_RELATION_TOLERANCE) {
         matched = true;
         break;
       }
@@ -603,4 +604,3 @@ _POINT_BINARY_RELATIONS_KERNEL_NAMES = (
     "point_in_polygon_polygon_compacted_state",
     "point_in_polygon_multipolygon_compacted_state",
 )
-

@@ -36,6 +36,7 @@ from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
 from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection  # noqa: E402
+from vibespatial.runtime.config import SEGMENT_TILE_SIZE  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import (  # noqa: E402
     KernelClass,
@@ -1429,7 +1430,7 @@ def generate_segment_candidates(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     *,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
 ) -> SegmentIntersectionCandidates:
     if tile_size <= 0:
         raise ValueError("tile_size must be positive")
@@ -1443,7 +1444,7 @@ def _generate_segment_candidates_from_tables(
     left_segments: SegmentTable,
     right_segments: SegmentTable,
     *,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
 ) -> SegmentIntersectionCandidates:
     if tile_size <= 0:
         raise ValueError("tile_size must be positive")
@@ -1821,7 +1822,7 @@ def _classify_segment_intersections_gpu(
     runtime_selection: RuntimeSelection,
     precision_plan: PrecisionPlan,
     robustness_plan: RobustnessPlan,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
 ) -> SegmentIntersectionResult:
     """Full GPU-native segment intersection pipeline.
@@ -2042,7 +2043,7 @@ def _classify_segment_intersections_cpu(
     runtime_selection: RuntimeSelection,
     precision_plan: PrecisionPlan,
     robustness_plan: RobustnessPlan,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
 ) -> SegmentIntersectionResult:
     """CPU fallback using numpy vectorized orientation + exact Fraction arithmetic."""
     left_segs = left_segments if left_segments is not None else extract_segments(left)
@@ -2191,7 +2192,7 @@ def classify_segment_intersections(
     right: OwnedGeometryArray,
     *,
     candidate_pairs: SegmentIntersectionCandidates | None = None,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
@@ -2279,7 +2280,7 @@ def benchmark_segment_intersections(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     *,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
 ) -> SegmentIntersectionBenchmark:
     started = perf_counter()

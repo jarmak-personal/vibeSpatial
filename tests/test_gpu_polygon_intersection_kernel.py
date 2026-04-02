@@ -11,8 +11,8 @@ import pytest
 import shapely
 from shapely.geometry import Polygon, box
 
-from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
+from vibespatial.testing import build_owned as _make_owned_polygons
 
 try:
     from vibespatial.cuda._runtime import has_cuda_device
@@ -22,13 +22,6 @@ except (ImportError, ModuleNotFoundError):
     _has_gpu = False
 
 requires_gpu = pytest.mark.skipif(not _has_gpu, reason="GPU not available")
-
-
-def _make_owned_polygons(geoms: list) -> OwnedGeometryArray:
-    """Helper to create an OwnedGeometryArray from a list of Shapely geometries."""
-    return from_shapely_geometries(geoms)
-
-
 def _shapely_intersection(left_geoms, right_geoms):
     """Shapely oracle: element-wise intersection."""
     left_arr = np.empty(len(left_geoms), dtype=object)
@@ -83,13 +76,13 @@ def _assert_geom_equal(gpu_geom, ref_geom, *, rtol=1e-6, msg=""):
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_basic_rectangle_overlap():
+def test_basic_rectangle_overlap(make_owned):
     """Two overlapping axis-aligned rectangles."""
     left_geoms = [box(0, 0, 4, 4)]
     right_geoms = [box(2, 2, 6, 6)]
 
-    left = _make_owned_polygons(left_geoms)
-    right = _make_owned_polygons(right_geoms)
+    left = make_owned(left_geoms)
+    right = make_owned(right_geoms)
 
     from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
 
@@ -106,13 +99,13 @@ def test_basic_rectangle_overlap():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_fully_contained():
+def test_fully_contained(make_owned):
     """Left polygon fully inside right polygon."""
     left_geoms = [box(1, 1, 3, 3)]
     right_geoms = [box(0, 0, 10, 10)]
 
-    left = _make_owned_polygons(left_geoms)
-    right = _make_owned_polygons(right_geoms)
+    left = make_owned(left_geoms)
+    right = make_owned(right_geoms)
 
     from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
 
@@ -373,8 +366,8 @@ def test_empty_input():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_result_is_device_resident():
-    """GPU result should be DEVICE-resident."""
+def test_result_is_device_resident(strict_device_guard):
+    """GPU result should stay device-resident with lazy host metadata."""
     left = _make_owned_polygons([box(0, 0, 4, 4)])
     right = _make_owned_polygons([box(2, 2, 6, 6)])
 
@@ -383,6 +376,9 @@ def test_result_is_device_resident():
     result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
     assert result.residency == Residency.DEVICE
     assert result.device_state is not None
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +492,7 @@ def test_precision_plan_wired():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_cw_clip_polygon_validity(strict_device_guard):
+def test_cw_clip_polygon_validity():
     """Clip polygons with CW winding must produce correct intersections.
 
     Regression test for the validity bitmap bug where Sutherland-Hodgman
@@ -555,7 +551,7 @@ def test_cw_clip_polygon_validity(strict_device_guard):
 
 
 @requires_gpu
-def test_mixed_winding_boxes(strict_device_guard):
+def test_mixed_winding_boxes():
     """Intersection works regardless of left/right winding direction.
 
     Tests all 4 combinations: CCW/CCW, CCW/CW, CW/CCW, CW/CW.

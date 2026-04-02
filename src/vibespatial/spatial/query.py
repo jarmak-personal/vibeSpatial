@@ -109,6 +109,37 @@ def _device_candidates_to_result(
     return (result, execution) if return_metadata else result
 
 
+def _indices_to_device_result(
+    left_idx: Any,
+    right_idx: Any,
+    *,
+    sort: bool,
+    execution: SpatialQueryExecution,
+    return_metadata: bool,
+) -> Any:
+    """Build a DeviceSpatialJoinResult from host or device index arrays."""
+    import cupy as _cp
+
+    if hasattr(left_idx, "__cuda_array_interface__"):
+        d_left = left_idx.astype(_cp.int32, copy=False)
+        d_right = right_idx.astype(_cp.int32, copy=False)
+    else:
+        d_left = _cp.asarray(left_idx, dtype=_cp.int32)
+        d_right = _cp.asarray(right_idx, dtype=_cp.int32)
+
+    if sort and d_left.size > 0:
+        order = _cp.lexsort(
+            _cp.stack([
+                _cp.asarray(d_right, dtype=_cp.int64),
+                _cp.asarray(d_left, dtype=_cp.int64),
+            ])
+        )
+        d_left = d_left[order]
+        d_right = d_right[order]
+    result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+    return (result, execution) if return_metadata else result
+
+
 def query_spatial_index(
     tree_owned: OwnedGeometryArray,
     flat_index,
@@ -193,6 +224,11 @@ def query_spatial_index(
             else:
                 left_idx, right_idx = regular_grid_box_pairs
             if scalar:
+                if not sort:
+                    right_idx = _reorder_scalar_tree_matches(
+                        right_idx.astype(np.intp, copy=False),
+                        flat_index.order,
+                    )
                 indices = right_idx.astype(np.intp, copy=False)
             else:
                 indices = np.vstack(
@@ -251,6 +287,11 @@ def query_spatial_index(
             )
             left_idx, right_idx = point_box_pairs
             if scalar:
+                if not sort:
+                    right_idx = _reorder_scalar_tree_matches(
+                        right_idx.astype(np.intp, copy=False),
+                        flat_index.order,
+                    )
                 indices = right_idx.astype(np.intp, copy=False)
             else:
                 indices = np.vstack(
@@ -444,6 +485,7 @@ def query_spatial_index(
     _tree_shapely = tree_shapely   # caller-provided or None
 
     gpu_candidate_gen = False
+    device_indices_materialized_from_gpu = False
     if predicate == "dwithin":
         if distance is None:
             raise ValueError("'distance' parameter is required for 'dwithin' predicate")
@@ -460,10 +502,8 @@ def query_spatial_index(
         )
         if device_dist_cands is not None:
             gpu_candidate_gen = True
-            # Host indices needed for tag-based family grouping in the
-            # distance dispatch loop; device candidates passed separately
-            # for device-side gather of surviving indices after filtering.
-            left_idx, right_idx = device_dist_cands.to_host()  # zcopy:ok(dwithin threshold indexing: per_row_distance[left_idx] requires host numpy; return_device path returns early with device arrays)
+            left_idx = None
+            right_idx = None
         else:
             left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)
 
@@ -508,6 +548,9 @@ def query_spatial_index(
                 return (device_result, execution) if return_metadata else device_result
         else:
             # CPU Shapely fallback.
+            if left_idx is None or right_idx is None:
+                left_idx, right_idx = device_dist_cands.to_host()
+                device_indices_materialized_from_gpu = True
             if query_values is None:
                 query_values = np.asarray(query_owned.to_shapely(), dtype=object)
                 _query_shapely = query_values
@@ -654,38 +697,18 @@ def query_spatial_index(
         and not scalar
         and output_format == "indices"
         and execution.selected is ExecutionMode.GPU
+        and not device_indices_materialized_from_gpu
         and has_gpu_runtime()
     ):
-        import cupy as _cp
-
-        # When indices are already device-resident CuPy arrays (e.g. from
-        # _dwithin_refine_gpu with return_device=True), use them directly
-        # to avoid a D->H + H->D round-trip.
-        _already_device = hasattr(left_idx, "__cuda_array_interface__")
-        if _already_device:
-            d_left = left_idx.astype(_cp.int32, copy=False)
-            d_right = right_idx.astype(_cp.int32, copy=False)
-        else:
-            d_left = _cp.asarray(left_idx, dtype=_cp.int32)
-            d_right = _cp.asarray(right_idx, dtype=_cp.int32)
-
-        # Sort on device if requested (overlay always passes sort=True).
-        if sort and d_left.size > 0:
-            order = _cp.lexsort(_cp.stack([_cp.asarray(d_right, dtype=_cp.int64), _cp.asarray(d_left, dtype=_cp.int64)]))
-            d_left = d_left[order]
-            d_right = d_right[order]
-        device_result = DeviceSpatialJoinResult(
-            d_left_idx=d_left,
-            d_right_idx=d_right,
+        return _indices_to_device_result(
+            left_idx,
+            right_idx,
+            sort=sort,
+            execution=execution,
+            return_metadata=return_metadata,
         )
-        return (device_result, execution) if return_metadata else device_result
 
     if scalar:
-        if not sort:
-            right_idx = _reorder_scalar_tree_matches(
-                right_idx.astype(np.intp, copy=False),
-                flat_index.order,
-            )
         indices = right_idx.astype(np.intp, copy=False)
     else:
         indices = np.vstack(

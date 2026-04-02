@@ -54,6 +54,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     build_device_resident_owned,
     build_updated_device_family_buffer,
+    forward_result_metadata,
     from_shapely_geometries,
     tile_single_row,
 )
@@ -571,7 +572,7 @@ def _snap_gpu(
     new_device_families = {}
 
     for lf, a_buf in d_left_state.families.items():
-        a_coord_count = int(a_buf.x.shape[0])
+        a_coord_count = a_buf.x.shape[0]
         if a_coord_count == 0:
             new_device_families[lf] = a_buf
             continue
@@ -579,7 +580,7 @@ def _snap_gpu(
         lt = FAMILY_TAGS[lf]
 
         d_a_geom_offsets = cp.asarray(a_buf.geometry_offsets)
-        a_num_geoms = int(d_a_geom_offsets.shape[0]) - 1
+        a_num_geoms = d_a_geom_offsets.shape[0] - 1
         if a_num_geoms == 0:
             new_device_families[lf] = a_buf
             continue
@@ -624,12 +625,15 @@ def _snap_gpu(
         )
         new_device_families[lf] = new_buf
 
+    tags, validity, family_row_offsets = forward_result_metadata(left)
+
     return build_device_resident_owned(
         device_families=new_device_families,
         row_count=n,
-        tags=left.tags.copy(),
-        validity=left.validity.copy(),
-        family_row_offsets=left.family_row_offsets.copy(),
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
 
 

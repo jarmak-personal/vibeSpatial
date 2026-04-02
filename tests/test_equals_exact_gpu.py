@@ -18,17 +18,10 @@ from shapely.geometry import (
     Polygon,
 )
 
-from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.testing import build_owned as _make_owned
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
-
-
-def _make_owned(geoms: list) -> OwnedGeometryArray:
-    """Create an OwnedGeometryArray from Shapely geometries."""
-    return from_shapely_geometries(geoms)
-
-
 def _shapely_equals_exact(left_geoms, right_geoms, tolerance):
     """Shapely oracle for equals_exact."""
     left_arr = np.asarray(left_geoms, dtype=object)
@@ -41,12 +34,12 @@ def _shapely_equals_exact(left_geoms, right_geoms, tolerance):
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_equals_exact_points_identical():
+def test_equals_exact_points_identical(make_owned):
     """Identical points should be equal with zero tolerance."""
     n = 1200  # above GPU threshold
     geoms = [Point(i * 0.1, i * 0.2) for i in range(n)]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)
@@ -56,13 +49,13 @@ def test_equals_exact_points_identical():
 
 
 @requires_gpu
-def test_equals_exact_points_with_tolerance():
+def test_equals_exact_points_with_tolerance(make_owned):
     """Points within tolerance should match."""
     n = 1200
     base = [Point(i, i * 2) for i in range(n)]
     shifted = [Point(i + 0.005, i * 2 - 0.003) for i in range(n)]
-    left = _make_owned(base)
-    right = _make_owned(shifted)
+    left = make_owned(base)
+    right = make_owned(shifted)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     # Tolerance large enough to match
@@ -79,13 +72,13 @@ def test_equals_exact_points_with_tolerance():
 
 
 @requires_gpu
-def test_equals_exact_points_different():
+def test_equals_exact_points_different(make_owned):
     """Different points should not be equal."""
     n = 1200
     left_geoms = [Point(i, i) for i in range(n)]
     right_geoms = [Point(i + 1, i + 1) for i in range(n)]
-    left = _make_owned(left_geoms)
-    right = _make_owned(right_geoms)
+    left = make_owned(left_geoms)
+    right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)
@@ -99,12 +92,12 @@ def test_equals_exact_points_different():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_equals_exact_linestrings():
+def test_equals_exact_linestrings(make_owned):
     """Identical linestrings should be equal."""
     n = 1200
     geoms = [LineString([(i, 0), (i + 1, 1), (i + 2, 0)]) for i in range(n)]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)
@@ -114,13 +107,13 @@ def test_equals_exact_linestrings():
 
 
 @requires_gpu
-def test_equals_exact_linestrings_different_length():
+def test_equals_exact_linestrings_different_length(make_owned):
     """LineStrings with different vertex counts should not match."""
     n = 1200
     left_geoms = [LineString([(i, 0), (i + 1, 1)]) for i in range(n)]
     right_geoms = [LineString([(i, 0), (i + 1, 1), (i + 2, 0)]) for i in range(n)]
-    left = _make_owned(left_geoms)
-    right = _make_owned(right_geoms)
+    left = make_owned(left_geoms)
+    right = make_owned(right_geoms)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)
@@ -134,15 +127,15 @@ def test_equals_exact_linestrings_different_length():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_equals_exact_polygons():
+def test_equals_exact_polygons(make_owned):
     """Identical polygons should be equal."""
     n = 1200
     geoms = [
         Polygon([(i, 0), (i + 1, 0), (i + 1, 1), (i, 1), (i, 0)])
         for i in range(n)
     ]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)
@@ -152,15 +145,15 @@ def test_equals_exact_polygons():
 
 
 @requires_gpu
-def test_equals_exact_polygons_with_holes():
+def test_equals_exact_polygons_with_holes(make_owned):
     """Polygons with holes should check ring structure."""
     n = 1200
     outer = [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)]
     hole = [(2, 2), (8, 2), (8, 8), (2, 8), (2, 2)]
     geoms_with_hole = [Polygon(outer, [hole]) for _ in range(n)]
     geoms_no_hole = [Polygon(outer) for _ in range(n)]
-    left = _make_owned(geoms_with_hole)
-    right = _make_owned(geoms_no_hole)
+    left = make_owned(geoms_with_hole)
+    right = make_owned(geoms_no_hole)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)
@@ -174,12 +167,12 @@ def test_equals_exact_polygons_with_holes():
 # ---------------------------------------------------------------------------
 
 @requires_gpu
-def test_equals_exact_multipoints():
+def test_equals_exact_multipoints(make_owned):
     """Identical MultiPoints should be equal."""
     n = 1200
     geoms = [MultiPoint([(i, 0), (i + 1, 1)]) for i in range(n)]
-    left = _make_owned(geoms)
-    right = _make_owned(geoms)
+    left = make_owned(geoms)
+    right = make_owned(geoms)
 
     from vibespatial.geometry.equality import geom_equals_exact_owned
     result = geom_equals_exact_owned(left, right, tolerance=0.0, dispatch_mode=ExecutionMode.GPU)

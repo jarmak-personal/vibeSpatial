@@ -84,6 +84,23 @@ def test_point_simple():
     _compare_extract_unique_points(geoms, result)
 
 
+@requires_gpu
+def test_extract_unique_points_stays_device_resident(strict_device_guard):
+    """extract_unique_points keeps single-family metadata on device."""
+    from vibespatial.constructive.extract_unique_points import (
+        extract_unique_points_owned,
+    )
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    geoms = [LineString([(0, 0), (1, 1), (0, 0), (2, 2), (1, 1)])]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    result = extract_unique_points_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency == Residency.DEVICE
+
+
 # ---------------------------------------------------------------------------
 # LineString family
 # ---------------------------------------------------------------------------

@@ -1053,6 +1053,12 @@ def spatial_overlay_owned(
                 else:
                     _h_group_starts = group_starts
                     _h_group_ends = group_ends
+                _group_ranges = list(
+                    zip(
+                        np.asarray(_h_group_starts).tolist(),
+                        np.asarray(_h_group_ends).tolist(),
+                    )
+                )
 
                 if _is_broadcast_right_overlay and _n_groups > 0:
                     # Materialise right host state once outside the loop.
@@ -1065,8 +1071,7 @@ def spatial_overlay_owned(
                     # collecting (stream, result) futures for deferred
                     # synchronization.
                     _futures: list[tuple] = []
-                    for grp_idx in range(_n_groups):
-                        start, end = int(_h_group_starts[grp_idx]), int(_h_group_ends[grp_idx])
+                    for grp_idx, (start, end) in enumerate(_group_ranges):
                         n_pairs = end - start
                         _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
                         with (_stream if _stream is not None else contextlib.nullcontext()):
@@ -1117,8 +1122,7 @@ def spatial_overlay_owned(
                     # General case: multiple right neighbours per group,
                     # or non-broadcast_right strategy.
                     _futures_gen: list[tuple] = []
-                    for grp_idx in range(_n_groups):
-                        start, end = int(_h_group_starts[grp_idx]), int(_h_group_ends[grp_idx])
+                    for grp_idx, (start, end) in enumerate(_group_ranges):
                         n_pairs = end - start
                         _stream = _stream_pool[grp_idx % len(_stream_pool)] if _stream_pool else None
                         with (_stream if _stream is not None else contextlib.nullcontext()):
@@ -1410,7 +1414,8 @@ def spatial_overlay_owned(
         for g in candidates:
             if g.geom_type == "GeometryCollection":
                 has_collections = True
-                for part in g.geoms:
+                parts = shapely.get_parts(np.asarray([g], dtype=object))
+                for part in parts:
                     if part.geom_type in (
                         "Point", "LineString", "Polygon",
                         "MultiPoint", "MultiLineString", "MultiPolygon",

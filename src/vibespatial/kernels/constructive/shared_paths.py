@@ -20,6 +20,8 @@ Output arrays:
 
 from __future__ import annotations
 
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+
 # ---------------------------------------------------------------------------
 # Collinearity + overlap detection kernel
 #
@@ -36,13 +38,13 @@ from __future__ import annotations
 # Direction: if t_q2 > t_q1 => forward, else => backward
 # ---------------------------------------------------------------------------
 
-_SHARED_PATHS_KERNEL_SOURCE = r"""
+_SHARED_PATHS_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 // Collinearity tolerance: segments must lie on the same infinite line
 // within this cross-product tolerance (relative to segment length squared).
 #define COL_EPS 1e-10
 
 // Minimum parametric overlap length to consider segments as shared.
-#define OVERLAP_EPS 1e-12
+#define OVERLAP_EPS VS_SPATIAL_EPSILON
 
 // ===================================================================
 // Device helper: count or scatter shared segments between two coord ranges

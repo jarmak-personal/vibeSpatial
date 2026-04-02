@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import cupy as cp
 import numpy as np
 
-from vibespatial.cuda._runtime import get_cuda_runtime
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.cuda._runtime import DeviceArray, get_cuda_runtime
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
+    build_device_resident_owned,
 )
 from vibespatial.runtime.residency import Residency
 
@@ -24,40 +25,22 @@ def build_device_backed_point_output(
 ) -> OwnedGeometryArray:
     """Build a device-resident Point OwnedGeometryArray."""
     runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    point_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.POINT,
-        schema=get_geometry_buffer_schema(GeometryFamily.POINT),
+    d_validity = runtime.from_host(validity)
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.POINT,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=runtime.from_host(geometry_offsets),
+                empty_mask=~cp.asarray(d_validity),
+            ),
+        },
         row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.POINT: point_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.POINT,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                )
-            },
-        ),
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=cp.int8),
+        validity=d_validity,
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
 
@@ -71,40 +54,22 @@ def build_device_backed_linestring_output(
 ) -> OwnedGeometryArray:
     """Build a device-resident LineString OwnedGeometryArray."""
     runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    ls_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.LINESTRING,
-        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
+    d_validity = runtime.from_host(validity)
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=runtime.from_host(geometry_offsets),
+                empty_mask=~cp.asarray(d_validity),
+            ),
+        },
         row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.LINESTRING: ls_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.LINESTRING,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                )
-            },
-        ),
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=cp.int8),
+        validity=d_validity,
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
 
@@ -118,65 +83,68 @@ def build_device_backed_multipoint_output(
 ) -> OwnedGeometryArray:
     """Build a device-resident MultiPoint OwnedGeometryArray."""
     runtime = get_cuda_runtime()
-    tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=np.int8)
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-    empty_mask = ~validity
-
-    mp_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.MULTIPOINT,
-        schema=get_geometry_buffer_schema(GeometryFamily.MULTIPOINT),
+    d_validity = runtime.from_host(validity)
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.MULTIPOINT: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.MULTIPOINT,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=runtime.from_host(geometry_offsets),
+                empty_mask=~cp.asarray(d_validity),
+            ),
+        },
         row_count=row_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-        host_materialized=False,
-    )
-    return OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.MULTIPOINT: mp_buffer},
-        residency=Residency.DEVICE,
-        device_state=OwnedGeometryDeviceState(
-            validity=runtime.from_host(validity),
-            tags=runtime.from_host(tags),
-            family_row_offsets=runtime.from_host(family_row_offsets),
-            families={
-                GeometryFamily.MULTIPOINT: DeviceFamilyGeometryBuffer(
-                    family=GeometryFamily.MULTIPOINT,
-                    x=device_x,
-                    y=device_y,
-                    geometry_offsets=runtime.from_host(geometry_offsets),
-                    empty_mask=runtime.from_host(empty_mask),
-                )
-            },
-        ),
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=cp.int8),
+        validity=d_validity,
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
 
 def build_point_result_from_source(
     points: OwnedGeometryArray,
-    new_validity: np.ndarray,
+    new_validity: np.ndarray | None,
+    *,
+    d_new_validity: DeviceArray | None = None,
 ) -> OwnedGeometryArray:
     """Build an OwnedGeometryArray sharing Point buffers with new validity."""
     new_device_state = None
+    host_validity = new_validity
+    host_tags = points.tags.copy()
+    host_family_row_offsets = points.family_row_offsets.copy()
     if points.device_state is not None:
         runtime = get_cuda_runtime()
+        if d_new_validity is not None:
+            d_validity = d_new_validity
+        elif new_validity is not None:
+            d_validity = runtime.from_host(new_validity)
+        else:
+            raise ValueError(
+                "Either new_validity or d_new_validity must be provided"
+            )
         new_device_state = OwnedGeometryDeviceState(
-            validity=runtime.from_host(new_validity),
+            validity=d_validity,
             tags=points.device_state.tags,
             family_row_offsets=points.device_state.family_row_offsets,
             families=dict(points.device_state.families),
         )
+        host_validity = None
+        host_tags = None
+        host_family_row_offsets = None
 
     return OwnedGeometryArray(
-        validity=new_validity,
-        tags=points.tags.copy(),
-        family_row_offsets=points.family_row_offsets.copy(),
+        validity=host_validity,
+        tags=host_tags,
+        family_row_offsets=host_family_row_offsets,
         families=dict(points.families),
-        residency=points.residency,
+        residency=(
+            Residency.DEVICE
+            if new_device_state is not None
+            else points.residency
+        ),
         device_state=new_device_state,
+        _row_count=points.row_count,
     )
 
 

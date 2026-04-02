@@ -31,6 +31,7 @@ _VIOLATION_BASELINE = 0  # FIX-15..19: all violations fixed or suppressed 2026-0
 
 # Method names that pull data from device to host.
 D2H_APIS = {"get", "copy_to_host", "to_host", "asnumpy", "tolist", "to_pylist"}
+BUILTIN_D2H_COERCIONS = {"int", "float", "bool", "len"}
 
 # Method / function names that push data from host to device.
 H2D_APIS = {"asarray", "array", "to_device", "as_cupy", "to_gpu"}
@@ -256,6 +257,69 @@ def _value_derives_from_numpy(value: ast.expr, names: set[str]) -> bool:
     return False
 
 
+def _expr_has_device_provenance(expr: ast.expr, device_names: set[str] | frozenset[str]) -> bool:
+    """Return True if *expr* is clearly derived from a device-resident value."""
+    if isinstance(expr, ast.Name):
+        return expr.id in device_names
+    if isinstance(expr, ast.Subscript):
+        return _expr_has_device_provenance(expr.value, device_names)
+    if isinstance(expr, ast.Attribute):
+        return _expr_has_device_provenance(expr.value, device_names)
+    if isinstance(expr, ast.UnaryOp):
+        return _expr_has_device_provenance(expr.operand, device_names)
+    if isinstance(expr, ast.BinOp):
+        return (
+            _expr_has_device_provenance(expr.left, device_names)
+            or _expr_has_device_provenance(expr.right, device_names)
+        )
+    return False
+
+
+def _collect_device_names(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> frozenset[str]:
+    """Collect variable names in *func_node* with clear device provenance."""
+    names: set[str] = set()
+
+    for node in ast.walk(func_node):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        target_name = node.targets[0].id
+
+        value = node.value
+        if isinstance(value, ast.Call):
+            if isinstance(value.func, ast.Attribute):
+                receiver = value.func.value
+                if (
+                    isinstance(receiver, ast.Name)
+                    and receiver.id in H2D_MODULES
+                    and value.func.attr not in D2H_APIS
+                ):
+                    names.add(target_name)
+                    continue
+                if value.func.attr in {"allocate", "from_host", "to_device", "as_cupy", "to_gpu"}:
+                    names.add(target_name)
+                    continue
+            if isinstance(value.func, ast.Name) and value.func.id in {"to_device", "as_cupy", "to_gpu"}:
+                names.add(target_name)
+
+    for _pass in range(2):
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Assign):
+                continue
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                continue
+            target_name = node.targets[0].id
+            if target_name in names:
+                continue
+            if _expr_has_device_provenance(node.value, names):
+                names.add(target_name)
+
+    return frozenset(names)
+
+
 def _scope_has_pyarrow(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     """Return True if *func_node* body contains ``import pyarrow`` (any alias).
 
@@ -396,6 +460,7 @@ def _is_d2h_call(
     node: ast.Call,
     numpy_names: frozenset[str] = frozenset(),
     *,
+    device_names: frozenset[str] = frozenset(),
     pyarrow_names: frozenset[str] = frozenset(),
 ) -> bool:
     name = _call_name(node)
@@ -437,6 +502,20 @@ def _is_d2h_call(
     if _receiver_is_numpy(node, numpy_names):
         return False
     return True
+
+
+def _is_builtin_device_coercion(
+    node: ast.Call,
+    *,
+    device_names: frozenset[str] = frozenset(),
+) -> bool:
+    """Return True for builtin scalar coercions on clearly device-backed values."""
+    name = _call_name(node)
+    if name not in BUILTIN_D2H_COERCIONS:
+        return False
+    if len(node.args) != 1:
+        return False
+    return _expr_has_device_provenance(node.args[0], device_names)
 
 
 def _is_h2d_call(node: ast.Call) -> bool:
@@ -595,13 +674,19 @@ def check_pingpong_transfers(
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             numpy_names = _collect_numpy_names(node)
+            device_names = _collect_device_names(node)
             pa_names = _collect_pyarrow_names(node) if _scope_has_pyarrow(node) else frozenset()
             d2h_calls: list[ast.Call] = []
             h2d_calls: list[ast.Call] = []
             for descendant in ast.walk(node):
                 if not isinstance(descendant, ast.Call):
                     continue
-                if _is_d2h_call(descendant, numpy_names, pyarrow_names=pa_names):
+                if _is_d2h_call(
+                    descendant,
+                    numpy_names,
+                    device_names=device_names,
+                    pyarrow_names=pa_names,
+                ):
                     d2h_calls.append(descendant)
                 if _is_h2d_call(descendant):
                     h2d_calls.append(descendant)
@@ -672,10 +757,12 @@ def check_loop_transfers(
         # Pre-compute numpy name sets and pyarrow names per enclosing function.
         # For loops at module level, use empty sets (conservative).
         func_numpy: dict[int, frozenset[str]] = {}
+        func_device: dict[int, frozenset[str]] = {}
         func_pyarrow: dict[int, frozenset[str]] = {}
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 func_numpy[id(node)] = _collect_numpy_names(node)
+                func_device[id(node)] = _collect_device_names(node)
                 func_pyarrow[id(node)] = (
                     _collect_pyarrow_names(node) if _scope_has_pyarrow(node) else frozenset()
                 )
@@ -688,11 +775,20 @@ def check_loop_transfers(
                 continue
             # Find enclosing function scope for numpy name tracking.
             numpy_names = _enclosing_func_numpy_names(node, func_numpy)
+            device_names = _enclosing_func_numpy_names(node, func_device)
             pa_names = _enclosing_func_pyarrow_names(node, func_pyarrow)
             for descendant in ast.walk(node):
                 if not isinstance(descendant, ast.Call):
                     continue
-                if _is_d2h_call(descendant, numpy_names, pyarrow_names=pa_names):
+                if _is_d2h_call(
+                    descendant,
+                    numpy_names,
+                    device_names=device_names,
+                    pyarrow_names=pa_names,
+                ) or _is_builtin_device_coercion(
+                    descendant,
+                    device_names=device_names,
+                ):
                     is_suppressed = descendant.lineno in suppressions
                     if is_suppressed:
                         suppressed += 1
@@ -719,6 +815,7 @@ def check_loop_transfers(
 def _returns_host_conversion(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> int | None:
     """Return the line number of a D->H call in a return statement, or None."""
     numpy_names = _collect_numpy_names(func_node)
+    device_names = _collect_device_names(func_node)
     pa_names = (
         _collect_pyarrow_names(func_node) if _scope_has_pyarrow(func_node) else frozenset()
     )
@@ -727,7 +824,10 @@ def _returns_host_conversion(func_node: ast.FunctionDef | ast.AsyncFunctionDef) 
             continue
         for descendant in ast.walk(node.value):
             if isinstance(descendant, ast.Call) and _is_d2h_call(
-                descendant, numpy_names, pyarrow_names=pa_names
+                descendant,
+                numpy_names,
+                device_names=device_names,
+                pyarrow_names=pa_names,
             ):
                 return descendant.lineno
     return None

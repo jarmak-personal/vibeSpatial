@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
 from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
-from vibespatial.cuda.preamble import PRECISION_PREAMBLE
+from vibespatial.cuda.preamble import PRECISION_PREAMBLE, SPATIAL_TOLERANCE_PREAMBLE
 
-_POLYGON_BUFFER_KERNEL_SOURCE = r"""
+_POLYGON_BUFFER_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 #define PI 3.14159265358979323846
-#define EPSILON 1e-12
+#define EPSILON VS_SPATIAL_EPSILON
 
 #define JOIN_ROUND 0
 #define JOIN_MITRE 1

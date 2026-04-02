@@ -250,6 +250,26 @@ class TestGetGeometry:
         with pytest.raises(RuntimeError, match="get-geometry-gpu-boom"):
             get_geometry_owned(owned, 0, dispatch_mode="gpu")
 
+    @pytest.mark.gpu
+    def test_gpu_result_metadata_stays_device_resident(self):
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.residency import Residency
+
+        geoms = [
+            MultiPoint([(0, 0), (1, 1), (2, 2)]),
+            MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]]),
+        ]
+        owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+        result = get_geometry_owned(owned, 0, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.residency == Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
     def test_multi_types(self):
         geoms = [
             MultiPoint([(0, 0), (1, 1), (2, 2)]),

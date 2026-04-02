@@ -6,9 +6,10 @@ from vibespatial.cuda.device_functions.point_in_ring import (
     POINT_IN_RING_BOUNDARY_DEVICE,
 )
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 _SEGMENT_DISTANCE_KERNEL_SOURCE = (
-    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + """
+    POINT_ON_SEGMENT_DEVICE + POINT_IN_RING_BOUNDARY_DEVICE + SPATIAL_TOLERANCE_PREAMBLE + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -112,7 +113,7 @@ extern "C" __device__ inline bool seg_point_in_rings(
     if ((ce - cs) < 2) continue;
     bool on_boundary = false;
     bool ring_inside = vs_ring_contains_point_with_boundary(
-        px, py, x, y, cs, ce, 1e-12, &on_boundary);
+        px, py, x, y, cs, ce, VS_SPATIAL_EPSILON, &on_boundary);
     if (on_boundary) return true;
     if (ring_inside) inside = !inside;
   }

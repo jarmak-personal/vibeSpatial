@@ -18,9 +18,14 @@ import pytest
 import shapely
 from shapely.geometry import Polygon
 
+from vibespatial import from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.make_valid_pipeline import (
     MakeValidResult,
     make_valid_owned,
+)
+
+requires_gpu = pytest.mark.skipif(
+    not has_gpu_runtime(), reason="GPU runtime not available",
 )
 
 # ---------------------------------------------------------------------------
@@ -318,3 +323,88 @@ def test_gpu_module_imports():
     from vibespatial.constructive.make_valid_gpu import GPURepairResult, gpu_repair_invalid_polygons
     assert GPURepairResult is not None
     assert gpu_repair_invalid_polygons is not None
+
+
+@requires_gpu
+def test_build_batch_repaired_device_keeps_metadata_lazy(strict_device_guard):
+    """Device make_valid batch builder should keep routing metadata on device."""
+    import cupy as cp
+
+    from vibespatial.constructive.make_valid_gpu import (
+        _build_batch_repaired_device,
+        _planned_make_valid_runtime_selection,
+    )
+    from vibespatial.runtime.residency import Residency
+
+    d_x = cp.asarray([0.0, 1.0, 1.0, 0.0, 0.0], dtype=cp.float64)
+    d_y = cp.asarray([0.0, 0.0, 1.0, 1.0, 0.0], dtype=cp.float64)
+    d_ring_offsets = cp.asarray([0, 5], dtype=cp.int32)
+    d_geom_offsets = cp.asarray([0, 1], dtype=cp.int32)
+    runtime_selection = _planned_make_valid_runtime_selection(
+        kernel_name="make_valid_gpu_batch_repair",
+        row_count=1,
+        reason="test",
+    )
+
+    result = _build_batch_repaired_device(
+        d_x,
+        d_y,
+        d_ring_offsets,
+        d_geom_offsets,
+        ring_count=1,
+        polygon_count=1,
+        runtime_selection=runtime_selection,
+    )
+
+    assert result is not None
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+
+
+@requires_gpu
+def test_device_scatter_repaired_keeps_merged_metadata_lazy(strict_device_guard):
+    """Device scatter/remap should merge repaired polygons without host metadata."""
+    from vibespatial.constructive.make_valid_gpu import _device_scatter_repaired
+    from vibespatial.runtime.residency import Residency
+
+    bowtie = shapely.from_wkt("POLYGON ((0 0, 2 2, 2 0, 0 2, 0 0))")
+    repaired = Polygon([(0, 0), (2, 0), (2, 1), (0, 1), (0, 0)])
+    original_owned = from_shapely_geometries([bowtie], residency=Residency.DEVICE)
+    repaired_batch = from_shapely_geometries([repaired], residency=Residency.DEVICE)
+
+    result = _device_scatter_repaired(
+        original_owned,
+        repaired_batch,
+        "polygon",
+        np.asarray([0], dtype=np.int32),
+        {0: 0},
+    )
+
+    assert result.residency is Residency.DEVICE
+    assert result._validity is None
+    assert result._tags is None
+    assert result._family_row_offsets is None
+
+
+@requires_gpu
+def test_gpu_repair_invalid_polygons_keeps_public_result_metadata_lazy(strict_device_guard):
+    """Public GPU make_valid repair should stay device-resident through face assembly."""
+    from vibespatial.constructive.make_valid_gpu import gpu_repair_invalid_polygons
+    from vibespatial.runtime.residency import Residency
+
+    bowtie = shapely.from_wkt("POLYGON ((0 0, 2 2, 2 0, 0 2, 0 0))")
+    original_owned = from_shapely_geometries([bowtie], residency=Residency.DEVICE)
+
+    result = gpu_repair_invalid_polygons(
+        original_owned,
+        np.asarray([0], dtype=np.int32),
+    )
+
+    assert result is not None
+    assert result.repaired_owned is not None
+    assert result.repaired_owned.residency is Residency.DEVICE
+    assert result.repaired_owned._validity is None
+    assert result.repaired_owned._tags is None
+    assert result.repaired_owned._family_row_offsets is None

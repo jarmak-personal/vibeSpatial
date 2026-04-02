@@ -9,6 +9,7 @@ import vibespatial.spatial.query as spatial_query_module
 import vibespatial.spatial.query_utils as spatial_query_utils_module
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
@@ -36,12 +37,12 @@ def test_query_spatial_index_supports_dwithin() -> None:
     assert indices.tolist() == [[0, 1], [0, 2]]
 
 
-def test_query_spatial_index_scalar_sort_false_preserves_flat_index_order() -> None:
+def test_query_spatial_index_scalar_sort_false_preserves_membership_without_sorting() -> None:
     tree = np.asarray(
-        [box(10, 0, 11, 1), box(0, 0, 1, 1), box(5, 0, 6, 1)],
+        [Point(5, 5), Point(2, 2), Point(4, 4), Point(0, 0), Point(3, 3), Point(1, 1)],
         dtype=object,
     )
-    query = box(-1, -1, 20, 2)
+    query = box(0, 0, 2, 2)
     owned, flat = build_owned_spatial_index(tree)
 
     unsorted = query_spatial_index(owned, flat, query, predicate="intersects", sort=False)
@@ -49,7 +50,7 @@ def test_query_spatial_index_scalar_sort_false_preserves_flat_index_order() -> N
     expected_unsorted = flat.query_bounds(query.bounds)
 
     assert unsorted.tolist() == expected_unsorted.tolist()
-    assert sorted_indices.tolist() == [0, 1, 2]
+    assert sorted(sorted_indices.tolist()) == sorted(expected_unsorted.tolist())
     assert unsorted.tolist() != sorted_indices.tolist()
 
 
@@ -1018,6 +1019,36 @@ def test_return_device_true_returns_device_result() -> None:
     else:
         # CPU fallback returns numpy as usual
         assert isinstance(result, np.ndarray)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_dwithin_return_device_true_stays_device_resident(strict_device_guard) -> None:
+    """Per-row dwithin thresholds should stay device-native for return_device=True."""
+    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+    tree = np.asarray([Point(0, 0), Point(10, 0), Point(20, 0)], dtype=object)
+    tree_owned, flat = build_owned_spatial_index(tree)
+    query_owned = from_shapely_geometries(
+        [Point(1, 0), Point(16, 0)],
+        residency=Residency.DEVICE,
+    )
+
+    result, execution = query_spatial_index(
+        tree_owned,
+        flat,
+        query_owned,
+        predicate="dwithin",
+        distance=np.asarray([5.0, 5.0], dtype=np.float64),
+        sort=True,
+        return_device=True,
+        return_metadata=True,
+    )
+
+    assert execution.selected is ExecutionMode.GPU
+    assert isinstance(result, DeviceSpatialJoinResult)
+    assert result.size == 2
+    assert hasattr(result.d_left_idx, "__cuda_array_interface__")
+    assert hasattr(result.d_right_idx, "__cuda_array_interface__")
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")

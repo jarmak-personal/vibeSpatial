@@ -28,6 +28,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from vibespatial.constructive.binary_constructive_cpu import binary_constructive_cpu
+from vibespatial.constructive.nonpolygon_binary_output import (
+    build_point_result_from_source,
+)
 from vibespatial.cuda._runtime import DeviceArray
 
 if TYPE_CHECKING:
@@ -49,6 +52,7 @@ from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
 )
+from vibespatial.runtime.residency import Residency, TransferTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -193,55 +197,11 @@ def _build_point_polygon_result(
     reflects the new mask -- ensuring downstream GPU consumers see the
     correct null rows without re-uploading coordinates.
     """
-    from vibespatial.geometry.owned import OwnedGeometryDeviceState
-
-    new_device_state = None
-
-    if points.device_state is not None:
-        # Determine the device validity array
-        if d_new_validity is not None:
-            d_validity_out = d_new_validity
-        elif new_validity is not None:
-            from vibespatial.cuda._runtime import get_cuda_runtime
-            runtime = get_cuda_runtime()
-            d_validity_out = runtime.from_host(new_validity)
-        else:
-            raise ValueError(
-                "Either new_validity or d_new_validity must be provided"
-            )
-
-        new_device_state = OwnedGeometryDeviceState(
-            validity=d_validity_out,
-            tags=points.device_state.tags,
-            family_row_offsets=points.device_state.family_row_offsets,
-            families=dict(points.device_state.families),
-        )
-
-    # When device metadata is available and no host validity was provided,
-    # keep host arrays None for lazy materialisation.
-    if d_new_validity is not None and new_device_state is not None:
-        # Device-resident result: host metadata is lazy
-        h_validity = None
-        h_tags = None
-        h_family_row_offsets = None
-    else:
-        # Host-resident result: copy the metadata arrays
-        h_validity = new_validity
-        h_tags = points.tags.copy()
-        h_family_row_offsets = points.family_row_offsets.copy()
-
-    # Tags and family_row_offsets still index into the same family buffer.
-    # For rows that are now invalid, the consumer will skip them via validity.
-    result = OwnedGeometryArray(
-        validity=h_validity,
-        tags=h_tags,
-        family_row_offsets=h_family_row_offsets,
-        families=dict(points.families),
-        residency=points.residency,
-        device_state=new_device_state,
-        _row_count=points.row_count,
+    return build_point_result_from_source(
+        points,
+        new_validity,
+        d_new_validity=d_new_validity,
     )
-    return result
 
 
 def _intersection_point_polygon_gpu(
@@ -262,6 +222,17 @@ def _intersection_point_polygon_gpu(
     ADR-0033: Tier 2 (CuPy element-wise mask) over Tier 1 PIP kernel.
     """
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+
+    points.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="binary_constructive point_polygon intersection GPU",
+    )
+    polygons.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="binary_constructive point_polygon intersection GPU",
+    )
 
     # PIP kernel returns CuPy bool array (GPU) or numpy bool array (CPU).
     pip_mask = point_in_polygon(points, polygons, _return_device=True)
@@ -299,6 +270,17 @@ def _difference_point_polygon_gpu(
     ADR-0033: Tier 2 (CuPy element-wise mask) over Tier 1 PIP kernel.
     """
     from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+
+    points.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="binary_constructive point_polygon difference GPU",
+    )
+    polygons.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="binary_constructive point_polygon difference GPU",
+    )
 
     pip_mask = point_in_polygon(points, polygons, _return_device=True)
 

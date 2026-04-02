@@ -8,6 +8,7 @@ from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 import vibespatial.api as geopandas
 from vibespatial import (
     ExecutionMode,
+    Residency,
     benchmark_clip_by_rect,
     clip_by_rect_owned,
     from_shapely_geometries,
@@ -23,6 +24,26 @@ def _assert_geometries_match(actual, expected) -> None:
             continue
         assert left.geom_type == right.geom_type
         assert bool(shapely.equals(left, right))
+
+
+def _make_device_resident_with_host_stubs_cleared(geoms: list[object | None]):
+    from vibespatial.geometry.owned import FamilyGeometryBuffer
+
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    owned.families = {
+        family: FamilyGeometryBuffer(
+            family=buffer.family,
+            schema=buffer.schema,
+            row_count=buffer.row_count,
+            x=np.empty(0, dtype=np.float64),
+            y=np.empty(0, dtype=np.float64),
+            geometry_offsets=np.empty(0, dtype=np.int32),
+            empty_mask=np.empty(0, dtype=np.bool_),
+            host_materialized=False,
+        )
+        for family, buffer in owned.families.items()
+    }
+    return owned
 
 
 def test_clip_by_rect_owned_matches_shapely_for_points_lines_and_polygons() -> None:
@@ -147,6 +168,9 @@ def test_clip_polygon_gpu_coordinates_stay_device_resident() -> None:
     assert owned is not None
     assert owned.residency is Residency.DEVICE, "output should be device-resident"
     assert owned.device_state is not None, "device_state should be populated"
+    assert owned._validity is None
+    assert owned._tags is None
+    assert owned._family_row_offsets is None
     poly_dev_buf = owned.device_state.families[GeometryFamily.POLYGON]
     assert isinstance(poly_dev_buf.x, cp.ndarray), "x coordinates should be device-resident CuPy"
     assert isinstance(poly_dev_buf.y, cp.ndarray), "y coordinates should be device-resident CuPy"
@@ -160,4 +184,42 @@ def test_clip_polygon_gpu_coordinates_stay_device_resident() -> None:
         1.0, 1.0, 5.0, 5.0,
     )
 
+    _assert_geometries_match(result.geometries.tolist(), list(expected))
+
+
+@pytest.mark.gpu
+def test_clip_lines_gpu_uses_device_family_buffers_when_host_stubs_are_empty() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    values = [LineString([(0, 0), (4, 4)])]
+    owned = _make_device_resident_with_host_stubs_cleared(values)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        2.0,
+        2.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.runtime_selection.selected is ExecutionMode.GPU
+    assert result.fallback_rows.size == 0
+    assert result.owned_result is not None
+    assert result.owned_result.residency is Residency.DEVICE
+    assert result.owned_result.device_state is not None
+    assert result.owned_result._validity is None
+    assert result.owned_result._tags is None
+    assert result.owned_result._family_row_offsets is None
+
+    line_dev_buf = result.owned_result.device_state.families[GeometryFamily.LINESTRING]
+    assert isinstance(line_dev_buf.x, cp.ndarray)
+    assert isinstance(line_dev_buf.y, cp.ndarray)
+
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
     _assert_geometries_match(result.geometries.tolist(), list(expected))

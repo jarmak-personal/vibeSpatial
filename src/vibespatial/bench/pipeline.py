@@ -76,6 +76,23 @@ PIPELINE_DEFINITIONS = (
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".benchmark_fixtures"
+_SUPPORTED_COLLECTION_GEOM_TYPES = {
+    "Point",
+    "LineString",
+    "Polygon",
+    "MultiPoint",
+    "MultiLineString",
+    "MultiPolygon",
+}
+_POLYGONAL_COLLECTION_GEOM_TYPES = {"Polygon", "MultiPolygon"}
+
+
+def _extract_supported_collection_parts(geometry, allowed_geom_types: set[str]) -> list:
+    parts = shapely.get_parts(np.asarray([geometry], dtype=object))
+    return [
+        part for part in parts
+        if part.geom_type in allowed_geom_types and not part.is_empty
+    ]
 
 
 def _extract_polygonal_components(geometries) -> list:
@@ -85,7 +102,7 @@ def _extract_polygonal_components(geometries) -> list:
         if g is None or shapely.is_empty(g):
             result.append(g)
         elif g.geom_type == "GeometryCollection":
-            polys = [part for part in g.geoms if part.geom_type in ("Polygon", "MultiPolygon")]
+            polys = _extract_supported_collection_parts(g, _POLYGONAL_COLLECTION_GEOM_TYPES)
             if polys:
                 result.append(shapely.union_all(np.asarray(polys, dtype=object)) if len(polys) > 1 else polys[0])
             else:
@@ -1159,16 +1176,13 @@ def _empty_owned_placeholder() -> OwnedGeometryArray:
 
 def _from_shapely_safe(geoms: list) -> OwnedGeometryArray:
     """Convert shapely geometries, filtering out unsupported types like GeometryCollection."""
-    import shapely
     filtered = []
     for g in geoms:
         if g is None or g.is_empty:
             continue
         if g.geom_type == "GeometryCollection":
             # Extract supported geometry types from collections
-            for part in g.geoms:
-                if part.geom_type in ("Point", "LineString", "Polygon", "MultiPoint", "MultiLineString", "MultiPolygon"):
-                    filtered.append(part)
+            filtered.extend(_extract_supported_collection_parts(g, _SUPPORTED_COLLECTION_GEOM_TYPES))
         else:
             filtered.append(g)
     if not filtered:

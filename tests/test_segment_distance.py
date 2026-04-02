@@ -13,13 +13,9 @@ from shapely.geometry import (
 
 from vibespatial import has_gpu_runtime
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.testing import build_owned as _make_owned
 
 pytestmark = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
-
-
-def _make_owned(geoms):
-    return from_shapely_geometries(geoms)
 
 
 def _compute_distances(query_owned, tree_owned, left_idx, right_idx, query_family, tree_family, exclusive=False):
@@ -57,45 +53,45 @@ def _shapely_distances(query_geoms, tree_geoms, left_idx, right_idx):
 # ---- LS × LS ----
 
 class TestLsLsDistance:
-    def test_parallel_lines(self):
+    def test_parallel_lines(self, make_owned):
         """Parallel lines — distance is perpendicular gap."""
         q = [LineString([(0, 0), (10, 0)])]
         t = [LineString([(2, 3), (8, 3)])]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.LINESTRING, GeometryFamily.LINESTRING,
         )
         assert gpu[0] == pytest.approx(3.0, abs=1e-10)
 
-    def test_crossing_lines(self):
+    def test_crossing_lines(self, make_owned):
         """Crossing lines → distance 0."""
         q = [LineString([(0, 0), (2, 2)])]
         t = [LineString([(0, 2), (2, 0)])]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.LINESTRING, GeometryFamily.LINESTRING,
         )
         assert gpu[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_endpoint_nearest(self):
+    def test_endpoint_nearest(self, make_owned):
         q = [LineString([(0, 0), (1, 0)])]
         t = [LineString([(3, 0), (4, 0)])]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.LINESTRING, GeometryFamily.LINESTRING,
         )
         assert gpu[0] == pytest.approx(2.0, abs=1e-10)
 
-    def test_multi_pair(self):
+    def test_multi_pair(self, make_owned):
         q = [LineString([(0, 0), (1, 0)]), LineString([(5, 5), (6, 5)])]
         t = [LineString([(0, 1), (1, 1)]), LineString([(5, 0), (6, 0)])]
         left = np.array([0, 1, 0, 1], dtype=np.int32)
         right = np.array([0, 1, 1, 0], dtype=np.int32)
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t), left, right,
+            make_owned(q), make_owned(t), left, right,
             GeometryFamily.LINESTRING, GeometryFamily.LINESTRING,
         )
         expected = _shapely_distances(q, t, left, right)
@@ -105,44 +101,44 @@ class TestLsLsDistance:
 # ---- LS × PG ----
 
 class TestLsPgDistance:
-    def test_line_outside_polygon(self):
+    def test_line_outside_polygon(self, make_owned):
         q = [LineString([(3, 0), (4, 0)])]
         t = [box(0, 0, 2, 2)]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
         )
         expected = shapely.distance(q[0], t[0])
         assert gpu[0] == pytest.approx(expected, abs=1e-10)
 
-    def test_line_inside_polygon(self):
+    def test_line_inside_polygon(self, make_owned):
         q = [LineString([(0.5, 0.5), (1.5, 1.5)])]
         t = [box(0, 0, 2, 2)]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
         )
         assert gpu[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_line_crossing_polygon_boundary(self):
+    def test_line_crossing_polygon_boundary(self, make_owned):
         q = [LineString([(1, 1), (3, 1)])]
         t = [box(0, 0, 2, 2)]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
         )
         assert gpu[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_symmetric_dispatch(self):
+    def test_symmetric_dispatch(self, make_owned):
         """PG × LS uses canonical swap and gives same result."""
         lines = [LineString([(3, 0), (4, 0)])]
         polys = [box(0, 0, 2, 2)]
         # Query=PG, Tree=LS (reversed).
         gpu = _compute_distances(
-            _make_owned(polys), _make_owned(lines),
+            make_owned(polys), make_owned(lines),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.POLYGON, GeometryFamily.LINESTRING,
         )
@@ -153,43 +149,43 @@ class TestLsPgDistance:
 # ---- PG × PG ----
 
 class TestPgPgDistance:
-    def test_disjoint_boxes(self):
+    def test_disjoint_boxes(self, make_owned):
         q = [box(0, 0, 1, 1)]
         t = [box(3, 0, 4, 1)]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert gpu[0] == pytest.approx(2.0, abs=1e-10)
 
-    def test_overlapping_polygons(self):
+    def test_overlapping_polygons(self, make_owned):
         q = [box(0, 0, 2, 2)]
         t = [box(1, 1, 3, 3)]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert gpu[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_contained_polygon(self):
+    def test_contained_polygon(self, make_owned):
         q = [box(0, 0, 10, 10)]
         t = [box(2, 2, 3, 3)]
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )
         assert gpu[0] == pytest.approx(0.0, abs=1e-10)
 
-    def test_polygon_with_hole(self):
+    def test_polygon_with_hole(self, make_owned):
         outer = [(0, 0), (10, 0), (10, 10), (0, 10)]
         hole = [(3, 3), (7, 3), (7, 7), (3, 7)]
         q = [Polygon(outer, [hole])]
         t = [box(4, 4, 6, 6)]  # inside the hole
         gpu = _compute_distances(
-            _make_owned(q), _make_owned(t),
+            make_owned(q), make_owned(t),
             np.array([0], dtype=np.int32), np.array([0], dtype=np.int32),
             GeometryFamily.POLYGON, GeometryFamily.POLYGON,
         )

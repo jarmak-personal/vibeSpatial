@@ -17,9 +17,9 @@ import pytest
 import shapely
 from shapely.geometry import MultiPolygon, Polygon, box
 
-from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.runtime import ExecutionMode
+from vibespatial.testing import build_owned as _make_owned
 
 
 def _has_gpu():
@@ -32,13 +32,6 @@ def _has_gpu():
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
-
-
-def _make_owned(geometries: list) -> OwnedGeometryArray:
-    """Build an OwnedGeometryArray from a list of Shapely geometries."""
-    return from_shapely_geometries(geometries)
-
-
 def _shapely_segmented_union(geometries: list, group_offsets: np.ndarray) -> list:
     """Reference implementation using shapely.union_all per group."""
     n_groups = len(group_offsets) - 1

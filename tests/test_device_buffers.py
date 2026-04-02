@@ -159,3 +159,82 @@ def test_ensure_host_family_structure_hydrates_offsets_without_coordinates() -> 
     np.testing.assert_array_equal(hydrated.geometry_offsets, np.asarray([0, 1], dtype=np.int32))
     np.testing.assert_array_equal(hydrated.empty_mask, np.asarray([False], dtype=np.bool_))
     np.testing.assert_array_equal(hydrated.ring_offsets, np.asarray([0, 5], dtype=np.int32))
+
+
+def test_runtime_from_host_passes_through_device_arrays(strict_device_guard) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    d_input = cp.asarray(np.asarray([1, 2, 3], dtype=np.int32))
+
+    d_output = runtime.from_host(d_input)
+
+    assert isinstance(d_output, cp.ndarray)
+    assert int(d_output.data.ptr) == int(d_input.data.ptr)
+
+
+def test_build_device_resident_owned_accepts_device_metadata_arrays(strict_device_guard) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    polygon_family = GeometryFamily.POLYGON
+
+    owned = build_device_resident_owned(
+        device_families={
+            polygon_family: DeviceFamilyGeometryBuffer(
+                family=polygon_family,
+                x=runtime.from_host(np.asarray([0.0, 2.0, 2.0, 0.0, 0.0], dtype=np.float64)),
+                y=runtime.from_host(np.asarray([0.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float64)),
+                geometry_offsets=runtime.from_host(np.asarray([0, 1], dtype=np.int32)),
+                empty_mask=runtime.from_host(np.asarray([False], dtype=np.bool_)),
+                ring_offsets=runtime.from_host(np.asarray([0, 5], dtype=np.int32)),
+            )
+        },
+        row_count=1,
+        tags=cp.asarray(np.asarray([FAMILY_TAGS[polygon_family]], dtype=np.int8)),
+        validity=cp.asarray(np.asarray([True], dtype=np.bool_)),
+        family_row_offsets=cp.asarray(np.asarray([0], dtype=np.int32)),
+    )
+
+    assert owned.row_count == 1
+    assert owned.residency is Residency.DEVICE
+    assert owned.device_state is not None
+    assert owned._validity is None
+    assert owned._tags is None
+    assert owned._family_row_offsets is None
+    assert owned.families[polygon_family].row_count == 1
+
+
+def test_build_device_resident_owned_rejects_host_metadata_in_gpu_mode() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+    polygon_family = GeometryFamily.POLYGON
+
+    with pytest.raises(AssertionError, match="host metadata"):
+        build_device_resident_owned(
+            device_families={
+                polygon_family: DeviceFamilyGeometryBuffer(
+                    family=polygon_family,
+                    x=cp.asarray(np.asarray([0.0, 2.0, 2.0, 0.0, 0.0], dtype=np.float64)),
+                    y=cp.asarray(np.asarray([0.0, 0.0, 1.0, 1.0, 0.0], dtype=np.float64)),
+                    geometry_offsets=runtime.from_host(np.asarray([0, 1], dtype=np.int32)),
+                    empty_mask=runtime.from_host(np.asarray([False], dtype=np.bool_)),
+                    ring_offsets=runtime.from_host(np.asarray([0, 5], dtype=np.int32)),
+                )
+            },
+            row_count=1,
+            tags=np.asarray([FAMILY_TAGS[polygon_family]], dtype=np.int8),
+            validity=np.asarray([True], dtype=np.bool_),
+            family_row_offsets=np.asarray([0], dtype=np.int32),
+            execution_mode="gpu",
+        )

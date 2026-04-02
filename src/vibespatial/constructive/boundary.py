@@ -22,8 +22,6 @@ PrecisionPlan wired at dispatch for observability.
 
 from __future__ import annotations
 
-import numpy as np
-
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover
@@ -354,14 +352,15 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     d_state = owned._ensure_device_state()
 
     new_device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
-    out_tags = owned.tags.copy()
-    out_validity = owned.validity.copy()
+    out_tags = cp.asarray(d_state.tags).copy()
+    out_validity = cp.asarray(d_state.validity).copy()
 
     # Use original tags for source masks to avoid cross-contamination when
     # two input families produce the same output family.  For example,
     # MultiPolygon -> MultiLineString would pollute the MultiLineString ->
     # MultiPoint remap if we matched against the already-modified out_tags.
-    src_tags = owned.tags
+    src_tags = cp.asarray(d_state.tags)
+    family_global_rows_ordered: dict[GeometryFamily, list] = {}
 
     for family, device_buf in d_state.families.items():
         geom_count = int(device_buf.geometry_offsets.shape[0]) - 1
@@ -369,6 +368,7 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
             continue
 
         if family is GeometryFamily.POLYGON:
+            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
             new_buf = _boundary_polygon_gpu(device_buf, geom_count)
             if GeometryFamily.MULTILINESTRING in new_device_families:
                 new_device_families[GeometryFamily.MULTILINESTRING] = (
@@ -379,12 +379,16 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 )
             else:
                 new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
+            family_global_rows_ordered.setdefault(GeometryFamily.MULTILINESTRING, []).append(
+                src_rows,
+            )
             # Remap tags: Polygon rows -> MultiLineString
             poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
             mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
             out_tags[src_tags == poly_tag] = mls_tag
 
         elif family is GeometryFamily.MULTIPOLYGON:
+            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
             new_buf = _boundary_multipolygon_gpu(device_buf, geom_count)
             if GeometryFamily.MULTILINESTRING in new_device_families:
                 new_device_families[GeometryFamily.MULTILINESTRING] = (
@@ -395,12 +399,16 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 )
             else:
                 new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
+            family_global_rows_ordered.setdefault(GeometryFamily.MULTILINESTRING, []).append(
+                src_rows,
+            )
             # Remap tags: MultiPolygon rows -> MultiLineString
             mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
             mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
             out_tags[src_tags == mpoly_tag] = mls_tag
 
         elif family is GeometryFamily.LINESTRING:
+            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.LINESTRING])
             new_buf = _boundary_linestring_gpu(device_buf, geom_count)
             if GeometryFamily.MULTIPOINT in new_device_families:
                 new_device_families[GeometryFamily.MULTIPOINT] = (
@@ -411,12 +419,16 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 )
             else:
                 new_device_families[GeometryFamily.MULTIPOINT] = new_buf
+            family_global_rows_ordered.setdefault(GeometryFamily.MULTIPOINT, []).append(
+                src_rows,
+            )
             # Remap tags: LineString rows -> MultiPoint
             ls_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
             mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
             out_tags[src_tags == ls_tag] = mp_tag
 
         elif family is GeometryFamily.MULTILINESTRING:
+            src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
             new_buf = _boundary_multilinestring_gpu(device_buf, geom_count)
             if GeometryFamily.MULTIPOINT in new_device_families:
                 new_device_families[GeometryFamily.MULTIPOINT] = (
@@ -427,6 +439,9 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 )
             else:
                 new_device_families[GeometryFamily.MULTIPOINT] = new_buf
+            family_global_rows_ordered.setdefault(GeometryFamily.MULTIPOINT, []).append(
+                src_rows,
+            )
             # Remap tags: MultiLineString rows -> MultiPoint
             mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
             mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
@@ -441,12 +456,11 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # Recompute family_row_offsets for the new tag assignments.
     # Family types changed (Polygon -> MultiLineString, LineString -> MultiPoint,
     # etc.), so the mapping from global row -> family-local row must be rebuilt.
-    new_family_row_offsets = np.full(owned.row_count, -1, dtype=np.int32)
-    for fam in new_device_families:
-        fam_tag = FAMILY_TAGS[fam]
-        fam_global = np.flatnonzero(out_tags == fam_tag)
-        new_family_row_offsets[fam_global] = np.arange(
-            len(fam_global), dtype=np.int32,
+    new_family_row_offsets = cp.full(owned.row_count, -1, dtype=cp.int32)
+    for row_chunks in family_global_rows_ordered.values():
+        ordered_rows = cp.concatenate(row_chunks) if len(row_chunks) > 1 else row_chunks[0]
+        new_family_row_offsets[ordered_rows] = cp.arange(
+            int(ordered_rows.size), dtype=cp.int32,
         )
 
     return build_device_resident_owned(
@@ -455,6 +469,7 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         tags=out_tags,
         validity=out_validity,
         family_row_offsets=new_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

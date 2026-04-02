@@ -10,4 +10,4 @@ for name in ["segmented_sort_asc_f64", "segmented_sort_asc_i32"]:
     print(f"Compiling {name} ...")
     spec = SPEC_REGISTRY[name]
     CCCLPrecompiler.get()._compile_one(spec)
-    print(f"  OK\n")
+    print("  OK\n")

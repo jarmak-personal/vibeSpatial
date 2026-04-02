@@ -65,6 +65,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
@@ -114,7 +115,7 @@ def _segments_cross(
     u = (dx_ab * dy_a - dy_ab * dx_a) / denom
 
     # Strict interior crossing: both parameters in open interval (0, 1)
-    eps = 1e-12
+    eps = SPATIAL_EPSILON
     return eps < t < (1.0 - eps) and eps < u < (1.0 - eps)
 
 
@@ -127,15 +128,15 @@ def _point_on_segment_cpu(
     dy = by - ay
     cross = (px - ax) * dy - (py - ay) * dx
     scale = abs(dx) + abs(dy) + 1.0
-    if abs(cross) > 1e-12 * scale:
+    if abs(cross) > SPATIAL_EPSILON * scale:
         return False
     minx = min(ax, bx)
     maxx = max(ax, bx)
     miny = min(ay, by)
     maxy = max(ay, by)
     return (
-        px >= minx - 1e-12 and px <= maxx + 1e-12
-        and py >= miny - 1e-12 and py <= maxy + 1e-12
+        px >= minx - SPATIAL_EPSILON and px <= maxx + SPATIAL_EPSILON
+        and py >= miny - SPATIAL_EPSILON and py <= maxy + SPATIAL_EPSILON
     )
 
 

@@ -9,7 +9,9 @@ Extracted from spatial_query_kernels.py -- dispatch logic remains there.
 """
 from __future__ import annotations
 
-_SPATIAL_QUERY_KERNEL_SOURCE = """
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+
+_SPATIAL_QUERY_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + """
 #if !defined(INFINITY)
 #define INFINITY __longlong_as_double(0x7FF0000000000000LL)
 #endif
@@ -993,7 +995,7 @@ _SPATIAL_QUERY_KERNEL_NAMES = (
     "nearest_first_per_segment",
 )
 
-_MORTON_RANGE_KERNEL_SOURCE = """
+_MORTON_RANGE_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + """
 extern "C" __device__ unsigned long long _mr_spread_bits_32(unsigned int value) {
   unsigned long long x = (unsigned long long) value;
   x = (x | (x << 16)) & 0x0000FFFF0000FFFFULL;
@@ -1026,8 +1028,8 @@ extern "C" __global__ void morton_range_from_bounds(
     return;
   }
 
-  const double span_x = fmax(total_maxx - total_minx, 1e-12);
-  const double span_y = fmax(total_maxy - total_miny, 1e-12);
+  const double span_x = fmax(total_maxx - total_minx, VS_SPATIAL_EPSILON);
+  const double span_y = fmax(total_maxy - total_miny, VS_SPATIAL_EPSILON);
   unsigned int nx0 = (unsigned int) max(min(llround(((qx0 - total_minx) / span_x) * 65535.0), 65535LL), 0LL);
   unsigned int ny0 = (unsigned int) max(min(llround(((qy0 - total_miny) / span_y) * 65535.0), 65535LL), 0LL);
   unsigned int nx1 = (unsigned int) max(min(llround(((qx1 - total_minx) / span_x) * 65535.0), 65535LL), 0LL);

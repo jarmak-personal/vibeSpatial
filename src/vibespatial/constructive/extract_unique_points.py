@@ -176,7 +176,7 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
             d_empty_host = cp.asarray(host_buf.empty_mask.astype(np.uint8))
             d_fam_local = cp.asarray(fam_local_rows)
             d_fam_empty = cp.zeros(n_fam, dtype=cp.uint8)
-            safe_idx = cp.minimum(d_fam_local, max(int(d_empty_host.size) - 1, 0))
+            safe_idx = cp.minimum(d_fam_local, max(d_empty_host.size - 1, 0))
             valid_fr = d_fam_local < d_empty_host.size
             d_fam_empty[valid_fr] = d_empty_host[safe_idx[valid_fr]]
         else:
@@ -375,11 +375,13 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         d_mp_empty[d_valid_rows[d_zero_count]] = 1
 
     # Build output metadata arrays
-    out_validity = validity.copy()
-    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=np.int8)
-    out_tags[~validity] = -1  # null rows
-    out_family_row_offsets = np.arange(row_count, dtype=np.int32)
-    out_family_row_offsets[~validity] = -1
+    d_validity = cp.asarray(d_state.validity)
+    out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=cp.int8)
+    out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
+    d_null = ~d_validity
+    if int(d_null.any()) != 0:
+        out_tags[d_null] = -1
+        out_family_row_offsets[d_null] = -1
 
     device_families = {
         GeometryFamily.MULTIPOINT: DeviceFamilyGeometryBuffer(
@@ -395,8 +397,9 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         device_families=device_families,
         row_count=row_count,
         tags=out_tags,
-        validity=out_validity,
+        validity=d_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -406,11 +409,13 @@ def _build_empty_multipoint_output(
 ) -> OwnedGeometryArray:
     """Build an all-empty MultiPoint OGA for degenerate cases."""
     runtime = get_cuda_runtime()
-    out_validity = validity.copy()
-    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=np.int8)
-    out_tags[~validity] = -1
-    out_family_row_offsets = np.arange(row_count, dtype=np.int32)
-    out_family_row_offsets[~validity] = -1
+    d_validity = cp.asarray(validity, dtype=cp.bool_)
+    out_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTIPOINT], dtype=cp.int8)
+    out_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
+    d_null = ~d_validity
+    if int(d_null.any()) != 0:
+        out_tags[d_null] = -1
+        out_family_row_offsets[d_null] = -1
 
     d_x = runtime.allocate((0,), np.float64)
     d_y = runtime.allocate((0,), np.float64)
@@ -431,8 +436,9 @@ def _build_empty_multipoint_output(
         device_families=device_families,
         row_count=row_count,
         tags=out_tags,
-        validity=out_validity,
+        validity=d_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

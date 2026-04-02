@@ -127,6 +127,18 @@ def test_radius_polygon():
 
 
 @requires_gpu
+def test_minimum_bounding_circle_stays_device_resident(strict_device_guard):
+    """minimum_bounding_circle keeps single-family metadata on device."""
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    owned = from_shapely_geometries([SQUARE], residency=Residency.DEVICE)
+    result = minimum_bounding_circle_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency == Residency.DEVICE
+
+
+@requires_gpu
 def test_radius_multipoint():
     """MultiPoint bounding radius."""
     owned = from_shapely_geometries([MULTIPOINT])

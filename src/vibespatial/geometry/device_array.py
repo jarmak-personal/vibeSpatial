@@ -1166,6 +1166,8 @@ class DeviceGeometryArray(ExtensionArray):
         )
 
     def clip_by_rect(self, xmin, ymin, xmax, ymax):
+        import shapely
+
         from vibespatial.constructive.clip_rect import clip_by_rect_owned
         from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.runtime.dispatch import record_dispatch_event
@@ -1203,13 +1205,13 @@ class DeviceGeometryArray(ExtensionArray):
         # clip_by_rect returns GEOMETRYCOLLECTION EMPTY for clipped-away rows;
         # from_shapely_geometries doesn't support GeometryCollection, so treat
         # empties as None.
-        geoms = []
-        for g in result.geometries:
-            if g is None or g.is_empty:
-                geoms.append(None)
-            else:
-                geoms.append(g)
-        new_owned = from_shapely_geometries(geoms)
+        geoms = np.asarray(result.geometries, dtype=object).copy()
+        non_null = geoms != None  # noqa: E711 - intentional numpy identity mask
+        if np.any(non_null):
+            empty = np.zeros(len(geoms), dtype=bool)
+            empty[non_null] = np.asarray(shapely.is_empty(geoms[non_null]), dtype=bool)
+            geoms[empty] = None
+        new_owned = from_shapely_geometries(geoms.tolist())
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def _binary_constructive(self, op: str, other, *args, **kwargs):

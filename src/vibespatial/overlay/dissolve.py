@@ -12,6 +12,11 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection
 
+from vibespatial.runtime.config import (
+    OVERLAY_GPU_FAILURE_THRESHOLD,
+    OVERLAY_GROUPED_BOX_GPU_THRESHOLD,
+    OVERLAY_UNION_ALL_GPU_THRESHOLD,
+)
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 
 try:
@@ -28,7 +33,6 @@ if TYPE_CHECKING:
 
 
 _EMPTY = GeometryCollection()
-_GROUPED_BOX_GPU_THRESHOLD = 50_000
 
 
 class DissolveUnionMethod(StrEnum):
@@ -362,7 +366,10 @@ def execute_grouped_union(
     normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
     values = np.asarray(geometries, dtype=object)
     # GPU box union fast path
-    if normalized is DissolveUnionMethod.COVERAGE and int(values.size) >= _GROUPED_BOX_GPU_THRESHOLD:
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and int(values.size) >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
+    ):
         accelerated = execute_grouped_box_union_gpu(values, group_positions)
         if accelerated is not None:
             return accelerated
@@ -373,7 +380,7 @@ def execute_grouped_union(
     _GPU_UNION_MIN_GROUP_SIZE = 100
     use_gpu_union = (
         cp is not None
-        and int(values.size) >= _GROUPED_BOX_GPU_THRESHOLD
+        and int(values.size) >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
         and grid_size is None
     )
     merged = np.empty(len(group_positions), dtype=object)
@@ -593,7 +600,6 @@ def union_all_owned(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 # GPU-accelerated union_all via device-resident tree-reduce (ADR-0017)
 # ---------------------------------------------------------------------------
 
-_UNION_ALL_GPU_THRESHOLD = 50
 
 
 def union_all_gpu(
@@ -646,7 +652,7 @@ def union_all_gpu(
 
     if (
         selection.selected is ExecutionMode.GPU
-        and row_count >= _UNION_ALL_GPU_THRESHOLD
+        and row_count >= OVERLAY_UNION_ALL_GPU_THRESHOLD
         and grid_size is None  # grid_size not supported on GPU path
     ):
         # Validate input: GPU overlay requires polygon-family geometries
@@ -746,14 +752,12 @@ def _union_all_tree_reduce_gpu(
     max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
     rounds = 0
     consecutive_gpu_failures = 0
-    _GPU_FAILURE_THRESHOLD = 3  # switch to full-CPU after this many consecutive failures
-
     while len(current) > 1 and rounds < max_rounds:
         next_round: list[OwnedGeometryArray] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
                 gpu_ok = False
-                if consecutive_gpu_failures < _GPU_FAILURE_THRESHOLD:
+                if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
                     try:
                         result = overlay_union_owned(
                             current[i], current[i + 1],

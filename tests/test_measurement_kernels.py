@@ -25,8 +25,8 @@ from vibespatial.constructive.measurement import (
     area_owned,
     length_owned,
 )
-from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
+from vibespatial.testing import build_owned as _make_owned
 
 
 def _has_gpu():
@@ -39,15 +39,6 @@ def _has_gpu():
 
 
 requires_gpu = pytest.mark.skipif(not _has_gpu(), reason="GPU not available")
-
-
-def _make_owned(geometries: list) -> OwnedGeometryArray:
-    """Build an OwnedGeometryArray from a list of Shapely geometries."""
-    from vibespatial.geometry.owned import from_shapely_geometries
-
-    return from_shapely_geometries(geometries)
-
-
 def _shapely_area(geometries: list) -> np.ndarray:
     return shapely.area(np.array(geometries, dtype=object))
 

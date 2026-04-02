@@ -37,12 +37,6 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
 
 logger = logging.getLogger(__name__)
 
-# Minimum number of candidate pairs before using the GPU kernel.
-# Below this threshold the Python fallback is used to avoid kernel
-# launch overhead dominating.
-_BATCH_PIP_GPU_THRESHOLD = 100
-
-
 # ---------------------------------------------------------------------------
 # Containment bypass: GPU-accelerated identification of polygons fully
 # inside the corridor, skipping overlay computation for those polygons.

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import pytest
 
-cp = pytest.importorskip("cupy")
+from vibespatial.testing import DeviceResidencyViolation, device_residency_guard
 
-from vibespatial.testing import DeviceResidencyViolation, device_residency_guard  # noqa: E402
+cp = pytest.importorskip("cupy")
 
 
 class TestScalarExemption:

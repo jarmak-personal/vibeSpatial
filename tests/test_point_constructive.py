@@ -5,7 +5,11 @@ import pytest
 import shapely
 from shapely.geometry import Point, Polygon
 
-from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
+from vibespatial.constructive.point import (
+    clip_points_rect_owned,
+    point_buffer_owned_array,
+    point_owned_from_xy_device,
+)
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.arrow import geoseries_from_owned
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
@@ -52,6 +56,9 @@ def test_clip_points_rect_owned_gpu_matches_cpu_subset() -> None:
     gpu = clip_points_rect_owned(points, 0.0, 0.0, 1.5, 1.5, dispatch_mode=ExecutionMode.GPU)
     assert gpu.residency is Residency.DEVICE
     assert gpu.device_state is not None
+    assert gpu._validity is None
+    assert gpu._tags is None
+    assert gpu._family_row_offsets is None
     assert gpu.families[next(iter(gpu.families))].host_materialized is False
 
     _assert_geometries_equal(gpu.to_shapely(), [Point(0, 0), Point(1, 1), Point(1.5, 0.5)])
@@ -68,6 +75,9 @@ def test_point_buffer_owned_array_gpu_matches_cpu_diamonds() -> None:
     gpu = point_buffer_owned_array(points, 1.5, quad_segs=1, dispatch_mode=ExecutionMode.GPU)
     assert gpu.residency is Residency.DEVICE
     assert gpu.device_state is not None
+    assert gpu._validity is None
+    assert gpu._tags is None
+    assert gpu._family_row_offsets is None
     assert gpu.families[next(iter(gpu.families))].host_materialized is False
 
     expected = [
@@ -149,6 +159,32 @@ def test_clip_then_buffer_gpu_stays_device_resident_until_materialization() -> N
         Polygon(((2.5, 0.5), (1.5, -0.5), (0.5, 0.5), (1.5, 1.5), (2.5, 0.5))),
     ]
     _assert_geometries_equal(buffered.to_shapely(), expected)
+
+
+@pytest.mark.gpu
+def test_point_owned_from_xy_device_keeps_structural_metadata_on_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    owned = point_owned_from_xy_device(
+        np.asarray([0.0, 2.0], dtype=np.float64),
+        np.asarray([1.0, 3.0], dtype=np.float64),
+    )
+
+    assert owned.residency is Residency.DEVICE
+    assert owned.device_state is not None
+    assert owned._validity is None
+    assert owned._tags is None
+    assert owned._family_row_offsets is None
+
+    point_dev_buf = owned.device_state.families[GeometryFamily.POINT]
+    assert isinstance(point_dev_buf.geometry_offsets, cp.ndarray)
+    assert isinstance(point_dev_buf.empty_mask, cp.ndarray)
+    assert isinstance(point_dev_buf.bounds, cp.ndarray)
 
 
 @pytest.mark.gpu

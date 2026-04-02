@@ -8,6 +8,7 @@ from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds, 
 from vibespatial.overlay.reconstruction import OverlayOperation, plan_overlay_reconstruction
 from vibespatial.predicates.binary import evaluate_binary_predicate
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime, select_runtime
+from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE, SEGMENT_TILE_SIZE
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
 from vibespatial.runtime.robustness import select_robustness_plan
 from vibespatial.spatial.indexing import build_flat_spatial_index, generate_bounds_pairs
@@ -73,7 +74,7 @@ def profile_join_kernel(
     *,
     rows: int,
     overlap_ratio: float = 0.2,
-    tile_size: int = 256,
+    tile_size: int = COARSE_BOUNDS_TILE_SIZE,
     predicate: str = "intersects",
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     enable_nvtx: bool = False,
@@ -203,7 +204,7 @@ def profile_join_kernel(
 def profile_overlay_kernel(
     *,
     rows: int,
-    tile_size: int = 512,
+    tile_size: int = SEGMENT_TILE_SIZE,
     operation: OverlayOperation | str = OverlayOperation.INTERSECTION,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     enable_nvtx: bool = False,

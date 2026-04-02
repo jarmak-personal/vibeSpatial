@@ -444,6 +444,16 @@ class TestConvexHull:
         assert geoms[0] is not None
         assert geoms[0].geom_type == "Polygon"
 
+    def test_convex_hull_stays_device_resident(self, strict_device_guard):
+        """convex_hull keeps single-family metadata on device."""
+        from vibespatial.constructive.convex_hull import convex_hull_owned
+
+        poly = Polygon([(0, 0), (10, 0), (5, 10)])
+        owned = from_shapely_geometries([poly], residency=Residency.DEVICE)
+        result = convex_hull_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.residency == Residency.DEVICE
+
 
 class TestValidity:
     """Tests for is_valid/is_simple checks."""
@@ -652,6 +662,27 @@ class TestZeroCopyChains:
         assert rev._owned.residency == Residency.DEVICE
 
         geoms = rev._owned.to_shapely()
+        assert len(geoms) == 1000
+
+    def test_set_precision_stays_on_device(self):
+        """set_precision on device-resident input avoids D->H transfers."""
+        from vibespatial.constructive.set_precision import set_precision_owned
+        from vibespatial.runtime.execution_trace import assert_no_transfers
+
+        polys = _make_random_polygons(1000, seed=123)
+        owned = from_shapely_geometries(polys, residency=Residency.DEVICE)
+
+        with assert_no_transfers():
+            result = set_precision_owned(
+                owned,
+                grid_size=1.0,
+                mode="pointwise",
+                dispatch_mode=ExecutionMode.GPU,
+            )
+
+        assert result.residency == Residency.DEVICE
+
+        geoms = result.to_shapely()
         assert len(geoms) == 1000
 
     def test_orient_reverse_orient(self):

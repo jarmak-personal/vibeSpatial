@@ -6,8 +6,10 @@ import shapely
 from shapely.geometry import LineString
 
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 
 
 def _buffer_matches_shapely(gpu_geom, shapely_geom, *, tol: float = 1e-6) -> bool:
@@ -116,6 +118,28 @@ def test_linestring_buffer_gpu_quad_segs_1() -> None:
     assert _buffer_matches_shapely(result, expected), (
         f"area diff: {result.symmetric_difference(expected).area}"
     )
+
+
+@pytest.mark.gpu
+def test_linestring_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    line = LineString([(0, 0), (10, 0)])
+    lines = from_shapely_geometries([line], residency=Residency.DEVICE)
+    gpu = linestring_buffer_owned_array(lines, 1.0, quad_segs=4, dispatch_mode=ExecutionMode.GPU)
+
+    assert gpu.residency is Residency.DEVICE
+    assert gpu._validity is None
+    assert gpu._tags is None
+    assert gpu._family_row_offsets is None
+    assert gpu.device_state is not None
+
+    poly_buf = gpu.device_state.families[GeometryFamily.POLYGON]
+    assert isinstance(poly_buf.geometry_offsets, cp.ndarray)
+    assert isinstance(poly_buf.ring_offsets, cp.ndarray)
 
 
 # --- Phase 3: cap/join style variants ---

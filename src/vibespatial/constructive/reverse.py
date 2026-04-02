@@ -33,6 +33,7 @@ from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    forward_result_metadata,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -118,12 +119,15 @@ def _reverse_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
             bounds=device_buf.bounds,  # bounds unchanged by reverse
         )
 
+    tags, validity, family_row_offsets = forward_result_metadata(owned)
+
     return build_device_resident_owned(
         device_families=new_device_families,
         row_count=owned.row_count,
-        tags=owned.tags.copy(),
-        validity=owned.validity.copy(),
-        family_row_offsets=owned.family_row_offsets.copy(),
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+        execution_mode="gpu",
     )
 
 

@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 
 import pytest
+from shapely.geometry import GeometryCollection, LineString, Point
 
 from vibespatial.bench.compare import compare_results
-from vibespatial.bench.pipeline import benchmark_pipeline_suite, suite_to_json
+from vibespatial.bench.pipeline import _from_shapely_safe, benchmark_pipeline_suite, suite_to_json
 
 
 def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
@@ -47,6 +48,20 @@ def test_pipeline_smoke_suite_can_run_geopandas_predicate_baseline() -> None:
     read_stage = trace["stages"][0]
     assert read_stage["metadata"]["requested_engine"] == "pyogrio"
     assert read_stage["metadata"]["actual_engine"] in {"pyogrio", "default"}
+
+
+def test_from_shapely_safe_flattens_supported_geometry_collections() -> None:
+    owned = _from_shapely_safe([
+        GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])]),
+        GeometryCollection([]),
+        None,
+    ])
+
+    restored = owned.to_shapely()
+
+    assert len(restored) == 2
+    assert restored[0].equals(Point(0, 0))
+    assert restored[1].equals(LineString([(0, 0), (1, 1)]))
 
 
 def test_vegetation_corridor_smoke() -> None:

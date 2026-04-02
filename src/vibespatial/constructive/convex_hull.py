@@ -586,15 +586,21 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         return _convex_hull_cpu(owned)
 
     # Build device-resident OwnedGeometryArray
-    new_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=np.int8)
-    new_family_row_offsets = np.arange(row_count, dtype=np.int32)
+    d_validity = cp.asarray(d_state.validity)
+    new_tags = cp.full(row_count, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8)
+    new_family_row_offsets = cp.arange(row_count, dtype=cp.int32)
+    d_null = ~d_validity
+    if int(d_null.any()) != 0:
+        new_tags[d_null] = -1
+        new_family_row_offsets[d_null] = -1
 
     return build_device_resident_owned(
         device_families={GeometryFamily.POLYGON: result_buf},
         row_count=row_count,
         tags=new_tags,
-        validity=owned.validity.copy(),
+        validity=d_validity,
         family_row_offsets=new_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

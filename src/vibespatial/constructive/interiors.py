@@ -20,7 +20,6 @@ except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
 from vibespatial.constructive.interiors_cpu import _interiors_cpu as _interiors_cpu
-from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
@@ -80,10 +79,10 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     row_count = owned.row_count
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-    poly_mask = owned.tags == poly_tag
+    d_poly_valid = (d_state.tags == poly_tag) & d_state.validity
 
     has_polys = (
-        np.any(poly_mask)
+        int(d_poly_valid.sum().item()) > 0
         and GeometryFamily.POLYGON in d_state.families
     )
 
@@ -205,20 +204,12 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     # -------------------------------------------------------------------
     # Step 7: Build output OGA metadata
     # -------------------------------------------------------------------
-    out_validity = owned.validity.copy()
     mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-    out_tags = np.full(row_count, mls_tag, dtype=np.int8)
-    out_tags[~poly_mask] = -1  # non-polygon rows are null
-    out_validity[~poly_mask] = False
-
-    # Handle original null rows
-    out_tags[~owned.validity] = -1
-    out_validity[~owned.validity] = False
-
-    out_family_row_offsets = np.full(row_count, -1, dtype=np.int32)
-    out_family_row_offsets[poly_mask & owned.validity] = np.arange(
-        poly_count, dtype=np.int32
-    )
+    out_validity = d_poly_valid.copy()
+    out_tags = cp.full(row_count, -1, dtype=cp.int8)
+    out_tags[d_poly_valid] = mls_tag
+    out_family_row_offsets = cp.full(row_count, -1, dtype=cp.int32)
+    out_family_row_offsets[d_poly_valid] = d_state.family_row_offsets[d_poly_valid]
 
     d_empty_mask = cp.zeros(poly_count, dtype=cp.bool_)
 
@@ -239,6 +230,7 @@ def _interiors_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         tags=out_tags,
         validity=out_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 
@@ -250,33 +242,28 @@ def _build_all_empty_multilinestring(
     Polygon rows get an empty MultiLineString (zero parts).
     Non-polygon rows and null rows get null.
     """
-    runtime = get_cuda_runtime()
+    d_state = owned._ensure_device_state()
 
     row_count = owned.row_count
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-    poly_mask = owned.tags == poly_tag
+    d_poly_valid = (d_state.tags == poly_tag) & d_state.validity
 
-    out_validity = owned.validity.copy()
-    out_tags = np.full(row_count, mls_tag, dtype=np.int8)
-    out_tags[~poly_mask] = -1
-    out_validity[~poly_mask] = False
-    out_tags[~owned.validity] = -1
-    out_validity[~owned.validity] = False
+    out_validity = d_poly_valid.copy()
+    out_tags = cp.full(row_count, -1, dtype=cp.int8)
+    out_tags[d_poly_valid] = mls_tag
 
-    poly_count = int(np.sum(poly_mask & owned.validity))
+    poly_count = int(d_poly_valid.sum().item())
 
-    out_family_row_offsets = np.full(row_count, -1, dtype=np.int32)
-    out_family_row_offsets[poly_mask & owned.validity] = np.arange(
-        poly_count, dtype=np.int32
-    )
+    out_family_row_offsets = cp.full(row_count, -1, dtype=cp.int32)
+    out_family_row_offsets[d_poly_valid] = d_state.family_row_offsets[d_poly_valid]
 
     # All-zero offsets = all empty
-    d_geom_offsets = runtime.from_host(np.zeros(poly_count + 1, dtype=np.int32))
-    d_part_offsets = runtime.from_host(np.zeros(1, dtype=np.int32))
-    d_empty = runtime.from_host(np.zeros(poly_count, dtype=bool))
-    d_x = runtime.from_host(np.empty(0, dtype=np.float64))
-    d_y = runtime.from_host(np.empty(0, dtype=np.float64))
+    d_geom_offsets = cp.zeros(poly_count + 1, dtype=cp.int32)
+    d_part_offsets = cp.zeros(1, dtype=cp.int32)
+    d_empty = cp.zeros(poly_count, dtype=cp.bool_)
+    d_x = cp.empty(0, dtype=cp.float64)
+    d_y = cp.empty(0, dtype=cp.float64)
 
     device_families = {
         GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
@@ -295,6 +282,7 @@ def _build_all_empty_multilinestring(
         tags=out_tags,
         validity=out_validity,
         family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
     )
 
 

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-_INDEXING_KERNEL_SOURCE = """
+from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
+
+_INDEXING_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + """
 extern "C" __device__ unsigned long long spread_bits_32(unsigned int value) {
   unsigned long long x = (unsigned long long) value;
   x = (x | (x << 16)) & 0x0000FFFF0000FFFFULL;
@@ -35,8 +37,8 @@ extern "C" __global__ void morton_keys_from_bounds(
     out_keys[row] = 0xFFFFFFFFFFFFFFFFULL;
     return;
   }
-  const double span_x = fmax(maxx - minx, 1e-12);
-  const double span_y = fmax(maxy - miny, 1e-12);
+  const double span_x = fmax(maxx - minx, VS_SPATIAL_EPSILON);
+  const double span_y = fmax(maxy - miny, VS_SPATIAL_EPSILON);
   const double center_x = (bx0 + bx1) * 0.5;
   const double center_y = (by0 + by1) * 0.5;
   const unsigned int norm_x = (unsigned int) llround(((center_x - minx) / span_x) * 65535.0);

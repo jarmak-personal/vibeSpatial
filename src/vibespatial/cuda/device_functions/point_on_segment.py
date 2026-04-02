@@ -22,7 +22,8 @@ POINT_ON_SEGMENT_DEVICE: str = r"""
      px, py    -- query point coordinates
      ax, ay    -- segment start coordinates
      bx, by    -- segment end coordinates
-     tolerance -- absolute tolerance (e.g. 1e-7 or 1e-12)
+     tolerance -- absolute tolerance (for example a coarse `1e-7` or the
+                  shared spatial epsilon)
 */
 __device__ inline bool vs_point_on_segment(
     double px, double py,
@@ -63,7 +64,7 @@ POINT_ON_SEGMENT_KIND_DEVICE: str = r"""
      px, py    -- query point coordinates
      ax, ay    -- segment start coordinates
      bx, by    -- segment end coordinates
-     tolerance -- absolute tolerance (e.g. 1e-12)
+     tolerance -- absolute tolerance (for example the shared spatial epsilon)
 */
 __device__ inline unsigned char vs_point_on_segment_kind(
     double px, double py,

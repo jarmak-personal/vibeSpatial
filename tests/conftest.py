@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import pytest
+from shapely.geometry import LineString, Point, Polygon
 
 import vibespatial.api as geopandas
 from vibespatial import ExecutionMode
 from vibespatial.testing import (
     SyntheticSpec,
     assert_matches_shapely,
+    build_owned,
     cuda_runtime_available,
     device_residency_guard,
     generate_lines,
@@ -98,6 +100,37 @@ def synthetic_dataset():
         return generators[spec.geometry_type](spec)
 
     return _factory
+
+
+@pytest.fixture
+def make_owned():
+    return build_owned
+
+
+@pytest.fixture
+def owned_points(make_owned):
+    return make_owned([Point(0, 0), Point(1, 1), Point(2, 2)])
+
+
+@pytest.fixture
+def owned_polygons(make_owned):
+    return make_owned(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1)]),
+            Polygon([(2, 2), (3, 2), (3, 3), (2, 3)]),
+        ]
+    )
+
+
+@pytest.fixture
+def owned_mixed(make_owned):
+    return make_owned(
+        [
+            Point(0, 0),
+            LineString([(0, 0), (1, 1)]),
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+        ]
+    )
 
 
 @pytest.fixture

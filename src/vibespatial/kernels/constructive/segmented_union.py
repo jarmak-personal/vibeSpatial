@@ -38,6 +38,7 @@ from vibespatial.constructive.segmented_union_host import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import OVERLAY_GPU_FAILURE_THRESHOLD
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
@@ -299,14 +300,12 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
     rounds = 0
     max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
     consecutive_gpu_failures = 0
-    _GPU_FAILURE_THRESHOLD = 3
-
     while len(current) > 1 and rounds < max_rounds:
         next_round: list[OwnedGeometryArray] = []
         for i in range(0, len(current), 2):
             if i + 1 < len(current):
                 gpu_ok = False
-                if consecutive_gpu_failures < _GPU_FAILURE_THRESHOLD:
+                if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
                     try:
                         merged = overlay_union_owned(
                             current[i],

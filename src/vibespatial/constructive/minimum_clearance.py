@@ -32,6 +32,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover
+    cp = None
+
 from vibespatial.constructive.minimum_clearance_cpu import (
     _minimum_clearance_cpu,
     _minimum_clearance_line_cpu,
@@ -42,11 +47,12 @@ from vibespatial.cuda._runtime import (
     compile_kernel_group,
     get_cuda_runtime,
 )
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
-    FamilyGeometryBuffer,
+    DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
+    build_device_resident_owned,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -465,10 +471,10 @@ def _minimum_clearance_line_gpu(
     row_count = owned.row_count
 
     # Per-row output: 4 doubles (ax, ay, bx, by). NaN = empty.
-    out_ax = np.full(row_count, np.nan, dtype=np.float64)
-    out_ay = np.full(row_count, np.nan, dtype=np.float64)
-    out_bx = np.full(row_count, np.nan, dtype=np.float64)
-    out_by = np.full(row_count, np.nan, dtype=np.float64)
+    out_ax = cp.full(row_count, cp.nan, dtype=cp.float64)
+    out_ay = cp.full(row_count, cp.nan, dtype=cp.float64)
+    out_bx = cp.full(row_count, cp.nan, dtype=cp.float64)
+    out_by = cp.full(row_count, cp.nan, dtype=cp.float64)
 
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
@@ -492,11 +498,14 @@ def _minimum_clearance_line_gpu(
     )
 
     # Mark invalid rows as NaN (empty LineString)
-    validity = owned.validity
-    out_ax[~validity] = np.nan
-    out_ay[~validity] = np.nan
-    out_bx[~validity] = np.nan
-    out_by[~validity] = np.nan
+    validity = cp.asarray(
+        owned.device_state.validity if owned.device_state is not None else owned.validity,
+        dtype=cp.bool_,
+    )
+    out_ax[~validity] = cp.nan
+    out_ay[~validity] = cp.nan
+    out_bx[~validity] = cp.nan
+    out_by[~validity] = cp.nan
 
     return _build_clearance_line_oga(row_count, out_ax, out_ay, out_bx, out_by, validity)
 
@@ -559,14 +568,12 @@ def _launch_linestring_clearance_line(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        h_ax = runtime.copy_device_to_host(d_oax)
-        h_ay = runtime.copy_device_to_host(d_oay)
-        h_bx = runtime.copy_device_to_host(d_obx)
-        h_by = runtime.copy_device_to_host(d_oby)
-        out_ax[global_rows] = h_ax[family_rows]
-        out_ay[global_rows] = h_ay[family_rows]
-        out_bx[global_rows] = h_bx[family_rows]
-        out_by[global_rows] = h_by[family_rows]
+        d_global_rows = cp.asarray(global_rows, dtype=cp.int32)
+        d_family_rows = cp.asarray(family_rows, dtype=cp.int32)
+        out_ax[d_global_rows] = d_oax[d_family_rows]
+        out_ay[d_global_rows] = d_oay[d_family_rows]
+        out_bx[d_global_rows] = d_obx[d_family_rows]
+        out_by[d_global_rows] = d_oby[d_family_rows]
     finally:
         for d in (d_oax, d_oay, d_obx, d_oby):
             runtime.free(d)
@@ -629,14 +636,12 @@ def _launch_multilinestring_clearance_line(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        h_ax = runtime.copy_device_to_host(d_oax)
-        h_ay = runtime.copy_device_to_host(d_oay)
-        h_bx = runtime.copy_device_to_host(d_obx)
-        h_by = runtime.copy_device_to_host(d_oby)
-        out_ax[global_rows] = h_ax[family_rows]
-        out_ay[global_rows] = h_ay[family_rows]
-        out_bx[global_rows] = h_bx[family_rows]
-        out_by[global_rows] = h_by[family_rows]
+        d_global_rows = cp.asarray(global_rows, dtype=cp.int32)
+        d_family_rows = cp.asarray(family_rows, dtype=cp.int32)
+        out_ax[d_global_rows] = d_oax[d_family_rows]
+        out_ay[d_global_rows] = d_oay[d_family_rows]
+        out_bx[d_global_rows] = d_obx[d_family_rows]
+        out_by[d_global_rows] = d_oby[d_family_rows]
     finally:
         for d in (d_oax, d_oay, d_obx, d_oby):
             runtime.free(d)
@@ -699,14 +704,12 @@ def _launch_polygon_clearance_line(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        h_ax = runtime.copy_device_to_host(d_oax)
-        h_ay = runtime.copy_device_to_host(d_oay)
-        h_bx = runtime.copy_device_to_host(d_obx)
-        h_by = runtime.copy_device_to_host(d_oby)
-        out_ax[global_rows] = h_ax[family_rows]
-        out_ay[global_rows] = h_ay[family_rows]
-        out_bx[global_rows] = h_bx[family_rows]
-        out_by[global_rows] = h_by[family_rows]
+        d_global_rows = cp.asarray(global_rows, dtype=cp.int32)
+        d_family_rows = cp.asarray(family_rows, dtype=cp.int32)
+        out_ax[d_global_rows] = d_oax[d_family_rows]
+        out_ay[d_global_rows] = d_oay[d_family_rows]
+        out_bx[d_global_rows] = d_obx[d_family_rows]
+        out_by[d_global_rows] = d_oby[d_family_rows]
     finally:
         for d in (d_oax, d_oay, d_obx, d_oby):
             runtime.free(d)
@@ -777,14 +780,12 @@ def _launch_multipolygon_clearance_line(
         )
         grid, block = runtime.launch_config(kernel, n)
         runtime.launch(kernel, grid=grid, block=block, params=params)
-        h_ax = runtime.copy_device_to_host(d_oax)
-        h_ay = runtime.copy_device_to_host(d_oay)
-        h_bx = runtime.copy_device_to_host(d_obx)
-        h_by = runtime.copy_device_to_host(d_oby)
-        out_ax[global_rows] = h_ax[family_rows]
-        out_ay[global_rows] = h_ay[family_rows]
-        out_bx[global_rows] = h_bx[family_rows]
-        out_by[global_rows] = h_by[family_rows]
+        d_global_rows = cp.asarray(global_rows, dtype=cp.int32)
+        d_family_rows = cp.asarray(family_rows, dtype=cp.int32)
+        out_ax[d_global_rows] = d_oax[d_family_rows]
+        out_ay[d_global_rows] = d_oay[d_family_rows]
+        out_bx[d_global_rows] = d_obx[d_family_rows]
+        out_by[d_global_rows] = d_oby[d_family_rows]
     finally:
         for d in (d_oax, d_oay, d_obx, d_oby):
             runtime.free(d)
@@ -799,60 +800,52 @@ def _launch_multipolygon_clearance_line(
 
 def _build_clearance_line_oga(
     row_count: int,
-    out_ax: np.ndarray,
-    out_ay: np.ndarray,
-    out_bx: np.ndarray,
-    out_by: np.ndarray,
-    validity: np.ndarray,
+    out_ax,
+    out_ay,
+    out_bx,
+    out_by,
+    validity,
 ) -> OwnedGeometryArray:
-    """Assemble a 2-point LineString OGA from closest-point pair arrays.
+    """Assemble a device-resident 2-point LineString OGA from closest-point pairs.
 
     Each row where (ax,ay) and (bx,by) are finite produces a 2-point
     LineString.  Rows with NaN produce empty LineStrings.
     """
-    # Determine which rows have valid clearance lines
-    has_line = np.isfinite(out_ax) & validity
-
-    # Build coordinate arrays: 2 points per valid row, 0 per empty
-    coords_per_row = np.where(has_line, 2, 0).astype(np.int32)
-    # geometry_offsets: cumulative sum [0, c0, c0+c1, ...]
-    geometry_offsets = np.empty(row_count + 1, dtype=np.int32)
+    d_validity = cp.asarray(validity, dtype=cp.bool_)
+    has_line = cp.isfinite(out_ax) & d_validity
+    coords_per_row = cp.where(has_line, 2, 0).astype(cp.int32)
+    geometry_offsets = cp.empty(row_count + 1, dtype=cp.int32)
     geometry_offsets[0] = 0
-    np.cumsum(coords_per_row, out=geometry_offsets[1:])
-    total_coords = int(geometry_offsets[-1])
+    cp.cumsum(coords_per_row, out=geometry_offsets[1:])
+    total_coords = int(geometry_offsets[-1].item()) if row_count else 0
 
-    x = np.empty(total_coords, dtype=np.float64)
-    y = np.empty(total_coords, dtype=np.float64)
+    x = cp.empty(total_coords, dtype=cp.float64)
+    y = cp.empty(total_coords, dtype=cp.float64)
 
-    # Scatter coordinates for valid rows
-    valid_indices = np.flatnonzero(has_line)
-    if len(valid_indices) > 0:
+    valid_indices = cp.flatnonzero(has_line)
+    if int(valid_indices.size):
         starts = geometry_offsets[valid_indices]
         x[starts] = out_ax[valid_indices]
         y[starts] = out_ay[valid_indices]
         x[starts + 1] = out_bx[valid_indices]
         y[starts + 1] = out_by[valid_indices]
 
-    empty_mask = ~has_line
-    out_tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=np.int8)
-    out_validity = validity.copy()
-    family_row_offsets = np.arange(row_count, dtype=np.int32)
-
-    ls_buffer = FamilyGeometryBuffer(
-        family=GeometryFamily.LINESTRING,
-        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.LINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.LINESTRING,
+                x=x,
+                y=y,
+                geometry_offsets=geometry_offsets,
+                empty_mask=~has_line,
+                bounds=None,
+            ),
+        },
         row_count=row_count,
-        x=x,
-        y=y,
-        geometry_offsets=geometry_offsets,
-        empty_mask=empty_mask,
-    )
-
-    return OwnedGeometryArray(
-        validity=out_validity,
-        tags=out_tags,
-        family_row_offsets=family_row_offsets,
-        families={GeometryFamily.LINESTRING: ls_buffer},
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.LINESTRING], dtype=cp.int8),
+        validity=d_validity,
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
     )
 
 
