@@ -7,7 +7,8 @@
 #   .claude/hooks/*                          (Claude hook scripts)
 #   .claude/settings.json                    (hook registrations)
 #   .claude/settings.local.json              (local hook overrides)
-#   .claude/skills/pre-land-review/SKILL.md  (review skill definition)
+#   .agents/skills/pre-land-review/SKILL.md  (Codex review skill definition)
+#   .claude/skills/pre-land-review/SKILL.md  (Claude review skill definition)
 #
 # Returns JSON: {"decision":"block","reason":"..."} | {}
 
@@ -61,8 +62,12 @@ def main():
             "cannot be modified by AI agents. Edit manually if needed."
         ),
         ".claude/skills/pre-land-review/SKILL.md": (
-            "The pre-land-review skill definition cannot be modified by "
-            "AI agents. Edit manually if needed."
+            "The Claude pre-land-review skill definition cannot be modified "
+            "by AI agents. Edit manually if needed."
+        ),
+        ".agents/skills/pre-land-review/SKILL.md": (
+            "The Codex pre-land-review skill definition cannot be modified "
+            "by AI agents. Edit manually if needed."
         ),
     }
 

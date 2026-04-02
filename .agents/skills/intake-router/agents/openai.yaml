@@ -1,0 +1,4 @@
+interface:
+  display_name: "Intake Router"
+  short_description: "Help with Intake Router tasks"
+  default_prompt: "Use $intake-router to find the narrowest relevant docs, files, and verification commands for this task."

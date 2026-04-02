@@ -36,8 +36,8 @@ uv run python scripts/install_githooks.py
 ```
 
 That's it. The git hook runs deterministic checks on every commit and prints
-a reminder about the AI review commands. The skill and hook layers are
-configured automatically via `.claude/settings.json` and `.claude/skills/`.
+a reminder about the AI review skills. The hook layer is configured via
+`.claude/settings.json`; repo-local Codex skills live in `.agents/skills/`.
 
 ## Layer 1: Deterministic Checks (git pre-commit hook)
 
@@ -97,10 +97,10 @@ host_data = device_array.get()  # zcopy:ok(materialization boundary: DataFrame c
 | MAINT001 | New modules in `src/vibespatial/` must be in intake | Missing from `intake-index.json` |
 | MAINT002 | New ADRs must be indexed | Missing from `docs/decisions/index.md` |
 
-## Layer 2: Pre-Land Review Skill (Claude Code, proactive)
+## Layer 2: Pre-Land Review Skill (Codex, proactive)
 
-The `pre-land-review` skill (`.claude/skills/pre-land-review/SKILL.md`) fires
-**proactively** when Claude detects intent to commit or land work. Unlike
+The `pre-land-review` skill ([`.agents/skills/pre-land-review/SKILL.md`](/home/picard/repos/vibeSpatial/.agents/skills/pre-land-review/SKILL.md)) fires
+**proactively** when Codex detects intent to commit or land work. Unlike
 AGENTS.md instructions which can be compressed away in long conversations,
 skills are matched against current context on every turn by their description
 field. The skill fires on keywords like "commit", "land", "done", "ship it",
@@ -111,24 +111,21 @@ context, regardless of how long the conversation has been running.
 
 ### Workflow
 
-1. Make your changes in a Claude Code session
+1. Make your changes in a Codex session
 2. When you're ready to land, say "commit" or "let's land this"
 3. The skill fires automatically and runs the full checklist
-4. If verdict is LAND, the skill writes `.claude/.review-completed` marker
+4. If verdict is LAND, the skill writes `.agents/.review-completed` marker
 5. `git commit` -- deterministic checks run, `commit-msg` hook verifies marker
 6. Commit completes
 
-### Available commands
+### Available skills
 
-You can also invoke the review commands explicitly:
+You can also invoke the review skills explicitly:
 
-| Command | Purpose |
+| Skill | Purpose |
 |---------|---------|
-| `/pre-land-review` | Skill: full checklist, orchestrates all enforcers |
-| `/gpu-code-review` | Skill: 6-pass GPU kernel review (auto-invoked by pre-land-review when GPU code touched) |
-| `/performance-analysis` | Command: GPU utilization, tier compliance, regression risk |
-| `/zero-copy-enforcer` | Command: device residency, transfer path tracing |
-| `/maintainability-enforcer` | Command: intake routing, doc coherence |
+| `$pre-land-review` | Skill: full checklist, orchestrates deterministic checks plus AI review |
+| `$gpu-code-review` | Skill: targeted GPU kernel review for kernel and dispatch changes |
 
 ### Suppressing the pre-commit reminder
 
@@ -138,7 +135,7 @@ The reminder is non-blocking. To suppress it:
 VIBESPATIAL_SKIP_AI_REMINDER=1 git commit -m "message"
 ```
 
-## Layer 3: PreToolUse Hooks (Claude Code, mechanical)
+## Layer 3: PreToolUse Hooks (legacy Claude Code, mechanical)
 
 Two `PreToolUse` hooks run **outside the LLM context window** -- they cannot
 be compressed away, forgotten, or skipped by the model.
@@ -158,7 +155,7 @@ for commands that would bypass or tamper with enforcement infrastructure:
 | `rm`/`mv`/`>` on `.claude/settings*.json` | Removing hook registrations |
 
 For `git commit` commands that pass the above checks, the hook injects a
-system message reminding Claude to complete `/pre-land-review` first.
+system message reminding the agent to complete `$pre-land-review` first.
 
 ### File guard (`.claude/hooks/file-guard.sh`)
 
@@ -171,9 +168,9 @@ writes to enforcement-critical paths:
 | `.claude/hooks/*` | Claude hook scripts |
 | `.claude/settings.json` | Hook registrations |
 | `.claude/settings.local.json` | Local hook overrides |
-| `.claude/skills/pre-land-review/SKILL.md` | Review skill definition |
+| `.agents/skills/pre-land-review/SKILL.md` | Review skill definition |
 
-To modify any of these files, edit them manually outside Claude Code.
+To modify any of these files, edit them manually outside the agent session.
 
 ### Configuration
 
@@ -193,20 +190,20 @@ Both hooks are registered in `.claude/settings.json`:
 ## Layer 4: commit-msg Gate (Content-Addressable Marker)
 
 The `commit-msg` hook (`.githooks/commit-msg`) is the **hard gate** for
-Claude-assisted commits. It checks the commit message for a
-`Co-Authored-By: ... Claude` line:
+AI-assisted commits. It checks the commit message for a
+`Co-Authored-By: ... Codex` or `Co-Authored-By: ... Claude` line:
 
-- **Present**: the review marker `.claude/.review-completed` must exist,
+- **Present**: the review marker `.agents/.review-completed` must exist,
   be less than 1 hour old, contain a `staged_hash` that matches the current
   `git diff --cached | sha256sum`, and have a `verdict` of `LAND`.
   If any check fails, the commit is blocked.
 - **Absent**: human-only commit, passes unconditionally.
 
-The marker is a JSON file written by the `/pre-land-review` skill after a
+The marker is a JSON file written by the `$pre-land-review` skill after a
 LAND verdict. It binds the review to the exact staged diff via SHA-256 hash,
-so a stub file (`touch .claude/.review-completed`) or a marker from a
+so a stub file (`touch .agents/.review-completed`) or a marker from a
 different staging state will not pass. If you stage additional changes after
-the review, the hash breaks and you must re-run `/pre-land-review`.
+the review, the hash breaks and you must re-run `$pre-land-review`.
 
 ## How The Layers Interact
 
@@ -214,14 +211,14 @@ The four layers form a defense-in-depth chain:
 
 ```
 Layer 2: Skill fires on "commit" / "land" / "done" intent
-  --> Loads full checklist, Claude runs AI analysis
-  --> Writes .claude/.review-completed marker on LAND verdict
+  --> Loads full checklist, Codex runs AI analysis
+  --> Writes .agents/.review-completed marker on LAND verdict
     --> Layer 3: Bash guard hard-blocks --no-verify, hook tampering
     --> Layer 3: File guard hard-blocks Edit/Write to enforcement files
     --> Layer 3: Bash guard injects commit reminder if checks above pass
       --> Layer 1: Pre-commit hook runs deterministic checks
         --> Layer 4: commit-msg hook checks Co-Author + marker
-          --> Blocks if Claude co-authored without review
+          --> Blocks if Codex or Claude co-authored without review
 ```
 
 Each layer catches what the previous one might miss:
@@ -237,7 +234,7 @@ Each layer catches what the previous one might miss:
 | Agent ignores skill and hook, commits anyway | Layer 4 (commit-msg gate) |
 | Agent creates stub marker file (`touch ...`) | Layer 4 (missing JSON / hash) |
 | Agent stages new changes after review | Layer 4 (hash mismatch) |
-| Claude Code not available (human contributor) | Layer 1 (pre-commit, no gate) |
+| Codex not available (human contributor) | Layer 1 (pre-commit, no gate) |
 | Non-interactive environment (CI, VS Code) | Layer 1 (pre-commit, no gate) |
 
 ## Ratchet Baseline System
@@ -286,7 +283,7 @@ To add an entirely new enforcer:
 1. Create `scripts/check_<name>.py` following the existing pattern
 2. Add it to `.githooks/pre-commit` in the Layer 1 block
 3. Add it to AGENTS.md project shape and verification sections
-4. Add a corresponding command in `.claude/commands/` for AI-powered analysis
+4. Add a corresponding Codex skill in `.agents/skills/` for AI-powered analysis
 5. Document it in this file
 
 ## Troubleshooting
@@ -311,13 +308,13 @@ The ratchet baseline should prevent this. If it happens:
 3. If a dependency update introduced new violations, raise the baseline
    with a comment explaining the cause
 
-### Skill not firing in Claude Code
+### Skill not firing in Codex
 
 The skill triggers on keywords in the conversation. If it doesn't fire:
 
-1. Say `/pre-land-review` explicitly to invoke it
-2. Check that `.claude/skills/pre-land-review/SKILL.md` exists
-3. Verify the skill appears in Claude Code's skill list
+1. Say `$pre-land-review` explicitly to invoke it
+2. Check that `.agents/skills/pre-land-review/SKILL.md` exists
+3. Verify the skill appears in Codex's skill list
 
 ### Hook not injecting reminder
 
@@ -328,8 +325,8 @@ The skill triggers on keywords in the conversation. If it doesn't fire:
 ### Skipping hooks entirely
 
 The `--no-verify` flag is **hard-blocked** for AI agents by the Bash guard
-hook. It cannot be used from within Claude Code sessions.
+hook. It cannot be used from within the hooked agent sessions.
 
-For human contributors working outside Claude Code, `--no-verify` still works
+For human contributors working outside Codex, `--no-verify` still works
 in a plain terminal. Use sparingly -- it bypasses ALL checks including
 deterministic ones.

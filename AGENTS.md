@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 256/260 lines
+Body Budget: 255/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -18,13 +18,13 @@ Section Map (Body Lines)
 | 30-34 | Verify |
 | 35-40 | Risks |
 | 41-58 | Mission |
-| 59-74 | Startup |
-| 75-87 | Routing |
-| 88-106 | Execution Model |
-| 107-136 | Property Convergence |
-| 137-148 | Test Strategy |
-| 149-158 | Build And Tooling |
-| 159-182 | Verification |
+| 59-71 | Startup |
+| 72-85 | Routing |
+| 86-104 | Execution Model |
+| 105-135 | Property Convergence |
+| 136-147 | Test Strategy |
+| 148-157 | Build And Tooling |
+| 158-181 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -86,29 +86,27 @@ Build a new NVIDIA GPU-accelerated spatial analytics library from scratch.
 
 ## Startup
 
-1. Run `/property-framing` with the task description. This snapshots the
-   property dashboard and produces a brief grounding work in measurable
-   codebase properties.
-2. Run `/intake-router` with the task description to find relevant files.
-3. Open only the routed files/docs first.
-4. Read relevant ADRs from `docs/decisions/index.md` when the task reopens
+1. Run `$intake-router` with the task description to find relevant files.
+2. Open only the routed files/docs first.
+3. Read relevant ADRs from `docs/decisions/index.md` when the task reopens
    a design decision.
-5. Make the smallest coherent change that advances target properties.
-6. Run the narrowest meaningful verification before expanding scope.
-7. Refresh generated docs with `uv run python scripts/check_docs.py --refresh`
+4. Make the smallest coherent change that advances target properties.
+5. Run the narrowest meaningful verification before expanding scope.
+6. Refresh generated docs with `uv run python scripts/check_docs.py --refresh`
    when doc metadata changes.
 
 For session orientation: `uv run python scripts/health.py --check`
 
 ## Routing
 
-Use `/intake-router` or `uv run python scripts/intake.py "<request>"` as
+Use `$intake-router` or `uv run python scripts/intake.py "<request>"` as
 the source of truth for file discovery. Do not manually enumerate files.
 Do not front-load full-repo reads. Route, inspect the local area, then
 expand.
 
-Agent definitions live in `.claude/agents/` and describe themselves.
-Skills live in `.claude/skills/` and describe themselves.
+Legacy Claude agent definitions live in `.claude/agents/` and describe
+themselves. Claude skills live in `.claude/skills/`. Repo-local Codex skills
+live in `.agents/skills/`.
 Scripts live in `scripts/` and are indexed by intake routing.
 
 Do not duplicate their contents here.
@@ -145,8 +143,9 @@ The dashboard aggregates all check scripts into a unified view. Each
 property has a distance metric (0.0 = satisfied, >1.0 = regressed).
 Ratchet baselines track known debt; new code must not increase it.
 
-**Before starting work:** run `/property-framing` to snapshot the dashboard
-and identify which properties your work should advance.
+**Before starting work:** snapshot the dashboard with
+`uv run python scripts/property_dashboard.py --json` if the task is broad
+enough that a property baseline will help.
 
 **After completing work:** re-run the dashboard. Your changes are successful
 when:
@@ -160,7 +159,7 @@ What does NOT count as success:
 - A change that adds new violations to any ratchet baseline
 
 The pre-commit hook enforces all property checks automatically. The
-`/pre-land-review` skill validates before commit.
+`$pre-land-review` skill validates before commit.
 
 ## Test Strategy
 
@@ -205,7 +204,7 @@ For targeted verification during development:
 If verification cannot run because dependencies, drivers, or local services
 are missing, say so concretely and include the command that failed.
 
-The `/commit` skill runs `/pre-land-review` automatically, which orchestrates
+The `$commit` skill runs `$pre-land-review` automatically, which orchestrates
 deterministic checks and AI-powered sub-agent reviews.
 
 ## Working Rules
@@ -259,14 +258,14 @@ See ADR-0032 for the canonical example.
 
 ## Landing
 
-All landing is handled by the `/commit` skill. Run `/commit` when work
+All landing is handled by the `$commit` skill. Run `$commit` when work
 is complete. It orchestrates:
 
-1. `/pre-land-review` — deterministic checks + AI sub-agent reviews
+1. `$pre-land-review` — deterministic checks + AI sub-agent reviews
 2. Staging and review marker generation
 3. Git commit with content-addressable review verification
 
-**The `/commit` skill will reject your work if:**
+**The `$commit` skill will reject your work if:**
 - Any deterministic check fails (ruff, ARCH, ZCOPY, VPAT, MAINT, IGRD)
 - AI review finds BLOCKING issues (all findings default to BLOCKING)
 - The review marker hash doesn't match the staged diff

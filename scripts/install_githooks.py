@@ -58,11 +58,9 @@ def main() -> None:
     print("  6. check_maintainability.py --all")
     print("  7. AI review reminder (interactive prompt)")
     print()
-    print("AI-powered review commands (run in Claude Code sessions):")
-    print("  /pre-land-review           all three enforcers")
-    print("  /performance-analysis      GPU utilization, tier compliance")
-    print("  /zero-copy-enforcer        device residency, transfer paths")
-    print("  /maintainability-enforcer  intake routing, doc coherence")
+    print("AI-powered review skills (run in Codex):")
+    print("  $pre-land-review  deterministic checks + AI review gate")
+    print("  $gpu-code-review  targeted GPU review when kernel code changes")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cuda Optimizer"
+  short_description: "Help with Cuda Optimizer tasks"
+  default_prompt: "Use $cuda-optimizer to review an existing GPU module and propose the highest-impact performance rewrites."

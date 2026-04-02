@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gpu Code Review"
+  short_description: "Help with Gpu Code Review tasks"
+  default_prompt: "Use $gpu-code-review to review a GPU diff for residency, synchronization, precision, and performance risks."

@@ -1,6 +1,6 @@
 #!/bin/sh
 # PreToolUse hook (Bash tool): blocks enforcement bypasses and reminds
-# about /pre-land-review before commits.
+# about $pre-land-review before commits.
 #
 # Hard-blocks:
 #   - git commit --no-verify / -n            (hook bypass)
@@ -9,7 +9,7 @@
 #   - Destructive ops on .githooks/, .claude/hooks/, .claude/settings*.json
 #
 # Soft gate:
-#   - Any git commit -> systemMessage reminder about /pre-land-review
+#   - Any git commit -> systemMessage reminder about $pre-land-review
 #
 # Input:  JSON on stdin  {command: "..."}
 # Output: JSON on stdout {"decision":"block","reason":"..."} |
@@ -50,7 +50,7 @@ def main():
         if re.search(r"--no-verify", cmd):
             block(
                 "--no-verify is prohibited. Pre-commit and commit-msg hooks "
-                "are mandatory. Run /pre-land-review first, then commit "
+                "are mandatory. Run $pre-land-review first, then commit "
                 "without --no-verify."
             )
         # Detect short -n flag.  Strip -m/--message args first so we do not
@@ -71,7 +71,7 @@ def main():
         if re.search(r"(?:^|\s)-n(?:\s|$)", stripped):
             block(
                 "-n (--no-verify) is prohibited. Hooks are mandatory. "
-                "Run /pre-land-review first, then commit without -n."
+                "Run $pre-land-review first, then commit without -n."
             )
 
     # 2. git config core.hooksPath  (redirects hooks away from .githooks/)
@@ -114,11 +114,11 @@ def main():
 
     # ---- Soft gate ----------------------------------------------------------
 
-    # 5. Any git commit -> remind about /pre-land-review
+    # 5. Any git commit -> remind about $pre-land-review
     if is_git_commit:
         remind(
             "MANDATORY: Before creating this commit, you must have "
-            "completed the /pre-land-review checklist. If you have not "
+            "completed the $pre-land-review checklist. If you have not "
             "run it in this session, invoke the pre-land-review skill "
             "NOW before proceeding. The checklist includes: "
             "(1) all deterministic checks pass, "

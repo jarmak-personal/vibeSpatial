@@ -12,6 +12,7 @@ __pycache__/
 .claude/last-review.md
 .claude/.review-completed
 .claude/.property-before.json
+.agents/.review-completed
 .claude/projects/
 .brainstorm/
 .beads/

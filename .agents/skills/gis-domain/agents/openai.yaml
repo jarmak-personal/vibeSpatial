@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gis Domain"
+  short_description: "Help with Gis Domain tasks"
+  default_prompt: "Use $gis-domain to verify the GIS semantics, edge cases, or DE-9IM behavior of this operation."

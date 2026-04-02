@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pre Land Review"
+  short_description: "Help with Pre Land Review tasks"
+  default_prompt: "Use $pre-land-review to run the repository's full pre-landing review workflow before committing."

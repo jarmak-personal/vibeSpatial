@@ -1,30 +1,39 @@
 #!/bin/sh
-# commit-msg hook: if Claude co-authored this commit, verify the pre-land
+# commit-msg hook: if an AI assistant co-authored this commit, verify the pre-land
 # review was completed by checking a content-addressable review marker.
 #
 # - Human-only commits: no gate, passes unconditionally.
-# - Claude co-authored commits: must have .claude/.review-completed marker
-#   from the current session (written by /pre-land-review skill).
+# - AI co-authored commits: must have either .agents/.review-completed or
+#   .claude/.review-completed from the current session (written by the
+#   relevant pre-land-review workflow).
 #
 # The marker is a JSON file containing a SHA-256 hash of `git diff --cached`
 # at review time.  The hook recomputes the hash and rejects mismatches, so a
 # stub file or a marker from a different staging state cannot pass.
 
 _msg_file="$1"
-_marker=".claude/.review-completed"
+_marker_agents=".agents/.review-completed"
+_marker_claude=".claude/.review-completed"
 _max_age=3600  # marker must be less than 1 hour old
 
-# Only gate on Claude co-authored commits.
-if ! grep -qi "Co-Authored-By:.*Claude" "$_msg_file" 2>/dev/null; then
+# Only gate on AI co-authored commits.
+if ! grep -Eqi "Co-Authored-By:.*(Codex|Claude)" "$_msg_file" 2>/dev/null; then
     exit 0
 fi
 
 # --- Marker existence ---
-if [ ! -f "$_marker" ]; then
+_marker=""
+if [ -f "$_marker_agents" ]; then
+    _marker="$_marker_agents"
+elif [ -f "$_marker_claude" ]; then
+    _marker="$_marker_claude"
+fi
+
+if [ -z "$_marker" ]; then
     printf "\n"
-    printf "%s\n" "commit-msg: BLOCKED -- Claude is co-authoring but /pre-land-review was not run."
-    printf "Run /pre-land-review in your Claude Code session first.\n"
-    printf "The skill writes %s when all checks pass.\n" "$_marker"
+    printf "%s\n" "commit-msg: BLOCKED -- AI is co-authoring but $pre-land-review was not run."
+    printf "Run $pre-land-review in your current agent session first.\n"
+    printf "The workflow writes %s or %s when all checks pass.\n" "$_marker_agents" "$_marker_claude"
     exit 1
 fi
 
@@ -41,7 +50,7 @@ if command -v stat >/dev/null 2>&1; then
     if [ "$_age" -gt "$_max_age" ]; then
         printf "\n"
         printf "commit-msg: BLOCKED -- review marker is %s seconds old (max %s).\n" "$_age" "$_max_age"
-        printf "Run /pre-land-review again to refresh it.\n"
+        printf "Run $pre-land-review again to refresh it.\n"
         exit 1
     fi
 fi
@@ -62,7 +71,7 @@ _marker_hash=$(sed -n 's/.*"staged_hash" *: *"\([a-f0-9]*\)".*/\1/p' "$_marker" 
 if [ -z "$_marker_hash" ]; then
     printf "\n"
     printf "commit-msg: BLOCKED -- review marker is missing staged_hash.\n"
-    printf "The marker must be a JSON file written by /pre-land-review.\n"
+    printf "The marker must be a JSON file written by $pre-land-review.\n"
     printf "A plain timestamp or stub file will not pass.\n"
     exit 1
 fi
@@ -72,7 +81,7 @@ if [ "$_marker_hash" != "$_current_hash" ]; then
     printf "commit-msg: BLOCKED -- staged diff has changed since the review.\n"
     printf "  marker hash: %s\n" "$_marker_hash"
     printf "  staged hash: %s\n" "$_current_hash"
-    printf "Run /pre-land-review again to review the current staged changes.\n"
+    printf "Run $pre-land-review again to review the current staged changes.\n"
     exit 1
 fi
 
@@ -81,11 +90,11 @@ _verdict=$(sed -n 's/.*"verdict" *: *"\([A-Z_]*\)".*/\1/p' "$_marker" | head -1)
 if [ "$_verdict" != "LAND" ]; then
     printf "\n"
     printf "commit-msg: BLOCKED -- review verdict is '%s', not LAND.\n" "$_verdict"
-    printf "Fix all blocking findings and re-run /pre-land-review.\n"
+    printf "Fix all blocking findings and re-run $pre-land-review.\n"
     exit 1
 fi
 
 printf "commit-msg: pre-land review verified (marker age: %ss, hash: %.8s...).\n" "$_age" "$_current_hash"
 
-# Consume the marker so it cannot be reused for a subsequent commit.
-rm -f "$_marker"
+# Consume either marker so it cannot be reused for a subsequent commit.
+rm -f "$_marker_agents" "$_marker_claude"

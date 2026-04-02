@@ -32,9 +32,8 @@ uv run python scripts/check_import_guard.py --all
 # ===========================================================================
 # Tier 2: AI review reminder
 #
-# The AI commands (/performance-analysis, /zero-copy-enforcer,
-# /maintainability-enforcer, /pre-land-review) are designed for
-# interactive Claude Code sessions, not automated pre-commit runs.
+# The AI review skills ($gpu-code-review, $pre-land-review) are designed
+# for interactive agent sessions, not automated pre-commit runs.
 #
 # This prints a non-blocking reminder visible in terminals and VS Code
 # git output alike.  Suppress with VIBESPATIAL_SKIP_AI_REMINDER=1.
@@ -42,9 +41,7 @@ uv run python scripts/check_import_guard.py --all
 
 if [ "${VIBESPATIAL_SKIP_AI_REMINDER:-0}" = "0" ]; then
     printf "\n"
-    printf "%s\n" "Reminder: run /pre-land-review in Claude Code before landing."
-    printf "  /pre-land-review           all three enforcers\n"
-    printf "  /performance-analysis      GPU utilization, tier compliance\n"
-    printf "  /zero-copy-enforcer        device residency, transfer paths\n"
-    printf "  /maintainability-enforcer  intake routing, doc coherence\n"
+    printf "%s\n" "Reminder: run $pre-land-review in Codex before landing."
+    printf "  $pre-land-review  deterministic checks + AI review gate\n"
+    printf "  $gpu-code-review  targeted GPU review when kernel code changes\n"
 fi

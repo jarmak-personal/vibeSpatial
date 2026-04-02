@@ -1,0 +1,4 @@
+interface:
+  display_name: "Commit"
+  short_description: "Help with Commit tasks and workflows"
+  default_prompt: "Use $commit to run the landing workflow, write the review marker, and create the final git commit."

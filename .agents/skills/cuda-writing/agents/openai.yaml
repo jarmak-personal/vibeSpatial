@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cuda Writing"
+  short_description: "Help with Cuda Writing tasks"
+  default_prompt: "Use $cuda-writing to guide GPU kernel design, tier selection, and launch/runtime patterns for this change."

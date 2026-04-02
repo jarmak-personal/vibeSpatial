@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dispatch Wiring"
+  short_description: "Help with Dispatch Wiring tasks"
+  default_prompt: "Use $dispatch-wiring to map a new operation through the Python dispatch stack and CPU/GPU fallback layers."

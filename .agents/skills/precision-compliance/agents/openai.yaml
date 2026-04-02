@@ -1,0 +1,4 @@
+interface:
+  display_name: "Precision Compliance"
+  short_description: "Help with Precision Compliance tasks"
+  default_prompt: "Use $precision-compliance to wire or verify ADR-0002 precision planning for a GPU kernel or dispatch path."

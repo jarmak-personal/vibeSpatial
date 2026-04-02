@@ -3828,6 +3828,290 @@
   "files": [
     {
       "kind": "repo",
+      "path": ".agents/skills/commit/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "commit",
+        "md",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/commit/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "commit",
+        "openai",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/cuda-optimizer/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "cuda",
+        "md",
+        "optimizer",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/cuda-optimizer/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "cuda",
+        "openai",
+        "optimizer",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/cuda-writing/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "cuda",
+        "md",
+        "skill",
+        "skills",
+        "writing"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/cuda-writing/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "cuda",
+        "openai",
+        "skills",
+        "writing",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/dispatch-wiring/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "dispatch",
+        "md",
+        "skill",
+        "skills",
+        "wiring"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/dispatch-wiring/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "dispatch",
+        "openai",
+        "skills",
+        "wiring",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/gis-domain/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "domain",
+        "gis",
+        "md",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/gis-domain/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "domain",
+        "gis",
+        "openai",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/gpu-code-review/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "code",
+        "gpu",
+        "md",
+        "review",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/gpu-code-review/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "code",
+        "gpu",
+        "openai",
+        "review",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/intake-router/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "intake",
+        "md",
+        "router",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/intake-router/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "intake",
+        "openai",
+        "router",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/new-kernel-checklist/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "checklist",
+        "kernel",
+        "md",
+        "new",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/new-kernel-checklist/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "checklist",
+        "kernel",
+        "new",
+        "openai",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/pre-land-review/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "land",
+        "md",
+        "pre",
+        "review",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/pre-land-review/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "land",
+        "openai",
+        "pre",
+        "review",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/precision-compliance/SKILL.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "compliance",
+        "md",
+        "precision",
+        "skill",
+        "skills"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".agents/skills/precision-compliance/agents/openai.yaml",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "compliance",
+        "openai",
+        "precision",
+        "skills",
+        "yaml"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": ".beads/README.md",
       "referenced_by": [],
       "symbols": [],

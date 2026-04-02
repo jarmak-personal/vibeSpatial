@@ -108,9 +108,19 @@ def plan_request(request: str) -> dict[str, Any]:
     doc_scores = [_score_doc(request_text, request_tokens, doc) for doc in index["docs"]]
     doc_scores.sort(key=lambda item: (-item["score"], item["path"]))
 
-    if not doc_scores or doc_scores[0]["score"] <= 0:
-        fallback = next(doc for doc in doc_scores if doc["path"] == "README.md")
-        doc_scores = [fallback, *[doc for doc in doc_scores if doc["path"] != "README.md"]]
+    if not doc_scores:
+        raise ValueError("Intake index contains no routable docs.")
+
+    if doc_scores[0]["score"] <= 0:
+        fallback = next(
+            (
+                doc
+                for doc in doc_scores
+                if doc["path"] in {"AGENTS.md", "docs/ops/intake.md"}
+            ),
+            doc_scores[0],
+        )
+        doc_scores = [fallback, *[doc for doc in doc_scores if doc["path"] != fallback["path"]]]
 
     selected_docs = [doc for doc in doc_scores[:3] if doc["score"] > 0] or doc_scores[:1]
     selected_doc_scores = {doc["path"]: doc["score"] for doc in selected_docs}
