@@ -28,7 +28,16 @@ def test_import_vibespatial_api_without_cupy(tmp_path: Path) -> None:
     )
 
     proc = subprocess.run(
-        [sys.executable, "-c", "import vibespatial.api; print('import-ok')"],
+        [
+            sys.executable,
+            "-c",
+            (
+                "import vibespatial.api; "
+                "from vibespatial.constructive.binary_constructive import binary_constructive_owned; "
+                "from vibespatial.kernels.constructive import segmented_union_all; "
+                "print('import-ok')"
+            ),
+        ],
         capture_output=True,
         text=True,
         env=env,

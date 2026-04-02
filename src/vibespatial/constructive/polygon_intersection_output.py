@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import cupy as cp
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
 
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
@@ -10,6 +13,11 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     build_device_resident_owned,
 )
+
+
+def _require_cupy() -> None:
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        raise RuntimeError("CuPy is not installed; GPU polygon-intersection output builders are unavailable")
 
 
 def build_device_backed_polygon_intersection_output(
@@ -22,6 +30,7 @@ def build_device_backed_polygon_intersection_output(
     runtime_selection,
 ) -> OwnedGeometryArray:
     """Build a device-resident polygon OwnedGeometryArray from GPU outputs."""
+    _require_cupy()
     runtime = get_cuda_runtime()
     d_validity = runtime.from_host(validity)
     result = build_device_resident_owned(

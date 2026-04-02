@@ -20957,6 +20957,7 @@
       "path": "src/vibespatial/constructive/nonpolygon_binary_output.py",
       "referenced_by": [],
       "symbols": [
+        "_require_cupy",
         "build_device_backed_point_output",
         "build_device_backed_linestring_output",
         "build_device_backed_multipoint_output",
@@ -20969,6 +20970,7 @@
         "binary",
         "build",
         "constructive",
+        "cupy",
         "device",
         "empty",
         "host",
@@ -20980,6 +20982,7 @@
         "point",
         "prefix",
         "py",
+        "require",
         "result",
         "source",
         "src",
@@ -21330,6 +21333,7 @@
       "path": "src/vibespatial/constructive/polygon_intersection_output.py",
       "referenced_by": [],
       "symbols": [
+        "_require_cupy",
         "build_device_backed_polygon_intersection_output",
         "build_empty_device_backed_polygon_intersection_output"
       ],
@@ -21337,12 +21341,14 @@
         "backed",
         "build",
         "constructive",
+        "cupy",
         "device",
         "empty",
         "intersection",
         "output",
         "polygon",
         "py",
+        "require",
         "src",
         "vibespatial"
       ]
@@ -30420,6 +30426,7 @@
         "has_gpu_runtime",
         "select_runtime",
         "set_execution_mode",
+        "set_requested_mode",
         "get_requested_mode"
       ],
       "tokens": [
@@ -30454,7 +30461,8 @@
         "has_gpu_runtime",
         "select_runtime",
         "set_execution_mode",
-        "get_requested_mode"
+        "get_requested_mode",
+        "set_requested_mode"
       ],
       "tokens": [
         "execution",

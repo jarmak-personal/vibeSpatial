@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import cupy as cp
 import numpy as np
+
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
 
 from vibespatial.cuda._runtime import DeviceArray, get_cuda_runtime
 from vibespatial.geometry.buffers import GeometryFamily
@@ -15,6 +19,11 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime.residency import Residency
 
 
+def _require_cupy() -> None:
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        raise RuntimeError("CuPy is not installed; GPU constructive output builders are unavailable")
+
+
 def build_device_backed_point_output(
     device_x,
     device_y,
@@ -24,6 +33,7 @@ def build_device_backed_point_output(
     geometry_offsets: np.ndarray,
 ) -> OwnedGeometryArray:
     """Build a device-resident Point OwnedGeometryArray."""
+    _require_cupy()
     runtime = get_cuda_runtime()
     d_validity = runtime.from_host(validity)
     return build_device_resident_owned(
@@ -53,6 +63,7 @@ def build_device_backed_linestring_output(
     geometry_offsets: np.ndarray,
 ) -> OwnedGeometryArray:
     """Build a device-resident LineString OwnedGeometryArray."""
+    _require_cupy()
     runtime = get_cuda_runtime()
     d_validity = runtime.from_host(validity)
     return build_device_resident_owned(
@@ -82,6 +93,7 @@ def build_device_backed_multipoint_output(
     geometry_offsets: np.ndarray,
 ) -> OwnedGeometryArray:
     """Build a device-resident MultiPoint OwnedGeometryArray."""
+    _require_cupy()
     runtime = get_cuda_runtime()
     d_validity = runtime.from_host(validity)
     return build_device_resident_owned(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.util import find_spec
@@ -104,3 +105,15 @@ def get_requested_mode() -> ExecutionMode:
     if raw is not None:
         return ExecutionMode(raw.lower())
     return ExecutionMode.AUTO
+
+
+@contextmanager
+def set_requested_mode(mode: ExecutionMode | str | None):
+    """Temporarily override the requested execution mode for a scope."""
+
+    previous_override = _override_mode
+    set_execution_mode(mode)
+    try:
+        yield
+    finally:
+        set_execution_mode(previous_override)

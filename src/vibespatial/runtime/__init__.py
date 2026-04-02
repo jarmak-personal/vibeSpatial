@@ -8,5 +8,6 @@ __all__ = [  # noqa: F405
     "has_gpu_runtime",
     "select_runtime",
     "set_execution_mode",
+    "set_requested_mode",
     "get_requested_mode",
 ]
