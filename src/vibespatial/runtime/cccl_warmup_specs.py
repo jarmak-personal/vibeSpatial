@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+import numpy as np
+
 try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
@@ -42,14 +44,13 @@ class WarmupDiagnostic:
 
 
 def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
-    if cp is None:  # pragma: no cover - exercised on CPU-only installs
-        return {}
     S = CCCLWarmupSpec
     F = AlgorithmFamily
-    i32 = cp.dtype(cp.int32)
-    i64 = cp.dtype(cp.int64)
-    u64 = cp.dtype(cp.uint64)
-    f64 = cp.dtype(cp.float64)
+    dtype_module = cp if cp is not None else np
+    i32 = dtype_module.dtype(dtype_module.int32)
+    i64 = dtype_module.dtype(dtype_module.int64)
+    u64 = dtype_module.dtype(dtype_module.uint64)
+    f64 = dtype_module.dtype(dtype_module.float64)
     return {
         "exclusive_scan_i32": S("exclusive_scan_i32", F.EXCLUSIVE_SCAN, i32, None, "sum"),
         "exclusive_scan_i64": S("exclusive_scan_i64", F.EXCLUSIVE_SCAN, i64, None, "sum"),

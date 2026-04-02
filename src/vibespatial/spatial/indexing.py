@@ -1114,7 +1114,7 @@ def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
         kernel_name="segment_mbr_extract",
         kernel_class=KernelClass.COARSE,
         row_count=geometry_array.row_count,
-        requested_mode=ExecutionMode.GPU,
+        requested_mode=ExecutionMode.AUTO,
         gpu_available=has_gpu_runtime() and cp is not None,
     )
     if selection.selected is ExecutionMode.GPU and cp is not None:
@@ -1455,7 +1455,7 @@ def generate_segment_mbr_pairs(
         kernel_name="segment_mbr_pairs",
         kernel_class=KernelClass.COARSE,
         row_count=left_segments.count + right_segments.count,
-        requested_mode=ExecutionMode.GPU,
+        requested_mode=ExecutionMode.AUTO,
         gpu_available=(
             has_gpu_runtime()
             and cp is not None

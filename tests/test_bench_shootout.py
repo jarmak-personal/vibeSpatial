@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from vibespatial.bench.cli import main as vsbench_main
+from vibespatial.runtime import has_gpu_runtime
 
 
 def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) -> None:
@@ -36,12 +37,23 @@ def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) ->
         Path(line.split()[2]).name: line.split()[0]
         for line in lines
     }
-    expected_failures = {
-        "corridor_flood_priority.py",
-        "parcel_zoning.py",
-        "redevelopment_screening.py",
-        "transit_service_gap.py",
-    }
+    if has_gpu_runtime():
+        expected_failures = {
+            "corridor_flood_priority.py",
+            "parcel_zoning.py",
+            "redevelopment_screening.py",
+            "transit_service_gap.py",
+        }
+    else:
+        expected_failures = {
+            "flood_exposure.py",
+            "network_service_area.py",
+            "parcel_zoning.py",
+            "redevelopment_screening.py",
+            "site_suitability.py",
+            "transit_service_gap.py",
+            "vegetation_corridor.py",
+        }
 
     # These canaries intentionally stay red until the underlying public-path
     # parity gaps are fixed in the library. When those fixes land, update

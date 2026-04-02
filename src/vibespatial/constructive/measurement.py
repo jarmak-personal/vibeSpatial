@@ -115,8 +115,6 @@ def _fp32_center_coords(
     The ``.get()`` is issued outside the family search loop to satisfy
     ZCOPY002 (no D2H transfers inside loop bodies).
     """
-    import cupy as _cp
-
     # Phase 1: find the first non-empty family and compute device stats
     # (no .get() inside the loop).
     d_stats = None
@@ -126,6 +124,12 @@ def _fp32_center_coords(
             continue
         ds = owned.device_state
         if ds is not None and fam in ds.families:
+            try:
+                import cupy as _cp
+            except ModuleNotFoundError:
+                _cp = None
+            if _cp is None:
+                continue
             d_buf = ds.families[fam]
             if int(d_buf.x.size) > 0:
                 d_x = _cp.asarray(d_buf.x)
@@ -162,8 +166,6 @@ def _coord_stats_from_owned(
     a single device array across ALL families so that only **one** ``.get()``
     call is issued outside the loop, satisfying ZCOPY002.
     """
-    import cupy as _cp
-
     max_abs: float = 0.0
     coord_min: float = float("inf")
     coord_max: float = float("-inf")
@@ -176,6 +178,12 @@ def _coord_stats_from_owned(
             continue
         ds = owned.device_state
         if ds is not None and fam in ds.families:
+            try:
+                import cupy as _cp
+            except ModuleNotFoundError:
+                _cp = None
+            if _cp is None:
+                continue
             d_buf = ds.families[fam]
             if int(d_buf.x.size) > 0:
                 d_x = _cp.asarray(d_buf.x)

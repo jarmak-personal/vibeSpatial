@@ -15,7 +15,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
@@ -446,6 +446,8 @@ class TestConvexHull:
 
     def test_convex_hull_stays_device_resident(self, strict_device_guard):
         """convex_hull keeps single-family metadata on device."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
         from vibespatial.constructive.convex_hull import convex_hull_owned
 
         poly = Polygon([(0, 0), (10, 0), (5, 10)])

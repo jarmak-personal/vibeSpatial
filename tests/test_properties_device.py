@@ -7,6 +7,8 @@ geometry property functions.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import shapely
@@ -31,7 +33,7 @@ from vibespatial.constructive.properties import (
 )
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
 # ---------------------------------------------------------------------------
 # Test helpers
@@ -245,6 +247,15 @@ class TestGetGeometry:
         monkeypatch.setattr(
             "vibespatial.constructive.properties._get_geometry_gpu",
             _boom,
+        )
+        monkeypatch.setattr(
+            "vibespatial.constructive.properties.plan_dispatch_selection",
+            lambda *args, _mode=ExecutionMode, **kwargs: SimpleNamespace(
+                selected=_mode.GPU,
+                requested=_mode.GPU,
+                precision_plan=SimpleNamespace(compute_precision=SimpleNamespace(value="fp64")),
+                reason="test",
+            ),
         )
 
         with pytest.raises(RuntimeError, match="get-geometry-gpu-boom"):

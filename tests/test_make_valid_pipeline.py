@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Polygon
@@ -104,6 +106,15 @@ def test_make_valid_gpu_detection_failure_propagates(monkeypatch: pytest.MonkeyP
         "vibespatial.constructive.make_valid_pipeline._detect_self_intersections_gpu",
         _boom,
     )
+    monkeypatch.setattr(
+        "vibespatial.constructive.make_valid_pipeline.plan_dispatch_selection",
+        lambda *args, **kwargs: SimpleNamespace(
+            selected=ExecutionMode.GPU,
+            requested=ExecutionMode.GPU,
+            precision_plan=None,
+            reason="test",
+        ),
+    )
 
     with pytest.raises(RuntimeError, match="gpu-detect-boom"):
         make_valid_owned(owned=owned, dispatch_mode=ExecutionMode.GPU)
@@ -127,6 +138,15 @@ def test_make_valid_gpu_repair_failure_propagates(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         "vibespatial.constructive.make_valid_pipeline._make_valid_gpu_repair",
         _boom,
+    )
+    monkeypatch.setattr(
+        "vibespatial.constructive.make_valid_pipeline.plan_dispatch_selection",
+        lambda *args, **kwargs: SimpleNamespace(
+            selected=ExecutionMode.GPU,
+            requested=ExecutionMode.GPU,
+            precision_plan=None,
+            reason="test",
+        ),
     )
 
     with pytest.raises(RuntimeError, match="gpu-repair-boom"):

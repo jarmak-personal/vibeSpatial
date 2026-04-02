@@ -365,6 +365,11 @@ def query_spatial_index(
         else:
             left_idx, right_idx = regular_grid_box_pairs
         if scalar:
+            if not sort:
+                right_idx = _reorder_scalar_tree_matches(
+                    right_idx.astype(np.intp, copy=False),
+                    flat_index.order,
+                )
             indices = right_idx.astype(np.intp, copy=False)
         else:
             indices = np.vstack(
@@ -415,6 +420,11 @@ def query_spatial_index(
         else:
             left_idx, right_idx = fast_pairs
         if scalar:
+            if not sort:
+                right_idx = _reorder_scalar_tree_matches(
+                    right_idx.astype(np.intp, copy=False),
+                    flat_index.order,
+                )
             indices = right_idx.astype(np.intp, copy=False)
         else:
             indices = np.vstack(
@@ -449,6 +459,11 @@ def query_spatial_index(
         )
         left_idx, right_idx = point_box_pairs
         if scalar:
+            if not sort:
+                right_idx = _reorder_scalar_tree_matches(
+                    right_idx.astype(np.intp, copy=False),
+                    flat_index.order,
+                )
             indices = right_idx.astype(np.intp, copy=False)
         else:
             indices = np.vstack(
