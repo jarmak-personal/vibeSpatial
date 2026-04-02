@@ -3,7 +3,10 @@ from __future__ import annotations
 import logging
 from time import perf_counter
 
-import cupy as cp
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
 
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
@@ -76,7 +79,8 @@ from .point_within_bounds import (
     _normalize_right_input,
 )
 
-request_warmup(["select_i32", "select_i64"])
+if cp is not None:
+    request_warmup(["select_i32", "select_i64"])
 
 _POINT_IN_POLYGON_KERNEL_SOURCE = _format_pip_kernel_source("double")
 
@@ -440,9 +444,10 @@ def _compute_work_estimates_for_candidates(
 
 
 
-request_nvrtc_warmup([
-    ("point-in-polygon", _POINT_IN_POLYGON_KERNEL_SOURCE, _POINT_IN_POLYGON_KERNEL_NAMES),
-])
+if cp is not None:
+    request_nvrtc_warmup([
+        ("point-in-polygon", _POINT_IN_POLYGON_KERNEL_SOURCE, _POINT_IN_POLYGON_KERNEL_NAMES),
+    ])
 
 
 def _point_in_polygon_kernels(compute_type: str = "double"):

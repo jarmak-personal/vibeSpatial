@@ -4,7 +4,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-import cupy as cp
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
 
 
 class AlgorithmFamily(StrEnum):
@@ -39,6 +42,8 @@ class WarmupDiagnostic:
 
 
 def build_spec_registry() -> dict[str, CCCLWarmupSpec]:
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        return {}
     S = CCCLWarmupSpec
     F = AlgorithmFamily
     i32 = cp.dtype(cp.int32)

@@ -1061,6 +1061,8 @@ def request_warmup(spec_names: list[str]) -> None:
     Safe to call at module scope.  No-op if GPU is not available
     or if precompilation is disabled via VIBESPATIAL_PRECOMPILE=0.
     """
+    if not SPEC_REGISTRY:
+        return
     if not precompile_enabled():
         return
     from vibespatial.runtime import has_gpu_runtime

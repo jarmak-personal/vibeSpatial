@@ -33774,6 +33774,27 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_cpu_only_imports.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_import_vibespatial_api_without_cupy"
+      ],
+      "tokens": [
+        "api",
+        "cpu",
+        "cupy",
+        "import",
+        "imports",
+        "only",
+        "py",
+        "test",
+        "tests",
+        "vibespatial",
+        "without"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_csv_gpu.py",
       "referenced_by": [],
       "symbols": [

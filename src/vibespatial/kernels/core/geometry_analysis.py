@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-import cupy as cp
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
 
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
@@ -47,6 +50,8 @@ from vibespatial.runtime.residency import Residency, TransferTrigger
 
 _BOUNDS_KERNEL_SOURCE = _format_bounds_kernel_source("double")
 _BOUNDS_COOPERATIVE_KERNEL_SOURCE = _format_cooperative_bounds_kernel_source("double")
+
+
 def _compute_geometry_bounds_cpu_scalar(geometry_array: OwnedGeometryArray):
     return _compute_geometry_bounds_cpu_scalar_host(geometry_array)
 
@@ -67,10 +72,11 @@ def _compute_geometry_bounds_cpu_vectorized(geometry_array: OwnedGeometryArray):
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
-request_nvrtc_warmup([
-    ("geometry-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
-    ("geometry-bounds-cooperative", _BOUNDS_COOPERATIVE_KERNEL_SOURCE, _BOUNDS_COOPERATIVE_KERNEL_NAMES),
-])
+if cp is not None:
+    request_nvrtc_warmup([
+        ("geometry-bounds", _BOUNDS_KERNEL_SOURCE, _BOUNDS_KERNEL_NAMES),
+        ("geometry-bounds-cooperative", _BOUNDS_COOPERATIVE_KERNEL_SOURCE, _BOUNDS_COOPERATIVE_KERNEL_NAMES),
+    ])
 
 
 def _bounds_kernels(compute_type: str = "double"):
@@ -279,6 +285,8 @@ def _compute_geometry_bounds_gpu_impl(
     geometry_array: OwnedGeometryArray,
     compute_type: str = "double",
 ):
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        raise RuntimeError("CuPy is not installed; GPU bounds execution is unavailable")
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
     state = geometry_array._ensure_device_state()
