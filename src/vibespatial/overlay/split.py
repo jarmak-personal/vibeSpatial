@@ -29,6 +29,7 @@ from vibespatial.cuda.cccl_primitives import (
     unique_sorted_pairs,
 )
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.hotpath_trace import hotpath_stage
 from vibespatial.spatial.segment_primitives import (
     DeviceSegmentTable,
     SegmentIntersectionDeviceState,
@@ -107,6 +108,8 @@ def _deduplicate_atomic_edge_geometry(
     src_y,
     dst_x,
     dst_y,
+    *,
+    row_indices=None,
 ):
     """Collapse duplicate geometric segments before half-edge graph build.
 
@@ -131,12 +134,18 @@ def _deduplicate_atomic_edge_geometry(
     q_src_y = cp.rint(d_src_y * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
     q_dst_x = cp.rint(d_dst_x * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
     q_dst_y = cp.rint(d_dst_y * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
-    sort_order = cp.lexsort(cp.stack((forward_indices, q_dst_y, q_dst_x, q_src_y, q_src_x)))
+    sort_keys = [forward_indices, q_dst_y, q_dst_x, q_src_y, q_src_x]
+    if row_indices is not None:
+        d_rows = cp.asarray(row_indices)[forward_indices]
+        sort_keys.append(d_rows)
+    sort_order = cp.lexsort(cp.stack(sort_keys))
     sorted_forward = forward_indices[sort_order]
     sorted_q_src_x = q_src_x[sort_order]
     sorted_q_src_y = q_src_y[sort_order]
     sorted_q_dst_x = q_dst_x[sort_order]
     sorted_q_dst_y = q_dst_y[sort_order]
+    if row_indices is not None:
+        sorted_rows = d_rows[sort_order]
 
     unique_mask = cp.empty(int(sorted_forward.size), dtype=cp.bool_)
     unique_mask[0] = True
@@ -147,6 +156,8 @@ def _deduplicate_atomic_edge_geometry(
             | (sorted_q_dst_x[1:] != sorted_q_dst_x[:-1])
             | (sorted_q_dst_y[1:] != sorted_q_dst_y[:-1])
         )
+        if row_indices is not None:
+            unique_mask[1:] |= sorted_rows[1:] != sorted_rows[:-1]
     representatives = sorted_forward[unique_mask]
     unique_count = int(representatives.size)
 
@@ -286,6 +297,7 @@ def build_gpu_split_events(
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    require_same_row: bool = False,
 ) -> SplitEventTable:
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
@@ -297,20 +309,24 @@ def build_gpu_split_events(
     # GPU-native segment extraction -- no CPU loop, no host round-trip.
     # lyy.15: reuse pre-extracted right-side segments when provided
     # (N-vs-1 overlay caches the corridor segments once).
-    left_segments = _extract_segments_gpu(left)
+    with hotpath_stage("overlay.split.extract_left_segments", category="setup"):
+        left_segments = _extract_segments_gpu(left)
     _owns_right_segments = _cached_right_segments is None
-    right_segments = (
-        _cached_right_segments
-        if _cached_right_segments is not None
-        else _extract_segments_gpu(right)
-    )
+    with hotpath_stage("overlay.split.extract_right_segments", category="setup"):
+        right_segments = (
+            _cached_right_segments
+            if _cached_right_segments is not None
+            else _extract_segments_gpu(right)
+        )
 
-    result = intersection_result or classify_segment_intersections(
-        left,
-        right,
-        dispatch_mode=dispatch_mode,
-        _cached_right_device_segments=_cached_right_segments,
-    )
+    with hotpath_stage("overlay.split.classify_intersections", category="refine"):
+        result = intersection_result or classify_segment_intersections(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_device_segments=_cached_right_segments,
+            _require_same_row=require_same_row,
+        )
     if result.runtime_selection.selected is not ExecutionMode.GPU:
         raise RuntimeError("build_gpu_split_events requires a GPU segment-intersection result")
     owns_intersection_state = False
@@ -399,30 +415,33 @@ def build_gpu_split_events(
             ),
         )
         endpoint_grid, endpoint_block = runtime.launch_config(kernels["emit_endpoint_split_events"], base_event_count)
-        runtime.launch(
-            kernels["emit_endpoint_split_events"],
-            grid=endpoint_grid,
-            block=endpoint_block,
-            params=endpoint_params,
-        )
+        with hotpath_stage("overlay.split.emit_endpoint_events", category="emit"):
+            runtime.launch(
+                kernels["emit_endpoint_split_events"],
+                grid=endpoint_grid,
+                block=endpoint_block,
+                params=endpoint_params,
+            )
 
         pair_counts = runtime.allocate((result.count,), np.int32)
-        count_params = (
-            (ptr(device_state.kinds), ptr(pair_counts), result.count),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        )
-        count_grid, count_block = runtime.launch_config(kernels["count_pair_split_events"], result.count)
-        runtime.launch(
-            kernels["count_pair_split_events"],
-            grid=count_grid,
-            block=count_block,
-            params=count_params,
-        )
+        with hotpath_stage("overlay.split.count_pair_events", category="filter"):
+            count_params = (
+                (ptr(device_state.kinds), ptr(pair_counts), result.count),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            )
+            count_grid, count_block = runtime.launch_config(kernels["count_pair_split_events"], result.count)
+            runtime.launch(
+                kernels["count_pair_split_events"],
+                grid=count_grid,
+                block=count_block,
+                params=count_params,
+            )
 
-        pair_offsets = exclusive_sum(pair_counts)
-        pair_event_count = (
-            int(cp.asnumpy(pair_offsets[-1] + pair_counts[-1])) if int(result.count) else 0  # hygiene:ok — allocation-fence: need pair_event_count to size 5 output buffers
-        )
+        with hotpath_stage("overlay.split.prefix_pair_events", category="sort"):
+            pair_offsets = exclusive_sum(pair_counts)
+            pair_event_count = (
+                int(cp.asnumpy(pair_offsets[-1] + pair_counts[-1])) if int(result.count) else 0  # hygiene:ok — allocation-fence: need pair_event_count to size 5 output buffers
+            )
         extra_source_ids = runtime.allocate((pair_event_count,), np.int32)
         extra_t = runtime.allocate((pair_event_count,), np.float64)
         extra_x = runtime.allocate((pair_event_count,), np.float64)
@@ -487,39 +506,42 @@ def build_gpu_split_events(
                 ),
             )
             scatter_grid, scatter_block = runtime.launch_config(kernels["scatter_pair_split_events"], result.count)
-            runtime.launch(
-                kernels["scatter_pair_split_events"],
-                grid=scatter_grid,
-                block=scatter_block,
-                params=scatter_params,
-            )
+            with hotpath_stage("overlay.split.scatter_pair_events", category="emit"):
+                runtime.launch(
+                    kernels["scatter_pair_split_events"],
+                    grid=scatter_grid,
+                    block=scatter_block,
+                    params=scatter_params,
+                )
 
-            all_source_ids = cp.concatenate((endpoint_source_ids, extra_source_ids))
-            all_t = cp.concatenate((endpoint_t, extra_t))
-            all_x = cp.concatenate((endpoint_x, extra_x))
-            all_y = cp.concatenate((endpoint_y, extra_y))
-            all_keys = cp.concatenate((endpoint_keys, extra_keys))
+            with hotpath_stage("overlay.split.sort_unique_events", category="sort"):
+                all_source_ids = cp.concatenate((endpoint_source_ids, extra_source_ids))
+                all_t = cp.concatenate((endpoint_t, extra_t))
+                all_x = cp.concatenate((endpoint_x, extra_x))
+                all_y = cp.concatenate((endpoint_y, extra_y))
+                all_keys = cp.concatenate((endpoint_keys, extra_keys))
 
-            event_indices = cp.arange(int(all_keys.size), dtype=cp.int32)
-            sorted_pairs = sort_pairs(all_keys, event_indices, synchronize=False)
-            unique_pairs = unique_sorted_pairs(sorted_pairs.keys, sorted_pairs.values)
+                event_indices = cp.arange(int(all_keys.size), dtype=cp.int32)
+                sorted_pairs = sort_pairs(all_keys, event_indices, synchronize=False)
+                unique_pairs = unique_sorted_pairs(sorted_pairs.keys, sorted_pairs.values)
 
-            unique_indices = unique_pairs.values
-            unique_source_ids = all_source_ids[unique_indices]
-            unique_t = all_t[unique_indices]
-            unique_x = all_x[unique_indices]
-            unique_y = all_y[unique_indices]
-            unique_keys = unique_pairs.keys
+                unique_indices = unique_pairs.values
+                unique_source_ids = all_source_ids[unique_indices]
+                unique_t = all_t[unique_indices]
+                unique_x = all_x[unique_indices]
+                unique_y = all_y[unique_indices]
+                unique_keys = unique_pairs.keys
 
             # Derive source_side / row / part / ring indices on GPU.
-            d_source_side, d_row_indices, d_part_indices, d_ring_indices = (
-                _segment_metadata_gpu(
-                    unique_source_ids,
-                    left_count=left_count,
-                    left_segments=left_segments,
-                    right_segments=right_segments,
+            with hotpath_stage("overlay.split.segment_metadata", category="emit"):
+                d_source_side, d_row_indices, d_part_indices, d_ring_indices = (
+                    _segment_metadata_gpu(
+                        unique_source_ids,
+                        left_count=left_count,
+                        left_segments=left_segments,
+                        right_segments=right_segments,
+                    )
                 )
-            )
             event_count = int(unique_source_ids.size)
 
             return SplitEventTable(
@@ -588,7 +610,11 @@ def build_gpu_split_events(
             runtime.free(device_state.ambiguous_rows)
 
 
-def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
+def build_gpu_atomic_edges(
+    split_events: SplitEventTable,
+    *,
+    isolate_rows: bool = False,
+) -> AtomicEdgeTable:
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
 
@@ -683,6 +709,7 @@ def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
                 out_src_y,
                 out_dst_x,
                 out_dst_y,
+                row_indices=device.row_indices if isolate_rows else None,
             )
         )
         runtime.free(out_source_ids)

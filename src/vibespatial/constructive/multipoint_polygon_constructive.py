@@ -69,8 +69,8 @@ def multipoint_polygon_intersection(
     h_mp_offsets = runtime.copy_device_to_host(d_mp_offsets)
     h_both_valid = runtime.copy_device_to_host(d_both_valid)
 
-    h_mp_x = mp_buf.x if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.x)
-    h_mp_y = mp_buf.y if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.y)
+    h_mp_x = runtime.copy_device_to_host(mp_buf.x)
+    h_mp_y = runtime.copy_device_to_host(mp_buf.y)
     poly_shapely = polygons.to_shapely()
 
     point_geoms = []
@@ -153,8 +153,8 @@ def multipoint_polygon_difference(
     h_mp_valid = runtime.copy_device_to_host(d_mp_valid)
     h_both_valid = runtime.copy_device_to_host(d_both_valid)
 
-    h_mp_x = mp_buf.x if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.x)
-    h_mp_y = mp_buf.y if mp_buf.host_materialized else runtime.copy_device_to_host(mp_buf.y)
+    h_mp_x = runtime.copy_device_to_host(mp_buf.x)
+    h_mp_y = runtime.copy_device_to_host(mp_buf.y)
     poly_shapely = polygons.to_shapely()
 
     point_geoms = []

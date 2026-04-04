@@ -5,8 +5,16 @@ import json
 import pytest
 from shapely.geometry import GeometryCollection, LineString, Point
 
+import vibespatial.bench.pipeline as pipeline_module
 from vibespatial.bench.compare import compare_results
-from vibespatial.bench.pipeline import _from_shapely_safe, benchmark_pipeline_suite, suite_to_json
+from vibespatial.bench.pipeline import (
+    _actual_array_device_label,
+    _from_shapely_safe,
+    _profile_predicate_pipeline,
+    benchmark_pipeline_suite,
+    suite_to_json,
+)
+from vibespatial.bench.runner import _extract_gpu_util
 
 
 def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
@@ -48,6 +56,85 @@ def test_pipeline_smoke_suite_can_run_geopandas_predicate_baseline() -> None:
     read_stage = trace["stages"][0]
     assert read_stage["metadata"]["requested_engine"] == "pyogrio"
     assert read_stage["metadata"]["actual_engine"] in {"pyogrio", "default"}
+
+
+def test_actual_array_device_label_requires_cuda_array_interface() -> None:
+    class _FakeCpuArray:
+        device = "cpu"
+
+    class _FakeGpuArray:
+        __cuda_array_interface__ = {
+            "shape": (1,),
+            "strides": None,
+            "typestr": "<i4",
+            "data": (0, False),
+            "version": 3,
+        }
+
+    assert _actual_array_device_label(_FakeCpuArray()) == "cpu"
+    assert _actual_array_device_label(_FakeGpuArray()) == "gpu"
+
+
+def test_predicate_pipeline_reports_cpu_when_runtime_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline_module, "has_gpu_runtime", lambda: False)
+
+    result = _profile_predicate_pipeline(scale=8)
+
+    assert result.selected_runtime == "cpu"
+    trace = result.stages[0]
+    filter_stage = next(stage for stage in trace["stages"] if stage["name"] == "filter_points")
+    assert filter_stage["device"] == "cpu"
+
+
+def test_extract_gpu_util_ignores_nvml_only_cpu_traces() -> None:
+    stages = (
+        {
+            "stages": [
+                {
+                    "name": "cpu_stage",
+                    "device": "cpu",
+                    "metadata": {
+                        "gpu_device_name": "fake-gpu",
+                        "gpu_utilization_pct_avg": 12.0,
+                        "gpu_utilization_pct_max": 24.0,
+                        "gpu_memory_utilization_pct_avg": 30.0,
+                        "gpu_vram_used_bytes_max": 100,
+                        "gpu_vram_total_bytes": 1000,
+                        "gpu_util_sparkline": "||",
+                    },
+                }
+            ]
+        },
+    )
+
+    assert _extract_gpu_util(stages, selected_runtime="cpu") is None
+
+
+def test_extract_gpu_util_requires_gpu_labeled_stage() -> None:
+    stages = (
+        {
+            "stages": [
+                {
+                    "name": "gpu_stage",
+                    "device": "gpu",
+                    "metadata": {
+                        "gpu_device_name": "fake-gpu",
+                        "gpu_utilization_pct_avg": 12.0,
+                        "gpu_utilization_pct_max": 24.0,
+                        "gpu_memory_utilization_pct_avg": 30.0,
+                        "gpu_vram_used_bytes_max": 100,
+                        "gpu_vram_total_bytes": 1000,
+                        "gpu_util_sparkline": "||",
+                    },
+                }
+            ]
+        },
+    )
+
+    gpu_util = _extract_gpu_util(stages, selected_runtime="gpu")
+
+    assert gpu_util is not None
+    assert gpu_util.device_name == "fake-gpu"
 
 
 def test_from_shapely_safe_flattens_supported_geometry_collections() -> None:

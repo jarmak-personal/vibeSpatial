@@ -114,6 +114,38 @@ def build_device_backed_multipoint_output(
     )
 
 
+def build_device_backed_multilinestring_output(
+    device_x,
+    device_y,
+    *,
+    row_count: int,
+    validity: np.ndarray,
+    geometry_offsets: np.ndarray,
+    part_offsets: np.ndarray,
+) -> OwnedGeometryArray:
+    """Build a device-resident MultiLineString OwnedGeometryArray."""
+    _require_cupy()
+    runtime = get_cuda_runtime()
+    d_validity = runtime.from_host(validity)
+    return build_device_resident_owned(
+        device_families={
+            GeometryFamily.MULTILINESTRING: DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.MULTILINESTRING,
+                x=device_x,
+                y=device_y,
+                geometry_offsets=runtime.from_host(geometry_offsets),
+                part_offsets=runtime.from_host(part_offsets),
+                empty_mask=~cp.asarray(d_validity),
+            ),
+        },
+        row_count=row_count,
+        tags=cp.full(row_count, FAMILY_TAGS[GeometryFamily.MULTILINESTRING], dtype=cp.int8),
+        validity=d_validity,
+        family_row_offsets=cp.arange(row_count, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+
+
 def build_point_result_from_source(
     points: OwnedGeometryArray,
     new_validity: np.ndarray | None,

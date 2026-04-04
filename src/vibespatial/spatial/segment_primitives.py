@@ -37,6 +37,7 @@ from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: 
 from vibespatial.runtime import ExecutionMode, RuntimeSelection  # noqa: E402
 from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.config import SEGMENT_TILE_SIZE  # noqa: E402
+from vibespatial.runtime.hotpath_trace import hotpath_stage  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import (  # noqa: E402
     KernelClass,
@@ -48,6 +49,8 @@ from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_pla
 from vibespatial.spatial.segment_primitives_kernels import (  # noqa: E402
     _CANDIDATE_SCATTER_KERNEL_NAMES,
     _CANDIDATE_SCATTER_KERNEL_SOURCE,
+    _SAME_ROW_CANDIDATE_KERNEL_NAMES,
+    _SAME_ROW_CANDIDATE_KERNEL_SOURCE,
     _SEGMENT_CLASSIFY_KERNEL_NAMES,
     _SEGMENT_EXTRACT_KERNEL_NAMES,
     CLASSIFY_SOURCE_FP32,
@@ -377,6 +380,7 @@ request_nvrtc_warmup([
     ("segment-classify-fp64", CLASSIFY_SOURCE_FP64, _SEGMENT_CLASSIFY_KERNEL_NAMES),
     ("segment-classify-fp32", CLASSIFY_SOURCE_FP32, _SEGMENT_CLASSIFY_KERNEL_NAMES),
     ("segment-candidate-scatter", _CANDIDATE_SCATTER_KERNEL_SOURCE, _CANDIDATE_SCATTER_KERNEL_NAMES),
+    ("segment-same-row-candidates", _SAME_ROW_CANDIDATE_KERNEL_SOURCE, _SAME_ROW_CANDIDATE_KERNEL_NAMES),
 ])
 
 
@@ -397,6 +401,14 @@ def _candidate_scatter_kernels():
         "segment-candidate-scatter",
         _CANDIDATE_SCATTER_KERNEL_SOURCE,
         _CANDIDATE_SCATTER_KERNEL_NAMES,
+    )
+
+
+def _same_row_candidate_kernels():
+    return compile_kernel_group(
+        "segment-same-row-candidates",
+        _SAME_ROW_CANDIDATE_KERNEL_SOURCE,
+        _SAME_ROW_CANDIDATE_KERNEL_NAMES,
     )
 
 # Kernel 1 dispatch: GPU Segment Extraction
@@ -669,6 +681,7 @@ _MIN_BATCH_PAIRS = 1 * 1024 * 1024
 
 
 _MAX_BATCH_PAIRS_CAP = 8 * 1024 * 1024  # 8M pairs hard cap (~960 MB peak)
+_SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW = 2048
 
 
 def _compute_max_batch_pairs() -> int:
@@ -699,6 +712,193 @@ def _compute_max_batch_pairs() -> int:
     max_pairs = usable_bytes // _BYTES_PER_RAW_PAIR
 
     return min(max(max_pairs, _MIN_BATCH_PAIRS), _MAX_BATCH_PAIRS_CAP)
+
+
+def _segment_row_spans(row_indices):
+    import cupy as cp
+
+    n = int(row_indices.size)
+    if n == 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty, empty
+
+    d_rows = cp.asarray(row_indices, dtype=cp.int32)
+    d_change = cp.empty(n, dtype=cp.bool_)
+    d_change[0] = True
+    if n > 1:
+        d_change[1:] = d_rows[1:] != d_rows[:-1]
+    d_starts = cp.flatnonzero(d_change).astype(cp.int32)
+    d_ends = cp.concatenate((d_starts[1:], cp.asarray([n], dtype=cp.int32)))
+    d_row_ids = d_rows[d_starts]
+    return d_row_ids, d_starts, d_ends
+
+
+def _generate_candidates_gpu_same_row_warp(
+    left: DeviceSegmentTable,
+    right: DeviceSegmentTable,
+    *,
+    _allow_swap: bool = True,
+) -> DeviceSegmentIntersectionCandidates | None:
+    import cupy as cp
+
+    runtime = get_cuda_runtime()
+
+    left_row_ids, left_row_starts, left_row_ends = _segment_row_spans(left.row_indices)
+    right_row_ids, right_row_starts, right_row_ends = _segment_row_spans(right.row_indices)
+    if left_row_ids.size == 0 or right_row_ids.size == 0:
+        return None
+
+    max_left_span = int(cp.max(left_row_ends - left_row_starts).item())
+    max_right_span = int(cp.max(right_row_ends - right_row_starts).item())
+    if max_right_span > _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW:
+        if _allow_swap and max_left_span <= _SAME_ROW_WARP_MAX_RIGHT_SEGMENTS_PER_ROW:
+            swapped = _generate_candidates_gpu_same_row_warp(
+                right,
+                left,
+                _allow_swap=False,
+            )
+            if swapped is None:
+                return None
+            return DeviceSegmentIntersectionCandidates(
+                left_rows=swapped.right_rows,
+                left_segments=swapped.right_segments,
+                left_lookup=swapped.right_lookup,
+                right_rows=swapped.left_rows,
+                right_segments=swapped.left_segments,
+                right_lookup=swapped.left_lookup,
+                count=swapped.count,
+            )
+        return None
+
+    max_row_id = int(max(cp.max(left_row_ids).item(), cp.max(right_row_ids).item()))
+    d_right_row_starts = cp.full(max_row_id + 1, -1, dtype=cp.int32)
+    d_right_row_ends = cp.full(max_row_id + 1, -1, dtype=cp.int32)
+    d_right_row_starts[right_row_ids] = right_row_starts
+    d_right_row_ends[right_row_ids] = right_row_ends
+
+    d_left_rows = cp.asarray(left.row_indices, dtype=cp.int32)
+    kernels = _same_row_candidate_kernels()
+    ptr = runtime.pointer
+    n_left = left.count
+
+    d_counts = cp.empty(n_left, dtype=cp.int32)
+    total_threads = n_left * 32
+    count_kernel = kernels["count_same_row_overlap_candidates"]
+    count_grid, count_block = runtime.launch_config(count_kernel, total_threads)
+    runtime.launch(
+        count_kernel,
+        grid=count_grid,
+        block=count_block,
+        params=(
+            (
+                ptr(d_left_rows),
+                ptr(left.x0),
+                ptr(left.y0),
+                ptr(left.x1),
+                ptr(left.y1),
+                ptr(d_right_row_starts),
+                ptr(d_right_row_ends),
+                ptr(right.x0),
+                ptr(right.y0),
+                ptr(right.x1),
+                ptr(right.y1),
+                ptr(d_counts),
+                n_left,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+
+    d_counts64 = d_counts.astype(cp.int64, copy=False)
+    d_offsets = exclusive_sum(d_counts64, synchronize=False)
+    total_candidates = count_scatter_total(runtime, d_counts64, d_offsets)
+    if total_candidates == 0:
+        empty_d = runtime.allocate((0,), np.int32)
+        return DeviceSegmentIntersectionCandidates(
+            left_rows=empty_d,
+            left_segments=empty_d,
+            left_lookup=runtime.allocate((0,), np.int32),
+            right_rows=empty_d,
+            right_segments=empty_d,
+            right_lookup=runtime.allocate((0,), np.int32),
+            count=0,
+        )
+
+    d_left_lookup = cp.empty(total_candidates, dtype=cp.int32)
+    d_right_lookup = cp.empty(total_candidates, dtype=cp.int32)
+
+    scatter_kernel = kernels["scatter_same_row_overlap_candidates"]
+    scatter_grid, scatter_block = runtime.launch_config(scatter_kernel, total_threads)
+    runtime.launch(
+        scatter_kernel,
+        grid=scatter_grid,
+        block=scatter_block,
+        params=(
+            (
+                ptr(d_left_rows),
+                ptr(left.x0),
+                ptr(left.y0),
+                ptr(left.x1),
+                ptr(left.y1),
+                ptr(d_right_row_starts),
+                ptr(d_right_row_ends),
+                ptr(right.x0),
+                ptr(right.y0),
+                ptr(right.x1),
+                ptr(right.y1),
+                ptr(d_offsets),
+                ptr(d_left_lookup),
+                ptr(d_right_lookup),
+                n_left,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+
+    out_left_rows = left.row_indices[d_left_lookup]
+    out_left_segs = left.segment_indices[d_left_lookup]
+    out_right_rows = right.row_indices[d_right_lookup]
+    out_right_segs = right.segment_indices[d_right_lookup]
+
+    return DeviceSegmentIntersectionCandidates(
+        left_rows=out_left_rows,
+        left_segments=out_left_segs,
+        left_lookup=d_left_lookup,
+        right_rows=out_right_rows,
+        right_segments=out_right_segs,
+        right_lookup=d_right_lookup,
+        count=int(d_left_lookup.size),
+    )
 
 
 def _main_sweep_scatter_and_filter(
@@ -960,6 +1160,8 @@ def _scatter_and_filter_single(
 def _generate_candidates_gpu(
     left: DeviceSegmentTable,
     right: DeviceSegmentTable,
+    *,
+    require_same_row: bool = False,
 ) -> DeviceSegmentIntersectionCandidates:
     """GPU-native O(n log n) candidate generation via sort-sweep."""
     import cupy as cp
@@ -978,16 +1180,23 @@ def _generate_candidates_gpu(
             count=0,
         )
 
-    # Compute segment bounds on device (CuPy Tier 2 element-wise)
-    left_minx = cp.minimum(left.x0, left.x1)
-    left_maxx = cp.maximum(left.x0, left.x1)
-    left_miny = cp.minimum(left.y0, left.y1)
-    left_maxy = cp.maximum(left.y0, left.y1)
+    if require_same_row:
+        with hotpath_stage("segment.candidates.same_row_fast_path", category="filter"):
+            same_row_candidates = _generate_candidates_gpu_same_row_warp(left, right)
+        if same_row_candidates is not None:
+            return same_row_candidates
 
-    right_minx = cp.minimum(right.x0, right.x1)
-    right_maxx = cp.maximum(right.x0, right.x1)
-    right_miny = cp.minimum(right.y0, right.y1)
-    right_maxy = cp.maximum(right.y0, right.y1)
+    # Compute segment bounds on device (CuPy Tier 2 element-wise)
+    with hotpath_stage("segment.candidates.compute_bounds", category="setup"):
+        left_minx = cp.minimum(left.x0, left.x1)
+        left_maxx = cp.maximum(left.x0, left.x1)
+        left_miny = cp.minimum(left.y0, left.y1)
+        left_maxy = cp.maximum(left.y0, left.y1)
+
+        right_minx = cp.minimum(right.x0, right.x1)
+        right_maxx = cp.maximum(right.x0, right.x1)
+        right_miny = cp.minimum(right.y0, right.y1)
+        right_maxy = cp.maximum(right.y0, right.y1)
 
     # Sort right segments by x-midpoint for sweep-based candidate search.
     # Algorithm: sort right segments by x-midpoint, then for each left segment
@@ -1004,10 +1213,11 @@ def _generate_candidates_gpu(
     # so accepting an iterator would require invasive changes to
     # sort_pairs + its strategy dispatch.  Not worth the churn for a
     # one-shot 4MB allocation.
-    right_indices = cp.arange(right.count, dtype=cp.int32)
-    sort_result = sort_pairs(right_xmid, right_indices, synchronize=False)
-    sorted_right_xmid = sort_result.keys
-    sorted_right_idx = sort_result.values
+    with hotpath_stage("segment.candidates.sort_right_midpoints", category="sort"):
+        right_indices = cp.arange(right.count, dtype=cp.int32)
+        sort_result = sort_pairs(right_xmid, right_indices, synchronize=False)
+        sorted_right_xmid = sort_result.keys
+        sorted_right_idx = sort_result.values
 
     # -----------------------------------------------------------------------
     # P95 half-width strategy for search window sizing.
@@ -1023,48 +1233,51 @@ def _generate_candidates_gpu(
     # -----------------------------------------------------------------------
     right_half_w = (right_maxx - right_minx) * 0.5
 
-    if right.count < 20:
-        # Too few segments for P95 to matter -- use global max.
-        d_search_hw = cp.max(right_half_w)
-        has_outliers = False
-        outlier_mask_bool = None
-    else:
-        # Use partition (O(n)) instead of full sort (O(n log n)) to get P95.
-        p95_idx = int(right.count * 95) // 100  # floor index
-        partitioned_hw = cp.partition(right_half_w, p95_idx)
-        d_p95_hw = partitioned_hw[p95_idx]       # CuPy scalar on device
-        d_max_hw = cp.max(right_half_w)          # CuPy scalar on device
-
-        # If P95 == max, all segments fit within the P95 window.
-        # Materializes a single Python bool (one scalar D2H -- necessary
-        # for control flow, not in a loop).
-        has_outliers = bool(d_max_hw > d_p95_hw)
-        d_search_hw = d_p95_hw
-
-        # Pre-compute outlier boolean mask on device for later use
-        # in both main-sweep dedup and outlier pass.
-        if has_outliers:
-            outlier_mask_bool = right_half_w > d_search_hw
-        else:
+    with hotpath_stage("segment.candidates.search_window", category="filter"):
+        if right.count < 20:
+            # Too few segments for P95 to matter -- use global max.
+            d_search_hw = cp.max(right_half_w)
+            has_outliers = False
             outlier_mask_bool = None
+        else:
+            # Use partition (O(n)) instead of full sort (O(n log n)) to get P95.
+            p95_idx = int(right.count * 95) // 100  # floor index
+            partitioned_hw = cp.partition(right_half_w, p95_idx)
+            d_p95_hw = partitioned_hw[p95_idx]       # CuPy scalar on device
+            d_max_hw = cp.max(right_half_w)          # CuPy scalar on device
+
+            # If P95 == max, all segments fit within the P95 window.
+            # Materializes a single Python bool (one scalar D2H -- necessary
+            # for control flow, not in a loop).
+            has_outliers = bool(d_max_hw > d_p95_hw)
+            d_search_hw = d_p95_hw
+
+            # Pre-compute outlier boolean mask on device for later use
+            # in both main-sweep dedup and outlier pass.
+            if has_outliers:
+                outlier_mask_bool = right_half_w > d_search_hw
+            else:
+                outlier_mask_bool = None
 
     # --- Main sweep: binary search using P95 (or max) half-width ---
-    search_lo = left_minx - d_search_hw
-    search_hi = left_maxx + d_search_hw
+    with hotpath_stage("segment.candidates.binary_search", category="filter"):
+        search_lo = left_minx - d_search_hw
+        search_hi = left_maxx + d_search_hw
 
-    # Binary search in sorted_right_xmid (same-stream ordering guarantees
-    # sort_pairs completes before lower_bound/upper_bound read its output)
-    range_start = lower_bound(sorted_right_xmid, search_lo, synchronize=False)
-    range_end = upper_bound(sorted_right_xmid, search_hi, synchronize=False)
+        # Binary search in sorted_right_xmid (same-stream ordering guarantees
+        # sort_pairs completes before lower_bound/upper_bound read its output)
+        range_start = lower_bound(sorted_right_xmid, search_lo, synchronize=False)
+        range_end = upper_bound(sorted_right_xmid, search_hi, synchronize=False)
 
-    # Two-pass: count candidates per left, prefix-sum, scatter.
-    # Use int64 for counts/offsets: at 100k+ segments, total candidates can
-    # exceed int32 max (~2.1B), causing prefix-sum overflow and negative batch sizes.
-    d_cand_counts = cp.asarray(range_end, dtype=cp.int64) - cp.asarray(range_start, dtype=cp.int64)
-    d_cand_counts = cp.maximum(d_cand_counts, 0)  # clamp negatives
+        # Two-pass: count candidates per left, prefix-sum, scatter.
+        # Use int64 for counts/offsets: at 100k+ segments, total candidates can
+        # exceed int32 max (~2.1B), causing prefix-sum overflow and negative batch sizes.
+    with hotpath_stage("segment.candidates.prefix_candidate_counts", category="sort"):
+        d_cand_counts = cp.asarray(range_end, dtype=cp.int64) - cp.asarray(range_start, dtype=cp.int64)
+        d_cand_counts = cp.maximum(d_cand_counts, 0)  # clamp negatives
 
-    d_cand_offsets = exclusive_sum(d_cand_counts, synchronize=False)
-    total_raw_candidates = count_scatter_total(runtime, d_cand_counts, d_cand_offsets)
+        d_cand_offsets = exclusive_sum(d_cand_counts, synchronize=False)
+        total_raw_candidates = count_scatter_total(runtime, d_cand_counts, d_cand_offsets)
 
     # Guard: if total raw candidates exceed what the GPU can classify
     # (each surviving pair requires ~49 bytes of output arrays), raise early
@@ -1083,24 +1296,25 @@ def _generate_candidates_gpu(
         )
 
     if total_raw_candidates > 0:
-        main_final_left, main_final_right = _main_sweep_scatter_and_filter(
-            runtime=runtime,
-            left=left,
-            d_cand_offsets=d_cand_offsets,
-            range_start=range_start,
-            range_end=range_end,
-            sorted_right_idx=sorted_right_idx,
-            left_minx=left_minx,
-            left_maxx=left_maxx,
-            left_miny=left_miny,
-            left_maxy=left_maxy,
-            right_minx=right_minx,
-            right_maxx=right_maxx,
-            right_miny=right_miny,
-            right_maxy=right_maxy,
-            outlier_mask_bool=outlier_mask_bool,
-            total_raw_candidates=total_raw_candidates,
-        )
+        with hotpath_stage("segment.candidates.main_sweep_filter", category="filter"):
+            main_final_left, main_final_right = _main_sweep_scatter_and_filter(
+                runtime=runtime,
+                left=left,
+                d_cand_offsets=d_cand_offsets,
+                range_start=range_start,
+                range_end=range_end,
+                sorted_right_idx=sorted_right_idx,
+                left_minx=left_minx,
+                left_maxx=left_maxx,
+                left_miny=left_miny,
+                left_maxy=left_maxy,
+                right_minx=right_minx,
+                right_maxx=right_maxx,
+                right_miny=right_miny,
+                right_maxy=right_maxy,
+                outlier_mask_bool=outlier_mask_bool,
+                total_raw_candidates=total_raw_candidates,
+            )
     else:
         main_final_left = cp.empty(0, dtype=cp.int32)
         main_final_right = cp.empty(0, dtype=cp.int32)
@@ -1110,72 +1324,74 @@ def _generate_candidates_gpu(
         # Identify outlier right segment indices (boolean mask -> compact).
         # These are right segments whose half-width exceeds P95, meaning
         # the main sweep's narrower window may have missed them.
-        outlier_mask_u8 = outlier_mask_bool.astype(cp.uint8)
-        outlier_compact = compact_indices(outlier_mask_u8)
+        with hotpath_stage("segment.candidates.outlier_pass", category="filter"):
+            outlier_mask_u8 = outlier_mask_bool.astype(cp.uint8)
+            outlier_compact = compact_indices(outlier_mask_u8)
 
-        if outlier_compact.count > 0:
-            outlier_right_idx = outlier_compact.values  # indices into right arrays
-            n_outliers = outlier_compact.count
-            n_left = left.count
+            if outlier_compact.count > 0:
+                outlier_right_idx = outlier_compact.values  # indices into right arrays
+                n_outliers = outlier_compact.count
+                n_left = left.count
 
-            # Batched brute-force: process outlier rights in chunks to avoid
-            # materializing O(n_left * n_outliers) pairs which would OOM at
-            # scale (e.g. 1M left × 50K outliers = 50B elements = 200+ GB).
-            # Batch size adapts to available VRAM (same policy as main sweep).
-            _MAX_EXPANDED_PAIRS = _compute_max_batch_pairs()
-            _OUTLIER_BATCH = max(1, _MAX_EXPANDED_PAIRS // max(n_left, 1))
-            batch_left_parts = []
-            batch_right_parts = []
-            d_left_arange = cp.arange(n_left, dtype=cp.int32)
+                # Batched brute-force: process outlier rights in chunks to avoid
+                # materializing O(n_left * n_outliers) pairs which would OOM at
+                # scale (e.g. 1M left × 50K outliers = 50B elements = 200+ GB).
+                # Batch size adapts to available VRAM (same policy as main sweep).
+                _MAX_EXPANDED_PAIRS = _compute_max_batch_pairs()
+                _OUTLIER_BATCH = max(1, _MAX_EXPANDED_PAIRS // max(n_left, 1))
+                batch_left_parts = []
+                batch_right_parts = []
+                d_left_arange = cp.arange(n_left, dtype=cp.int32)
 
-            for batch_start in range(0, n_outliers, _OUTLIER_BATCH):
-                batch_end = min(batch_start + _OUTLIER_BATCH, n_outliers)
-                batch_right = outlier_right_idx[batch_start:batch_end]
-                batch_size = batch_end - batch_start
+                for batch_start in range(0, n_outliers, _OUTLIER_BATCH):
+                    batch_end = min(batch_start + _OUTLIER_BATCH, n_outliers)
+                    batch_right = outlier_right_idx[batch_start:batch_end]
+                    batch_size = batch_end - batch_start
 
-                # Expand: n_left × batch_size pairs (bounded to ~1M per batch)
-                ol_left_idx = cp.repeat(d_left_arange, batch_size)
-                ol_right_idx = cp.tile(batch_right, n_left)
+                    # Expand: n_left × batch_size pairs (bounded to ~1M per batch)
+                    ol_left_idx = cp.repeat(d_left_arange, batch_size)
+                    ol_right_idx = cp.tile(batch_right, n_left)
 
-                # Vectorized MBR overlap test
-                ol_overlap = (
-                    (left_minx[ol_left_idx] <= right_maxx[ol_right_idx]) &
-                    (left_maxx[ol_left_idx] >= right_minx[ol_right_idx]) &
-                    (left_miny[ol_left_idx] <= right_maxy[ol_right_idx]) &
-                    (left_maxy[ol_left_idx] >= right_miny[ol_right_idx])
-                )
-                ol_compact = compact_indices(ol_overlap.astype(cp.uint8))
+                    # Vectorized MBR overlap test
+                    ol_overlap = (
+                        (left_minx[ol_left_idx] <= right_maxx[ol_right_idx]) &
+                        (left_maxx[ol_left_idx] >= right_minx[ol_right_idx]) &
+                        (left_miny[ol_left_idx] <= right_maxy[ol_right_idx]) &
+                        (left_maxy[ol_left_idx] >= right_miny[ol_right_idx])
+                    )
+                    ol_compact = compact_indices(ol_overlap.astype(cp.uint8))
 
-                if ol_compact.count > 0:
-                    ol_keep = ol_compact.values
-                    batch_left_parts.append(ol_left_idx[ol_keep])
-                    batch_right_parts.append(ol_right_idx[ol_keep])
+                    if ol_compact.count > 0:
+                        ol_keep = ol_compact.values
+                        batch_left_parts.append(ol_left_idx[ol_keep])
+                        batch_right_parts.append(ol_right_idx[ol_keep])
 
-            if batch_left_parts:
-                outlier_final_left = cp.concatenate(batch_left_parts) if len(batch_left_parts) > 1 else batch_left_parts[0]
-                outlier_final_right = cp.concatenate(batch_right_parts) if len(batch_right_parts) > 1 else batch_right_parts[0]
+                if batch_left_parts:
+                    outlier_final_left = cp.concatenate(batch_left_parts) if len(batch_left_parts) > 1 else batch_left_parts[0]
+                    outlier_final_right = cp.concatenate(batch_right_parts) if len(batch_right_parts) > 1 else batch_right_parts[0]
+                else:
+                    outlier_final_left = cp.empty(0, dtype=cp.int32)
+                    outlier_final_right = cp.empty(0, dtype=cp.int32)
             else:
                 outlier_final_left = cp.empty(0, dtype=cp.int32)
                 outlier_final_right = cp.empty(0, dtype=cp.int32)
-        else:
-            outlier_final_left = cp.empty(0, dtype=cp.int32)
-            outlier_final_right = cp.empty(0, dtype=cp.int32)
     else:
         outlier_final_left = cp.empty(0, dtype=cp.int32)
         outlier_final_right = cp.empty(0, dtype=cp.int32)
 
     # --- Merge main + outlier candidates on device ---
-    if outlier_final_left.size > 0 and main_final_left.size > 0:
-        final_left = cp.concatenate([main_final_left, outlier_final_left])
-        final_right = cp.concatenate([main_final_right, outlier_final_right])
-    elif outlier_final_left.size > 0:
-        final_left = outlier_final_left
-        final_right = outlier_final_right
-    else:
-        final_left = main_final_left
-        final_right = main_final_right
+    with hotpath_stage("segment.candidates.assemble_output", category="emit"):
+        if outlier_final_left.size > 0 and main_final_left.size > 0:
+            final_left = cp.concatenate([main_final_left, outlier_final_left])
+            final_right = cp.concatenate([main_final_right, outlier_final_right])
+        elif outlier_final_left.size > 0:
+            final_left = outlier_final_left
+            final_right = outlier_final_right
+        else:
+            final_left = main_final_left
+            final_right = main_final_right
 
-    total_candidates = int(final_left.size)
+        total_candidates = int(final_left.size)
     if total_candidates == 0:
         empty_d = runtime.allocate((0,), np.int32)
         return DeviceSegmentIntersectionCandidates(
@@ -1189,10 +1405,34 @@ def _generate_candidates_gpu(
         )
 
     # Build output candidate arrays
-    out_left_rows = left.row_indices[final_left]
-    out_left_segs = left.segment_indices[final_left]
-    out_right_rows = right.row_indices[final_right]
-    out_right_segs = right.segment_indices[final_right]
+    with hotpath_stage("segment.candidates.gather_rows", category="emit"):
+        out_left_rows = left.row_indices[final_left]
+        out_left_segs = left.segment_indices[final_left]
+        out_right_rows = right.row_indices[final_right]
+        out_right_segs = right.segment_indices[final_right]
+
+        if require_same_row:
+            same_row_mask = (out_left_rows == out_right_rows).astype(cp.uint8, copy=False)
+            same_row_keep = compact_indices(same_row_mask)
+            if same_row_keep.count == 0:
+                empty_d = runtime.allocate((0,), np.int32)
+                return DeviceSegmentIntersectionCandidates(
+                    left_rows=empty_d,
+                    left_segments=empty_d,
+                    left_lookup=runtime.allocate((0,), np.int32),
+                    right_rows=empty_d,
+                    right_segments=empty_d,
+                    right_lookup=runtime.allocate((0,), np.int32),
+                    count=0,
+                )
+            keep = same_row_keep.values
+            final_left = final_left[keep]
+            final_right = final_right[keep]
+            out_left_rows = out_left_rows[keep]
+            out_left_segs = out_left_segs[keep]
+            out_right_rows = out_right_rows[keep]
+            out_right_segs = out_right_segs[keep]
+            total_candidates = int(final_left.size)
 
     return DeviceSegmentIntersectionCandidates(
         left_rows=out_left_rows,
@@ -1824,6 +2064,7 @@ def _classify_segment_intersections_gpu(
     robustness_plan: RobustnessPlan,
     tile_size: int = SEGMENT_TILE_SIZE,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
+    _require_same_row: bool = False,
 ) -> SegmentIntersectionResult:
     """Full GPU-native segment intersection pipeline.
 
@@ -1847,12 +2088,14 @@ def _classify_segment_intersections_gpu(
     compute_type = "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"
 
     # --- Kernel 1: Extract segments on GPU ---
-    d_left_segs = _extract_segments_gpu(left, compute_type)
-    d_right_segs = (
-        _cached_right_device_segments
-        if _cached_right_device_segments is not None
-        else _extract_segments_gpu(right, compute_type)
-    )
+    with hotpath_stage("segment.classify.extract_left_segments", category="setup"):
+        d_left_segs = _extract_segments_gpu(left, compute_type)
+    with hotpath_stage("segment.classify.extract_right_segments", category="setup"):
+        d_right_segs = (
+            _cached_right_device_segments
+            if _cached_right_device_segments is not None
+            else _extract_segments_gpu(right, compute_type)
+        )
 
     if d_left_segs.count == 0 or d_right_segs.count == 0:
         return _empty_segment_intersection_result(
@@ -1862,7 +2105,12 @@ def _classify_segment_intersections_gpu(
         )
 
     # --- Kernel 2: Generate candidates on GPU ---
-    d_candidates = _generate_candidates_gpu(d_left_segs, d_right_segs)
+    with hotpath_stage("segment.classify.generate_candidates", category="filter"):
+        d_candidates = _generate_candidates_gpu(
+            d_left_segs,
+            d_right_segs,
+            require_same_row=_require_same_row,
+        )
 
     if d_candidates.count == 0:
         return _empty_segment_intersection_result(
@@ -1928,8 +2176,9 @@ def _classify_segment_intersections_gpu(
             KERNEL_PARAM_I32,
         ),
     )
-    grid, block = runtime.launch_config(classify_kernel, n_pairs)
-    runtime.launch(classify_kernel, grid=grid, block=block, params=classify_params)
+    with hotpath_stage("segment.classify.launch_kernel", category="refine"):
+        grid, block = runtime.launch_config(classify_kernel, n_pairs)
+        runtime.launch(classify_kernel, grid=grid, block=block, params=classify_params)
 
     # Preserve the CPU-visible ambiguous-row contract on device: rows whose
     # fast orientation filter was numerically ambiguous or degenerate still
@@ -1963,34 +2212,36 @@ def _classify_segment_intersections_gpu(
         errbound = _ORIENTATION_ERRBOUND * (cp.abs(term1) + cp.abs(term2))
         return det, cp.abs(det) <= errbound
 
-    o1, a1 = _orient2d_fast_device(ax, ay, bx, by, cx, cy)
-    o2, a2 = _orient2d_fast_device(ax, ay, bx, by, dx, dy)
-    o3, a3 = _orient2d_fast_device(cx, cy, dx, dy, ax, ay)
-    o4, a4 = _orient2d_fast_device(cx, cy, dx, dy, bx, by)
+    with hotpath_stage("segment.classify.ambiguous_rows", category="refine"):
+        o1, a1 = _orient2d_fast_device(ax, ay, bx, by, cx, cy)
+        o2, a2 = _orient2d_fast_device(ax, ay, bx, by, dx, dy)
+        o3, a3 = _orient2d_fast_device(cx, cy, dx, dy, ax, ay)
+        o4, a4 = _orient2d_fast_device(cx, cy, dx, dy, bx, by)
 
-    zero_left = (ax == bx) & (ay == by)
-    zero_right = (cx == dx) & (cy == dy)
-    sign1 = cp.sign(o1).astype(cp.int8, copy=False)
-    sign2 = cp.sign(o2).astype(cp.int8, copy=False)
-    sign3 = cp.sign(o3).astype(cp.int8, copy=False)
-    sign4 = cp.sign(o4).astype(cp.int8, copy=False)
+        zero_left = (ax == bx) & (ay == by)
+        zero_right = (cx == dx) & (cy == dy)
+        sign1 = cp.sign(o1).astype(cp.int8, copy=False)
+        sign2 = cp.sign(o2).astype(cp.int8, copy=False)
+        sign3 = cp.sign(o3).astype(cp.int8, copy=False)
+        sign4 = cp.sign(o4).astype(cp.int8, copy=False)
 
-    ambiguous_mask = (
-        a1
-        | a2
-        | a3
-        | a4
-        | zero_left
-        | zero_right
-        | (sign1 == 0)
-        | (sign2 == 0)
-        | (sign3 == 0)
-        | (sign4 == 0)
-    )
-    d_ambiguous_rows = compact_indices(ambiguous_mask.astype(cp.uint8)).values
+        ambiguous_mask = (
+            a1
+            | a2
+            | a3
+            | a4
+            | zero_left
+            | zero_right
+            | (sign1 == 0)
+            | (sign2 == 0)
+            | (sign3 == 0)
+            | (sign4 == 0)
+        )
+        d_ambiguous_rows = compact_indices(ambiguous_mask.astype(cp.uint8)).values
 
     # Sync GPU before returning device-primary result.
-    runtime.synchronize()
+    with hotpath_stage("segment.classify.synchronize", category="emit"):
+        runtime.synchronize()
 
     # Device-primary: host arrays are lazily materialized on first access.
     return SegmentIntersectionResult(
@@ -2196,6 +2447,7 @@ def classify_segment_intersections(
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
+    _require_same_row: bool = False,
 ) -> SegmentIntersectionResult:
     """Classify all segment-segment intersections between two geometry arrays.
 
@@ -2262,6 +2514,7 @@ def classify_segment_intersections(
             robustness_plan=robustness_plan,
             tile_size=tile_size,
             _cached_right_device_segments=_cached_right_device_segments,
+            _require_same_row=_require_same_row,
         )
 
     # CPU fallback

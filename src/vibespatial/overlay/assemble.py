@@ -54,18 +54,22 @@ def _has_polygonal_families(geom: OwnedGeometryArray) -> bool:
     )
 
 
-def _empty_polygon_output(runtime_selection: RuntimeSelection) -> OwnedGeometryArray:
+def _empty_polygon_output(
+    runtime_selection: RuntimeSelection,
+    *,
+    row_count: int = 0,
+) -> OwnedGeometryArray:
     residency = Residency.DEVICE if cp is not None else Residency.HOST
-    empty_validity = np.asarray([], dtype=bool)
-    empty_tags = np.asarray([], dtype=np.int8)
-    empty_offsets = np.asarray([], dtype=np.int32)
+    empty_validity = np.zeros(row_count, dtype=bool)
+    empty_tags = np.full(row_count, -1, dtype=np.int8)
+    empty_offsets = np.full(row_count, -1, dtype=np.int32)
     if residency is Residency.DEVICE:
         result = build_device_resident_owned(
             device_families={},
-            row_count=0,
-            tags=cp.empty(0, dtype=cp.int8),
-            validity=cp.empty(0, dtype=cp.bool_),
-            family_row_offsets=cp.empty(0, dtype=cp.int32),
+            row_count=row_count,
+            tags=cp.asarray(empty_tags),
+            validity=cp.asarray(empty_validity),
+            family_row_offsets=cp.asarray(empty_offsets),
             execution_mode="gpu",
         )
         result.runtime_history.append(runtime_selection)
@@ -155,6 +159,8 @@ def _build_polygon_output_from_faces_gpu(
     half_edge_graph: HalfEdgeGraph,
     faces: OverlayFaceTable,
     selected_face_indices: np.ndarray | cp.ndarray,
+    *,
+    preserve_row_count: int | None = None,
 ) -> OwnedGeometryArray | None:
     """GPU face-to-polygon assembly (Phase 11: GPU boundary cycle detection).
 
@@ -178,7 +184,10 @@ def _build_polygon_output_from_faces_gpu(
     if cp is None or half_edge_graph.device_state is None or faces.device_state is None:
         return None
     if selected_face_indices.size == 0:
-        return _empty_polygon_output(faces.runtime_selection)
+        return _empty_polygon_output(
+            faces.runtime_selection,
+            row_count=preserve_row_count or 0,
+        )
 
     # Lazy import: kernel compile functions stay in gpu.py to avoid
     # circular imports (they depend on gpu_kernels module-level state).
@@ -231,7 +240,10 @@ def _build_polygon_output_from_faces_gpu(
 
     boundary_count = int(cp.sum(d_is_boundary != 0))
     if boundary_count == 0:
-        return _empty_polygon_output(faces.runtime_selection)
+        return _empty_polygon_output(
+            faces.runtime_selection,
+            row_count=preserve_row_count or 0,
+        )
 
     # --- Step 4: Compute boundary next pointers via GPU kernel ---
     d_boundary_next = cp.full(edge_count, -1, dtype=cp.int32)
@@ -315,7 +327,10 @@ def _build_polygon_output_from_faces_gpu(
     del valid_cycle_mask
 
     if ring_count == 0:
-        return _empty_polygon_output(faces.runtime_selection)
+        return _empty_polygon_output(
+            faces.runtime_selection,
+            row_count=preserve_row_count or 0,
+        )
 
     valid_cycle_starts = cycle_starts[valid_cycle_indices]
     valid_cycle_ends = cycle_ends[valid_cycle_indices]
@@ -336,23 +351,14 @@ def _build_polygon_output_from_faces_gpu(
     b_y1 = d_src_y_b[b_next_edges]
     del b_next_edges
     b_cross = b_x0 * b_y1 - b_x1 * b_y0
-    b_cx_contrib = (b_x0 + b_x1) * b_cross
-    b_cy_contrib = (b_y0 + b_y1) * b_cross
     # Phase 25 memory: boundary coordinate arrays consumed by cross products.
     del b_x0, b_y0, b_x1, b_y1
 
     # Segmented reduce for per-cycle area and centroid
     cross_sums_b = segmented_reduce_sum(b_cross, valid_cycle_starts, valid_cycle_ends, num_segments=ring_count).values
-    cx_sums_b = segmented_reduce_sum(b_cx_contrib, valid_cycle_starts, valid_cycle_ends, num_segments=ring_count).values
-    cy_sums_b = segmented_reduce_sum(b_cy_contrib, valid_cycle_starts, valid_cycle_ends, num_segments=ring_count).values
-    del b_cross, b_cx_contrib, b_cy_contrib
-
+    del b_cross
     d_ring_area = cross_sums_b * 0.5
-    safe_twice_b = cp.where(cross_sums_b == 0.0, 1.0, cross_sums_b)
-    factor_b = 1.0 / (3.0 * safe_twice_b)
-    d_ring_centroid_x = cx_sums_b * factor_b
-    d_ring_centroid_y = cy_sums_b * factor_b
-    del cross_sums_b, cx_sums_b, cy_sums_b, safe_twice_b, factor_b
+    del cross_sums_b
 
     # Ring edge starts (first full edge id of each valid cycle) and counts
     d_ring_edge_starts = sorted_full_edge_ids[valid_cycle_starts]
@@ -435,6 +441,7 @@ def _build_polygon_output_from_faces_gpu(
 
             # First edge of each hole face (the canonical cycle start)
             d_hole_edge_starts = d_face_edge_ids_dev[d_vh_starts]
+            d_hole_source_rows = d_row_indices[d_hole_edge_starts].astype(cp.int32)
 
             # Scatter coordinates via GPU kernel
             d_hole_coord_counts = d_vh_lengths + 1  # +1 for ring closure
@@ -477,8 +484,6 @@ def _build_polygon_output_from_faces_gpu(
 
             # Per-ring starts/ends for segmented reduce (use coord offsets)
             h_cross = h_x0 * h_y1 - h_x1 * h_y0
-            h_cx_c = (h_x0 + h_x1) * h_cross
-            h_cy_c = (h_y0 + h_y1) * h_cross
             del h_x0, h_y0, h_x1, h_y1
 
             # Segmented reduce -- use coord-based segments (each ring's coords
@@ -486,14 +491,7 @@ def _build_polygon_output_from_faces_gpu(
             hole_seg_starts = d_hole_coord_offsets[:-1]
             hole_seg_ends = d_hole_coord_offsets[1:] - 1  # exclude closure vertex from cross products
             h_area = segmented_reduce_sum(h_cross, hole_seg_starts, hole_seg_ends, num_segments=n_valid_holes).values * 0.5
-            h_cx_sum = segmented_reduce_sum(h_cx_c, hole_seg_starts, hole_seg_ends, num_segments=n_valid_holes).values
-            h_cy_sum = segmented_reduce_sum(h_cy_c, hole_seg_starts, hole_seg_ends, num_segments=n_valid_holes).values
-            del h_cross, h_cx_c, h_cy_c, hole_seg_starts, hole_seg_ends
-            h_safe_twice = cp.where(h_area == 0.0, 0.5, h_area * 2.0)
-            h_factor = 1.0 / (3.0 * h_safe_twice)
-            h_centroid_x = h_cx_sum * h_factor
-            h_centroid_y = h_cy_sum * h_factor
-            del h_cx_sum, h_cy_sum, h_safe_twice, h_factor
+            del h_cross, hole_seg_starts, hole_seg_ends
 
             # Filter degenerate holes on device (|area| < SPATIAL_EPSILON)
             d_nondegenerate = cp.abs(h_area) >= SPATIAL_EPSILON
@@ -504,13 +502,12 @@ def _build_polygon_output_from_faces_gpu(
             if n_valid_nondegenerate > 0:
                 # Keep only non-degenerate hole rings (device-resident)
                 _d_hole_area = h_area[d_nondegen_idx]
-                _d_hole_cx = h_centroid_x[d_nondegen_idx]
-                _d_hole_cy = h_centroid_y[d_nondegen_idx]
                 _d_hole_lengths = d_vh_lengths[d_nondegen_idx]
                 _d_hole_starts = d_hole_coord_offsets[:-1][d_nondegen_idx]
+                _d_hole_source_rows = d_hole_source_rows[d_nondegen_idx]
                 # These device arrays are passed directly to Step 8
-                _hole_device_data = (_d_hole_area, _d_hole_cx, _d_hole_cy,
-                                     _d_hole_lengths, _d_hole_starts,
+                _hole_device_data = (_d_hole_area,
+                                     _d_hole_lengths, _d_hole_starts, _d_hole_source_rows,
                                      d_hole_x, d_hole_y, d_hole_coord_offsets,
                                      n_valid_nondegenerate)
             else:
@@ -524,8 +521,8 @@ def _build_polygon_output_from_faces_gpu(
     boundary_ring_count = ring_count
 
     if _hole_device_data is not None:
-        (_d_hole_area, _d_hole_cx, _d_hole_cy, _d_hole_lengths,
-         _d_hole_starts, _d_hole_all_x, _d_hole_all_y,
+        (_d_hole_area, _d_hole_lengths,
+         _d_hole_starts, _d_hole_source_rows, _d_hole_all_x, _d_hole_all_y,
          _d_hole_coord_offsets_full, n_holes) = _hole_device_data
 
         # Build compact hole coordinate buffer: gather non-degenerate hole
@@ -556,8 +553,6 @@ def _build_polygon_output_from_faces_gpu(
         # have negative (clockwise) area so assign_holes_to_exteriors treats
         # them as holes rather than self-assigned exteriors.
         d_all_area = cp.concatenate((d_ring_area, -cp.abs(_d_hole_area)))
-        d_all_cx = cp.concatenate((d_ring_centroid_x, _d_hole_cx))
-        d_all_cy = cp.concatenate((d_ring_centroid_y, _d_hole_cy))
         d_all_x = cp.concatenate((d_out_x, d_hole_compact_x))
         d_all_y = cp.concatenate((d_out_y, d_hole_compact_y))
         # Merged coordinate offsets: boundary offsets + compact hole offsets shifted.
@@ -568,16 +563,14 @@ def _build_polygon_output_from_faces_gpu(
         d_all_coord_offsets = cp.concatenate((d_ring_coord_offsets, d_hole_offsets_shifted))
         d_all_edge_counts = cp.concatenate((d_ring_edge_counts, d_hole_edge_counts))
         # Phase 25 memory: pre-merge ring arrays consumed by concatenation.
-        del d_ring_area, d_ring_centroid_x, d_ring_centroid_y
+        del d_ring_area
         del d_out_x, d_out_y, d_ring_coord_offsets, d_ring_edge_counts
         del d_hole_compact_x, d_hole_compact_y, d_hole_offsets_compact
-        del _d_hole_area, _d_hole_cx, _d_hole_cy, d_hole_edge_counts
+        del _d_hole_area, d_hole_edge_counts
         del d_hole_offsets_shifted
     else:
         n_holes = 0
         d_all_area = d_ring_area
-        d_all_cx = d_ring_centroid_x
-        d_all_cy = d_ring_centroid_y
         d_all_x = d_out_x
         d_all_y = d_out_y
         d_all_coord_offsets = d_ring_coord_offsets
@@ -589,10 +582,44 @@ def _build_polygon_output_from_faces_gpu(
     del d_hole_fi, d_src_x_b, d_src_y_b
     total_ring_count = boundary_ring_count + n_holes
 
+    # Compute one in-ring sample point per assembled ring. Unlike centroids,
+    # these sample points stay inside concave rings and match the host
+    # assembly logic used for ring containment and hole assignment.
+    d_ring_sample_x = cp.empty(total_ring_count, dtype=cp.float64)
+    d_ring_sample_y = cp.empty(total_ring_count, dtype=cp.float64)
+    sample_grid = (max(1, (total_ring_count + 255) // 256), 1, 1)
+    runtime.launch(
+        kernels["compute_ring_sample_points"],
+        grid=sample_grid,
+        block=block,
+        params=(
+            (
+                ptr(d_all_coord_offsets),
+                ptr(d_all_edge_counts),
+                ptr(d_all_x),
+                ptr(d_all_y),
+                ptr(d_ring_sample_x),
+                ptr(d_ring_sample_y),
+                total_ring_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+
     # --- Source rows for ALL rings on device ---
     # Boundary rings: from cycle walk; holes: inherit from exterior later.
     d_all_source_rows = cp.full(total_ring_count, -1, dtype=cp.int32)
     d_all_source_rows[:boundary_ring_count] = d_cycle_source_rows
+    if _hole_device_data is not None:
+        d_all_source_rows[boundary_ring_count:] = _d_hole_source_rows
 
     # --- Step 8b: GPU nesting depth for boundary rings ---
     # Boundary rings with positive area might be nested inside other
@@ -612,7 +639,7 @@ def _build_polygon_output_from_faces_gpu(
             kernels["count_boundary_nesting_depth"],
             grid=boundary_depth_grid, block=block,
             params=(
-                (ptr(d_all_cx), ptr(d_all_cy), ptr(d_all_area),
+                (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
                  ptr(d_all_source_rows), ptr(d_all_coord_offsets),
                  ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
                  ptr(d_boundary_depth), boundary_ring_count),
@@ -645,15 +672,18 @@ def _build_polygon_output_from_faces_gpu(
     d_exterior_id = cp.full(total_ring_count, -1, dtype=cp.int32)
     ring_grid_all = (max(1, (total_ring_count + 255) // 256), 1, 1)
     runtime.launch(
-        kernels["assign_holes_to_exteriors"],
+            kernels["assign_holes_to_exteriors"],
         grid=ring_grid_all, block=block,
         params=(
-            (ptr(d_all_cx), ptr(d_all_cy), ptr(d_all_area),
+            (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
+             ptr(d_exterior_mask_full.astype(cp.int8, copy=False)),
+             ptr(d_all_source_rows),
              ptr(d_all_coord_offsets), ptr(d_all_edge_counts),
              ptr(d_all_x), ptr(d_all_y),
              ptr(d_exterior_indices), exterior_count,
              ptr(d_exterior_id), total_ring_count),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_I32,
@@ -676,7 +706,7 @@ def _build_polygon_output_from_faces_gpu(
             kernels["count_sibling_hole_depth"],
             grid=ring_grid_all, block=block,
             params=(
-                (ptr(d_all_cx), ptr(d_all_cy), ptr(d_all_area),
+                (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
                  ptr(d_exterior_id), ptr(d_all_coord_offsets),
                  ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
                  ptr(d_sibling_depth), total_ring_count),
@@ -764,6 +794,7 @@ def _build_polygon_output_from_faces_gpu(
     d_row_ends = cp.concatenate((d_row_starts[1:], cp.asarray([n_polygons], dtype=cp.int32)))
     d_polys_per_row = d_row_ends - d_row_starts
     n_output_rows = int(d_row_starts.size)
+    d_output_source_rows = d_poly_source_row[d_row_starts]
 
     return _build_device_resident_polygon_output(
         d_all_x=d_all_x,
@@ -774,8 +805,10 @@ def _build_polygon_output_from_faces_gpu(
         d_rings_per_poly=d_rings_per_poly,
         d_polys_per_row=d_polys_per_row,
         d_poly_starts=d_poly_starts,
+        d_output_source_rows=d_output_source_rows,
         n_output_rows=n_output_rows,
         runtime_selection=faces.runtime_selection,
+        preserve_row_count=preserve_row_count,
     )
 
 
@@ -789,8 +822,10 @@ def _build_device_resident_polygon_output(
     d_rings_per_poly: cp.ndarray,
     d_polys_per_row: cp.ndarray,
     d_poly_starts: cp.ndarray,
+    d_output_source_rows: cp.ndarray,
     n_output_rows: int,
     runtime_selection: RuntimeSelection,
+    preserve_row_count: int | None = None,
 ) -> OwnedGeometryArray:
     """Build device-resident OwnedGeometryArray from GPU face assembly results.
 
@@ -806,13 +841,18 @@ def _build_device_resident_polygon_output(
     # --- Vectorised classification: polygon vs multipolygon per row ---
     # A row with exactly 1 polygon is a POLYGON; otherwise MULTIPOLYGON.
     is_polygon_row = d_polys_per_row == 1
-    output_row_count = n_output_rows
+    output_row_count = preserve_row_count if preserve_row_count is not None else n_output_rows
     if output_row_count == 0:
-        return _empty_polygon_output(runtime_selection)
+        return _empty_polygon_output(runtime_selection, row_count=preserve_row_count or 0)
 
-    validity = cp.ones(output_row_count, dtype=cp.bool_)
+    validity = cp.zeros(output_row_count, dtype=cp.bool_)
     tags = cp.full(output_row_count, -1, dtype=cp.int8)
     family_row_offsets = cp.full(output_row_count, -1, dtype=cp.int32)
+    compact_row_ids = (
+        d_output_source_rows.astype(cp.int32, copy=False)
+        if preserve_row_count is not None
+        else cp.arange(n_output_rows, dtype=cp.int32)
+    )
 
     poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
     mpoly_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
@@ -829,7 +869,7 @@ def _build_device_resident_polygon_output(
     ring_counts_per_poly = d_rings_per_poly.astype(cp.int32, copy=False)
     total_output_rings = int(ring_counts_per_poly.sum(dtype=cp.int64).item())
     if total_output_rings == 0:
-        return _empty_polygon_output(runtime_selection)
+        return _empty_polygon_output(runtime_selection, row_count=preserve_row_count or 0)
 
     # Build per-polygon -> row mapping: polygon p belongs to the row
     # determined by cumulative polys_per_row.
@@ -865,17 +905,20 @@ def _build_device_resident_polygon_output(
     ring_is_mpoly = mpoly_mask_per_polygon[ring_poly_ids]
 
     # Assign family tags and family_row_offsets (vectorised, no Python loop)
-    tags[poly_row_mask] = poly_tag
-    tags[mpoly_row_mask] = mpoly_tag
     polygon_count = int(poly_row_mask.sum().item())
     multipolygon_count = int(mpoly_row_mask.sum().item())
     # Family-local sequential index: polygon rows get 0..polygon_count-1,
     # multipolygon rows get 0..multipolygon_count-1.
     if polygon_count > 0:
-        family_row_offsets[poly_row_mask] = cp.arange(polygon_count, dtype=cp.int32)
+        poly_rows = compact_row_ids[poly_row_mask]
+        family_row_offsets[poly_rows] = cp.arange(polygon_count, dtype=cp.int32)
+        validity[poly_rows] = True
+        tags[poly_rows] = poly_tag
     if multipolygon_count > 0:
-        family_row_offsets[mpoly_row_mask] = cp.arange(multipolygon_count, dtype=cp.int32)
-
+        mpoly_rows = compact_row_ids[mpoly_row_mask]
+        family_row_offsets[mpoly_rows] = cp.arange(multipolygon_count, dtype=cp.int32)
+        validity[mpoly_rows] = True
+        tags[mpoly_rows] = mpoly_tag
     device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
 
     if polygon_count > 0:
@@ -921,10 +964,13 @@ def _build_device_resident_polygon_output(
         d_mpoly_part_offsets = cp.zeros(int(mpoly_polygons.size) + 1, dtype=cp.int32)
         cp.cumsum(rings_per_mpoly_part, out=d_mpoly_part_offsets[1:])
         # Geometry offsets: parts per multipolygon row
-        mpoly_row_indices = poly_to_row[mpoly_polygons]
+        # Under preserve_row_count, compact_row_ids holds sparse source-row ids.
+        # Use those source ids when mapping polygons back to multipolygon
+        # family-local row ids; poly_to_row alone is only a compact row position.
+        mpoly_row_indices = compact_row_ids[poly_to_row[mpoly_polygons]]
         # Map row indices to family-local multipolygon index
         mpoly_row_to_family = cp.full(output_row_count, -1, dtype=cp.int32)
-        mpoly_rows = cp.flatnonzero(mpoly_row_mask).astype(cp.int32, copy=False)
+        mpoly_rows = compact_row_ids[mpoly_row_mask]
         mpoly_row_to_family[mpoly_rows] = cp.arange(multipolygon_count, dtype=cp.int32)
         mpoly_family_ids = mpoly_row_to_family[mpoly_row_indices]
         parts_per_geom = cp.bincount(mpoly_family_ids, minlength=multipolygon_count).astype(cp.int32, copy=False)

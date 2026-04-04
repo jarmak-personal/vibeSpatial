@@ -576,7 +576,8 @@ _OVERLAY_FACE_LABEL_KERNEL_NAMES = (
 # 4. Face assembly (ring reconstruction) kernels
 # ---------------------------------------------------------------------------
 # Kernels: compute_boundary_edges, compute_boundary_next,
-#          scatter_ring_coordinates, assign_holes_to_exteriors,
+#          scatter_ring_coordinates, compute_ring_sample_points,
+#          assign_holes_to_exteriors,
 #          count_boundary_nesting_depth, count_sibling_hole_depth
 
 _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
@@ -700,13 +701,80 @@ scatter_ring_coordinates(
   out_y[offset + n_edges] = src_y[start_edge];
 }
 
-// Test each ring centroid against each exterior ring to determine
+// Compute one host-style sample point per ring. The sample point is taken
+// from the first non-degenerate edge midpoint, offset by a tiny inward
+// perpendicular scaled by the ring extent. This mirrors the host fallback's
+// _face_sample_point helper and avoids using centroids that can lie outside
+// concave rings.
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_ring_sample_points(
+    const int* __restrict__ ring_coord_offsets,
+    const int* __restrict__ ring_edge_counts,
+    const double* __restrict__ all_x,
+    const double* __restrict__ all_y,
+    double* __restrict__ out_sample_x,
+    double* __restrict__ out_sample_y,
+    int ring_count
+) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= ring_count) return;
+
+  const int start = ring_coord_offsets[r];
+  const int n_edges = ring_edge_counts[r];
+  if (n_edges <= 0) {
+    out_sample_x[r] = 0.0;
+    out_sample_y[r] = 0.0;
+    return;
+  }
+
+  double min_x = all_x[start];
+  double max_x = all_x[start];
+  double min_y = all_y[start];
+  double max_y = all_y[start];
+  for (int i = 1; i < n_edges; ++i) {
+    const double x = all_x[start + i];
+    const double y = all_y[start + i];
+    if (x < min_x) min_x = x;
+    if (x > max_x) max_x = x;
+    if (y < min_y) min_y = y;
+    if (y > max_y) max_y = y;
+  }
+  double extent = max_x - min_x;
+  const double extent_y = max_y - min_y;
+  if (extent_y > extent) extent = extent_y;
+  if (extent < 1.0) extent = 1.0;
+  const double epsilon = extent * 1.0e-6;
+
+  for (int i = 0; i < n_edges; ++i) {
+    const int j = (i + 1) % n_edges;
+    const double x0 = all_x[start + i];
+    const double y0 = all_y[start + i];
+    const double x1 = all_x[start + j];
+    const double y1 = all_y[start + j];
+    const double dx = x1 - x0;
+    const double dy = y1 - y0;
+    const double length = sqrt(dx * dx + dy * dy);
+    if (length <= 0.0) continue;
+    const double midpoint_x = 0.5 * (x0 + x1);
+    const double midpoint_y = 0.5 * (y0 + y1);
+    out_sample_x[r] = midpoint_x - (dy / length) * epsilon;
+    out_sample_y[r] = midpoint_y + (dx / length) * epsilon;
+    return;
+  }
+
+  out_sample_x[r] = all_x[start];
+  out_sample_y[r] = all_y[start];
+}
+
+// Test each ring sample point against each exterior ring to determine
 // hole-to-exterior assignment. One thread per candidate ring.
 extern "C" __global__ void __launch_bounds__(256, 4)
 assign_holes_to_exteriors(
-    const double* __restrict__ ring_centroid_x,
-    const double* __restrict__ ring_centroid_y,
+    const double* __restrict__ ring_sample_x,
+    const double* __restrict__ ring_sample_y,
     const double* __restrict__ ring_area,
+    const signed char* __restrict__ is_true_exterior,
+    const int* __restrict__ source_rows,
     const int* __restrict__ ring_coord_offsets,
     const int* __restrict__ ring_edge_counts,
     const double* __restrict__ all_x,
@@ -718,23 +786,27 @@ assign_holes_to_exteriors(
 ) {
   const int r = blockIdx.x * blockDim.x + threadIdx.x;
   if (r >= ring_count) return;
-  // Exterior rings map to themselves
-  if (ring_area[r] > 0.0) {
+  // Only true exteriors map to themselves. Nested positive-area boundary
+  // rings still need containment assignment, matching the host assembler.
+  if (is_true_exterior[r] != 0) {
     out_exterior_id[r] = r;
     return;
   }
-  // Hole: find smallest containing exterior whose area exceeds |hole area|
-  const double px = ring_centroid_x[r];
-  const double py = ring_centroid_y[r];
-  const double abs_hole_area = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
+  // Non-exterior ring: find smallest containing exterior of the same row
+  // whose area exceeds |ring area|.
+  const double px = ring_sample_x[r];
+  const double py = ring_sample_y[r];
+  const double abs_ring_area = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
+  const int row_r = source_rows[r];
   double best_area = 1e308;
   int best_exterior = -1;
   for (int ei = 0; ei < exterior_count; ++ei) {
     const int ext = exterior_indices[ei];
+    if (source_rows[ext] != row_r) continue;
     const double ext_area = ring_area[ext];
     if (ext_area <= 0.0 || ext_area >= best_area) continue;
-    // Exterior must be strictly larger than the candidate hole
-    if (ext_area <= abs_hole_area) continue;
+    // Exterior must be strictly larger than the candidate ring
+    if (ext_area <= abs_ring_area) continue;
     // PIP test against exterior ring coordinates
     const int coord_start = ring_coord_offsets[ext];
     const int coord_end = coord_start + ring_edge_counts[ext] + 1;
@@ -748,14 +820,14 @@ assign_holes_to_exteriors(
 
 // Count containment depth for boundary rings (positive area).
 // For each boundary ring r, count how many OTHER boundary rings from
-// the SAME source row with strictly larger area contain r's centroid.
+// the SAME source row with strictly larger area contain r's sample point.
 // Even depth -> true exterior, odd depth -> nested interior.
 // out_depth[r] is written for ALL boundary_count rings; callers
 // inspect it only for positive-area boundary rings.
 extern "C" __global__ void __launch_bounds__(256, 4)
 count_boundary_nesting_depth(
-    const double* __restrict__ centroid_x,
-    const double* __restrict__ centroid_y,
+    const double* __restrict__ sample_x,
+    const double* __restrict__ sample_y,
     const double* __restrict__ ring_area,
     const int* __restrict__ source_rows,
     const int* __restrict__ coord_offsets,
@@ -773,8 +845,8 @@ count_boundary_nesting_depth(
     out_depth[r] = 0;
     return;
   }
-  const double px = centroid_x[r];
-  const double py = centroid_y[r];
+  const double px = sample_x[r];
+  const double py = sample_y[r];
   const int row_r = source_rows[r];
   int depth = 0;
 
@@ -795,12 +867,12 @@ count_boundary_nesting_depth(
 // Count nesting depth among sibling holes assigned to the same exterior.
 // For each ring r that has been assigned to an exterior (exterior_id[r] >= 0
 // and exterior_id[r] != r), count how many other rings sharing the same
-// exterior with strictly larger |area| contain r's centroid.
+// exterior with strictly larger |area| contain r's sample point.
 // Even local depth -> direct hole; odd -> nested inside another hole (skip).
 extern "C" __global__ void __launch_bounds__(256, 4)
 count_sibling_hole_depth(
-    const double* __restrict__ centroid_x,
-    const double* __restrict__ centroid_y,
+    const double* __restrict__ sample_x,
+    const double* __restrict__ sample_y,
     const double* __restrict__ ring_area,
     const int* __restrict__ exterior_id,
     const int* __restrict__ coord_offsets,
@@ -820,8 +892,8 @@ count_sibling_hole_depth(
     return;
   }
 
-  const double px = centroid_x[r];
-  const double py = centroid_y[r];
+  const double px = sample_x[r];
+  const double py = sample_y[r];
   const double abs_area_r = ring_area[r] < 0.0 ? -ring_area[r] : ring_area[r];
   int depth = 0;
 
@@ -846,6 +918,7 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
     "compute_boundary_edges",
     "compute_boundary_next",
     "scatter_ring_coordinates",
+    "compute_ring_sample_points",
     "assign_holes_to_exteriors",
     "count_boundary_nesting_depth",
     "count_sibling_hole_depth",

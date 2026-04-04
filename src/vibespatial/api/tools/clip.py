@@ -3,8 +3,9 @@
 import warnings
 
 import numpy as np
+import pandas as pd
 import pandas.api.types
-from shapely.geometry import MultiPolygon, Polygon, box
+from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
 
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._compat import PANDAS_GE_30
@@ -14,6 +15,9 @@ from vibespatial.api.geometry_array import (
     POLYGON_GEOM_TYPES,
     _check_crs,
     _crs_mismatch_warn,
+)
+from vibespatial.api.geometry_array import (
+    from_shapely as _geometryarray_from_shapely,
 )
 
 
@@ -36,6 +40,76 @@ def _mask_is_list_like_rectangle(mask):
     return pandas.api.types.is_list_like(mask) and not isinstance(
         mask, GeoDataFrame | GeoSeries | Polygon | MultiPolygon
     )
+
+
+def _rectangle_bounds_from_mask(mask):
+    """Return rectangle bounds for axis-aligned rectangle masks, else None."""
+    if _mask_is_list_like_rectangle(mask):
+        return tuple(float(v) for v in mask)
+    if isinstance(mask, MultiPolygon):
+        return None
+    if not isinstance(mask, Polygon) or mask.is_empty or len(mask.interiors) != 0:
+        return None
+    coords = np.asarray(mask.exterior.coords)
+    if len(coords) != 5:
+        return None
+    xs = np.unique(coords[:4, 0])
+    ys = np.unique(coords[:4, 1])
+    if len(xs) != 2 or len(ys) != 2:
+        return None
+    return (float(xs[0]), float(ys[0]), float(xs[1]), float(ys[1]))
+
+
+def _clip_polygon_partition_with_rectangle_mask(
+    partition,
+    rectangle_bounds: tuple[float, float, float, float],
+):
+    """Clip polygon rows to a rectangle mask while preserving sliver leftovers.
+
+    The owned rectangle clip path returns polygonal area correctly, but
+    `OwnedGeometryArray` still cannot represent per-row GeometryCollections.
+    For rectangle masks we recover lower-dimensional leftovers at the
+    GeoPandas/Shapely boundary, then assemble any mixed polygon+line result
+    there as well.
+    """
+    xmin, ymin, xmax, ymax = rectangle_bounds
+    rectangle_mask = box(xmin, ymin, xmax, ymax)
+    source_values = partition.geometry.values if isinstance(partition, GeoDataFrame) else partition.values
+    source_geoms = np.asarray(source_values, dtype=object)
+    area_values = source_values.clip_by_rect(xmin, ymin, xmax, ymax)
+    area_geoms = np.asarray(area_values, dtype=object)
+
+    assembled = np.empty(len(partition), dtype=object)
+    for row_index in range(len(partition)):
+        source_geom = source_geoms[row_index]
+        if source_geom is None or source_geom.is_empty:
+            assembled[row_index] = None
+            continue
+        area_geom = area_geoms[row_index]
+        if area_geom is not None and area_geom.is_empty:
+            area_geom = None
+
+        edge_geom = source_geom.boundary.intersection(rectangle_mask)
+        if area_geom is not None and edge_geom is not None:
+            edge_geom = edge_geom.difference(area_geom.boundary)
+        if edge_geom is not None and edge_geom.is_empty:
+            edge_geom = None
+
+        if area_geom is None and edge_geom is None:
+            assembled[row_index] = None
+        elif area_geom is None:
+            assembled[row_index] = edge_geom
+        elif edge_geom is None:
+            assembled[row_index] = area_geom
+        else:
+            assembled[row_index] = GeometryCollection([area_geom, edge_geom])
+
+    clipped_partition = partition.copy(deep=not PANDAS_GE_30)
+    if isinstance(clipped_partition, GeoDataFrame):
+        clipped_partition[clipped_partition._geometry_column_name] = assembled
+    else:
+        clipped_partition[:] = assembled
+    return clipped_partition
 
 
 def _clip_gdf_with_mask(gdf, mask, sort=False):
@@ -64,6 +138,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         that intersects with polygon/rectangle.
     """
     clipping_by_rectangle = _mask_is_list_like_rectangle(mask)
+    rectangle_bounds = _rectangle_bounds_from_mask(mask)
     if clipping_by_rectangle:
         intersection_polygon = box(*mask)
     else:
@@ -75,31 +150,104 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
     )
     gdf_sub = gdf.iloc[candidate_rows]
 
-    # For performance reasons points don't need to be intersected with poly
-    non_point_mask = gdf_sub.geom_type != "Point"
+    # For performance reasons Points don't need to be intersected with the
+    # mask at all. For the remaining rows, keep line-like and polygon-like
+    # subsets homogeneous so public clip(mask) does not depend on mixed-family
+    # constructive dispatch for simple viewport-style workloads.
+    point_mask = gdf_sub.geom_type == "Point"
+    non_point_mask = ~point_mask
+    line_mask = gdf_sub.geom_type.isin(LINE_GEOM_TYPES)
+    multiline_mask = gdf_sub.geom_type == "MultiLineString"
+    simple_line_mask = line_mask & ~multiline_mask
+    polygon_mask = gdf_sub.geom_type.isin(POLYGON_GEOM_TYPES)
+    generic_mask = non_point_mask & ~(simple_line_mask | multiline_mask | polygon_mask)
 
     if not non_point_mask.any():
         # only points, directly return
         return gdf_sub
 
-    # Clip the data with the polygon
-    if isinstance(gdf_sub, GeoDataFrame):
-        clipped = gdf_sub.copy(deep=not PANDAS_GE_30)
-        if clipping_by_rectangle:
-            clipped.loc[non_point_mask, clipped._geometry_column_name] = (
-                gdf_sub.geometry.values[non_point_mask].clip_by_rect(*mask)
+    def _clip_partition(partition, *, use_rect_fast_path=False):
+        if (
+            not clipping_by_rectangle
+            and rectangle_bounds is not None
+            and partition.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        ):
+            return _clip_polygon_partition_with_rectangle_mask(partition, rectangle_bounds)
+
+        if isinstance(partition, GeoDataFrame):
+            clipped_partition = partition.copy(deep=not PANDAS_GE_30)
+            geom_name = clipped_partition._geometry_column_name
+            geom_values = (
+                partition.geometry.values.clip_by_rect(*rectangle_bounds)
+                if use_rect_fast_path
+                else partition.geometry.values.intersection(mask)
             )
-        else:
-            clipped.loc[non_point_mask, clipped._geometry_column_name] = (
-                gdf_sub.geometry.values[non_point_mask].intersection(mask)
+            if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
+                geom_values = geom_values.remove_repeated_points(0.0).normalize()
+            clipped_partition[geom_name] = geom_values
+            return clipped_partition
+
+        clipped_partition = partition.copy(deep=not PANDAS_GE_30)
+        geom_values = (
+            partition.values.clip_by_rect(*rectangle_bounds)
+            if use_rect_fast_path
+            else partition.values.intersection(mask)
+        )
+        if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
+            geom_values = geom_values.remove_repeated_points(0.0).normalize()
+        clipped_partition[:] = geom_values
+        return clipped_partition
+
+    parts = []
+    if point_mask.any():
+        parts.append(gdf_sub[point_mask].copy(deep=not PANDAS_GE_30))
+    if simple_line_mask.any():
+        parts.append(
+            _clip_partition(
+                gdf_sub[simple_line_mask],
+                use_rect_fast_path=clipping_by_rectangle,
             )
+        )
+    if multiline_mask.any():
+        parts.append(
+            _clip_partition(
+                gdf_sub[multiline_mask],
+                use_rect_fast_path=(
+                    clipping_by_rectangle
+                    or rectangle_bounds is not None
+                ),
+            )
+        )
+    if polygon_mask.any():
+        parts.append(
+            _clip_partition(
+                gdf_sub[polygon_mask],
+                use_rect_fast_path=clipping_by_rectangle,
+            )
+        )
+    if generic_mask.any():
+        parts.append(
+            _clip_partition(
+                gdf_sub[generic_mask],
+                use_rect_fast_path=clipping_by_rectangle,
+            )
+        )
+
+    clipped = pd.concat(parts).loc[gdf_sub.index]
+    if isinstance(clipped, GeoDataFrame):
+        geom_name = clipped._geometry_column_name
+        clipped = clipped.copy(deep=not PANDAS_GE_30)
+        clipped[geom_name] = GeoSeries(
+            _geometryarray_from_shapely(np.asarray(clipped[geom_name], dtype=object), crs=gdf.crs),
+            index=clipped.index,
+            crs=gdf.crs,
+        )
     else:
-        # GeoSeries
-        clipped = gdf_sub.copy(deep=not PANDAS_GE_30)
-        if clipping_by_rectangle:
-            clipped[non_point_mask] = gdf_sub.values[non_point_mask].clip_by_rect(*mask)
-        else:
-            clipped[non_point_mask] = gdf_sub.values[non_point_mask].intersection(mask)
+        clipped = GeoSeries(
+            _geometryarray_from_shapely(np.asarray(clipped, dtype=object), crs=gdf.crs),
+            index=clipped.index,
+            crs=gdf.crs,
+        )
 
     if clipping_by_rectangle:
         # clip_by_rect might return empty geometry collections in edge cases

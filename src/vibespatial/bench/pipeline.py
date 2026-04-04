@@ -396,6 +396,10 @@ def _selected_runtime_from_history(*values) -> str | None:
     return None
 
 
+def _actual_array_device_label(value) -> str:
+    return "gpu" if hasattr(value, "__cuda_array_interface__") else "cpu"
+
+
 def _pipeline_runtime_from_stage_devices(stage_devices: list[str]) -> str:
     devices = {device for device in stage_devices if device}
     if "gpu" in devices and "cpu" in devices:
@@ -876,7 +880,7 @@ def _profile_predicate_pipeline(
                 stage.metadata["gpu_substage_timings"] = gpu_timings
             _record_stage_overheads(stage, audit, memory, batch)
 
-        filter_device = ExecutionMode.GPU if hasattr(mask, 'device') else ExecutionMode.CPU
+        filter_device = _actual_array_device_label(mask)
         with profiler.stage(
             "filter_points",
             category="filter",
@@ -1137,11 +1141,14 @@ def _profile_zero_transfer_pipeline(
     transfer_count = audit.transfer_count
     materialization_count = audit.materialization_count
     status = "ok" if transfer_count == 0 and materialization_count == 0 else "failed"
+    stage_devices = [stage.device for stage in profiler._stages]
+    actual_selected_runtime = _pipeline_runtime_from_stage_devices(stage_devices)
+    planner_selected_runtime = ExecutionMode.GPU.value
     trace = profiler.finish(
         metadata={
             "scale": scale,
-            "actual_selected_runtime": "gpu",
-            "planner_selected_runtime": ExecutionMode.GPU.value,
+            "actual_selected_runtime": actual_selected_runtime,
+            "planner_selected_runtime": planner_selected_runtime,
             "dispatch_events": len(get_dispatch_events(clear=True)),
             "fallback_events": len(get_fallback_events(clear=True)),
         }
@@ -1151,8 +1158,8 @@ def _profile_zero_transfer_pipeline(
         scale=scale,
         status=status,
         elapsed_seconds=trace.total_elapsed_seconds,
-        selected_runtime="gpu",
-        planner_selected_runtime=ExecutionMode.GPU.value,
+        selected_runtime=actual_selected_runtime,
+        planner_selected_runtime=planner_selected_runtime,
         output_rows=int(len(filtered)),
         transfer_count=transfer_count,
         materialization_count=materialization_count,
@@ -1526,7 +1533,7 @@ def _profile_vegetation_corridor_pipeline(
                     valid_owned = from_shapely_geometries(valid_geoms)
                     corridor_owned = union_all_gpu_owned(valid_owned)
                 stage.rows_out = corridor_owned.row_count
-                stage.device = _selected_runtime_from_history(corridor_owned) or "gpu"
+                stage.device = _selected_runtime_from_history(corridor_owned) or "cpu"
             except Exception:
                 # Fallback to the GeoDataFrame path if tree-reduce fails
                 valid_result = make_valid_owned(owned=buffered_lines)

@@ -271,12 +271,19 @@ def plan_adaptive_execution(
         gpu_available=snapshot.gpu_available,
         workload_shape=workload.workload_shape,
     )
+    effective_threshold = crossover_policy.auto_min_rows
+    if workload.workload_shape in (WorkloadShape.BROADCAST_RIGHT, WorkloadShape.SCALAR_RIGHT):
+        effective_threshold = (
+            crossover_policy.broadcast_min_rows
+            if crossover_policy.broadcast_min_rows is not None
+            else crossover_policy.auto_min_rows // 10
+        )
 
     if initial_runtime.requested is ExecutionMode.AUTO and dispatch_decision is DispatchDecision.CPU:
         runtime_selection = RuntimeSelection(
             requested=initial_runtime.requested,
             selected=ExecutionMode.CPU,
-            reason=f"{initial_runtime.reason}; below {crossover_policy.auto_min_rows}-row crossover",
+            reason=f"{initial_runtime.reason}; below {effective_threshold}-row crossover",
         )
     elif dispatch_decision is DispatchDecision.GPU:
         runtime_selection = RuntimeSelection(

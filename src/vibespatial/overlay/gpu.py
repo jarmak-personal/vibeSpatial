@@ -44,6 +44,7 @@ from .types import (  # noqa: E402, F401  # Re-exported for backward compatibili
     AtomicEdgeTable,
     HalfEdgeGraph,
     HalfEdgeGraphDeviceState,
+    OverlayExecutionPlan,
     OverlayFaceDeviceState,
     OverlayFaceTable,
     SplitEventDeviceState,
@@ -249,6 +250,7 @@ def build_gpu_split_events(
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    require_same_row: bool = False,
 ) -> SplitEventTable:
     # Delegated to overlay/split.py — this re-export preserves import compatibility.
     from vibespatial.overlay.split import build_gpu_split_events as _impl
@@ -257,13 +259,124 @@ def build_gpu_split_events(
         intersection_result=intersection_result,
         dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
+        require_same_row=require_same_row,
     )
 
 
-def build_gpu_atomic_edges(split_events: SplitEventTable) -> AtomicEdgeTable:
+def build_gpu_atomic_edges(
+    split_events: SplitEventTable,
+    *,
+    isolate_rows: bool = False,
+) -> AtomicEdgeTable:
     # Delegated to overlay/split.py — this re-export preserves import compatibility.
     from vibespatial.overlay.split import build_gpu_atomic_edges as _impl
-    return _impl(split_events)
+    return _impl(split_events, isolate_rows=isolate_rows)
+
+
+def _build_overlay_execution_plan(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
+    _row_isolated: bool = False,
+) -> OverlayExecutionPlan:
+    split_events = build_gpu_split_events(
+        left,
+        right,
+        dispatch_mode=dispatch_mode,
+        _cached_right_segments=_cached_right_segments,
+        require_same_row=_row_isolated,
+    )
+    atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
+    # split_events are fully consumed by build_gpu_atomic_edges.
+    _free_split_event_device_state(split_events)
+    try:
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass
+
+    half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=_row_isolated)
+    # half_edge_graph retains the atomic-edge arrays it still needs.
+    _free_atomic_edge_excess(atomic_edges)
+    try:
+        get_cuda_runtime().free_pool_memory()
+    except Exception:
+        pass
+
+    faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
+    return OverlayExecutionPlan(
+        split_events=None,
+        atomic_edges=None,
+        half_edge_graph=half_edge_graph,
+        faces=faces,
+        row_isolated=_row_isolated,
+    )
+
+
+def _materialize_overlay_execution_plan(
+    plan: OverlayExecutionPlan,
+    *,
+    operation: str,
+    requested: ExecutionMode,
+    preserve_row_count: int | None = None,
+) -> tuple[OwnedGeometryArray, ExecutionMode]:
+    d_selected_face_indices = _select_overlay_face_indices_gpu(plan.faces, operation=operation)
+    try:
+        if requested is ExecutionMode.GPU:
+            result = _build_polygon_output_from_faces_gpu(
+                plan.half_edge_graph,
+                plan.faces,
+                d_selected_face_indices,
+                preserve_row_count=preserve_row_count,
+            )
+            if result is None:
+                raise RuntimeError(
+                    "GPU face assembly returned None (device state unavailable) "
+                    "despite GPU execution mode being requested"
+                )
+            return result, ExecutionMode.GPU
+
+        gpu_result: OwnedGeometryArray | None = None
+        gpu_failed = False
+        gpu_fail_reason = ""
+        try:
+            gpu_result = _build_polygon_output_from_faces_gpu(
+                plan.half_edge_graph,
+                plan.faces,
+                d_selected_face_indices,
+                preserve_row_count=preserve_row_count,
+            )
+            if gpu_result is None:
+                gpu_failed = True
+                gpu_fail_reason = "GPU face assembly unavailable (no device state)"
+        except Exception as exc:
+            gpu_failed = True
+            gpu_fail_reason = f"GPU face assembly raised {type(exc).__name__}: {exc}"
+
+        if gpu_failed:
+            record_fallback_event(
+                surface="overlay.gpu._overlay_owned",
+                reason=gpu_fail_reason,
+                detail=f"operation={operation}",
+                requested=requested,
+                selected=ExecutionMode.CPU,
+                pipeline="overlay",
+                d2h_transfer=True,
+            )
+            selected_face_indices = cp.asnumpy(d_selected_face_indices)
+            result = _build_polygon_output_from_faces(
+                plan.half_edge_graph, plan.faces, selected_face_indices,
+            )
+            return result, ExecutionMode.CPU
+
+        return gpu_result, ExecutionMode.GPU  # type: ignore[return-value]
+    finally:
+        del d_selected_face_indices
+        try:
+            get_cuda_runtime().free_pool_memory()
+        except Exception:
+            pass
 
 
 def overlay_intersection_owned(
@@ -338,6 +451,7 @@ def _overlay_owned(
     operation: str,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     _cached_right_segments: DeviceSegmentTable | None = None,
+    _row_isolated: bool = False,
 ) -> OwnedGeometryArray:
     requested = dispatch_mode if isinstance(dispatch_mode, ExecutionMode) else ExecutionMode(dispatch_mode)
     _polygonal_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
@@ -396,7 +510,7 @@ def _overlay_owned(
         )
         return _overlay_owned(left, right, operation=operation, dispatch_mode=ExecutionMode.CPU)
 
-    if operation == "intersection":
+    if operation == "intersection" and not _row_isolated:
         rectangle_fast_path = _overlay_intersection_rectangles_gpu(left, right, requested=requested)
         if rectangle_fast_path is not None:
             return rectangle_fast_path
@@ -409,105 +523,24 @@ def _overlay_owned(
     # pipeline, so no additional transfer heuristic is needed here — the
     # adaptive runtime handles crossover decisions upstream via
     # plan_dispatch_selection().
-
-    split_events = build_gpu_split_events(
-        left, right,
+    plan = _build_overlay_execution_plan(
+        left,
+        right,
         dispatch_mode=ExecutionMode.GPU,
         _cached_right_segments=_cached_right_segments,
+        _row_isolated=_row_isolated,
     )
-    atomic_edges = build_gpu_atomic_edges(split_events)
-    # Phase 25 memory: split_events device state is fully consumed by
-    # build_gpu_atomic_edges.  Free its device arrays to release ~5 large
-    # float64 buffers (x, y, t, packed_keys, source_segment_ids) before
-    # the half-edge graph and face table allocate more.
-    _free_split_event_device_state(split_events)
-    # Return freed split-event blocks to the device so they can be reused
-    # by the half-edge graph and face table allocations that follow.
+    result, face_assembly_mode = _materialize_overlay_execution_plan(
+        plan,
+        operation=operation,
+        requested=requested,
+        preserve_row_count=left.row_count if _row_isolated else None,
+    )
+    del plan
     try:
         get_cuda_runtime().free_pool_memory()
     except Exception:
-        pass  # best-effort cleanup
-    half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
-    # Phase 25 memory: atomic_edges device state arrays that are NOT
-    # shared with half_edge_graph can be freed.  The HalfEdgeGraph keeps
-    # references to src_x, src_y, source_segment_ids, source_side,
-    # row_indices, part_indices, ring_indices, direction from the
-    # AtomicEdgeDeviceState — but dst_x and dst_y are only needed during
-    # build_gpu_half_edge_graph and can be freed now.
-    _free_atomic_edge_excess(atomic_edges)
-    # Return freed atomic-edge excess blocks to the device before face
-    # table allocation.
-    try:
-        get_cuda_runtime().free_pool_memory()
-    except Exception:
-        pass  # best-effort cleanup
-    faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
-    # Phase 13: Device-resident face selection — avoids triggering
-    # _ensure_host() D->H on bounded_mask/left_covered/right_covered.
-    d_selected_face_indices = _select_overlay_face_indices_gpu(faces, operation=operation)
-    # GPU face assembly is the primary path.  The GPU pipeline (Phases 7-14)
-    # returns device-resident results, so it is strongly preferred.
-    #
-    # - GPU-explicit mode: GPU only, raise on failure.
-    # - AUTO mode: GPU first, CPU fallback when GPU is unavailable or errors.
-    if requested is ExecutionMode.GPU:
-        # Strict GPU: no fallback.
-        result = _build_polygon_output_from_faces_gpu(
-            half_edge_graph, faces, d_selected_face_indices,
-        )
-        if result is None:
-            raise RuntimeError(
-                "GPU face assembly returned None (device state unavailable) "
-                "despite GPU execution mode being requested"
-            )
-        face_assembly_mode = ExecutionMode.GPU
-    else:
-        # AUTO: GPU first, CPU fallback on failure.
-        gpu_result: OwnedGeometryArray | None = None
-        gpu_failed = False
-        gpu_fail_reason = ""
-        try:
-            gpu_result = _build_polygon_output_from_faces_gpu(
-                half_edge_graph, faces, d_selected_face_indices,
-            )
-            if gpu_result is None:
-                gpu_failed = True
-                gpu_fail_reason = "GPU face assembly unavailable (no device state)"
-        except Exception as exc:
-            gpu_failed = True
-            gpu_fail_reason = f"GPU face assembly raised {type(exc).__name__}: {exc}"
-
-        if gpu_failed:
-            record_fallback_event(
-                surface="overlay.gpu._overlay_owned",
-                reason=gpu_fail_reason,
-                detail=f"operation={operation}",
-                requested=requested,
-                selected=ExecutionMode.CPU,
-                pipeline="overlay",
-                d2h_transfer=True,
-            )
-            # CPU fallback needs host indices
-            selected_face_indices = cp.asnumpy(d_selected_face_indices)
-            result = _build_polygon_output_from_faces(
-                half_edge_graph, faces, selected_face_indices,
-            )
-            face_assembly_mode = ExecutionMode.CPU
-        else:
-            result = gpu_result  # type: ignore[assignment]
-            face_assembly_mode = ExecutionMode.GPU
-    # Phase 25 memory: free intermediate overlay structures once the final
-    # OwnedGeometryArray has been built.  The result holds its own device
-    # coordinate arrays; the half-edge graph, face table, and face indices
-    # are no longer needed.
-    del half_edge_graph, faces, d_selected_face_indices
-    # Return freed overlay structures to the device.  When _overlay_owned
-    # is called repeatedly (per-group loop in spatial_overlay_owned), this
-    # prevents pool-cached blocks from accumulating across iterations.
-    try:
-        get_cuda_runtime().free_pool_memory()
-    except Exception:
-        pass  # best-effort cleanup
+        pass
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,

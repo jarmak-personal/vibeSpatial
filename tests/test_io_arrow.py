@@ -718,6 +718,26 @@ def test_geoseries_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     assert geopandas.get_fallback_events(clear=True) == []
 
 
+def test_geoseries_to_arrow_point_fast_path_preserves_empty_point_rows() -> None:
+    geopandas.clear_fallback_events()
+    series = geopandas.GeoSeries([Point(0, 0), Point(), None, Point(2, 2)])
+
+    arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
+    schema_capsule, array_capsule = arrow_array.__arrow_c_array__()
+    import pyarrow as pa
+
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+    pa_array = pa.Array._import_from_c_capsule(field.__arrow_c_schema__(), array_capsule)
+    restored = io_arrow._decode_geoarrow_array_to_owned(field, pa_array).to_shapely()
+
+    assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+    assert restored[0].equals(Point(0, 0))
+    assert restored[1].is_empty
+    assert restored[2] is None
+    assert restored[3].equals(Point(2, 2))
+    assert geopandas.get_fallback_events(clear=True) == []
+
+
 def test_geodataframe_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     geopandas.clear_fallback_events()
     gdf = geopandas.GeoDataFrame(
@@ -1173,6 +1193,31 @@ def test_write_geoparquet_device_geoarrow_outputs_true_geoarrow(tmp_path) -> Non
     assert not arrow_table.schema.field("geometry").type.equals(pa.binary())
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.TRANSFER] == []
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
+
+
+def test_write_geoparquet_device_geoarrow_preserves_empty_point_rows(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    geopandas.clear_fallback_events()
+    gdf, owned = _make_device_dga_gdf([Point(0, 0), Point(), None, Point(1, 1)])
+    path = tmp_path / "device_geoarrow_empty_points.parquet"
+
+    write_geoparquet(gdf, path, geometry_encoding="geoarrow")
+    result = geopandas.read_parquet(path)
+    arrow_table = pq.read_table(path)
+
+    assert result.geometry.iloc[0].equals(Point(0, 0))
+    assert result.geometry.iloc[1].is_empty
+    assert result.geometry.iloc[2] is None
+    assert result.geometry.iloc[3].equals(Point(1, 1))
+    assert not arrow_table.schema.field("geometry").type.equals(pa.binary())
+    assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.TRANSFER] == []
+    assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
+    assert geopandas.get_fallback_events(clear=True) == []
 
 
 def test_zero_transfer_pipeline(tmp_path) -> None:

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import numpy as np
+
+from vibespatial.bench import profile_rails as profile_rails_module
 from vibespatial.bench.profile_rails import (
     profile_join_kernel,
     profile_overlay_kernel,
@@ -136,3 +139,22 @@ def test_profile_spatial_query_stack_reports_full_path() -> None:
         "owned_point_box_query",
         "generic_query_pipeline",
     }
+
+
+def test_profile_spatial_query_stack_fast_path_does_not_claim_gpu_without_runtime(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(profile_rails_module, "has_gpu_runtime", lambda: False)
+    monkeypatch.setattr(
+        profile_rails_module,
+        "_query_point_tree_box_index",
+        lambda *args, **kwargs: (np.asarray([0], dtype=np.int32), np.asarray([0], dtype=np.int32)),
+    )
+
+    trace = profile_rails_module.profile_spatial_query_stack(rows=8, overlap_ratio=0.25)
+
+    assert trace.metadata["selected_path"] == "point_box_query"
+    assert trace.metadata["actual_selected_runtime"] == "cpu"
+    assert trace.metadata["execution_implementation"] == "owned_cpu_spatial_query"
+    probe_stage = next(stage for stage in trace.stages if stage.name == "probe_query_point_box")
+    assert probe_stage.device == "cpu"

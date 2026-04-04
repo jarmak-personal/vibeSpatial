@@ -164,7 +164,7 @@ def _convert_pipeline_result(pr: Any) -> BenchmarkResult:
     )
 
     # Extract GPU util from stage metadata if available
-    gpu_util = _extract_gpu_util(pr.stages)
+    gpu_util = _extract_gpu_util(pr.stages, selected_runtime=pr.selected_runtime)
 
     # Determine pass/fail/skip
     if pr.status == "ok":
@@ -209,17 +209,30 @@ def _convert_pipeline_result(pr: Any) -> BenchmarkResult:
     )
 
 
-def _extract_gpu_util(stages: tuple[Any, ...]) -> GpuUtilSummary | None:
-    """Try to pull GPU util summary from stage metadata."""
+def _iter_stage_entries(stages: tuple[Any, ...]):
     from .profiling import ProfileTrace
 
     for stage in stages:
-        meta = {}
         if isinstance(stage, ProfileTrace):
-            meta = stage.metadata
+            for trace_stage in stage.stages:
+                yield trace_stage.device, trace_stage.metadata
         elif isinstance(stage, dict):
-            meta = stage.get("metadata", {})
+            for trace_stage in stage.get("stages", ()):
+                yield trace_stage.get("device"), trace_stage.get("metadata", {})
 
+
+def _extract_gpu_util(
+    stages: tuple[Any, ...],
+    *,
+    selected_runtime: str | None = None,
+) -> GpuUtilSummary | None:
+    """Try to pull GPU util summary from stage metadata."""
+    if selected_runtime not in {"gpu", "hybrid"}:
+        return None
+
+    for device, meta in _iter_stage_entries(stages):
+        if device != "gpu":
+            continue
         device_name = meta.get("gpu_device_name")
         if device_name:
             return GpuUtilSummary(

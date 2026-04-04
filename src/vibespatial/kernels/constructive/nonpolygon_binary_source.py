@@ -112,6 +112,134 @@ __device__ bool seg_seg_intersect(
     return true;
 }
 
+__device__ int collect_segment_polygon_hits(
+    double ax, double ay, double bx, double by,
+    const double* __restrict__ poly_x,
+    const double* __restrict__ poly_y,
+    const int ring_start,
+    const int poly_n,
+    double* hit0_t, double* hit0_x, double* hit0_y,
+    double* hit1_t, double* hit1_x, double* hit1_y
+) {
+    const double tol_sq = 1e-18;
+    int hit_count = 0;
+    *hit0_t = 2.0;
+    *hit1_t = 2.0;
+
+    const double d1x = bx - ax;
+    const double d1y = by - ay;
+
+    for (int i = 0, j = poly_n - 1; i < poly_n; j = i++) {
+        double ix, iy;
+        if (!seg_seg_intersect(
+                ax, ay, bx, by,
+                poly_x[ring_start + j], poly_y[ring_start + j],
+                poly_x[ring_start + i], poly_y[ring_start + i],
+                &ix, &iy)) {
+            continue;
+        }
+
+        if (hit_count >= 1) {
+            const double dx0 = ix - *hit0_x;
+            const double dy0 = iy - *hit0_y;
+            if ((dx0 * dx0 + dy0 * dy0) <= tol_sq) {
+                continue;
+            }
+        }
+        if (hit_count >= 2) {
+            const double dx1 = ix - *hit1_x;
+            const double dy1 = iy - *hit1_y;
+            if ((dx1 * dx1 + dy1 * dy1) <= tol_sq) {
+                continue;
+            }
+        }
+
+        double t = 0.0;
+        if (fabs(d1x) >= fabs(d1y)) {
+            if (fabs(d1x) < 1e-15) continue;
+            t = (ix - ax) / d1x;
+        } else {
+            if (fabs(d1y) < 1e-15) continue;
+            t = (iy - ay) / d1y;
+        }
+
+        if (hit_count == 0) {
+            *hit0_t = t;
+            *hit0_x = ix;
+            *hit0_y = iy;
+            hit_count = 1;
+        } else if (hit_count == 1) {
+            *hit1_t = t;
+            *hit1_x = ix;
+            *hit1_y = iy;
+            if (*hit1_t < *hit0_t) {
+                const double tmp_t = *hit0_t;
+                const double tmp_x = *hit0_x;
+                const double tmp_y = *hit0_y;
+                *hit0_t = *hit1_t;
+                *hit0_x = *hit1_x;
+                *hit0_y = *hit1_y;
+                *hit1_t = tmp_t;
+                *hit1_x = tmp_x;
+                *hit1_y = tmp_y;
+            }
+            hit_count = 2;
+        }
+    }
+
+    return hit_count;
+}
+
+__device__ bool segment_has_extent(
+    double ax, double ay,
+    double bx, double by
+) {
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    return (dx * dx + dy * dy) > 1e-18;
+}
+
+__device__ void count_linestring_fragment(
+    double ax, double ay,
+    double bx, double by,
+    bool* prev_kept,
+    int* coord_count,
+    int* part_count
+) {
+    if (!segment_has_extent(ax, ay, bx, by)) return;
+    if (!(*prev_kept)) {
+        *coord_count += 2;
+        *part_count += 1;
+    } else {
+        *coord_count += 1;
+    }
+    *prev_kept = true;
+}
+
+__device__ void scatter_linestring_fragment(
+    double ax, double ay,
+    double bx, double by,
+    bool* prev_kept,
+    int* coord_pos,
+    int* part_pos,
+    int* __restrict__ out_part_offsets,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y
+) {
+    if (!segment_has_extent(ax, ay, bx, by)) return;
+    if (!(*prev_kept)) {
+        out_part_offsets[*part_pos] = *coord_pos;
+        (*part_pos)++;
+        out_x[*coord_pos] = ax;
+        out_y[*coord_pos] = ay;
+        (*coord_pos)++;
+    }
+    out_x[*coord_pos] = bx;
+    out_y[*coord_pos] = by;
+    (*coord_pos)++;
+    *prev_kept = true;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Count kernel: count output vertices per linestring-polygon pair.  */
 /*                                                                     */
@@ -156,8 +284,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_count(
     const int first_ring = poly_geom_offsets[idx];
     const int ring_start = poly_ring_offsets[first_ring];
     const int ring_end = poly_ring_offsets[first_ring + 1];
+    const int poly_n = ring_end - ring_start;
 
-    if (seg_count < 1 || (ring_end - ring_start) < 3) {
+    if (seg_count < 1 || poly_n < 3) {
         out_counts[idx] = 0;
         return;
     }
@@ -202,9 +331,20 @@ extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_count(
             count += 2;  /* clip point + end */
             prev_kept = true;
         } else {
-            /* Both outside: need to check for edge crossings through polygon */
-            /* For simplicity in this initial implementation, skip segments
-               where both endpoints are outside and no crossing is detected. */
+            /* Both outside: keep pass-through segments that cross the polygon. */
+            double hit0_t = 2.0, hit0_x = 0.0, hit0_y = 0.0;
+            double hit1_t = 2.0, hit1_x = 0.0, hit1_y = 0.0;
+            const int hit_count = collect_segment_polygon_hits(
+                ax, ay, bx, by,
+                poly_x, poly_y, ring_start, poly_n,
+                &hit0_t, &hit0_x, &hit0_y,
+                &hit1_t, &hit1_x, &hit1_y
+            );
+            if (hit_count >= 2) {
+                count += 2;
+            } else if (hit_count == 1) {
+                count += 1;
+            }
             prev_kept = false;
         }
     }
@@ -320,6 +460,283 @@ extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_scatter(
             pos++;
             prev_kept = true;
         } else {
+            double hit0_t = 2.0, hit0_x = 0.0, hit0_y = 0.0;
+            double hit1_t = 2.0, hit1_x = 0.0, hit1_y = 0.0;
+            const int hit_count = collect_segment_polygon_hits(
+                ax, ay, bx, by,
+                poly_x, poly_y, ring_start, poly_n,
+                &hit0_t, &hit0_x, &hit0_y,
+                &hit1_t, &hit1_x, &hit1_y
+            );
+            if (hit_count >= 1) {
+                out_x[pos] = hit0_x;
+                out_y[pos] = hit0_y;
+                pos++;
+            }
+            if (hit_count >= 2) {
+                out_x[pos] = hit1_x;
+                out_y[pos] = hit1_y;
+                pos++;
+            }
+            prev_kept = false;
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_difference_count(
+    const double* __restrict__ ls_x,
+    const double* __restrict__ ls_y,
+    const int* __restrict__ ls_geom_offsets,
+    const double* __restrict__ poly_x,
+    const double* __restrict__ poly_y,
+    const int* __restrict__ poly_ring_offsets,
+    const int* __restrict__ poly_geom_offsets,
+    const int* __restrict__ valid_mask,
+    int* __restrict__ out_coord_counts,
+    int* __restrict__ out_part_counts,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    if (!valid_mask[idx]) {
+        out_coord_counts[idx] = 0;
+        out_part_counts[idx] = 0;
+        return;
+    }
+
+    const int ls_start = ls_geom_offsets[idx];
+    const int ls_end = ls_geom_offsets[idx + 1];
+    const int seg_count = ls_end - ls_start - 1;
+
+    const int first_ring = poly_geom_offsets[idx];
+    const int ring_start = poly_ring_offsets[first_ring];
+    const int ring_end = poly_ring_offsets[first_ring + 1];
+    const int poly_n = ring_end - ring_start;
+
+    if (seg_count < 1 || poly_n < 3) {
+        out_coord_counts[idx] = 0;
+        out_part_counts[idx] = 0;
+        return;
+    }
+
+    int coord_count = 0;
+    int part_count = 0;
+    bool prev_kept = false;
+
+    for (int s = 0; s < seg_count; s++) {
+        const double ax = ls_x[ls_start + s];
+        const double ay = ls_y[ls_start + s];
+        const double bx = ls_x[ls_start + s + 1];
+        const double by = ls_y[ls_start + s + 1];
+
+        const bool a_inside = vs_ring_contains_point(ax, ay, poly_x, poly_y, ring_start, ring_end);
+        const bool b_inside = vs_ring_contains_point(bx, by, poly_x, poly_y, ring_start, ring_end);
+
+        double hit0_t = 2.0, hit0_x = 0.0, hit0_y = 0.0;
+        double hit1_t = 2.0, hit1_x = 0.0, hit1_y = 0.0;
+        const int hit_count = collect_segment_polygon_hits(
+            ax, ay, bx, by,
+            poly_x, poly_y, ring_start, poly_n,
+            &hit0_t, &hit0_x, &hit0_y,
+            &hit1_t, &hit1_x, &hit1_y
+        );
+
+        if (!a_inside && !b_inside) {
+            if (hit_count == 0) {
+                count_linestring_fragment(
+                    ax, ay, bx, by,
+                    &prev_kept, &coord_count, &part_count
+                );
+            } else if (hit_count == 1) {
+                if (hit0_t <= 1e-12 || hit0_t >= (1.0 - 1e-12)) {
+                    count_linestring_fragment(
+                        ax, ay, bx, by,
+                        &prev_kept, &coord_count, &part_count
+                    );
+                } else {
+                    count_linestring_fragment(
+                        ax, ay, hit0_x, hit0_y,
+                        &prev_kept, &coord_count, &part_count
+                    );
+                    prev_kept = false;
+                    count_linestring_fragment(
+                        hit0_x, hit0_y, bx, by,
+                        &prev_kept, &coord_count, &part_count
+                    );
+                }
+            } else {
+                count_linestring_fragment(
+                    ax, ay, hit0_x, hit0_y,
+                    &prev_kept, &coord_count, &part_count
+                );
+                prev_kept = false;
+                count_linestring_fragment(
+                    hit1_x, hit1_y, bx, by,
+                    &prev_kept, &coord_count, &part_count
+                );
+            }
+        } else if (!a_inside && b_inside) {
+            if (hit_count >= 1) {
+                count_linestring_fragment(
+                    ax, ay, hit0_x, hit0_y,
+                    &prev_kept, &coord_count, &part_count
+                );
+            }
+            prev_kept = false;
+        } else if (a_inside && !b_inside) {
+            if (hit_count >= 1) {
+                const double sx = (hit_count >= 2) ? hit1_x : hit0_x;
+                const double sy = (hit_count >= 2) ? hit1_y : hit0_y;
+                prev_kept = false;
+                count_linestring_fragment(
+                    sx, sy, bx, by,
+                    &prev_kept, &coord_count, &part_count
+                );
+            } else {
+                prev_kept = false;
+            }
+        } else {
+            if (hit_count >= 2) {
+                prev_kept = false;
+                count_linestring_fragment(
+                    hit0_x, hit0_y, hit1_x, hit1_y,
+                    &prev_kept, &coord_count, &part_count
+                );
+            }
+            prev_kept = false;
+        }
+    }
+
+    out_coord_counts[idx] = coord_count;
+    out_part_counts[idx] = part_count;
+}
+
+extern "C" __global__ __launch_bounds__(256, 2) void linestring_polygon_difference_scatter(
+    const double* __restrict__ ls_x,
+    const double* __restrict__ ls_y,
+    const int* __restrict__ ls_geom_offsets,
+    const double* __restrict__ poly_x,
+    const double* __restrict__ poly_y,
+    const int* __restrict__ poly_ring_offsets,
+    const int* __restrict__ poly_geom_offsets,
+    const int* __restrict__ valid_mask,
+    const int* __restrict__ coord_output_offsets,
+    const int* __restrict__ part_output_offsets,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    int* __restrict__ out_part_offsets,
+    const int n
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    if (!valid_mask[idx]) return;
+
+    const int ls_start = ls_geom_offsets[idx];
+    const int ls_end = ls_geom_offsets[idx + 1];
+    const int seg_count = ls_end - ls_start - 1;
+
+    const int first_ring = poly_geom_offsets[idx];
+    const int ring_start = poly_ring_offsets[first_ring];
+    const int ring_end = poly_ring_offsets[first_ring + 1];
+    const int poly_n = ring_end - ring_start;
+
+    if (seg_count < 1 || poly_n < 3) return;
+
+    int coord_pos = coord_output_offsets[idx];
+    int part_pos = part_output_offsets[idx];
+    bool prev_kept = false;
+
+    for (int s = 0; s < seg_count; s++) {
+        const double ax = ls_x[ls_start + s];
+        const double ay = ls_y[ls_start + s];
+        const double bx = ls_x[ls_start + s + 1];
+        const double by = ls_y[ls_start + s + 1];
+
+        const bool a_inside = vs_ring_contains_point(ax, ay, poly_x, poly_y, ring_start, ring_end);
+        const bool b_inside = vs_ring_contains_point(bx, by, poly_x, poly_y, ring_start, ring_end);
+
+        double hit0_t = 2.0, hit0_x = 0.0, hit0_y = 0.0;
+        double hit1_t = 2.0, hit1_x = 0.0, hit1_y = 0.0;
+        const int hit_count = collect_segment_polygon_hits(
+            ax, ay, bx, by,
+            poly_x, poly_y, ring_start, poly_n,
+            &hit0_t, &hit0_x, &hit0_y,
+            &hit1_t, &hit1_x, &hit1_y
+        );
+
+        if (!a_inside && !b_inside) {
+            if (hit_count == 0) {
+                scatter_linestring_fragment(
+                    ax, ay, bx, by,
+                    &prev_kept, &coord_pos, &part_pos,
+                    out_part_offsets, out_x, out_y
+                );
+            } else if (hit_count == 1) {
+                if (hit0_t <= 1e-12 || hit0_t >= (1.0 - 1e-12)) {
+                    scatter_linestring_fragment(
+                        ax, ay, bx, by,
+                        &prev_kept, &coord_pos, &part_pos,
+                        out_part_offsets, out_x, out_y
+                    );
+                } else {
+                    scatter_linestring_fragment(
+                        ax, ay, hit0_x, hit0_y,
+                        &prev_kept, &coord_pos, &part_pos,
+                        out_part_offsets, out_x, out_y
+                    );
+                    prev_kept = false;
+                    scatter_linestring_fragment(
+                        hit0_x, hit0_y, bx, by,
+                        &prev_kept, &coord_pos, &part_pos,
+                        out_part_offsets, out_x, out_y
+                    );
+                }
+            } else {
+                scatter_linestring_fragment(
+                    ax, ay, hit0_x, hit0_y,
+                    &prev_kept, &coord_pos, &part_pos,
+                    out_part_offsets, out_x, out_y
+                );
+                prev_kept = false;
+                scatter_linestring_fragment(
+                    hit1_x, hit1_y, bx, by,
+                    &prev_kept, &coord_pos, &part_pos,
+                    out_part_offsets, out_x, out_y
+                );
+            }
+        } else if (!a_inside && b_inside) {
+            if (hit_count >= 1) {
+                scatter_linestring_fragment(
+                    ax, ay, hit0_x, hit0_y,
+                    &prev_kept, &coord_pos, &part_pos,
+                    out_part_offsets, out_x, out_y
+                );
+            }
+            prev_kept = false;
+        } else if (a_inside && !b_inside) {
+            if (hit_count >= 1) {
+                const double sx = (hit_count >= 2) ? hit1_x : hit0_x;
+                const double sy = (hit_count >= 2) ? hit1_y : hit0_y;
+                prev_kept = false;
+                scatter_linestring_fragment(
+                    sx, sy, bx, by,
+                    &prev_kept, &coord_pos, &part_pos,
+                    out_part_offsets, out_x, out_y
+                );
+            } else {
+                prev_kept = false;
+            }
+        } else {
+            if (hit_count >= 2) {
+                prev_kept = false;
+                scatter_linestring_fragment(
+                    hit0_x, hit0_y, hit1_x, hit1_y,
+                    &prev_kept, &coord_pos, &part_pos,
+                    out_part_offsets, out_x, out_y
+                );
+            }
             prev_kept = false;
         }
     }
@@ -458,6 +875,8 @@ _POINT_LINESTRING_KERNEL_NAMES = ("point_linestring_on_line",)
 _LINESTRING_POLYGON_KERNEL_NAMES = (
     "linestring_polygon_count",
     "linestring_polygon_scatter",
+    "linestring_polygon_difference_count",
+    "linestring_polygon_difference_scatter",
 )
 _LINESTRING_LINESTRING_KERNEL_NAMES = (
     "linestring_linestring_count",

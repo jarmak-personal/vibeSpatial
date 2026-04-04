@@ -5,7 +5,7 @@ Scope: Strict native mode upstream test pass rate as the real GeoPandas compatib
 Read If: You are measuring, reporting, or verifying strict native GeoPandas compatibility.
 STOP IF: Your task already has the coverage script open and only needs the command.
 Source Of Truth: Native coverage metric definition for upstream GeoPandas compatibility.
-Body Budget: 65/220 lines
+Body Budget: 75/220 lines
 Document: docs/testing/native-coverage.md
 
 Section Map (Body Lines)
@@ -18,8 +18,8 @@ Section Map (Body Lines)
 | 20-24 | Verify |
 | 25-29 | Risks |
 | 30-51 | Definition |
-| 52-59 | Command |
-| 60-65 | Notes |
+| 52-69 | Command |
+| 70-75 | Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -78,6 +78,16 @@ uv run python scripts/upstream_native_coverage.py
 ```
 
 Use `--json` for machine-readable output.
+
+For long sweeps, prefer chunked progress so the command does not sit silent on a
+single giant pytest subprocess:
+
+```bash
+uv run python scripts/upstream_native_coverage.py --grouped --group-by file --json
+```
+
+Progress and heartbeats stream to stderr; the final report still prints JSON to
+stdout.
 
 ## Notes
 

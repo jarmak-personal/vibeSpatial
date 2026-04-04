@@ -15,6 +15,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.predicates.binary import _gpu_candidate_pairs_supported
 from vibespatial.runtime.kernel_registry import get_kernel_variants
 
 
@@ -116,12 +117,53 @@ def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_p
     adaptive_runtime.invalidate_snapshot_cache()
 
     # Use `crosses` — not in _DE9IM_PREDICATES, so line-line GPU is still unsupported.
-    with pytest.raises(NotImplementedError, match="point-centric candidate rows"):
+    with pytest.raises(
+        NotImplementedError,
+        match="GPU refine currently supports only point-centric",
+    ):
         crosses_exact(
             [LineString([(0, 0), (4, 4)])],
             [LineString([(0, 4), (4, 0)])],
             dispatch_mode=ExecutionMode.GPU,
         )
+
+
+def test_gpu_candidate_pairs_supported_accepts_mixed_point_and_de9im_rows() -> None:
+    left = from_shapely_geometries(
+        [
+            Point(1, 1),
+            box(0, 0, 2, 2),
+            LineString([(0, 0), (2, 2)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            Point(1, 1),
+            box(0, 0, 2, 2),
+        ]
+    )
+    candidate_rows = np.arange(3, dtype=np.int32)
+
+    assert _gpu_candidate_pairs_supported(left, right, candidate_rows, "intersects") is True
+
+
+def test_gpu_candidate_pairs_supported_rejects_mixed_batches_with_unsupported_nonpoint_rows() -> None:
+    left = from_shapely_geometries(
+        [
+            Point(1, 1),
+            LineString([(0, 0), (2, 2)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            box(0, 0, 2, 2),
+        ]
+    )
+    candidate_rows = np.arange(2, dtype=np.int32)
+
+    assert _gpu_candidate_pairs_supported(left, right, candidate_rows, "crosses") is False
 
 
 def test_all_binary_predicates_register_gpu_variants() -> None:

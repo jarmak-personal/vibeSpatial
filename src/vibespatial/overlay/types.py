@@ -631,3 +631,14 @@ class OverlayFaceTable:
     @property
     def face_count(self) -> int:
         return self._face_count
+
+
+@dataclass(frozen=True)
+class OverlayExecutionPlan:
+    """Reusable overlay topology plan for one left/right workload."""
+
+    split_events: SplitEventTable | None
+    atomic_edges: AtomicEdgeTable | None
+    half_edge_graph: HalfEdgeGraph
+    faces: OverlayFaceTable
+    row_isolated: bool = False

@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 255/260 lines
+Body Budget: 258/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -24,7 +24,7 @@ Section Map (Body Lines)
 | 105-135 | Property Convergence |
 | 136-147 | Test Strategy |
 | 148-157 | Build And Tooling |
-| 158-181 | Verification |
+| 158-184 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -200,6 +200,9 @@ For targeted verification during development:
 | Vendored tests | `uv run python scripts/vendor_geopandas_tests.py` |
 | Upstream smoke | `uv run pytest tests/upstream/geopandas/tests/test_config.py` |
 | All properties | `uv run python scripts/property_dashboard.py` |
+
+For GPU-sensitive verification, do not trust sandboxed "no GPU runtime"
+results by default. Re-run the relevant `uv run python ...`, `uv run pytest ... --run-gpu`, or benchmark command outside the sandbox with escalation, and collect `nvidia-smi -L`, `ls /dev/nvidia*`, and `printenv CUDA_VISIBLE_DEVICES`. Missing `/dev/nvidia*` or a failing `nvidia-smi` inside the sandbox is an environment visibility issue first, not a library regression.
 
 If verification cannot run because dependencies, drivers, or local services
 are missing, say so concretely and include the command that failed.

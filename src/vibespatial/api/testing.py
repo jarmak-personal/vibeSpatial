@@ -2,11 +2,23 @@
 
 import warnings
 
+import numpy as np
 import pandas as pd
+import shapely
 
 from vibespatial.api import GeoDataFrame, GeoSeries
-from vibespatial.api.geometry_array import GeometryDtype
 from vibespatial.api.geo_base import _is_geometry_like_dtype
+
+_PUBLIC_EQUALITY_GEOM_TYPES = frozenset(
+    {
+        "Point",
+        "LineString",
+        "Polygon",
+        "MultiPoint",
+        "MultiLineString",
+        "MultiPolygon",
+    }
+)
 
 
 def _isna(this):
@@ -42,10 +54,13 @@ def _geom_equals_mask(this, that):
     Series
         boolean Series, True if geometries in left equal geometries in right
     """
-    return (
-        this.geom_equals(that)
-        | (this.is_empty & that.is_empty)
-        | (_isna(this) & _isna(that))
+    this_values, index = _comparison_values_and_index(this)
+    that_values = _comparison_values(that)
+    equals_mask = _public_geom_equals_mask(this, that)
+    if equals_mask is None:
+        equals_mask = _comparison_mask(shapely.equals(this_values, that_values), index)
+    return equals_mask | (_empty_mask(this, index) & _empty_mask(that, index)) | (
+        _na_mask(this, index) & _na_mask(that, index)
     )
 
 
@@ -84,11 +99,108 @@ def _geom_almost_equals_mask(this, that):
     Series
         boolean Series, True if geometries in left almost equal geometries in right
     """
-    return (
-        this.geom_equals_exact(that, tolerance=0.5 * 10 ** (-6))
-        | (this.is_empty & that.is_empty)
-        | (_isna(this) & _isna(that))
+    this_values, index = _comparison_values_and_index(this)
+    that_values = _comparison_values(that)
+    equals_mask = _public_geom_almost_equals_mask(this, that)
+    if equals_mask is None:
+        equals_mask = _comparison_mask(
+            shapely.equals_exact(this_values, that_values, tolerance=0.5 * 10 ** (-6)),
+            index,
+        )
+    return equals_mask | (_empty_mask(this, index) & _empty_mask(that, index)) | (
+        _na_mask(this, index) & _na_mask(that, index)
     )
+
+
+def _public_geom_equals_mask(this, that):
+    this_series, that_series = _series_pair_for_public_comparison(this, that)
+    if this_series is None or that_series is None:
+        return None
+    return this_series.geom_equals(that_series, align=False)
+
+
+def _public_geom_almost_equals_mask(this, that):
+    this_series, that_series = _series_pair_for_public_comparison(this, that)
+    if this_series is None or that_series is None:
+        return None
+    return this_series.geom_equals_exact(that_series, tolerance=0.5 * 10 ** (-6), align=False)
+
+
+def _series_pair_for_public_comparison(this, that):
+    if isinstance(this, GeoDataFrame):
+        this = this.geometry
+    if isinstance(that, GeoDataFrame):
+        that = that.geometry
+    if not isinstance(this, GeoSeries) or not isinstance(that, GeoSeries):
+        return None, None
+    if _contains_unsupported_public_equality_family(this) or _contains_unsupported_public_equality_family(that):
+        return None, None
+    return this, that
+
+
+def _contains_unsupported_public_equality_family(obj) -> bool:
+    values = _comparison_values(obj)
+    array = np.asarray(values, dtype=object)
+    if array.ndim == 0:
+        array = np.asarray([values], dtype=object)
+    missing = shapely.is_missing(array)
+    for geometry in array[~missing]:
+        geom_type = getattr(geometry, "geom_type", None)
+        if geom_type not in _PUBLIC_EQUALITY_GEOM_TYPES:
+            return True
+    return False
+
+
+def _comparison_values(obj):
+    if isinstance(obj, GeoDataFrame):
+        obj = obj.geometry
+    if isinstance(obj, GeoSeries):
+        return np.asarray(obj.array, dtype=object)
+    if _is_geometry_like_dtype(getattr(obj, "dtype", None)):
+        return np.asarray(obj, dtype=object)
+    if isinstance(obj, (list, tuple)):
+        return np.asarray(obj, dtype=object)
+    return obj
+
+
+def _comparison_values_and_index(obj):
+    if isinstance(obj, GeoDataFrame):
+        obj = obj.geometry
+    if isinstance(obj, GeoSeries):
+        return np.asarray(obj.array, dtype=object), obj.index
+    values = _comparison_values(obj)
+    if np.ndim(values) == 0 or not hasattr(values, "__len__"):
+        return values, pd.RangeIndex(1)
+    return values, pd.RangeIndex(len(values))
+
+
+def _comparison_mask(values, index):
+    array = np.asarray(values, dtype=bool)
+    if array.ndim == 0:
+        array = np.repeat(array, len(index))
+    return pd.Series(array, index=index)
+
+
+def _empty_mask(obj, index):
+    if isinstance(obj, GeoDataFrame):
+        obj = obj.geometry
+    if isinstance(obj, GeoSeries):
+        return pd.Series(np.asarray(obj.is_empty, dtype=bool), index=index)
+    values = _comparison_values(obj)
+    array = np.asarray(shapely.is_empty(values), dtype=bool)
+    if array.ndim == 0:
+        array = np.repeat(array, len(index))
+    return pd.Series(array, index=index)
+
+
+def _na_mask(obj, index):
+    if isinstance(obj, GeoDataFrame):
+        obj = obj.geometry
+    mask = _isna(obj)
+    array = np.asarray(mask, dtype=bool)
+    if array.ndim == 0:
+        array = np.repeat(array, len(index))
+    return pd.Series(array, index=index)
 
 
 def geom_almost_equals(this, that):

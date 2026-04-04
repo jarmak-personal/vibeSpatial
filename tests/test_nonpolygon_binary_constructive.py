@@ -352,6 +352,18 @@ class TestLineStringPolygonIntersection:
         assert result_geoms[0] is None or result_geoms[0].is_empty
 
     @requires_gpu
+    def test_line_touching_polygon_corner_returns_point(self):
+        """A touching line/polygon intersection must preserve point-collapse slivers."""
+        left = _make_owned([LineString([(10, 5), (13, 5), (15, 5)])])
+        right = _make_owned([box(0, 0, 10, 10)])
+
+        result = linestring_polygon_intersection(left, right)
+        result_geoms = result.to_shapely()
+
+        assert len(result_geoms) == 1
+        _assert_geom_close(result_geoms[0], Point(10, 5), msg="touching corner")
+
+    @requires_gpu
     def test_line_inside_polygon_stays_device_resident(self, strict_device_guard):
         left = _make_owned([LineString([(1, 1), (2, 2)])])
         right = _make_owned([box(0, 0, 4, 4)])
@@ -389,6 +401,43 @@ class TestLineStringPolygonDifference:
 
         assert len(result_geoms) == 1
         assert result_geoms[0] is not None and not result_geoms[0].is_empty
+
+    @requires_gpu
+    def test_crossing_line_splits_into_multiline_outside_pieces(self):
+        left_geoms = [
+            LineString([(2, 0), (2, 4), (6, 4)]),
+            LineString([(0, 3), (6, 3)]),
+        ]
+        right_geoms = [
+            box(1, 1, 3, 3),
+            box(3, 3, 5, 5),
+        ]
+        left = _make_owned(left_geoms)
+        right = _make_owned(right_geoms)
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned("difference", left, right, dispatch_mode=ExecutionMode.GPU)
+        result_geoms = result.to_shapely()
+        ref_geoms = _shapely_op("difference", left_geoms, right_geoms)
+
+        assert len(result_geoms) == 2
+        _assert_geom_close(result_geoms[0], ref_geoms[0], msg="row 0 split outside fragments")
+        _assert_geom_close(result_geoms[1], ref_geoms[1], msg="row 1 boundary overlap fragments")
+
+    @requires_gpu
+    def test_boundary_coincident_line_becomes_empty_geometry(self):
+        left_geoms = [LineString([(0, 0), (1, 0)])]
+        right_geoms = [box(0, 0, 2, 2)]
+        left = _make_owned(left_geoms)
+        right = _make_owned(right_geoms)
+
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        result = binary_constructive_owned("difference", left, right, dispatch_mode=ExecutionMode.GPU)
+        result_geoms = result.to_shapely()
+        ref_geoms = _shapely_op("difference", left_geoms, right_geoms)
+
+        assert len(result_geoms) == 1
+        _assert_geom_close(result_geoms[0], ref_geoms[0], msg="boundary-coincident line should become LINESTRING EMPTY")
 
     @requires_gpu
     def test_nonpolygon_right_empty_result_stays_device_resident(self, strict_device_guard):
@@ -618,3 +667,31 @@ class TestDispatcherCoversAllFamilies:
         for op in ["intersection", "difference"]:
             result = binary_constructive_owned(op, left, right, dispatch_mode=ExecutionMode.GPU)
             assert result is not None, f"MultiPoint-Polygon {op} returned None"
+
+    @requires_gpu
+    def test_mixed_linestring_and_polygon_intersection_dispatch(self):
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+        left = _make_owned(
+            [
+                LineString([(1, 1), (5, 5)]),
+                box(2, 2, 6, 6),
+            ]
+        )
+        right = _make_owned(
+            [
+                box(0, 0, 4, 4),
+                box(0, 0, 5, 5),
+            ]
+        )
+
+        result = binary_constructive_owned(
+            "intersection",
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+        assert result is not None
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2

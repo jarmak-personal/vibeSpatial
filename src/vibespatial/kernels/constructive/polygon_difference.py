@@ -71,12 +71,8 @@ def _polygon_difference_gpu(
     transfer point as all other overlay operations).
     """
     from vibespatial.overlay.gpu import (
-        _assemble_faces_from_device_indices,
-        _select_overlay_face_indices_gpu,
-        build_gpu_atomic_edges,
-        build_gpu_half_edge_graph,
-        build_gpu_overlay_faces,
-        build_gpu_split_events,
+        _build_overlay_execution_plan,
+        _materialize_overlay_execution_plan,
     )
 
     runtime_selection = RuntimeSelection(
@@ -85,19 +81,16 @@ def _polygon_difference_gpu(
         reason="GPU polygon_difference kernel selected",
     )
 
-    split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
-    atomic_edges = build_gpu_atomic_edges(split_events)
-    half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
-    faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
-
-    # Phase 13: device-resident face selection eliminates D->H transfers on
-    # bounded_mask, left_covered, and right_covered.
-    d_selected_face_indices = _select_overlay_face_indices_gpu(faces, operation="difference")
-
-    result = _assemble_faces_from_device_indices(
-        half_edge_graph, faces, d_selected_face_indices,
+    plan = _build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
     )
-
+    result, _ = _materialize_overlay_execution_plan(
+        plan,
+        operation="difference",
+        requested=ExecutionMode.GPU,
+    )
     result.runtime_history.append(runtime_selection)
     return result
 

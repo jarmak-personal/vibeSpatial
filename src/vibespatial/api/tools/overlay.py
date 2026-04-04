@@ -6,6 +6,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import shapely
+from shapely.geometry import GeometryCollection
 
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._compat import PANDAS_GE_30
@@ -40,6 +41,26 @@ def _extract_owned_pair(df1, df2):
     if left_owned is not None and right_owned is not None:
         return left_owned, right_owned
     return None, None
+
+
+def _coerce_owned_pair_for_strict_overlay(df1, df2, left_owned, right_owned):
+    """Materialize owned backing for strict overlay paths when GPU is available.
+
+    Overlay does its spatial join before pairwise constructive work, so this
+    coercion stays off the hot-path for non-strict runs. In strict mode we need
+    the downstream pairwise overlay operations to use the repo-owned GPU
+    dispatch instead of inheriting the generic small-workload crossover.
+    """
+    if not strict_native_mode_enabled() or not has_gpu_runtime():
+        return left_owned, right_owned
+    try:
+        if left_owned is None:
+            left_owned = df1.geometry.values.to_owned()
+        if right_owned is None:
+            right_owned = df2.geometry.values.to_owned()
+    except (AttributeError, NotImplementedError):
+        return left_owned, right_owned
+    return left_owned, right_owned
 
 
 # ---- Memory estimation for overlay difference GPU guard ----
@@ -363,29 +384,53 @@ def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
     # to eliminate the D->H->D round-trip when downstream take() re-uploads.
     # Returns DeviceSpatialJoinResult when device arrays are available,
     # otherwise returns the standard (2, n) numpy array or (idx1, idx2) tuple.
-    if not strict_native_mode_enabled():
-        request_device = left_owned is not None and right_owned is not None
-        result = df2.sindex.query(
-            df1.geometry,
-            predicate="intersects",
-            sort=True,
-            return_device=request_device,
-        )
-        # DeviceSpatialJoinResult flows through directly to the caller.
-        if isinstance(result, DeviceSpatialJoinResult):
-            return result
-        return result
-
-    idx1, idx2 = df2.sindex._tree.query(
-        np.asarray(df1.geometry.array, dtype=object),
-        predicate="intersects",
+    request_device = (
+        not strict_native_mode_enabled()
+        and left_owned is not None
+        and right_owned is not None
     )
-    idx1 = np.asarray(idx1, dtype=np.int32)
-    idx2 = np.asarray(idx2, dtype=np.int32)
-    # Sort by idx1 to match the non-strict path (sort=True) contract.
-    # _overlay_difference relies on sorted idx1 for np.split grouping.
-    order = np.argsort(idx1, kind="stable")
-    return idx1[order], idx2[order]
+    result = df2.sindex.query(
+        df1.geometry,
+        predicate="intersects",
+        sort=True,
+        return_device=request_device,
+    )
+    # DeviceSpatialJoinResult flows through directly to the caller.
+    if isinstance(result, DeviceSpatialJoinResult):
+        return result
+    return result
+
+
+def _reverse_intersecting_index_pairs(index_result):
+    """Derive the reverse intersects pair mapping from a forward query result."""
+    if isinstance(index_result, DeviceSpatialJoinResult):
+        import cupy as cp
+
+        d_left = index_result.d_right_idx.astype(cp.int32, copy=False)
+        d_right = index_result.d_left_idx.astype(cp.int32, copy=False)
+        if d_left.size > 0:
+            order = cp.lexsort(
+                cp.stack([
+                    cp.asarray(d_right, dtype=cp.int64),
+                    cp.asarray(d_left, dtype=cp.int64),
+                ])
+            )
+            d_left = d_left[order]
+            d_right = d_right[order]
+        return DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
+
+    if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+        idx1, idx2 = index_result
+    else:
+        idx1, idx2 = index_result
+
+    left = np.asarray(idx2)
+    right = np.asarray(idx1)
+    if left.size > 0:
+        order = np.lexsort((right, left))
+        left = left[order]
+        right = right[order]
+    return left, right
 
 
 def _assemble_intersection_attributes(idx1, idx2, df1, df2):
@@ -413,6 +458,147 @@ def _assemble_intersection_attributes(idx1, idx2, df1, df2):
         suffixes=("_1", "_2"),
     )
     return result
+
+
+def _assemble_polygon_intersection_rows_with_lower_dim(
+    left_pairs: GeoSeries,
+    right_pairs: GeoSeries,
+    area_pairs: GeoSeries,
+) -> GeoSeries:
+    """Recover lower-dimensional polygon intersection remnants at the boundary.
+
+    The polygon constructive intersection path returns only polygonal area.
+    Public overlay semantics also need line/point remnants when polygon pairs
+    touch without area overlap, and GeometryCollections when polygonal area has
+    additional lower-dimensional pieces.
+    """
+    area_geoms = np.asarray(area_pairs, dtype=object)
+    left_geoms = np.asarray(left_pairs, dtype=object)
+    right_geoms = np.asarray(right_pairs, dtype=object)
+    boundary_geoms = np.asarray(
+        shapely.intersection(
+            shapely.boundary(left_geoms),
+            shapely.boundary(right_geoms),
+        ),
+        dtype=object,
+    )
+
+    assembled = np.empty(len(area_geoms), dtype=object)
+    for row_index in range(len(area_geoms)):
+        area_geom = area_geoms[row_index]
+        if area_geom is not None and area_geom.is_empty:
+            area_geom = None
+        elif area_geom is not None and getattr(area_geom, "area", 0.0) == 0.0:
+            area_geom = None
+
+        edge_geom = boundary_geoms[row_index]
+        if edge_geom is not None and edge_geom.is_empty:
+            edge_geom = None
+
+        if area_geom is not None and edge_geom is not None:
+            edge_geom = edge_geom.difference(area_geom.boundary)
+            if edge_geom is not None and edge_geom.is_empty:
+                edge_geom = None
+
+        if edge_geom is not None:
+            edge_parts = [
+                part
+                for part in shapely.get_parts(np.asarray([edge_geom], dtype=object))
+                if not part.is_empty
+            ]
+            if edge_parts:
+                unique_parts = []
+                seen_parts = set()
+                for part in edge_parts:
+                    normalized = shapely.normalize(part)
+                    key = normalized.wkb
+                    if key in seen_parts:
+                        continue
+                    seen_parts.add(key)
+                    unique_parts.append(normalized)
+
+                if len(unique_parts) == 1:
+                    edge_geom = unique_parts[0]
+                else:
+                    edge_part_types = {part.geom_type for part in unique_parts}
+                    merged_edges = shapely.union_all(np.asarray(unique_parts, dtype=object))
+                    if edge_part_types <= {"LineString", "LinearRing", "MultiLineString"}:
+                        edge_geom = shapely.line_merge(merged_edges)
+                    else:
+                        edge_geom = merged_edges
+                if edge_geom is not None and edge_geom.is_empty:
+                    edge_geom = None
+
+        if area_geom is None and edge_geom is None:
+            assembled[row_index] = None
+            continue
+        if area_geom is None:
+            assembled[row_index] = edge_geom
+            continue
+        if edge_geom is None:
+            assembled[row_index] = area_geom
+            continue
+
+        parts = [area_geom]
+        parts.extend(
+            part
+            for part in shapely.get_parts(np.asarray([edge_geom], dtype=object))
+            if not part.is_empty
+        )
+        assembled[row_index] = GeometryCollection(parts)
+
+    return GeoSeries(assembled, index=area_pairs.index, crs=area_pairs.crs)
+
+
+def _needs_host_overlay_difference_boundary_rebuild(df1, df2) -> bool:
+    """Return True when public overlay difference needs boundary reconstruction.
+
+    The polygon-polygon owned path preserves the overlay face topology we need.
+    Mixed-dimensional overlay differences still need GeoPandas/GEOS boundary
+    semantics at the public API boundary: polygon boundaries noded by linework,
+    lines split into outside pieces, and exact lower-dimensional remnants.
+    """
+    left_types = set(df1.geometry.geom_type.dropna())
+    right_types = set(df2.geometry.geom_type.dropna())
+    if not left_types or not right_types:
+        return False
+    return (
+        not left_types.issubset(set(POLYGON_GEOM_TYPES))
+        or not right_types.issubset(set(POLYGON_GEOM_TYPES))
+    )
+
+
+def _grouped_overlay_difference_geoms(df1, df2, idx1, idx2) -> np.ndarray:
+    """Vectorized grouped Shapely difference for overlay boundary assembly."""
+    left_geoms = np.asarray(df1.geometry, dtype=object)
+    result_geoms = left_geoms.copy()
+
+    if idx1.size == 0:
+        return result_geoms
+
+    h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
+    h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
+
+    right_geoms = np.asarray(df2.geometry, dtype=object)
+    right_unions = np.empty(len(df1), dtype=object)
+    right_unions.fill(None)
+
+    idx1_unique, idx1_split_at = np.unique(h_idx1, return_index=True)
+    idx2_groups = np.split(h_idx2, idx1_split_at[1:])
+    for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups, strict=True):
+        neighbors = right_geoms[neighbors_idx]
+        if len(neighbors) == 1:
+            right_unions[left_pos] = neighbors[0]
+        else:
+            right_unions[left_pos] = shapely.union_all(neighbors)
+
+    has_neighbors = np.zeros(len(df1), dtype=bool)
+    has_neighbors[idx1_unique] = True
+    result_geoms[has_neighbors] = shapely.difference(
+        left_geoms[has_neighbors],
+        right_unions[has_neighbors],
+    )
+    return result_geoms
 
 
 def _many_vs_one_intersection_owned(
@@ -462,7 +648,9 @@ def _many_vs_one_intersection_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n_pairs,
     )
-    _pairwise_mode = _pairwise_mode.selected
+    _pairwise_mode = (
+        ExecutionMode.GPU if strict_native_mode_enabled() else _pairwise_mode.selected
+    )
 
     # Build the single-row right OGA for containment bypass / SH clip.
     right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
@@ -711,7 +899,16 @@ def _many_vs_one_intersection_owned(
     return concat_result.take(inverse_perm)
 
 
-def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
+def _overlay_intersection(
+    df1,
+    df2,
+    left_owned=None,
+    right_owned=None,
+    *,
+    _prefer_exact_polygon_gpu: bool = False,
+    _preserve_lower_dim_polygon_results: bool = False,
+    _index_result=None,
+):
     """Overlay Intersection operation used in overlay function.
 
     Returns
@@ -719,6 +916,9 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
     tuple[GeoDataFrame, bool]
         Result GeoDataFrame and whether the owned dispatch path was used.
     """
+    left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
+        df1, df2, left_owned, right_owned,
+    )
     # ADR-0036 boundary: spatial index produces index arrays only.
     # Phase 2: pass owned arrays to request device-resident index pairs.
     #
@@ -729,25 +929,33 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
     # benefits the overlay kernels (containment bypass, SH batch clip)
     # without penalizing the join.
     _force_strtree = (
-        left_owned is None
+        _index_result is None
+        and left_owned is None
         and right_owned is None
         and has_gpu_runtime()
     )
     if _force_strtree:
         df2.sindex._ensure_strtree()
-        _raw_idx = df2.sindex._tree.query(
-            np.asarray(df1.geometry.array, dtype=object),
+        _raw_idx = df2.sindex.query(
+            df1.geometry,
             predicate="intersects",
+            sort=True,
         )
-        idx1 = np.asarray(_raw_idx[0], dtype=np.int32)
-        idx2 = np.asarray(_raw_idx[1], dtype=np.int32)
-        order = np.argsort(idx1, kind="stable")
-        idx1, idx2 = idx1[order], idx2[order]
+        if isinstance(_raw_idx, np.ndarray) and _raw_idx.ndim == 2:
+            idx1, idx2 = _raw_idx
+        else:
+            idx1, idx2 = _raw_idx
+        idx1 = np.asarray(idx1, dtype=np.int32)
+        idx2 = np.asarray(idx2, dtype=np.int32)
         d_idx1, d_idx2 = None, None
         _has_device_indices = False
     else:
-        index_result = _intersecting_index_pairs(
-            df1, df2, left_owned=left_owned, right_owned=right_owned,
+        index_result = (
+            _index_result
+            if _index_result is not None
+            else _intersecting_index_pairs(
+                df1, df2, left_owned=left_owned, right_owned=right_owned,
+            )
         )
 
         # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
@@ -768,6 +976,8 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
     used_owned = False
     # Create pairs of geometries in both dataframes to be intersected
     if idx1.size > 0 and idx2.size > 0:
+        left_sub = None
+        right_sub = None
         # Many-vs-one owned coercion: when the spatial join reveals a
         # many-vs-one pattern (all pairs reference the same single right
         # row) and neither side has owned backing, coerce to
@@ -828,14 +1038,14 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 get_cuda_runtime().free_pool_memory()
             except Exception:
                 pass
-            # AUTO dispatch: the GPU polygon_intersection kernel uses
-            # Sutherland-Hodgman, which is only correct for convex clip
-            # polygons.  AUTO lets the crossover policy route small
-            # batches (< 50K rows) to the CPU/Shapely path that handles
-            # concave polygons.  The validity-bitmap winding-direction
-            # bug has been fixed, so GPU dispatch IS correct when the
-            # crossover threshold selects it for convex-only workloads.
-            _pairwise_mode = ExecutionMode.AUTO
+            # Keep AUTO behavior for normal runs, but in strict-native mode
+            # force the repo-owned GPU path here so overlay surfaces do not
+            # die on the generic small-workload crossover before the polygon
+            # intersection dispatcher has a chance to choose its rowwise GPU
+            # overlay fallback for non-SH-safe polygons.
+            _pairwise_mode = (
+                ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
+            )
 
             # ---- Many-vs-one detection ----
             # Check BEFORE device_take: for many-vs-one (all pairs
@@ -887,6 +1097,7 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
                     dispatch_mode=_pairwise_mode,
+                    _prefer_exact_polygon_intersection=_prefer_exact_polygon_gpu,
                 )
                 intersections = GeoSeries(
                     GeometryArray.from_owned(result_owned, crs=df1.crs),
@@ -905,6 +1116,7 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
                     dispatch_mode=_pairwise_mode,
+                    _prefer_exact_polygon_intersection=_prefer_exact_polygon_gpu,
                 )
                 intersections = GeoSeries(
                     GeometryArray.from_owned(result_owned, crs=df1.crs),
@@ -924,6 +1136,30 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
         intersections = _make_valid_geoseries(intersections)
 
         geom_intersect = intersections
+        if (
+            _preserve_lower_dim_polygon_results
+            and df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
+            and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        ):
+            if left_sub is not None and right_sub is not None:
+                pair_left = GeoSeries(
+                    GeometryArray.from_owned(left_sub, crs=df1.crs),
+                    index=geom_intersect.index,
+                )
+                pair_right = GeoSeries(
+                    GeometryArray.from_owned(right_sub, crs=df1.crs),
+                    index=geom_intersect.index,
+                )
+            else:
+                pair_left = df1.geometry.take(idx1)
+                pair_left.reset_index(drop=True, inplace=True)
+                pair_right = df2.geometry.take(idx2)
+                pair_right.reset_index(drop=True, inplace=True)
+            geom_intersect = _assemble_polygon_intersection_rows_with_lower_dim(
+                pair_left,
+                pair_right,
+                geom_intersect,
+            )
 
         # ADR-0036 boundary: attribute assembly from index arrays.
         df1 = df1.reset_index(drop=True)
@@ -949,7 +1185,7 @@ def _overlay_intersection(df1, df2, left_owned=None, right_owned=None):
         ], used_owned
 
 
-def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
+def _overlay_difference(df1, df2, left_owned=None, right_owned=None, *, _index_result=None):
     """Overlay Difference operation used in overlay function.
 
     Returns
@@ -957,10 +1193,17 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     tuple[GeoDataFrame, bool]
         Result GeoDataFrame and whether the owned dispatch path was used.
     """
+    left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
+        df1, df2, left_owned, right_owned,
+    )
     # ADR-0036 boundary: spatial index produces index arrays only.
     # Phase 2: pass owned arrays to request device-resident index pairs.
-    index_result = _intersecting_index_pairs(
-        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    index_result = (
+        _index_result
+        if _index_result is not None
+        else _intersecting_index_pairs(
+            df1, df2, left_owned=left_owned, right_owned=right_owned,
+        )
     )
 
     # Unpack result: DeviceSpatialJoinResult (device arrays) or numpy.
@@ -988,15 +1231,24 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
     # Phase 18: uses concat_owned_scatter to keep the result device-resident
     # instead of materializing via to_shapely().
     #
-    if idx1.size > 0 and left_owned is not None and right_owned is not None:
-        from vibespatial.geometry.owned import concat_owned_scatter
+    use_lower_dim_boundary_rebuild = _needs_host_overlay_difference_boundary_rebuild(df1, df2)
 
-        # The GPU polygon_intersection kernel uses Sutherland-Hodgman
-        # which only handles convex clip polygons.  The difference
-        # pipeline may produce concave intermediates (e.g., union of
-        # overlapping circles), so keep AUTO until the kernel supports
-        # concave clipping.
-        _pairwise_mode = ExecutionMode.AUTO
+    if (
+        idx1.size > 0
+        and left_owned is not None
+        and right_owned is not None
+        and not use_lower_dim_boundary_rebuild
+    ):
+        from vibespatial.geometry.owned import OwnedGeometryArray, concat_owned_scatter
+        from vibespatial.runtime.residency import Residency
+
+        # Keep AUTO behavior for normal runs, but in strict-native mode force
+        # the repo-owned GPU difference path here so overlay does not die on
+        # the generic small-workload crossover before the polygon dispatcher
+        # can choose its overlay-based GPU implementation for concave inputs.
+        _pairwise_mode = (
+            ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
+        )
 
         # Batched overlay difference: splits groups into VRAM-safe
         # batches to prevent OOM at large scale (100K+).  At small
@@ -1012,10 +1264,34 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
             _pairwise_mode,
         )
 
-        # Assemble full result: scatter differenced rows into the
-        # original left owned array.  No to_shapely() materialisation.
+        # Assemble full result without reviving emptied overlap rows.
+        # Rows with no spatial-join neighbors keep their original left geometry.
+        # Rows in idx1_unique must take the differenced result verbatim, even
+        # when that result is null/empty.
+        null_base = OwnedGeometryArray(
+            validity=np.zeros(n_left, dtype=bool),
+            tags=np.full(n_left, -1, dtype=np.int8),
+            family_row_offsets=np.full(n_left, -1, dtype=np.int32),
+            families={},
+            residency=Residency.HOST,
+        )
+        result_owned = null_base
+        no_neighbor_idx = np.setdiff1d(
+            np.arange(n_left, dtype=np.int64),
+            np.asarray(idx1_unique, dtype=np.int64),
+            assume_unique=True,
+        )
+        if no_neighbor_idx.size > 0:
+            preserved_left = left_owned.take(no_neighbor_idx)
+            result_owned = concat_owned_scatter(
+                result_owned,
+                preserved_left,
+                no_neighbor_idx,
+            )
         result_owned = concat_owned_scatter(
-            left_owned, diff_owned, idx1_unique,
+            result_owned,
+            diff_owned,
+            np.asarray(idx1_unique, dtype=np.int64),
         )
         used_owned = True
 
@@ -1028,39 +1304,7 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None):
         )
     else:
         if result_geoms is None:
-            # Vectorized grouped-union approach: for each left geometry, compute
-            # left_i - union(overlapping right geometries).  Replaces per-geometry
-            # Python loop with grouped shapely.union_all + vectorized
-            # shapely.difference.
-            left_geoms = np.asarray(df1.geometry, dtype=object)
-            result_geoms = left_geoms.copy()
-
-            if idx1.size > 0:
-                # Ensure host arrays for Shapely fallback path — indices may
-                # be CuPy when the owned path above raised an exception.
-                h_idx1 = idx1.get() if hasattr(idx1, "get") else idx1
-                h_idx2 = idx2.get() if hasattr(idx2, "get") else idx2
-
-                right_geoms = np.asarray(df2.geometry, dtype=object)
-                right_unions = np.empty(n_left, dtype=object)
-                right_unions.fill(None)
-
-                # O(N log N) grouping via np.split — avoids O(K*N) per-group
-                # mask scan.
-                idx1_unique, idx1_split_at = np.unique(h_idx1, return_index=True)
-                idx2_groups = np.split(h_idx2, idx1_split_at[1:])
-                for left_pos, neighbors_idx in zip(idx1_unique, idx2_groups):
-                    neighbors = right_geoms[neighbors_idx]
-                    if len(neighbors) == 1:
-                        right_unions[left_pos] = neighbors[0]
-                    else:
-                        right_unions[left_pos] = shapely.union_all(neighbors)  # CPU-only mode
-
-                has_neighbors = np.zeros(n_left, dtype=bool)
-                has_neighbors[idx1_unique] = True
-                result_geoms[has_neighbors] = shapely.difference(  # CPU-only mode
-                    left_geoms[has_neighbors], right_unions[has_neighbors],
-                )
+            result_geoms = _grouped_overlay_difference_geoms(df1, df2, idx1, idx2)
 
         differences = GeoSeries(result_geoms, index=df1.index, crs=df1.crs)
 
@@ -1088,8 +1332,23 @@ def _overlay_identity(df1, df2, left_owned=None, right_owned=None):
 
     Returns (GeoDataFrame, bool) -- result and whether any sub-op used owned dispatch.
     """
-    dfintersection, used_inter = _overlay_intersection(df1, df2, left_owned, right_owned)
-    dfdifference, used_diff = _overlay_difference(df1, df2, left_owned, right_owned)
+    forward_index_result = _intersecting_index_pairs(
+        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    )
+    dfintersection, used_inter = _overlay_intersection(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+        _index_result=forward_index_result,
+    )
+    dfdifference, used_diff = _overlay_difference(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+        _index_result=forward_index_result,
+    )
     dfdifference = _ensure_geometry_column(dfdifference)
 
     # Columns that were suffixed in dfintersection need to be suffixed in dfdifference
@@ -1115,13 +1374,42 @@ def _overlay_identity(df1, df2, left_owned=None, right_owned=None):
     return result, used_inter or used_diff
 
 
-def _overlay_symmetric_diff(df1, df2, left_owned=None, right_owned=None):
+def _overlay_symmetric_diff(
+    df1,
+    df2,
+    left_owned=None,
+    right_owned=None,
+    *,
+    _forward_index_result=None,
+    _reverse_index_result=None,
+):
     """Overlay Symmetric Difference operation used in overlay function.
 
     Returns (GeoDataFrame, bool) -- result and whether any sub-op used owned dispatch.
     """
-    dfdiff1, used1 = _overlay_difference(df1, df2, left_owned, right_owned)
-    dfdiff2, used2 = _overlay_difference(df2, df1, right_owned, left_owned)
+    if _forward_index_result is None:
+        _forward_index_result = _intersecting_index_pairs(
+            df1, df2, left_owned=left_owned, right_owned=right_owned,
+        )
+    if _reverse_index_result is None:
+        _reverse_index_result = _reverse_intersecting_index_pairs(
+            _forward_index_result,
+        )
+
+    dfdiff1, used1 = _overlay_difference(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+        _index_result=_forward_index_result,
+    )
+    dfdiff2, used2 = _overlay_difference(
+        df2,
+        df1,
+        right_owned,
+        left_owned,
+        _index_result=_reverse_index_result,
+    )
     dfdiff1["__idx1"] = range(len(dfdiff1))
     dfdiff2["__idx2"] = range(len(dfdiff2))
     dfdiff1["__idx2"] = np.nan
@@ -1138,6 +1426,13 @@ def _overlay_symmetric_diff(df1, df2, left_owned=None, right_owned=None):
     diff2_owned = getattr(dfdiff2.geometry.values, '_owned', None)
 
     if diff1_owned is not None and diff2_owned is not None:
+        # GeoPandas warns on CRS mismatch at the public overlay boundary but
+        # still proceeds with the left CRS. The owned-preserving concat path
+        # must mirror that contract instead of delegating the mismatch to
+        # GeometryArray._concat_same_type(), which would raise on pd.concat.
+        if dfdiff1.crs != dfdiff2.crs:
+            dfdiff2 = dfdiff2.set_crs(dfdiff1.crs, allow_override=True)
+
         # Align columns to match merge(..., suffixes=("_1","_2")) behavior:
         # shared attribute columns get "_1"/"_2" suffix; unique columns
         # keep their original names.
@@ -1185,8 +1480,23 @@ def _overlay_union(df1, df2, left_owned=None, right_owned=None):
 
     Returns (GeoDataFrame, bool) -- result and whether any sub-op used owned dispatch.
     """
-    dfinter, used_inter = _overlay_intersection(df1, df2, left_owned, right_owned)
-    dfsym, used_sym = _overlay_symmetric_diff(df1, df2, left_owned, right_owned)
+    forward_index_result = _intersecting_index_pairs(
+        df1, df2, left_owned=left_owned, right_owned=right_owned,
+    )
+    dfinter, used_inter = _overlay_intersection(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+        _index_result=forward_index_result,
+    )
+    dfsym, used_sym = _overlay_symmetric_diff(
+        df1,
+        df2,
+        left_owned,
+        right_owned,
+        _forward_index_result=forward_index_result,
+    )
     dfunion = pd.concat([dfinter, dfsym], ignore_index=True, sort=False)
     # keep geometry column last
     columns = list(dfunion.columns)
@@ -1430,8 +1740,18 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                 df1, df2, left_owned, right_owned,
             )
         elif how == "intersection":
+            preserve_lower_dim = (
+                keep_geom_type is False or keep_geom_type_warning
+            )
             result, _used_owned = _overlay_intersection(
-                df1, df2, left_owned, right_owned,
+                df1,
+                df2,
+                left_owned,
+                right_owned,
+                _prefer_exact_polygon_gpu=(
+                    strict_native_mode_enabled() and not preserve_lower_dim
+                ),
+                _preserve_lower_dim_polygon_results=preserve_lower_dim,
             )
         elif how == "symmetric_difference":
             result, _used_owned = _overlay_symmetric_diff(
@@ -1443,9 +1763,6 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
             result, _used_owned = _overlay_identity(
                 df1, df2, left_owned, right_owned,
             )
-
-        if how in ["intersection", "symmetric_difference", "union", "identity"]:
-            result.drop(["__idx1", "__idx2"], axis=1, inplace=True)
 
     record_dispatch_event(
         surface="geopandas.overlay",
@@ -1470,6 +1787,14 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
             result = _collection_extract_owned(result, geom_type, keep_geom_type_warning)
         else:
             result = _collection_extract(result, geom_type, keep_geom_type_warning)
+
+    if result.geometry.isna().any():
+        result = result.loc[~result.geometry.isna()].copy()
+
+    if how in ["intersection", "symmetric_difference", "union", "identity"]:
+        drop_cols = [col for col in ("__idx1", "__idx2") if col in result.columns]
+        if drop_cols:
+            result.drop(drop_cols, axis=1, inplace=True)
 
     result.reset_index(drop=True, inplace=True)
     return result
@@ -1550,6 +1875,33 @@ def _collection_extract_owned(df, geom_type, keep_geom_type_warning):
     keep_indices = np.flatnonzero(keep_mask)
     result = df.iloc[keep_indices].copy()
     filtered_owned = owned.take(keep_indices)
+
+    if (
+        geom_type in POLYGON_GEOM_TYPES
+        and "__idx1" in result.columns
+        and "__idx2" in result.columns
+        and len(result) > 1
+    ):
+        from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+        idx1_col = result["__idx1"]
+        idx2_col = result["__idx2"]
+        if idx1_col.notna().all() and idx2_col.notna().all():
+            idx1 = idx1_col.to_numpy(dtype=np.int64, copy=False)
+            idx2 = idx2_col.to_numpy(dtype=np.int64, copy=False)
+            order = np.lexsort((idx2, idx1))
+            if order.size > 1:
+                idx1_sorted = idx1[order]
+                idx2_sorted = idx2[order]
+                group_starts = np.flatnonzero(
+                    (idx1_sorted[1:] != idx1_sorted[:-1]) | (idx2_sorted[1:] != idx2_sorted[:-1])
+                ) + 1
+                group_offsets = np.concatenate(
+                    [np.asarray([0], dtype=np.int64), group_starts.astype(np.int64, copy=False), np.asarray([len(order)], dtype=np.int64)]
+                )
+                if len(group_offsets) - 1 != len(order):
+                    result = result.iloc[order].iloc[group_offsets[:-1]].copy()
+                    filtered_owned = segmented_union_all(filtered_owned.take(order), group_offsets)
 
     # Rebuild the GeoSeries with owned backing to avoid Shapely materialisation.
     geom_col = result._geometry_column_name

@@ -8,19 +8,28 @@ Covers nsf.3: elimination of [other]*len(self) materialization.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Point, box
+from shapely.geometry import MultiPoint, Point, box
 
+from vibespatial.api import read_file
+from vibespatial.constructive import binary_constructive as binary_constructive_module
 from vibespatial.constructive.binary_constructive import binary_constructive_owned
 from vibespatial.geometry.owned import (
     from_shapely_geometries,
     tile_single_row,
 )
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+from vibespatial.testing import strict_native_environment
 
 # The four constructive operations.
 _CONSTRUCTIVE_OPS = ("intersection", "union", "difference", "symmetric_difference")
+
+requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
 
 
 # ---------------------------------------------------------------------------
@@ -220,6 +229,273 @@ def test_tiling_equivalence(op: str) -> None:
             assert bg.equals_exact(tg, 1e-9), (
                 f"Row {i}: broadcast != tiled\n  broadcast={bg}\n  tiled={tg}"
             )
+
+
+@requires_gpu
+def test_strict_broadcast_polygon_intersection_preserves_row_cardinality_for_complex_polygons() -> None:
+    """Strict scalar-right polygon intersection keeps one output slot per input row.
+
+    Buffered polygons exceed the SH kernel's vertex workspace, so this exercises
+    the row-preserving overlay fallback instead of the direct polygon clip
+    kernel.
+    """
+    left = [
+        Point(2, 2).buffer(4),
+        Point(3, 4).buffer(4),
+        Point(9, 8).buffer(4),
+        Point(-12, -15).buffer(4),
+    ]
+    right = box(0, 0, 10, 10)
+
+    left_owned = from_shapely_geometries(left)
+    right_owned = from_shapely_geometries([right])
+
+    with strict_native_environment():
+        result = binary_constructive_owned("intersection", left_owned, right_owned)
+
+    got = result.to_shapely()
+    expected = _shapely_oracle("intersection", left, right)
+
+    assert len(got) == len(expected) == 4
+    for i, (got_geom, expected_geom) in enumerate(zip(got, expected, strict=True)):
+        if expected_geom is None:
+            assert got_geom is None, f"Row {i}: expected None, got {got_geom}"
+        elif shapely.is_empty(expected_geom):
+            assert got_geom is None or shapely.is_empty(got_geom), (
+                f"Row {i}: expected empty or null, got {got_geom}"
+            )
+        else:
+            assert got_geom is not None, f"Row {i}: expected non-null polygon result"
+            assert got_geom.normalize().equals_exact(expected_geom.normalize(), 1e-9), (
+                f"Row {i}: broadcast complex polygon intersection mismatch\n"
+                f"  got={got_geom}\n"
+                f"  exp={expected_geom}"
+            )
+
+
+def test_polygon_intersection_tries_rowwise_overlay_after_overlay_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Polygon intersection recovers with rowwise overlay when bulk overlay raises."""
+    left = from_shapely_geometries([box(0, 0, 2, 2), box(4, 4, 6, 6)])
+    right = from_shapely_geometries([box(1, 1, 3, 3), box(4, 4, 5, 5)])
+    sentinel = from_shapely_geometries([box(1, 1, 2, 2), box(4, 4, 5, 5)])
+
+    monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *_: False)
+
+    def _raise_overlay(*args, **kwargs):
+        raise RuntimeError("overlay boom")
+
+    monkeypatch.setattr(binary_constructive_module, "_dispatch_overlay_gpu", _raise_overlay)
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    result = binary_constructive_module._binary_constructive_gpu(
+        "intersection",
+        left,
+        right,
+    )
+
+    assert result is sentinel
+
+
+def test_polygon_difference_tries_legacy_rowwise_after_batched_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = from_shapely_geometries([box(0, 0, 2, 2), box(4, 4, 6, 6)])
+    right = from_shapely_geometries([box(1, 1, 3, 3), box(4, 4, 5, 5)])
+    sentinel = from_shapely_geometries([box(0, 0, 1, 2), box(5, 5, 6, 6)])
+
+    def _raise_batched(*args, **kwargs):
+        raise RuntimeError("batched boom")
+
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_difference_overlay_batched_gpu",
+        _raise_batched,
+    )
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_difference_overlay_rowwise_gpu_legacy",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    result = binary_constructive_module._dispatch_polygon_difference_overlay_rowwise_gpu(
+        left,
+        right,
+    )
+
+    assert result is sentinel
+
+
+@requires_gpu
+def test_single_pair_polygon_intersection_uses_exact_overlay_path_for_complex_polygons() -> None:
+    data = os.path.join(
+        os.path.dirname(__file__),
+        "upstream",
+        "geopandas",
+        "tests",
+        "data",
+    )
+    overlay_data = os.path.join(data, "overlay", "nybb_qgis")
+    left = read_file(f"zip://{os.path.join(data, 'nybb_16a.zip')}").iloc[[4]].copy()
+    right = read_file(os.path.join(overlay_data, "polydf2.shp")).iloc[[8]].copy()
+    left_owned = left.geometry.values.to_owned()
+    right_owned = right.geometry.values.to_owned()
+    expected = left.geometry.iloc[0].intersection(right.geometry.iloc[0]).normalize()
+
+    result = binary_constructive_owned(
+        "intersection",
+        left_owned,
+        right_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    got = result.to_shapely()[0]
+    assert got is not None
+    assert got.geom_type == expected.geom_type
+    assert got.normalize().equals_exact(expected, tolerance=1e-6)
+
+
+@requires_gpu
+def test_single_pair_polygon_difference_preserves_touch_only_left_polygon() -> None:
+    left = from_shapely_geometries(
+        [box(-1, 1, 1, 3)]
+    )
+    right = from_shapely_geometries(
+        [box(1, 1, 3, 3)]
+    )
+
+    result = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    got = result.to_shapely()[0]
+    expected = box(-1, 1, 1, 3)
+    assert got is not None
+    assert got.equals_exact(expected, tolerance=1e-9)
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    ("right_geom", "label"),
+    [
+        (Point(1, 1), "point"),
+        (MultiPoint([(1, 1), (3, 3)]), "multipoint"),
+    ],
+)
+def test_single_pair_polygon_difference_preserves_left_for_lower_dim_right(
+    right_geom,
+    label: str,
+) -> None:
+    left = from_shapely_geometries(
+        [box(0, 0, 4, 4)]
+    )
+    right = from_shapely_geometries([right_geom])
+
+    result = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    got = result.to_shapely()[0]
+    expected = box(0, 0, 4, 4)
+    assert got is not None, f"{label} difference unexpectedly returned null"
+    assert got.equals_exact(expected, tolerance=1e-9), (
+        f"{label} difference should preserve the left polygon exactly"
+    )
+
+
+@requires_gpu
+def test_polygon_union_batches_aligned_overlay_candidate_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = [
+        Point(0, 0).buffer(10, resolution=32),
+        Point(40, 0).buffer(10, resolution=32),
+        Point(0, 40).buffer(10, resolution=32),
+        Point(40, 40).buffer(10, resolution=32),
+    ]
+    right = [
+        Point(5, 0).buffer(10, resolution=32),
+        Point(45, 0).buffer(10, resolution=32),
+        Point(5, 40).buffer(10, resolution=32),
+        Point(45, 40).buffer(10, resolution=32),
+    ]
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+
+    result = binary_constructive_owned(
+        "union",
+        from_shapely_geometries(left),
+        from_shapely_geometries(right),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    got = result.to_shapely()
+    expected = shapely.union(np.asarray(left, dtype=object), np.asarray(right, dtype=object)).tolist()
+    assert len(got) == len(expected) == 4
+    for got_geom, expected_geom in zip(got, expected, strict=True):
+        assert got_geom is not None
+        assert got_geom.normalize().equals_exact(expected_geom.normalize(), tolerance=1e-9)
+
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.classify.generate_candidates") == 1
+    assert summary.get("overlay.split.classify_intersections") == 1
+
+
+@requires_gpu
+def test_polygon_difference_batches_aligned_overlay_candidate_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = [
+        box(0, 0, 4, 4),      # partial overlap
+        box(10, 0, 14, 4),    # touch-only
+        box(20, 0, 24, 4),    # full overlap
+        box(30, 0, 34, 4),    # disjoint
+    ]
+    right = [
+        box(2, 0, 6, 4),
+        box(14, 0, 18, 4),
+        box(20, 0, 24, 4),
+        box(40, 0, 44, 4),
+    ]
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+
+    result = binary_constructive_owned(
+        "difference",
+        from_shapely_geometries(left),
+        from_shapely_geometries(right),
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    got = result.to_shapely()
+    expected = shapely.difference(np.asarray(left, dtype=object), np.asarray(right, dtype=object)).tolist()
+    assert len(got) == len(expected) == 4
+    for got_geom, expected_geom in zip(got, expected, strict=True):
+        if expected_geom is None:
+            assert got_geom is None
+        elif shapely.is_empty(expected_geom):
+            assert got_geom is None or shapely.is_empty(got_geom)
+        else:
+            assert got_geom is not None
+            assert got_geom.normalize().equals_exact(expected_geom.normalize(), tolerance=1e-9)
+
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.classify.generate_candidates") == 1
+    assert summary.get("overlay.split.classify_intersections") == 1
+
 
 
 # ---------------------------------------------------------------------------

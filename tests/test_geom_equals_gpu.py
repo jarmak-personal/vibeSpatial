@@ -24,8 +24,14 @@ from shapely.geometry import (
     Polygon,
 )
 
+import vibespatial
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
-from vibespatial.testing import build_owned as _make_owned
+from vibespatial.testing import (
+    build_owned as _make_owned,
+)
+from vibespatial.testing import (
+    strict_native_environment,
+)
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
 def _shapely_equals(left_geoms, right_geoms):
@@ -454,6 +460,35 @@ def test_geopandas_scalar_broadcast():
     # Even-indexed are equal, odd-indexed are not (except possibly i=5)
     assert result.iloc[0] is np.bool_(True)
     assert result.iloc[1] is np.bool_(False)
+
+
+@requires_gpu
+def test_geopandas_scalar_broadcast_strict_native_stays_on_owned_path():
+    """Strict scalar broadcast should not escape to the Shapely fallback path."""
+    import geopandas
+
+    n = 1200
+    pt = Point(5, 5)
+    geoms = [Point(5, 5) if i % 2 == 0 else Point(i, i) for i in range(n)]
+    gs = geopandas.GeoSeries(geoms)
+
+    with strict_native_environment():
+        vibespatial.clear_dispatch_events()
+        result = gs.geom_equals(pt, align=False)
+        events = vibespatial.get_dispatch_events(clear=True)
+
+    assert result.iloc[0] is np.bool_(True)
+    assert result.iloc[1] is np.bool_(False)
+    assert any(
+        event.surface == "geopandas.array.equals"
+        and event.implementation == "geom_equals_owned_broadcast"
+        for event in events
+    )
+    assert not any(
+        event.surface == "geopandas.array.equals"
+        and event.implementation == "shapely_scalar_broadcast"
+        for event in events
+    )
 
 
 @requires_gpu

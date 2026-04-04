@@ -10,7 +10,7 @@ from __future__ import annotations
 from vibespatial.cuda.device_functions.signed_area import SIGNED_AREA_DEVICE
 from vibespatial.cuda.device_functions.strip_closure import STRIP_CLOSURE_DEVICE
 
-_MAX_CLIP_VERTS = 64  # 4 buffers * 64 * 8 bytes = 2KB per thread (vs 8KB at 256)
+_MAX_CLIP_VERTS = 128  # 4 buffers * 128 * 8 bytes = 4KB per thread; covers common buffered polygons
 
 _POLYGON_INTERSECTION_KERNEL_SOURCE = SIGNED_AREA_DEVICE + STRIP_CLOSURE_DEVICE + r"""
 #define MAX_CLIP_VERTS """ + str(_MAX_CLIP_VERTS) + r"""

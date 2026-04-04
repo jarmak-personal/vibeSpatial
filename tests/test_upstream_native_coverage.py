@@ -43,3 +43,25 @@ def test_discover_group_targets_splits_upstream_tree_by_top_level_area() -> None
         "tests/upstream/geopandas/io",
         "tests/upstream/geopandas/tools",
     )
+
+
+def test_discover_group_targets_splits_upstream_tree_by_test_file() -> None:
+    grouped = discover_group_targets(
+        ("tests/upstream/geopandas/tools/tests",),
+        cwd=Path.cwd(),
+        group_by="file",
+    )
+
+    assert tuple(grouped) == (
+        "tests/upstream/geopandas/tools/tests/test_clip.py",
+        "tests/upstream/geopandas/tools/tests/test_hilbert_curve.py",
+        "tests/upstream/geopandas/tools/tests/test_random.py",
+        "tests/upstream/geopandas/tools/tests/test_sjoin.py",
+        "tests/upstream/geopandas/tools/tests/test_tools.py",
+    )
+    assert grouped["tests/upstream/geopandas/tools/tests/test_clip.py"] == (
+        "tests/upstream/geopandas/tools/tests/test_clip.py",
+    )
+    assert grouped["tests/upstream/geopandas/tools/tests/test_tools.py"] == (
+        "tests/upstream/geopandas/tools/tests/test_tools.py",
+    )

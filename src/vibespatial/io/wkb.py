@@ -327,9 +327,6 @@ def _device_geoarrow_fast_path_reason_owned(owned: OwnedGeometryArray) -> str | 
         return "empty geometry column requires upstream GeoArrow constructor semantics"
     if not bool(owned.validity.any()):
         return "all-missing geometry column requires upstream GeoArrow constructor semantics"
-    for buf in owned.families.values():
-        if bool(buf.empty_mask.any()):
-            return "empty geometry rows require upstream GeoArrow constructor semantics"
     try:
         _homogeneous_family(owned)
     except ValueError as exc:
@@ -363,11 +360,15 @@ def _device_validity_gpumask(owned: OwnedGeometryArray):
     return plc.gpumemoryview(cp.asarray(validity_bytes.view(np.uint8))), null_count
 
 
-def _device_point_values_column(x_device, y_device):
+def _device_point_values_column(x_device, y_device, *, mask=None, null_count: int = 0):
     import pylibcudf as plc
 
     x_col = plc.Column.from_cuda_array_interface(x_device)
     y_col = plc.Column.from_cuda_array_interface(y_device)
+    if mask is not None and null_count:
+        x_col = x_col.with_mask(mask, null_count)
+        y_col = y_col.with_mask(mask, null_count)
+        return plc.Column.struct_from_children([x_col, y_col]).with_mask(mask, null_count)
     return plc.Column.struct_from_children([x_col, y_col])
 
 
@@ -396,14 +397,16 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
 
     if family is GeometryFamily.POINT:
         row_count = owned.row_count
-        x_full = cp.zeros(row_count, dtype=cp.float64)
-        y_full = cp.zeros(row_count, dtype=cp.float64)
+        x_full = cp.full(row_count, cp.nan, dtype=cp.float64)
+        y_full = cp.full(row_count, cp.nan, dtype=cp.float64)
         valid_mask = state.validity
-        x_full[valid_mask] = device_buffer.x
-        y_full[valid_mask] = device_buffer.y
-        column = _device_point_values_column(x_full, y_full)
-        if null_count:
-            column = column.with_mask(mask, null_count)
+        valid_rows = cp.flatnonzero(valid_mask)
+        non_empty_mask = ~device_buffer.empty_mask
+        if int(cp.count_nonzero(non_empty_mask)) > 0:
+            coord_indices = device_buffer.geometry_offsets[:-1][non_empty_mask]
+            x_full[valid_rows[non_empty_mask]] = device_buffer.x[coord_indices]
+            y_full[valid_rows[non_empty_mask]] = device_buffer.y[coord_indices]
+        column = _device_point_values_column(x_full, y_full, mask=mask, null_count=null_count)
         return column, "point"
 
     point_values = _device_point_values_column(device_buffer.x, device_buffer.y)
@@ -511,6 +514,7 @@ def _write_geoparquet_native_device(
     geometry_columns,
     **kwargs,
 ) -> bool:
+    import base64
     import json
     import os
 
@@ -522,7 +526,15 @@ def _write_geoparquet_native_device(
     except ModuleNotFoundError:
         return False
 
+    from vibespatial.api.io._geoarrow import (
+        _linestring_type,
+        _multilinestring_type,
+        _multipoint_type,
+        _multipolygon_type,
+        _polygon_type,
+    )
     from vibespatial.api.io.arrow import _create_metadata, _encode_metadata
+    from vibespatial.io.geoarrow import _geoarrow_field_metadata
 
     # Extract recognized kwargs; only fall back for truly unrecognized ones.
     _RECOGNIZED_KWARGS = {"row_group_size", "max_page_size"}
@@ -540,15 +552,6 @@ def _write_geoparquet_native_device(
             d2h_transfer=False,
         )
         return False
-    record_fallback_event(
-        surface="geopandas.geodataframe.to_parquet",
-        reason="device-side parquet writer does not preserve Arrow schema metadata on pyarrow.read_table",
-        detail="falling back to the owned-buffer pyarrow writer until native metadata parity lands",
-        selected=ExecutionMode.CPU,
-        pipeline="io/to_parquet",
-        d2h_transfer=False,
-    )
-    return False
     if not isinstance(path, (str, bytes, os.PathLike)):
         return False
 
@@ -667,13 +670,102 @@ def _write_geoparquet_native_device(
     if df.attrs:
         footer_metadata["PANDAS_ATTRS"] = json.dumps(df.attrs)
 
+    point_type = pa.struct(
+        [
+            pa.field("x", pa.float64(), nullable=False),
+            pa.field("y", pa.float64(), nullable=False),
+        ]
+    )
+
+    def _geometry_field(column_name: str) -> pa.Field:
+        series = df[column_name]
+        if geometry_encoding_dict[column_name] == "WKB":
+            field_metadata = {}
+            if series.crs is not None:
+                try:
+                    crs_json = series.crs.to_json_dict()
+                except AttributeError:
+                    crs_json = None
+                if crs_json is not None:
+                    field_metadata[b"ARROW:extension:metadata"] = json.dumps(
+                        {"crs": crs_json}
+                    ).encode()
+            field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+            if b"ARROW:extension:metadata" not in field_metadata:
+                field_metadata[b"ARROW:extension:metadata"] = b"{}"
+            return pa.field(
+                column_name,
+                pa.binary(),
+                nullable=True,
+                metadata=field_metadata,
+            )
+
+        family = _homogeneous_family(owned_by_name[column_name])
+        if family is GeometryFamily.POINT:
+            field_type = point_type
+        elif family is GeometryFamily.LINESTRING:
+            field_type = _linestring_type(point_type)
+        elif family is GeometryFamily.POLYGON:
+            field_type = _polygon_type(point_type)
+        elif family is GeometryFamily.MULTIPOINT:
+            field_type = _multipoint_type(point_type)
+        elif family is GeometryFamily.MULTILINESTRING:
+            field_type = _multilinestring_type(point_type)
+        elif family is GeometryFamily.MULTIPOLYGON:
+            field_type = _multipolygon_type(point_type)
+        else:  # pragma: no cover - exhaustive today
+            raise ValueError(f"Unsupported family for native GeoArrow schema: {family}")
+
+        extension_name = f"geoarrow.{geometry_encoding_dict[column_name].lower()}"
+        return pa.field(
+            column_name,
+            field_type,
+            nullable=True,
+            metadata=_geoarrow_field_metadata(
+                extension_name=extension_name,
+                crs=series.crs,
+            ),
+        )
+
+    schema_fields = []
+    host_fields = {field.name: field for field in host_table.schema}
+    for column_name in all_column_names:
+        if column_name in geometry_columns_set:
+            schema_fields.append(_geometry_field(column_name))
+        elif column_name == "bbox":
+            schema_fields.append(
+                pa.field(
+                    "bbox",
+                    pa.struct(
+                        [
+                            pa.field("xmin", pa.float64(), nullable=False),
+                            pa.field("ymin", pa.float64(), nullable=False),
+                            pa.field("xmax", pa.float64(), nullable=False),
+                            pa.field("ymax", pa.float64(), nullable=False),
+                        ]
+                    ),
+                    nullable=True,
+                )
+            )
+        else:
+            schema_fields.append(host_fields[column_name])
+
+    schema_metadata = dict(host_table.schema.metadata or {})
+    schema_metadata[b"geo"] = _encode_metadata(geo_metadata)
+    if df.attrs:
+        schema_metadata[b"PANDAS_ATTRS"] = json.dumps(df.attrs).encode()
+    arrow_schema = pa.schema(schema_fields, metadata=schema_metadata)
+    footer_metadata["ARROW:schema"] = base64.b64encode(
+        arrow_schema.serialize().to_pybytes()
+    ).decode()
+
     builder = plc.io.parquet.ParquetWriterOptions.builder(
         plc.io.types.SinkInfo([str(path)]),
         plc_table,
     )
     builder.metadata(metadata)
     builder.key_value_metadata([footer_metadata])
-    builder.write_arrow_schema(True)
+    builder.write_arrow_schema(False)
     builder.compression(_compression_type_from_name(compression))
     if "row_group_size" in recognized_kwargs:
         builder.row_group_size_rows(int(recognized_kwargs["row_group_size"]))

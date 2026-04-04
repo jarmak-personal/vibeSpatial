@@ -238,6 +238,96 @@ __device__ inline compute_t abs_ct(compute_t value) {{{{
     return value < (compute_t)0.0 ? -value : value;
 }}}}
 
+typedef struct {{
+    double hi;
+    double lo;
+}} vs_dd;
+
+__device__ inline vs_dd vs_dd_normalize(double hi, double lo) {{{{
+    double s, e;
+    vs_two_sum(hi, lo, s, e);
+    vs_dd out;
+    out.hi = s;
+    out.lo = e;
+    return out;
+}}}}
+
+__device__ inline vs_dd vs_dd_from_double(double value) {{{{
+    vs_dd out;
+    out.hi = value;
+    out.lo = 0.0;
+    return out;
+}}}}
+
+__device__ inline vs_dd vs_dd_add(vs_dd a, vs_dd b) {{{{
+    double s, e;
+    vs_two_sum(a.hi, b.hi, s, e);
+    return vs_dd_normalize(s, a.lo + b.lo + e);
+}}}}
+
+__device__ inline vs_dd vs_dd_sub(vs_dd a, vs_dd b) {{{{
+    double s, e;
+    vs_two_sum(a.hi, -b.hi, s, e);
+    return vs_dd_normalize(s, a.lo - b.lo + e);
+}}}}
+
+__device__ inline vs_dd vs_dd_mul_double(vs_dd a, double b) {{{{
+    double p, e;
+    vs_two_product(a.hi, b, p, e);
+    return vs_dd_normalize(p, e + a.lo * b);
+}}}}
+
+__device__ inline vs_dd vs_dd_mul_diff(double ax, double by, double ay, double bx) {{{{
+    double p1, e1, p2, e2, s, e;
+    vs_two_product(ax, by, p1, e1);
+    vs_two_product(ay, bx, p2, e2);
+    vs_two_sum(p1, -p2, s, e);
+    return vs_dd_normalize(s, e1 - e2 + e);
+}}}}
+
+__device__ inline double vs_dd_div(vs_dd num, vs_dd den) {{{{
+    const double q1 = num.hi / den.hi;
+    vs_dd rem1 = vs_dd_sub(num, vs_dd_mul_double(den, q1));
+    const double q2 = rem1.hi / den.hi;
+    vs_dd rem2 = vs_dd_sub(rem1, vs_dd_mul_double(den, q2));
+    const double q3 = rem2.hi / den.hi;
+    return (q1 + q2) + q3;
+}}}}
+
+__device__ inline int vs_proper_intersection_point_dd(
+    double ax,
+    double ay,
+    double bx,
+    double by,
+    double cx,
+    double cy,
+    double dx,
+    double dy,
+    double* out_x,
+    double* out_y
+) {{{{
+    vs_dd denominator = vs_dd_mul_diff(ax - bx, cy - dy, ay - by, cx - dx);
+    if (denominator.hi == 0.0 && denominator.lo == 0.0) {{{{
+        return 0;
+    }}}}
+
+    vs_dd left_det = vs_dd_mul_diff(ax, by, ay, bx);
+    vs_dd right_det = vs_dd_mul_diff(cx, dy, cy, dx);
+
+    vs_dd num_x = vs_dd_sub(
+        vs_dd_mul_double(left_det, cx - dx),
+        vs_dd_mul_double(right_det, ax - bx)
+    );
+    vs_dd num_y = vs_dd_sub(
+        vs_dd_mul_double(left_det, cy - dy),
+        vs_dd_mul_double(right_det, ay - by)
+    );
+
+    *out_x = vs_dd_div(num_x, denominator);
+    *out_y = vs_dd_div(num_y, denominator);
+    return 1;
+}}}}
+
 /* orient2d predicate provided by ORIENT2D_DEVICE (vs_orient2d) */
 /* collinear containment provided by SEGMENT_CROSSING_DEVICE (vs_point_on_segment_collinear) */
 
@@ -386,13 +476,14 @@ classify_segment_pairs_v2(
             /* Fall through to adaptive refinement */
         }}}} else if ((sign1 * sign2 < 0) && (sign3 * sign4 < 0)) {{{{
             /* Proper intersection */
-            double denominator = (ax - bx) * (cy - dy) - (ay - by) * (cx - dx);
-            if (denominator != 0.0) {{{{
-                double left_det = ax * by - ay * bx;
-                double right_det = cx * dy - cy * dx;
+            double ix = 0.0;
+            double iy = 0.0;
+            if (vs_proper_intersection_point_dd(
+                ax, ay, bx, by, cx, cy, dx, dy, &ix, &iy
+            )) {{{{
                 out_kind[row] = CLASS_PROPER;
-                out_point_x[row] = (left_det * (cx - dx) - (ax - bx) * right_det) / denominator;
-                out_point_y[row] = (left_det * (cy - dy) - (ay - by) * right_det) / denominator;
+                out_point_x[row] = ix;
+                out_point_y[row] = iy;
             }}}}
             return;
         }}}} else {{{{
@@ -435,13 +526,14 @@ classify_segment_pairs_v2(
 
     /* Proper intersection: segments cross */
     if (s1 * s2 < 0 && s3 * s4 < 0) {{{{
-        double denominator = (ax - bx) * (cy - dy) - (ay - by) * (cx - dx);
-        if (denominator != 0.0) {{{{
-            double left_det = ax * by - ay * bx;
-            double right_det = cx * dy - cy * dx;
+        double ix = 0.0;
+        double iy = 0.0;
+        if (vs_proper_intersection_point_dd(
+            ax, ay, bx, by, cx, cy, dx, dy, &ix, &iy
+        )) {{{{
             out_kind[row] = CLASS_PROPER;
-            out_point_x[row] = (left_det * (cx - dx) - (ax - bx) * right_det) / denominator;
-            out_point_y[row] = (left_det * (cy - dy) - (ay - by) * right_det) / denominator;
+            out_point_x[row] = ix;
+            out_point_y[row] = iy;
         }}}}
         return;
     }}}}
@@ -599,6 +691,160 @@ scatter_candidate_pairs_batch(
 """
 
 _CANDIDATE_SCATTER_KERNEL_NAMES = ("scatter_candidate_pairs", "scatter_candidate_pairs_batch")
+
+
+# ---------------------------------------------------------------------------
+# Same-row candidate kernels: warp-cooperative MBR overlap generation for
+# aligned workloads that require row isolation.
+# ---------------------------------------------------------------------------
+
+_SAME_ROW_CANDIDATE_KERNEL_SOURCE = """
+extern "C" __global__ void __launch_bounds__(256, 4)
+count_same_row_overlap_candidates(
+    const int* __restrict__ left_rows,
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const int* __restrict__ right_row_starts,
+    const int* __restrict__ right_row_ends,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
+    int* __restrict__ out_counts,
+    const int n_left
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (warp >= n_left) return;
+
+    const int row = left_rows[warp];
+    const int rs = right_row_starts[row];
+    const int re = right_row_ends[row];
+
+    if (rs < 0 || re <= rs) {
+        if (lane == 0) out_counts[warp] = 0;
+        return;
+    }
+
+    const double lx0 = left_x0[warp];
+    const double ly0 = left_y0[warp];
+    const double lx1 = left_x1[warp];
+    const double ly1 = left_y1[warp];
+    const double lminx = fmin(lx0, lx1);
+    const double lmaxx = fmax(lx0, lx1);
+    const double lminy = fmin(ly0, ly1);
+    const double lmaxy = fmax(ly0, ly1);
+
+    int count = 0;
+    for (int base = rs; base < re; base += 32) {
+        const int ridx = base + lane;
+        int hit = 0;
+        if (ridx < re) {
+            const double rx0 = right_x0[ridx];
+            const double ry0 = right_y0[ridx];
+            const double rx1 = right_x1[ridx];
+            const double ry1 = right_y1[ridx];
+            const double rminx = fmin(rx0, rx1);
+            const double rmaxx = fmax(rx0, rx1);
+            const double rminy = fmin(ry0, ry1);
+            const double rmaxy = fmax(ry0, ry1);
+            hit = (lminx <= rmaxx) && (lmaxx >= rminx) &&
+                  (lminy <= rmaxy) && (lmaxy >= rminy);
+        }
+        const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit);
+        if (lane == 0) {
+            count += __popc(mask);
+        }
+    }
+
+    if (lane == 0) out_counts[warp] = count;
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+scatter_same_row_overlap_candidates(
+    const int* __restrict__ left_rows,
+    const double* __restrict__ left_x0,
+    const double* __restrict__ left_y0,
+    const double* __restrict__ left_x1,
+    const double* __restrict__ left_y1,
+    const int* __restrict__ right_row_starts,
+    const int* __restrict__ right_row_ends,
+    const double* __restrict__ right_x0,
+    const double* __restrict__ right_y0,
+    const double* __restrict__ right_x1,
+    const double* __restrict__ right_y1,
+    const long long* __restrict__ cand_offsets,
+    int* __restrict__ out_left,
+    int* __restrict__ out_right,
+    const int n_left
+) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (warp >= n_left) return;
+
+    const int row = left_rows[warp];
+    const int rs = right_row_starts[row];
+    const int re = right_row_ends[row];
+    if (rs < 0 || re <= rs) return;
+
+    const double lx0 = left_x0[warp];
+    const double ly0 = left_y0[warp];
+    const double lx1 = left_x1[warp];
+    const double ly1 = left_y1[warp];
+    const double lminx = fmin(lx0, lx1);
+    const double lmaxx = fmax(lx0, lx1);
+    const double lminy = fmin(ly0, ly1);
+    const double lmaxy = fmax(ly0, ly1);
+    int base_write = 0;
+    int written = 0;
+    if (lane == 0) {
+        base_write = (int)cand_offsets[warp];
+    }
+    base_write = __shfl_sync(0xFFFFFFFFu, base_write, 0);
+
+    for (int base = rs; base < re; base += 32) {
+        const int ridx = base + lane;
+        int hit = 0;
+        if (ridx < re) {
+            const double rx0 = right_x0[ridx];
+            const double ry0 = right_y0[ridx];
+            const double rx1 = right_x1[ridx];
+            const double ry1 = right_y1[ridx];
+            const double rminx = fmin(rx0, rx1);
+            const double rmaxx = fmax(rx0, rx1);
+            const double rminy = fmin(ry0, ry1);
+            const double rmaxy = fmax(ry0, ry1);
+            hit = (lminx <= rmaxx) && (lmaxx >= rminx) &&
+                  (lminy <= rmaxy) && (lmaxy >= rminy);
+        }
+
+        const unsigned mask = __ballot_sync(0xFFFFFFFFu, hit);
+        if (!mask) continue;
+
+        const int prefix = __popc(mask & ((1u << lane) - 1));
+        const int total = __popc(mask);
+        int chunk_base = 0;
+        if (lane == 0) {
+            chunk_base = base_write + written;
+            written += total;
+        }
+        chunk_base = __shfl_sync(0xFFFFFFFFu, chunk_base, 0);
+        if (hit) {
+            out_left[chunk_base + prefix] = warp;
+            out_right[chunk_base + prefix] = ridx;
+        }
+    }
+}
+"""
+
+_SAME_ROW_CANDIDATE_KERNEL_NAMES = (
+    "count_same_row_overlap_candidates",
+    "scatter_same_row_overlap_candidates",
+)
 
 
 # ---------------------------------------------------------------------------

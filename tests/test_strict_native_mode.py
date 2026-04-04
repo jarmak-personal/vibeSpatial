@@ -6,7 +6,6 @@ import pytest
 from shapely.geometry import LineString, Point, Polygon, box
 
 import vibespatial
-from vibespatial.runtime import has_gpu_runtime
 from vibespatial.runtime.fallbacks import (
     StrictNativeFallbackError,
     record_fallback_event,
@@ -14,7 +13,10 @@ from vibespatial.runtime.fallbacks import (
 )
 from vibespatial.testing import run_strict_api_matrix, strict_native_environment
 
-requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+
+def _require_gpu_runtime() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU required")
 
 
 def _build_viewport_fixture(kind: str) -> vibespatial.GeoDataFrame:
@@ -65,7 +67,7 @@ def test_record_fallback_event_raises_in_strict_native_mode(monkeypatch: pytest.
         record_fallback_event(surface="geopandas.array.contains", reason="explicit CPU fallback")
 
 
-@requires_gpu
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     ("fixture_kind", "expected_bounds", "expected_total_bounds"),
     [
@@ -87,6 +89,7 @@ def test_strict_bounds_surfaces_succeed_for_viewport_fixtures(
     expected_bounds: list[list[float]],
     expected_total_bounds: list[float],
 ) -> None:
+    _require_gpu_runtime()
     with strict_native_environment():
         gdf = _load_viewport_fixture(tmp_path, fixture_kind)
         bounds = gdf.geometry.bounds
@@ -96,7 +99,7 @@ def test_strict_bounds_surfaces_succeed_for_viewport_fixtures(
     assert total_bounds.tolist() == expected_total_bounds
 
 
-@requires_gpu
+@pytest.mark.gpu
 @pytest.mark.parametrize(
     (
         "fixture_kind",
@@ -120,8 +123,8 @@ def test_strict_bounds_surfaces_succeed_for_viewport_fixtures(
         "expected_clip_strict_fallback",
     ),
     [
-        ("lines", ("LineString",), True, 2, None, False, 1, True, 1, None, False, True, 2, None, False, False, None, "StrictNativeFallbackError", True),
-        ("mixed", ("LineString", "Point", "Polygon"), True, 3, None, False, 3, False, None, "NotImplementedError", False, False, None, "NotImplementedError", False, False, None, "StrictNativeFallbackError", True),
+        ("lines", ("LineString",), True, 2, None, False, 1, True, 1, None, False, True, 2, None, False, True, 1, None, False),
+        ("mixed", ("LineString", "Point", "Polygon"), True, 3, None, False, 3, True, 3, None, False, True, 3, None, False, True, 3, None, False),
     ],
 )
 def test_strict_viewport_matrix_documents_current_public_api_behavior(
@@ -146,6 +149,7 @@ def test_strict_viewport_matrix_documents_current_public_api_behavior(
     expected_clip_error_type: str | None,
     expected_clip_strict_fallback: bool,
 ) -> None:
+    _require_gpu_runtime()
     _, calls = _viewport_call_matrix()
 
     with strict_native_environment():
@@ -202,10 +206,11 @@ def test_strict_viewport_matrix_documents_current_public_api_behavior(
         assert by_surface["geodataframe.clip(box)"].result_type == "GeoDataFrame"
 
 
-@requires_gpu
-def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_intersection_fallback(
+@pytest.mark.gpu
+def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_gpu_intersection(
     tmp_path: Path,
 ) -> None:
+    _require_gpu_runtime()
     _, calls = _viewport_call_matrix()
 
     with strict_native_environment():
@@ -225,17 +230,24 @@ def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_interse
 
     by_surface = report.by_surface()
 
-    assert by_surface["geodataframe.clip(box)"].ok is False
-    assert by_surface["geodataframe.clip(box)"].error_type == "StrictNativeFallbackError"
-    assert by_surface["geodataframe.clip(box)"].strict_fallback is True
+    assert by_surface["geodataframe.clip(box)"].ok is True
+    assert by_surface["geodataframe.clip(box)"].error_type is None
+    assert by_surface["geodataframe.clip(box)"].strict_fallback is False
+    assert by_surface["geodataframe.clip(box)"].result_len == 1
     assert sindex._tree is None
     assert any(event.surface == "geopandas.sindex.query" for event in events)
+    assert any(
+        event.surface == "geopandas.array.intersection"
+        and event.implementation == "binary_constructive_gpu"
+        for event in events
+    )
 
 
-@requires_gpu
-def test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_intersection_fallback(
+@pytest.mark.gpu
+def test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_gpu_intersection(
     tmp_path: Path,
 ) -> None:
+    _require_gpu_runtime()
     _, calls = _viewport_call_matrix()
 
     with strict_native_environment():
@@ -255,15 +267,22 @@ def test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_inters
 
     by_surface = report.by_surface()
 
-    assert by_surface["geodataframe.clip(box)"].ok is False
-    assert by_surface["geodataframe.clip(box)"].error_type == "StrictNativeFallbackError"
-    assert by_surface["geodataframe.clip(box)"].strict_fallback is True
+    assert by_surface["geodataframe.clip(box)"].ok is True
+    assert by_surface["geodataframe.clip(box)"].error_type is None
+    assert by_surface["geodataframe.clip(box)"].strict_fallback is False
+    assert by_surface["geodataframe.clip(box)"].result_len == 3
     assert sindex._tree is None
     assert any(event.surface == "geopandas.sindex.query" for event in events)
+    assert any(
+        event.surface == "geopandas.array.intersection"
+        and event.implementation == "binary_constructive_gpu"
+        for event in events
+    )
 
 
-@requires_gpu
+@pytest.mark.gpu
 def test_strict_api_matrix_report_is_structured_by_surface(tmp_path: Path) -> None:
+    _require_gpu_runtime()
     _, calls = _viewport_call_matrix()
 
     with strict_native_environment():

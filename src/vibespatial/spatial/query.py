@@ -725,6 +725,8 @@ def query_spatial_index(
 
     if scalar:
         indices = right_idx.astype(np.intp, copy=False)
+        if not sort:
+            indices = _reorder_scalar_tree_matches(indices, flat_index.order)
     else:
         indices = np.vstack(
             (

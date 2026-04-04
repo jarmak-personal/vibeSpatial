@@ -1221,10 +1221,19 @@ class DeviceGeometryArray(ExtensionArray):
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
+            from vibespatial.runtime.crossover import WorkloadShape
 
             grid_size = kwargs.get("grid_size", None)
+            workload_shape = None
+            from shapely.geometry.base import BaseGeometry as _BG
+            if isinstance(other, _BG):
+                workload_shape = WorkloadShape.SCALAR_RIGHT
             result_owned = binary_constructive_owned(
-                op, self._owned, other_owned, grid_size=grid_size
+                op,
+                self._owned,
+                other_owned,
+                grid_size=grid_size,
+                workload_shape=workload_shape,
             )
             return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 

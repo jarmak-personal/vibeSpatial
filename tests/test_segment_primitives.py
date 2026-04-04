@@ -12,6 +12,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
 
 
 def test_extract_segments_reads_owned_buffers_without_materialization() -> None:
@@ -135,6 +136,115 @@ def test_segment_primitives_explicit_gpu_request_matches_cpu_for_ambiguous_rows(
         assert np.allclose(gpu.overlap_x1, cpu.overlap_x1, equal_nan=True)
         assert np.allclose(gpu.overlap_y1, cpu.overlap_y1, equal_nan=True)
         assert gpu.device_state is not None
+
+
+@pytest.mark.gpu
+def test_segment_primitives_same_row_gpu_fast_path_skips_binary_search(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries(
+        [
+            LineString([(0, 0), (3, 3)]),
+            LineString([(10, 0), (13, 3)]),
+            LineString([(20, 0), (23, 3)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(0, 3), (3, 0)]),
+            LineString([(10, 3), (13, 0)]),
+            LineString([(20, 3), (23, 0)]),
+        ]
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+    result = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _require_same_row=True,
+    )
+
+    assert result.runtime_selection.selected is ExecutionMode.GPU
+    assert result.kind_names() == ["proper", "proper", "proper"]
+    assert result.left_rows.tolist() == [0, 1, 2]
+    assert result.right_rows.tolist() == [0, 1, 2]
+
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.candidates.same_row_fast_path") == 1
+    assert "segment.candidates.binary_search" not in summary
+
+
+@pytest.mark.gpu
+def test_segment_primitives_same_row_fast_path_allows_large_left_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries(
+        [
+            LineString([(float(i), 0.0) for i in range(3001)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(1500.5, -1.0), (1500.5, 1.0)]),
+        ]
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+    result = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _require_same_row=True,
+    )
+
+    assert result.runtime_selection.selected is ExecutionMode.GPU
+    assert result.kind_names() == ["proper"]
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.candidates.same_row_fast_path") == 1
+    assert "segment.candidates.binary_search" not in summary
+
+
+@pytest.mark.gpu
+def test_segment_primitives_same_row_fast_path_swaps_large_right_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries(
+        [
+            LineString([(1500.5, -1.0), (1500.5, 1.0)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(float(i), 0.0) for i in range(3001)]),
+        ]
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+    result = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _require_same_row=True,
+    )
+
+    assert result.runtime_selection.selected is ExecutionMode.GPU
+    assert result.kind_names() == ["proper"]
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.candidates.same_row_fast_path") == 1
+    assert "segment.candidates.binary_search" not in summary
 
 
 def test_benchmark_segment_intersections_reports_degenerate_mix() -> None:

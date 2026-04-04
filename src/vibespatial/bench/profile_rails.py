@@ -38,6 +38,18 @@ from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
 from .profiling import ProfileTrace, StageProfiler
 
 
+def _actual_query_runtime_label() -> str:
+    return ExecutionMode.GPU.value if has_gpu_runtime() else ExecutionMode.CPU.value
+
+
+def _actual_query_implementation() -> str:
+    return (
+        "owned_gpu_spatial_query"
+        if has_gpu_runtime()
+        else "owned_cpu_spatial_query"
+    )
+
+
 def _build_join_inputs(rows: int, *, overlap_ratio: float) -> tuple[np.ndarray, np.ndarray]:
     tree = np.asarray(
         list(
@@ -460,7 +472,7 @@ def profile_spatial_query_stack(
             box_bounds=point_box_bounds,
         )
         if point_box_pairs is not None:
-            stage.device = ExecutionMode.GPU.value
+            stage.device = _actual_query_runtime_label()
             stage.rows_out = int(point_box_pairs[0].size)
             stage.metadata["fast_path_hit"] = True
         else:
@@ -496,8 +508,8 @@ def profile_spatial_query_stack(
                 "predicate": predicate,
                 "output_format": output_format,
                 "matched_pairs": int(right_idx.size),
-                "actual_selected_runtime": "gpu",
-                "execution_implementation": "owned_gpu_spatial_query",
+                "actual_selected_runtime": _actual_query_runtime_label(),
+                "execution_implementation": _actual_query_implementation(),
                 "execution_reason": "point-tree box query selected the repo-owned GPU candidate kernel",
                 "selected_path": "point_box_query",
             }
@@ -528,7 +540,7 @@ def profile_spatial_query_stack(
             predicate=predicate,
         )
         if regular_grid_box_pairs is not None:
-            stage.device = ExecutionMode.GPU.value
+            stage.device = _actual_query_runtime_label()
             if isinstance(regular_grid_box_pairs, _DeviceCandidates):
                 stage.rows_out = regular_grid_box_pairs.total_pairs
             else:
@@ -570,8 +582,8 @@ def profile_spatial_query_stack(
                 "predicate": predicate,
                 "output_format": output_format,
                 "matched_pairs": int(right_idx.size),
-                "actual_selected_runtime": "gpu",
-                "execution_implementation": "owned_gpu_spatial_query",
+                "actual_selected_runtime": _actual_query_runtime_label(),
+                "execution_implementation": _actual_query_implementation(),
                 "execution_reason": (
                     "repo-owned regular-grid rectangle box query executed on GPU with exact range expansion"
                 ),
@@ -589,7 +601,7 @@ def profile_spatial_query_stack(
     ) as stage:
         fast_pairs = _query_regular_grid_point_index(flat_index, query_owned, predicate=predicate)
         if fast_pairs is not None:
-            stage.device = ExecutionMode.GPU.value
+            stage.device = _actual_query_runtime_label()
             if isinstance(fast_pairs, _DeviceCandidates):
                 stage.rows_out = fast_pairs.total_pairs
             else:
@@ -631,8 +643,8 @@ def profile_spatial_query_stack(
                 "predicate": predicate,
                 "output_format": output_format,
                 "matched_pairs": int(right_idx.size),
-                "actual_selected_runtime": "gpu",
-                "execution_implementation": "owned_gpu_spatial_query",
+                "actual_selected_runtime": _actual_query_runtime_label(),
+                "execution_implementation": _actual_query_implementation(),
                 "execution_reason": "regular-grid point query selected the repo-owned GPU candidate kernel",
                 "selected_path": "regular_grid_point",
             }
@@ -653,7 +665,7 @@ def profile_spatial_query_stack(
             box_bounds=_extract_box_query_bounds_from_owned(predicate, query_owned),
         )
         if owned_point_box_pairs is not None:
-            stage.device = ExecutionMode.GPU.value
+            stage.device = _actual_query_runtime_label()
             stage.rows_out = int(owned_point_box_pairs[0].size)
             stage.metadata["fast_path_hit"] = True
         else:
@@ -689,8 +701,8 @@ def profile_spatial_query_stack(
                 "predicate": predicate,
                 "output_format": output_format,
                 "matched_pairs": int(right_idx.size),
-                "actual_selected_runtime": "gpu",
-                "execution_implementation": "owned_gpu_spatial_query",
+                "actual_selected_runtime": _actual_query_runtime_label(),
+                "execution_implementation": _actual_query_implementation(),
                 "execution_reason": "point-tree box query selected the repo-owned GPU candidate kernel",
                 "selected_path": "owned_point_box_query",
             }

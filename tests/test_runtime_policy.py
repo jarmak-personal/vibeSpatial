@@ -15,6 +15,7 @@ from vibespatial import (
     select_dispatch_for_rows,
     select_residency_plan,
 )
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.crossover import WorkloadShape
 
 
@@ -213,6 +214,20 @@ def test_scalar_right_uses_broadcast_threshold() -> None:
         workload_shape=WorkloadShape.SCALAR_RIGHT,
     )
     assert decision is DispatchDecision.GPU
+
+
+def test_plan_dispatch_selection_reports_scalar_broadcast_threshold_in_reason() -> None:
+    plan = plan_dispatch_selection(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=2,
+        requested_mode=ExecutionMode.AUTO,
+        gpu_available=True,
+        workload_shape=WorkloadShape.SCALAR_RIGHT,
+    )
+
+    assert plan.selected is ExecutionMode.CPU
+    assert plan.reason == "GPU runtime available; below 500-row crossover"
 
 
 def test_pairwise_uses_original_threshold() -> None:

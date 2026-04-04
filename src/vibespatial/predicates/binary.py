@@ -160,6 +160,9 @@ def _coerce_array(
 ) -> tuple[np.ndarray | None, OwnedGeometryArray | None]:
     if isinstance(values, OwnedGeometryArray):
         return None, values
+    to_owned = getattr(values, "to_owned", None)
+    if callable(to_owned):
+        return None, to_owned()
     if isinstance(values, np.ndarray):
         if values.ndim == 0:
             raise TypeError(f"{arg_name} must be a 1D geometry array or a scalar geometry")
@@ -167,6 +170,24 @@ def _coerce_array(
     if isinstance(values, (list, tuple)):
         return np.asarray(values, dtype=object), None
     raise TypeError(f"{arg_name} must be an OwnedGeometryArray or 1D geometry sequence")
+
+
+def _is_scalar_geometry_operand(values: object) -> bool:
+    if isinstance(values, (OwnedGeometryArray, np.ndarray, list, tuple)):
+        return False
+    return not callable(getattr(values, "to_owned", None))
+
+
+def _coerce_owned_exact_values(
+    values: object | PredicateInput,
+    *,
+    arg_name: str,
+) -> tuple[np.ndarray | None, OwnedGeometryArray | None]:
+    array, owned = _coerce_array(values, arg_name=arg_name)
+    if owned is not None:
+        return None, owned
+    assert array is not None
+    return None, from_shapely_geometries(array.tolist())
 
 
 def _coerce_right(
@@ -463,8 +484,8 @@ def _unsupported_gpu_reason(predicate: str, *, scalar_right: bool) -> str:
     if scalar_right:
         return f"{predicate} GPU refine does not support scalar right-hand geometries yet"
     return (
-        f"{predicate} GPU refine currently supports only point-centric candidate rows "
-        "(point/point, point/line, point/polygon, and inverses)"
+        f"{predicate} GPU refine currently supports only point-centric and DE-9IM "
+        "line/polygon candidate rows"
     )
 
 
@@ -503,6 +524,27 @@ def _de9im_candidate_pairs_supported(
     return bool(
         np.all(np.isin(left_tags, _DE9IM_TAGS))
         and np.all(np.isin(right_tags, _DE9IM_TAGS))
+    )
+
+
+def _gpu_candidate_pairs_supported(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    candidate_rows: np.ndarray,
+    predicate: str,
+) -> bool:
+    """Whether the mixed candidate batch can be partitioned across GPU refine paths."""
+    if candidate_rows.size == 0:
+        return True
+    left_tags = left.tags[candidate_rows]
+    right_tags = right.tags[candidate_rows]
+    left_is_point = (left_tags == _POINT_TAG) | (left_tags == _MP_TAG)
+    right_is_point = (right_tags == _POINT_TAG) | (right_tags == _MP_TAG)
+    point_rows = candidate_rows[left_is_point | right_is_point]
+    de9im_rows = candidate_rows[~(left_is_point | right_is_point)]
+    return (
+        _candidate_pairs_supported(left, right, point_rows)
+        and _de9im_candidate_pairs_supported(left, right, de9im_rows, predicate)
     )
 
 
@@ -1220,12 +1262,7 @@ def evaluate_binary_predicate(
 
         if left_gpu_owned is not None and right_gpu_owned is not None:
             _cand = np.flatnonzero(candidate_mask & ~null_mask).astype(np.int32, copy=False)
-            _point_ok = _candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand)
-            _de9im_ok = (
-                not _point_ok
-                and _de9im_candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand, predicate)
-            )
-            if not _point_ok and not _de9im_ok:
+            if not _gpu_candidate_pairs_supported(left_gpu_owned, right_gpu_owned, _cand, predicate):
                 if requested_mode is ExecutionMode.GPU:
                     raise NotImplementedError(gpu_reason)
                 runtime_selection = _explicit_cpu_fallback_selection(
@@ -1358,8 +1395,9 @@ def _evaluate_geopandas_equals(
     composes them: normalize both inputs, then compare with the shared
     geometry-equality tolerance.
 
-    For scalar right operands, falls back to Shapely's vectorized C path
-    to avoid O(N) Python-side geometry duplication.
+    Scalar right operands are promoted to the same owned broadcast shape used
+    by the main binary-predicate stack so strict-native public equality does
+    not escape to Shapely solely because the right side is a scalar.
     """
     from vibespatial.geometry.equality import (
         geom_equals_owned,
@@ -1367,44 +1405,67 @@ def _evaluate_geopandas_equals(
     )
     from vibespatial.runtime import get_requested_mode
 
-    # Scalar right: fall back to Shapely vectorized equals which
-    # handles scalar broadcasting natively in C, avoiding O(N) Python-side
-    # geometry duplication.
-    is_scalar = not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple))
+    is_scalar = _is_scalar_geometry_operand(right)
     if is_scalar:
-        left_shapely = (
-            np.asarray(left.to_shapely(), dtype=object)
-            if isinstance(left, OwnedGeometryArray)
-            else np.asarray(left, dtype=object)
+        right_geom_type = getattr(right, "geom_type", None)
+        if right is not None and right_geom_type not in _OWNED_EXACT_GEOMETRY_TYPES:
+            left_shapely = (
+                np.asarray(left.to_shapely(), dtype=object)
+                if isinstance(left, OwnedGeometryArray)
+                else np.asarray(left, dtype=object)
+            )
+            result = shapely.equals(left_shapely, right)
+            record_dispatch_event(
+                surface="geopandas.array.equals",
+                operation="equals",
+                implementation="shapely_scalar_broadcast",
+                reason="scalar right-hand operand uses unsupported owned equality family",
+                detail=f"rows={len(left_shapely)}, geom_type={right_geom_type}",
+                selected=ExecutionMode.CPU,
+            )
+            record_fallback_event(
+                surface="geopandas.array.equals",
+                reason="unsupported geometry type for owned equality path (e.g. GeometryCollection)",
+                detail=f"right contains unsupported geometry family {right_geom_type}",
+                pipeline="predicate",
+                d2h_transfer=isinstance(left, OwnedGeometryArray),
+            )
+            return result.astype(bool, copy=False)
+
+        _, left_owned = _coerce_owned_exact_values(left, arg_name="left")
+        assert left_owned is not None
+        right_owned = from_shapely_geometries([right])
+        right_owned = _broadcast_right_owned(right_owned, left_owned.row_count)
+
+        mixed_family_fallback = requires_mixed_family_topology_fallback(left_owned, right_owned)
+        result = geom_equals_owned(
+            left_owned,
+            right_owned,
+            dispatch_mode=get_requested_mode(),
         )
-        result = shapely.equals(left_shapely, right)
         record_dispatch_event(
             surface="geopandas.array.equals",
             operation="equals",
-            implementation="shapely_scalar_broadcast",
-            reason="scalar right-hand operand; Shapely vectorized C path",
-            detail=f"rows={len(left_shapely)}",
-            selected=ExecutionMode.CPU,
-        )
-        record_fallback_event(
-            surface="geopandas.array.equals",
-            reason="scalar right-hand operand requires Shapely broadcast",
-            detail=f"rows={len(left_shapely)}",
-            pipeline="predicate",
-            d2h_transfer=isinstance(left, OwnedGeometryArray),
+            implementation=(
+                "shapely_mixed_family_topology"
+                if mixed_family_fallback
+                else "geom_equals_owned_broadcast"
+            ),
+            reason=(
+                "mixed valid geometry families require full topological equality"
+                if mixed_family_fallback
+                else "scalar right-hand operand promoted to owned broadcast"
+            ),
+            detail=f"rows={left_owned.row_count}",
+            selected=ExecutionMode.CPU if mixed_family_fallback else get_requested_mode(),
         )
         return result.astype(bool, copy=False)
 
     # Coerce inputs to OwnedGeometryArray.
-    if isinstance(left, OwnedGeometryArray):
-        left_owned = left
-    else:
-        left_owned = from_shapely_geometries(list(left) if not isinstance(left, list) else left)
-
-    if isinstance(right, OwnedGeometryArray):
-        right_owned = right
-    else:
-        right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
+    _, left_owned = _coerce_owned_exact_values(left, arg_name="left")
+    _, right_owned = _coerce_owned_exact_values(right, arg_name="right")
+    assert left_owned is not None
+    assert right_owned is not None
 
     dispatch_mode = get_requested_mode()
     mixed_family_fallback = requires_mixed_family_topology_fallback(left_owned, right_owned)
@@ -1449,7 +1510,7 @@ def _evaluate_geopandas_equals_exact(
     # Scalar right: fall back to Shapely vectorized equals_exact which
     # handles scalar broadcasting natively in C, avoiding O(N) Python-side
     # geometry duplication.
-    is_scalar = not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple))
+    is_scalar = _is_scalar_geometry_operand(right)
     if is_scalar:
         left_shapely = (
             np.asarray(left.to_shapely(), dtype=object)
@@ -1468,15 +1529,10 @@ def _evaluate_geopandas_equals_exact(
         return result.astype(bool, copy=False)
 
     # Coerce inputs to OwnedGeometryArray.
-    if isinstance(left, OwnedGeometryArray):
-        left_owned = left
-    else:
-        left_owned = from_shapely_geometries(list(left) if not isinstance(left, list) else left)
-
-    if isinstance(right, OwnedGeometryArray):
-        right_owned = right
-    else:
-        right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
+    _, left_owned = _coerce_owned_exact_values(left, arg_name="left")
+    _, right_owned = _coerce_owned_exact_values(right, arg_name="right")
+    assert left_owned is not None
+    assert right_owned is not None
 
     dispatch_mode = get_requested_mode()
     result = geom_equals_exact_owned(
@@ -1510,7 +1566,7 @@ def _evaluate_geopandas_equals_identical(
     # Scalar right: fall back to Shapely vectorized equals_identical which
     # handles scalar broadcasting natively in C, avoiding O(N) Python-side
     # geometry duplication.
-    is_scalar = not isinstance(right, (OwnedGeometryArray, np.ndarray, list, tuple))
+    is_scalar = _is_scalar_geometry_operand(right)
     if is_scalar:
         left_shapely = (
             np.asarray(left.to_shapely(), dtype=object)
@@ -1529,15 +1585,10 @@ def _evaluate_geopandas_equals_identical(
         return result.astype(bool, copy=False)
 
     # Coerce inputs to OwnedGeometryArray.
-    if isinstance(left, OwnedGeometryArray):
-        left_owned = left
-    else:
-        left_owned = from_shapely_geometries(list(left) if not isinstance(left, list) else left)
-
-    if isinstance(right, OwnedGeometryArray):
-        right_owned = right
-    else:
-        right_owned = from_shapely_geometries(list(right) if not isinstance(right, list) else right)
+    _, left_owned = _coerce_owned_exact_values(left, arg_name="left")
+    _, right_owned = _coerce_owned_exact_values(right, arg_name="right")
+    assert left_owned is not None
+    assert right_owned is not None
 
     dispatch_mode = get_requested_mode()
     result = geom_equals_identical_owned(

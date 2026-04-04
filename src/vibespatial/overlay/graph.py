@@ -102,7 +102,11 @@ def _empty_half_edge_graph(
     )
 
 
-def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
+def build_gpu_half_edge_graph(
+    atomic_edges: AtomicEdgeTable,
+    *,
+    isolate_rows: bool = False,
+) -> HalfEdgeGraph:
     _require_gpu_arrays()
     _ = get_cuda_runtime()
     if atomic_edges.count == 0:
@@ -112,18 +116,30 @@ def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
     edge_count = int(atomic_edges.count)
     all_x = cp.concatenate((device.src_x, device.dst_x))
     all_y = cp.concatenate((device.src_y, device.dst_y))
-    qx = _quantize_coordinate(all_x)
-    qy = _quantize_coordinate(all_y)
+    all_rows = None
+    if isolate_rows and device.row_indices is not None:
+        d_rows = cp.asarray(device.row_indices)
+        all_rows = cp.concatenate((d_rows, d_rows))
 
-    point_order = cp.lexsort(cp.stack((qy, qx)))
-    sorted_qx = qx[point_order]
-    sorted_qy = qy[point_order]
-    del qx, qy  # Phase 25 memory: quantized coords consumed
+    # Shared split events already emit the exact same fp64 coordinate payload
+    # for both sides of a proper intersection. Keep node grouping on those
+    # exact coordinates instead of collapsing nearby-but-distinct vertices via
+    # quantization, which can fuse separate nodes in dense polygon/circle
+    # overlays and corrupt the successor graph.
+    if all_rows is not None:
+        point_order = cp.lexsort(cp.stack((all_y, all_x, all_rows)))
+    else:
+        point_order = cp.lexsort(cp.stack((all_y, all_x)))
+    sorted_x = all_x[point_order]
+    sorted_y = all_y[point_order]
+    sorted_rows = all_rows[point_order] if all_rows is not None else None
     point_start_mask = cp.empty((int(all_x.size),), dtype=cp.bool_)
     point_start_mask[0] = True
     if int(all_x.size) > 1:
-        point_start_mask[1:] = (sorted_qx[1:] != sorted_qx[:-1]) | (sorted_qy[1:] != sorted_qy[:-1])
-    del sorted_qx, sorted_qy  # Phase 25 memory: sorted quantized coords consumed
+        point_start_mask[1:] = (sorted_x[1:] != sorted_x[:-1]) | (sorted_y[1:] != sorted_y[:-1])
+        if sorted_rows is not None:
+            point_start_mask[1:] |= sorted_rows[1:] != sorted_rows[:-1]
+    del sorted_x, sorted_y, sorted_rows, all_rows
     point_node_ids_sorted = cp.cumsum(point_start_mask.astype(cp.int32), dtype=cp.int32) - 1
     point_node_ids = cp.empty((int(all_x.size),), dtype=cp.int32)
     point_node_ids[point_order] = point_node_ids_sorted
@@ -136,10 +152,12 @@ def build_gpu_half_edge_graph(atomic_edges: AtomicEdgeTable) -> HalfEdgeGraph:
     del all_x, all_y, point_order, point_start_mask  # Phase 25 memory
 
     angle = cp.arctan2(device.dst_y - device.src_y, device.dst_x - device.src_x)
-    angle_key = _quantize_coordinate(angle + np.pi)
     edge_ids = cp.arange(edge_count, dtype=cp.int32)
-    sorted_edge_ids = cp.lexsort(cp.stack((edge_ids, angle_key, src_node_ids)))
-    del angle_key  # Phase 25 memory
+    # Use the full fp64 angle for radial ordering at each node. Quantizing
+    # the turn angle can collapse near-collinear but distinct rays onto the
+    # same key, which breaks the half-edge successor relation on dense
+    # polygon/circle intersections even when the split-event payload is exact.
+    sorted_edge_ids = cp.lexsort(cp.stack((edge_ids, angle, src_node_ids)))
     sorted_src_nodes = src_node_ids[sorted_edge_ids]
 
     span_start_mask = cp.empty((edge_count,), dtype=cp.bool_)

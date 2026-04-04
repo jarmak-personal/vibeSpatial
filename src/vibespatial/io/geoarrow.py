@@ -154,14 +154,15 @@ def _full_offsets_from_local(
 def _encode_point_family(buffer: FamilyGeometryBuffer, array: OwnedGeometryArray, *, field_name: str, crs: Any | None, interleaved: bool):
     import pyarrow as pa
 
-    if bool(buffer.empty_mask.any()):
-        raise ValueError("Native point GeoArrow fast path does not support empty Point rows")
-    x_full = np.zeros(array.row_count, dtype=np.float64)
-    y_full = np.zeros(array.row_count, dtype=np.float64)
+    x_full = np.full(array.row_count, np.nan, dtype=np.float64)
+    y_full = np.full(array.row_count, np.nan, dtype=np.float64)
     valid_rows = np.flatnonzero(array.validity)
     locals_ = array.family_row_offsets[valid_rows]
-    x_full[valid_rows] = buffer.x[locals_]
-    y_full[valid_rows] = buffer.y[locals_]
+    non_empty_rows = ~buffer.empty_mask[locals_]
+    if bool(non_empty_rows.any()):
+        coord_indices = buffer.geometry_offsets[locals_[non_empty_rows]]
+        x_full[valid_rows[non_empty_rows]] = buffer.x[coord_indices]
+        y_full[valid_rows[non_empty_rows]] = buffer.y[coord_indices]
     mask = None if bool(array.validity.all()) else pa.array(~array.validity, type=pa.bool_())
     if interleaved:
         point_type = pa.list_(pa.field("xy", pa.float64(), nullable=False), 2)
@@ -282,9 +283,6 @@ def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str |
             return "empty geometry column requires upstream GeoArrow constructor semantics"
         if not bool(owned.validity.any()):
             return "all-missing geometry column requires upstream GeoArrow constructor semantics"
-        for buf in owned.families.values():
-            if bool(buf.empty_mask.any()):
-                return "empty geometry rows require upstream GeoArrow constructor semantics"
         try:
             _homogeneous_family(owned)
         except ValueError as exc:
@@ -298,8 +296,6 @@ def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str |
     if bool(missing.all()):
         return "all-missing geometry column requires upstream GeoArrow constructor semantics"
     present = values[~missing]
-    if bool(shapely.is_empty(present).any()):
-        return "empty geometry rows require upstream GeoArrow constructor semantics"
     if bool(shapely.has_z(present).any()):
         return "3D geometry rows require upstream GeoArrow constructor semantics"
     try:

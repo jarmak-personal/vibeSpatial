@@ -1406,13 +1406,16 @@ class GeometryArray(ExtensionArray):
         """Dispatch binary constructive ops through owned path when available."""
         if self._owned is not None:
             from vibespatial.constructive.binary_constructive import binary_constructive_owned
+            from vibespatial.runtime.crossover import WorkloadShape
 
             # Coerce other to OwnedGeometryArray.
+            workload_shape = None
             if isinstance(other, BaseGeometry):
                 # Broadcast scalar: create a 1-row owned array.  The
                 # dispatch layer (binary_constructive_owned) handles
                 # broadcast-right semantics so only one row is stored.
                 other_owned = from_shapely_geometries([other])
+                workload_shape = WorkloadShape.SCALAR_RIGHT
             elif isinstance(other, GeometryArray):
                 other_owned = other.to_owned()
             else:
@@ -1421,7 +1424,7 @@ class GeometryArray(ExtensionArray):
             if other_owned is not None:
                 try:
                     result_owned = binary_constructive_owned(
-                        op, self._owned, other_owned, **kwargs,
+                        op, self._owned, other_owned, workload_shape=workload_shape, **kwargs,
                     )
                     # binary_constructive_owned records its own dispatch event
                     # with the accurate selected mode (GPU or CPU).
