@@ -27,9 +27,12 @@ from vibespatial.runtime.config import (
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.precision import KernelClass
+from vibespatial.spatial.indexing import generate_bounds_pairs
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 
 logger = logging.getLogger(__name__)
+
+_OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS = 262_144
 
 
 def _extract_owned_pair(df1, df2):
@@ -40,6 +43,21 @@ def _extract_owned_pair(df1, df2):
     right_owned = getattr(ga2, '_owned', None)
     if left_owned is not None and right_owned is not None:
         return left_owned, right_owned
+    if (
+        has_gpu_runtime()
+        and df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        and (len(df1) * len(df2)) <= _OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS
+    ):
+        try:
+            if left_owned is None:
+                left_owned = ga1.to_owned()
+            if right_owned is None:
+                right_owned = ga2.to_owned()
+        except (AttributeError, NotImplementedError):
+            return None, None
+        if left_owned is not None and right_owned is not None:
+            return left_owned, right_owned
     return None, None
 
 
@@ -384,6 +402,31 @@ def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
     # to eliminate the D->H->D round-trip when downstream take() re-uploads.
     # Returns DeviceSpatialJoinResult when device arrays are available,
     # otherwise returns the standard (2, n) numpy array or (idx1, idx2) tuple.
+    if (
+        left_owned is not None
+        and right_owned is not None
+        and df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        and (left_owned.row_count * right_owned.row_count) <= _OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS
+    ):
+        candidate_pairs = generate_bounds_pairs(left_owned, right_owned)
+        left_idx = np.asarray(candidate_pairs.left_indices, dtype=np.int32)
+        right_idx = np.asarray(candidate_pairs.right_indices, dtype=np.int32)
+        if left_idx.size > 0:
+            order = np.lexsort((right_idx, left_idx))
+            left_idx = left_idx[order]
+            right_idx = right_idx[order]
+        record_dispatch_event(
+            surface="geopandas.overlay.sindex",
+            operation="intersects",
+            implementation="gpu_bbox_pairs_fast_path",
+            reason=(
+                "owned polygon overlay used direct bbox candidate pairs "
+                f"for {left_owned.row_count}x{right_owned.row_count} rows"
+            ),
+        )
+        return left_idx, right_idx
+
     request_device = (
         not strict_native_mode_enabled()
         and left_owned is not None
@@ -919,6 +962,18 @@ def _overlay_intersection(
     left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
         df1, df2, left_owned, right_owned,
     )
+    _polygon_inputs = (
+        df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+    )
+    # Public polygon intersection can legitimately produce lower-dimensional
+    # rows or GeometryCollections that must be filtered at the GeoPandas
+    # boundary. Unless the strict exact-polygon GPU path is explicitly
+    # requested, keep geometry construction on the host boundary and use the
+    # owned path only for pairing/index acceleration.
+    _defer_polygon_intersection_to_public_boundary = (
+        _polygon_inputs and not _prefer_exact_polygon_gpu
+    )
     # ADR-0036 boundary: spatial index produces index arrays only.
     # Phase 2: pass owned arrays to request device-resident index pairs.
     #
@@ -1024,7 +1079,11 @@ def _overlay_intersection(
         # invalidates it on mutation, so owned survives _make_valid when
         # all geometries are already valid.
         intersections = None
-        if left_owned is not None and right_owned is not None:
+        if (
+            left_owned is not None
+            and right_owned is not None
+            and not _defer_polygon_intersection_to_public_boundary
+        ):
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
@@ -1038,13 +1097,16 @@ def _overlay_intersection(
                 get_cuda_runtime().free_pool_memory()
             except Exception:
                 pass
-            # Keep AUTO behavior for normal runs, but in strict-native mode
-            # force the repo-owned GPU path here so overlay surfaces do not
-            # die on the generic small-workload crossover before the polygon
-            # intersection dispatcher has a chance to choose its rowwise GPU
-            # overlay fallback for non-SH-safe polygons.
+            # Keep AUTO behavior for normal runs, but force the repo-owned
+            # GPU path when the public overlay contract only needs polygon
+            # output. The small-workload CPU crossover can yield
+            # GeometryCollection rows that are valid at the constructive
+            # layer but wrong for the keep_geom_type=True / default overlay
+            # boundary before collection extraction runs.
             _pairwise_mode = (
-                ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
+                ExecutionMode.GPU
+                if strict_native_mode_enabled() or _prefer_exact_polygon_gpu
+                else ExecutionMode.AUTO
             )
 
             # ---- Many-vs-one detection ----
@@ -1125,10 +1187,18 @@ def _overlay_intersection(
 
         if intersections is None:
             # ADR-0036 boundary: geometry operations on geometry arrays.
-            left = df1.geometry.take(idx1)
-            left.reset_index(drop=True, inplace=True)
-            right = df2.geometry.take(idx2)
-            right.reset_index(drop=True, inplace=True)
+            if _defer_polygon_intersection_to_public_boundary:
+                # Force a plain Shapely-backed public-boundary intersection
+                # here. GeoSeries.take() on owned-backed geometry can retain
+                # DGA backing and recurse into binary_constructive_owned,
+                # which cannot round-trip GeometryCollection outputs.
+                left = GeoSeries(list(df1.geometry.take(idx1)), crs=df1.crs)
+                right = GeoSeries(list(df2.geometry.take(idx2)), crs=df2.crs)
+            else:
+                left = df1.geometry.take(idx1)
+                left.reset_index(drop=True, inplace=True)
+                right = df2.geometry.take(idx2)
+                right.reset_index(drop=True, inplace=True)
             intersections = left.intersection(right)
 
         # Post-intersection make_valid: use GPU path when owned backing is
@@ -1160,6 +1230,13 @@ def _overlay_intersection(
                 pair_right,
                 geom_intersect,
             )
+
+        nonempty_mask = ~(geom_intersect.isna() | geom_intersect.is_empty)
+        if not nonempty_mask.all():
+            keep = np.asarray(nonempty_mask, dtype=bool)
+            idx1 = np.asarray(idx1, dtype=np.int32)[keep]
+            idx2 = np.asarray(idx2, dtype=np.int32)[keep]
+            geom_intersect = geom_intersect[keep].reset_index(drop=True)
 
         # ADR-0036 boundary: attribute assembly from index arrays.
         df1 = df1.reset_index(drop=True)
@@ -1247,7 +1324,9 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None, *, _index_r
         # the generic small-workload crossover before the polygon dispatcher
         # can choose its overlay-based GPU implementation for concave inputs.
         _pairwise_mode = (
-            ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
+            ExecutionMode.GPU
+            if strict_native_mode_enabled()
+            else ExecutionMode.AUTO
         )
 
         # Batched overlay difference: splits groups into VRAM-safe

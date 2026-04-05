@@ -323,6 +323,25 @@ class SegmentIntersectionBenchmark:
 
 
 @dataclass(frozen=True)
+class SegmentLocalEventSummary:
+    """Per-row exact local-event summary derived from segment intersections."""
+
+    runtime_selection: RuntimeSelection
+    precision_plan: PrecisionPlan
+    robustness_plan: RobustnessPlan
+    candidate_pairs: int
+    point_intersection_count: int
+    parallel_or_colinear_candidate_count: int
+    row_point_intersection_counts: np.ndarray
+    exact_event_counts: np.ndarray
+    exact_interval_upper_bounds: np.ndarray
+
+    @property
+    def max_exact_events(self) -> int:
+        return int(self.exact_event_counts.max(initial=0))
+
+
+@dataclass(frozen=True)
 class SegmentIntersectionDeviceState:
     left_rows: DeviceArray
     left_segments: DeviceArray
@@ -2526,6 +2545,87 @@ def classify_segment_intersections(
         precision_plan=precision_plan,
         robustness_plan=robustness_plan,
         tile_size=tile_size,
+    )
+
+
+def summarize_exact_local_events(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    candidate_pairs: SegmentIntersectionCandidates | None = None,
+    tile_size: int = SEGMENT_TILE_SIZE,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _cached_right_device_segments: DeviceSegmentTable | None = None,
+    _require_same_row: bool = False,
+) -> SegmentLocalEventSummary:
+    """Summarize per-row exact local-event counts for overlay-style workloads.
+
+    This is a reusable bridge between segment intersection classification and
+    later topology stages.  It combines segment endpoints with exact
+    point-intersection outputs to produce stable row-local exact-event counts
+    and interval upper bounds without teaching that logic separately in each
+    overlay consumer.
+    """
+    intersections = classify_segment_intersections(
+        left,
+        right,
+        candidate_pairs=candidate_pairs,
+        tile_size=tile_size,
+        dispatch_mode=dispatch_mode,
+        precision=precision,
+        _cached_right_device_segments=_cached_right_device_segments,
+        _require_same_row=_require_same_row,
+    )
+    left_segments = extract_segments(left)
+    right_segments = extract_segments(right)
+    row_count = max(left.row_count, right.row_count)
+
+    xy_events_by_row: list[set[tuple[str, str]]] = [set() for _ in range(row_count)]
+    for row_idx in range(row_count):
+        left_mask = left_segments.row_indices == row_idx
+        right_mask = right_segments.row_indices == row_idx
+        xy_events_by_row[row_idx].update(
+            (float(x).hex(), float(y).hex())
+            for x, y in zip(left_segments.x0[left_mask], left_segments.y0[left_mask])
+        )
+        xy_events_by_row[row_idx].update(
+            (float(x).hex(), float(y).hex())
+            for x, y in zip(left_segments.x1[left_mask], left_segments.y1[left_mask])
+        )
+        xy_events_by_row[row_idx].update(
+            (float(x).hex(), float(y).hex())
+            for x, y in zip(right_segments.x0[right_mask], right_segments.y0[right_mask])
+        )
+        xy_events_by_row[row_idx].update(
+            (float(x).hex(), float(y).hex())
+            for x, y in zip(right_segments.x1[right_mask], right_segments.y1[right_mask])
+        )
+
+    point_mask = np.isfinite(intersections.point_x) & np.isfinite(intersections.point_y)
+    point_rows = intersections.left_rows[point_mask].astype(np.int64, copy=False)
+    point_x = intersections.point_x[point_mask]
+    point_y = intersections.point_y[point_mask]
+    for row_idx, x, y in zip(point_rows, point_x, point_y):
+        xy_events_by_row[int(row_idx)].add((float(x).hex(), float(y).hex()))
+
+    exact_event_counts = np.asarray([len(events) for events in xy_events_by_row], dtype=np.int64)
+    return SegmentLocalEventSummary(
+        runtime_selection=intersections.runtime_selection,
+        precision_plan=intersections.precision_plan,
+        robustness_plan=intersections.robustness_plan,
+        candidate_pairs=int(intersections.candidate_pairs),
+        point_intersection_count=int(point_mask.sum()),
+        parallel_or_colinear_candidate_count=int(
+            np.count_nonzero(
+                ~np.isfinite(intersections.point_x)
+                & ~np.isfinite(intersections.overlap_x0)
+                & (intersections.kinds != int(SegmentIntersectionKind.DISJOINT))
+            )
+        ),
+        row_point_intersection_counts=np.bincount(point_rows, minlength=row_count).astype(np.int64, copy=False),
+        exact_event_counts=exact_event_counts,
+        exact_interval_upper_bounds=np.maximum(exact_event_counts - 1, 0),
     )
 
 

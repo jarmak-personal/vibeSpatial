@@ -11,6 +11,7 @@ from vibespatial import (
     extract_segments,
     from_shapely_geometries,
     has_gpu_runtime,
+    summarize_exact_local_events,
 )
 from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
 
@@ -257,3 +258,58 @@ def test_benchmark_segment_intersections_reports_degenerate_mix() -> None:
     assert benchmark.proper_pairs >= 1
     assert benchmark.overlap_pairs >= 1
     assert benchmark.ambiguous_pairs >= 1
+
+
+def test_exact_local_event_summary_counts_endpoint_and_intersection_events() -> None:
+    left = from_shapely_geometries(
+        [
+            LineString([(0, 0), (4, 4)]),
+            LineString([(10, 0), (14, 4)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(0, 4), (4, 0)]),
+            LineString([(10, 4), (14, 0)]),
+        ]
+    )
+
+    summary = summarize_exact_local_events(left, right, dispatch_mode=ExecutionMode.CPU, _require_same_row=True)
+
+    assert summary.candidate_pairs == 2
+    assert summary.point_intersection_count == 2
+    assert summary.parallel_or_colinear_candidate_count == 0
+    assert summary.row_point_intersection_counts.tolist() == [1, 1]
+    assert summary.exact_event_counts.tolist() == [5, 5]
+    assert summary.exact_interval_upper_bounds.tolist() == [4, 4]
+    assert summary.max_exact_events == 5
+
+
+@pytest.mark.gpu
+def test_exact_local_event_summary_gpu_matches_cpu_for_same_row_workload() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries(
+        [
+            LineString([(0, 0), (4, 4)]),
+            LineString([(10, 0), (14, 4)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(0, 4), (4, 0)]),
+            LineString([(10, 4), (14, 0)]),
+        ]
+    )
+
+    cpu = summarize_exact_local_events(left, right, dispatch_mode=ExecutionMode.CPU, _require_same_row=True)
+    gpu = summarize_exact_local_events(left, right, dispatch_mode=ExecutionMode.GPU, _require_same_row=True)
+
+    assert gpu.runtime_selection.selected is ExecutionMode.GPU
+    assert gpu.candidate_pairs == cpu.candidate_pairs
+    assert gpu.point_intersection_count == cpu.point_intersection_count
+    assert gpu.parallel_or_colinear_candidate_count == cpu.parallel_or_colinear_candidate_count
+    assert gpu.row_point_intersection_counts.tolist() == cpu.row_point_intersection_counts.tolist()
+    assert gpu.exact_event_counts.tolist() == cpu.exact_event_counts.tolist()
+    assert gpu.exact_interval_upper_bounds.tolist() == cpu.exact_interval_upper_bounds.tolist()

@@ -322,11 +322,13 @@ from .spatial.segment_primitives import (
     SegmentIntersectionCandidates,
     SegmentIntersectionKind,
     SegmentIntersectionResult,
+    SegmentLocalEventSummary,
     SegmentTable,
     benchmark_segment_intersections,
     classify_segment_intersections,
     extract_segments,
     generate_segment_candidates,
+    summarize_exact_local_events,
 )
 from .testing import SCALE_PRESETS, SyntheticDataset, SyntheticSpec
 
@@ -510,6 +512,8 @@ __all__ = [
     "get_fallback_events",
     "extract_segment_mbrs",
     "extract_segments",
+    "SegmentLocalEventSummary",
+    "summarize_exact_local_events",
     "generate_bounds_pairs",
     "generate_segment_candidates",
     "generate_segment_mbr_pairs",

@@ -3,8 +3,9 @@ from __future__ import annotations
 import importlib
 import os
 
+import numpy as np
 import pytest
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon, box
 
 import vibespatial
 from vibespatial.api import GeoDataFrame, GeoSeries, read_file
@@ -75,6 +76,90 @@ def test_overlay_union_reuses_intersecting_pair_queries(monkeypatch: pytest.Monk
 
     assert len(result) == 7
     assert calls == 1
+
+
+def test_overlay_intersection_keep_geom_type_preserves_geometry_collection_boundary() -> None:
+    left = GeoDataFrame(
+        {
+            "left": [0, 1],
+            "geometry": [
+                box(0, 0, 1, 1),
+                box(1, 1, 3, 3).union(box(1, 3, 5, 5)),
+            ],
+        }
+    )
+    right = GeoDataFrame(
+        {
+            "right": [0, 1],
+            "geometry": [
+                box(0, 0, 1, 1),
+                box(3, 1, 4, 2).union(box(4, 1, 5, 4)),
+            ],
+        }
+    )
+
+    kept = overlay(left, right, keep_geom_type=True)
+    assert kept.geometry.geom_type.tolist() == ["Polygon", "Polygon"]
+
+    all_geoms = overlay(left, right, keep_geom_type=False)
+    assert all_geoms.geometry.geom_type.tolist() == [
+        "Polygon",
+        "Point",
+        "GeometryCollection",
+    ]
+    assert all_geoms.geometry.iloc[2].equals(
+        GeometryCollection([box(4, 3, 5, 4), LineString([(3, 1), (3, 2)])])
+    )
+
+
+def test_overlay_intersecting_index_pairs_can_bypass_public_sindex_query_for_small_owned_polygons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(10, 10), (12, 10), (12, 12), (10, 12)]),
+            ]
+        ),
+    )
+    left_owned = left.geometry.values.to_owned()
+    right_owned = right.geometry.values.to_owned()
+
+    class _Pairs:
+        left_indices = np.asarray([0], dtype=np.int32)
+        right_indices = np.asarray([0], dtype=np.int32)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "generate_bounds_pairs",
+        lambda *args, **kwargs: _Pairs(),
+    )
+    monkeypatch.setattr(
+        right.sindex,
+        "query",
+        lambda *args, **kwargs: pytest.fail("public sindex.query should not run on the bbox fast path"),
+    )
+
+    idx1, idx2 = overlay_module._intersecting_index_pairs(
+        left,
+        right,
+        left_owned=left_owned,
+        right_owned=right_owned,
+    )
+
+    assert idx1.tolist() == [0]
+    assert idx2.tolist() == [0]
 
 
 def test_overlay_symmetric_difference_reuses_intersecting_pair_queries(
@@ -178,7 +263,45 @@ def test_overlay_intersection_uses_public_sindex_query_in_strict_mode() -> None:
         events = vibespatial.get_dispatch_events(clear=True)
 
     assert len(result) == 3
-    assert any(event.surface == "geopandas.sindex.query" for event in events)
+    assert any(
+        event.surface in {"geopandas.sindex.query", "geopandas.overlay.sindex"}
+        for event in events
+    )
+
+
+def test_overlay_intersection_drops_empty_rows_after_bbox_false_positive_in_strict_mode() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1]},
+        geometry=GeoSeries(
+            [
+                Polygon([(0, 0), (2, 0), (0, 2), (0, 0)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": [1]},
+        geometry=GeoSeries(
+            [
+                Polygon([(2, 2), (4, 2), (2, 4), (2, 2)]),
+            ]
+        ),
+    )
+
+    real_query = overlay_module._intersecting_index_pairs
+    try:
+        overlay_module._intersecting_index_pairs = lambda *args, **kwargs: (
+            np.asarray([0], dtype=np.int32),
+            np.asarray([0], dtype=np.int32),
+        )
+        with strict_native_environment():
+            result = overlay(left, right, how="intersection")
+    finally:
+        overlay_module._intersecting_index_pairs = real_query
+
+    assert len(result) == 0
 
 
 def test_overlay_union_promotes_small_pairwise_intersection_in_strict_mode() -> None:
@@ -210,7 +333,10 @@ def test_overlay_union_promotes_small_pairwise_intersection_in_strict_mode() -> 
         events = vibespatial.get_dispatch_events(clear=True)
 
     assert len(result) == 7
-    assert any(event.surface == "geopandas.sindex.query" for event in events)
+    assert any(
+        event.surface in {"geopandas.sindex.query", "geopandas.overlay.sindex"}
+        for event in events
+    )
     assert any(
         event.surface == "geopandas.array.intersection"
         and event.selected is ExecutionMode.GPU
@@ -533,6 +659,57 @@ def test_overlay_intersection_keeps_touch_line_when_keep_geom_type_false_in_stri
     geom_types = result.geom_type.tolist()
     assert geom_types.count("Polygon") == 2
     assert any(geom_type in {"LineString", "MultiLineString"} for geom_type in geom_types)
+
+
+def test_overlay_intersection_keep_geom_type_true_skips_geometry_collection_cpu_fallback() -> None:
+    left = GeoDataFrame(
+        {"left": [0, 1]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 1, 1),
+                box(1, 1, 3, 3).union(box(1, 3, 5, 5)),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"right": [0, 1]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 1, 1),
+                box(3, 1, 4, 2).union(box(4, 1, 5, 4)),
+            ]
+        ),
+    )
+
+    result = overlay(left, right, how="intersection", keep_geom_type=True)
+
+    assert set(result.geometry.geom_type.unique()) <= {"Polygon", "MultiPolygon"}
+
+
+def test_overlay_intersection_keep_geom_type_none_warns_for_geometry_collection_rows() -> None:
+    left = GeoDataFrame(
+        {"left": [0, 1]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 1, 1),
+                box(1, 1, 3, 3).union(box(1, 3, 5, 5)),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"right": [0, 1]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 1, 1),
+                box(3, 1, 4, 2).union(box(4, 1, 5, 4)),
+            ]
+        ),
+    )
+
+    with pytest.warns(UserWarning, match="`keep_geom_type=True` in overlay"):
+        result = overlay(left, right, how="intersection", keep_geom_type=None)
+
+    assert set(result.geometry.geom_type.unique()) <= {"Polygon", "MultiPolygon"}
 
 
 def test_overlay_difference_survives_strict_native_mode_for_small_overlap_polygons() -> None:

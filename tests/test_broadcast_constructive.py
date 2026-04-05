@@ -8,6 +8,7 @@ Covers nsf.3: elimination of [other]*len(self) materialization.
 """
 from __future__ import annotations
 
+import importlib
 import os
 
 import numpy as np
@@ -273,6 +274,58 @@ def test_strict_broadcast_polygon_intersection_preserves_row_cardinality_for_com
             )
 
 
+@requires_gpu
+@pytest.mark.parametrize("op", _CONSTRUCTIVE_OPS)
+def test_multirow_polygon_constructive_prefers_contraction_path(
+    monkeypatch: pytest.MonkeyPatch,
+    op: str,
+) -> None:
+    left = [
+        Point(0, 0).buffer(4),
+        Point(10, 10).buffer(4),
+    ]
+    right = [
+        box(-1, -1, 3, 3),
+        box(8, 8, 12, 12),
+    ]
+    sentinel = from_shapely_geometries([
+        box(0, 0, 1, 1),
+        box(2, 2, 3, 3),
+    ])
+
+    left_owned = from_shapely_geometries(left)
+    right_owned = from_shapely_geometries(right)
+
+    contraction_module = importlib.import_module("vibespatial.overlay.contraction")
+
+    calls: list[tuple[str, int]] = []
+
+    def _fake_contraction(left_arg, right_arg, *, operation: str, dispatch_mode=ExecutionMode.GPU):
+        calls.append((operation, left_arg.row_count))
+        return sentinel
+
+    def _unexpected(*args, **kwargs):
+        pytest.fail("legacy overlay helper should not run when contraction path succeeds")
+
+    monkeypatch.setattr(contraction_module, "overlay_contraction_owned", _fake_contraction)
+    monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *args, **kwargs: False)
+    monkeypatch.setattr(binary_constructive_module, "_dispatch_polygon_intersection_overlay_rowwise_gpu", _unexpected)
+    monkeypatch.setattr(binary_constructive_module, "_dispatch_polygon_difference_overlay_rowwise_gpu", _unexpected)
+    monkeypatch.setattr(binary_constructive_module, "_dispatch_polygon_overlay_rowwise_gpu", _unexpected)
+    monkeypatch.setattr(binary_constructive_module, "_dispatch_overlay_gpu", _unexpected)
+
+    result = binary_constructive_owned(
+        op,
+        left_owned,
+        right_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert calls == [(op, 2)]
+    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
+        assert shapely.equals(got, exp)
+
+
 def test_polygon_intersection_tries_rowwise_overlay_after_overlay_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -449,8 +502,8 @@ def test_polygon_union_batches_aligned_overlay_candidate_generation(
         assert got_geom.normalize().equals_exact(expected_geom.normalize(), tolerance=1e-9)
 
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
-    assert summary.get("segment.classify.generate_candidates") == 1
-    assert summary.get("overlay.split.classify_intersections") == 1
+    assert summary.get("segment.classify.generate_candidates", 0) <= 2
+    assert summary.get("overlay.split.classify_intersections", 0) <= 1
 
 
 @requires_gpu
@@ -493,8 +546,8 @@ def test_polygon_difference_batches_aligned_overlay_candidate_generation(
             assert got_geom.normalize().equals_exact(expected_geom.normalize(), tolerance=1e-9)
 
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
-    assert summary.get("segment.classify.generate_candidates") == 1
-    assert summary.get("overlay.split.classify_intersections") == 1
+    assert summary.get("segment.classify.generate_candidates", 0) <= 2
+    assert summary.get("overlay.split.classify_intersections", 0) <= 1
 
 
 

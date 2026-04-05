@@ -487,6 +487,45 @@ def _dispatch_polygon_overlay_rowwise_gpu(
     )
 
 
+def _dispatch_polygon_contraction_gpu(
+    op: str,
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Try the contraction-based polygon constructive path for aligned batches."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count or left.row_count <= 1:
+        return None
+    try:
+        from vibespatial.overlay.contraction import overlay_contraction_owned
+
+        result = overlay_contraction_owned(
+            left,
+            right,
+            operation=op,
+            dispatch_mode=dispatch_mode,
+        )
+    except Exception:
+        logger.debug(
+            "contraction polygon %s GPU path failed; falling back to overlay helpers",
+            op,
+            exc_info=True,
+        )
+        return None
+    if result.row_count != left.row_count:
+        logger.debug(
+            "contraction polygon %s GPU path returned %d rows (expected %d)",
+            op,
+            result.row_count,
+            left.row_count,
+        )
+        return None
+    return result
+
+
 def _dispatch_polygon_intersection_overlay_rowwise_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -1303,6 +1342,15 @@ def _binary_constructive_gpu(
 
         if prefer_rowwise_overlay:
             try:
+                contraction_result = _dispatch_polygon_contraction_gpu(
+                    op,
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                )
+                if contraction_result is not None and contraction_result.row_count == left.row_count:
+                    return contraction_result
+
                 if op == "intersection":
                     rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
                         left,
