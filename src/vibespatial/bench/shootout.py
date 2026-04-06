@@ -1,13 +1,17 @@
 """vsbench shootout — run a user script with geopandas then vibespatial."""
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -165,6 +169,10 @@ def _error_run(label: str, error: str) -> ShootoutRun:
 
 
 _FINGERPRINT_PREFIX = "SHOOTOUT_FINGERPRINT: "
+_NESTED_GPU_LAUNCH_ERRORS = (
+    "GPU execution was requested, but no GPU runtime is available",
+    "GPU WKB encode unavailable",
+)
 
 
 def _extract_fingerprint(stdout: str) -> str | None:
@@ -290,6 +298,82 @@ def _run_harness(
                 pass
 
 
+def _run_harness_in_process(
+    *,
+    label: str,
+    script: Path,
+    repeat: int,
+    warmup: bool,
+    env: dict[str, str] | None = None,
+) -> ShootoutRun:
+    """Run the timing harness in-process.
+
+    Used only as a recovery path when a nested subprocess launch loses GPU
+    runtime visibility despite the current parent process having a working
+    GPU runtime.
+    """
+    original_stdout = sys.stdout
+    original_cwd = Path.cwd()
+    original_path = list(sys.path)
+    original_env = os.environ.copy()
+
+    if env is not None:
+        os.environ.clear()
+        os.environ.update(env)
+
+    os.chdir(os.path.dirname(os.path.abspath(script)))
+
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore")
+
+            if warmup:
+                sys.stdout = io.StringIO()
+                try:
+                    runpy.run_path(script, run_name="__warmup__")
+                except Exception:
+                    pass
+                finally:
+                    sys.stdout = original_stdout
+
+            samples: list[float] = []
+            errors: list[str] = []
+            captured_stdout = ""
+            for i in range(repeat):
+                sys.stdout = capture = io.StringIO()
+                error = None
+                start = time.perf_counter()
+                try:
+                    runpy.run_path(script, run_name="__main__")
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                elapsed = time.perf_counter() - start
+                sys.stdout = original_stdout
+                if i == 0:
+                    captured_stdout = capture.getvalue()
+                samples.append(elapsed)
+                if error is not None:
+                    errors.append(error)
+
+            return ShootoutRun(
+                label=label,
+                timing=timing_from_samples(samples),
+                error=errors[0] if errors else None,
+                stdout=captured_stdout,
+            )
+    finally:
+        sys.stdout = original_stdout
+        sys.path[:] = original_path
+        os.chdir(original_cwd)
+        os.environ.clear()
+        os.environ.update(original_env)
+
+
+def _should_retry_vibespatial_in_process(run: ShootoutRun) -> bool:
+    error = run.error or ""
+    return any(marker in error for marker in _NESTED_GPU_LAUNCH_ERRORS)
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -306,6 +390,8 @@ def run_shootout(
     scale: str | None = None,
 ) -> ShootoutResult:
     """Run a user script with geopandas and vibespatial, return comparison."""
+    from vibespatial.runtime import has_gpu_runtime
+
     script = Path(script_path)
     if not script.is_file():
         raise FileNotFoundError(f"Script not found: {script}")
@@ -377,6 +463,20 @@ def run_shootout(
         timeout=timeout,
         quiet=quiet,
     )
+    launch_mode = "subprocess"
+    if (
+        vs_run.error is not None
+        and has_gpu_runtime()
+        and _should_retry_vibespatial_in_process(vs_run)
+    ):
+        vs_run = _run_harness_in_process(
+            label="vibespatial",
+            script=script,
+            repeat=repeat,
+            warmup=warmup,
+            env=vs_env,
+        )
+        launch_mode = "in_process_retry"
 
     # --- comparison ---
     speedup = None
@@ -406,6 +506,7 @@ def run_shootout(
     meta: dict[str, Any] = {"repeat": repeat, "warmup": warmup}
     if scale is not None:
         meta["scale"] = scale
+    meta["vibespatial_launch"] = launch_mode
     if fingerprint_match:
         meta["fingerprint"] = fingerprint_match
         meta["fingerprint_geopandas"] = gpd_fp

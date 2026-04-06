@@ -23727,6 +23727,8 @@
         "_extract_fingerprint",
         "_fingerprints_match",
         "_run_harness",
+        "_run_harness_in_process",
+        "_should_retry_vibespatial_in_process",
         "run_shootout"
       ],
       "tokens": [
@@ -23741,13 +23743,16 @@
         "geopandas",
         "harness",
         "match",
+        "process",
         "py",
         "result",
+        "retry",
         "run",
         "script",
         "shootout",
         "shootoutresult",
         "shootoutrun",
+        "should",
         "src",
         "then",
         "time",
@@ -38282,7 +38287,8 @@
       "symbols": [
         "test_vsbench_shootout_directory_smoke",
         "test_strict_native_shootout_scripts_do_not_need_compat_env",
-        "test_strict_native_transit_service_gap_matches_baseline"
+        "test_strict_native_transit_service_gap_matches_baseline",
+        "test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss"
       ],
       "tokens": [
         "baseline",
@@ -38292,11 +38298,16 @@
         "do",
         "env",
         "gap",
+        "gpu",
+        "launcher",
+        "loss",
         "matches",
         "native",
         "need",
+        "nested",
         "not",
         "py",
+        "recovers",
         "scripts",
         "service",
         "shootout",

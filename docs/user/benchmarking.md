@@ -2,22 +2,24 @@
 
 vibeSpatial ships a unified benchmarking CLI called **`vsbench`**.  Use it to
 measure individual operations, run regression suites, compare against
-GeoPandas, and generate HTML reports.
+GeoPandas, and generate HTML reports. For repo-local GPU and strict-native
+workflows, invoke it through `uv run vsbench ...` so the project-managed
+environment and GPU runtime detection stay intact.
 
 ## Quick start
 
 ```bash
 # List available operations
-vsbench list operations
+uv run vsbench list operations
 
 # Run a single operation benchmark
-vsbench run buffer --scale 100k
+uv run vsbench run buffer --scale 100k
 
 # Run the smoke suite (fast, good for local dev)
-vsbench suite smoke
+uv run vsbench suite smoke
 
 # Compare vibeSpatial vs GeoPandas on your own script
-vsbench shootout my_workflow.py
+uv run vsbench shootout my_workflow.py
 ```
 
 ## Commands
@@ -143,11 +145,13 @@ vibeSpatial.  The script should `import geopandas as gpd` -- vsbench
 handles the import swap transparently.
 
 ```bash
-vsbench shootout examples/nearby_buildings.py --repeat 5
-vsbench shootout my_etl.py --with pyogrio --json
+uv run vsbench shootout examples/nearby_buildings.py --repeat 5
+uv run vsbench shootout my_etl.py --with pyogrio --json
 ```
 
 The `script` argument accepts a single Python file or a directory of scripts.
+For GPU and `VIBESPATIAL_STRICT_NATIVE=1` runs, `uv run vsbench shootout ...`
+is the supported launch mode.
 
 | Flag | Default | Description |
 |------|---------|-------------|

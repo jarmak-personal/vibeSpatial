@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -118,3 +121,43 @@ def test_strict_native_transit_service_gap_matches_baseline() -> None:
     assert result.vibespatial.error is None
     assert result.metadata.get("fingerprint") == "match"
 
+
+@pytest.mark.gpu
+def test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    code = (
+        "import json; "
+        "from pathlib import Path; "
+        "from vibespatial.bench.shootout import run_shootout; "
+        "res = run_shootout("
+        "Path('benchmarks/shootout/network_service_area.py'), "
+        "repeat=1, warmup=False, scale='10k', timeout=300, quiet=True, "
+        "baseline_python='/tmp/gpd_bench/bin/python'"
+        "); "
+        "print(json.dumps({"
+        "'status': res.status, "
+        "'reason': res.status_reason, "
+        "'fingerprint': res.metadata.get('fingerprint'), "
+        "'launch': res.metadata.get('vibespatial_launch')"
+        "}))"
+    )
+    proc = subprocess.run(
+        [str(Path(".venv/bin/python")), "-c", code],
+        cwd=Path.cwd(),
+        env={
+            **os.environ,
+            "VIBESPATIAL_STRICT_NATIVE": "1",
+            "UV_CACHE_DIR": "/tmp/uv-cache",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout.strip())
+    assert payload["status"] == "pass"
+    assert payload["fingerprint"] == "match"
+    assert payload["launch"] in {"subprocess", "in_process_retry"}

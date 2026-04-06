@@ -85,6 +85,9 @@ on any CPU fallback:
 VIBESPATIAL_STRICT_NATIVE=1 uv run pytest tests/
 ```
 
+For repo-local CLI tools and benchmarks, prefer the same launch shape:
+`VIBESPATIAL_STRICT_NATIVE=1 uv run vsbench ...`.
+
 Or programmatically:
 
 ```python

@@ -105,9 +105,13 @@ def main(argv: list[str] | None = None) -> int:
     # --- vsbench shootout <script.py> ----------------------------------------
     p_shootout = sub.add_parser(
         "shootout",
-        help="Compare a script running with real geopandas vs vibespatial",
+        help="Compare a script running with real geopandas vs vibespatial (prefer `uv run vsbench shootout`)",
     )
-    p_shootout.add_argument("script", type=Path, help="Python script or directory of scripts")
+    p_shootout.add_argument(
+        "script",
+        type=Path,
+        help="Python script or directory of scripts",
+    )
     p_shootout.add_argument("--repeat", type=int, default=3, help="Number of timed runs (default: 3)")
     p_shootout.add_argument("--no-warmup", action="store_true", help="Skip warmup run")
     p_shootout.add_argument(
@@ -122,7 +126,12 @@ def main(argv: list[str] | None = None) -> int:
     p_shootout.add_argument("--timeout", type=int, default=300, help="Per-run timeout in seconds (default: 300)")
     p_shootout.add_argument("--json", action="store_true", dest="json_output")
     p_shootout.add_argument("--quiet", action="store_true")
-    p_shootout.add_argument("--output", type=Path, default=None, help="Write results to file")
+    p_shootout.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write results to file. For GPU/strict-native runs, invoke the CLI via `uv run vsbench ...`.",
+    )
 
     args = parser.parse_args(argv)
     return _dispatch(args)
