@@ -4,12 +4,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from vibespatial.bench.cli import main as vsbench_main
-from vibespatial.bench.shootout import run_shootout
+from vibespatial.bench.shootout import _run_harness, run_shootout
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.testing import strict_native_environment
 
@@ -45,7 +46,6 @@ def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) ->
     if has_gpu_runtime():
         expected_failures = {
             "corridor_flood_priority.py",
-            "transit_service_gap.py",
         }
     else:
         expected_failures = {
@@ -161,3 +161,54 @@ def test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss() -> None
     assert payload["status"] == "pass"
     assert payload["fingerprint"] == "match"
     assert payload["launch"] in {"subprocess", "in_process_retry"}
+
+
+@pytest.mark.gpu
+def test_vibespatial_harness_pipeline_warm_drains_deferred_cache(
+    tmp_path: Path,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    script = tmp_path / "warm_probe.py"
+    script.write_text(
+        "import json\n"
+        "import geopandas as gpd\n"
+        "from vibespatial.cuda.cccl_precompile import precompile_status\n"
+        "print(json.dumps(precompile_status()))\n",
+        encoding="utf-8",
+    )
+
+    base_env = {**os.environ, "UV_CACHE_DIR": "/tmp/uv-cache"}
+    cold = _run_harness(
+        label="vibespatial",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        pipeline_warm=False,
+        env=base_env,
+        timeout=60,
+        quiet=True,
+    )
+    warm = _run_harness(
+        label="vibespatial",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        pipeline_warm=True,
+        env=base_env,
+        timeout=60,
+        quiet=True,
+    )
+
+    cold_status = json.loads(cold.stdout.strip())
+    warm_status = json.loads(warm.stdout.strip())
+    assert cold.error is None
+    assert warm.error is None
+    assert cold_status["cccl"]["deferred"] > 0 or cold_status["nvrtc"]["deferred"] > 0
+    assert warm_status["cccl"]["deferred"] == 0
+    assert warm_status["nvrtc"]["deferred"] == 0
+    assert warm_status["cccl"]["pending"] == 0
+    assert warm_status["nvrtc"]["pending"] == 0

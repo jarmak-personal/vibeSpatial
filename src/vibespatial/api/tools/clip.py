@@ -166,6 +166,8 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         # only points, directly return
         return gdf_sub
 
+    mask_owned = None
+
     def _clip_partition(partition, *, use_rect_fast_path=False):
         if (
             not clipping_by_rectangle
@@ -173,6 +175,26 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
             and partition.geom_type.isin(POLYGON_GEOM_TYPES).all()
         ):
             return _clip_polygon_partition_with_rectangle_mask(partition, rectangle_bounds)
+
+        def _polygon_area_intersection_values(partition):
+            from vibespatial.api.geometry_array import GeometryArray
+            from vibespatial.constructive.binary_constructive import (
+                binary_constructive_owned,
+            )
+            from vibespatial.geometry.owned import from_shapely_geometries
+
+            nonlocal mask_owned
+
+            values = partition.geometry.values if hasattr(partition, "geometry") else partition.values
+            if mask_owned is None:
+                mask_owned = from_shapely_geometries([mask])
+            result_owned = binary_constructive_owned(
+                "intersection",
+                values.to_owned(),
+                mask_owned,
+                _prefer_exact_polygon_intersection=True,
+            )
+            return GeometryArray.from_owned(result_owned, crs=partition.crs)
 
         if isinstance(partition, GeoDataFrame):
             clipped_partition = partition.copy(deep=not PANDAS_GE_30)
@@ -182,7 +204,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
                     _assemble_polygon_intersection_rows_with_lower_dim,
                 )
 
-                area_values = partition.geometry.values.intersection(mask)
+                area_values = _polygon_area_intersection_values(partition)
                 area_values = area_values.remove_repeated_points(0.0).normalize()
                 area_pairs = GeoSeries(area_values, index=partition.index, crs=partition.crs)
                 repeated_mask = np.empty(len(partition), dtype=object)
@@ -208,7 +230,9 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
                 _assemble_polygon_intersection_rows_with_lower_dim,
             )
 
-            area_values = partition.values.intersection(mask)
+            area_values = _polygon_area_intersection_values(
+                GeoSeries(partition, index=partition.index, crs=partition.crs),
+            )
             area_values = area_values.remove_repeated_points(0.0).normalize()
             area_pairs = GeoSeries(area_values, index=partition.index, crs=partition.crs)
             repeated_mask = np.empty(len(partition), dtype=object)

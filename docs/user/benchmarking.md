@@ -157,7 +157,7 @@ is the supported launch mode.
 |------|---------|-------------|
 | `--repeat` | 3 | Timed runs per engine |
 | `--scale` | none | Passed as `VSBENCH_SCALE` env var (e.g. `10K`, `100K`) |
-| `--no-warmup` | off | Skip the untimed warmup run |
+| `--no-warmup` | off | Skip the untimed script warmup run; the vibespatial leg still prewarms registered GPU pipelines before timing |
 | `--baseline-python` | auto | Python interpreter with real geopandas |
 | `--with DEP` | none | Extra pip deps for the geopandas env (repeatable) |
 | `--timeout` | 300 | Per-run timeout in seconds |

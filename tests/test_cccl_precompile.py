@@ -10,6 +10,7 @@ from vibespatial.cuda.cccl_precompile import (
     PRECOMPILE_ENV_VAR,
     SPEC_REGISTRY,
     CCCLPrecompiler,
+    ensure_pipelines_warm,
     precompile_enabled,
     precompile_status,
     request_warmup,
@@ -99,6 +100,13 @@ class TestCCCLPrecompilerNoGPU:
 
     def test_precompile_status_empty_when_no_warmup(self):
         assert precompile_status() == {}
+
+    def test_ensure_pipelines_warm_calls_exact_polygon_probe(self):
+        with patch(
+            "vibespatial.cuda.cccl_precompile._warm_exact_polygon_intersection_route",
+        ) as probe:
+            ensure_pipelines_warm()
+        probe.assert_called_once_with()
 
     def test_deduplication(self):
         precompiler = CCCLPrecompiler(max_workers=1)

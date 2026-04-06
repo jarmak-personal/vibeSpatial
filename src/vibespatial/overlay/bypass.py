@@ -37,6 +37,32 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
 
 logger = logging.getLogger(__name__)
 
+
+def _is_convex_ring_xy(x: np.ndarray, y: np.ndarray, start: int, end: int) -> bool:
+    """Return True when the closed ring slice [start:end] is convex."""
+    if end - start < 4:
+        return False
+
+    ring_x = np.asarray(x[start:end], dtype=np.float64)
+    ring_y = np.asarray(y[start:end], dtype=np.float64)
+
+    if ring_x.size >= 2 and ring_x[0] == ring_x[-1] and ring_y[0] == ring_y[-1]:
+        ring_x = ring_x[:-1]
+        ring_y = ring_y[:-1]
+
+    if ring_x.size < 3:
+        return False
+
+    prev_x = np.roll(ring_x, 1)
+    prev_y = np.roll(ring_y, 1)
+    next_x = np.roll(ring_x, -1)
+    next_y = np.roll(ring_y, -1)
+    cross = (ring_x - prev_x) * (next_y - ring_y) - (ring_y - prev_y) * (next_x - ring_x)
+    non_collinear = cross[np.abs(cross) > 1e-12]
+    if non_collinear.size == 0:
+        return False
+    return bool(np.all(non_collinear > 0.0) or np.all(non_collinear < 0.0))
+
 # ---------------------------------------------------------------------------
 # Containment bypass: GPU-accelerated identification of polygons fully
 # inside the corridor, skipping overlay computation for those polygons.
@@ -92,6 +118,13 @@ def _containment_bypass_gpu(
 
     # Right must be a single row.
     if right.row_count != 1:
+        return None, None
+
+    clip_eligible, _clip_vert_count = _is_clip_polygon_sh_eligible(right)
+    if not clip_eligible:
+        # All-vertex containment is only a correct bypass for convex clip
+        # polygons. Concave masks can contain every vertex of the subject
+        # while still having an edge cross outside the clip polygon.
         return None, None
 
     # Supported operations: intersection, difference.
@@ -511,6 +544,14 @@ def _is_clip_polygon_sh_eligible(
         logger.debug(
             "SH batch clip: clip polygon has %d vertices (limit %d) -- skipping SH tier",
             n_verts, _MAX_CLIP_VERTS,
+        )
+        return False, 0
+
+    start = int(ring_offsets[first_ring])
+    end = int(ring_offsets[first_ring + 1])
+    if not _is_convex_ring_xy(poly_buf.x, poly_buf.y, start, end):
+        logger.debug(
+            "SH batch clip: clip polygon exterior ring is concave -- skipping SH tier",
         )
         return False, 0
 

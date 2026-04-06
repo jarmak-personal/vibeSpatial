@@ -856,7 +856,10 @@ def _many_vs_one_intersection_owned(
     def _remainder_intersection(left_rem_oga, right_one_oga):
         """Choose one remainder path up front instead of falling back by exception."""
         if (
-            left_rem_oga.row_count < OVERLAY_GPU_REMAINDER_THRESHOLD
+            (
+                left_rem_oga.row_count < OVERLAY_GPU_REMAINDER_THRESHOLD
+                and not strict_native_mode_enabled()
+            )
             or not has_gpu_runtime()
         ):
             return _shapely_remainder_intersection(left_rem_oga, right_one_oga)

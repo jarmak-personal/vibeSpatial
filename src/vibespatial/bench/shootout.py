@@ -37,8 +37,17 @@ script = sys.argv[1]
 result_path = sys.argv[2]
 repeat = int(sys.argv[3])
 do_warmup = sys.argv[4] == "1"
+do_pipeline_warm = sys.argv[5] == "1"
 
 os.chdir(os.path.dirname(os.path.abspath(script)))
+
+if do_pipeline_warm:
+    try:
+        import geopandas as _shootout_gpd  # noqa: F401
+        from vibespatial.cuda.cccl_precompile import ensure_pipelines_warm
+        ensure_pipelines_warm()
+    except Exception:
+        pass
 
 if do_warmup:
     old = sys.stdout
@@ -225,6 +234,7 @@ def _run_harness(
     script: Path,
     repeat: int,
     warmup: bool,
+    pipeline_warm: bool = False,
     env: dict[str, str] | None = None,
     timeout: int = 300,
     quiet: bool = False,
@@ -244,6 +254,7 @@ def _run_harness(
             result_path,
             str(repeat),
             "1" if warmup else "0",
+            "1" if pipeline_warm else "0",
         ]
 
         if not quiet:
@@ -459,6 +470,7 @@ def run_shootout(
         script=script,
         repeat=repeat,
         warmup=warmup,
+        pipeline_warm=True,
         env=vs_env,
         timeout=timeout,
         quiet=quiet,

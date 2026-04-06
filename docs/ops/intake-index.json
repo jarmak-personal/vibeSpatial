@@ -28388,6 +28388,7 @@
         "request_warmup",
         "precompile_status",
         "ensure_pipelines_warm",
+        "_warm_exact_polygon_intersection_route",
         "precompile_all"
       ],
       "tokens": [
@@ -28422,10 +28423,12 @@
         "enabled",
         "ensure",
         "env",
+        "exact",
         "exclusive",
         "get",
         "gil",
         "incrementally",
+        "intersection",
         "jit",
         "key",
         "lower",
@@ -28437,6 +28440,7 @@
         "op",
         "parallelism",
         "pipelines",
+        "polygon",
         "pre",
         "precompile",
         "precompiledprimitive",
@@ -28448,6 +28452,7 @@
         "reduce",
         "releases",
         "request",
+        "route",
         "scan",
         "scope",
         "segmented",
@@ -34346,6 +34351,7 @@
       "path": "src/vibespatial/overlay/bypass.py",
       "referenced_by": [],
       "symbols": [
+        "_is_convex_ring_xy",
         "_containment_bypass_gpu",
         "_is_clip_polygon_sh_eligible",
         "_classify_remainder_sh_eligible",
@@ -34374,6 +34380,7 @@
         "combine",
         "computation",
         "containment",
+        "convex",
         "corridor",
         "crossing",
         "directly",
@@ -34422,7 +34429,8 @@
         "that",
         "these",
         "used",
-        "vibespatial"
+        "vibespatial",
+        "xy"
       ]
     },
     {
@@ -38288,17 +38296,22 @@
         "test_vsbench_shootout_directory_smoke",
         "test_strict_native_shootout_scripts_do_not_need_compat_env",
         "test_strict_native_transit_service_gap_matches_baseline",
-        "test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss"
+        "test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss",
+        "test_vibespatial_harness_pipeline_warm_drains_deferred_cache"
       ],
       "tokens": [
         "baseline",
         "bench",
+        "cache",
         "compat",
+        "deferred",
         "directory",
         "do",
+        "drains",
         "env",
         "gap",
         "gpu",
+        "harness",
         "launcher",
         "loss",
         "matches",
@@ -38306,6 +38319,7 @@
         "need",
         "nested",
         "not",
+        "pipeline",
         "py",
         "recovers",
         "scripts",
@@ -38316,7 +38330,9 @@
         "test",
         "tests",
         "transit",
-        "vsbench"
+        "vibespatial",
+        "vsbench",
+        "warm"
       ]
     },
     {

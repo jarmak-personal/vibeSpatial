@@ -113,7 +113,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Python script or directory of scripts",
     )
     p_shootout.add_argument("--repeat", type=int, default=3, help="Number of timed runs (default: 3)")
-    p_shootout.add_argument("--no-warmup", action="store_true", help="Skip warmup run")
+    p_shootout.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="Skip the untimed script warmup run; vibespatial still prewarms registered GPU pipelines before timing",
+    )
     p_shootout.add_argument(
         "--baseline-python", type=str, default=None,
         help="Python interpreter with real geopandas (skips uv isolation)",

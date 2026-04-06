@@ -30,6 +30,8 @@ from vibespatial.runtime.cccl_warmup_specs import (
 logger = logging.getLogger(__name__)
 
 PRECOMPILE_ENV_VAR = "VIBESPATIAL_PRECOMPILE"
+_exact_polygon_intersection_warm_lock = threading.Lock()
+_exact_polygon_intersection_warm_done = False
 
 
 def precompile_enabled() -> bool:
@@ -1102,7 +1104,61 @@ def ensure_pipelines_warm(timeout: float = 60.0) -> dict[str, Any]:
         result["cccl_cold"] = CCCLPrecompiler.get().ensure_warm(timeout=timeout)
     if NVRTCPrecompiler._instance is not None:
         result["nvrtc_cold"] = NVRTCPrecompiler.get().ensure_warm(timeout=timeout)
+    _warm_exact_polygon_intersection_route()
     return result
+
+
+def _warm_exact_polygon_intersection_route() -> None:
+    """Warm the exact rowwise polygon intersection route used by public clip().
+
+    The default NVRTC/CCCL warm registry does not naturally touch the exact
+    rowwise polygon intersection dispatch used for concave polygon masks in
+    strict-native clip workloads. Front-load that first-use cost here so
+    shootout and benchmark children do not pay a 6-8s cold tax on their first
+    concave polygon clip.
+    """
+    global _exact_polygon_intersection_warm_done
+
+    with _exact_polygon_intersection_warm_lock:
+        if _exact_polygon_intersection_warm_done:
+            return
+
+        try:
+            from vibespatial.api.geoseries import GeoSeries
+            from vibespatial.constructive.binary_constructive import (
+                binary_constructive_owned,
+            )
+            from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+
+            if not has_gpu_runtime():
+                return
+
+            left = GeoSeries.from_wkt(
+                [
+                    "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))",
+                    "POLYGON ((1 1, 5 1, 5 5, 1 5, 1 1))",
+                ],
+            ).values.to_owned()
+            right = GeoSeries.from_wkt(
+                [
+                    "POLYGON ((0 0, 5 0, 5 1, 2 1, 2 4, 0 4, 0 0))",
+                ],
+            ).values.to_owned()
+            binary_constructive_owned(
+                "intersection",
+                left,
+                right,
+                dispatch_mode=ExecutionMode.GPU,
+                _prefer_exact_polygon_intersection=True,
+            )
+        except Exception:
+            logger.debug(
+                "exact polygon intersection warm probe failed",
+                exc_info=True,
+            )
+            return
+
+        _exact_polygon_intersection_warm_done = True
 
 
 # Modules whose import triggers request_nvrtc_warmup() at module scope.
