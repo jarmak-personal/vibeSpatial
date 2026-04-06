@@ -304,7 +304,12 @@ def _build_overlay_execution_plan(
     except Exception:
         pass
 
-    faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
+    faces = build_gpu_overlay_faces(
+        left,
+        right,
+        half_edge_graph=half_edge_graph,
+        row_isolated=_row_isolated,
+    )
     return OverlayExecutionPlan(
         split_events=None,
         atomic_edges=None,

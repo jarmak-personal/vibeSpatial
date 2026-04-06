@@ -2293,6 +2293,43 @@ def _encode_owned_wkb_array(
         )
         return gpu_result
 
+    # If the caller already handed us a device-resident owned array, make one
+    # final direct device-encode attempt before surfacing a host fallback. This
+    # avoids spurious strict-native failures when ambient requested-mode state
+    # or lightweight planner heuristics suppress the optimistic helper above.
+    if owned.residency is Residency.DEVICE and owned.device_state is not None:
+        try:
+            import pyarrow as pa
+
+            plc_column = _encode_owned_wkb_column_device(owned)
+            arrow_col = plc_column.to_arrow()
+            wkb_arr = arrow_col.cast(pa.binary())
+
+            field_metadata = {}
+            if crs is not None:
+                try:
+                    crs_json = crs.to_json_dict()
+                except AttributeError:
+                    crs_json = None
+                if crs_json is not None:
+                    import json
+
+                    field_metadata[b"ARROW:extension:metadata"] = json.dumps(
+                        {"crs": crs_json}
+                    ).encode()
+            field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+            field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
+            record_dispatch_event(
+                surface="vibespatial.io.wkb",
+                operation="encode_to_parquet",
+                implementation="device_wkb_encode",
+                reason="direct device-owned WKB encode for parquet write",
+                selected=ExecutionMode.GPU,
+            )
+            return field, wkb_arr
+        except Exception:
+            pass
+
     # CPU fallback -- needs host state
     record_fallback_event(
         surface="vibespatial.io.wkb",

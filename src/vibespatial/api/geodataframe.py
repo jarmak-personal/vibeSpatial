@@ -15,16 +15,15 @@ from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 
 import vibespatial.api as geopandas
-from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve
-from vibespatial.runtime import ExecutionMode
-from vibespatial.api.geometry_array import GeometryArray, GeometryDtype, from_shapely, to_wkb, to_wkt
 from vibespatial.api.geo_base import GeoPandasBase, _is_geometry_like_dtype, is_geometry_type
+from vibespatial.api.geometry_array import GeometryArray, from_shapely, to_wkb, to_wkt
 from vibespatial.api.explore import _explore
 from vibespatial.api.geoseries import GeoSeries
-
 from vibespatial.api._compat import HAS_PYPROJ, PANDAS_GE_30
 from vibespatial.api._decorator import doc
+from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, evaluate_geopandas_lazy_dissolve
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import record_dispatch_event
 
 if PANDAS_GE_30:
     from pandas.core.accessor import Accessor
@@ -2330,6 +2329,45 @@ default 'snappy'
         )
 
         return aggregated
+
+    def dissolve_lazy(
+        self,
+        by: str | None = None,
+        aggfunc="first",
+        as_index: bool = True,
+        level=None,
+        sort: bool = True,
+        observed: bool = False,
+        dropna: bool = True,
+        method: Literal["unary", "coverage", "disjoint_subset"] = "unary",
+        grid_size: float | None = None,
+        **kwargs,
+    ):
+        """Build a predicate-first dissolve view with on-demand materialization."""
+        if by is None and level is None:
+            by = np.zeros(len(self), dtype="int64")  # type: ignore [assignment]
+
+        record_dispatch_event(
+            surface="geopandas.geodataframe.dissolve_lazy",
+            operation="dissolve_lazy",
+            implementation="virtual_grouped_dissolve",
+            reason="route grouped dissolve into a lazy predicate-first view with deferred union materialization",
+            detail=f"rows={len(self)}, method={method}, sort={sort}, observed={observed}",
+            selected=ExecutionMode.CPU,
+        )
+        return evaluate_geopandas_lazy_dissolve(
+            self,
+            by=by,
+            aggfunc=aggfunc,
+            as_index=as_index,
+            level=level,
+            sort=sort,
+            observed=observed,
+            dropna=dropna,
+            method=method,
+            grid_size=grid_size,
+            agg_kwargs=kwargs,
+        )
 
     # overrides the pandas native explode method to break up features geometrically
     def explode(

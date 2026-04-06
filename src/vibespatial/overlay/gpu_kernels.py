@@ -492,10 +492,12 @@ extern "C" __global__ void __launch_bounds__(256, 4)
 label_face_coverage_polygon(
     const double* __restrict__ label_x,
     const double* __restrict__ label_y,
+    const int* __restrict__ face_source_rows,
     const double* __restrict__ polygon_x,
     const double* __restrict__ polygon_y,
     const int* __restrict__ polygon_geometry_offsets,
     const int* __restrict__ polygon_ring_offsets,
+    const int* __restrict__ polygon_source_rows,
     int polygon_count,
     signed char* __restrict__ out_covered,
     int face_count
@@ -504,8 +506,11 @@ label_face_coverage_polygon(
   if (f >= face_count) return;
   const double px = label_x[f];
   const double py = label_y[f];
+  const bool restrict_row = face_source_rows != nullptr && polygon_source_rows != nullptr;
+  const int face_row = restrict_row ? face_source_rows[f] : -1;
 
   for (int poly = 0; poly < polygon_count; ++poly) {
+    if (restrict_row && polygon_source_rows[poly] != face_row) continue;
     const int ring_start = polygon_geometry_offsets[poly];
     const int ring_end = polygon_geometry_offsets[poly + 1];
     bool inside = false;
@@ -529,11 +534,13 @@ extern "C" __global__ void __launch_bounds__(256, 4)
 label_face_coverage_multipolygon(
     const double* __restrict__ label_x,
     const double* __restrict__ label_y,
+    const int* __restrict__ face_source_rows,
     const double* __restrict__ mp_x,
     const double* __restrict__ mp_y,
     const int* __restrict__ mp_geometry_offsets,
     const int* __restrict__ mp_part_offsets,
     const int* __restrict__ mp_ring_offsets,
+    const int* __restrict__ mp_source_rows,
     int mp_count,
     signed char* __restrict__ out_covered,
     int face_count
@@ -543,8 +550,11 @@ label_face_coverage_multipolygon(
   if (out_covered[f] == 1) return;  // already covered by polygon pass
   const double px = label_x[f];
   const double py = label_y[f];
+  const bool restrict_row = face_source_rows != nullptr && mp_source_rows != nullptr;
+  const int face_row = restrict_row ? face_source_rows[f] : -1;
 
   for (int mp = 0; mp < mp_count; ++mp) {
+    if (restrict_row && mp_source_rows[mp] != face_row) continue;
     const int polygon_start = mp_geometry_offsets[mp];
     const int polygon_end = mp_geometry_offsets[mp + 1];
     for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {

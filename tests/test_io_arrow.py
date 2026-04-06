@@ -1171,6 +1171,40 @@ def test_write_geoparquet_device_wkb_has_no_transfer_or_materialization(tmp_path
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
 
 
+def test_write_geoparquet_strict_native_wkb_succeeds_for_geometry_array_with_device_owned(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.testing import strict_native_environment
+
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+                Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+            ],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    owned = gdf.geometry.values.to_owned()
+    owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="strict native parquet WKB write regression",
+    )
+
+    path = tmp_path / "strict_native_geometry_array_device_owned_wkb.parquet"
+    with strict_native_environment():
+        gdf.to_parquet(path, geometry_encoding="WKB")
+
+    result = geopandas.read_parquet(path)
+    assert len(result) == 2
+    assert result.geometry.iloc[0].equals(gdf.geometry.iloc[0])
+    assert result.geometry.iloc[1].equals(gdf.geometry.iloc[1])
+
+
 def test_write_geoparquet_device_geoarrow_outputs_true_geoarrow(tmp_path) -> None:
     if not has_gpu_runtime() or not has_pylibcudf_support():
         return

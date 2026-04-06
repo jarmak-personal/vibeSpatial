@@ -584,6 +584,22 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
     if left.row_count != right.row_count:
         return None
 
+    def _collapse_to_single_row(sub_result: OwnedGeometryArray) -> OwnedGeometryArray | None:
+        if sub_result.row_count <= 1:
+            return sub_result
+        if not _is_polygon_only(sub_result):
+            return None
+
+        from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+        collapsed = segmented_union_all(
+            sub_result,
+            np.asarray([0, sub_result.row_count], dtype=np.int64),
+        )
+        if collapsed.row_count != 1:
+            return None
+        return collapsed
+
     left_valid = np.asarray(left.validity, dtype=bool)
     right_valid = np.asarray(right.validity, dtype=bool)
     active_rows = left_valid & right_valid
@@ -600,7 +616,14 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         _materialize_overlay_execution_plan,
     )
 
-    plan = _build_overlay_execution_plan(
+    # Materializing an overlay execution plan is not a pure read-only
+    # operation for every downstream consumer. The row-preserving batched
+    # difference helper needs both an area-intersection classification pass
+    # and the final difference result; reuse of the same plan across both
+    # materializations can leak mutated assembly state into the second call
+    # on complex aligned batches. Build a fresh plan for the difference
+    # phase so the topology result is computed from pristine inputs.
+    intersection_plan = _build_overlay_execution_plan(
         active_left,
         active_right,
         dispatch_mode=dispatch_mode,
@@ -608,7 +631,7 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         _row_isolated=True,
     )
     area_intersection, _ = _materialize_overlay_execution_plan(
-        plan,
+        intersection_plan,
         operation="intersection",
         requested=ExecutionMode.GPU,
         preserve_row_count=active_left.row_count,
@@ -618,63 +641,22 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
 
     area_state = area_intersection._ensure_device_state()
     d_area_valid = area_state.validity.astype(cp.bool_, copy=False)
-    d_active_row_ids = cp.asarray(active_row_indices, dtype=cp.int64)
 
     d_preserve_rows = cp.flatnonzero(cp.asarray(left_valid & ~right_valid)).astype(cp.int64)
-    d_empty_rows = cp.empty(0, dtype=cp.int64)
-    d_partial_local = cp.empty(0, dtype=cp.int64)
-
-    from vibespatial.constructive.representative_point import representative_point_owned
-    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-    from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
-
-    compute_geometry_bounds(active_left, dispatch_mode=ExecutionMode.GPU)
-    compute_geometry_bounds(active_right, dispatch_mode=ExecutionMode.GPU)
-    compute_geometry_bounds(area_intersection, dispatch_mode=ExecutionMode.GPU)
-    d_left_bounds = cp.asarray(active_left._ensure_device_state().row_bounds)
-    d_right_bounds = cp.asarray(active_right._ensure_device_state().row_bounds)
-
-    d_invalid_local = cp.flatnonzero(~d_area_valid).astype(cp.int64)
-    if int(d_invalid_local.size) > 0:
-        left_inside_right_bbox_d = (
-            (d_left_bounds[d_invalid_local, 0] >= d_right_bounds[d_invalid_local, 0])
-            & (d_left_bounds[d_invalid_local, 1] >= d_right_bounds[d_invalid_local, 1])
-            & (d_left_bounds[d_invalid_local, 2] <= d_right_bounds[d_invalid_local, 2])
-            & (d_left_bounds[d_invalid_local, 3] <= d_right_bounds[d_invalid_local, 3])
-        )
-        d_contained_local = d_invalid_local[left_inside_right_bbox_d]
-        if int(d_contained_local.size) > 0:
-            contained_left = active_left.take(d_contained_local)
-            # representative_point_owned still expects host ring offsets on
-            # taken polygon subsets; populate them once for this small
-            # contained-row batch rather than falling back to per-row overlay.
-            contained_left._ensure_host_state()
-            rep = representative_point_owned(
-                contained_left,
-                dispatch_mode=ExecutionMode.GPU,
-            )
-            inside_mask = point_in_polygon(
-                rep,
-                active_right.take(d_contained_local),
-                _return_device=True,
-            )
-            d_inside_mask = inside_mask.astype(cp.bool_, copy=False)
-            d_empty_rows = cp.concatenate((d_empty_rows, d_active_row_ids[d_contained_local[d_inside_mask]]))
-            d_preserve_rows = cp.concatenate((d_preserve_rows, d_active_row_ids[d_contained_local[~d_inside_mask]]))
-        d_preserve_rows = cp.concatenate((d_preserve_rows, d_active_row_ids[d_invalid_local[~left_inside_right_bbox_d]]))
-
-    d_valid_local = cp.flatnonzero(d_area_valid).astype(cp.int64)
-    if int(d_valid_local.size) > 0:
-        d_partial_local = cp.concatenate((d_partial_local, d_valid_local))
-
-    d_preserve_rows = cp.unique(d_preserve_rows.astype(cp.int64, copy=False))
-    d_empty_rows = cp.unique(d_empty_rows.astype(cp.int64, copy=False))
-    d_partial_local = cp.unique(d_partial_local.astype(cp.int64, copy=False))
+    d_fallback_local = cp.flatnonzero(~d_area_valid).astype(cp.int64, copy=False)
+    d_partial_local = cp.flatnonzero(d_area_valid).astype(cp.int64, copy=False)
 
     partial_result: OwnedGeometryArray | None = None
     if int(d_partial_local.size) > 0:
+        difference_plan = _build_overlay_execution_plan(
+            active_left,
+            active_right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=None,
+            _row_isolated=True,
+        )
         partial_result, _ = _materialize_overlay_execution_plan(
-            plan,
+            difference_plan,
             operation="difference",
             requested=ExecutionMode.GPU,
             preserve_row_count=active_left.row_count,
@@ -682,9 +664,29 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         if partial_result.row_count != active_left.row_count:
             return None
 
+    fallback_result: OwnedGeometryArray | None = None
+    if int(d_fallback_local.size) > 0:
+        fallback_left = active_left.take(d_fallback_local)
+        fallback_right = active_right.take(d_fallback_local)
+        fallback_plan = _build_overlay_execution_plan(
+            fallback_left,
+            fallback_right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=None,
+            _row_isolated=True,
+        )
+        fallback_result, _ = _materialize_overlay_execution_plan(
+            fallback_plan,
+            operation="difference",
+            requested=ExecutionMode.GPU,
+            preserve_row_count=fallback_left.row_count,
+        )
+        if fallback_result.row_count != fallback_left.row_count:
+            return None
+
     preserve_rows = cp.asnumpy(d_preserve_rows)  # zcopy:ok(final row-assembly metadata after batched GPU classification; tiny row-id materialization only)
-    empty_rows = cp.asnumpy(d_empty_rows)
     partial_local = cp.asnumpy(d_partial_local)
+    fallback_local = cp.asnumpy(d_fallback_local)
     out_validity = cp.zeros(left.row_count, dtype=cp.bool_)
     out_tags = cp.full(left.row_count, NULL_TAG, dtype=cp.int8)
     out_family_row_offsets = cp.full(left.row_count, -1, dtype=cp.int32)
@@ -694,11 +696,14 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         int(active_row_indices[int(local_pos)]): int(local_pos)
         for local_pos in partial_local.tolist()
     }
+    fallback_pos = {
+        int(active_row_indices[int(local_pos)]): int(local_pos)
+        for local_pos in fallback_local.tolist()
+    }
     preserve_set = set(preserve_rows.tolist())
-    empty_set = set(empty_rows.tolist())
 
     for row_index in range(left.row_count):
-        if not left_valid[row_index] or row_index in empty_set:
+        if not left_valid[row_index]:
             continue
 
         if row_index in preserve_set:
@@ -709,9 +714,18 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
             sub_result = partial_result.take(
                 cp.asarray([partial_pos[row_index]], dtype=cp.int64)
             )
+        elif row_index in fallback_pos:
+            if fallback_result is None:
+                return None
+            sub_result = fallback_result.take(
+                cp.asarray([fallback_pos[row_index]], dtype=cp.int64)
+            )
         else:
             continue
 
+        sub_result = _collapse_to_single_row(sub_result)
+        if sub_result is None:
+            return None
         if sub_result.row_count != 1:
             return None
         sub_state = sub_result._ensure_device_state()
@@ -778,87 +792,40 @@ def _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
             return None
         return collapsed
 
-    def _short_circuit_difference_from_intersection(
-        left_row: OwnedGeometryArray,
-        right_row: OwnedGeometryArray,
-        area_intersection: OwnedGeometryArray | None,
-    ) -> OwnedGeometryArray | None:
-        if area_intersection is None or area_intersection.row_count != 1:
-            return None
-
-        area_state = area_intersection._ensure_device_state()
-        from vibespatial.constructive.measurement import area_owned
-        from vibespatial.constructive.representative_point import representative_point_owned
-        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-        from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
-
-        if not bool(area_state.validity[0]) or not _is_polygon_only(area_intersection):
-            left_bounds = compute_geometry_bounds(left_row)
-            right_bounds = compute_geometry_bounds(right_row)
-            if (
-                left_bounds[0, 0] >= right_bounds[0, 0]
-                and left_bounds[0, 1] >= right_bounds[0, 1]
-                and left_bounds[0, 2] <= right_bounds[0, 2]
-                and left_bounds[0, 3] <= right_bounds[0, 3]
-            ):
-                rep = representative_point_owned(
-                    left_row,
-                    dispatch_mode=ExecutionMode.GPU,
-                )
-                inside_mask = point_in_polygon(rep, right_row, _return_device=True)
-                inside = bool(cp.asnumpy(inside_mask)[0]) if hasattr(inside_mask, "__cuda_array_interface__") else bool(np.asarray(inside_mask)[0])
-                if inside:
-                    return _empty_device_constructive_output(1)
-            return left_row
-
-        left_bounds = compute_geometry_bounds(left_row)
-        inter_bounds = compute_geometry_bounds(area_intersection)
-        if not np.allclose(left_bounds, inter_bounds, atol=1e-9, rtol=1e-9):
-            return None
-
-        left_area = float(area_owned(left_row)[0])
-        inter_area = float(area_owned(area_intersection)[0])
-        if np.isclose(left_area, inter_area, atol=1e-9, rtol=1e-9):
-            return _empty_device_constructive_output(1)
-        return None
-
-    out_validity = cp.zeros(left.row_count, dtype=cp.bool_)
-    out_tags = cp.full(left.row_count, NULL_TAG, dtype=cp.int8)
-    out_family_row_offsets = cp.full(left.row_count, -1, dtype=cp.int32)
-    family_buffers: dict[GeometryFamily, list] = {}
-    family_row_bases: dict[GeometryFamily, int] = {}
+    from vibespatial.kernels.constructive.polygon_difference import (
+        polygon_difference as _single_row_polygon_difference,
+    )
+    empty_row = _empty_device_constructive_output(1)
+    row_results: list[OwnedGeometryArray] = []
 
     for row_index in range(left.row_count):
         if not bool(left.validity[row_index]):
+            row_results.append(empty_row)
             continue
 
         d_row = cp.asarray([row_index], dtype=cp.int64)
         left_row = left.take(d_row)
         right_row = right.take(d_row)
-
-        # Touch-only and disjoint polygon pairs have no polygonal overlap, so
-        # the constructive difference must preserve the left polygon exactly.
-        # The overlay difference path can otherwise absorb boundary-touch
-        # artifacts into face selection for those zero-area cases.
-        area_intersection = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-            left_row,
-            right_row,
-            dispatch_mode=dispatch_mode,
-            _cached_right_segments=None,
-        )
-        sub_result = _short_circuit_difference_from_intersection(
-            left_row,
-            right_row,
-            area_intersection,
-        )
-        if sub_result is None:
+        try:
+            sub_result = _single_row_polygon_difference(
+                left_row,
+                right_row,
+                dispatch_mode=dispatch_mode,
+            )
+        except Exception:
+            logger.debug(
+                "single-row polygon_difference kernel failed; falling back to overlay",
+                exc_info=True,
+            )
             sub_result = _dispatch_overlay_gpu(
                 "difference",
                 left_row,
                 right_row,
                 dispatch_mode=dispatch_mode,
-                # See the rowwise intersection helper above: per-row subcalls
-                # must not reuse a segment table cached for the original batch.
+                # The cached segment table is built for the original aligned
+                # multi-row right operand. Reusing it after right.take([i])
+                # breaks row isolation and can leak full-batch topology into a
+                # single-row overlay subcall.
                 _cached_right_segments=None,
             )
         sub_result = _collapse_to_single_row(sub_result)
@@ -868,6 +835,7 @@ def _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
             )
             return None
         if sub_result.row_count == 0:
+            row_results.append(empty_row)
             continue
         if sub_result.row_count != 1:
             logger.debug(
@@ -878,44 +846,12 @@ def _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
 
         sub_state = sub_result._ensure_device_state()
         if not bool(sub_state.validity[0]):
+            row_results.append(empty_row)
             continue
 
-        tag_value = int(sub_state.tags[0])
-        family = TAG_FAMILIES.get(tag_value)
-        if family is None:
-            logger.debug(
-                "row-preserving polygon difference fallback saw unsupported tag %d",
-                tag_value,
-            )
-            return None
+        row_results.append(sub_result)
 
-        buffer = sub_state.families.get(family)
-        if buffer is None:
-            logger.debug(
-                "row-preserving polygon difference fallback missing %s family buffer",
-                family.value,
-            )
-            return None
-
-        base_row = family_row_bases.get(family, 0)
-        out_validity[row_index] = sub_state.validity[0]
-        out_tags[row_index] = sub_state.tags[0]
-        out_family_row_offsets[row_index] = base_row
-        family_buffers.setdefault(family, []).append(buffer)
-        family_row_bases[family] = base_row + (int(buffer.geometry_offsets.size) - 1)
-
-    device_families = {
-        family: _concat_device_family_buffers(family, buffers)
-        for family, buffers in family_buffers.items()
-    }
-    return build_device_resident_owned(
-        device_families=device_families,
-        row_count=left.row_count,
-        tags=out_tags,
-        validity=out_validity,
-        family_row_offsets=out_family_row_offsets,
-        execution_mode="gpu",
-    )
+    return OwnedGeometryArray.concat(row_results)
 
 
 def _pair_supports_gpu_constructive(

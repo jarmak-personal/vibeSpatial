@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Point, Polygon
+from shapely.geometry import MultiPolygon, Point, Polygon
 
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
@@ -17,6 +17,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
+from vibespatial.testing import strict_native_environment
 
 # ---------------------------------------------------------------------------
 # Phase 1: Device-resident builder
@@ -455,6 +456,55 @@ class TestConvexHull:
         result = convex_hull_owned(owned, dispatch_mode=ExecutionMode.GPU)
 
         assert result.residency == Residency.DEVICE
+
+    def test_convex_hull_multipolygon_matches_shapely(self):
+        """Multipolygon hull gathers coordinates across all parts/rings."""
+        from vibespatial.constructive.convex_hull import convex_hull_owned
+
+        mp = MultiPolygon([
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+            Polygon([(4, 0), (6, 0), (5, 2), (4, 0)]),
+        ])
+        owned = from_shapely_geometries([mp])
+        result = convex_hull_owned(owned)
+        got = result.to_shapely()[0]
+        expected = shapely.convex_hull(mp)
+        assert shapely.normalize(got).equals_exact(shapely.normalize(expected), 1e-7)
+
+    def test_convex_hull_multipolygon_gpu_matches_shapely(self, strict_device_guard):
+        """GPU convex_hull supports multipolygon rows without CPU fallback."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        from vibespatial.constructive.convex_hull import convex_hull_owned
+
+        mp = MultiPolygon([
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+            Polygon([(4, 0), (6, 0), (5, 2), (4, 0)]),
+        ])
+        owned = from_shapely_geometries([mp], residency=Residency.DEVICE)
+        result = convex_hull_owned(owned, dispatch_mode=ExecutionMode.GPU)
+        got = result.to_shapely()[0]
+        expected = shapely.convex_hull(mp)
+        assert result.residency == Residency.DEVICE
+        assert shapely.normalize(got).equals_exact(shapely.normalize(expected), 1e-7)
+
+    def test_convex_hull_multipolygon_strict_auto_uses_gpu(self):
+        """Strict-native mode must not take the CPU crossover on multipolygon hulls."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        from vibespatial.constructive.convex_hull import convex_hull_owned
+
+        mp = MultiPolygon([
+            Polygon([(0, 0), (2, 0), (1, 1), (0, 0)]),
+            Polygon([(4, 0), (6, 0), (5, 2), (4, 0)]),
+        ])
+        owned = from_shapely_geometries([mp], residency=Residency.DEVICE)
+        with strict_native_environment():
+            result = convex_hull_owned(owned)
+        got = result.to_shapely()[0]
+        expected = shapely.convex_hull(mp)
+        assert result.residency == Residency.DEVICE
+        assert shapely.normalize(got).equals_exact(shapely.normalize(expected), 1e-7)
 
 
 class TestValidity:

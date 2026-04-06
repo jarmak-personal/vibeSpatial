@@ -701,6 +701,12 @@ def build_gpu_atomic_edges(
             params=params,
         )
         runtime.synchronize()
+        raw_edge_rows = None
+        if isolate_rows:
+            d_adj_rows = cp.asarray(device.row_indices)[cp.flatnonzero(adjacency_mask)]
+            raw_edge_rows = cp.empty(pair_count * 2, dtype=cp.int32)
+            raw_edge_rows[0::2] = d_adj_rows
+            raw_edge_rows[1::2] = d_adj_rows
         dedup_source_ids, dedup_direction, dedup_src_x, dedup_src_y, dedup_dst_x, dedup_dst_y = (
             _deduplicate_atomic_edge_geometry(
                 out_source_ids,
@@ -709,7 +715,7 @@ def build_gpu_atomic_edges(
                 out_src_y,
                 out_dst_x,
                 out_dst_y,
-                row_indices=device.row_indices if isolate_rows else None,
+                row_indices=raw_edge_rows,
             )
         )
         runtime.free(out_source_ids)
@@ -719,25 +725,40 @@ def build_gpu_atomic_edges(
         runtime.free(out_dst_x)
         runtime.free(out_dst_y)
 
-        # Derive source_side and row / part / ring indices on GPU via
-        # searchsorted against split_events device metadata, avoiding
-        # host round-trip.
+        # Derive source_side and row / part / ring indices on GPU.
+        #
+        # split_events.source_segment_ids is ordered by packed event key, not
+        # by source segment id, so direct searchsorted on that array is
+        # invalid once multiple rows/segments are interleaved. Rebuild a
+        # compact source-id -> representative split-event mapping on device
+        # first, then gather the segment-level metadata from that mapping.
         d_out_ids = cp.asarray(dedup_source_ids)  # zcopy:ok(already device-resident — cp.asarray is a no-op)
         left_count = split_events.left_segment_count
         d_source_side = cp.where(d_out_ids < left_count, cp.int8(1), cp.int8(2))
 
         se_device = split_events.device_state
         d_se_source_ids = cp.asarray(se_device.source_segment_ids)
-        clip_idx = cp.clip(
-            cp.searchsorted(d_se_source_ids, d_out_ids),
-            0, max(split_events.count - 1, 0),
-        )
         d_se_row = cp.asarray(se_device.row_indices)
         d_se_part = cp.asarray(se_device.part_indices)
         d_se_ring = cp.asarray(se_device.ring_indices)
-        d_row_indices = d_se_row[clip_idx]
-        d_part_indices = d_se_part[clip_idx]
-        d_ring_indices = d_se_ring[clip_idx]
+        source_sort = sort_pairs(
+            d_se_source_ids,
+            cp.arange(split_events.count, dtype=cp.int32),
+            synchronize=False,
+        )
+        sorted_source_ids = source_sort.keys
+        sorted_event_idx = source_sort.values
+        unique_source_mask = cp.empty(int(sorted_source_ids.size), dtype=cp.bool_)
+        unique_source_mask[0] = True
+        if int(sorted_source_ids.size) > 1:
+            unique_source_mask[1:] = sorted_source_ids[1:] != sorted_source_ids[:-1]
+        representative_source_ids = sorted_source_ids[unique_source_mask]
+        representative_event_idx = sorted_event_idx[unique_source_mask]
+        source_lookup_idx = cp.searchsorted(representative_source_ids, d_out_ids)
+        source_event_idx = representative_event_idx[source_lookup_idx]
+        d_row_indices = d_se_row[source_event_idx]
+        d_part_indices = d_se_part[source_event_idx]
+        d_ring_indices = d_se_ring[source_event_idx]
 
         # Row/part/ring stay on device; downstream build_gpu_half_edge_graph
         # reads device_state directly.  Host copies are lazily materialized

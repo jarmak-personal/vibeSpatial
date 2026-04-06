@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import pandas as pd
 from shapely.geometry import Point
 
@@ -13,6 +15,8 @@ from vibespatial import (
 from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, execute_grouped_union
 from vibespatial.runtime.fusion import IntermediateDisposition
+
+dissolve_module = importlib.import_module("vibespatial.overlay.dissolve")
 
 
 def test_dissolve_pipeline_plan_uses_group_encoding_and_grouped_union() -> None:
@@ -75,6 +79,58 @@ def test_evaluate_geopandas_dissolve_matches_current_categorical_semantics() -> 
     )
     expected = frame.copy().dissolve(["cat", "noncat"])
 
+    assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_can_use_dense_group_codes_without_group_positions(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", "a", "b", "a"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POLYGON ((0 0, 1 0, 0 1, 0 0))",
+                    "POLYGON ((1 0, 1 1, 0 1, 1 0))",
+                    "POLYGON ((10 10, 11 10, 10 11, 10 10))",
+                    "POLYGON ((11 10, 11 11, 10 11, 11 10))",
+                ]
+            ),
+        }
+    )
+
+    expected = frame.dissolve(by="group", aggfunc="first", sort=False, method="coverage")
+
+    calls = 0
+    real_codes = dissolve_module.execute_grouped_union_codes
+
+    def _count_codes(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_codes(*args, **kwargs)
+
+    def _fail_positions(*args, **kwargs):
+        raise AssertionError("dense group code path should avoid _normalize_group_positions")
+
+    monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _count_codes)
+    monkeypatch.setattr(dissolve_module, "_normalize_group_positions", _fail_positions)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="coverage",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert calls == 1
     assert_geodataframe_equal(result, expected)
 
 

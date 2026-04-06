@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import importlib
 import os
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
 import shapely
 from shapely.geometry import MultiPoint, Point, box
 
+from benchmarks.shootout._data import setup_fixtures
 from vibespatial.api import read_file
 from vibespatial.constructive import binary_constructive as binary_constructive_module
 from vibespatial.constructive.binary_constructive import binary_constructive_owned
@@ -23,6 +26,7 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
     tile_single_row,
 )
+from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
 from vibespatial.testing import strict_native_environment
@@ -433,6 +437,191 @@ def test_single_pair_polygon_difference_preserves_touch_only_left_polygon() -> N
     expected = box(-1, 1, 1, 3)
     assert got is not None
     assert got.equals_exact(expected, tolerance=1e-9)
+
+
+@requires_gpu
+def test_grouped_polygon_difference_rowwise_matches_oracle_on_redevelopment_rows() -> None:
+    """Redevelopment grouped difference wrapper matches the exact Shapely oracle."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="test_redev_grouped_diff_"))
+    fixtures = setup_fixtures(tmpdir)
+
+    import geopandas as gpd
+
+    parcels = gpd.read_parquet(fixtures["parcels"])
+    exclusions = gpd.read_parquet(fixtures["exclusion_zones"])
+
+    bounds = parcels.total_bounds
+    dx = (bounds[2] - bounds[0]) * 0.15
+    dy = (bounds[3] - bounds[1]) * 0.15
+    clip_box = box(bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
+    study = gpd.clip(parcels, clip_box)
+    study = study[study.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+
+    left = study.geometry.values.to_owned()
+    right = exclusions.geometry.values.to_owned()
+
+    idx1, idx2 = exclusions.sindex.query(study.geometry, predicate="intersects", sort=True)
+    idx1 = np.asarray(idx1)
+    idx2 = np.asarray(idx2)
+    idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
+    group_offsets = np.concatenate([idx1_split_at, np.asarray([len(idx2)])])
+    right_grouped = right.take(idx2)
+    right_unioned = segmented_union_all(right_grouped, group_offsets)
+    left_grouped = left.take(idx1_unique)
+
+    row_subset = np.asarray([2, 17, 27, 28, 29], dtype=np.int64)
+    left_subset = left_grouped.take(row_subset)
+    right_subset = right_unioned.take(row_subset)
+
+    result = binary_constructive_module._dispatch_polygon_difference_overlay_rowwise_gpu(
+        left_subset,
+        right_subset,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    assert result is not None
+
+    got = list(result.to_shapely())
+    expected = [
+        left_geom.difference(right_geom)
+        for left_geom, right_geom in zip(
+            left_subset.to_shapely(),
+            right_subset.to_shapely(),
+            strict=True,
+        )
+    ]
+
+    assert len(got) == len(expected)
+    for row, (actual, oracle) in enumerate(zip(got, expected, strict=True)):
+        if actual is None or oracle is None:
+            assert actual is None and oracle is None, f"row {row} null mismatch"
+            continue
+        assert shapely.normalize(actual).equals(shapely.normalize(oracle)), (
+            f"row {row} grouped rowwise difference mismatch"
+        )
+
+
+@requires_gpu
+def test_grouped_polygon_difference_batched_matches_oracle_on_redevelopment_prefix() -> None:
+    """The batched row-isolated difference path stays exact on the first failing prefix."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="test_redev_grouped_diff_prefix_"))
+    fixtures = setup_fixtures(tmpdir)
+
+    import geopandas as gpd
+
+    parcels = gpd.read_parquet(fixtures["parcels"])
+    exclusions = gpd.read_parquet(fixtures["exclusion_zones"])
+
+    bounds = parcels.total_bounds
+    dx = (bounds[2] - bounds[0]) * 0.15
+    dy = (bounds[3] - bounds[1]) * 0.15
+    clip_box = box(bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
+    study = gpd.clip(parcels, clip_box)
+    study = study[study.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+
+    left = study.geometry.values.to_owned()
+    right = exclusions.geometry.values.to_owned()
+
+    idx1, idx2 = exclusions.sindex.query(study.geometry, predicate="intersects", sort=True)
+    idx1 = np.asarray(idx1)
+    idx2 = np.asarray(idx2)
+    idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
+    group_offsets = np.concatenate([idx1_split_at, np.asarray([len(idx2)])])
+    right_grouped = right.take(idx2)
+    right_unioned = segmented_union_all(right_grouped, group_offsets)
+    left_grouped = left.take(idx1_unique)
+
+    prefix = np.arange(16, dtype=np.int64)
+    left_prefix = left_grouped.take(prefix)
+    right_prefix = right_unioned.take(prefix)
+
+    with strict_native_environment():
+        result = binary_constructive_module._dispatch_polygon_difference_overlay_rowwise_gpu(
+            left_prefix,
+            right_prefix,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    assert result is not None
+    got = list(result.to_shapely())
+    expected = [
+        left_geom.difference(right_geom)
+        for left_geom, right_geom in zip(
+            left_prefix.to_shapely(),
+            right_prefix.to_shapely(),
+            strict=True,
+        )
+    ]
+
+    assert len(got) == len(expected)
+    for row, (actual, oracle) in enumerate(zip(got, expected, strict=True)):
+        if actual is None or oracle is None:
+            assert actual is None and oracle is None, f"row {row} null mismatch"
+            continue
+        assert shapely.normalize(actual).equals(shapely.normalize(oracle)), (
+            f"row {row} batched grouped difference mismatch"
+        )
+
+
+@requires_gpu
+def test_grouped_polygon_difference_strict_matches_oracle_on_redevelopment_prefix_16() -> None:
+    """The 16-row redevelopment prefix stays exact under strict row isolation."""
+    tmpdir = Path(tempfile.mkdtemp(prefix="test_redev_grouped_diff_prefix16_"))
+    fixtures = setup_fixtures(tmpdir)
+
+    import geopandas as gpd
+
+    parcels = gpd.read_parquet(fixtures["parcels"])
+    exclusions = gpd.read_parquet(fixtures["exclusion_zones"])
+
+    bounds = parcels.total_bounds
+    dx = (bounds[2] - bounds[0]) * 0.15
+    dy = (bounds[3] - bounds[1]) * 0.15
+    clip_box = box(bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
+    study = gpd.clip(parcels, clip_box)
+    study = study[study.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+
+    left = study.geometry.values.to_owned()
+    right = exclusions.geometry.values.to_owned()
+
+    idx1, idx2 = exclusions.sindex.query(study.geometry, predicate="intersects", sort=True)
+    idx1 = np.asarray(idx1)
+    idx2 = np.asarray(idx2)
+    idx1_unique, idx1_split_at = np.unique(idx1, return_index=True)
+    group_offsets = np.concatenate([idx1_split_at, np.asarray([len(idx2)])])
+    right_grouped = right.take(idx2)
+    right_unioned = segmented_union_all(right_grouped, group_offsets)
+    left_grouped = left.take(idx1_unique)
+
+    prefix = np.arange(16, dtype=np.int64)
+    left_prefix = left_grouped.take(prefix)
+    right_prefix = right_unioned.take(prefix)
+
+    with strict_native_environment():
+        result = binary_constructive_module._dispatch_polygon_difference_overlay_rowwise_gpu(
+            left_prefix,
+            right_prefix,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+    assert result is not None
+
+    got = list(result.to_shapely())
+    expected = [
+        left_geom.difference(right_geom)
+        for left_geom, right_geom in zip(
+            left_prefix.to_shapely(),
+            right_prefix.to_shapely(),
+            strict=True,
+        )
+    ]
+
+    assert len(got) == len(expected)
+    for row, (actual, oracle) in enumerate(zip(got, expected, strict=True)):
+        if actual is None or oracle is None:
+            assert actual is None and oracle is None, f"row {row} null mismatch"
+            continue
+        assert shapely.normalize(actual).equals(shapely.normalize(oracle)), (
+            f"row {row} grouped strict difference mismatch"
+        )
 
 
 @requires_gpu

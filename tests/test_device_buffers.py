@@ -64,6 +64,26 @@ def test_owned_geometry_round_trips_through_device_residency() -> None:
         assert left.equals(right)
 
 
+def test_device_subset_to_shapely_materializes_lazy_host_stubs() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (3, 0), (3, 3), (0, 0)]),
+            Polygon([(5, 5), (8, 5), (8, 8), (5, 5)]),
+            None,
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    subset = owned.take(np.asarray([1, 0], dtype=np.int32))
+    restored = subset.to_shapely()
+
+    assert restored[0] is not None and restored[0].equals(owned.to_shapely()[1])
+    assert restored[1] is not None and restored[1].equals(owned.to_shapely()[0])
+
+
 def test_device_bounds_buffers_preserve_cached_values() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

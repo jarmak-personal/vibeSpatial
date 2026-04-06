@@ -1388,35 +1388,20 @@ class OwnedGeometryArray:
             )
             return list(expanded)
 
-        if self.residency is Residency.DEVICE:
-            self.move_to(
-                Residency.HOST,
-                trigger=TransferTrigger.USER_MATERIALIZATION,
-                reason="materialized geometry objects for CPU validation",
-            )
-        else:
-            self._ensure_host_state()
+        from vibespatial.io.wkb import encode_wkb_owned
+
+        # The Shapely bridge is a host-only surface.  If this array is backed
+        # by lazy device stubs, materialize host buffers before attempting the
+        # host-side WKB encode path.
+        self._ensure_host_state()
         self._record(DiagnosticKind.MATERIALIZATION, "materialized shapely geometries", visible=True)
-        result: list[object | None] = []
-        for row_index in range(self.row_count):
-            if not bool(self.validity[row_index]):
-                result.append(None)
-                continue
-            family = TAG_FAMILIES[int(self.tags[row_index])]
-            family_buffer = self.families[family]
-            family_row = int(self.family_row_offsets[row_index])
-            result.append(_materialize_family_row(family_buffer, family_row))
-        return result
+        wkb_values = encode_wkb_owned(self, hex=False)
+        return list(shapely.from_wkb(np.asarray(wkb_values, dtype=object)))
 
     def to_wkb(self, *, hex: bool = False) -> list[bytes | str | None]:
-        values = self.to_shapely()
-        result: list[bytes | str | None] = []
-        for value in values:
-            if value is None:
-                result.append(None)
-                continue
-            result.append(shapely.to_wkb(value, hex=hex))
-        return result
+        from vibespatial.io.wkb import encode_wkb_owned
+
+        return encode_wkb_owned(self, hex=hex)
 
     def to_geoarrow(
         self,

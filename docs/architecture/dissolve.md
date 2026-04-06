@@ -5,7 +5,7 @@ Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggrega
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 65/220 lines
+Body Budget: 74/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
@@ -19,7 +19,7 @@ Section Map (Body Lines)
 | 29-34 | Risks |
 | 35-43 | Decision |
 | 44-52 | Pipeline |
-| 53-65 | Performance Notes |
+| 53-74 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -78,6 +78,15 @@ iteration.
   work, which keeps the eventual GPU path coherent.
 - Grouped union should be per-group work dispatch, not one global union followed
   by regrouping.
+- `o18.x` is allowed to route polygon coverage dissolve groups into a shared-edge
+  elimination fast path: cancel duplicate undirected edges inside each group,
+  reconstruct grouped boundary linework in bulk, and build the final coverage
+  areas without reopening generic overlay topology.
+- `o18.x` is also allowed to expose a lazy dissolve surface for predicate-heavy
+  workflows: keep grouped members and per-group bounds, answer exact scalar
+  `intersects` without materializing the dissolved geometry, answer exact point
+  `contains` the same way, and only materialize the true grouped union when a
+  geometry-producing surface is actually requested.
 - Stable in-group row order matters for deterministic output and debugability.
 - Host performance is acceptable enough to route `GeoDataFrame.dissolve` through
   the grouped pipeline today; future GPU work should replace only the grouped

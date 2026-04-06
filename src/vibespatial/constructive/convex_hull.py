@@ -49,10 +49,10 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     build_device_resident_owned,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 from vibespatial.runtime.residency import Residency
@@ -192,7 +192,7 @@ def _convex_hull_family_cpu(buf, family):
 
     # Determine coordinate spans for each geometry row.
     # For all families, we gather all coordinates belonging to each row.
-    if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+    if family is GeometryFamily.POLYGON:
         # Polygons: gather all coords across all rings.
         # geometry_offsets -> ring indices, ring_offsets -> coord indices.
         geom_off = buf.geometry_offsets
@@ -204,6 +204,25 @@ def _convex_hull_family_cpu(buf, family):
             if first_ring == last_ring:
                 coord_spans.append((0, 0))
             else:
+                cs = ring_off[first_ring]
+                ce = ring_off[last_ring]
+                coord_spans.append((int(cs), int(ce)))
+    elif family is GeometryFamily.MULTIPOLYGON:
+        # MultiPolygon: gather all coords across all polygons/rings.
+        # geometry_offsets -> polygon indices, part_offsets -> ring indices,
+        # ring_offsets -> coord indices.
+        geom_off = buf.geometry_offsets
+        part_off = buf.part_offsets
+        ring_off = buf.ring_offsets
+        coord_spans = []
+        for r in range(row_count):
+            first_poly = geom_off[r]
+            last_poly = geom_off[r + 1]
+            if first_poly == last_poly:
+                coord_spans.append((0, 0))
+            else:
+                first_ring = part_off[first_poly]
+                last_ring = part_off[last_poly]
                 cs = ring_off[first_ring]
                 ce = ring_off[last_ring]
                 coord_spans.append((int(cs), int(ce)))
@@ -406,7 +425,14 @@ def _compute_flat_coord_offsets(device_buf, family):
         d_flat_offsets = d_part_off[d_geom_off]
         return d_flat_offsets
 
-    # MultiPolygon: complex 3-level indirection, not supported on GPU path
+    if family is GeometryFamily.MULTIPOLYGON:
+        # MultiPolygon: geometry_offsets -> polygon indices,
+        # part_offsets -> ring indices, ring_offsets -> coord indices.
+        d_geom_off = cp.asarray(device_buf.geometry_offsets)
+        d_part_off = cp.asarray(device_buf.part_offsets)
+        d_ring_off = cp.asarray(device_buf.ring_offsets)
+        return d_ring_off[d_part_off[d_geom_off]]
+
     return None
 
 
@@ -541,7 +567,7 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
     execution_modes=(ExecutionMode.GPU,),
     geometry_families=(
         "point", "multipoint", "linestring", "multilinestring",
-        "polygon",
+        "polygon", "multipolygon",
     ),
     supports_mixed=False,
     tags=("cuda-python", "constructive", "convex_hull"),
@@ -551,8 +577,8 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
     Returns a device-resident Polygon OwnedGeometryArray.
     Handles single-family inputs of Point, MultiPoint, LineString,
-    MultiLineString, and Polygon.  Mixed families and MultiPolygon
-    fall back to the CPU path via the dispatcher.
+    MultiLineString, Polygon, and MultiPolygon. Mixed families fall
+    back to the CPU path via the dispatcher.
     """
     runtime = get_cuda_runtime()
     d_state = owned._ensure_device_state()
@@ -576,10 +602,6 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         return _convex_hull_cpu(owned)
 
     family, device_buf = active_families[0]
-
-    if family is GeometryFamily.MULTIPOLYGON:
-        # MultiPolygon has 3-level offset indirection, fall back to CPU
-        return _convex_hull_cpu(owned)
 
     result_buf = _convex_hull_family_gpu(runtime, device_buf, family, row_count)
     if result_buf is None:
@@ -650,8 +672,12 @@ def convex_hull_owned(
         requested_precision=precision,
     )
 
+    selected_mode = selection.selected
+    if strict_native_mode_enabled() and has_gpu_runtime() and cp is not None:
+        selected_mode = ExecutionMode.GPU
+
     # Check if GPU path is viable
-    if selection.selected is ExecutionMode.GPU and cp is not None:
+    if selected_mode is ExecutionMode.GPU and cp is not None:
         # COARSE class: always fp64, precision_plan used only for event metadata.
         precision_plan = selection.precision_plan
         # GPU path supports single-family non-MultiPolygon inputs.
@@ -662,9 +688,7 @@ def convex_hull_owned(
             if owned.family_has_rows(fam)
         ]
         is_single_family = len(families_with_rows) == 1
-        has_multipolygon = GeometryFamily.MULTIPOLYGON in families_with_rows
-
-        if is_single_family and not has_multipolygon:
+        if is_single_family:
             try:
                 result = _convex_hull_gpu(owned)
             except Exception:
@@ -675,7 +699,7 @@ def convex_hull_owned(
                     surface="geopandas.array.convex_hull",
                     operation="convex_hull",
                     requested=dispatch_mode,
-                    selected=ExecutionMode.GPU,
+                    selected=selected_mode,
                     implementation="convex_hull_gpu_nvrtc",
                     reason=selection.reason,
                     detail=f"precision={precision_plan.compute_precision}",
@@ -687,7 +711,7 @@ def convex_hull_owned(
         surface="geopandas.array.convex_hull",
         operation="convex_hull",
         requested=dispatch_mode,
-        selected=ExecutionMode.CPU,
+        selected=selected_mode,
         implementation="convex_hull_cpu_numpy",
         reason=selection.reason,
     )

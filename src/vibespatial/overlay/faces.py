@@ -22,7 +22,7 @@ from vibespatial.cuda._runtime import (
     get_cuda_runtime,
 )
 from vibespatial.geometry.buffers import GeometryFamily
-from vibespatial.geometry.owned import OwnedGeometryArray
+from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.spatial.segment_primitives import SegmentIntersectionResult
@@ -47,6 +47,8 @@ def _gpu_label_face_coverage(
     label_x: cp.ndarray,
     label_y: cp.ndarray,
     face_count: int,
+    *,
+    face_source_rows: cp.ndarray | None = None,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """GPU face labeling: test face sample points against input geometries.
 
@@ -90,6 +92,29 @@ def _gpu_label_face_coverage(
         launch_mpoly = (has_mpoly and mp_count > 0
                         and mp_buf is not None and mp_buf.part_offsets is not None)
 
+        d_poly_source_rows = None
+        d_mp_source_rows = None
+        if face_source_rows is not None:
+            d_tags = cp.asarray(device_state.tags)
+            d_validity = cp.asarray(device_state.validity)
+            d_family_rows = cp.asarray(device_state.family_row_offsets)
+            if launch_poly:
+                d_poly_source_rows = cp.full(poly_count, -1, dtype=cp.int32)
+                d_poly_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+                d_poly_slots = d_family_rows[d_poly_mask].astype(cp.int32, copy=False)
+                d_poly_rows = cp.flatnonzero(d_poly_mask).astype(cp.int32, copy=False)
+                d_poly_source_rows[d_poly_slots] = d_poly_rows
+            if launch_mpoly:
+                d_mp_source_rows = cp.full(mp_count, -1, dtype=cp.int32)
+                d_mp_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+                d_mp_slots = d_family_rows[d_mp_mask].astype(cp.int32, copy=False)
+                d_mp_rows = cp.flatnonzero(d_mp_mask).astype(cp.int32, copy=False)
+                d_mp_source_rows[d_mp_slots] = d_mp_rows
+
+        face_rows_ptr = 0 if face_source_rows is None else ptr(face_source_rows)
+        poly_rows_ptr = 0 if d_poly_source_rows is None else ptr(d_poly_source_rows)
+        mp_rows_ptr = 0 if d_mp_source_rows is None else ptr(d_mp_source_rows)
+
         if launch_poly and launch_mpoly:
             # Both families present — launch on separate CUDA streams so
             # the kernels can overlap.  They write to non-overlapping (or
@@ -98,13 +123,15 @@ def _gpu_label_face_coverage(
             s_mpoly = runtime.create_stream()
             try:
                 poly_params = (
-                    (ptr(label_x), ptr(label_y),
+                    (ptr(label_x), ptr(label_y), face_rows_ptr,
                      ptr(poly_buf.x), ptr(poly_buf.y),
                      ptr(poly_buf.geometry_offsets), ptr(poly_buf.ring_offsets),
-                     poly_count, ptr(out_covered), face_count),
+                     poly_rows_ptr, poly_count, ptr(out_covered), face_count),
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
                 runtime.launch(kernels["label_face_coverage_polygon"],
@@ -112,14 +139,16 @@ def _gpu_label_face_coverage(
                                stream=s_poly)
 
                 mp_params = (
-                    (ptr(label_x), ptr(label_y),
+                    (ptr(label_x), ptr(label_y), face_rows_ptr,
                      ptr(mp_buf.x), ptr(mp_buf.y),
                      ptr(mp_buf.geometry_offsets), ptr(mp_buf.part_offsets),
-                     ptr(mp_buf.ring_offsets),
+                     ptr(mp_buf.ring_offsets), mp_rows_ptr,
                      mp_count, ptr(out_covered), face_count),
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
@@ -136,27 +165,31 @@ def _gpu_label_face_coverage(
             # Single family — launch on the default (null) stream.
             if launch_poly:
                 params = (
-                    (ptr(label_x), ptr(label_y),
+                    (ptr(label_x), ptr(label_y), face_rows_ptr,
                      ptr(poly_buf.x), ptr(poly_buf.y),
                      ptr(poly_buf.geometry_offsets), ptr(poly_buf.ring_offsets),
-                     poly_count, ptr(out_covered), face_count),
+                     poly_rows_ptr, poly_count, ptr(out_covered), face_count),
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
                 runtime.launch(kernels["label_face_coverage_polygon"],
                                grid=grid, block=block, params=params)
             if launch_mpoly:
                 params = (
-                    (ptr(label_x), ptr(label_y),
+                    (ptr(label_x), ptr(label_y), face_rows_ptr,
                      ptr(mp_buf.x), ptr(mp_buf.y),
                      ptr(mp_buf.geometry_offsets), ptr(mp_buf.part_offsets),
-                     ptr(mp_buf.ring_offsets),
+                     ptr(mp_buf.ring_offsets), mp_rows_ptr,
                      mp_count, ptr(out_covered), face_count),
                     (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR,
                      KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
@@ -243,6 +276,7 @@ def build_gpu_overlay_faces(
     split_events: SplitEventTable | None = None,
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
+    row_isolated: bool = False,
 ) -> OverlayFaceTable:
     from vibespatial.overlay.gpu import (
         build_gpu_atomic_edges,
@@ -297,9 +331,20 @@ def build_gpu_overlay_faces(
          d_centroid_x, d_centroid_y, d_label_x, d_label_y, face_count) = _gpu_face_walk(half_edge_graph)
 
         if face_count > 0:
+            d_face_source_rows = None
+            if row_isolated and half_edge_graph.device_state.row_indices is not None:
+                d_face_source_rows = cp.asarray(half_edge_graph.device_state.row_indices)[
+                    d_face_edge_ids[d_face_offsets[:-1]]
+                ].astype(cp.int32, copy=False)
             # GPU face labeling: test sample points against input geometries
             d_left_covered, d_right_covered = _gpu_label_face_coverage(
-                left, right, d_label_x, d_label_y, face_count)
+                left,
+                right,
+                d_label_x,
+                d_label_y,
+                face_count,
+                face_source_rows=d_face_source_rows,
+            )
             # Mask out unbounded faces (keep on device -- ADR-0005)
             d_left_covered = cp.where(d_bounded_mask != 0, d_left_covered, 0).astype(cp.int8)
             d_right_covered = cp.where(d_bounded_mask != 0, d_right_covered, 0).astype(cp.int8)

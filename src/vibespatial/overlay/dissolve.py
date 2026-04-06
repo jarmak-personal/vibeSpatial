@@ -12,11 +12,13 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection
 
+from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.config import (
     OVERLAY_GPU_FAILURE_THRESHOLD,
     OVERLAY_GROUPED_BOX_GPU_THRESHOLD,
     OVERLAY_UNION_ALL_GPU_THRESHOLD,
 )
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 
 try:
@@ -96,6 +98,257 @@ class DissolveBenchmark:
         if self.pipeline_elapsed_seconds == 0.0:
             return float("inf")
         return self.baseline_elapsed_seconds / self.pipeline_elapsed_seconds
+
+
+class LazyDissolvedFrame:
+    """Predicate-first grouped dissolve view with on-demand materialization."""
+
+    def __init__(
+        self,
+        *,
+        frame,
+        aggregated_data: pd.DataFrame,
+        group_positions: list[np.ndarray],
+        row_group_codes: np.ndarray | None,
+        method: DissolveUnionMethod,
+        grid_size: float | None,
+        as_index: bool,
+        owned: OwnedGeometryArray | None,
+    ) -> None:
+        self._frame = frame
+        self._aggregated_data = aggregated_data
+        self._group_positions = [np.asarray(pos, dtype=np.int32) for pos in group_positions]
+        self._row_group_codes = None if row_group_codes is None else np.asarray(row_group_codes, dtype=np.int32)
+        self._method = method
+        self._grid_size = grid_size
+        self._as_index = as_index
+        self._owned = owned
+        self._geometry_name = frame.geometry.name
+        self._materialized = None
+        self._group_bounds = None
+
+    def __len__(self) -> int:
+        return len(self._group_positions)
+
+    def __getitem__(self, key):
+        return self.attributes[key]
+
+    @property
+    def attributes(self) -> pd.DataFrame:
+        if self._as_index:
+            return self._aggregated_data.copy()
+        return self._aggregated_data.reset_index()
+
+    @property
+    def group_index(self) -> pd.Index:
+        return self._aggregated_data.index
+
+    @property
+    def geometry(self):
+        return self.materialize()[self._geometry_name]
+
+    def materialize(self):
+        if self._materialized is not None:
+            return self._materialized
+        self._ensure_group_positions()
+        if self._row_group_codes is not None:
+            grouped_union = execute_grouped_union_codes(
+                np.asarray(self._frame.geometry.array, dtype=object),
+                self._row_group_codes,
+                group_count=len(self._aggregated_data.index),
+                method=self._method,
+                grid_size=self._grid_size,
+                owned=self._owned,
+            )
+        else:
+            grouped_union = None
+        if grouped_union is None:
+            grouped_union = execute_grouped_union(
+                np.asarray(self._frame.geometry.array, dtype=object),
+                self._group_positions,
+                method=self._method,
+                grid_size=self._grid_size,
+                owned=self._owned,
+            )
+        geometry_frame = type(self._frame)(
+            {self._geometry_name: grouped_union.geometries},
+            geometry=self._geometry_name,
+            index=self._aggregated_data.index,
+            crs=self._frame.crs,
+        )
+        aggregated = geometry_frame.join(self._aggregated_data)
+        if not self._as_index:
+            aggregated = aggregated.reset_index()
+        self._materialized = aggregated
+        return aggregated
+
+    def to_geodataframe(self):
+        return self.materialize()
+
+    def intersects(self, other) -> pd.Series:
+        query_values, scalar = _coerce_lazy_query(other)
+        if not scalar:
+            record_dispatch_event(
+                surface="geopandas.geodataframe.dissolve_lazy",
+                operation="intersects",
+                implementation="materialized_fallback",
+                reason="row-wise lazy intersects currently supports scalar queries only",
+                detail=f"groups={len(self)}",
+                selected=ExecutionMode.CPU,
+            )
+            return self.geometry.intersects(other, align=False)
+        return self._scalar_group_any_predicate("intersects", query_values[0], use_bbox=True)
+
+    def contains(self, other) -> pd.Series:
+        query_values, scalar = _coerce_lazy_query(other)
+        if (
+            not scalar
+            or not _is_point_family_query(query_values[0])
+            or self._method is not DissolveUnionMethod.COVERAGE
+        ):
+            record_dispatch_event(
+                surface="geopandas.geodataframe.dissolve_lazy",
+                operation="contains",
+                implementation="materialized_fallback",
+                reason="lazy contains fast path only preserves exact semantics for scalar point queries on coverage groups",
+                detail=f"groups={len(self)}",
+                selected=ExecutionMode.CPU,
+            )
+            return self.geometry.contains(other, align=False)
+        return self._scalar_group_contains_point_coverage(query_values[0])
+
+    def _scalar_group_any_predicate(self, predicate: str, query, *, use_bbox: bool) -> pd.Series:
+        self._ensure_group_positions()
+        result = np.zeros(len(self._group_positions), dtype=bool)
+        if len(self._group_positions) == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        candidate_groups = np.arange(len(self._group_positions), dtype=np.int32)
+        if use_bbox:
+            group_bounds = self._ensure_group_bounds()
+            query_bounds = np.asarray(shapely.bounds(np.asarray([query], dtype=object)), dtype=np.float64)[0]
+            overlaps = _bbox_overlaps(group_bounds, query_bounds)
+            candidate_groups = np.flatnonzero(overlaps).astype(np.int32, copy=False)
+            if candidate_groups.size == 0:
+                return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        member_positions = np.concatenate([self._group_positions[int(i)] for i in candidate_groups if self._group_positions[int(i)].size])
+        if member_positions.size == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        member_lengths = np.asarray(
+            [self._group_positions[int(i)].size for i in candidate_groups if self._group_positions[int(i)].size],
+            dtype=np.int32,
+        )
+        non_empty_candidate_groups = candidate_groups[member_lengths > 0]
+        if member_lengths.size == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        predicate_values = getattr(self._frame.geometry.iloc[member_positions], predicate)(query, align=False)
+        member_hits = np.asarray(predicate_values, dtype=bool)
+        offsets = np.concatenate(
+            [np.asarray([0], dtype=np.int32), np.cumsum(member_lengths[:-1], dtype=np.int32)]
+        )
+        reduced = np.maximum.reduceat(member_hits.astype(np.int8, copy=False), offsets).astype(bool, copy=False)
+        result[non_empty_candidate_groups.astype(np.intp, copy=False)] = reduced
+        return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+    def _scalar_group_contains_point_coverage(self, query) -> pd.Series:
+        self._ensure_group_positions()
+        result = np.zeros(len(self._group_positions), dtype=bool)
+        if len(self._group_positions) == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        group_bounds = self._ensure_group_bounds()
+        query_bounds = np.asarray(shapely.bounds(np.asarray([query], dtype=object)), dtype=np.float64)[0]
+        candidate_groups = np.flatnonzero(_bbox_overlaps(group_bounds, query_bounds)).astype(np.int32, copy=False)
+        if candidate_groups.size == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        non_empty_candidate_groups = np.asarray(
+            [int(i) for i in candidate_groups if self._group_positions[int(i)].size],
+            dtype=np.int32,
+        )
+        if non_empty_candidate_groups.size == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+        member_lengths = np.asarray(
+            [self._group_positions[int(i)].size for i in non_empty_candidate_groups],
+            dtype=np.int32,
+        )
+        member_positions = np.concatenate([self._group_positions[int(i)] for i in non_empty_candidate_groups])
+        offsets = np.concatenate(
+            [np.asarray([0], dtype=np.int32), np.cumsum(member_lengths[:-1], dtype=np.int32)]
+        )
+
+        member_contains = np.asarray(
+            self._frame.geometry.iloc[member_positions].contains(query, align=False),
+            dtype=bool,
+        )
+        contains_any = np.maximum.reduceat(
+            member_contains.astype(np.int8, copy=False),
+            offsets,
+        ).astype(bool, copy=False)
+        result[non_empty_candidate_groups.astype(np.intp, copy=False)] = contains_any
+
+        unresolved_groups = non_empty_candidate_groups[~contains_any]
+        if unresolved_groups.size == 0:
+            return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+        unresolved_lengths = np.asarray(
+            [self._group_positions[int(i)].size for i in unresolved_groups],
+            dtype=np.int32,
+        )
+        unresolved_positions = np.concatenate([self._group_positions[int(i)] for i in unresolved_groups])
+        unresolved_offsets = np.concatenate(
+            [np.asarray([0], dtype=np.int32), np.cumsum(unresolved_lengths[:-1], dtype=np.int32)]
+        )
+        member_covers = np.asarray(
+            self._frame.geometry.iloc[unresolved_positions].covers(query, align=False),
+            dtype=bool,
+        )
+        cover_any = np.maximum.reduceat(
+            member_covers.astype(np.int8, copy=False),
+            unresolved_offsets,
+        ).astype(bool, copy=False)
+        ambiguous_groups = unresolved_groups[cover_any]
+        if ambiguous_groups.size:
+            materialized = np.asarray(self.geometry.contains(query, align=False), dtype=bool)
+            result[ambiguous_groups.astype(np.intp, copy=False)] = materialized[
+                ambiguous_groups.astype(np.intp, copy=False)
+            ]
+        return pd.Series(result, index=self._aggregated_data.index, copy=False)
+
+    def _ensure_group_bounds(self) -> np.ndarray:
+        if self._group_bounds is not None:
+            return self._group_bounds
+        self._ensure_group_positions()
+        values = np.asarray(self._frame.geometry.array, dtype=object)
+        row_bounds = np.asarray(shapely.bounds(values), dtype=np.float64)
+        group_bounds = np.full((len(self._group_positions), 4), np.nan, dtype=np.float64)
+        for group_index, positions in enumerate(self._group_positions):
+            if positions.size == 0:
+                continue
+            block = row_bounds[positions]
+            valid = np.isfinite(block).all(axis=1)
+            if not np.any(valid):
+                continue
+            block = block[valid]
+            group_bounds[group_index, 0] = float(block[:, 0].min())
+            group_bounds[group_index, 1] = float(block[:, 1].min())
+            group_bounds[group_index, 2] = float(block[:, 2].max())
+            group_bounds[group_index, 3] = float(block[:, 3].max())
+        self._group_bounds = group_bounds
+        return group_bounds
+
+    def _ensure_group_positions(self) -> None:
+        if self._group_positions:
+            return
+        if self._row_group_codes is None:
+            return
+        self._group_positions = _group_positions_from_codes(
+            self._row_group_codes,
+            len(self._aggregated_data.index),
+        )
 
 
 def plan_dissolve_pipeline(method: DissolveUnionMethod | str = DissolveUnionMethod.UNARY) -> DissolvePipelinePlan:
@@ -215,6 +468,120 @@ def _normalize_group_positions(index: pd.Index, indices_items: list[tuple[Any, A
     return [_lookup_group_positions(indices_items, key) for key in keys]
 
 
+def _coerce_lazy_query(other) -> tuple[np.ndarray, bool]:
+    try:
+        from vibespatial.api.geoseries import GeoSeries
+    except Exception:  # pragma: no cover - defensive import seam
+        GeoSeries = ()
+
+    if isinstance(other, GeoSeries):
+        return np.asarray(other.array, dtype=object), False
+    if isinstance(other, np.ndarray):
+        if other.ndim == 0 or other.size == 1:
+            return np.asarray(other, dtype=object).reshape(1), True
+        return np.asarray(other, dtype=object), False
+    if isinstance(other, (list, tuple)):
+        values = np.asarray(other, dtype=object)
+        if values.ndim == 0 or values.size == 1:
+            return values.reshape(1), True
+        return values, False
+    return np.asarray([other], dtype=object), True
+
+
+def _is_point_family_query(query) -> bool:
+    if query is None:
+        return False
+    type_id = int(np.asarray(shapely.get_type_id(np.asarray([query], dtype=object)), dtype=np.int32)[0])
+    return type_id in (0, 4)  # Point / MultiPoint
+
+
+def _bbox_overlaps(group_bounds: np.ndarray, query_bounds: np.ndarray) -> np.ndarray:
+    valid = np.isfinite(group_bounds).all(axis=1)
+    if not np.any(valid):
+        return np.zeros(group_bounds.shape[0], dtype=bool)
+    overlaps = (
+        (group_bounds[:, 0] <= query_bounds[2])
+        & (group_bounds[:, 2] >= query_bounds[0])
+        & (group_bounds[:, 1] <= query_bounds[3])
+        & (group_bounds[:, 3] >= query_bounds[1])
+    )
+    return valid & overlaps
+
+
+def _build_row_group_codes(
+    frame,
+    *,
+    by,
+    level,
+    aggregated_index: pd.Index,
+) -> np.ndarray | None:
+    if len(frame) == 0:
+        return np.asarray([], dtype=np.int32)
+    try:
+        if level is None:
+            if by is None:
+                row_keys = pd.Index(np.zeros(len(frame), dtype=np.int64))
+            elif isinstance(by, str) and by in frame.columns:
+                row_keys = pd.Index(frame[by])
+            elif (
+                isinstance(by, (list, tuple))
+                and len(by) > 0
+                and all(isinstance(key, str) and key in frame.columns for key in by)
+            ):
+                row_keys = pd.MultiIndex.from_frame(frame[list(by)])
+            else:
+                by_array = np.asarray(by, dtype=object)
+                if by_array.ndim == 1 and by_array.shape[0] == len(frame):
+                    row_keys = pd.Index(by_array)
+                else:
+                    return None
+        else:
+            index = frame.index
+            if isinstance(level, (list, tuple)):
+                if not isinstance(index, pd.MultiIndex):
+                    return None
+                row_keys = index.droplevel([name for name in index.names if name not in level])
+            else:
+                row_keys = index.get_level_values(level)
+        codes = aggregated_index.get_indexer(row_keys)
+    except Exception:
+        return None
+    return np.asarray(codes, dtype=np.int32)
+
+
+def _group_offsets_from_sorted_codes(sorted_codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if sorted_codes.size == 0:
+        return np.asarray([0], dtype=np.int32), np.asarray([], dtype=np.int32)
+    start_mask = np.empty(sorted_codes.size, dtype=bool)
+    start_mask[0] = True
+    if sorted_codes.size > 1:
+        start_mask[1:] = sorted_codes[1:] != sorted_codes[:-1]
+    starts = np.flatnonzero(start_mask).astype(np.int32, copy=False)
+    unique_codes = sorted_codes[starts]
+    offsets = np.concatenate(
+        [starts, np.asarray([sorted_codes.size], dtype=np.int32)],
+    )
+    return offsets, unique_codes
+
+
+def _group_non_empty_counts(row_group_codes: np.ndarray, group_count: int) -> tuple[int, int]:
+    if group_count == 0:
+        return 0, 0
+    observed = row_group_codes[row_group_codes >= 0]
+    if observed.size == 0:
+        return 0, group_count
+    counts = np.bincount(observed.astype(np.int32, copy=False), minlength=group_count)
+    non_empty = int(np.count_nonzero(counts))
+    return non_empty, int(group_count - non_empty)
+
+
+def _group_positions_from_codes(row_group_codes: np.ndarray, group_count: int) -> list[np.ndarray]:
+    return [
+        np.flatnonzero(row_group_codes == group_index).astype(np.int32, copy=False)
+        for group_index in range(group_count)
+    ]
+
+
 def _union_block(values: np.ndarray, method: DissolveUnionMethod, grid_size: float | None) -> object:
     if values.size == 0:
         return _EMPTY
@@ -307,6 +674,449 @@ def execute_grouped_box_union_gpu(
     )
 
 
+def execute_grouped_box_union_gpu_codes(
+    values: np.ndarray,
+    row_group_codes: np.ndarray,
+    *,
+    group_count: int,
+) -> GroupedUnionResult | None:
+    if cp is None:
+        return None
+    bounds = _rectangle_bounds(values)
+    if bounds is None:
+        return None
+    if values.size == 0:
+        return GroupedUnionResult(
+            geometries=np.asarray([], dtype=object),
+            group_count=0,
+            non_empty_groups=0,
+            empty_groups=0,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    observed_mask = row_group_codes >= 0
+    if not np.any(observed_mask):
+        merged = np.full(group_count, _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    observed_codes = row_group_codes[observed_mask].astype(np.int32, copy=False)
+    observed_bounds = bounds[observed_mask].astype(np.float64, copy=False)
+    sorted_rows = np.argsort(observed_codes, kind="stable")
+    sorted_codes = observed_codes[sorted_rows]
+    sorted_bounds = observed_bounds[sorted_rows]
+    offsets, unique_codes = _group_offsets_from_sorted_codes(sorted_codes)
+    starts = offsets[:-1]
+    xmin = np.minimum.reduceat(sorted_bounds[:, 0], starts)
+    ymin = np.minimum.reduceat(sorted_bounds[:, 1], starts)
+    xmax = np.maximum.reduceat(sorted_bounds[:, 2], starts)
+    ymax = np.maximum.reduceat(sorted_bounds[:, 3], starts)
+    merged = np.full(group_count, _EMPTY, dtype=object)
+    merged[unique_codes.astype(np.intp, copy=False)] = shapely.box(xmin, ymin, xmax, ymax)
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+    )
+
+
+def execute_grouped_coverage_union_gpu(
+    values: np.ndarray,
+    group_positions: list[np.ndarray],
+    *,
+    owned: OwnedGeometryArray | None = None,
+) -> GroupedUnionResult | None:
+    """Union coverage groups on GPU via owned coverage reduction per group.
+
+    This replaces the grouped host-side ``coverage_union_all`` loop for
+    polygon-family coverages that are not narrow enough for the rectangle
+    bounds fast path.
+    """
+    if cp is None:
+        return None
+
+    valid_mask = np.asarray([geom is not None and not shapely.is_empty(geom) for geom in values], dtype=bool)
+    if np.any(valid_mask):
+        type_ids = shapely.get_type_id(values[valid_mask])
+        if not np.all(np.isin(type_ids, [3, 6])):  # Polygon / MultiPolygon
+            return None
+
+    if owned is None:
+        try:
+            owned = getattr(values, "_owned", None)
+        except Exception:
+            owned = None
+    if owned is None:
+        return None
+
+    from vibespatial.constructive.union_all import coverage_union_all_gpu_owned
+
+    merged = np.empty(len(group_positions), dtype=object)
+    non_empty_groups = 0
+    empty_groups = 0
+
+    for group_index, positions in enumerate(group_positions):
+        positions = np.asarray(positions, dtype=np.intp)
+        if positions.size == 0:
+            merged[group_index] = _EMPTY
+            empty_groups += 1
+            continue
+        non_empty_groups += 1
+        if positions.size == 1:
+            merged[group_index] = values[int(positions[0])]
+            continue
+        group_owned = owned.take(positions)
+        reduced = coverage_union_all_gpu_owned(group_owned)
+        reduced_geoms = reduced.to_shapely()
+        merged[group_index] = reduced_geoms[0] if reduced_geoms else _EMPTY
+
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=len(group_positions),
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+    )
+
+
+def execute_grouped_coverage_edge_union(
+    values: np.ndarray,
+    group_positions: list[np.ndarray],
+) -> GroupedUnionResult | None:
+    """Topology-free grouped coverage dissolve via shared-edge elimination.
+
+    This implements the essential `#13` shape for polygonal coverages:
+    eliminate shared interior edges inside each dissolve group, then
+    reconstruct polygon boundaries from the surviving edges.
+    """
+    if values.size == 0:
+        return GroupedUnionResult(
+            geometries=np.asarray([], dtype=object),
+            group_count=0,
+            non_empty_groups=0,
+            empty_groups=0,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    group_codes = np.full(values.size, -1, dtype=np.int32)
+    for group_index, positions in enumerate(group_positions):
+        if len(positions):
+            group_codes[np.asarray(positions, dtype=np.int32)] = group_index
+
+    valid_mask = np.asarray(
+        [geom is not None and not shapely.is_empty(geom) for geom in values],
+        dtype=bool,
+    )
+    if not np.any(valid_mask):
+        merged = np.full(len(group_positions), _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=len(group_positions),
+            non_empty_groups=0,
+            empty_groups=len(group_positions),
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    valid_values = values[valid_mask]
+    valid_rows = np.flatnonzero(valid_mask).astype(np.int32, copy=False)
+    parts, geom_part_index = shapely.get_parts(valid_values, return_index=True)
+    if parts.size == 0:
+        return None
+    part_type_ids = shapely.get_type_id(parts)
+    if not np.all(part_type_ids == 3):  # Polygon
+        return None
+
+    rings, ring_part_index = shapely.get_rings(parts, return_index=True)
+    if rings.size == 0:
+        return None
+
+    ring_lengths = np.asarray(shapely.get_num_coordinates(rings), dtype=np.int64)
+    edge_counts = ring_lengths - 1
+    total_edges = int(edge_counts.sum())
+    if total_edges <= 0:
+        return None
+
+    ring_coords = np.asarray(shapely.get_coordinates(rings), dtype=np.float64)
+    ring_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int64), np.cumsum(ring_lengths[:-1], dtype=np.int64)]
+    )
+    edge_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int64), np.cumsum(edge_counts[:-1], dtype=np.int64)]
+    )
+    ring_row_index = valid_rows[geom_part_index[ring_part_index]]
+    edge_group_codes = np.repeat(group_codes[ring_row_index], edge_counts)
+
+    base = np.arange(total_edges, dtype=np.int64)
+    repeated_edge_offsets = np.repeat(edge_offsets, edge_counts)
+    repeated_ring_offsets = np.repeat(ring_offsets, edge_counts)
+    start_idx = repeated_ring_offsets + (base - repeated_edge_offsets)
+    end_idx = start_idx + 1
+
+    start_xy = ring_coords[start_idx]
+    end_xy = ring_coords[end_idx]
+    start_x_bits = start_xy[:, 0].view(np.uint64)
+    start_y_bits = start_xy[:, 1].view(np.uint64)
+    end_x_bits = end_xy[:, 0].view(np.uint64)
+    end_y_bits = end_xy[:, 1].view(np.uint64)
+
+    swap = (
+        (start_x_bits > end_x_bits)
+        | ((start_x_bits == end_x_bits) & (start_y_bits > end_y_bits))
+    )
+    key_x0 = np.where(swap, end_x_bits, start_x_bits)
+    key_y0 = np.where(swap, end_y_bits, start_y_bits)
+    key_x1 = np.where(swap, start_x_bits, end_x_bits)
+    key_y1 = np.where(swap, start_y_bits, end_y_bits)
+
+    order = np.lexsort((key_y1, key_x1, key_y0, key_x0, edge_group_codes))
+    sorted_groups = edge_group_codes[order]
+    sorted_x0 = key_x0[order]
+    sorted_y0 = key_y0[order]
+    sorted_x1 = key_x1[order]
+    sorted_y1 = key_y1[order]
+
+    start_mask = np.empty(order.size, dtype=bool)
+    start_mask[0] = True
+    start_mask[1:] = (
+        (sorted_groups[1:] != sorted_groups[:-1])
+        | (sorted_x0[1:] != sorted_x0[:-1])
+        | (sorted_y0[1:] != sorted_y0[:-1])
+        | (sorted_x1[1:] != sorted_x1[:-1])
+        | (sorted_y1[1:] != sorted_y1[:-1])
+    )
+    run_starts = np.flatnonzero(start_mask).astype(np.int64, copy=False)
+    run_lengths = np.diff(
+        np.concatenate([run_starts, np.asarray([order.size], dtype=np.int64)])
+    )
+    boundary_orders = order[run_starts[run_lengths % 2 == 1]]
+
+    if boundary_orders.size == 0:
+        merged = np.full(len(group_positions), _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=len(group_positions),
+            non_empty_groups=0,
+            empty_groups=len(group_positions),
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    boundary_groups = edge_group_codes[boundary_orders]
+    boundary_start = start_xy[boundary_orders]
+    boundary_end = end_xy[boundary_orders]
+    flat_coords = np.empty((boundary_orders.size * 2, 2), dtype=np.float64)
+    flat_coords[0::2] = boundary_start
+    flat_coords[1::2] = boundary_end
+    line_indices = np.repeat(np.arange(boundary_orders.size, dtype=np.int32), 2)
+    boundary_lines = shapely.linestrings(flat_coords, indices=line_indices)
+
+    observed_boundary_groups = np.unique(boundary_groups).astype(np.int32, copy=False)
+    group_inverse = np.searchsorted(observed_boundary_groups, boundary_groups).astype(np.int32, copy=False)
+    grouped_lines = shapely.multilinestrings(boundary_lines, indices=group_inverse)
+    grouped_areas = shapely.build_area(grouped_lines)
+
+    merged = np.full(len(group_positions), _EMPTY, dtype=object)
+    merged[observed_boundary_groups.astype(np.intp, copy=False)] = np.asarray(grouped_areas, dtype=object)
+    non_empty_groups = int(np.count_nonzero([len(positions) > 0 for positions in group_positions]))
+    empty_groups = len(group_positions) - non_empty_groups
+
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=len(group_positions),
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+    )
+
+
+def execute_grouped_coverage_edge_union_codes(
+    values: np.ndarray,
+    row_group_codes: np.ndarray,
+    *,
+    group_count: int,
+) -> GroupedUnionResult | None:
+    if values.size == 0:
+        return GroupedUnionResult(
+            geometries=np.asarray([], dtype=object),
+            group_count=0,
+            non_empty_groups=0,
+            empty_groups=0,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    valid_mask = np.asarray(
+        [geom is not None and not shapely.is_empty(geom) for geom in values],
+        dtype=bool,
+    )
+    if not np.any(valid_mask):
+        merged = np.full(group_count, _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    valid_values = values[valid_mask]
+    valid_group_codes = row_group_codes[valid_mask].astype(np.int32, copy=False)
+    valid_rows = np.flatnonzero(valid_mask).astype(np.int32, copy=False)
+    parts, geom_part_index = shapely.get_parts(valid_values, return_index=True)
+    if parts.size == 0:
+        return None
+    part_type_ids = shapely.get_type_id(parts)
+    if not np.all(part_type_ids == 3):
+        return None
+
+    rings, ring_part_index = shapely.get_rings(parts, return_index=True)
+    if rings.size == 0:
+        return None
+
+    ring_lengths = np.asarray(shapely.get_num_coordinates(rings), dtype=np.int64)
+    edge_counts = ring_lengths - 1
+    total_edges = int(edge_counts.sum())
+    if total_edges <= 0:
+        return None
+
+    ring_coords = np.asarray(shapely.get_coordinates(rings), dtype=np.float64)
+    ring_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int64), np.cumsum(ring_lengths[:-1], dtype=np.int64)]
+    )
+    edge_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int64), np.cumsum(edge_counts[:-1], dtype=np.int64)]
+    )
+    ring_row_index = valid_rows[geom_part_index[ring_part_index]]
+    edge_group_codes = np.repeat(valid_group_codes[ring_row_index], edge_counts)
+
+    base = np.arange(total_edges, dtype=np.int64)
+    repeated_edge_offsets = np.repeat(edge_offsets, edge_counts)
+    repeated_ring_offsets = np.repeat(ring_offsets, edge_counts)
+    start_idx = repeated_ring_offsets + (base - repeated_edge_offsets)
+    end_idx = start_idx + 1
+
+    start_xy = ring_coords[start_idx]
+    end_xy = ring_coords[end_idx]
+    start_x_bits = start_xy[:, 0].view(np.uint64)
+    start_y_bits = start_xy[:, 1].view(np.uint64)
+    end_x_bits = end_xy[:, 0].view(np.uint64)
+    end_y_bits = end_xy[:, 1].view(np.uint64)
+
+    swap = (
+        (start_x_bits > end_x_bits)
+        | ((start_x_bits == end_x_bits) & (start_y_bits > end_y_bits))
+    )
+    key_x0 = np.where(swap, end_x_bits, start_x_bits)
+    key_y0 = np.where(swap, end_y_bits, start_y_bits)
+    key_x1 = np.where(swap, start_x_bits, end_x_bits)
+    key_y1 = np.where(swap, start_y_bits, end_y_bits)
+
+    order = np.lexsort((key_y1, key_x1, key_y0, key_x0, edge_group_codes))
+    sorted_groups = edge_group_codes[order]
+    sorted_x0 = key_x0[order]
+    sorted_y0 = key_y0[order]
+    sorted_x1 = key_x1[order]
+    sorted_y1 = key_y1[order]
+
+    start_mask = np.empty(order.size, dtype=bool)
+    start_mask[0] = True
+    start_mask[1:] = (
+        (sorted_groups[1:] != sorted_groups[:-1])
+        | (sorted_x0[1:] != sorted_x0[:-1])
+        | (sorted_y0[1:] != sorted_y0[:-1])
+        | (sorted_x1[1:] != sorted_x1[:-1])
+        | (sorted_y1[1:] != sorted_y1[:-1])
+    )
+    run_starts = np.flatnonzero(start_mask).astype(np.int64, copy=False)
+    run_lengths = np.diff(
+        np.concatenate([run_starts, np.asarray([order.size], dtype=np.int64)])
+    )
+    boundary_orders = order[run_starts[run_lengths % 2 == 1]]
+
+    if boundary_orders.size == 0:
+        merged = np.full(group_count, _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    boundary_groups = edge_group_codes[boundary_orders]
+    boundary_start = start_xy[boundary_orders]
+    boundary_end = end_xy[boundary_orders]
+    flat_coords = np.empty((boundary_orders.size * 2, 2), dtype=np.float64)
+    flat_coords[0::2] = boundary_start
+    flat_coords[1::2] = boundary_end
+    line_indices = np.repeat(np.arange(boundary_orders.size, dtype=np.int32), 2)
+    boundary_lines = shapely.linestrings(flat_coords, indices=line_indices)
+
+    observed_boundary_groups = np.unique(boundary_groups).astype(np.int32, copy=False)
+    group_inverse = np.searchsorted(observed_boundary_groups, boundary_groups).astype(np.int32, copy=False)
+    grouped_lines = shapely.multilinestrings(boundary_lines, indices=group_inverse)
+    grouped_areas = shapely.build_area(grouped_lines)
+
+    merged = np.full(group_count, _EMPTY, dtype=object)
+    merged[observed_boundary_groups.astype(np.intp, copy=False)] = np.asarray(grouped_areas, dtype=object)
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+    )
+
+
+def execute_grouped_disjoint_subset_union_codes(
+    values: np.ndarray,
+    row_group_codes: np.ndarray,
+    *,
+    group_count: int,
+) -> GroupedUnionResult | None:
+    observed_mask = row_group_codes >= 0
+    merged = np.full(group_count, _EMPTY, dtype=object)
+    if not np.any(observed_mask):
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=DissolveUnionMethod.DISJOINT_SUBSET,
+        )
+
+    observed_codes = row_group_codes[observed_mask].astype(np.int32, copy=False)
+    observed_values = values[observed_mask]
+    order = np.argsort(observed_codes, kind="stable")
+    sorted_codes = observed_codes[order]
+    sorted_values = observed_values[order]
+    offsets, unique_codes = _group_offsets_from_sorted_codes(sorted_codes)
+
+    for group_index, start, stop in zip(
+        unique_codes.astype(np.intp, copy=False),
+        offsets[:-1],
+        offsets[1:],
+        strict=True,
+    ):
+        merged[int(group_index)] = shapely.disjoint_subset_union_all(sorted_values[int(start):int(stop)])
+
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.DISJOINT_SUBSET,
+    )
+
+
 def _gpu_union_group(group_geoms: np.ndarray) -> object:
     """Union a group of polygon geometries on GPU via tree-reduce (ADR-0017).
 
@@ -356,12 +1166,95 @@ def _gpu_union_group(group_geoms: np.ndarray) -> object:
     return current[0]
 
 
+def execute_grouped_union_codes(
+    geometries: Sequence[object | None] | np.ndarray,
+    row_group_codes: np.ndarray,
+    *,
+    group_count: int,
+    method: DissolveUnionMethod | str = DissolveUnionMethod.UNARY,
+    grid_size: float | None = None,
+    owned: OwnedGeometryArray | None = None,
+) -> GroupedUnionResult | None:
+    normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
+    values = np.asarray(geometries, dtype=object)
+    if values.size != row_group_codes.size:
+        raise ValueError("row_group_codes length must match geometries length")
+
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and int(values.size) >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_box_union_gpu_codes(
+            values,
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and int(values.size) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_disjoint_subset_union_codes(
+            values,
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and int(values.size) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_coverage_edge_union_codes(
+            values,
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
+
+    if owned is not None and normalized is DissolveUnionMethod.UNARY and grid_size is None:
+        observed_mask = row_group_codes >= 0
+        if not np.any(observed_mask):
+            merged = np.full(group_count, _EMPTY, dtype=object)
+            return GroupedUnionResult(
+                geometries=merged,
+                group_count=group_count,
+                non_empty_groups=0,
+                empty_groups=group_count,
+                method=normalized,
+            )
+        from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+        observed_codes = row_group_codes[observed_mask].astype(np.int32, copy=False)
+        observed_rows = np.flatnonzero(observed_mask).astype(np.int64, copy=False)
+        order = np.argsort(observed_codes, kind="stable")
+        sorted_codes = observed_codes[order]
+        sorted_rows = observed_rows[order]
+        offsets, unique_codes = _group_offsets_from_sorted_codes(sorted_codes)
+        reduced = segmented_union_all(owned.take(sorted_rows), offsets)
+        reduced_geometries = np.asarray(reduced.to_shapely(), dtype=object)
+        merged = np.full(group_count, _EMPTY, dtype=object)
+        merged[unique_codes.astype(np.intp, copy=False)] = reduced_geometries
+        non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=normalized,
+        )
+    return None
+
+
 def execute_grouped_union(
     geometries: Sequence[object | None] | np.ndarray,
     group_positions: list[np.ndarray],
     *,
     method: DissolveUnionMethod | str = DissolveUnionMethod.UNARY,
     grid_size: float | None = None,
+    owned: OwnedGeometryArray | None = None,
 ) -> GroupedUnionResult:
     normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
     values = np.asarray(geometries, dtype=object)
@@ -371,6 +1264,23 @@ def execute_grouped_union(
         and int(values.size) >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
     ):
         accelerated = execute_grouped_box_union_gpu(values, group_positions)
+        if accelerated is not None:
+            return accelerated
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and int(values.size) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_coverage_edge_union(
+            values,
+            group_positions,
+        )
+        if accelerated is not None:
+            return accelerated
+        accelerated = execute_grouped_coverage_union_gpu(
+            values,
+            group_positions,
+            owned=owned,
+        )
         if accelerated is not None:
             return accelerated
     # GPU polygon union via tree-reduce (ADR-0017)
@@ -405,6 +1315,58 @@ def execute_grouped_union(
     )
 
 
+def _prepare_grouped_dissolve(
+    frame,
+    *,
+    by,
+    aggfunc,
+    level,
+    sort: bool,
+    observed: bool,
+    dropna: bool,
+    normalized_method: DissolveUnionMethod,
+    agg_kwargs: dict[str, Any],
+) -> tuple[pd.DataFrame, list[np.ndarray], OwnedGeometryArray | None, np.ndarray | None]:
+    if by is None and level is None:
+        by = np.zeros(len(frame), dtype="int64")
+
+    groupby_kwargs = {
+        "by": by,
+        "level": level,
+        "sort": sort,
+        "observed": observed,
+        "dropna": dropna,
+    }
+
+    data = frame.drop(labels=frame.geometry.name, axis=1)
+    aggregated_data = data.groupby(**groupby_kwargs).agg(aggfunc, **agg_kwargs)
+    aggregated_data.columns = aggregated_data.columns.to_flat_index()
+
+    row_group_codes = _build_row_group_codes(
+        frame,
+        by=by,
+        level=level,
+        aggregated_index=aggregated_data.index,
+    )
+    if row_group_codes is None:
+        grouped_geometry = frame.groupby(group_keys=False, **groupby_kwargs)[frame.geometry.name]
+        indices_items = list(grouped_geometry.indices.items())
+        group_positions = _normalize_group_positions(aggregated_data.index, indices_items)
+    else:
+        group_positions = []
+    owned = getattr(frame.geometry.values, "_owned", None)
+    if (
+        owned is None
+        and normalized_method is DissolveUnionMethod.COVERAGE
+        and int(len(frame)) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+    ):
+        try:
+            owned = frame.geometry.values.to_owned()
+        except (AttributeError, NotImplementedError):
+            owned = None
+    return aggregated_data, group_positions, owned, row_group_codes
+
+
 def evaluate_geopandas_dissolve(
     frame,
     *,
@@ -425,31 +1387,41 @@ def evaluate_geopandas_dissolve(
         normalized_method = DissolveUnionMethod(method)
         if normalized_method is not DissolveUnionMethod.UNARY and grid_size is not None:
             raise ValueError(f"grid_size is not supported for method '{method}'.")
-
-        if by is None and level is None:
-            by = np.zeros(len(frame), dtype="int64")
-
-        groupby_kwargs = {
-            "by": by,
-            "level": level,
-            "sort": sort,
-            "observed": observed,
-            "dropna": dropna,
-        }
-
-        data = frame.drop(labels=frame.geometry.name, axis=1)
-        aggregated_data = data.groupby(**groupby_kwargs).agg(aggfunc, **agg_kwargs)
-        aggregated_data.columns = aggregated_data.columns.to_flat_index()
-
-        grouped_geometry = frame.groupby(group_keys=False, **groupby_kwargs)[frame.geometry.name]
-        indices_items = list(grouped_geometry.indices.items())
-        group_positions = _normalize_group_positions(aggregated_data.index, indices_items)
-        grouped_union = execute_grouped_union(
-            np.asarray(frame.geometry.array, dtype=object),
-            group_positions,
-            method=normalized_method,
-            grid_size=grid_size,
+        aggregated_data, group_positions, owned, row_group_codes = _prepare_grouped_dissolve(
+            frame,
+            by=by,
+            aggfunc=aggfunc,
+            level=level,
+            sort=sort,
+            observed=observed,
+            dropna=dropna,
+            normalized_method=normalized_method,
+            agg_kwargs=agg_kwargs,
         )
+        if row_group_codes is not None:
+            grouped_union = execute_grouped_union_codes(
+                np.asarray(frame.geometry.array, dtype=object),
+                row_group_codes,
+                group_count=len(aggregated_data.index),
+                method=normalized_method,
+                grid_size=grid_size,
+                owned=owned,
+            )
+        else:
+            grouped_union = None
+        if grouped_union is None:
+            if row_group_codes is not None and not group_positions:
+                group_positions = _group_positions_from_codes(
+                    row_group_codes,
+                    len(aggregated_data.index),
+                )
+            grouped_union = execute_grouped_union(
+                np.asarray(frame.geometry.array, dtype=object),
+                group_positions,
+                method=normalized_method,
+                grid_size=grid_size,
+                owned=owned,
+            )
 
         geometry_frame = type(frame)(
             {frame.geometry.name: grouped_union.geometries},
@@ -461,6 +1433,46 @@ def evaluate_geopandas_dissolve(
         if not as_index:
             aggregated = aggregated.reset_index()
         return aggregated
+
+
+def evaluate_geopandas_lazy_dissolve(
+    frame,
+    *,
+    by,
+    aggfunc,
+    as_index: bool,
+    level,
+    sort: bool,
+    observed: bool,
+    dropna: bool,
+    method: str,
+    grid_size: float | None,
+    agg_kwargs: dict[str, Any],
+) -> LazyDissolvedFrame:
+    normalized_method = DissolveUnionMethod(method)
+    if normalized_method is not DissolveUnionMethod.UNARY and grid_size is not None:
+        raise ValueError(f"grid_size is not supported for method '{method}'.")
+    aggregated_data, group_positions, owned, _row_group_codes = _prepare_grouped_dissolve(
+        frame,
+        by=by,
+        aggfunc=aggfunc,
+        level=level,
+        sort=sort,
+        observed=observed,
+        dropna=dropna,
+        normalized_method=normalized_method,
+        agg_kwargs=agg_kwargs,
+    )
+    return LazyDissolvedFrame(
+        frame=frame,
+        aggregated_data=aggregated_data,
+        group_positions=group_positions,
+        row_group_codes=_row_group_codes,
+        method=normalized_method,
+        grid_size=grid_size,
+        as_index=as_index,
+        owned=owned,
+    )
 
 
 def _run_pipeline_once(frame, *, by, method):

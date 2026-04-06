@@ -37,8 +37,6 @@ from vibespatial.runtime.fallbacks import (
     get_fallback_events,
     record_fallback_event,
 )
-
-
 def get_runtime_selection(
     requested: ExecutionMode | str = ExecutionMode.AUTO,
 ) -> RuntimeSelection:
