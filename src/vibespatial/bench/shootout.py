@@ -358,8 +358,12 @@ def run_shootout(
     )
 
     # --- vibespatial ---
+    # The repo-local geopandas shim is already imported from src/ without the
+    # compat flag, so keep the vibespatial subprocess environment as close to
+    # the baseline as possible. The compat flag only suppresses a deprecation
+    # warning, and on this machine it also perturbs CUDA visibility in the
+    # shootout subprocess.
     vs_env = os.environ.copy()
-    vs_env["_VIBESPATIAL_GEOPANDAS_COMPAT"] = "1"
     if scale is not None:
         vs_env["VSBENCH_SCALE"] = scale
 

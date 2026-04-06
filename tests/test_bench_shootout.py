@@ -6,7 +6,9 @@ from pathlib import Path
 import pytest
 
 from vibespatial.bench.cli import main as vsbench_main
+from vibespatial.bench.shootout import run_shootout
 from vibespatial.runtime import has_gpu_runtime
+from vibespatial.testing import strict_native_environment
 
 
 def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) -> None:
@@ -40,8 +42,6 @@ def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) ->
     if has_gpu_runtime():
         expected_failures = {
             "corridor_flood_priority.py",
-            "parcel_zoning.py",
-            "redevelopment_screening.py",
             "transit_service_gap.py",
         }
     else:
@@ -67,3 +67,54 @@ def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) ->
     assert {
         name for name, status in statuses_by_script.items() if status == "[PASS]"
     } == ({path.name for path in expected_scripts} - expected_failures)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "script_name",
+    [
+        "network_service_area.py",
+    ],
+)
+def test_strict_native_shootout_scripts_do_not_need_compat_env(
+    script_name: str,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    script = Path("benchmarks/shootout") / script_name
+    with strict_native_environment():
+        result = run_shootout(
+            script,
+            repeat=1,
+            warmup=False,
+            scale="200",
+            timeout=300,
+            quiet=True,
+        )
+
+    assert result.status == "pass"
+    assert result.vibespatial.error is None
+    assert result.metadata.get("fingerprint") == "match"
+
+
+@pytest.mark.gpu
+def test_strict_native_transit_service_gap_matches_baseline() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    script = Path("benchmarks/shootout") / "transit_service_gap.py"
+    with strict_native_environment():
+        result = run_shootout(
+            script,
+            repeat=1,
+            warmup=False,
+            scale="10000",
+            timeout=300,
+            quiet=True,
+        )
+
+    assert result.status == "pass"
+    assert result.vibespatial.error is None
+    assert result.metadata.get("fingerprint") == "match"
+

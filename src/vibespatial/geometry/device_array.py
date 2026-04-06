@@ -673,6 +673,14 @@ class DeviceGeometryArray(ExtensionArray):
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs
         )
 
+    def remove_repeated_points(self, tolerance=0.0):
+        from vibespatial.constructive.remove_repeated_points import (
+            remove_repeated_points_owned,
+        )
+
+        result_owned = remove_repeated_points_owned(self._owned, tolerance)
+        return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
+
     def normalize(self, precision="auto"):
         from vibespatial.constructive.normalize import normalize_owned
 

@@ -327,5 +327,11 @@ def fingerprint(gdf: gpd.GeoDataFrame) -> str:
     """Deterministic summary for correctness comparison across engines."""
     rows = len(gdf)
     b = tuple(round(float(v), 2) for v in gdf.total_bounds)
-    area = float(gdf.geometry.convex_hull.area.sum())
+    # The benchmark fingerprint runs after the timed body, so we can afford
+    # to materialize a host-safe geometry snapshot explicitly here rather than
+    # letting strict-native fingerprinting stumble into a CPU fallback on a
+    # lazy device-backed series.
+    geoms = np.asarray(gdf.geometry.values._data, dtype=object)
+    hulls = shapely.convex_hull(geoms)
+    area = float(np.asarray(shapely.area(hulls), dtype=np.float64).sum())
     return f"rows={rows} bounds={b} convex_hull_area={area:.2f}"

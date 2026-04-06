@@ -177,25 +177,55 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         if isinstance(partition, GeoDataFrame):
             clipped_partition = partition.copy(deep=not PANDAS_GE_30)
             geom_name = clipped_partition._geometry_column_name
-            geom_values = (
-                partition.geometry.values.clip_by_rect(*rectangle_bounds)
-                if use_rect_fast_path
-                else partition.geometry.values.intersection(mask)
-            )
             if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
-                geom_values = geom_values.remove_repeated_points(0.0).normalize()
-            clipped_partition[geom_name] = geom_values
+                from vibespatial.api.tools.overlay import (
+                    _assemble_polygon_intersection_rows_with_lower_dim,
+                )
+
+                area_values = partition.geometry.values.intersection(mask)
+                area_values = area_values.remove_repeated_points(0.0).normalize()
+                area_pairs = GeoSeries(area_values, index=partition.index, crs=partition.crs)
+                repeated_mask = np.empty(len(partition), dtype=object)
+                repeated_mask[:] = mask
+                right_pairs = GeoSeries(repeated_mask, index=partition.index, crs=partition.crs)
+                clipped_partition[geom_name] = _assemble_polygon_intersection_rows_with_lower_dim(
+                    partition.geometry,
+                    right_pairs,
+                    area_pairs,
+                )
+            else:
+                geom_values = (
+                    partition.geometry.values.clip_by_rect(*rectangle_bounds)
+                    if use_rect_fast_path
+                    else partition.geometry.values.intersection(mask)
+                )
+                clipped_partition[geom_name] = geom_values
             return clipped_partition
 
         clipped_partition = partition.copy(deep=not PANDAS_GE_30)
-        geom_values = (
-            partition.values.clip_by_rect(*rectangle_bounds)
-            if use_rect_fast_path
-            else partition.values.intersection(mask)
-        )
         if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
-            geom_values = geom_values.remove_repeated_points(0.0).normalize()
-        clipped_partition[:] = geom_values
+            from vibespatial.api.tools.overlay import (
+                _assemble_polygon_intersection_rows_with_lower_dim,
+            )
+
+            area_values = partition.values.intersection(mask)
+            area_values = area_values.remove_repeated_points(0.0).normalize()
+            area_pairs = GeoSeries(area_values, index=partition.index, crs=partition.crs)
+            repeated_mask = np.empty(len(partition), dtype=object)
+            repeated_mask[:] = mask
+            right_pairs = GeoSeries(repeated_mask, index=partition.index, crs=partition.crs)
+            clipped_partition[:] = _assemble_polygon_intersection_rows_with_lower_dim(
+                partition,
+                right_pairs,
+                area_pairs,
+            )
+        else:
+            geom_values = (
+                partition.values.clip_by_rect(*rectangle_bounds)
+                if use_rect_fast_path
+                else partition.values.intersection(mask)
+            )
+            clipped_partition[:] = geom_values
         return clipped_partition
 
     parts = []
@@ -249,15 +279,17 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
             crs=gdf.crs,
         )
 
+    clipped_geometry = clipped.geometry if isinstance(clipped, GeoDataFrame) else clipped
+
     if clipping_by_rectangle:
         # clip_by_rect might return empty geometry collections in edge cases
-        clipped = clipped[~clipped.is_empty]
+        clipped = clipped[~clipped_geometry.isna() & ~clipped_geometry.is_empty]
     else:
         # GPU intersection may produce degenerate zero-area polygon slivers at
         # exact clip boundaries where GEOS/Shapely returns lower-dimensional
         # results (LineStrings/Points).  Remove empty geometries and zero-area
         # polygon slivers so clip output matches stock geopandas behaviour.
-        keep = ~clipped.is_empty
+        keep = ~clipped_geometry.isna() & ~clipped_geometry.is_empty
         if non_point_mask.any():
             poly_rows = clipped.geom_type.isin(POLYGON_GEOM_TYPES)
             if poly_rows.any():

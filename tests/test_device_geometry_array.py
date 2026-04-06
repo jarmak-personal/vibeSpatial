@@ -7,6 +7,7 @@ import pickle
 import numpy as np
 import pandas as pd
 import pytest
+import shapely
 from shapely.geometry import (
     LineString,
     MultiLineString,
@@ -1008,3 +1009,25 @@ class TestChainedOperations:
         result = hulls.contains(DeviceGeometryArray._from_sequence([Point(1, 1), Point(20, 20)]))
         assert result.dtype == bool
         assert list(result) == [True, False]
+
+    def test_remove_repeated_points_returns_dga(self):
+        polygon = Polygon(
+            [
+                (0.0, 0.0),
+                (3.0, 0.0),
+                (3.0, 0.0),
+                (3.0, 2.0),
+                (0.0, 2.0),
+                (0.0, 0.0),
+            ]
+        )
+        dga = DeviceGeometryArray._from_sequence([polygon])
+
+        result = dga.remove_repeated_points(0.0)
+
+        assert isinstance(result, DeviceGeometryArray)
+        expected = shapely.remove_repeated_points(
+            np.asarray([polygon], dtype=object),
+            tolerance=0.0,
+        )
+        assert result[0].equals(expected[0])

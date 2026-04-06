@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
+import shapely
 from shapely.geometry import LineString, Point, Polygon, box
 
 import vibespatial
+from benchmarks.shootout._data import setup_fixtures
+from vibespatial.geometry.device_array import DeviceGeometryArray
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime.fallbacks import (
     StrictNativeFallbackError,
     record_fallback_event,
@@ -241,6 +246,127 @@ def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_gpu_int
         and event.implementation == "binary_constructive_gpu"
         for event in events
     )
+
+
+@pytest.mark.gpu
+def test_strict_clip_polygon_mask_keeps_polygon_postprocess_on_device() -> None:
+    _require_gpu_runtime()
+    buildings = vibespatial.GeoDataFrame(
+        {
+            "building_id": [1, 2],
+            "geometry": vibespatial.GeoSeries(
+                DeviceGeometryArray._from_owned(
+                    from_shapely_geometries(
+                        [
+                            Polygon(
+                                [
+                                    (0.0, 0.0),
+                                    (8.0, 0.0),
+                                    (8.0, 0.0),
+                                    (8.0, 8.0),
+                                    (0.0, 8.0),
+                                    (0.0, 0.0),
+                                ]
+                            ),
+                            Polygon(
+                                [
+                                    (20.0, 20.0),
+                                    (28.0, 20.0),
+                                    (28.0, 28.0),
+                                    (20.0, 28.0),
+                                    (20.0, 20.0),
+                                ]
+                            ),
+                        ]
+                    )
+                ),
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    admin = vibespatial.GeoDataFrame(
+        {"geometry": [box(2.0, 2.0, 10.0, 10.0)]},
+        crs="EPSG:3857",
+    )
+
+    assert isinstance(buildings.geometry.values, DeviceGeometryArray)
+
+    with strict_native_environment():
+        result = vibespatial.clip(buildings, admin)
+
+    assert len(result) == 1
+    assert result.geometry.iloc[0].equals(box(2.0, 2.0, 8.0, 8.0))
+
+
+@pytest.mark.gpu
+def test_strict_clip_concave_polygon_mask_matches_shapely_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_gpu_runtime()
+    monkeypatch.setenv("VSBENCH_SCALE", "100")
+    fixtures = setup_fixtures(tmp_path)
+
+    buildings = vibespatial.read_parquet(fixtures["buildings"])
+    admin = vibespatial.read_file(fixtures["admin_boundary"])
+    mask_geom = admin.geometry.iloc[0]
+
+    source_geoms = np.asarray(buildings.geometry.values, dtype=object)
+    expected_geoms = np.asarray(shapely.intersection(source_geoms, mask_geom), dtype=object)
+    keep = ~shapely.is_empty(expected_geoms)
+    expected_index = buildings.index.to_numpy()[keep]
+    expected_norm = shapely.normalize(expected_geoms[keep])
+
+    with strict_native_environment():
+        result = vibespatial.clip(buildings, admin)
+
+    assert int(result.geometry.isna().sum()) == 0
+    assert result.index.to_numpy().tolist() == expected_index.tolist()
+    assert len(result) == len(expected_norm)
+
+
+@pytest.mark.gpu
+def test_strict_clip_concave_polygon_mask_drops_bbox_false_positives() -> None:
+    _require_gpu_runtime()
+    buildings = vibespatial.GeoDataFrame(
+        {
+            "geometry": [
+                box(0.5, 0.5, 1.5, 1.5),
+                box(2.4, 2.4, 2.8, 2.8),
+                box(1.4, 1.4, 2.2, 2.2),
+            ]
+        },
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+            (0.0, 0.0),
+        ]
+    )
+    admin = vibespatial.GeoDataFrame({"geometry": [mask]}, crs="EPSG:3857")
+
+    with strict_native_environment():
+        result = vibespatial.clip(buildings, admin)
+
+    expected_geoms = np.asarray(
+        shapely.intersection(np.asarray(buildings.geometry.values, dtype=object), mask),
+        dtype=object,
+    )
+    keep = ~shapely.is_empty(expected_geoms)
+    expected_index = buildings.index.to_numpy()[keep]
+    expected_norm = shapely.normalize(expected_geoms[keep])
+
+    assert int(result.geometry.isna().sum()) == 0
+    assert result.index.to_numpy().tolist() == expected_index.tolist()
+    actual = shapely.normalize(np.asarray(result.geometry.values, dtype=object))
+    assert np.asarray(shapely.equals(actual, expected_norm), dtype=bool).tolist() == [True] * len(expected_norm)
 
 
 @pytest.mark.gpu

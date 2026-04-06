@@ -125,6 +125,7 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
 
     The SH kernel has two documented limitations (polygon_intersection.py lines 66-76):
     1. Holes are not handled -- only exterior rings are used.
+    2. The clip polygon (right operand) must be convex.
     2. The per-thread workspace is limited to ``_MAX_CLIP_VERTS`` (64) vertices.
        Clipping a polygon with ``l_n`` vertices against a polygon with ``r_n``
        exterior-ring edges can produce up to ``l_n + r_n`` intermediate vertices.
@@ -142,6 +143,37 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
     from vibespatial.kernels.constructive.polygon_intersection import (
         _MAX_CLIP_VERTS,
     )
+
+    def _is_convex_ring(x: np.ndarray, y: np.ndarray, start: int, end: int) -> bool:
+        """Return True when the closed ring [start:end] is convex.
+
+        The SH kernel clips the left subject polygon against the right clip
+        polygon edge-by-edge. That only holds for convex clip polygons. A
+        concave right-hand exterior ring can silently produce the small
+        central kernel of the polygon instead of the full clipped area.
+        """
+        if end - start < 4:
+            return False
+
+        ring_x = np.asarray(x[start:end], dtype=np.float64)
+        ring_y = np.asarray(y[start:end], dtype=np.float64)
+
+        if ring_x.size >= 2 and ring_x[0] == ring_x[-1] and ring_y[0] == ring_y[-1]:
+            ring_x = ring_x[:-1]
+            ring_y = ring_y[:-1]
+
+        if ring_x.size < 3:
+            return False
+
+        prev_x = np.roll(ring_x, 1)
+        prev_y = np.roll(ring_y, 1)
+        next_x = np.roll(ring_x, -1)
+        next_y = np.roll(ring_y, -1)
+        cross = (ring_x - prev_x) * (next_y - ring_y) - (ring_y - prev_y) * (next_x - ring_x)
+        non_collinear = cross[np.abs(cross) > 1e-12]
+        if non_collinear.size == 0:
+            return False
+        return bool(np.all(non_collinear > 0.0) or np.all(non_collinear < 0.0))
 
     for side_label, side in (("right", right), ("left", left)):
         for family, buf in side.families.items():
@@ -170,12 +202,29 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
                 )
                 return False
 
+            if side_label == "right" and family == GeometryFamily.MULTIPOLYGON:
+                logger.debug(
+                    "SH kernel skip: right clip polygon family is multipolygon",
+                )
+                return False
+
             # Vectorized vertex-count check for exterior rings.
             # first_ring_idx is geom_offsets[:-1] for rows with at least 1 ring.
             has_rings = rings_per_row > 0
             if not np.any(has_rings):
                 continue
             first_ring_idx = geom_offsets[:-1][has_rings]
+
+            if side_label == "right":
+                for ring_idx in first_ring_idx:
+                    start = int(ring_offsets[ring_idx])
+                    end = int(ring_offsets[ring_idx + 1])
+                    if not _is_convex_ring(buf.x, buf.y, start, end):
+                        logger.debug(
+                            "SH kernel skip: right clip polygon exterior ring is concave",
+                        )
+                        return False
+
             ext_verts = ring_offsets[first_ring_idx + 1] - ring_offsets[first_ring_idx]
             max_verts = int(ext_verts.max()) if ext_verts.size > 0 else 0
             if max_verts > _MAX_CLIP_VERTS:
