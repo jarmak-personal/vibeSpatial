@@ -252,6 +252,7 @@ def _batched_overlay_difference_owned(
         diff_owned = binary_constructive_owned(
             "difference", left_sub, right_unions_owned,
             dispatch_mode=_pairwise_mode,
+            _prefer_rowwise_polygon_difference_overlay=True,
         )
         return diff_owned, idx1_unique
 
@@ -309,6 +310,7 @@ def _batched_overlay_difference_owned(
         batch_diff = binary_constructive_owned(
             "difference", left_sub, right_unions,
             dispatch_mode=_pairwise_mode,
+            _prefer_rowwise_polygon_difference_overlay=True,
         )
         del right_unions, left_sub  # free intermediates
 

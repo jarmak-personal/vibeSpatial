@@ -386,6 +386,113 @@ def test_overlay_difference_keeps_split_polygon_result_in_single_row_under_stric
     )
 
 
+def test_overlay_difference_prefers_rowwise_gpu_path_after_grouped_unions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(0, 0), (10, 0), (10, 6), (0, 6), (0, 0)]),
+                Polygon([(12, 0), (22, 0), (22, 6), (12, 6), (12, 0)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"col2": [1, 2, 3, 4]},
+        geometry=GeoSeries(
+            [
+                Polygon([(2, 0), (4, 0), (4, 6), (2, 6), (2, 0)]),
+                Polygon([(6, 0), (8, 0), (8, 6), (6, 6), (6, 0)]),
+                Polygon([(14, 0), (16, 0), (16, 6), (14, 6), (14, 0)]),
+                Polygon([(18, 0), (20, 0), (20, 6), (18, 6), (18, 0)]),
+            ]
+        ),
+    )
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    recorded: list[bool] = []
+    original = constructive_module.binary_constructive_owned
+
+    def _wrapped_binary_constructive_owned(*args, **kwargs):
+        if args and args[0] == "difference":
+            recorded.append(
+                bool(kwargs.get("_prefer_rowwise_polygon_difference_overlay", False))
+            )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        constructive_module,
+        "binary_constructive_owned",
+        _wrapped_binary_constructive_owned,
+    )
+
+    with strict_native_environment():
+        result = overlay(left, right, how="difference")
+
+    assert len(result) == 2
+    assert all(recorded)
+
+
+def test_binary_constructive_difference_skips_mixed_dispatch_for_polygonal_families(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from shapely.geometry import MultiPolygon
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    left = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (6, 0), (6, 4), (0, 4), (0, 0)]),
+            MultiPolygon(
+                [
+                    Polygon([(10, 0), (13, 0), (13, 4), (10, 4), (10, 0)]),
+                    Polygon([(14, 0), (17, 0), (17, 4), (14, 4), (14, 0)]),
+                ]
+            ),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            Polygon([(2, 0), (4, 0), (4, 4), (2, 4), (2, 0)]),
+            Polygon([(11, 1), (16, 1), (16, 3), (11, 3), (11, 1)]),
+        ]
+    )
+
+    mixed_dispatch_called = False
+    original_mixed_dispatch = constructive_module._dispatch_mixed_binary_constructive_gpu
+
+    def _wrapped_mixed_dispatch(*args, **kwargs):
+        nonlocal mixed_dispatch_called
+        mixed_dispatch_called = True
+        return original_mixed_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(
+        constructive_module,
+        "_dispatch_mixed_binary_constructive_gpu",
+        _wrapped_mixed_dispatch,
+    )
+
+    with strict_native_environment():
+        result = constructive_module.binary_constructive_owned(
+            "difference",
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    assert result.row_count == 2
+    assert not mixed_dispatch_called
+
+
 def test_overlay_difference_polygon_line_keeps_noded_polygon_boundary_under_strict_mode() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")

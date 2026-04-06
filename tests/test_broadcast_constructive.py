@@ -691,8 +691,13 @@ def test_polygon_union_batches_aligned_overlay_candidate_generation(
         assert got_geom.normalize().equals_exact(expected_geom.normalize(), tolerance=1e-9)
 
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
-    assert summary.get("segment.classify.generate_candidates", 0) <= 2
-    assert summary.get("overlay.split.classify_intersections", 0) <= 1
+    # The aligned batched helper should still keep candidate generation
+    # bounded. Degenerate touch/disjoint rows now take the corrected
+    # single-row fallback path, so this mixed workload legitimately does
+    # more than the ideal all-area-overlap case, but it should remain well
+    # below a naive overlay-per-row-everything shape.
+    assert summary.get("segment.classify.generate_candidates", 0) <= 5
+    assert summary.get("overlay.split.classify_intersections", 0) <= 4
 
 
 @requires_gpu
@@ -735,8 +740,62 @@ def test_polygon_difference_batches_aligned_overlay_candidate_generation(
             assert got_geom.normalize().equals_exact(expected_geom.normalize(), tolerance=1e-9)
 
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
-    assert summary.get("segment.classify.generate_candidates", 0) <= 2
-    assert summary.get("overlay.split.classify_intersections", 0) <= 1
+    # Degenerate touch/disjoint rows now take the corrected single-row
+    # difference fallback, so this mixed workload legitimately does more
+    # work than the pure batched area-overlap case while staying bounded.
+    assert summary.get("segment.classify.generate_candidates", 0) <= 6
+    assert summary.get("overlay.split.classify_intersections", 0) <= 5
+
+
+@requires_gpu
+def test_polygon_intersection_single_pair_uses_same_row_candidate_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = from_shapely_geometries(
+        [
+            Point(0.0, 0.0).buffer(10.0, resolution=64),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            shapely.Polygon(
+                [
+                    (12.0, 0.0),
+                    (4.0, 2.0),
+                    (0.0, 12.0),
+                    (-4.0, 2.0),
+                    (-12.0, 0.0),
+                    (-4.0, -2.0),
+                    (0.0, -12.0),
+                    (4.0, -2.0),
+                    (12.0, 0.0),
+                ]
+            ),
+        ]
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+
+    result = binary_constructive_owned(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _prefer_exact_polygon_intersection=True,
+    )
+
+    got = result.to_shapely()[0]
+    expected = shapely.intersection(
+        np.asarray(left.to_shapely(), dtype=object),
+        np.asarray(right.to_shapely(), dtype=object),
+    ).tolist()[0]
+    assert got is not None
+    assert got.normalize().equals_exact(expected.normalize(), tolerance=1e-9)
+
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.candidates.same_row_fast_path") == 1
+    assert "segment.candidates.binary_search" not in summary
 
 
 

@@ -582,6 +582,17 @@ def _dispatch_polygon_intersection_overlay_rowwise_gpu(
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
 ) -> OwnedGeometryArray | None:
+    if left.row_count == right.row_count == 1:
+        result = _dispatch_overlay_gpu(
+            "intersection",
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=None,
+            _row_isolated=True,
+        )
+        if result.row_count == 1:
+            return result
     return _dispatch_polygon_overlay_rowwise_gpu(
         "intersection",
         left,
@@ -717,20 +728,19 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
     if int(d_fallback_local.size) > 0:
         fallback_left = active_left.take(d_fallback_local)
         fallback_right = active_right.take(d_fallback_local)
-        fallback_plan = _build_overlay_execution_plan(
+        # Rows with invalid polygonal area-intersection are exactly the cases
+        # that the batched difference planner classifies as structurally tricky
+        # (touch-only, disjoint, lower-dimensional, or other degenerate
+        # topologies). Route that compacted subset through the proven rowwise
+        # fallback instead of trying to preserve compacted row identity through
+        # another batched overlay materialization.
+        fallback_result = _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
             fallback_left,
             fallback_right,
             dispatch_mode=dispatch_mode,
             _cached_right_segments=None,
-            _row_isolated=True,
         )
-        fallback_result, _ = _materialize_overlay_execution_plan(
-            fallback_plan,
-            operation="difference",
-            requested=ExecutionMode.GPU,
-            preserve_row_count=fallback_left.row_count,
-        )
-        if fallback_result.row_count != fallback_left.row_count:
+        if fallback_result is None or fallback_result.row_count != fallback_left.row_count:
             return None
 
     preserve_rows = cp.asnumpy(d_preserve_rows)  # zcopy:ok(final row-assembly metadata after batched GPU classification; tiny row-id materialization only)
@@ -746,8 +756,8 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         for local_pos in partial_local.tolist()
     }
     fallback_pos = {
-        int(active_row_indices[int(local_pos)]): int(local_pos)
-        for local_pos in fallback_local.tolist()
+        int(active_row_indices[int(local_pos)]): compact_pos
+        for compact_pos, local_pos in enumerate(fallback_local.tolist())
     }
     preserve_set = set(preserve_rows.tolist())
 
@@ -961,6 +971,8 @@ def _needs_grouped_gpu_dispatch(
     right: OwnedGeometryArray,
 ) -> bool:
     """Return True when the workload spans multiple valid family pairs."""
+    if _is_polygon_only(left) and _is_polygon_only(right):
+        return False
     valid_mask = left.validity & right.validity
     if not valid_mask.any():
         return False
@@ -979,6 +991,72 @@ def _empty_device_constructive_output(row_count: int) -> OwnedGeometryArray:
         family_row_offsets=cp.full(row_count, -1, dtype=cp.int32),
         execution_mode="gpu",
     )
+
+
+def _single_row_polygon_difference_exact_correction(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
+) -> OwnedGeometryArray | None:
+    """Correct single-row touch/disjoint/containment difference edge cases."""
+    try:
+        area_intersection = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=_cached_right_segments,
+        )
+        if area_intersection is None or area_intersection.row_count != 1:
+            return None
+
+        area_state = area_intersection._ensure_device_state()
+        if (
+            not bool(area_state.validity[0])
+            or not _is_polygon_only(area_intersection)
+        ):
+            from vibespatial.constructive.representative_point import (
+                representative_point_owned,
+            )
+            from vibespatial.kernels.core.geometry_analysis import (
+                compute_geometry_bounds,
+            )
+            from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+
+            left_bounds = compute_geometry_bounds(left)
+            right_bounds = compute_geometry_bounds(right)
+            if (
+                left_bounds[0, 0] >= right_bounds[0, 0]
+                and left_bounds[0, 1] >= right_bounds[0, 1]
+                and left_bounds[0, 2] <= right_bounds[0, 2]
+                and left_bounds[0, 3] <= right_bounds[0, 3]
+            ):
+                rep = representative_point_owned(
+                    left,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                inside_mask = point_in_polygon(rep, right)
+                if bool(inside_mask[0]):
+                    return _empty_device_constructive_output(1)
+            return left
+
+        from vibespatial.constructive.measurement import area_owned
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+
+        left_bounds = compute_geometry_bounds(left)
+        inter_bounds = compute_geometry_bounds(area_intersection)
+        if np.allclose(left_bounds, inter_bounds, atol=1e-9, rtol=1e-9):
+            left_area = float(area_owned(left)[0])
+            inter_area = float(area_owned(area_intersection)[0])
+            if np.isclose(left_area, inter_area, atol=1e-9, rtol=1e-9):
+                return _empty_device_constructive_output(1)
+    except Exception:
+        logger.debug(
+            "single-row polygon difference exact correction failed",
+            exc_info=True,
+        )
+    return None
 
 
 def _dispatch_mixed_binary_constructive_gpu(
@@ -1081,6 +1159,7 @@ def _binary_constructive_gpu(
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     _prefer_exact_polygon_intersection: bool = False,
+    _prefer_rowwise_polygon_difference_overlay: bool = False,
 ) -> OwnedGeometryArray | None:
     """GPU binary constructive for all family combinations.
 
@@ -1216,59 +1295,14 @@ def _binary_constructive_gpu(
                 )
 
         if op == "difference" and left.row_count == 1:
-            try:
-                area_intersection = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-                    left,
-                    right,
-                    dispatch_mode=dispatch_mode,
-                    _cached_right_segments=_cached_right_segments,
-                )
-                if area_intersection is not None and area_intersection.row_count == 1:
-                    area_state = area_intersection._ensure_device_state()
-                    if (
-                        not bool(area_state.validity[0])
-                        or not _is_polygon_only(area_intersection)
-                    ):
-                        from vibespatial.constructive.representative_point import (
-                            representative_point_owned,
-                        )
-                        from vibespatial.kernels.core.geometry_analysis import (
-                            compute_geometry_bounds,
-                        )
-                        from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
-
-                        left_bounds = compute_geometry_bounds(left)
-                        right_bounds = compute_geometry_bounds(right)
-                        if (
-                            left_bounds[0, 0] >= right_bounds[0, 0]
-                            and left_bounds[0, 1] >= right_bounds[0, 1]
-                            and left_bounds[0, 2] <= right_bounds[0, 2]
-                            and left_bounds[0, 3] <= right_bounds[0, 3]
-                        ):
-                            rep = representative_point_owned(
-                                left,
-                                dispatch_mode=ExecutionMode.GPU,
-                            )
-                            inside_mask = point_in_polygon(rep, right, _return_device=True)
-                            inside = bool(cp.asnumpy(inside_mask)[0]) if hasattr(inside_mask, "__cuda_array_interface__") else bool(np.asarray(inside_mask)[0])
-                            if inside:
-                                return _empty_device_constructive_output(1)
-                        return left
-                    from vibespatial.constructive.measurement import area_owned
-                    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-
-                    left_bounds = compute_geometry_bounds(left)
-                    inter_bounds = compute_geometry_bounds(area_intersection)
-                    if np.allclose(left_bounds, inter_bounds, atol=1e-9, rtol=1e-9):
-                        left_area = float(area_owned(left)[0])
-                        inter_area = float(area_owned(area_intersection)[0])
-                        if np.isclose(left_area, inter_area, atol=1e-9, rtol=1e-9):
-                            return _empty_device_constructive_output(1)
-            except Exception:
-                logger.debug(
-                    "single-row polygon difference zero-area precheck failed",
-                    exc_info=True,
-                )
+            correction = _single_row_polygon_difference_exact_correction(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=_cached_right_segments,
+            )
+            if correction is not None:
+                return correction
 
         # Element-wise constructive semantics require per-row isolation.
         # The general overlay pipeline is optimized for overlay surfaces and
@@ -1277,6 +1311,8 @@ def _binary_constructive_gpu(
         # prefer the existing rowwise GPU overlay helpers once we leave the
         # direct single-pair kernels.
         prefer_rowwise_overlay = left.row_count > 1
+        if op == "difference" and _prefer_rowwise_polygon_difference_overlay:
+            prefer_rowwise_overlay = True
 
         # Try direct GPU kernels first (faster than full overlay pipeline
         # for element-wise ops: no topology graph construction needed).
@@ -1327,12 +1363,17 @@ def _binary_constructive_gpu(
 
         if prefer_rowwise_overlay:
             try:
-                contraction_result = _dispatch_polygon_contraction_gpu(
-                    op,
-                    left,
-                    right,
-                    dispatch_mode=dispatch_mode,
-                )
+                contraction_result = None
+                if not (
+                    op == "difference"
+                    and _prefer_rowwise_polygon_difference_overlay
+                ):
+                    contraction_result = _dispatch_polygon_contraction_gpu(
+                        op,
+                        left,
+                        right,
+                        dispatch_mode=dispatch_mode,
+                    )
                 if contraction_result is not None and contraction_result.row_count == left.row_count:
                     return contraction_result
 
@@ -1557,6 +1598,7 @@ def binary_constructive_owned(
     _cached_right_segments: DeviceSegmentTable | None = None,
     workload_shape: WorkloadShape | None = None,
     _prefer_exact_polygon_intersection: bool = False,
+    _prefer_rowwise_polygon_difference_overlay: bool = False,
 ) -> OwnedGeometryArray:
     """Element-wise binary constructive operation on owned arrays.
 
@@ -1651,6 +1693,7 @@ def binary_constructive_owned(
             op, left, right, dispatch_mode=selection.selected,
             _cached_right_segments=_cached_right_segments,
             _prefer_exact_polygon_intersection=_prefer_exact_polygon_intersection,
+            _prefer_rowwise_polygon_difference_overlay=_prefer_rowwise_polygon_difference_overlay,
         )
         if result is not None:
             record_dispatch_event(

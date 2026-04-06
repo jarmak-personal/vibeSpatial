@@ -37,7 +37,10 @@ def test_debug_overlay_single_pair_gpu_vs_host_assembly() -> None:
 
     gpu_geom = gpu_result.to_shapely()[0]
     host_geom = host_result.to_shapely()[0]
-    assert False, (
+    gpu_norm = gpu_geom.normalize()
+    host_norm = host_geom.normalize()
+    assert gpu_geom.is_valid == host_geom.is_valid
+    assert gpu_norm.equals_exact(host_norm, 1e-9), (
         f"gpu_valid={gpu_geom.is_valid} gpu_area={gpu_geom.area} "
         f"host_valid={host_geom.is_valid} host_area={host_geom.area}"
     )

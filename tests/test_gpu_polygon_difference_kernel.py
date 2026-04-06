@@ -243,6 +243,19 @@ class TestPolygonDifferenceGPU:
         _assert_geometries_equivalent(result, expected)
 
     @requires_gpu
+    def test_touch_only_gpu_preserves_left(self) -> None:
+        """GPU: touch-only boxes leave left unchanged."""
+        left_geoms = [box(10, 0, 14, 4)]
+        right_geoms = [box(14, 0, 18, 4)]
+        left = from_shapely_geometries(left_geoms)
+        right = from_shapely_geometries(right_geoms)
+
+        result = polygon_difference(left, right, dispatch_mode=ExecutionMode.GPU)
+        expected = _shapely_difference(left_geoms, right_geoms)
+
+        _assert_geometries_equivalent(result, expected)
+
+    @requires_gpu
     def test_full_containment_produces_empty_gpu(self) -> None:
         """GPU: left fully inside right produces empty geometry."""
         left_geoms = [box(1, 1, 2, 2)]
