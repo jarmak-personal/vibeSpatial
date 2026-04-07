@@ -332,3 +332,31 @@ def test_explicit_modes_ignore_workload_shape() -> None:
         workload_shape=WorkloadShape.BROADCAST_RIGHT,
     )
     assert decision is DispatchDecision.GPU
+
+
+def test_auto_device_residency_pins_dispatch_to_gpu_below_threshold() -> None:
+    plan = plan_dispatch_selection(
+        kernel_name="geometry_area",
+        kernel_class=KernelClass.METRIC,
+        row_count=1,
+        requested_mode=ExecutionMode.AUTO,
+        gpu_available=True,
+        current_residency=Residency.DEVICE,
+    )
+
+    assert plan.selected is ExecutionMode.GPU
+    assert plan.dispatch_decision is DispatchDecision.GPU
+    assert plan.reason == "GPU runtime available; staying on device-resident buffers"
+
+
+def test_explicit_cpu_still_overrides_device_residency() -> None:
+    plan = plan_dispatch_selection(
+        kernel_name="geometry_area",
+        kernel_class=KernelClass.METRIC,
+        row_count=1,
+        requested_mode=ExecutionMode.CPU,
+        gpu_available=True,
+        current_residency=Residency.DEVICE,
+    )
+
+    assert plan.selected is ExecutionMode.CPU

@@ -57,7 +57,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-from vibespatial.runtime.residency import Residency, TransferTrigger
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
 logger = logging.getLogger(__name__)
 
@@ -460,6 +460,7 @@ def shared_paths_owned(
         row_count=n,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(left, right),
     )
 
     precision_plan = selection.precision_plan

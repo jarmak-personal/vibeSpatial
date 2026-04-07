@@ -26,6 +26,7 @@ from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.residency import combined_residency
 
 
 class MakeValidPrimitive(StrEnum):
@@ -156,6 +157,7 @@ def _gpu_polygon_validity_mask(owned) -> np.ndarray | None:
         row_count=owned.row_count,
         requested_mode=ExecutionMode.GPU,
         requested_precision=PrecisionMode.AUTO,
+        current_residency=combined_residency(owned),
     )
     precision_plan = selection.precision_plan
     compute_type = "float" if precision_plan.compute_precision is PrecisionMode.FP32 else "double"
@@ -586,6 +588,7 @@ def make_valid_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(owned),
     )
 
     # Defer Shapely materialization: when owned is provided, we may not need

@@ -5,7 +5,7 @@ Scope: Device residency defaults, transfer visibility rules, and zero-copy inter
 Read If: You are designing buffer movement, interop adapters, or host/device materialization behavior.
 STOP IF: Your task already has a settled residency contract and only needs implementation detail.
 Source Of Truth: Phase-1 residency and transfer policy before owned geometry buffers land.
-Body Budget: 91/240 lines
+Body Budget: 96/240 lines
 Document: docs/architecture/residency.md
 
 Section Map (Body Lines)
@@ -17,11 +17,11 @@ Section Map (Body Lines)
 | 19-25 | Open First |
 | 26-30 | Verify |
 | 31-36 | Risks |
-| 37-55 | Canonical Rule |
-| 56-61 | Transfer Rules |
-| 62-68 | Zero-Copy Rule |
-| 69-79 | Pipeline Rule |
-| 80-91 | Diagnostics Surface |
+| 37-58 | Canonical Rule |
+| 59-64 | Transfer Rules |
+| 65-71 | Zero-Copy Rule |
+| 72-84 | Pipeline Rule |
+| 85-96 | Diagnostics Surface |
 DOC_HEADER:END -->
 
 Owned geometry buffers are lazy-resident and move only at explicit boundaries.
@@ -62,6 +62,9 @@ allowed, and how zero-copy interop should behave before owned buffers land.
 
 - Geometry and attribute buffers are lazy-resident.
 - After first use on device, owned buffers are device-resident by default.
+- In `auto` mode, device-resident workloads stay on device; crossover planning
+  may still choose among GPU variants, but it should not demote back to CPU
+  based on row-count heuristics alone.
 - Buffers stay where they were created until a user-visible API or explicit
   runtime request needs a move.
 - Device-first owned outputs may keep lightweight host metadata
@@ -94,6 +97,8 @@ Host materialization boundaries are explicit:
 
 - A device-resident pipeline should incur zero non-user transfers once buffers
   have reached device residency.
+- Device-resident pipelines should treat `auto` as GPU-sticky until an explicit
+  host materialization or visible fallback boundary occurs.
 - Constructive chains such as point clip followed by point buffer should keep
   coordinate payloads on device through intermediate owned outputs.
 - Re-entering point-only `clip_by_rect` from a device-backed owned array should

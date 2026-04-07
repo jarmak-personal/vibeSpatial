@@ -42,6 +42,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import combined_residency
 
 from .measurement import _coord_stats_from_owned
 from .polygon import (
@@ -667,6 +668,7 @@ def centroid_owned(
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(owned),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -686,6 +688,7 @@ def centroid_owned(
             requested_precision=precision,
             precision_kernel_class=KernelClass.CONSTRUCTIVE,
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+            current_residency=combined_residency(owned),
         )
         precision_plan = selection.precision_plan
         result = _centroid_gpu(owned, precision_plan=precision_plan)

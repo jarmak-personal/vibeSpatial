@@ -33,6 +33,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import combined_residency
 
 if TYPE_CHECKING:
     from vibespatial.runtime.precision import PrecisionMode, PrecisionPlan
@@ -802,6 +803,7 @@ def area_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+        current_residency=combined_residency(owned),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -867,6 +869,7 @@ def length_owned(
         requested_mode=dispatch_mode,
         requested_precision=precision,
         coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+        current_residency=combined_residency(owned),
     )
 
     if selection.selected is ExecutionMode.GPU:

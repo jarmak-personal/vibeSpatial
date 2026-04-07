@@ -58,6 +58,7 @@ from vibespatial.runtime.precision import (
     PrecisionMode,
     PrecisionPlan,
 )
+from vibespatial.runtime.residency import combined_residency
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
 
 from .point import (
@@ -1914,6 +1915,7 @@ def clip_by_rect_owned(
         row_count=_row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(values),
     )
     has_polygon_families = False
     has_line_families = False

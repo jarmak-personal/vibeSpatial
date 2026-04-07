@@ -67,7 +67,7 @@ from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
 )
-from vibespatial.runtime.residency import Residency, TransferTrigger
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
 logger = logging.getLogger(__name__)
 
@@ -1669,6 +1669,7 @@ def binary_constructive_owned(
         requested_mode=effective_mode,
         requested_precision=precision,
         workload_shape=workload,
+        current_residency=combined_residency(left, right),
     )
     selection_reason = selection.reason
     if strict_gpu_promotion:

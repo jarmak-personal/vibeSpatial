@@ -20,6 +20,25 @@ def normalize_residency(value: Residency | str) -> Residency:
     return value if isinstance(value, Residency) else Residency(value)
 
 
+def combined_residency(*values: object) -> Residency:
+    """Return DEVICE when any provided value is device-resident, else HOST.
+
+    Accepts explicit ``Residency`` values, strings, or arbitrary objects with a
+    ``residency`` attribute. This lets dispatch wrappers preserve device
+    stickiness without special-casing every owned-array type.
+    """
+    for value in values:
+        if value is None:
+            continue
+        residency = getattr(value, "residency", value)
+        try:
+            if normalize_residency(residency) is Residency.DEVICE:
+                return Residency.DEVICE
+        except Exception:
+            continue
+    return Residency.HOST
+
+
 @dataclass(frozen=True)
 class ResidencyPlan:
     current: Residency

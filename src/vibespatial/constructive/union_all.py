@@ -59,7 +59,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-from vibespatial.runtime.residency import Residency
+from vibespatial.runtime.residency import Residency, combined_residency
 
 if TYPE_CHECKING:
     from vibespatial.geometry.owned import OwnedGeometryDeviceState
@@ -125,6 +125,7 @@ def disjoint_subset_union_all_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(owned),
     )
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
@@ -903,6 +904,7 @@ def union_all_gpu_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(owned),
     )
 
     precision_plan = selection.precision_plan
@@ -1019,6 +1021,7 @@ def coverage_union_all_gpu_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(owned),
     )
 
     precision_plan = selection.precision_plan
@@ -1131,6 +1134,7 @@ def intersection_all_gpu_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(owned),
     )
 
     precision_plan = selection.precision_plan

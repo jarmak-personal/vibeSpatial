@@ -33,7 +33,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass
-from vibespatial.runtime.residency import Residency, TransferTrigger
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
 request_nvrtc_warmup([
     ("linestring-buffer", _LINESTRING_BUFFER_KERNEL_SOURCE, _LINESTRING_BUFFER_KERNEL_NAMES),
@@ -86,6 +86,7 @@ def linestring_buffer_owned_array(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=lines.row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(lines),
     ).selected
 
     cap_int = _CAP_STYLE_MAP.get(cap_style, 0)

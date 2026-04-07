@@ -30,7 +30,11 @@ from vibespatial.geometry.owned import (  # noqa: E402
 from vibespatial.runtime import ExecutionMode  # noqa: E402
 from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
-from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
+from vibespatial.runtime.residency import (  # noqa: E402
+    Residency,
+    TransferTrigger,
+    combined_residency,
+)
 
 request_nvrtc_warmup([
     ("point-constructive", _POINT_CONSTRUCTIVE_KERNEL_SOURCE, _POINT_CONSTRUCTIVE_KERNEL_NAMES),
@@ -345,6 +349,7 @@ def clip_points_rect_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=points.row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(points),
     ).selected
     point_buffer = points.families[GeometryFamily.POINT]
     if point_buffer.row_count == 0:
@@ -514,6 +519,7 @@ def point_buffer_owned_array(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=points.row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(points),
     ).selected
     if selected_mode is not ExecutionMode.GPU:
         return _build_point_buffers_cpu(points, radii, quad_segs=quad_segs)

@@ -271,6 +271,13 @@ def plan_adaptive_execution(
         gpu_available=snapshot.gpu_available,
         workload_shape=workload.workload_shape,
     )
+    sticky_device_auto = (
+        initial_runtime.requested is ExecutionMode.AUTO
+        and workload.current_residency is Residency.DEVICE
+        and snapshot.gpu_available
+    )
+    if sticky_device_auto:
+        dispatch_decision = DispatchDecision.GPU
     effective_threshold = crossover_policy.auto_min_rows
     if workload.workload_shape in (WorkloadShape.BROADCAST_RIGHT, WorkloadShape.SCALAR_RIGHT):
         effective_threshold = (
@@ -279,7 +286,13 @@ def plan_adaptive_execution(
             else crossover_policy.auto_min_rows // 10
         )
 
-    if initial_runtime.requested is ExecutionMode.AUTO and dispatch_decision is DispatchDecision.CPU:
+    if sticky_device_auto:
+        runtime_selection = RuntimeSelection(
+            requested=initial_runtime.requested,
+            selected=ExecutionMode.GPU,
+            reason="GPU runtime available; staying on device-resident buffers",
+        )
+    elif initial_runtime.requested is ExecutionMode.AUTO and dispatch_decision is DispatchDecision.CPU:
         runtime_selection = RuntimeSelection(
             requested=initial_runtime.requested,
             selected=ExecutionMode.CPU,
@@ -315,6 +328,8 @@ def plan_adaptive_execution(
         crossover_policy.reason,
         f"precision: {precision_plan.reason}",
     ]
+    if sticky_device_auto:
+        diagnostics.append("residency: auto dispatch pinned to GPU for device-resident workload")
     if variant is None:
         diagnostics.append("variant: no compatible specialized variant registered")
     else:

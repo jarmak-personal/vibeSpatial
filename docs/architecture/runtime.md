@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 166/200 lines
+Body Budget: 169/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -17,13 +17,13 @@ Section Map (Body Lines)
 | 21-27 | Open First |
 | 28-31 | Verify |
 | 32-37 | Risks |
-| 38-65 | Core Rules |
-| 66-75 | Fallback |
-| 76-89 | Session Execution Mode Override |
-| 90-104 | Provenance Rewrite Override |
-| 105-132 | Index-Array Boundary Model (ADR-0036) |
-| 133-160 | Memory Pool Tiers (ADR-0040) |
-| 161-166 | Compatibility |
+| 38-68 | Core Rules |
+| 69-78 | Fallback |
+| 79-92 | Session Execution Mode Override |
+| 93-107 | Provenance Rewrite Override |
+| 108-135 | Index-Array Boundary Model (ADR-0036) |
+| 136-163 | Memory Pool Tiers (ADR-0040) |
+| 164-169 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -78,6 +78,9 @@ files to inspect when execution behavior changes.
   just a precision mode.
 - Deterministic reproducibility is opt-in; default mode stays performance-first.
 - `auto` dispatch must use per-kernel crossover thresholds, not one global size gate.
+- `auto` crossover thresholds apply at promotion time while inputs are host-resident;
+  once a workload is already device-resident, `auto` stays on GPU and only
+  re-plans among GPU variants.
 - Generic runtime probing must not claim GPU execution for `auto` by itself; the
   actual switch to GPU happens only inside kernel-specific dispatch planning.
 - Adaptive planning may re-evaluate at chunk boundaries, but not mid-kernel.

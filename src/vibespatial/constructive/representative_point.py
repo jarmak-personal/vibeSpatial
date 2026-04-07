@@ -30,7 +30,10 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
 )
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import combined_residency
 
 from .point import point_owned_from_xy
 
@@ -177,9 +180,6 @@ def representative_point_owned(
     When the GPU path is active, the output OGA is device-resident — no
     D2H transfer occurs for the coordinate data.
     """
-    from vibespatial.runtime.adaptive import plan_dispatch_selection
-    from vibespatial.runtime.precision import KernelClass
-
     row_count = owned.row_count
     if row_count == 0:
         return point_owned_from_xy(
@@ -192,6 +192,7 @@ def representative_point_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(owned),
     )
     use_gpu = selection.selected is ExecutionMode.GPU
 

@@ -31,7 +31,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-from vibespatial.runtime.residency import Residency, TransferTrigger
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
 # ---------------------------------------------------------------------------
 # Point-distance family support (mirrors point_distance._FAMILY_KERNEL_MAP)
@@ -93,6 +93,7 @@ def distance_owned(
         kernel_class=KernelClass.METRIC,
         row_count=n,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(left, right),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -167,6 +168,7 @@ def evaluate_geopandas_dwithin(
         row_count=n,
         requested_mode=ExecutionMode.AUTO,
         requested_precision=PrecisionMode.AUTO,
+        current_residency=combined_residency(left, right),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None

@@ -89,6 +89,18 @@ def test_point_buffer_owned_array_gpu_matches_cpu_diamonds() -> None:
     assert gpu.families[next(iter(gpu.families))].host_materialized is True
 
 
+@pytest.mark.gpu
+def test_point_buffer_auto_sticks_to_device_residency_below_threshold() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    points = from_shapely_geometries([Point(0, 0)], residency=Residency.DEVICE)
+
+    buffered = point_buffer_owned_array(points, 1.0, quad_segs=1, dispatch_mode=ExecutionMode.AUTO)
+
+    assert buffered.residency is Residency.DEVICE
+
+
 def test_point_buffer_owned_array_cpu_quad16_matches_shapely() -> None:
     points = from_shapely_geometries([Point(0, 0), Point(2, 3), Point(-1, 4)])
     radii = np.asarray([1.0, 2.0, 0.5])
