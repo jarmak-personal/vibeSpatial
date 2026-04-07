@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -91,6 +93,41 @@ def test_sort_pairs_merge_route_supports_descending() -> None:
     assert result.strategy is PairSortStrategy.MERGE
     np.testing.assert_array_equal(result.keys.get(), np.asarray([4, 3, 1, 1], dtype=np.int32))
     np.testing.assert_array_equal(result.values.get(), np.asarray([40, 30, 10, 11], dtype=np.int32))
+
+
+def test_sort_pairs_uses_precompiled_radix_fast_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    cp = _cupy()
+    keys = cp.asarray([4, 1, 3, 1], dtype=cp.int32)
+    values = cp.asarray([40, 10, 30, 11], dtype=cp.int32)
+
+    def _make_callable(temp, in_keys, out_keys, in_values, out_values, item_count):
+        if temp is None:  # pragma: no cover - exercised by _ensure_temp query path
+            return 1
+        idx = cp.argsort(in_keys[:item_count])
+        out_keys[:item_count] = in_keys[idx]
+        out_values[:item_count] = in_values[idx]
+
+    precompiled = SimpleNamespace(
+        make_callable=_make_callable,
+        temp_storage=cp.empty(1, dtype=cp.uint8),
+        temp_storage_bytes=1,
+        high_water_n=128,
+    )
+
+    from vibespatial.cuda import cccl_primitives as primitives_module
+
+    monkeypatch.setattr(primitives_module, "_get_precompiled", lambda name: precompiled)
+    monkeypatch.setattr(
+        primitives_module.algorithms,
+        "radix_sort",
+        lambda *args, **kwargs: pytest.fail("one-shot radix_sort should not be used"),
+    )
+
+    result = sort_pairs(keys, values, strategy=PairSortStrategy.RADIX)
+
+    assert result.strategy is PairSortStrategy.RADIX
+    np.testing.assert_array_equal(result.keys.get(), np.asarray([1, 1, 3, 4], dtype=np.int32))
+    np.testing.assert_array_equal(result.values.get(), np.asarray([10, 11, 30, 40], dtype=np.int32))
 
 
 def test_unique_sorted_pairs_dedupes_runs_and_keeps_first_value() -> None:

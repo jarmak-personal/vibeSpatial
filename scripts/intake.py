@@ -68,25 +68,26 @@ def _score_file(
     file_entry: dict[str, Any],
     doc_scores: dict[str, int],
 ) -> dict[str, Any]:
-    score = 0
+    direct_score = 0
     matches: set[str] = set()
 
     delta, delta_matches = _score_signal(request_text, request_tokens, file_entry["path"], 3)
-    score += delta
+    direct_score += delta
     matches.update(delta_matches)
 
     token_overlap = request_tokens & set(file_entry["tokens"])
     if token_overlap:
-        score += len(token_overlap) * 2
+        direct_score += len(token_overlap) * 2
         matches.update(token_overlap)
 
     doc_boost = sum(doc_scores.get(path, 0) for path in file_entry["referenced_by"])
-    score += doc_boost * 2
+    score = direct_score + (doc_boost * 2)
 
     return {
         "path": file_entry["path"],
         "kind": file_entry["kind"],
         "score": score,
+        "direct_score": direct_score,
         "matches": sorted(matches),
         "referenced_by": file_entry["referenced_by"],
     }
@@ -98,6 +99,9 @@ def _confidence(top_score: int) -> str:
     if top_score >= 8:
         return "medium"
     return "low"
+
+
+MAX_EXPLICIT_FILE_SEEDS = 4
 
 
 def plan_request(request: str) -> dict[str, Any]:
@@ -152,7 +156,21 @@ def plan_request(request: str) -> dict[str, Any]:
 
     seen_paths: set[str] = set()
     selected_files: list[dict[str, Any]] = []
-    ordered_paths = explicit_file_paths + [entry["path"] for entry in file_scores]
+    direct_match_paths = [
+        entry["path"]
+        for entry in sorted(
+            (entry for entry in file_scores if entry["matches"]),
+            key=lambda item: (-item["direct_score"], -item["score"], item["path"]),
+        )
+    ]
+    explicit_seed_paths = explicit_file_paths[:MAX_EXPLICIT_FILE_SEEDS]
+    remaining_explicit_paths = explicit_file_paths[MAX_EXPLICIT_FILE_SEEDS:]
+    ordered_paths = (
+        explicit_seed_paths
+        + direct_match_paths
+        + remaining_explicit_paths
+        + [entry["path"] for entry in file_scores]
+    )
     for path in ordered_paths:
         if path in selected_doc_scores:
             continue

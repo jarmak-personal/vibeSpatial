@@ -640,10 +640,44 @@ def sort_pairs(
             if descending
             else cccl_algorithms.SortOrder.ASCENDING
         )
-        cccl_algorithms.radix_sort(keys, out_keys, values, out_values, order, item_count)
+        precompiled = None
+        if not descending and values is not None:
+            precompiled = _get_precompiled(
+                f"radix_sort_{_dtype_suffix(keys.dtype)}_{_dtype_suffix(values.dtype)}",
+            )
+        if precompiled is not None:
+            temp = _ensure_temp(
+                precompiled,
+                item_count,
+                lambda: precompiled.make_callable(
+                    None, keys, out_keys, values, out_values, item_count,
+                ),
+            )
+            precompiled.make_callable(
+                temp, keys, out_keys, values, out_values, item_count,
+            )
+        else:
+            cccl_algorithms.radix_sort(keys, out_keys, values, out_values, order, item_count)
     else:
         comparison = _greater_than if descending else _less_than
-        cccl_algorithms.merge_sort(keys, values, out_keys, out_values, comparison, item_count)
+        precompiled = None
+        if not descending and values is not None:
+            precompiled = _get_precompiled(
+                f"merge_sort_{_dtype_suffix(keys.dtype)}_{_dtype_suffix(values.dtype)}",
+            )
+        if precompiled is not None:
+            temp = _ensure_temp(
+                precompiled,
+                item_count,
+                lambda: precompiled.make_callable(
+                    None, keys, values, out_keys, out_values, comparison, item_count,
+                ),
+            )
+            precompiled.make_callable(
+                temp, keys, values, out_keys, out_values, comparison, item_count,
+            )
+        else:
+            cccl_algorithms.merge_sort(keys, values, out_keys, out_values, comparison, item_count)
     if synchronize:
         cp_module.cuda.Stream.null.synchronize()
     return PairSortResult(keys=out_keys, values=out_values, strategy=resolved)

@@ -25,6 +25,7 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.config import SPATIAL_EPSILON
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 from vibespatial.spatial.segment_primitives import SegmentIntersectionResult
 
 from .types import (
@@ -39,6 +40,11 @@ try:
     import cupy as cp
 except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
     cp = None
+
+
+def _sync_hotpath(runtime) -> None:
+    if hotpath_trace_enabled():
+        runtime.synchronize()
 
 
 def _gpu_label_face_coverage(
@@ -70,46 +76,51 @@ def _gpu_label_face_coverage(
         kernels["label_face_coverage_polygon"], face_count,
     )
 
-    for side_input, out_covered in [(left, left_covered), (right, right_covered)]:
-        device_state = side_input._ensure_device_state()
+    for side_name, side_input, out_covered in [
+        ("left", left, left_covered),
+        ("right", right, right_covered),
+    ]:
+        with hotpath_stage(f"overlay.faces.coverage.{side_name}.prepare", category="setup"):
+            device_state = side_input._ensure_device_state()
 
-        has_poly = GeometryFamily.POLYGON in device_state.families
-        has_mpoly = GeometryFamily.MULTIPOLYGON in device_state.families
+            has_poly = GeometryFamily.POLYGON in device_state.families
+            has_mpoly = GeometryFamily.MULTIPOLYGON in device_state.families
 
-        poly_count = 0
-        mp_count = 0
-        poly_buf = None
-        mp_buf = None
+            poly_count = 0
+            mp_count = 0
+            poly_buf = None
+            mp_buf = None
 
-        if has_poly:
-            poly_buf = device_state.families[GeometryFamily.POLYGON]
-            poly_count = side_input.families[GeometryFamily.POLYGON].row_count
-        if has_mpoly:
-            mp_buf = device_state.families[GeometryFamily.MULTIPOLYGON]
-            mp_count = side_input.families[GeometryFamily.MULTIPOLYGON].row_count
+            if has_poly:
+                poly_buf = device_state.families[GeometryFamily.POLYGON]
+                poly_count = side_input.families[GeometryFamily.POLYGON].row_count
+            if has_mpoly:
+                mp_buf = device_state.families[GeometryFamily.MULTIPOLYGON]
+                mp_count = side_input.families[GeometryFamily.MULTIPOLYGON].row_count
 
-        launch_poly = has_poly and poly_count > 0
-        launch_mpoly = (has_mpoly and mp_count > 0
-                        and mp_buf is not None and mp_buf.part_offsets is not None)
+            launch_poly = has_poly and poly_count > 0
+            launch_mpoly = (has_mpoly and mp_count > 0
+                            and mp_buf is not None and mp_buf.part_offsets is not None)
 
-        d_poly_source_rows = None
-        d_mp_source_rows = None
-        if face_source_rows is not None:
-            d_tags = cp.asarray(device_state.tags)
-            d_validity = cp.asarray(device_state.validity)
-            d_family_rows = cp.asarray(device_state.family_row_offsets)
-            if launch_poly:
-                d_poly_source_rows = cp.full(poly_count, -1, dtype=cp.int32)
-                d_poly_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
-                d_poly_slots = d_family_rows[d_poly_mask].astype(cp.int32, copy=False)
-                d_poly_rows = cp.flatnonzero(d_poly_mask).astype(cp.int32, copy=False)
-                d_poly_source_rows[d_poly_slots] = d_poly_rows
-            if launch_mpoly:
-                d_mp_source_rows = cp.full(mp_count, -1, dtype=cp.int32)
-                d_mp_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
-                d_mp_slots = d_family_rows[d_mp_mask].astype(cp.int32, copy=False)
-                d_mp_rows = cp.flatnonzero(d_mp_mask).astype(cp.int32, copy=False)
-                d_mp_source_rows[d_mp_slots] = d_mp_rows
+            d_poly_source_rows = None
+            d_mp_source_rows = None
+            if face_source_rows is not None:
+                d_tags = cp.asarray(device_state.tags)
+                d_validity = cp.asarray(device_state.validity)
+                d_family_rows = cp.asarray(device_state.family_row_offsets)
+                if launch_poly:
+                    d_poly_source_rows = cp.full(poly_count, -1, dtype=cp.int32)
+                    d_poly_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+                    d_poly_slots = d_family_rows[d_poly_mask].astype(cp.int32, copy=False)
+                    d_poly_rows = cp.flatnonzero(d_poly_mask).astype(cp.int32, copy=False)
+                    d_poly_source_rows[d_poly_slots] = d_poly_rows
+                if launch_mpoly:
+                    d_mp_source_rows = cp.full(mp_count, -1, dtype=cp.int32)
+                    d_mp_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+                    d_mp_slots = d_family_rows[d_mp_mask].astype(cp.int32, copy=False)
+                    d_mp_rows = cp.flatnonzero(d_mp_mask).astype(cp.int32, copy=False)
+                    d_mp_source_rows[d_mp_slots] = d_mp_rows
+            _sync_hotpath(runtime)
 
         face_rows_ptr = 0 if face_source_rows is None else ptr(face_source_rows)
         poly_rows_ptr = 0 if d_poly_source_rows is None else ptr(d_poly_source_rows)
@@ -134,30 +145,32 @@ def _gpu_label_face_coverage(
                      KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
-                runtime.launch(kernels["label_face_coverage_polygon"],
-                               grid=grid, block=block, params=poly_params,
-                               stream=s_poly)
-
-                mp_params = (
-                    (ptr(label_x), ptr(label_y), face_rows_ptr,
-                     ptr(mp_buf.x), ptr(mp_buf.y),
-                     ptr(mp_buf.geometry_offsets), ptr(mp_buf.part_offsets),
-                     ptr(mp_buf.ring_offsets), mp_rows_ptr,
-                     mp_count, ptr(out_covered), face_count),
-                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_PTR,
-                     KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-                )
-                runtime.launch(kernels["label_face_coverage_multipolygon"],
-                               grid=grid, block=block, params=mp_params,
-                               stream=s_mpoly)
-
-                s_poly.synchronize()
-                s_mpoly.synchronize()
+                with hotpath_stage(
+                    f"overlay.faces.coverage.{side_name}.mixed_family_overlap",
+                    category="refine",
+                ):
+                    runtime.launch(kernels["label_face_coverage_polygon"],
+                                   grid=grid, block=block, params=poly_params,
+                                   stream=s_poly)
+                    mp_params = (
+                        (ptr(label_x), ptr(label_y), face_rows_ptr,
+                         ptr(mp_buf.x), ptr(mp_buf.y),
+                         ptr(mp_buf.geometry_offsets), ptr(mp_buf.part_offsets),
+                         ptr(mp_buf.ring_offsets), mp_rows_ptr,
+                         mp_count, ptr(out_covered), face_count),
+                        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                         KERNEL_PARAM_PTR,
+                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                         KERNEL_PARAM_PTR,
+                         KERNEL_PARAM_PTR,
+                         KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                    )
+                    runtime.launch(kernels["label_face_coverage_multipolygon"],
+                                   grid=grid, block=block, params=mp_params,
+                                   stream=s_mpoly)
+                    s_poly.synchronize()
+                    s_mpoly.synchronize()
             finally:
                 runtime.destroy_stream(s_poly)
                 runtime.destroy_stream(s_mpoly)
@@ -176,8 +189,10 @@ def _gpu_label_face_coverage(
                      KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
-                runtime.launch(kernels["label_face_coverage_polygon"],
-                               grid=grid, block=block, params=params)
+                with hotpath_stage(f"overlay.faces.coverage.{side_name}.polygon", category="refine"):
+                    runtime.launch(kernels["label_face_coverage_polygon"],
+                                   grid=grid, block=block, params=params)
+                    _sync_hotpath(runtime)
             if launch_mpoly:
                 params = (
                     (ptr(label_x), ptr(label_y), face_rows_ptr,
@@ -193,8 +208,10 @@ def _gpu_label_face_coverage(
                      KERNEL_PARAM_PTR,
                      KERNEL_PARAM_I32, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
                 )
-                runtime.launch(kernels["label_face_coverage_multipolygon"],
-                               grid=grid, block=block, params=params)
+                with hotpath_stage(f"overlay.faces.coverage.{side_name}.multipolygon", category="refine"):
+                    runtime.launch(kernels["label_face_coverage_multipolygon"],
+                                   grid=grid, block=block, params=params)
+                    _sync_hotpath(runtime)
     return left_covered, right_covered
 
 
@@ -346,8 +363,10 @@ def build_gpu_overlay_faces(
                 face_source_rows=d_face_source_rows,
             )
             # Mask out unbounded faces (keep on device -- ADR-0005)
-            d_left_covered = cp.where(d_bounded_mask != 0, d_left_covered, 0).astype(cp.int8)
-            d_right_covered = cp.where(d_bounded_mask != 0, d_right_covered, 0).astype(cp.int8)
+            with hotpath_stage("overlay.faces.mask_unbounded", category="filter"):
+                d_left_covered = cp.where(d_bounded_mask != 0, d_left_covered, 0).astype(cp.int8)
+                d_right_covered = cp.where(d_bounded_mask != 0, d_right_covered, 0).astype(cp.int8)
+                _sync_hotpath(runtime)
         else:
             # _gpu_face_walk already returned device arrays for the zero case
             d_left_covered = cp.empty(0, dtype=cp.int8)

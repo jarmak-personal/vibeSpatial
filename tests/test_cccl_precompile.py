@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from unittest.mock import patch
 
 import pytest
@@ -10,12 +11,14 @@ from vibespatial.cuda.cccl_precompile import (
     PRECOMPILE_ENV_VAR,
     SPEC_REGISTRY,
     CCCLPrecompiler,
+    _warm_many_vs_one_overlay_remainder_route,
     ensure_pipelines_warm,
     precompile_enabled,
     precompile_status,
     request_warmup,
 )
 from vibespatial.cuda.nvrtc_precompile import NVRTCPrecompiler
+from vibespatial.runtime import has_gpu_runtime
 
 
 @pytest.fixture(autouse=True)
@@ -108,6 +111,32 @@ class TestCCCLPrecompilerNoGPU:
             ensure_pipelines_warm()
         probe.assert_called_once_with()
 
+    def test_ensure_pipelines_warm_calls_many_vs_one_overlay_probe(self):
+        with patch(
+            "vibespatial.cuda.cccl_precompile._warm_many_vs_one_overlay_remainder_route",
+        ) as probe:
+            ensure_pipelines_warm()
+        probe.assert_called_once_with()
+
+
+@pytest.mark.gpu
+def test_warm_many_vs_one_overlay_probe_stays_off_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    import vibespatial.cuda.cccl_precompile as precompile_module
+
+    monkeypatch.setattr(precompile_module, "_many_vs_one_overlay_warm_done", False)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _warm_many_vs_one_overlay_remainder_route()
+
+    assert not any("many-vs-one remainder" in str(entry.message) for entry in caught)
+
+class TestCCCLPrecompilerCore:
     def test_deduplication(self):
         precompiler = CCCLPrecompiler(max_workers=1)
         with patch.object(precompiler, "_compile_one", return_value=None):

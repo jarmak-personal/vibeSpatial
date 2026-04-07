@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from collections import Counter
 
 import numpy as np
@@ -13,6 +14,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.overlay.graph import _largest_power_of_two_block_size
 
 
 def _group_point_counts(source_segment_ids: np.ndarray) -> Counter[int]:
@@ -65,6 +67,47 @@ def test_gpu_split_events_and_atomic_edges_for_touch_and_overlap() -> None:
 
 
 @pytest.mark.gpu
+def test_gpu_split_events_dedup_sorted_runs_without_unique_by_key_primitive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    split_module = importlib.import_module("vibespatial.overlay.split")
+
+    monkeypatch.setattr(
+        split_module,
+        "unique_sorted_pairs",
+        lambda *args, **kwargs: pytest.fail("unique_by_key primitive should not be used"),
+        raising=False,
+    )
+
+    overlap_left = from_shapely_geometries([LineString([(0, 0), (5, 0)])])
+    overlap_right = from_shapely_geometries([LineString([(2, 0), (7, 0)])])
+
+    overlap_events = build_gpu_split_events(overlap_left, overlap_right, dispatch_mode=ExecutionMode.GPU)
+
+    assert _group_point_counts(overlap_events.source_segment_ids) == Counter({0: 3, 1: 3})
+    assert np.allclose(overlap_events.x[:3], [0.0, 2.0, 5.0])
+    assert np.allclose(overlap_events.x[3:], [2.0, 5.0, 7.0])
+
+
+@pytest.mark.gpu
+def test_gpu_split_events_handle_empty_segment_tables() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    empty = from_shapely_geometries([])
+
+    split_events = build_gpu_split_events(empty, empty, dispatch_mode=ExecutionMode.GPU)
+
+    assert split_events.count == 0
+    assert split_events.source_segment_ids.shape[0] == 0
+    assert split_events.x.shape[0] == 0
+    assert split_events.runtime_selection.selected is ExecutionMode.GPU
+
+
+@pytest.mark.gpu
 def test_gpu_split_events_preserve_polygon_hole_ring_metadata() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -89,6 +132,31 @@ def test_gpu_split_events_preserve_polygon_hole_ring_metadata() -> None:
 
 
 @pytest.mark.gpu
+def test_gpu_atomic_edges_use_dense_metadata_lookup_without_sort_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    split_module = importlib.import_module("vibespatial.overlay.split")
+
+    left = from_shapely_geometries([Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)])])
+    right = from_shapely_geometries([Polygon([(2, -1), (5, -1), (5, 3), (2, 3), (2, -1)])])
+    split_events = build_gpu_split_events(left, right, dispatch_mode=ExecutionMode.GPU)
+
+    monkeypatch.setattr(
+        split_module,
+        "sort_pairs",
+        lambda *args, **kwargs: pytest.fail("build_gpu_atomic_edges should not sort source ids"),
+    )
+
+    atomic_edges = build_gpu_atomic_edges(split_events)
+
+    assert atomic_edges.count > 0
+    assert atomic_edges.row_indices.shape[0] == atomic_edges.count
+
+
+@pytest.mark.gpu
 def test_gpu_atomic_edges_collapse_duplicate_overlap_segments() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
@@ -110,3 +178,10 @@ def test_gpu_atomic_edges_collapse_duplicate_overlap_segments() -> None:
     )
     assert atomic_edges.count == 20
     assert np.unique(np.round(forward_segments, 12), axis=0).shape[0] == forward_segments.shape[0]
+
+
+def test_face_metrics_kernel_block_size_rounds_down_to_power_of_two() -> None:
+    assert _largest_power_of_two_block_size(256) == 256
+    assert _largest_power_of_two_block_size(224) == 128
+    assert _largest_power_of_two_block_size(192) == 128
+    assert _largest_power_of_two_block_size(1) == 1

@@ -5,11 +5,14 @@ import os
 
 import numpy as np
 import pytest
+import shapely
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon, box
 
 import vibespatial
 from vibespatial.api import GeoDataFrame, GeoSeries, read_file
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.tools.overlay import overlay
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
 from vibespatial.testing import strict_native_environment
 
@@ -793,6 +796,43 @@ def test_overlay_intersection_keep_geom_type_true_skips_geometry_collection_cpu_
     assert set(result.geometry.geom_type.unique()) <= {"Polygon", "MultiPolygon"}
 
 
+def test_overlay_intersection_keep_geom_type_true_skips_full_lower_dim_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(-1, 1), (1, 1), (1, 3), (-1, 3)]),
+                Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+            ]
+        ),
+    )
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_assemble_polygon_intersection_rows_with_lower_dim",
+        lambda *args, **kwargs: pytest.fail("full lower-dim assembly should be skipped"),
+    )
+
+    with strict_native_environment():
+        result = overlay(left, right, keep_geom_type=True)
+
+    assert list(result.geom_type) == ["Polygon", "Polygon"]
+
+
 def test_overlay_intersection_keep_geom_type_none_warns_for_geometry_collection_rows() -> None:
     left = GeoDataFrame(
         {"left": [0, 1]},
@@ -817,6 +857,318 @@ def test_overlay_intersection_keep_geom_type_none_warns_for_geometry_collection_
         result = overlay(left, right, how="intersection", keep_geom_type=None)
 
     assert set(result.geometry.geom_type.unique()) <= {"Polygon", "MultiPolygon"}
+
+
+def test_overlay_intersection_keep_geom_type_none_strict_warning_matches_host_count() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"left": [0, 1]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 1, 1),
+                box(1, 1, 3, 3).union(box(1, 3, 5, 5)),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        {"right": [0, 1]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 1, 1),
+                box(3, 1, 4, 2).union(box(4, 1, 5, 4)),
+            ]
+        ),
+    )
+
+    with pytest.warns(UserWarning, match="`keep_geom_type=True` in overlay") as host_warning:
+        overlay(left, right, how="intersection", keep_geom_type=None)
+
+    with strict_native_environment():
+        with pytest.warns(UserWarning, match="`keep_geom_type=True` in overlay") as strict_warning:
+            overlay(left, right, how="intersection", keep_geom_type=None)
+
+    assert str(strict_warning[0].message) == str(host_warning[0].message)
+
+
+def test_overlay_intersection_keep_geom_type_none_skips_full_lower_dim_assembly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        geometry=GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(-1, 1), (1, 1), (1, 3), (-1, 3)]),
+                Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+            ]
+        ),
+    )
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_assemble_polygon_intersection_rows_with_lower_dim",
+        lambda *args, **kwargs: pytest.fail("full lower-dim assembly should be skipped"),
+    )
+
+    with strict_native_environment():
+        with pytest.warns(UserWarning, match="`keep_geom_type=True` in overlay"):
+            result = overlay(left, right, keep_geom_type=None)
+
+    assert list(result.geom_type) == ["Polygon", "Polygon"]
+
+
+def test_keep_geom_type_filter_uses_geometry_array_values_not_geoseries_wrappers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left_pairs = GeoSeries(
+        [
+            box(0, 0, 1, 1),
+            box(0, 0, 1, 1),
+            box(0, 0, 1, 1),
+        ]
+    )
+    right_pairs = GeoSeries(
+        [
+            box(0, 0, 1, 1),
+            box(1, 0, 2, 1),
+            box(2, 2, 3, 3),
+        ]
+    )
+    area_pairs = GeoSeries(
+        [
+            GeometryCollection([box(0, 0, 1, 1), LineString([(0, 0), (1, 0)])]),
+            LineString([(1, 0), (1, 1)]),
+            None,
+        ]
+    )
+
+    def _fail(*_args, **_kwargs):
+        pytest.fail("GeoSeries wrapper path should stay cold")
+
+    monkeypatch.setattr(GeoSeries, "__array__", _fail, raising=False)
+    monkeypatch.setattr(GeoSeries, "isna", _fail, raising=False)
+    monkeypatch.setattr(GeoSeries, "is_empty", property(lambda self: _fail()))
+    monkeypatch.setattr(GeoSeries, "geom_type", property(lambda self: _fail()))
+
+    filtered, dropped, keep_mask = (
+        overlay_module._filter_polygon_intersection_rows_for_keep_geom_type(
+            left_pairs,
+            right_pairs,
+            area_pairs,
+            keep_geom_type_warning=True,
+        )
+    )
+
+    assert keep_mask.tolist() == [True, False, False]
+    assert dropped == 2
+    assert len(filtered) == 1
+    filtered_values = np.asarray(filtered.array, dtype=object)
+    assert shapely.get_type_id(filtered_values).tolist() == [3]
+
+
+def test_keep_geom_type_filter_preserves_owned_results_without_array_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left_pairs = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 1, 1),
+                    box(0, 0, 1, 1),
+                    box(0, 0, 1, 1),
+                ]
+            )
+        )
+    )
+    right_pairs = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 1, 1),
+                    box(1, 0, 2, 1),
+                    box(2, 2, 3, 3),
+                ]
+            )
+        )
+    )
+    area_pairs = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 1, 1),
+                    LineString([(1, 0), (1, 1)]),
+                    None,
+                ]
+            )
+        )
+    )
+
+    def _fail(*_args, **_kwargs):
+        pytest.fail("owned keep-geom-type filter should not materialize full geometry arrays")
+
+    monkeypatch.setattr(GeometryArray, "__array__", _fail, raising=False)
+
+    filtered, dropped, keep_mask = overlay_module._filter_polygon_intersection_rows_for_keep_geom_type(
+        left_pairs,
+        right_pairs,
+        area_pairs,
+        keep_geom_type_warning=False,
+    )
+
+    assert keep_mask.tolist() == [True, False, False]
+    assert dropped == 0
+    assert len(filtered) == 1
+    assert getattr(filtered.values, "_owned", None) is not None
+
+
+def test_overlay_intersection_many_vs_one_remainder_prefers_rowwise_overlay_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2, 3]},
+        geometry=GeoSeries(
+            [
+                Polygon([(-1, 1), (2, 1), (2, 4), (-1, 4), (-1, 1)]),
+                Polygon([(1, -1), (4, -1), (4, 2), (1, 2), (1, -1)]),
+                Polygon([(3, 3), (6, 3), (6, 6), (3, 6), (3, 3)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        geometry=GeoSeries(
+            [
+                Polygon([(0, 0), (6, 0), (6, 2), (2, 2), (2, 6), (0, 6), (0, 0)]),
+            ]
+        ),
+    )
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    called = False
+    original = constructive_module._dispatch_polygon_intersection_overlay_rowwise_gpu
+
+    def _wrapped(*args, **kwargs):
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        _wrapped,
+    )
+
+    with strict_native_environment():
+        result = overlay(left, right, how="intersection", keep_geom_type=True)
+
+    assert called
+    assert list(result["col1"]) == [1, 2]
+
+
+def test_overlay_intersection_many_vs_one_remainder_avoids_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2, 3]},
+        geometry=GeoSeries(
+            [
+                Polygon([(-1, 1), (2, 1), (2, 4), (-1, 4), (-1, 1)]),
+                Polygon([(1, -1), (4, -1), (4, 2), (1, 2), (1, -1)]),
+                Polygon([(3, 3), (6, 3), (6, 6), (3, 6), (3, 3)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        geometry=GeoSeries(
+            [
+                Polygon([(0, 0), (6, 0), (6, 2), (2, 2), (2, 6), (0, 6), (0, 0)]),
+            ]
+        ),
+    )
+
+    original = overlay_module.record_fallback_event
+
+    def _wrapped_record_fallback_event(*args, **kwargs):
+        reason = kwargs.get("reason", "")
+        if "many-vs-one remainder" in str(reason):
+            pytest.fail("many-vs-one polygon remainder should stay on GPU")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "record_fallback_event",
+        _wrapped_record_fallback_event,
+    )
+
+    result = overlay(left, right, how="intersection", keep_geom_type=True)
+
+    assert list(result["col1"]) == [1, 2]
+
+
+def test_overlay_intersection_many_vs_one_fast_path_retries_after_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left = GeoDataFrame(
+        {"col1": [1, 2, 3]},
+        geometry=GeoSeries(
+            [
+                Polygon([(-1, 1), (2, 1), (2, 4), (-1, 4), (-1, 1)]),
+                Polygon([(1, -1), (4, -1), (4, 2), (1, 2), (1, -1)]),
+                Polygon([(3, 3), (6, 3), (6, 6), (3, 6), (3, 3)]),
+            ]
+        ),
+    )
+    right = GeoDataFrame(
+        geometry=GeoSeries(
+            [
+                Polygon([(0, 0), (6, 0), (6, 2), (2, 2), (2, 6), (0, 6), (0, 0)]),
+            ]
+        ),
+    )
+
+    original = overlay_module._many_vs_one_intersection_owned
+    calls = 0
+
+    def _wrapped_many_vs_one(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise MemoryError("synthetic many-vs-one fast-path failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_many_vs_one_intersection_owned",
+        _wrapped_many_vs_one,
+    )
+
+    with strict_native_environment():
+        result = overlay(left, right, how="intersection", keep_geom_type=True)
+
+    assert calls == 2
+    assert list(result["col1"]) == [1, 2]
 
 
 def test_overlay_difference_survives_strict_native_mode_for_small_overlap_polygons() -> None:

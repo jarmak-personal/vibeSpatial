@@ -21,9 +21,9 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.cuda.cccl_primitives import (
     exclusive_sum,
-    segmented_reduce_sum,
     sort_pairs,
 )
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 
 from .types import (
     AtomicEdgeTable,
@@ -46,6 +46,17 @@ def _require_gpu_arrays() -> None:
 
 def _quantize_coordinate(values):
     return cp.rint(values * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+
+
+def _sync_hotpath(runtime) -> None:
+    if hotpath_trace_enabled():
+        runtime.synchronize()
+
+
+def _largest_power_of_two_block_size(block_size: int) -> int:
+    """Round a positive block size down to the nearest power of two."""
+    capped = max(1, int(block_size))
+    return 1 << (capped.bit_length() - 1)
 
 
 def _empty_half_edge_graph(
@@ -240,45 +251,38 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     ptr = runtime.pointer
 
     # --- Step 1: Pointer jumping to find cycles (Tier 2 CuPy) ---
-    face_id = cp.arange(edge_count, dtype=cp.int32)
-    jump = cp.asarray(device.next_edge_ids).copy()
-    max_iterations = max(1, int(np.ceil(np.log2(edge_count))))
+    with hotpath_stage("overlay.graph.face_id_pointer_jump", category="refine"):
+        face_id = cp.arange(edge_count, dtype=cp.int32)
+        jump = cp.asarray(device.next_edge_ids).copy()
+        max_iterations = max(1, int(np.ceil(np.log2(edge_count))))
 
-    for _ in range(max_iterations):
-        face_id = cp.minimum(face_id, face_id[jump])
-        jump = jump[jump]
-
-    # --- Step 2: Per-edge shoelace contributions ---
-    d_cross = cp.empty(edge_count, dtype=cp.float64)
-    d_cx_contrib = cp.empty(edge_count, dtype=cp.float64)
-    d_cy_contrib = cp.empty(edge_count, dtype=cp.float64)
-    shoelace_params = (
-        (ptr(device.src_x), ptr(device.src_y), ptr(device.next_edge_ids),
-         ptr(d_cross), ptr(d_cx_contrib), ptr(d_cy_contrib), edge_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-    )
-    grid, block = runtime.launch_config(kernels["compute_shoelace_contributions"], edge_count)
-    runtime.launch(kernels["compute_shoelace_contributions"], grid=grid, block=block, params=shoelace_params)
+        for _ in range(max_iterations):
+            face_id = cp.minimum(face_id, face_id[jump])
+            jump = jump[jump]
+        _sync_hotpath(runtime)
 
     # Phase 25 memory: jump is dead after pointer jumping.
     del jump
 
     # --- Step 3: Group edges by face_id via sort, then aggregate ---
     edge_ids = cp.arange(edge_count, dtype=cp.int32)
-    sort_result = sort_pairs(face_id, edge_ids, synchronize=False)
-    sorted_face_ids = sort_result.keys
-    sorted_edge_ids = sort_result.values
+    with hotpath_stage("overlay.graph.group_faces_sort", category="sort"):
+        sort_result = sort_pairs(face_id, edge_ids, synchronize=False)
+        _sync_hotpath(runtime)
+        sorted_face_ids = sort_result.keys
+        sorted_edge_ids = sort_result.values
 
     # Find unique face_ids and segment boundaries
-    face_start_mask = cp.empty(edge_count, dtype=cp.bool_)
-    face_start_mask[0] = True
-    if edge_count > 1:
-        face_start_mask[1:] = sorted_face_ids[1:] != sorted_face_ids[:-1]
-    del sorted_face_ids  # Phase 25 memory
-    starts = cp.flatnonzero(face_start_mask).astype(cp.int32, copy=False)
-    ends = cp.concatenate((starts[1:], cp.asarray([edge_count], dtype=cp.int32)))
-    del face_start_mask  # Phase 25 memory
+    with hotpath_stage("overlay.graph.face_span_boundaries", category="sort"):
+        face_start_mask = cp.empty(edge_count, dtype=cp.bool_)
+        face_start_mask[0] = True
+        if edge_count > 1:
+            face_start_mask[1:] = sorted_face_ids[1:] != sorted_face_ids[:-1]
+        del sorted_face_ids  # Phase 25 memory
+        starts = cp.flatnonzero(face_start_mask).astype(cp.int32, copy=False)
+        ends = cp.concatenate((starts[1:], cp.asarray([edge_count], dtype=cp.int32)))
+        del face_start_mask  # Phase 25 memory
+        _sync_hotpath(runtime)
 
     # Per-face edge counts
     face_lengths = ends - starts
@@ -298,72 +302,94 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     valid_lengths = face_lengths[valid_face_indices]
     del starts, ends, face_lengths, valid_face_indices  # Phase 25 memory
 
-    # Segmented reduce for cross, cx_contrib, cy_contrib
-    # Reorder contributions to match sorted edge order
-    sorted_cross = d_cross[sorted_edge_ids]
-    sorted_cx = d_cx_contrib[sorted_edge_ids]
-    sorted_cy = d_cy_contrib[sorted_edge_ids]
-    # Phase 25 memory: raw contribution arrays consumed after gather.
-    del d_cross, d_cx_contrib, d_cy_contrib
-
-    cross_sums = segmented_reduce_sum(sorted_cross, valid_starts, valid_ends, num_segments=face_count).values
-    cx_sums = segmented_reduce_sum(sorted_cx, valid_starts, valid_ends, num_segments=face_count).values
-    cy_sums = segmented_reduce_sum(sorted_cy, valid_starts, valid_ends, num_segments=face_count).values
-    del sorted_cross, sorted_cx, sorted_cy  # Phase 25 memory
-
-    # signed_area = twice_area * 0.5
-    signed_area = cross_sums * 0.5
-    # centroid: factor = 1 / (3 * twice_area), cx = sum_cx * factor
-    twice_area = cross_sums
-    safe_twice_area = cp.where(twice_area == 0.0, 1.0, twice_area)
-    factor = 1.0 / (3.0 * safe_twice_area)
-    centroid_x = cx_sums * factor
-    centroid_y = cy_sums * factor
-    # For zero-area faces, use mean of coordinates.  Compute the fallback
-    # unconditionally on device (cheap segmented reduce + cp.where) to avoid
-    # the implicit D2H sync that cp.any(zero_area_mask) would trigger.
-    zero_area_mask = twice_area == 0.0
-    sorted_src_x = cp.asarray(device.src_x)[sorted_edge_ids]
-    sorted_src_y = cp.asarray(device.src_y)[sorted_edge_ids]
-    mean_x = segmented_reduce_sum(sorted_src_x, valid_starts, valid_ends, num_segments=face_count).values
-    mean_y = segmented_reduce_sum(sorted_src_y, valid_starts, valid_ends, num_segments=face_count).values
-    safe_lengths = cp.where(valid_lengths == 0, 1, valid_lengths).astype(cp.float64)
-    centroid_x = cp.where(zero_area_mask, mean_x / safe_lengths, centroid_x)
-    centroid_y = cp.where(zero_area_mask, mean_y / safe_lengths, centroid_y)
-    del zero_area_mask, sorted_src_x, sorted_src_y, mean_x, mean_y, safe_lengths  # Phase 25 memory
-    del cross_sums, cx_sums, cy_sums, twice_area, safe_twice_area, factor  # Phase 25 memory
+    # Aggregate area/centroid directly from sorted face spans in one
+    # cooperative kernel instead of five segmented reductions over the same
+    # edge ordering.
+    signed_area = cp.empty(face_count, dtype=cp.float64)
+    centroid_x = cp.empty(face_count, dtype=cp.float64)
+    centroid_y = cp.empty(face_count, dtype=cp.float64)
+    metrics_params = (
+        (
+            ptr(device.src_x),
+            ptr(device.src_y),
+            ptr(device.next_edge_ids),
+            ptr(sorted_edge_ids),
+            ptr(valid_starts),
+            ptr(valid_ends),
+            ptr(signed_area),
+            ptr(centroid_x),
+            ptr(centroid_y),
+            face_count,
+            edge_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    metrics_block_size = _largest_power_of_two_block_size(
+        min(
+            runtime.optimal_block_size(kernels["compute_face_metrics"]),
+            256,
+        )
+    )
+    metrics_grid = (max(face_count, 1), 1, 1)
+    metrics_block = (metrics_block_size, 1, 1)
+    with hotpath_stage("overlay.graph.face_metrics_kernel", category="refine"):
+        runtime.launch(
+            kernels["compute_face_metrics"],
+            grid=metrics_grid,
+            block=metrics_block,
+            params=metrics_params,
+        )
+        _sync_hotpath(runtime)
 
     # Build compact face_offsets and face_edge_ids in cycle traversal order.
-    # GPU list ranking: each edge gets its position within its face cycle,
-    # then sort by (face_id, rank) to produce contiguous cycle-ordered layout.
-    # This replaces the prior serial host walk of next_edge_ids.
-    d_rank = cp.empty(edge_count, dtype=cp.int32)
-    max_walk = edge_count  # upper bound on cycle length
-    rank_params = (
-        (ptr(face_id), ptr(device.next_edge_ids),
-         ptr(d_rank), edge_count, max_walk),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
-    )
-    rank_grid, rank_block = runtime.launch_config(kernels["list_rank_within_cycle"], edge_count)
-    runtime.launch(
-        kernels["list_rank_within_cycle"],
-        grid=rank_grid, block=rank_block, params=rank_params,
-    )
+    # Rank edges within each cycle by pointer-jumping on the predecessor map:
+    # this avoids the prior O(cycle_length) per-edge root walk.
+    with hotpath_stage("overlay.graph.cycle_rank_pointer_jump", category="sort"):
+        next_edge_ids_i32 = cp.asarray(device.next_edge_ids, dtype=cp.int32)
+        predecessor = cp.empty(edge_count, dtype=cp.int32)
+        predecessor[next_edge_ids_i32] = edge_ids
+        root_mask = face_id == edge_ids
+        predecessor[root_mask] = edge_ids[root_mask]
+        d_rank = cp.ones(edge_count, dtype=cp.int32)
+        d_rank[root_mask] = 0
+        max_rank_iterations = max(1, int(np.ceil(np.log2(max(1, edge_count)))))
+        for _ in range(max_rank_iterations):
+            grandparent = predecessor[predecessor]
+            active = predecessor != grandparent
+            d_rank = cp.where(active, d_rank + d_rank[predecessor], d_rank)
+            predecessor = cp.where(active, grandparent, predecessor)
+        del next_edge_ids_i32, predecessor, root_mask, grandparent, active
+        _sync_hotpath(runtime)
 
     # Pack (face_id, rank) into a single sort key so sort_pairs gives us
     # edges grouped by face and ordered within each cycle.
-    packed_key = face_id.astype(cp.int64) * int(edge_count) + d_rank.astype(cp.int64)
-    cycle_sort = sort_pairs(packed_key, edge_ids, synchronize=False)
-    cycle_sorted_edge_ids = cycle_sort.values
+    with hotpath_stage("overlay.graph.cycle_sort", category="sort"):
+        packed_key = face_id.astype(cp.int64) * int(edge_count) + d_rank.astype(cp.int64)
+        cycle_sort = sort_pairs(packed_key, edge_ids, synchronize=False)
+        _sync_hotpath(runtime)
+        cycle_sorted_edge_ids = cycle_sort.values
 
     # Build face_offsets from valid_lengths on device (CCCL exclusive_sum).
     # exclusive_sum produces face_count elements; append the total to form
     # a proper CSR offset array with face_count+1 entries so that
     # face_offsets[face_count] gives the total edge count.
-    _prefix = exclusive_sum(valid_lengths.astype(cp.int32, copy=False))
-    _total = valid_lengths.sum().reshape(1).astype(cp.int32)
-    face_offsets = cp.concatenate((_prefix, _total))
+    with hotpath_stage("overlay.graph.face_offsets", category="sort"):
+        _prefix = exclusive_sum(valid_lengths.astype(cp.int32, copy=False))
+        _total = valid_lengths.sum().reshape(1).astype(cp.int32)
+        face_offsets = cp.concatenate((_prefix, _total))
+        _sync_hotpath(runtime)
 
     # Extract cycle-ordered edges for valid faces only.  The cycle-sorted
     # array has the same segment boundaries (valid_starts, valid_ends) as
@@ -375,17 +401,19 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
     # Build a flat gather index: for each slot in the output, compute the
     # source position in cycle_sorted_edge_ids.
     # slot_face = which valid face does this slot belong to?
-    slot_ids = cp.arange(total_edges, dtype=cp.int32)
-    slot_face = cp.searchsorted(face_offsets[1:], slot_ids, side='right').astype(cp.int32)
-    # local offset within that face's segment
-    slot_local = slot_ids - face_offsets[slot_face]
-    # source position in the cycle-sorted full array
-    src_pos = valid_starts[slot_face] + slot_local
-    face_edge_ids = cycle_sorted_edge_ids[src_pos]
-    # Phase 25 memory: face walk intermediates consumed.
-    del slot_ids, slot_face, slot_local, src_pos, cycle_sorted_edge_ids
-    del sorted_edge_ids, valid_starts, valid_ends, valid_lengths
-    del packed_key, d_rank
+    with hotpath_stage("overlay.graph.gather_face_edges", category="emit"):
+        slot_ids = cp.arange(total_edges, dtype=cp.int32)
+        slot_face = cp.searchsorted(face_offsets[1:], slot_ids, side='right').astype(cp.int32)
+        # local offset within that face's segment
+        slot_local = slot_ids - face_offsets[slot_face]
+        # source position in the cycle-sorted full array
+        src_pos = valid_starts[slot_face] + slot_local
+        face_edge_ids = cycle_sorted_edge_ids[src_pos]
+        # Phase 25 memory: face walk intermediates consumed.
+        del slot_ids, slot_face, slot_local, src_pos, cycle_sorted_edge_ids
+        del sorted_edge_ids, valid_starts, valid_ends, valid_lengths
+        del packed_key, d_rank
+        _sync_hotpath(runtime)
 
     # --- Step 4: Face sample points via kernel ---
     label_x = cp.empty(face_count, dtype=cp.float64)
@@ -402,6 +430,8 @@ def _gpu_face_walk(half_edge_graph: HalfEdgeGraph) -> tuple[
          KERNEL_PARAM_I32),
     )
     sample_grid, sample_block = runtime.launch_config(kernels["compute_face_sample_points"], face_count)
-    runtime.launch(kernels["compute_face_sample_points"], grid=sample_grid, block=sample_block, params=sample_params)
+    with hotpath_stage("overlay.graph.sample_points", category="refine"):
+        runtime.launch(kernels["compute_face_sample_points"], grid=sample_grid, block=sample_block, params=sample_params)
+        _sync_hotpath(runtime)
 
     return face_offsets, face_edge_ids, bounded_mask, signed_area, centroid_x, centroid_y, label_x, label_y, face_count

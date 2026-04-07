@@ -50,6 +50,7 @@ STOPWORDS = {
     "file",
     "files",
 }
+MAX_INDEXED_SYMBOLS = 64
 
 
 def tokenize(text: str) -> list[str]:
@@ -112,18 +113,31 @@ def path_exists(root: Path, relative_path: str) -> bool:
 
 
 def collect_python_symbols(content: str) -> list[str]:
-    symbols = re.findall(r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)", content, flags=re.MULTILINE)
+    defined_symbols = re.findall(
+        r"^(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        content,
+        flags=re.MULTILINE,
+    )
 
     # Also harvest names exported via __all__
+    exported_symbols: list[str] = []
     all_match = re.search(r"^__all__\s*=\s*\[([^\]]*)\]", content, flags=re.MULTILINE | re.DOTALL)
     if all_match:
         all_names = re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"|\'([A-Za-z_][A-Za-z0-9_]*)\'', all_match.group(1))
         for groups in all_names:
             name = groups[0] or groups[1]
-            if name not in symbols:
-                symbols.append(name)
+            if name not in exported_symbols:
+                exported_symbols.append(name)
 
-    return symbols[:24]
+    public_defined = [name for name in defined_symbols if not name.startswith("_")]
+    private_defined = [name for name in defined_symbols if name.startswith("_")]
+
+    ordered: list[str] = []
+    for name in [*exported_symbols, *public_defined, *private_defined]:
+        if name not in ordered:
+            ordered.append(name)
+
+    return ordered[:MAX_INDEXED_SYMBOLS]
 
 
 def extract_module_docstring(content: str) -> str:

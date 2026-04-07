@@ -295,7 +295,7 @@ _OVERLAY_SPLIT_KERNEL_NAMES = (
 # ---------------------------------------------------------------------------
 # 2. Half-edge face traversal kernels
 # ---------------------------------------------------------------------------
-# Kernels: compute_shoelace_contributions, compute_face_sample_points,
+# Kernels: compute_face_metrics, compute_face_sample_points,
 #          list_rank_within_cycle
 
 _OVERLAY_FACE_WALK_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
@@ -303,37 +303,98 @@ _OVERLAY_FACE_WALK_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 // Phase 1: GPU Face Walk via Pointer Jumping
 // -------------------------------------------------------------------
 
-// Compute per-edge shoelace contributions for area and centroid.
-// src_x[i], src_y[i] are the source coordinates of edge i.
-// next_edge_ids[i] gives the next edge in the cycle.
+// Compute per-face area and centroid in one pass over the face edge span.
+// Each block handles one face; threads cooperatively walk the sorted edge ids
+// for that face and reduce:
+//   cross = x0 * y1 - x1 * y0
+//   cx += (x0 + x1) * cross
+//   cy += (y0 + y1) * cross
+// When twice_area is zero, fall back to the mean of the source vertices.
 extern "C" __global__ void __launch_bounds__(256, 4)
-compute_shoelace_contributions(
+compute_face_metrics(
     const double* __restrict__ src_x,
     const double* __restrict__ src_y,
     const long long* __restrict__ next_edge_ids,
-    double* __restrict__ out_cross,
-    double* __restrict__ out_cx_contrib,
-    double* __restrict__ out_cy_contrib,
-    int edge_count
+    const int* __restrict__ sorted_edge_ids,
+    const int* __restrict__ face_starts,
+    const int* __restrict__ face_ends,
+    double* __restrict__ out_signed_area,
+    double* __restrict__ out_centroid_x,
+    double* __restrict__ out_centroid_y,
+    int face_count,
+    int total_edge_count
 ) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= edge_count) return;
-  const int next_i = (int)next_edge_ids[i];
-  // Bounds check: prevent ILLEGAL_ADDRESS from corrupted topology.
-  if (next_i < 0 || next_i >= edge_count) {
-    out_cross[i] = 0.0;
-    out_cx_contrib[i] = 0.0;
-    out_cy_contrib[i] = 0.0;
-    return;
+  const int f = blockIdx.x;
+  const int tid = threadIdx.x;
+  if (f >= face_count) return;
+
+  const int start = face_starts[f];
+  const int end = face_ends[f];
+
+  __shared__ double sh_cross[256];
+  __shared__ double sh_cx[256];
+  __shared__ double sh_cy[256];
+  __shared__ double sh_sx[256];
+  __shared__ double sh_sy[256];
+  __shared__ int sh_count[256];
+
+  double local_cross = 0.0;
+  double local_cx = 0.0;
+  double local_cy = 0.0;
+  double local_sx = 0.0;
+  double local_sy = 0.0;
+  int local_count = 0;
+
+  for (int pos = start + tid; pos < end; pos += blockDim.x) {
+    const int eid = sorted_edge_ids[pos];
+    if (eid < 0 || eid >= total_edge_count) continue;
+    const int next_i = (int)next_edge_ids[eid];
+    if (next_i < 0 || next_i >= total_edge_count) continue;
+    const double x0 = src_x[eid];
+    const double y0 = src_y[eid];
+    const double x1 = src_x[next_i];
+    const double y1 = src_y[next_i];
+    const double cross = x0 * y1 - x1 * y0;
+    local_cross += cross;
+    local_cx += (x0 + x1) * cross;
+    local_cy += (y0 + y1) * cross;
+    local_sx += x0;
+    local_sy += y0;
+    local_count += 1;
   }
-  const double x0 = src_x[i];
-  const double y0 = src_y[i];
-  const double x1 = src_x[next_i];
-  const double y1 = src_y[next_i];
-  const double cross = x0 * y1 - x1 * y0;
-  out_cross[i] = cross;
-  out_cx_contrib[i] = (x0 + x1) * cross;
-  out_cy_contrib[i] = (y0 + y1) * cross;
+
+  sh_cross[tid] = local_cross;
+  sh_cx[tid] = local_cx;
+  sh_cy[tid] = local_cy;
+  sh_sx[tid] = local_sx;
+  sh_sy[tid] = local_sy;
+  sh_count[tid] = local_count;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sh_cross[tid] += sh_cross[tid + stride];
+      sh_cx[tid] += sh_cx[tid + stride];
+      sh_cy[tid] += sh_cy[tid + stride];
+      sh_sx[tid] += sh_sx[tid + stride];
+      sh_sy[tid] += sh_sy[tid + stride];
+      sh_count[tid] += sh_count[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const double twice_area = sh_cross[0];
+    out_signed_area[f] = twice_area * 0.5;
+    if (twice_area == 0.0 || sh_count[0] == 0) {
+      const double denom = sh_count[0] > 0 ? (double)sh_count[0] : 1.0;
+      out_centroid_x[f] = sh_sx[0] / denom;
+      out_centroid_y[f] = sh_sy[0] / denom;
+    } else {
+      out_centroid_x[f] = sh_cx[0] / (3.0 * twice_area);
+      out_centroid_y[f] = sh_cy[0] / (3.0 * twice_area);
+    }
+  }
 }
 
 // One thread per face: compute a sample point by walking the face edges.
@@ -465,7 +526,7 @@ list_rank_within_cycle(
 """
 
 _OVERLAY_FACE_WALK_KERNEL_NAMES = (
-    "compute_shoelace_contributions",
+    "compute_face_metrics",
     "compute_face_sample_points",
     "list_rank_within_cycle",
 )

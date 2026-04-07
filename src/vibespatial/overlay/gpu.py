@@ -19,6 +19,7 @@ request_warmup([
 from vibespatial.cuda._runtime import (  # noqa: E402
     compile_kernel_group,
     get_cuda_runtime,
+    maybe_trim_pool_memory,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import (  # noqa: E402
@@ -291,18 +292,12 @@ def _build_overlay_execution_plan(
     atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
     # split_events are fully consumed by build_gpu_atomic_edges.
     _free_split_event_device_state(split_events)
-    try:
-        get_cuda_runtime().free_pool_memory()
-    except Exception:
-        pass
+    maybe_trim_pool_memory()
 
     half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=_row_isolated)
     # half_edge_graph retains the atomic-edge arrays it still needs.
     _free_atomic_edge_excess(atomic_edges)
-    try:
-        get_cuda_runtime().free_pool_memory()
-    except Exception:
-        pass
+    maybe_trim_pool_memory()
 
     faces = build_gpu_overlay_faces(
         left,
@@ -378,10 +373,7 @@ def _materialize_overlay_execution_plan(
         return gpu_result, ExecutionMode.GPU  # type: ignore[return-value]
     finally:
         del d_selected_face_indices
-        try:
-            get_cuda_runtime().free_pool_memory()
-        except Exception:
-            pass
+        maybe_trim_pool_memory()
 
 
 def overlay_intersection_owned(
@@ -542,10 +534,7 @@ def _overlay_owned(
         preserve_row_count=left.row_count if _row_isolated else None,
     )
     del plan
-    try:
-        get_cuda_runtime().free_pool_memory()
-    except Exception:
-        pass
+    maybe_trim_pool_memory()
     result.runtime_history.append(
         RuntimeSelection(
             requested=requested,
@@ -910,10 +899,7 @@ def spatial_overlay_owned(
     # Release GPU pool memory after containment bypass and SH batch clip:
     # bounds check, PIP, and clip kernels produce large intermediates that
     # are no longer needed before the per-group overlay loop.
-    try:
-        get_cuda_runtime().free_pool_memory()
-    except Exception:
-        pass  # best-effort cleanup
+    maybe_trim_pool_memory()
 
     # Stage 2: Per-left-group processing.
     #
@@ -1234,10 +1220,7 @@ def spatial_overlay_owned(
         # Release GPU pool memory after per-group overlay loop: each
         # iteration's split events, half-edge graphs, and face tables
         # leave freed-but-cached blocks in the CuPy pool.
-        try:
-            get_cuda_runtime().free_pool_memory()
-        except Exception:
-            pass  # best-effort cleanup
+        maybe_trim_pool_memory()
 
         # Filter empty/null using owned-level metadata (validity + empty_mask)
         # instead of to_shapely() — avoids D->H->D ping-pong.

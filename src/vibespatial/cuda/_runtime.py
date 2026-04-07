@@ -54,6 +54,31 @@ def _free_cupy_pinned_memory_pool() -> None:
         pool.free_all_blocks()
 
 
+def eager_pool_trim_enabled() -> bool:
+    """Return whether hot paths should eagerly flush the GPU memory pool.
+
+    This is intentionally opt-in. Calling ``free_all_blocks()`` on the CuPy pool
+    can introduce large synchronization overhead in overlay/clip hot paths.
+    Keep the default fast and expose eager trimming as an escape hatch for
+    memory-pressure debugging or emergency OOM mitigation.
+    """
+    value = os.environ.get("VIBESPATIAL_EAGER_GPU_POOL_TRIM", "")
+    if not value:
+        return False
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def maybe_trim_pool_memory(runtime: Any | None = None) -> None:
+    """Best-effort eager pool trim when explicitly enabled by environment."""
+    if not eager_pool_trim_enabled():
+        return
+    try:
+        target = runtime if runtime is not None else get_cuda_runtime()
+        target.free_pool_memory()
+    except Exception:
+        pass
+
+
 def _check_driver(result: tuple[Any, ...]) -> tuple[Any, ...]:
     err = result[0]
     if err != cu.CUresult.CUDA_SUCCESS:

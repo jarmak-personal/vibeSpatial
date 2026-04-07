@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import pandas as pd
 import pandas.api.types
+import shapely
 from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
 
 from vibespatial.api import GeoDataFrame, GeoSeries
@@ -13,12 +14,14 @@ from vibespatial.api.geometry_array import (
     LINE_GEOM_TYPES,
     POINT_GEOM_TYPES,
     POLYGON_GEOM_TYPES,
+    GeometryArray,
     _check_crs,
     _crs_mismatch_warn,
 )
 from vibespatial.api.geometry_array import (
     from_shapely as _geometryarray_from_shapely,
 )
+from vibespatial.geometry.device_array import DeviceGeometryArray
 
 
 def _mask_is_list_like_rectangle(mask):
@@ -78,31 +81,45 @@ def _clip_polygon_partition_with_rectangle_mask(
     source_geoms = np.asarray(source_values, dtype=object)
     area_values = source_values.clip_by_rect(xmin, ymin, xmax, ymax)
     area_geoms = np.asarray(area_values, dtype=object)
+    source_missing = np.asarray(
+        shapely.is_missing(source_geoms) | shapely.is_empty(source_geoms),
+        dtype=bool,
+    )
+    area_missing = np.asarray(
+        shapely.is_missing(area_geoms) | shapely.is_empty(area_geoms),
+        dtype=bool,
+    )
+
+    edge_geoms = np.asarray(
+        shapely.intersection(shapely.boundary(source_geoms), rectangle_mask),
+        dtype=object,
+    )
+    if np.any(~area_missing):
+        area_rows = np.flatnonzero(~area_missing)
+        edge_geoms[area_rows] = np.asarray(
+            shapely.difference(
+                edge_geoms[area_rows],
+                shapely.boundary(area_geoms[area_rows]),
+            ),
+            dtype=object,
+        )
+    edge_missing = np.asarray(
+        shapely.is_missing(edge_geoms) | shapely.is_empty(edge_geoms),
+        dtype=bool,
+    )
 
     assembled = np.empty(len(partition), dtype=object)
-    for row_index in range(len(partition)):
-        source_geom = source_geoms[row_index]
-        if source_geom is None or source_geom.is_empty:
-            assembled[row_index] = None
-            continue
-        area_geom = area_geoms[row_index]
-        if area_geom is not None and area_geom.is_empty:
-            area_geom = None
+    assembled[source_missing] = None
+    neither_mask = ~source_missing & area_missing & edge_missing
+    area_only_mask = ~source_missing & ~area_missing & edge_missing
+    edge_only_mask = ~source_missing & area_missing & ~edge_missing
+    both_mask = ~source_missing & ~area_missing & ~edge_missing
 
-        edge_geom = source_geom.boundary.intersection(rectangle_mask)
-        if area_geom is not None and edge_geom is not None:
-            edge_geom = edge_geom.difference(area_geom.boundary)
-        if edge_geom is not None and edge_geom.is_empty:
-            edge_geom = None
-
-        if area_geom is None and edge_geom is None:
-            assembled[row_index] = None
-        elif area_geom is None:
-            assembled[row_index] = edge_geom
-        elif edge_geom is None:
-            assembled[row_index] = area_geom
-        else:
-            assembled[row_index] = GeometryCollection([area_geom, edge_geom])
+    assembled[neither_mask] = None
+    assembled[area_only_mask] = area_geoms[area_only_mask]
+    assembled[edge_only_mask] = edge_geoms[edge_only_mask]
+    for row_index in np.flatnonzero(both_mask):
+        assembled[row_index] = GeometryCollection([area_geoms[row_index], edge_geoms[row_index]])
 
     clipped_partition = partition.copy(deep=not PANDAS_GE_30)
     if isinstance(clipped_partition, GeoDataFrame):
@@ -167,7 +184,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         return gdf_sub
 
     mask_owned = None
-
+    mask_many_vs_one_eligible = None
     def _clip_partition(partition, *, use_rect_fast_path=False):
         if (
             not clipping_by_rectangle
@@ -178,22 +195,42 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
 
         def _polygon_area_intersection_values(partition):
             from vibespatial.api.geometry_array import GeometryArray
+            from vibespatial.api.tools.overlay import _many_vs_one_intersection_owned
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
             )
             from vibespatial.geometry.owned import from_shapely_geometries
+            from vibespatial.overlay.bypass import _is_clip_polygon_sh_eligible
 
-            nonlocal mask_owned
+            nonlocal mask_many_vs_one_eligible, mask_owned
 
             values = partition.geometry.values if hasattr(partition, "geometry") else partition.values
             if mask_owned is None:
                 mask_owned = from_shapely_geometries([mask])
-            result_owned = binary_constructive_owned(
-                "intersection",
-                values.to_owned(),
-                mask_owned,
-                _prefer_exact_polygon_intersection=True,
-            )
+            if mask_many_vs_one_eligible is None:
+                mask_many_vs_one_eligible, _ = _is_clip_polygon_sh_eligible(mask_owned)
+            left_owned = values.to_owned()
+            if mask_many_vs_one_eligible:
+                try:
+                    result_owned = _many_vs_one_intersection_owned(
+                        left_owned,
+                        mask_owned,
+                        0,
+                    )
+                except Exception:
+                    result_owned = binary_constructive_owned(
+                        "intersection",
+                        left_owned,
+                        mask_owned,
+                        _prefer_exact_polygon_intersection=True,
+                    )
+            else:
+                result_owned = binary_constructive_owned(
+                    "intersection",
+                    left_owned,
+                    mask_owned,
+                    _prefer_exact_polygon_intersection=True,
+                )
             return GeometryArray.from_owned(result_owned, crs=partition.crs)
 
         if isinstance(partition, GeoDataFrame):
@@ -266,10 +303,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         parts.append(
             _clip_partition(
                 gdf_sub[multiline_mask],
-                use_rect_fast_path=(
-                    clipping_by_rectangle
-                    or rectangle_bounds is not None
-                ),
+                use_rect_fast_path=clipping_by_rectangle,
             )
         )
     if polygon_mask.any():
@@ -290,18 +324,30 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
     clipped = pd.concat(parts).loc[gdf_sub.index]
     if isinstance(clipped, GeoDataFrame):
         geom_name = clipped._geometry_column_name
+        geom_values = clipped[geom_name].values
         clipped = clipped.copy(deep=not PANDAS_GE_30)
-        clipped[geom_name] = GeoSeries(
-            _geometryarray_from_shapely(np.asarray(clipped[geom_name], dtype=object), crs=gdf.crs),
-            index=clipped.index,
-            crs=gdf.crs,
-        )
+        if isinstance(geom_values, GeometryArray | DeviceGeometryArray):
+            clipped[geom_name] = GeoSeries(
+                geom_values,
+                index=clipped.index,
+                crs=gdf.crs,
+            )
+        else:
+            clipped[geom_name] = GeoSeries(
+                _geometryarray_from_shapely(np.asarray(clipped[geom_name], dtype=object), crs=gdf.crs),
+                index=clipped.index,
+                crs=gdf.crs,
+            )
     else:
-        clipped = GeoSeries(
-            _geometryarray_from_shapely(np.asarray(clipped, dtype=object), crs=gdf.crs),
-            index=clipped.index,
-            crs=gdf.crs,
-        )
+        values = clipped.values
+        if isinstance(values, GeometryArray | DeviceGeometryArray):
+            clipped = GeoSeries(values, index=clipped.index, crs=gdf.crs)
+        else:
+            clipped = GeoSeries(
+                _geometryarray_from_shapely(np.asarray(clipped, dtype=object), crs=gdf.crs),
+                index=clipped.index,
+                crs=gdf.crs,
+            )
 
     clipped_geometry = clipped.geometry if isinstance(clipped, GeoDataFrame) else clipped
 
@@ -317,7 +363,46 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         if non_point_mask.any():
             poly_rows = clipped.geom_type.isin(POLYGON_GEOM_TYPES)
             if poly_rows.any():
-                keep = keep & ~(poly_rows & (clipped.geometry.area <= 0))
+                poly_mask = np.asarray(poly_rows, dtype=bool)
+                poly_values = np.asarray(clipped_geometry, dtype=object)[poly_mask]
+                nonpositive_area = np.asarray(
+                    shapely.area(poly_values),
+                    dtype=np.float64,
+                ) <= 0.0
+                if np.any(nonpositive_area):
+                    poly_keep = np.ones(poly_mask.sum(), dtype=bool)
+                    poly_keep[nonpositive_area] = False
+                    keep_array = np.asarray(keep, dtype=bool)
+                    keep_array[np.flatnonzero(poly_mask)] &= poly_keep
+                    keep = keep_array
+            line_rows = clipped.geom_type.isin(LINE_GEOM_TYPES)
+            if line_rows.any():
+                line_mask = np.asarray(line_rows, dtype=bool)
+                line_values = np.asarray(clipped_geometry, dtype=object)[line_mask]
+                degenerate_lines = np.asarray(
+                    shapely.length(line_values),
+                    dtype=np.float64,
+                ) == 0.0
+                if np.any(degenerate_lines):
+                    repaired_values = np.asarray(clipped_geometry, dtype=object).copy()
+                    repaired_values[np.flatnonzero(line_mask)[degenerate_lines]] = shapely.make_valid(
+                        line_values[degenerate_lines]
+                    )
+                    if isinstance(clipped, GeoDataFrame):
+                        geom_name = clipped._geometry_column_name
+                        clipped = clipped.copy(deep=not PANDAS_GE_30)
+                        clipped[geom_name] = GeoSeries(
+                            _geometryarray_from_shapely(repaired_values, crs=gdf.crs),
+                            index=clipped.index,
+                            crs=gdf.crs,
+                        )
+                    else:
+                        clipped = GeoSeries(
+                            _geometryarray_from_shapely(repaired_values, crs=gdf.crs),
+                            index=clipped.index,
+                            crs=gdf.crs,
+                        )
+                    clipped_geometry = clipped.geometry if isinstance(clipped, GeoDataFrame) else clipped
         clipped = clipped[keep]
     return clipped
 

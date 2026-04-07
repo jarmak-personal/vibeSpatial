@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 PRECOMPILE_ENV_VAR = "VIBESPATIAL_PRECOMPILE"
 _exact_polygon_intersection_warm_lock = threading.Lock()
 _exact_polygon_intersection_warm_done = False
+_many_vs_one_overlay_warm_lock = threading.Lock()
+_many_vs_one_overlay_warm_done = False
 
 
 def precompile_enabled() -> bool:
@@ -1105,6 +1107,7 @@ def ensure_pipelines_warm(timeout: float = 60.0) -> dict[str, Any]:
     if NVRTCPrecompiler._instance is not None:
         result["nvrtc_cold"] = NVRTCPrecompiler.get().ensure_warm(timeout=timeout)
     _warm_exact_polygon_intersection_route()
+    _warm_many_vs_one_overlay_remainder_route()
     return result
 
 
@@ -1159,6 +1162,64 @@ def _warm_exact_polygon_intersection_route() -> None:
             return
 
         _exact_polygon_intersection_warm_done = True
+
+
+def _warm_many_vs_one_overlay_remainder_route() -> None:
+    """Warm the N-vs-1 polygon overlay remainder route used by public overlay().
+
+    The public vegetation corridor workflow intersects many vegetation polygons
+    against a single dissolved corridor polygon. When the corridor is concave or
+    otherwise not eligible for SH clipping, ``_many_vs_one_intersection_owned``
+    falls into the exact overlay microcell route. That path uses a wider CCCL
+    surface area than the exact rowwise clip warm probe above, so prime it once
+    here to avoid paying first-use compilation inside benchmark timings.
+    """
+    global _many_vs_one_overlay_warm_done
+
+    with _many_vs_one_overlay_warm_lock:
+        if _many_vs_one_overlay_warm_done:
+            return
+
+        try:
+            from vibespatial.api.geoseries import GeoSeries
+            from vibespatial.api.tools.overlay import _many_vs_one_intersection_owned
+            from vibespatial.runtime import has_gpu_runtime
+            from vibespatial.runtime.residency import Residency, TransferTrigger
+
+            if not has_gpu_runtime():
+                return
+
+            left = GeoSeries.from_wkt(
+                [
+                    "POLYGON ((-1 1, 2 1, 2 4, -1 4, -1 1))",
+                    "POLYGON ((1 -1, 4 -1, 4 2, 1 2, 1 -1))",
+                    "POLYGON ((3 3, 6 3, 6 6, 3 6, 3 3))",
+                ],
+            ).values.to_owned()
+            right = GeoSeries.from_wkt(
+                [
+                    "POLYGON ((0 0, 6 0, 6 2, 2 2, 2 6, 0 6, 0 0))",
+                ],
+            ).values.to_owned()
+            left.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="warm many-vs-one overlay remainder route on device",
+            )
+            right.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="warm many-vs-one overlay remainder route on device",
+            )
+            _many_vs_one_intersection_owned(left, right, 0)
+        except Exception:
+            logger.debug(
+                "many-vs-one polygon overlay warm probe failed",
+                exc_info=True,
+            )
+            return
+
+        _many_vs_one_overlay_warm_done = True
 
 
 # Modules whose import triggers request_nvrtc_warmup() at module scope.

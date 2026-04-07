@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -117,6 +119,32 @@ def test_memory_pool_stats_no_backend_returns_empty() -> None:
     runtime._rmm_mr = None
     stats = runtime.memory_pool_stats()
     assert stats == {}
+
+
+def test_maybe_trim_pool_memory_skips_by_default(monkeypatch) -> None:
+    """Hot paths should not eagerly flush the pool unless explicitly enabled."""
+    import vibespatial.cuda._runtime as rt_mod
+
+    calls: list[str] = []
+    runtime = SimpleNamespace(free_pool_memory=lambda: calls.append("trim"))
+
+    monkeypatch.delenv("VIBESPATIAL_EAGER_GPU_POOL_TRIM", raising=False)
+    rt_mod.maybe_trim_pool_memory(runtime)
+
+    assert calls == []
+
+
+def test_maybe_trim_pool_memory_respects_env_opt_in(monkeypatch) -> None:
+    """The eager trim escape hatch should still call through when requested."""
+    import vibespatial.cuda._runtime as rt_mod
+
+    calls: list[str] = []
+    runtime = SimpleNamespace(free_pool_memory=lambda: calls.append("trim"))
+
+    monkeypatch.setenv("VIBESPATIAL_EAGER_GPU_POOL_TRIM", "1")
+    rt_mod.maybe_trim_pool_memory(runtime)
+
+    assert calls == ["trim"]
 
 
 # ---------------------------------------------------------------------------

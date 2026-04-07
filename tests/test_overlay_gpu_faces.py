@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, Polygon
 
 from vibespatial import (
     ExecutionMode,
@@ -13,6 +13,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.runtime.hotpath_trace import get_hotpath_trace, reset_hotpath_trace
 
 
 def _build_face_table(left_geometries, right_geometries):
@@ -119,3 +120,28 @@ def test_gpu_face_labels_include_overlap_band_for_collinear_rectangle_overlap() 
         if int(bounded_value) != 0
     }
     assert labels == {(1, 0), (1, 1), (0, 1)}
+
+
+@pytest.mark.gpu
+def test_gpu_face_coverage_trace_accounts_for_mixed_family_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left_polygon = Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)])
+    left_multi = MultiPolygon(
+        [
+            Polygon([(5, 0), (7, 0), (7, 2), (5, 2), (5, 0)]),
+            Polygon([(5, 3), (7, 3), (7, 5), (5, 5), (5, 3)]),
+        ]
+    )
+    right_polygon = Polygon([(2, -1), (6, -1), (6, 6), (2, 6), (2, -1)])
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+
+    _build_face_table([left_polygon, left_multi], [right_polygon])
+    trace_names = [stage.name for stage in get_hotpath_trace()]
+
+    assert "overlay.faces.coverage.left.mixed_family_overlap" in trace_names

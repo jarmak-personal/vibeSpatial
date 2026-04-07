@@ -22,6 +22,22 @@ def test_upstream_request_prioritizes_vendored_tests() -> None:
     assert "uv run pytest --collect-only tests/upstream/geopandas" in plan["verify"]
 
 
+def test_precompile_request_routes_to_cccl_precompile_surface() -> None:
+    plan = plan_request("precompile_all")
+
+    file_paths = {entry["path"] for entry in plan["files"]}
+
+    assert "src/vibespatial/cuda/cccl_precompile.py" in file_paths
+
+
+def test_overlay_keep_geom_type_request_routes_to_public_overlay_surface() -> None:
+    plan = plan_request("overlay function keep_geom_type")
+
+    file_paths = {entry["path"] for entry in plan["files"]}
+
+    assert "src/vibespatial/api/tools/overlay.py" in file_paths
+
+
 def test_generated_docs_are_current() -> None:
     assert evaluate_doc_headers(write=False)["outdated"] == []
     # Intake index freshness is enforced locally by the pre-commit hook,

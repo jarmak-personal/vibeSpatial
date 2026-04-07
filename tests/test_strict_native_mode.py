@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +11,7 @@ from shapely.geometry import LineString, Point, Polygon, box
 
 import vibespatial
 from benchmarks.shootout._data import setup_fixtures
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime.fallbacks import (
@@ -367,6 +370,221 @@ def test_strict_clip_concave_polygon_mask_drops_bbox_false_positives() -> None:
     assert result.index.to_numpy().tolist() == expected_index.tolist()
     actual = shapely.normalize(np.asarray(result.geometry.values, dtype=object))
     assert np.asarray(shapely.equals(actual, expected_norm), dtype=bool).tolist() == [True] * len(expected_norm)
+
+
+@pytest.mark.gpu
+def test_strict_clip_polygon_mask_uses_many_vs_one_intersection_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_gpu_runtime()
+    buildings = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
+        crs="EPSG:3857",
+    )
+    admin = vibespatial.GeoDataFrame(
+        {
+            "geometry": [
+                Polygon(
+                    [
+                        (1.0, 1.0),
+                        (12.0, 2.0),
+                        (11.0, 12.0),
+                        (2.0, 11.0),
+                        (1.0, 1.0),
+                    ]
+                )
+            ]
+        },
+        crs="EPSG:3857",
+    )
+
+    overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
+
+    called = False
+    original = overlay_module._many_vs_one_intersection_owned
+
+    def _wrapped_many_vs_one(*args, **kwargs):
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_many_vs_one_intersection_owned",
+        _wrapped_many_vs_one,
+    )
+
+    with strict_native_environment():
+        result = vibespatial.clip(buildings, admin)
+
+    assert called
+    assert len(result) == 2
+
+
+@pytest.mark.gpu
+def test_strict_clip_concave_polygon_mask_skips_many_vs_one_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_gpu_runtime()
+    buildings = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
+        crs="EPSG:3857",
+    )
+    admin = vibespatial.GeoDataFrame(
+        {
+            "geometry": [
+                Polygon(
+                    [
+                        (0.0, 0.0),
+                        (12.0, 0.0),
+                        (12.0, 4.0),
+                        (4.0, 4.0),
+                        (4.0, 12.0),
+                        (0.0, 12.0),
+                        (0.0, 0.0),
+                    ]
+                )
+            ]
+        },
+        crs="EPSG:3857",
+    )
+
+    overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
+
+    called = False
+    original = overlay_module._many_vs_one_intersection_owned
+
+    def _wrapped_many_vs_one(*args, **kwargs):
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_many_vs_one_intersection_owned",
+        _wrapped_many_vs_one,
+    )
+
+    with strict_native_environment():
+        result = vibespatial.clip(buildings, admin)
+
+    assert not called
+    assert len(result) == 1
+
+
+@pytest.mark.gpu
+def test_strict_clip_polygon_mask_preserves_geometry_array_after_concat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_gpu_runtime()
+    buildings = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
+        crs="EPSG:3857",
+    )
+    admin = vibespatial.GeoDataFrame(
+        {"geometry": [box(1.0, 1.0, 12.0, 12.0)]},
+        crs="EPSG:3857",
+    )
+
+    clip_module = importlib.import_module("vibespatial.api.tools.clip")
+
+    called = False
+    original = clip_module._geometryarray_from_shapely
+
+    def _wrapped_from_shapely(*args, **kwargs):
+        nonlocal called
+        called = True
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        clip_module,
+        "_geometryarray_from_shapely",
+        _wrapped_from_shapely,
+    )
+
+    with strict_native_environment():
+        result = vibespatial.clip(buildings, admin)
+
+    assert not called
+    assert isinstance(result.geometry.values, GeometryArray | DeviceGeometryArray)
+
+
+@pytest.mark.gpu
+def test_strict_clip_rectangular_polygon_mask_keeps_exact_polygon_semantics() -> None:
+    _require_gpu_runtime()
+    source = vibespatial.GeoSeries(
+        [LineString([(-1.0, -1.0), (0.0, 0.0)])],
+        crs="EPSG:3857",
+    )
+    mask = Polygon([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)])
+
+    with strict_native_environment():
+        result = vibespatial.clip(source, mask)
+
+    assert len(result) == 1
+    assert result.iloc[0].geom_type == "Point"
+    assert result.iloc[0].equals(Point(0.0, 0.0))
+
+
+@pytest.mark.gpu
+def test_strict_clip_box_skips_internal_geoseries_area_warning() -> None:
+    _require_gpu_runtime()
+    buildings = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
+        crs="EPSG:4326",
+    )
+    mask = box(1.0, 1.0, 12.0, 12.0)
+
+    with strict_native_environment():
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = vibespatial.clip(buildings, mask)
+
+    messages = [str(entry.message) for entry in caught]
+    assert not any("Results from 'area' are likely incorrect" in message for message in messages)
+    assert len(result) == 2
+
+
+@pytest.mark.gpu
+def test_strict_overlay_polygon_query_requests_device_indices(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _require_gpu_runtime()
+    left = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
+        crs="EPSG:3857",
+    )
+    right = vibespatial.GeoDataFrame(
+        {"geometry": [box(1.0, 1.0, 12.0, 12.0)]},
+        crs="EPSG:3857",
+    )
+
+    sindex_module = importlib.import_module("vibespatial.api.sindex")
+    overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
+    original_query = sindex_module.SpatialIndex.query
+    seen_return_device = []
+
+    def _wrapped_query(self, geometry, *args, **kwargs):
+        seen_return_device.append(kwargs.get("return_device", False))
+        return original_query(self, geometry, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sindex_module.SpatialIndex,
+        "query",
+        _wrapped_query,
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "_OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS",
+        0,
+    )
+
+    with strict_native_environment():
+        result = vibespatial.overlay(left, right, how="intersection")
+
+    assert seen_return_device
+    assert any(seen_return_device)
+    assert len(result) == 2
 
 
 @pytest.mark.gpu
