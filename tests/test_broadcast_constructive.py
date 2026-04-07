@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import MultiPoint, Point, box
+from shapely.geometry import MultiPoint, MultiPolygon, Point, box
 
 from benchmarks.shootout._data import setup_fixtures
 from vibespatial.api import read_file
@@ -796,6 +796,98 @@ def test_polygon_intersection_single_pair_uses_same_row_candidate_fast_path(
     summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
     assert summary.get("segment.candidates.same_row_fast_path") == 1
     assert "segment.candidates.binary_search" not in summary
+
+
+@requires_gpu
+def test_multipolygon_polygon_intersection_regroups_with_grouped_union_plan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left = from_shapely_geometries(
+        [
+            MultiPolygon(
+                [
+                    box(0, 0, 2, 2),
+                    box(4, 0, 6, 2),
+                ]
+            ),
+            MultiPolygon(
+                [
+                    box(10, 0, 12, 2),
+                    box(14, 0, 16, 2),
+                ]
+            ),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 0, 5, 2),
+            box(11, 0, 12, 2),
+        ]
+    )
+
+    overlay_gpu_module = importlib.import_module("vibespatial.overlay.gpu")
+    segmented_union_module = importlib.import_module(
+        "vibespatial.kernels.constructive.segmented_union"
+    )
+
+    original_materialize = overlay_gpu_module._materialize_overlay_execution_plan
+    original_segmented_union_all = segmented_union_module.segmented_union_all
+    union_materialize_calls = 0
+    segmented_union_calls = 0
+
+    def _counted_materialize(*args, **kwargs):
+        nonlocal union_materialize_calls
+        if kwargs.get("operation") == "union":
+            union_materialize_calls += 1
+        return original_materialize(*args, **kwargs)
+
+    def _counted_segmented_union_all(*args, **kwargs):
+        nonlocal segmented_union_calls
+        segmented_union_calls += 1
+        return original_segmented_union_all(*args, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_gpu_module,
+        "_materialize_overlay_execution_plan",
+        _counted_materialize,
+    )
+    monkeypatch.setattr(
+        segmented_union_module,
+        "segmented_union_all",
+        _counted_segmented_union_all,
+    )
+
+    with strict_native_environment():
+        result = binary_constructive_owned(
+            "intersection",
+            left,
+            right,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+
+    got = result.to_shapely()
+    expected = shapely.intersection(
+        np.asarray(left.to_shapely(), dtype=object),
+        np.asarray(right.to_shapely(), dtype=object),
+    ).tolist()
+
+    assert len(got) == len(expected) == 2
+    for row, (got_geom, expected_geom) in enumerate(zip(got, expected, strict=True)):
+        if expected_geom is None:
+            assert got_geom is None, f"row {row}: expected null"
+            continue
+        if shapely.is_empty(expected_geom):
+            assert got_geom is None or shapely.is_empty(got_geom), (
+                f"row {row}: expected empty or null, got {got_geom}"
+            )
+            continue
+        assert got_geom is not None
+        assert shapely.normalize(got_geom).equals(shapely.normalize(expected_geom)), (
+            f"row {row}: regrouped multipart intersection mismatch"
+        )
+
+    assert union_materialize_calls == 1
+    assert segmented_union_calls == 0
 
 
 

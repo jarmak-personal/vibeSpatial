@@ -1660,6 +1660,289 @@ def test_overlay_intersection_many_vs_one_fast_path_retries_after_first_failure(
     assert list(result["col1"]) == [1, 2]
 
 
+def test_overlay_intersection_few_right_fast_path_groups_by_right(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    left = GeoDataFrame(
+        {"col1": np.arange(24, dtype=np.int32)},
+        geometry=GeoSeries([box(i, 0, i + 1, 1) for i in range(24)]),
+    )
+    right = GeoDataFrame(
+        {"zone_type": ["A", "B", "C"]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 16, 2),
+                box(8, 0, 24, 2),
+                box(16, 0, 32, 2),
+            ]
+        ),
+    )
+    left_owned = left.geometry.values.to_owned()
+    right_owned = right.geometry.values.to_owned()
+    idx1 = np.arange(24, dtype=np.int32)
+    idx2 = np.repeat(np.arange(3, dtype=np.int32), 8)
+
+    prepare_calls: list[tuple[int, int]] = []
+    exact_calls: list[int] = []
+
+    def _fake_prepare(left_arg, right_arg, right_row, *, global_positions):
+        prepare_calls.append((int(right_row), left_arg.row_count))
+        quick_positions = np.asarray(global_positions[:6], dtype=np.intp)
+        quick_geoms = [
+            box(float(right_row * 100 + i), 0.0, float(right_row * 100 + i + 0.5), 0.5)
+            for i in range(6)
+        ]
+        complex_left = from_shapely_geometries(
+            [
+                box(float(1000 + right_row * 10 + i), 0.0, float(1000 + right_row * 10 + i + 0.5), 0.5)
+                for i in range(2)
+            ],
+            residency=Residency.DEVICE,
+        )
+        return (
+            [
+                (
+                    quick_positions,
+                    from_shapely_geometries(quick_geoms, residency=Residency.DEVICE),
+                )
+            ],
+            complex_left,
+            np.asarray(global_positions[6:], dtype=np.intp),
+            right_arg.take(np.asarray([right_row], dtype=np.intp)),
+            ExecutionMode.GPU,
+        )
+
+    def _fake_rowwise_exact(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
+        exact_calls.append(left_arg.row_count)
+        geoms = [
+            box(float(5000 + i), 0.0, float(5000 + i + 0.5), 0.5)
+            for i in range(left_arg.row_count)
+        ]
+        return from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_prepare_many_vs_one_intersection_chunks",
+        _fake_prepare,
+    )
+    monkeypatch.setattr(
+        constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        _fake_rowwise_exact,
+    )
+    monkeypatch.setattr(
+        constructive_module,
+        "binary_constructive_owned",
+        lambda *args, **kwargs: pytest.fail(
+            "few-right public intersection should fuse exact leftovers "
+            "through the rowwise helper"
+        ),
+    )
+
+    result, used_owned = overlay_module._overlay_intersection(
+        left,
+        right,
+        left_owned=left_owned,
+        right_owned=right_owned,
+        _prefer_exact_polygon_gpu=True,
+        _index_result=(idx1, idx2),
+    )
+
+    assert used_owned is True
+    assert prepare_calls == [(0, 8), (1, 8), (2, 8)]
+    assert exact_calls == [6]
+    assert result["col1"].tolist() == idx1.tolist()
+    assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
+    expected = [
+        box(float(group * 100 + local), 0.0, float(group * 100 + local + 0.5), 0.5)
+        if local < 6
+        else box(
+            float(5000 + group * 2 + (local - 6)),
+            0.0,
+            float(5000 + group * 2 + (local - 6) + 0.5),
+            0.5,
+        )
+        for group in range(3)
+        for local in range(8)
+    ]
+    for got_geom, expected_geom in zip(result.geometry, expected, strict=True):
+        assert got_geom.normalize().equals(expected_geom.normalize())
+
+
+def test_overlay_intersection_few_right_skips_non_polygon_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    left = GeoDataFrame(
+        {"col1": np.arange(24, dtype=np.int32)},
+        geometry=GeoSeries([Point(float(i), 0.0) for i in range(24)]),
+    )
+    right = GeoDataFrame(
+        {"zone_type": ["A", "B", "C"]},
+        geometry=GeoSeries(
+            [
+                box(-1, -1, 8, 1),
+                box(7, -1, 16, 1),
+                box(15, -1, 24, 1),
+            ]
+        ),
+    )
+    left_owned = left.geometry.values.to_owned()
+    right_owned = right.geometry.values.to_owned()
+    idx1 = np.arange(24, dtype=np.int32)
+    idx2 = np.repeat(np.arange(3, dtype=np.int32), 8)
+
+    binary_calls: list[int] = []
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_few_right_intersection_owned",
+        lambda *args, **kwargs: pytest.fail(
+            "few-right polygon shortcut must not run for non-polygon inputs"
+        ),
+    )
+
+    def _fake_binary(op, left_arg, right_arg, **kwargs):
+        assert op == "intersection"
+        binary_calls.append(left_arg.row_count)
+        return left_arg
+
+    monkeypatch.setattr(
+        constructive_module,
+        "binary_constructive_owned",
+        _fake_binary,
+    )
+
+    result, used_owned = overlay_module._overlay_intersection(
+        left,
+        right,
+        left_owned=left_owned,
+        right_owned=right_owned,
+        _prefer_exact_polygon_gpu=True,
+        _index_result=(idx1, idx2),
+    )
+
+    assert used_owned is True
+    assert binary_calls == [24]
+    assert result["col1"].tolist() == idx1.tolist()
+    assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
+
+
+def test_overlay_intersection_few_right_fallback_preserves_exact_polygon_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.constructive import binary_constructive as constructive_module
+
+    left = GeoDataFrame(
+        {"col1": np.arange(24, dtype=np.int32)},
+        geometry=GeoSeries([box(i, 0, i + 1, 1) for i in range(24)]),
+    )
+    right = GeoDataFrame(
+        {"zone_type": ["A", "B", "C"]},
+        geometry=GeoSeries(
+            [
+                box(0, 0, 16, 2),
+                box(8, 0, 24, 2),
+                box(16, 0, 32, 2),
+            ]
+        ),
+    )
+    left_owned = left.geometry.values.to_owned()
+    right_owned = right.geometry.values.to_owned()
+    idx1 = np.arange(24, dtype=np.int32)
+    idx2 = np.repeat(np.arange(3, dtype=np.int32), 8)
+
+    def _fake_prepare(left_arg, right_arg, right_row, *, global_positions):
+        quick_positions = np.asarray(global_positions[:6], dtype=np.intp)
+        quick_geoms = [
+            box(float(right_row * 100 + i), 0.0, float(right_row * 100 + i + 0.5), 0.5)
+            for i in range(6)
+        ]
+        complex_left = from_shapely_geometries(
+            [
+                box(
+                    float(1000 + right_row * 10 + i),
+                    0.0,
+                    float(1000 + right_row * 10 + i + 0.5),
+                    0.5,
+                )
+                for i in range(2)
+            ],
+            residency=Residency.DEVICE,
+        )
+        return (
+            [
+                (
+                    quick_positions,
+                    from_shapely_geometries(quick_geoms, residency=Residency.DEVICE),
+                )
+            ],
+            complex_left,
+            np.asarray(global_positions[6:], dtype=np.intp),
+            right_arg.take(np.asarray([right_row], dtype=np.intp)),
+            ExecutionMode.GPU,
+        )
+
+    fallback_calls: list[tuple[int, bool]] = []
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_prepare_many_vs_one_intersection_chunks",
+        _fake_prepare,
+    )
+    monkeypatch.setattr(
+        constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        lambda *args, **kwargs: None,
+    )
+
+    def _fake_binary(op, left_arg, right_arg, **kwargs):
+        assert op == "intersection"
+        fallback_calls.append(
+            (
+                left_arg.row_count,
+                bool(kwargs.get("_prefer_exact_polygon_intersection")),
+            )
+        )
+        geoms = [
+            box(float(5000 + i), 0.0, float(5000 + i + 0.5), 0.5)
+            for i in range(left_arg.row_count)
+        ]
+        return from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+    monkeypatch.setattr(
+        constructive_module,
+        "binary_constructive_owned",
+        _fake_binary,
+    )
+
+    result, used_owned = overlay_module._overlay_intersection(
+        left,
+        right,
+        left_owned=left_owned,
+        right_owned=right_owned,
+        _prefer_exact_polygon_gpu=True,
+        _index_result=(idx1, idx2),
+    )
+
+    assert used_owned is True
+    assert fallback_calls == [(6, True)]
+    assert result["col1"].tolist() == idx1.tolist()
+    assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
+
+
 def test_overlay_difference_survives_strict_native_mode_for_small_overlap_polygons() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")

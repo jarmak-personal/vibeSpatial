@@ -201,10 +201,8 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
                 )
                 return False
 
-            # Vectorized ring-count check: rings_per_row = geom_offsets[1:] - geom_offsets[:-1]
             rings_per_row = np.diff(geom_offsets)
 
-            # Check for holes (any polygon with >1 ring)
             if np.any(rings_per_row > 1):
                 logger.debug(
                     "SH kernel skip: %s polygon has rows with holes "
@@ -219,8 +217,6 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
                 )
                 return False
 
-            # Vectorized vertex-count check for exterior rings.
-            # first_ring_idx is geom_offsets[:-1] for rows with at least 1 ring.
             has_rings = rings_per_row > 0
             if not np.any(has_rings):
                 continue
@@ -761,34 +757,122 @@ def _dispatch_multipolygon_polygon_intersection_gpu(
 
     valid_parts = part_result.take(d_valid_parts)
     d_valid_source_rows = d_source_rows[d_valid_parts].astype(cp.int64, copy=False)
+    return _regroup_intersection_parts_with_grouped_union_gpu(
+        valid_parts,
+        d_valid_source_rows,
+        output_row_count=left.row_count,
+        dispatch_mode=dispatch_mode,
+    )
 
-    _sync_hotpath()
-    with hotpath_stage("constructive.intersection.multipart_group_offsets", category="setup"):
-        d_counts = cp.bincount(
-            d_valid_source_rows,
-            minlength=left.row_count,
-        ).astype(cp.int64, copy=False)
-        d_group_offsets = cp.empty(left.row_count + 1, dtype=cp.int64)
-        d_group_offsets[0] = 0
-        cp.cumsum(d_counts, out=d_group_offsets[1:])
-    _sync_hotpath()
 
-    from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+def _regroup_intersection_parts_with_grouped_union_gpu(
+    valid_parts: OwnedGeometryArray,
+    d_valid_source_rows: DeviceArray,
+    *,
+    output_row_count: int,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Regroup multipart intersection pieces with one grouped overlay union plan.
 
-    _sync_hotpath()
-    with hotpath_stage("constructive.intersection.multipart_union", category="refine"):
-        regrouped = segmented_union_all(valid_parts, cp.asnumpy(d_group_offsets))
-    _sync_hotpath()
-    if regrouped.row_count != left.row_count:
+    Each original multipolygon row contributes one or more polygonal
+    intersection fragments in ``valid_parts``. The correct high-performance
+    shape is:
+
+    - choose one seed fragment per non-empty source row
+    - group all remaining fragments by that same source row
+    - run one row-isolated overlay union plan across the full grouped batch
+
+    This replaces the previous ``segmented_union_all`` tree reduction, which
+    split back into many single-row pairwise union overlay executions.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         return None
 
-    d_nonempty_rows = cp.flatnonzero(d_counts > 0).astype(cp.int64, copy=False)
-    if int(d_nonempty_rows.size) == 0:
-        return _empty_device_constructive_output(left.row_count)
+    from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+    from vibespatial.overlay.gpu import (
+        _build_overlay_execution_plan,
+        _materialize_overlay_execution_plan,
+    )
 
-    compact = regrouped.take(d_nonempty_rows)
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_group_counts", category="setup"):
+        d_counts = cp.bincount(
+            d_valid_source_rows,
+            minlength=output_row_count,
+        ).astype(cp.int64, copy=False)
+        d_nonempty_rows = cp.flatnonzero(d_counts > 0).astype(cp.int64, copy=False)
+    _sync_hotpath()
+    if int(d_nonempty_rows.size) == 0:
+        return _empty_device_constructive_output(output_row_count)
+
+    d_group_counts = d_counts[d_nonempty_rows]
+    d_seed_positions = cp.cumsum(d_group_counts, dtype=cp.int64) - d_group_counts
+    seed_parts = valid_parts.take(d_seed_positions)
+    compact: OwnedGeometryArray | None = None
+
+    if int(valid_parts.row_count) == int(seed_parts.row_count):
+        compact = seed_parts
+    else:
+        d_rest_counts = d_group_counts - 1
+        _sync_hotpath()
+        with hotpath_stage("constructive.intersection.multipart_union.group_rows", category="setup"):
+            d_rest_offsets = cp.empty(d_rest_counts.size + 1, dtype=cp.int64)
+            d_rest_offsets[0] = 0
+            cp.cumsum(d_rest_counts, out=d_rest_offsets[1:])
+            rest_total = int(d_rest_offsets[-1])
+            d_rest_positions = cp.arange(rest_total, dtype=cp.int64)
+            d_rest_group_ids = (
+                cp.searchsorted(d_rest_offsets, d_rest_positions, side="right").astype(cp.int64)
+                - 1
+            )
+            d_rest_positions = (
+                d_rest_positions
+                - d_rest_offsets[d_rest_group_ids].astype(cp.int64, copy=False)
+                + d_seed_positions[d_rest_group_ids].astype(cp.int64, copy=False)
+                + 1
+            )
+            rest_parts = valid_parts.take(d_rest_positions)
+            d_right_group_rows = d_rest_group_ids.astype(cp.int32, copy=False)
+        _sync_hotpath()
+        try:
+            _sync_hotpath()
+            with hotpath_stage("constructive.intersection.multipart_union.plan.build", category="setup"):
+                plan = _build_overlay_execution_plan(
+                    seed_parts,
+                    rest_parts,
+                    dispatch_mode=dispatch_mode,
+                    _cached_right_segments=None,
+                    _row_isolated=True,
+                    _right_geometry_source_rows=d_right_group_rows,
+                )
+            _sync_hotpath()
+            with hotpath_stage("constructive.intersection.multipart_union.plan.materialize", category="refine"):
+                compact, _selected = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="union",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=seed_parts.row_count,
+                )
+            _sync_hotpath()
+        except Exception:
+            logger.debug(
+                "grouped multipart intersection union failed; "
+                "falling back to segmented_union_all",
+                exc_info=True,
+            )
+            d_group_offsets = cp.empty(d_group_counts.size + 1, dtype=cp.int64)
+            d_group_offsets[0] = 0
+            cp.cumsum(d_group_counts, out=d_group_offsets[1:])
+            _sync_hotpath()
+            with hotpath_stage("constructive.intersection.multipart_union.fallback", category="refine"):
+                compact = segmented_union_all(valid_parts, cp.asnumpy(d_group_offsets))
+            _sync_hotpath()
+
+    if compact is None or compact.row_count != int(d_nonempty_rows.size):
+        return None
+
     return device_concat_owned_scatter(
-        _empty_device_constructive_output(left.row_count),
+        _empty_device_constructive_output(output_row_count),
         compact,
         d_nonempty_rows,
     )

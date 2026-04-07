@@ -34,6 +34,8 @@ from vibespatial.spatial.query_types import DeviceSpatialJoinResult
 logger = logging.getLogger(__name__)
 
 _OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS = 262_144
+_OVERLAY_FEW_RIGHT_GROUP_MAX = 64
+_OVERLAY_FEW_RIGHT_GROUP_MIN_AVG = 8.0
 _SHAPELY_TYPE_ID_POLYGON = 3
 _SHAPELY_TYPE_ID_MULTIPOLYGON = 6
 _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION = 7
@@ -1074,144 +1076,15 @@ def _many_vs_one_intersection_owned(
     from vibespatial.constructive.binary_constructive import (
         binary_constructive_owned,
     )
-    from vibespatial.runtime.residency import Residency
 
-    n_pairs = left_sub.row_count
-    _pairwise_mode = plan_dispatch_selection(
-        kernel_name="overlay_pairwise",
-        kernel_class=KernelClass.CONSTRUCTIVE,
-        row_count=n_pairs,
+    index_oga_pairs, complex_left, complex_global_positions, right_one, _pairwise_mode = (
+        _prepare_many_vs_one_intersection_chunks(
+            left_sub,
+            right_owned,
+            unique_right_idx,
+            global_positions=np.arange(left_sub.row_count, dtype=np.intp),
+        )
     )
-    _pairwise_mode = (
-        ExecutionMode.GPU
-        if (
-            strict_native_mode_enabled()
-            or left_sub.residency is Residency.DEVICE
-        )
-        else _pairwise_mode.selected
-    )
-
-    # Build the single-row right OGA for containment bypass / SH clip.
-    right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
-
-    # ---- Tier 1: Containment bypass (GPU vertex-in-polygon) ----
-    # Identifies left polygons fully inside the right polygon.
-    _contained_result = None
-    _remainder_mask = None
-
-    try:
-        import cupy as _cp_local
-    except ModuleNotFoundError:
-        _cp_local = None
-
-    if _cp_local is not None:
-        try:
-            from vibespatial.overlay.bypass import _containment_bypass_gpu
-
-            _contained_result, _remainder_mask = _containment_bypass_gpu(
-                left_sub, right_one, "intersection",
-            )
-        except Exception:
-            _contained_result = None
-            _remainder_mask = None
-
-    if _contained_result is not None and _remainder_mask is None:
-        # All polygons are fully contained -- return left_sub as-is.
-        record_dispatch_event(
-            surface="geopandas.overlay.intersection",
-            operation="many_vs_one_containment_bypass",
-            implementation="gpu_containment_bypass_all",
-            reason=(
-                f"many-vs-one: all {n_pairs} polygons fully inside "
-                "right polygon (containment bypass)"
-            ),
-        )
-        return _contained_result
-
-    # Determine which rows are contained vs remainder.
-    d_contained_indices = None
-    d_remainder_indices = None
-    contained_indices = None
-    remainder_indices = None
-
-    if _remainder_mask is not None:
-        # Keep the partition on device through the expensive overlay work and
-        # only materialize host indices if we actually need a mixed-chunk
-        # reassembly at the end.
-        d_contained_indices = _cp_local.flatnonzero(~_remainder_mask).astype(
-            _cp_local.int64, copy=False,
-        )
-        d_remainder_indices = _cp_local.flatnonzero(_remainder_mask).astype(
-            _cp_local.int64, copy=False,
-        )
-        n_contained = int(d_contained_indices.size)
-        n_remainder = int(d_remainder_indices.size)
-    else:
-        # No containment bypass (no GPU or bypass failed) -- all need overlay.
-        contained_indices = np.asarray([], dtype=np.intp)
-        remainder_indices = np.arange(n_pairs, dtype=np.intp)
-        n_contained = 0
-        n_remainder = len(remainder_indices)
-
-    record_dispatch_event(
-        surface="geopandas.overlay.intersection",
-        operation="many_vs_one_containment_bypass",
-        implementation=(
-            "gpu_containment_bypass" if n_contained > 0 else "skipped"
-        ),
-        reason=(
-            f"many-vs-one: {n_contained}/{n_pairs} polygons fully inside "
-            f"right polygon, {n_remainder} need overlay"
-        ),
-    )
-
-    # Release GPU pool memory after containment bypass: bounds check + PIP
-    # can produce large intermediates that are no longer needed.
-    from vibespatial.cuda._runtime import maybe_trim_pool_memory
-
-    maybe_trim_pool_memory()
-
-    if n_remainder == 0:
-        # Should not happen (handled above), but be safe.
-        return _contained_result
-
-    # Subset left_sub to remainder rows only.
-    if d_remainder_indices is not None:
-        left_remainder = left_sub.take(d_remainder_indices)
-    else:
-        left_remainder = left_sub.take(remainder_indices)
-
-    # ---- Tier 2: SH batch clip for simple boundary-crossing polygons ----
-    sh_clip_result = None
-    sh_eligible_mask = None
-    sh_remainder_indices_local = None  # indices into left_remainder
-
-    if _cp_local is not None and left_remainder.row_count > 0:
-        try:
-            from vibespatial.overlay.bypass import (
-                _batched_sh_clip,
-                _classify_remainder_sh_eligible,
-                _is_clip_polygon_sh_eligible,
-            )
-
-            clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_one)
-            if clip_eligible:
-                sh_eligible_mask_arr, _complex_mask = _classify_remainder_sh_eligible(
-                    left_remainder, clip_vert_count,
-                )
-                n_sh = int(sh_eligible_mask_arr.sum())
-                if n_sh > 0:
-                    sh_clip_result = _batched_sh_clip(
-                        left_remainder, right_one, sh_eligible_mask_arr,
-                    )
-                    if sh_clip_result is not None:
-                        sh_eligible_mask = sh_eligible_mask_arr
-                        sh_remainder_indices_local = np.flatnonzero(
-                            ~sh_eligible_mask_arr
-                        )
-        except Exception:
-            sh_clip_result = None
-            sh_eligible_mask = None
 
     # ---- Tier 3: Overlay for remaining boundary-crossing polygons ----
     # After containment bypass and SH batch clip, only a small number of
@@ -1284,22 +1157,9 @@ def _many_vs_one_intersection_owned(
             return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
         return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
 
-    if sh_clip_result is not None and sh_eligible_mask is not None:
-        # Some polygons were SH-clipped; overlay only the complex remainder.
-        if len(sh_remainder_indices_local) > 0:
-            if _cp_local is not None:
-                d_complex = _cp_local.asarray(
-                    sh_remainder_indices_local,
-                ).astype(_cp_local.int64)
-                left_complex = left_remainder.take(d_complex)
-            else:
-                left_complex = left_remainder.take(sh_remainder_indices_local)
-            complex_result = _remainder_intersection(left_complex, right_one)
-        else:
-            complex_result = None
-    else:
-        # No SH clip -- overlay all remainder rows.
-        complex_result = _remainder_intersection(left_remainder, right_one)
+    complex_result = None
+    if complex_left is not None and complex_global_positions is not None:
+        complex_result = _remainder_intersection(complex_left, right_one)
 
     # Release GPU pool memory after overlay on remainder polygons: SH clip
     # and per-pair GPU overlay produce large intermediates that are dead now.
@@ -1307,84 +1167,300 @@ def _many_vs_one_intersection_owned(
 
     maybe_trim_pool_memory()
 
-    # ---- Reassemble results in original pair order ----
-    # Build a result array with one geometry per pair in the original order.
-    # contained_indices -> left_sub geometry (identity)
-    # remainder with SH clip -> sh_clip_result (in SH eligible order)
-    # remainder without SH clip -> complex_result (in complex order)
-    from vibespatial.geometry.owned import OwnedGeometryArray
+    if complex_result is not None and complex_global_positions is not None:
+        index_oga_pairs.append((complex_global_positions, complex_result))
 
-    def _host_index_array(indices):
-        if indices is None:
-            return None
-        if _cp_local is not None and hasattr(indices, "__cuda_array_interface__"):
-            return _cp_local.asnumpy(indices).astype(np.intp, copy=False)
-        return np.asarray(indices, dtype=np.intp)
+    return _assemble_indexed_owned_chunks(index_oga_pairs, left_sub.row_count)
 
-    # Track (global_indices, oga) for each chunk to enable correct ordering.
-    index_oga_pairs: list[tuple[np.ndarray, OwnedGeometryArray]] = []
 
-    if n_contained > 0 and _contained_result is not None:
-        contained_host = _host_index_array(d_contained_indices)
-        if contained_host is None:
-            contained_host = contained_indices
-        index_oga_pairs.append((contained_host, _contained_result))
-
-    if sh_clip_result is not None and sh_eligible_mask is not None:
-        # SH clip results correspond to the SH-eligible rows of left_remainder.
-        sh_eligible_local = np.flatnonzero(sh_eligible_mask).astype(np.int64, copy=False)
-        if d_remainder_indices is not None:
-            d_sh_eligible_local = _cp_local.asarray(sh_eligible_local).astype(
-                _cp_local.int64, copy=False,
-            )
-            sh_global = _host_index_array(d_remainder_indices[d_sh_eligible_local])
-        else:
-            sh_global = remainder_indices[sh_eligible_local]
-        index_oga_pairs.append((sh_global, sh_clip_result))
-
-        if complex_result is not None and sh_remainder_indices_local is not None:
-            if d_remainder_indices is not None:
-                d_complex_local = _cp_local.asarray(
-                    sh_remainder_indices_local,
-                ).astype(_cp_local.int64, copy=False)
-                complex_global = _host_index_array(d_remainder_indices[d_complex_local])
-            else:
-                complex_global = remainder_indices[sh_remainder_indices_local]
-            index_oga_pairs.append((complex_global, complex_result))
-    elif complex_result is not None:
-        remainder_host = _host_index_array(d_remainder_indices)
-        if remainder_host is None:
-            remainder_host = remainder_indices
-        index_oga_pairs.append((remainder_host, complex_result))
+def _assemble_indexed_owned_chunks(index_oga_pairs, row_count: int):
+    """Concatenate owned chunks and restore original row order."""
+    from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 
     if not index_oga_pairs:
-        # Edge case: no results at all.
-        from vibespatial.geometry.owned import from_shapely_geometries
-
         empty = from_shapely_geometries([shapely.Point()])
         return empty.take(np.asarray([], dtype=np.int64))
 
     if len(index_oga_pairs) == 1:
-        # Only one chunk -- check if it covers all pairs in order.
         indices, oga = index_oga_pairs[0]
-        if len(indices) == n_pairs and np.array_equal(
-            indices, np.arange(n_pairs),
-        ):
+        if len(indices) == row_count and np.array_equal(indices, np.arange(row_count)):
             return oga
 
-    # Multiple chunks or non-trivial ordering: concat and reorder.
-    # Build a permutation array: result[perm[i]] = concat_result[i].
     all_indices = np.concatenate([idx for idx, _ in index_oga_pairs])
-    all_ogas = [oga for _, oga in index_oga_pairs]
-    concat_result = OwnedGeometryArray.concat(all_ogas)
-
-    # all_indices[i] is the target position in the output for concat row i.
-    # We need: output[all_indices[i]] = concat_result[i]
-    # Equivalently: output = concat_result.take(inverse_perm)
-    # where inverse_perm[all_indices[i]] = i.
-    inverse_perm = np.empty(n_pairs, dtype=np.intp)
+    concat_result = OwnedGeometryArray.concat([oga for _, oga in index_oga_pairs])
+    inverse_perm = np.empty(row_count, dtype=np.intp)
     inverse_perm[all_indices] = np.arange(len(all_indices), dtype=np.intp)
     return concat_result.take(inverse_perm)
+
+
+def _prepare_many_vs_one_intersection_chunks(
+    left_sub,
+    right_owned,
+    unique_right_idx,
+    *,
+    global_positions: np.ndarray,
+):
+    """Prepare contained/SH chunks and return any complex remainder batch."""
+    from vibespatial.runtime.residency import Residency
+
+    n_pairs = left_sub.row_count
+    _pairwise_mode = plan_dispatch_selection(
+        kernel_name="overlay_pairwise",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=n_pairs,
+    )
+    _pairwise_mode = (
+        ExecutionMode.GPU
+        if (
+            strict_native_mode_enabled()
+            or left_sub.residency is Residency.DEVICE
+        )
+        else _pairwise_mode.selected
+    )
+
+    right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
+
+    _contained_result = None
+    _remainder_mask = None
+
+    try:
+        import cupy as _cp_local
+    except ModuleNotFoundError:
+        _cp_local = None
+
+    if _cp_local is not None:
+        try:
+            from vibespatial.overlay.bypass import _containment_bypass_gpu
+
+            _contained_result, _remainder_mask = _containment_bypass_gpu(
+                left_sub, right_one, "intersection",
+            )
+        except Exception:
+            _contained_result = None
+            _remainder_mask = None
+
+    if _contained_result is not None and _remainder_mask is None:
+        record_dispatch_event(
+            surface="geopandas.overlay.intersection",
+            operation="many_vs_one_containment_bypass",
+            implementation="gpu_containment_bypass_all",
+            reason=(
+                f"many-vs-one: all {n_pairs} polygons fully inside "
+                "right polygon (containment bypass)"
+            ),
+        )
+        return [(global_positions, _contained_result)], None, None, right_one, _pairwise_mode
+
+    d_contained_indices = None
+    d_remainder_indices = None
+    contained_indices = None
+    remainder_indices = None
+
+    if _remainder_mask is not None:
+        d_contained_indices = _cp_local.flatnonzero(~_remainder_mask).astype(
+            _cp_local.int64, copy=False,
+        )
+        d_remainder_indices = _cp_local.flatnonzero(_remainder_mask).astype(
+            _cp_local.int64, copy=False,
+        )
+        n_contained = int(d_contained_indices.size)
+        n_remainder = int(d_remainder_indices.size)
+    else:
+        contained_indices = np.asarray([], dtype=np.intp)
+        remainder_indices = np.arange(n_pairs, dtype=np.intp)
+        n_contained = 0
+        n_remainder = len(remainder_indices)
+
+    record_dispatch_event(
+        surface="geopandas.overlay.intersection",
+        operation="many_vs_one_containment_bypass",
+        implementation=("gpu_containment_bypass" if n_contained > 0 else "skipped"),
+        reason=(
+            f"many-vs-one: {n_contained}/{n_pairs} polygons fully inside "
+            f"right polygon, {n_remainder} need overlay"
+        ),
+    )
+
+    from vibespatial.cuda._runtime import maybe_trim_pool_memory
+
+    maybe_trim_pool_memory()
+
+    if n_remainder == 0:
+        return [(global_positions, _contained_result)], None, None, right_one, _pairwise_mode
+
+    if d_remainder_indices is not None:
+        left_remainder = left_sub.take(d_remainder_indices)
+        remainder_global = global_positions[
+            _cp_local.asnumpy(d_remainder_indices).astype(np.intp, copy=False)
+        ]
+    else:
+        left_remainder = left_sub.take(remainder_indices)
+        remainder_global = global_positions[remainder_indices]
+
+    sh_clip_result = None
+    sh_eligible_mask = None
+    sh_remainder_indices_local = None
+
+    if _cp_local is not None and left_remainder.row_count > 0:
+        try:
+            from vibespatial.overlay.bypass import (
+                _batched_sh_clip,
+                _classify_remainder_sh_eligible,
+                _is_clip_polygon_sh_eligible,
+            )
+
+            clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_one)
+            if clip_eligible:
+                sh_eligible_mask_arr, _complex_mask = _classify_remainder_sh_eligible(
+                    left_remainder, clip_vert_count,
+                )
+                n_sh = int(sh_eligible_mask_arr.sum())
+                if n_sh > 0:
+                    sh_clip_result = _batched_sh_clip(
+                        left_remainder, right_one, sh_eligible_mask_arr,
+                    )
+                    if sh_clip_result is not None:
+                        sh_eligible_mask = sh_eligible_mask_arr
+                        sh_remainder_indices_local = np.flatnonzero(~sh_eligible_mask_arr)
+        except Exception:
+            sh_clip_result = None
+            sh_eligible_mask = None
+
+    index_oga_pairs = []
+    if n_contained > 0 and _contained_result is not None:
+        contained_global = (
+            global_positions[_cp_local.asnumpy(d_contained_indices).astype(np.intp, copy=False)]
+            if d_contained_indices is not None
+            else global_positions[contained_indices]
+        )
+        index_oga_pairs.append((contained_global, _contained_result))
+
+    complex_left = None
+    complex_global_positions = None
+    if sh_clip_result is not None and sh_eligible_mask is not None:
+        sh_global = remainder_global[np.flatnonzero(sh_eligible_mask).astype(np.intp, copy=False)]
+        index_oga_pairs.append((sh_global, sh_clip_result))
+        if sh_remainder_indices_local is not None and len(sh_remainder_indices_local) > 0:
+            if _cp_local is not None:
+                d_complex = _cp_local.asarray(sh_remainder_indices_local).astype(
+                    _cp_local.int64,
+                    copy=False,
+                )
+                complex_left = left_remainder.take(d_complex)
+            else:
+                complex_left = left_remainder.take(sh_remainder_indices_local)
+            complex_global_positions = remainder_global[
+                np.asarray(sh_remainder_indices_local, dtype=np.intp)
+            ]
+    else:
+        complex_left = left_remainder
+        complex_global_positions = remainder_global
+
+    return (
+        index_oga_pairs,
+        complex_left,
+        complex_global_positions,
+        right_one,
+        _pairwise_mode,
+    )
+
+
+def _few_right_intersection_owned(
+    left_owned,
+    right_owned,
+    idx1,
+    idx2,
+    *,
+    dispatch_mode=ExecutionMode.AUTO,
+    _has_device_indices=False,
+    d_idx1=None,
+):
+    """Run grouped many-vs-one intersection with one exact remainder overlay pass."""
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover
+        cp = None
+
+    unique_right = np.unique(idx2)
+    if unique_right.size <= 1 or unique_right.size > _OVERLAY_FEW_RIGHT_GROUP_MAX:
+        return None
+    if (len(idx2) / unique_right.size) < _OVERLAY_FEW_RIGHT_GROUP_MIN_AVG:
+        return None
+
+    from vibespatial.constructive.binary_constructive import (
+        _dispatch_polygon_intersection_overlay_rowwise_gpu,
+        binary_constructive_owned,
+    )
+    from vibespatial.geometry.owned import (
+        OwnedGeometryArray,
+        materialize_broadcast,
+        tile_single_row,
+    )
+
+    index_oga_pairs: list[tuple[np.ndarray, OwnedGeometryArray]] = []
+    complex_left_chunks: list[OwnedGeometryArray] = []
+    complex_right_chunks: list[OwnedGeometryArray] = []
+    complex_global_chunks: list[np.ndarray] = []
+    complex_mode = dispatch_mode
+
+    for right_idx in unique_right.tolist():
+        pair_positions = np.flatnonzero(idx2 == right_idx).astype(np.int64, copy=False)
+        if pair_positions.size == 0:
+            continue
+        pair_positions_host = pair_positions.astype(np.intp, copy=False)
+        if _has_device_indices:
+            if cp is None or d_idx1 is None:
+                return None
+            d_pair_positions = cp.asarray(pair_positions, dtype=cp.int64)
+            left_group = left_owned.device_take(d_idx1[d_pair_positions])
+        else:
+            left_group = left_owned.take(np.asarray(idx1[pair_positions]))
+
+        (
+            group_pairs,
+            complex_left,
+            complex_global_positions,
+            right_one,
+            _group_mode,
+        ) = _prepare_many_vs_one_intersection_chunks(
+            left_group,
+            right_owned,
+            int(right_idx),
+            global_positions=pair_positions_host,
+        )
+        index_oga_pairs.extend(group_pairs)
+        if complex_left is not None and complex_global_positions is not None:
+            complex_left_chunks.append(complex_left)
+            complex_right_chunks.append(
+                materialize_broadcast(
+                    tile_single_row(right_one, complex_left.row_count),
+                ),
+            )
+            complex_global_chunks.append(complex_global_positions)
+
+    if complex_left_chunks:
+        complex_left_all = OwnedGeometryArray.concat(complex_left_chunks)
+        complex_right_all = OwnedGeometryArray.concat(complex_right_chunks)
+        complex_global_all = np.concatenate(complex_global_chunks)
+        complex_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+            complex_left_all,
+            complex_right_all,
+            dispatch_mode=complex_mode,
+        )
+        if (
+            complex_result is None
+            or complex_result.row_count != complex_left_all.row_count
+        ):
+            complex_result = binary_constructive_owned(
+                "intersection",
+                complex_left_all,
+                complex_right_all,
+                dispatch_mode=complex_mode,
+                _prefer_exact_polygon_intersection=True,
+            )
+        index_oga_pairs.append((complex_global_all, complex_result))
+
+    return _assemble_indexed_owned_chunks(index_oga_pairs, len(idx1))
 
 
 def _overlay_intersection(
@@ -1566,6 +1642,13 @@ def _overlay_intersection(
             _is_many_vs_one = (
                 _unique_right.size == 1 and idx1.size > 1
             )
+            _is_few_right = (
+                _unique_right.size > 1
+                and _unique_right.size <= _OVERLAY_FEW_RIGHT_GROUP_MAX
+                and (idx1.size / _unique_right.size) >= _OVERLAY_FEW_RIGHT_GROUP_MIN_AVG
+                and df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
+                and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+            )
 
             if _is_many_vs_one:
                 # Many-vs-one: only gather left side.
@@ -1622,6 +1705,29 @@ def _overlay_intersection(
                         )
                         # Fall through to element-wise fallback.
                         intersections = None
+            elif _is_few_right:
+                try:
+                    result_owned = _few_right_intersection_owned(
+                        left_owned,
+                        right_owned,
+                        np.asarray(idx1),
+                        np.asarray(idx2),
+                        dispatch_mode=_pairwise_mode,
+                        _has_device_indices=_has_device_indices,
+                        d_idx1=d_idx1,
+                    )
+                    if result_owned is not None:
+                        intersections = GeoSeries(
+                            GeometryArray.from_owned(result_owned, crs=df1.crs),
+                        )
+                        used_owned = True
+                except Exception:
+                    logger.debug(
+                        "few-right grouped polygon intersection fast path failed; "
+                        "falling back to gathered element-wise path",
+                        exc_info=True,
+                    )
+                    intersections = None
             else:
                 # Phase 2 zero-copy: pass CuPy device arrays directly to
                 # device_take() when available, eliminating H->D re-upload.
@@ -1632,8 +1738,25 @@ def _overlay_intersection(
                     left_sub = left_owned.take(np.asarray(idx1))
                     right_sub = right_owned.take(np.asarray(idx2))
 
-            if intersections is None and not _is_many_vs_one:
+            if intersections is None and not (_is_many_vs_one or _is_few_right):
                 # Standard element-wise path for N-vs-M patterns.
+                result_owned = binary_constructive_owned(
+                    "intersection", left_sub, right_sub,
+                    dispatch_mode=_pairwise_mode,
+                    _prefer_exact_polygon_intersection=_prefer_exact_polygon_gpu,
+                )
+                intersections = GeoSeries(
+                    GeometryArray.from_owned(result_owned, crs=df1.crs),
+                )
+                used_owned = True
+
+            if intersections is None and _is_few_right:
+                if _has_device_indices:
+                    left_sub = left_owned.device_take(d_idx1)
+                    right_sub = right_owned.device_take(d_idx2)
+                else:
+                    left_sub = left_owned.take(np.asarray(idx1))
+                    right_sub = right_owned.take(np.asarray(idx2))
                 result_owned = binary_constructive_owned(
                     "intersection", left_sub, right_sub,
                     dispatch_mode=_pairwise_mode,
