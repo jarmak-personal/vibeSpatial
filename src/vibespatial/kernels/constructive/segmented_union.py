@@ -36,7 +36,11 @@ from vibespatial.constructive.segmented_union_host import (
     singleton_indices,
     valid_row_indices,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
+)
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import OVERLAY_GPU_FAILURE_THRESHOLD
 from vibespatial.runtime.dispatch import record_dispatch_event
@@ -120,6 +124,7 @@ def segmented_union_all(
         row_count=total_geoms,
         requested_mode=requested,
         requested_precision=precision_mode,
+        current_residency=combined_residency(geometries),
     )
 
     # ADR-0002: CONSTRUCTIVE kernels stay fp64.  Precision plan is computed
@@ -200,6 +205,7 @@ def _segmented_union_gpu_variant(
         row_count=int(group_offsets[-1]),
         requested_mode=dispatch_mode,
         requested_precision=precision_mode,
+        current_residency=combined_residency(geometries),
     )
     precision_plan = selection.precision_plan
     return _segmented_union_gpu(
@@ -223,8 +229,6 @@ def _segmented_union_gpu(
     ADR-0002: CONSTRUCTIVE class, fp64 (segment intersection precision).
     ADR-0033: Inherits overlay pipeline tiers (NVRTC + CCCL + CuPy).
     """
-    from vibespatial.geometry.buffers import GeometryFamily
-    from vibespatial.geometry.owned import FAMILY_TAGS
 
     # Validate: GPU overlay requires polygon-family geometries.
     polygon_tags = {FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]}
@@ -289,13 +293,12 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
     consecutive GPU failures (suggesting CUDA context corruption), the
     rest of the reduction proceeds entirely on CPU.
     """
-    from vibespatial.overlay.gpu import overlay_union_owned
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
     # Split into single-row OwnedGeometryArrays for pairwise reduction.
-    current: list[OwnedGeometryArray] = [
-        group_owned.take(singleton_indices(i))
-        for i in range(group_owned.row_count)
-    ]
+    current: list[OwnedGeometryArray] = []
+    for i in range(group_owned.row_count):
+        current.append(group_owned.take(singleton_indices(i)))
 
     rounds = 0
     max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
@@ -307,7 +310,8 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 gpu_ok = False
                 if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
                     try:
-                        merged = overlay_union_owned(
+                        merged = binary_constructive_owned(
+                            "union",
                             current[i],
                             current[i + 1],
                             dispatch_mode=ExecutionMode.GPU,
@@ -320,7 +324,8 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
                 if not gpu_ok:
                     # CPU fallback for this pair.
-                    next_round.append(_segmented_union_pair_cpu(current[i], current[i + 1]))
+                    cpu_merged = _segmented_union_pair_cpu(current[i], current[i + 1])
+                    next_round.append(cpu_merged)
             else:
                 # Odd element passes through.
                 next_round.append(current[i])

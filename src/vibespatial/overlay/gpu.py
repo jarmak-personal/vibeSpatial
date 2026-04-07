@@ -252,6 +252,7 @@ def build_gpu_split_events(
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     require_same_row: bool = False,
+    right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> SplitEventTable:
     # Delegated to overlay/split.py — this re-export preserves import compatibility.
     from vibespatial.overlay.split import build_gpu_split_events as _impl
@@ -261,6 +262,7 @@ def build_gpu_split_events(
         dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
         require_same_row=require_same_row,
+        right_geometry_source_rows=right_geometry_source_rows,
     )
 
 
@@ -281,6 +283,8 @@ def _build_overlay_execution_plan(
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     _row_isolated: bool = False,
+    _left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
+    _right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> OverlayExecutionPlan:
     split_events = build_gpu_split_events(
         left,
@@ -288,6 +292,7 @@ def _build_overlay_execution_plan(
         dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
         require_same_row=_row_isolated,
+        right_geometry_source_rows=_right_geometry_source_rows,
     )
     atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
     # split_events are fully consumed by build_gpu_atomic_edges.
@@ -304,6 +309,8 @@ def _build_overlay_execution_plan(
         right,
         half_edge_graph=half_edge_graph,
         row_isolated=_row_isolated,
+        left_geometry_source_rows=_left_geometry_source_rows,
+        right_geometry_source_rows=_right_geometry_source_rows,
     )
     return OverlayExecutionPlan(
         split_events=None,

@@ -156,6 +156,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
     """
     clipping_by_rectangle = _mask_is_list_like_rectangle(mask)
     rectangle_bounds = _rectangle_bounds_from_mask(mask)
+    rect_fast_path = rectangle_bounds is not None
     if clipping_by_rectangle:
         intersection_polygon = box(*mask)
     else:
@@ -296,14 +297,14 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
         parts.append(
             _clip_partition(
                 gdf_sub[simple_line_mask],
-                use_rect_fast_path=clipping_by_rectangle,
+                use_rect_fast_path=rect_fast_path,
             )
         )
     if multiline_mask.any():
         parts.append(
             _clip_partition(
                 gdf_sub[multiline_mask],
-                use_rect_fast_path=clipping_by_rectangle,
+                use_rect_fast_path=rect_fast_path,
             )
         )
     if polygon_mask.any():
@@ -372,7 +373,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
                 if np.any(nonpositive_area):
                     poly_keep = np.ones(poly_mask.sum(), dtype=bool)
                     poly_keep[nonpositive_area] = False
-                    keep_array = np.asarray(keep, dtype=bool)
+                    keep_array = np.array(keep, dtype=bool, copy=True)
                     keep_array[np.flatnonzero(poly_mask)] &= poly_keep
                     keep = keep_array
             line_rows = clipped.geom_type.isin(LINE_GEOM_TYPES)

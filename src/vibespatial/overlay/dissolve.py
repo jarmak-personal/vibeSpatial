@@ -1176,45 +1176,41 @@ def execute_grouped_union_codes(
     owned: OwnedGeometryArray | None = None,
 ) -> GroupedUnionResult | None:
     normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
-    values = np.asarray(geometries, dtype=object)
-    if values.size != row_group_codes.size:
+    values: np.ndarray | None = None
+
+    def _values() -> np.ndarray:
+        nonlocal values
+        if values is None:
+            values = np.asarray(geometries, dtype=object)
+        return values
+
+    geometry_count = int(owned.row_count) if owned is not None else int(len(geometries))
+    if geometry_count != row_group_codes.size:
         raise ValueError("row_group_codes length must match geometries length")
 
-    if (
-        normalized is DissolveUnionMethod.COVERAGE
-        and int(values.size) >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
-    ):
-        accelerated = execute_grouped_box_union_gpu_codes(
-            values,
-            row_group_codes,
-            group_count=group_count,
-        )
-        if accelerated is not None:
-            return accelerated
-    if (
-        normalized is DissolveUnionMethod.COVERAGE
-        and int(values.size) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
-    ):
-        accelerated = execute_grouped_disjoint_subset_union_codes(
-            values,
-            row_group_codes,
-            group_count=group_count,
-        )
-        if accelerated is not None:
-            return accelerated
-    if (
-        normalized is DissolveUnionMethod.COVERAGE
-        and int(values.size) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
-    ):
-        accelerated = execute_grouped_coverage_edge_union_codes(
-            values,
-            row_group_codes,
-            group_count=group_count,
-        )
-        if accelerated is not None:
-            return accelerated
+    owned_supports_segmented_union = False
+    if owned is not None:
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.geometry.owned import FAMILY_TAGS
 
-    if owned is not None and normalized is DissolveUnionMethod.UNARY and grid_size is None:
+        valid_tags = owned.tags[owned.validity]
+        polygon_tags = np.asarray(
+            [
+                FAMILY_TAGS[GeometryFamily.POLYGON],
+                FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            ],
+            dtype=valid_tags.dtype if valid_tags.size else np.int8,
+        )
+        owned_supports_segmented_union = bool(
+            valid_tags.size == 0 or np.all(np.isin(valid_tags, polygon_tags))
+        )
+
+    if (
+        owned is not None
+        and owned_supports_segmented_union
+        and normalized is DissolveUnionMethod.UNARY
+        and grid_size is None
+    ):
         observed_mask = row_group_codes >= 0
         if not np.any(observed_mask):
             merged = np.full(group_count, _EMPTY, dtype=object)
@@ -1245,6 +1241,40 @@ def execute_grouped_union_codes(
             empty_groups=empty_groups,
             method=normalized,
         )
+
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and geometry_count >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_box_union_gpu_codes(
+            _values(),
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and geometry_count >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_disjoint_subset_union_codes(
+            _values(),
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
+        and geometry_count >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+    ):
+        accelerated = execute_grouped_coverage_edge_union_codes(
+            _values(),
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
     return None
 
 
@@ -1400,7 +1430,7 @@ def evaluate_geopandas_dissolve(
         )
         if row_group_codes is not None:
             grouped_union = execute_grouped_union_codes(
-                np.asarray(frame.geometry.array, dtype=object),
+                frame.geometry.array,
                 row_group_codes,
                 group_count=len(aggregated_data.index),
                 method=normalized_method,
@@ -1416,7 +1446,7 @@ def evaluate_geopandas_dissolve(
                     len(aggregated_data.index),
                 )
             grouped_union = execute_grouped_union(
-                np.asarray(frame.geometry.array, dtype=object),
+                frame.geometry.array,
                 group_positions,
                 method=normalized_method,
                 grid_size=grid_size,

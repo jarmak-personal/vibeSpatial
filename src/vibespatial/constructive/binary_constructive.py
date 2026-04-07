@@ -46,9 +46,12 @@ from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     NULL_TAG,
     TAG_FAMILIES,
+    DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     _concat_device_family_buffers,
+    _device_gather_offset_slices,
     build_device_resident_owned,
+    device_concat_owned_scatter,
     from_shapely_geometries,
     materialize_broadcast,
     tile_single_row,
@@ -62,6 +65,7 @@ from vibespatial.runtime.fallbacks import (
     record_fallback_event,
     strict_native_mode_enabled,
 )
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import (
     KernelClass,
@@ -82,6 +86,13 @@ _LINESTRING_FAMILIES = frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULT
 
 # Point-Polygon constructive operations supported by the PIP fast path
 _POINT_POLYGON_OPS = frozenset({"intersection", "difference"})
+
+
+def _sync_hotpath() -> None:
+    if hotpath_trace_enabled():
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        get_cuda_runtime().synchronize()
 
 
 def is_constructive_op(op: str) -> bool:
@@ -602,6 +613,307 @@ def _dispatch_polygon_intersection_overlay_rowwise_gpu(
     )
 
 
+def _explode_multipolygon_rows_to_polygons_gpu(
+    owned: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, DeviceArray]:
+    """Explode device-resident multipolygon rows into polygon rows on GPU.
+
+    Returns
+    -------
+    exploded : OwnedGeometryArray
+        Polygon-only rows, one per polygon part.
+    source_rows : DeviceArray
+        Global source row id for each exploded polygon row.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for multipolygon explosion")
+
+    state = owned._ensure_device_state()
+    multipolygon_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+    d_global_rows = cp.flatnonzero(
+        state.validity & (state.tags == multipolygon_tag)
+    ).astype(cp.int64, copy=False)
+    if int(d_global_rows.size) == 0:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    buffer = state.families.get(GeometryFamily.MULTIPOLYGON)
+    if buffer is None:
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    d_family_rows = state.family_row_offsets[d_global_rows].astype(cp.int64, copy=False)
+    d_part_counts = (
+        buffer.geometry_offsets[d_family_rows + 1] - buffer.geometry_offsets[d_family_rows]
+    ).astype(cp.int32, copy=False)
+    d_nonempty = d_part_counts > 0
+    if not bool(cp.any(d_nonempty)):
+        return _empty_device_constructive_output(0), cp.empty(0, dtype=cp.int64)
+
+    d_global_rows = d_global_rows[d_nonempty]
+    d_family_rows = d_family_rows[d_nonempty]
+    d_part_counts = d_part_counts[d_nonempty]
+
+    total_parts = int(d_part_counts.sum())
+    d_part_starts = buffer.geometry_offsets[d_family_rows].astype(cp.int64, copy=False)
+    d_part_offsets = cp.empty(int(d_part_counts.size) + 1, dtype=cp.int64)
+    d_part_offsets[0] = 0
+    cp.cumsum(d_part_counts.astype(cp.int64, copy=False), out=d_part_offsets[1:])
+    d_positions = cp.arange(total_parts, dtype=cp.int64)
+    d_segment_ids = cp.searchsorted(d_part_offsets, d_positions, side="right") - 1
+    d_source_rows = d_global_rows[d_segment_ids]
+    d_part_indices = (
+        d_positions
+        - d_part_offsets[d_segment_ids]
+        + d_part_starts[d_segment_ids]
+    ).astype(cp.int64, copy=False)
+
+    d_ring_space = cp.arange(buffer.ring_offsets.size, dtype=cp.int32)
+    d_ring_indices, d_geom_offsets = _device_gather_offset_slices(
+        d_ring_space,
+        buffer.part_offsets,
+        d_part_indices,
+    )
+    d_ring_indices = d_ring_indices.astype(cp.int64, copy=False)
+
+    d_coords = (
+        cp.column_stack([buffer.x, buffer.y])
+        if int(buffer.x.size) > 0
+        else cp.empty((0, 2), dtype=cp.float64)
+    )
+    d_gathered, d_ring_offsets = _device_gather_offset_slices(
+        d_coords,
+        buffer.ring_offsets,
+        d_ring_indices,
+    )
+    d_x = d_gathered[:, 0].copy() if int(d_gathered.size) else cp.empty(0, dtype=cp.float64)
+    d_y = d_gathered[:, 1].copy() if int(d_gathered.size) else cp.empty(0, dtype=cp.float64)
+
+    polygon_buffer = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.POLYGON,
+        x=d_x,
+        y=d_y,
+        geometry_offsets=d_geom_offsets,
+        empty_mask=cp.zeros(total_parts, dtype=cp.bool_),
+        ring_offsets=d_ring_offsets,
+        bounds=None,
+    )
+    exploded = build_device_resident_owned(
+        device_families={GeometryFamily.POLYGON: polygon_buffer},
+        row_count=total_parts,
+        tags=cp.full(total_parts, FAMILY_TAGS[GeometryFamily.POLYGON], dtype=cp.int8),
+        validity=cp.ones(total_parts, dtype=cp.bool_),
+        family_row_offsets=cp.arange(total_parts, dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    return exploded, d_source_rows
+
+
+def _dispatch_multipolygon_polygon_intersection_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Exact GPU rescue for homogeneous MultiPolygon-Polygon intersection.
+
+    Explodes multipolygon rows into polygon parts on device, intersects each
+    part against its aligned polygon row using the existing exact polygon
+    path, then unions the valid part intersections back per original row.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+
+    left_is_mpoly = _is_family_only(left, frozenset({GeometryFamily.MULTIPOLYGON}))
+    right_is_poly = _is_family_only(right, frozenset({GeometryFamily.POLYGON}))
+    left_is_poly = _is_family_only(left, frozenset({GeometryFamily.POLYGON}))
+    right_is_mpoly = _is_family_only(right, frozenset({GeometryFamily.MULTIPOLYGON}))
+
+    if not ((left_is_mpoly and right_is_poly) or (left_is_poly and right_is_mpoly)):
+        return None
+
+    if right_is_mpoly:
+        return _dispatch_multipolygon_polygon_intersection_gpu(
+            right,
+            left,
+            dispatch_mode=dispatch_mode,
+        )
+
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_explode", category="setup"):
+        exploded_left, d_source_rows = _explode_multipolygon_rows_to_polygons_gpu(left)
+    _sync_hotpath()
+    if exploded_left.row_count == 0:
+        return _empty_device_constructive_output(left.row_count)
+
+    exploded_right = right.take(d_source_rows)
+    part_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+        exploded_left,
+        exploded_right,
+        dispatch_mode=dispatch_mode,
+        _cached_right_segments=None,
+    )
+    if part_result is None or part_result.row_count != exploded_left.row_count:
+        return None
+
+    part_state = part_result._ensure_device_state()
+    d_valid_parts = cp.flatnonzero(part_state.validity).astype(cp.int64, copy=False)
+    if int(d_valid_parts.size) == 0:
+        return _empty_device_constructive_output(left.row_count)
+
+    valid_parts = part_result.take(d_valid_parts)
+    d_valid_source_rows = d_source_rows[d_valid_parts].astype(cp.int64, copy=False)
+
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_group_offsets", category="setup"):
+        d_counts = cp.bincount(
+            d_valid_source_rows,
+            minlength=left.row_count,
+        ).astype(cp.int64, copy=False)
+        d_group_offsets = cp.empty(left.row_count + 1, dtype=cp.int64)
+        d_group_offsets[0] = 0
+        cp.cumsum(d_counts, out=d_group_offsets[1:])
+    _sync_hotpath()
+
+    from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_union", category="refine"):
+        regrouped = segmented_union_all(valid_parts, cp.asnumpy(d_group_offsets))
+    _sync_hotpath()
+    if regrouped.row_count != left.row_count:
+        return None
+
+    d_nonempty_rows = cp.flatnonzero(d_counts > 0).astype(cp.int64, copy=False)
+    if int(d_nonempty_rows.size) == 0:
+        return _empty_device_constructive_output(left.row_count)
+
+    compact = regrouped.take(d_nonempty_rows)
+    return device_concat_owned_scatter(
+        _empty_device_constructive_output(left.row_count),
+        compact,
+        d_nonempty_rows,
+    )
+
+
+def _assemble_disjoint_polygonal_pieces_gpu(
+    pieces: list[OwnedGeometryArray],
+) -> OwnedGeometryArray | None:
+    """Assemble disjoint single-row polygonal pieces into one union geometry."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+
+    polygon_buffers: list[DeviceFamilyGeometryBuffer] = []
+    polygon_count = 0
+    for piece in pieces:
+        if piece.row_count == 0:
+            continue
+        state = piece._ensure_device_state()
+        if not bool(state.validity[0]):
+            continue
+        family = TAG_FAMILIES.get(int(state.tags[0]))
+        if family is GeometryFamily.POLYGON:
+            buffer = state.families.get(GeometryFamily.POLYGON)
+            if buffer is None:
+                return None
+            polygon_buffers.append(buffer)
+            polygon_count += 1
+            continue
+        if family is GeometryFamily.MULTIPOLYGON:
+            exploded, _ = _explode_multipolygon_rows_to_polygons_gpu(piece)
+            if exploded.row_count == 0:
+                continue
+            exploded_state = exploded._ensure_device_state()
+            buffer = exploded_state.families.get(GeometryFamily.POLYGON)
+            if buffer is None:
+                return None
+            polygon_buffers.append(buffer)
+            polygon_count += exploded.row_count
+            continue
+        return None
+
+    if polygon_count == 0:
+        return _empty_device_constructive_output(1)
+
+    merged = _concat_device_family_buffers(GeometryFamily.POLYGON, polygon_buffers)
+    if polygon_count == 1:
+        return build_device_resident_owned(
+            device_families={GeometryFamily.POLYGON: merged},
+            row_count=1,
+            tags=cp.asarray([FAMILY_TAGS[GeometryFamily.POLYGON]], dtype=cp.int8),
+            validity=cp.asarray([True], dtype=cp.bool_),
+            family_row_offsets=cp.asarray([0], dtype=cp.int32),
+            execution_mode="gpu",
+        )
+
+    multipolygon_buffer = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTIPOLYGON,
+        x=merged.x,
+        y=merged.y,
+        geometry_offsets=cp.asarray([0, polygon_count], dtype=cp.int32),
+        empty_mask=cp.asarray([False], dtype=cp.bool_),
+        part_offsets=merged.geometry_offsets,
+        ring_offsets=merged.ring_offsets,
+        bounds=None,
+    )
+    return build_device_resident_owned(
+        device_families={GeometryFamily.MULTIPOLYGON: multipolygon_buffer},
+        row_count=1,
+        tags=cp.asarray([FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]], dtype=cp.int8),
+        validity=cp.asarray([True], dtype=cp.bool_),
+        family_row_offsets=cp.asarray([0], dtype=cp.int32),
+        execution_mode="gpu",
+    )
+
+
+def _dispatch_multipolygon_polygon_union_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Exact single-row GPU rescue for homogeneous MultiPolygon-Polygon union."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count or left.row_count != 1:
+        return None
+
+    left_is_mpoly = _is_family_only(left, frozenset({GeometryFamily.MULTIPOLYGON}))
+    right_is_poly = _is_family_only(right, frozenset({GeometryFamily.POLYGON}))
+    left_is_poly = _is_family_only(left, frozenset({GeometryFamily.POLYGON}))
+    right_is_mpoly = _is_family_only(right, frozenset({GeometryFamily.MULTIPOLYGON}))
+
+    if not ((left_is_mpoly and right_is_poly) or (left_is_poly and right_is_mpoly)):
+        return None
+    if right_is_mpoly:
+        return _dispatch_multipolygon_polygon_union_gpu(
+            right,
+            left,
+            dispatch_mode=dispatch_mode,
+        )
+
+    left_minus = binary_constructive_owned(
+        "difference",
+        left,
+        right,
+        dispatch_mode=dispatch_mode,
+        _prefer_rowwise_polygon_difference_overlay=True,
+    )
+    right_minus = binary_constructive_owned(
+        "difference",
+        right,
+        left,
+        dispatch_mode=dispatch_mode,
+        _prefer_rowwise_polygon_difference_overlay=True,
+    )
+    overlap = _dispatch_multipolygon_polygon_intersection_gpu(
+        left,
+        right,
+        dispatch_mode=dispatch_mode,
+    )
+    if overlap is None:
+        return None
+    return _assemble_disjoint_polygonal_pieces_gpu([left_minus, right_minus, overlap])
+
+
 def _dispatch_polygon_difference_overlay_rowwise_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -683,19 +995,24 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
     # materializations can leak mutated assembly state into the second call
     # on complex aligned batches. Build a fresh plan for the difference
     # phase so the topology result is computed from pristine inputs.
-    intersection_plan = _build_overlay_execution_plan(
-        active_left,
-        active_right,
-        dispatch_mode=dispatch_mode,
-        _cached_right_segments=None,
-        _row_isolated=True,
-    )
-    area_intersection, _ = _materialize_overlay_execution_plan(
-        intersection_plan,
-        operation="intersection",
-        requested=ExecutionMode.GPU,
-        preserve_row_count=active_left.row_count,
-    )
+    _sync_hotpath()
+    with hotpath_stage("constructive.diff.intersection_plan.build", category="setup"):
+        intersection_plan = _build_overlay_execution_plan(
+            active_left,
+            active_right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=None,
+            _row_isolated=True,
+        )
+    _sync_hotpath()
+    with hotpath_stage("constructive.diff.intersection_plan.materialize", category="refine"):
+        area_intersection, _ = _materialize_overlay_execution_plan(
+            intersection_plan,
+            operation="intersection",
+            requested=ExecutionMode.GPU,
+            preserve_row_count=active_left.row_count,
+        )
+    _sync_hotpath()
     if area_intersection.row_count != active_left.row_count:
         return None
 
@@ -708,19 +1025,24 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
 
     partial_result: OwnedGeometryArray | None = None
     if int(d_partial_local.size) > 0:
-        difference_plan = _build_overlay_execution_plan(
-            active_left,
-            active_right,
-            dispatch_mode=dispatch_mode,
-            _cached_right_segments=None,
-            _row_isolated=True,
-        )
-        partial_result, _ = _materialize_overlay_execution_plan(
-            difference_plan,
-            operation="difference",
-            requested=ExecutionMode.GPU,
-            preserve_row_count=active_left.row_count,
-        )
+        _sync_hotpath()
+        with hotpath_stage("constructive.diff.difference_plan.build", category="setup"):
+            difference_plan = _build_overlay_execution_plan(
+                active_left,
+                active_right,
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=None,
+                _row_isolated=True,
+            )
+        _sync_hotpath()
+        with hotpath_stage("constructive.diff.difference_plan.materialize", category="refine"):
+            partial_result, _ = _materialize_overlay_execution_plan(
+                difference_plan,
+                operation="difference",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=active_left.row_count,
+            )
+        _sync_hotpath()
         if partial_result.row_count != active_left.row_count:
             return None
 
@@ -734,12 +1056,15 @@ def _dispatch_polygon_difference_overlay_batched_gpu(
         # topologies). Route that compacted subset through the proven rowwise
         # fallback instead of trying to preserve compacted row identity through
         # another batched overlay materialization.
-        fallback_result = _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
-            fallback_left,
-            fallback_right,
-            dispatch_mode=dispatch_mode,
-            _cached_right_segments=None,
-        )
+        _sync_hotpath()
+        with hotpath_stage("constructive.diff.rowwise_fallback", category="refine"):
+            fallback_result = _dispatch_polygon_difference_overlay_rowwise_gpu_legacy(
+                fallback_left,
+                fallback_right,
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=None,
+            )
+        _sync_hotpath()
         if fallback_result is None or fallback_result.row_count != fallback_left.row_count:
             return None
 
@@ -1278,6 +1603,59 @@ def _binary_constructive_gpu(
 
     # --- Polygon-Polygon GPU kernel fast paths ---
     if _is_polygon_only(left) and _is_polygon_only(right):
+        if op == "union":
+            try:
+                multipart_union = _dispatch_multipolygon_polygon_union_gpu(
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                )
+                if multipart_union is not None and multipart_union.row_count == left.row_count:
+                    return multipart_union
+            except Exception:
+                logger.debug(
+                    "multipart-polygon exact union GPU rescue failed",
+                    exc_info=True,
+                )
+
+        valid_mask = left.validity & right.validity
+        polygon_pair_count = (
+            len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask]))
+            if valid_mask.any()
+            else 0
+        )
+        if op == "intersection" and polygon_pair_count > 1:
+            try:
+                mixed_polygonal = _dispatch_mixed_binary_constructive_gpu(
+                    op,
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                    _cached_right_segments=_cached_right_segments,
+                )
+                if mixed_polygonal is not None and mixed_polygonal.row_count == left.row_count:
+                    return mixed_polygonal
+            except Exception:
+                logger.debug(
+                    "mixed polygonal GPU intersection dispatch failed",
+                    exc_info=True,
+                )
+
+        if op == "intersection":
+            try:
+                multipart_result = _dispatch_multipolygon_polygon_intersection_gpu(
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                )
+                if multipart_result is not None and multipart_result.row_count == left.row_count:
+                    return multipart_result
+            except Exception:
+                logger.debug(
+                    "multipart-polygon exact intersection GPU rescue failed",
+                    exc_info=True,
+                )
+
         if op == "intersection" and _prefer_exact_polygon_intersection:
             try:
                 rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
@@ -1479,6 +1857,24 @@ def _binary_constructive_gpu(
                         op,
                         exc_info=True,
                     )
+
+        if valid_mask.any() and len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask])) > 1:
+            try:
+                mixed_polygonal = _dispatch_mixed_binary_constructive_gpu(
+                    op,
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                    _cached_right_segments=_cached_right_segments,
+                )
+                if mixed_polygonal is not None:
+                    return mixed_polygonal
+            except Exception:
+                logger.debug(
+                    "mixed polygonal GPU fallback failed for %s",
+                    op,
+                    exc_info=True,
+                )
 
     # For any remaining family pair not covered above, return None to
     # trigger CPU fallback.  This should only happen for exotic multi-type

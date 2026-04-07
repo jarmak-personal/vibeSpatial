@@ -1016,7 +1016,11 @@ def _device_scatter_repaired(
         build_device_resident_owned,
     )
 
-    ds = original_owned.device_state
+    ds = (
+        original_owned.device_state
+        if original_owned.device_state is not None
+        else original_owned._ensure_device_state()
+    )
     family = GeometryFamily(family_name)
     family_tag = FAMILY_TAGS[family_name]
     orig_d_buf = ds.families[family]
@@ -1098,11 +1102,12 @@ def _device_scatter_repaired(
     d_validity = cp.asarray(ds.validity).copy()
     d_fro = cp.asarray(ds.family_row_offsets).copy()
 
-    # Count same-family repair rows
-    same_family_repair_count = (
-        int(same_family_buf.geometry_offsets.size) - 1
-        if same_family_buf is not None else 0
-    )
+    if repaired_batch.row_count != invalid_family_rows.size:
+        raise RuntimeError(
+            "make_valid repaired batch lost input row alignment "
+            f"({repaired_batch.row_count} repaired rows for "
+            f"{invalid_family_rows.size} invalid source rows)"
+        )
 
     # Build old->new position mapping for the original family
     old_to_new = cp.full(orig_polygon_count, -1, dtype=cp.int32)
@@ -1110,85 +1115,41 @@ def _device_scatter_repaired(
         d_valid_family_rows = cp.asarray(valid_family_rows, dtype=cp.int32)
         old_to_new[d_valid_family_rows] = cp.arange(d_valid_family_rows.size, dtype=cp.int32)
 
-    # Track which repaired rows went to a different family
-    # Build a map: batch_repair_index -> (target_family, family_row_offset)
-    cross_family_map: dict[int, tuple[GeometryFamily, int]] = {}
-    for rfam, rbuf in repair_families.items():
-        if rfam == family:
-            # Same-family: indices 0..same_family_repair_count-1
-            continue
-        rfam_count = int(rbuf.geometry_offsets.size) - 1
-        # Cross-family rows: their positions in the target family buffer
-        # are appended after whatever was already there.
-        existing_count = 0
-        if rfam in ds.families:
-            existing_count = int(ds.families[rfam].geometry_offsets.size) - 1
-        for i in range(rfam_count):
-            cross_family_map[i] = (rfam, existing_count + i)
+    # Remap untouched rows from the source family into the compacted merged buffer.
+    source_globals = cp.flatnonzero(ds.tags == family_tag)
+    if int(source_globals.size) > 0:
+        source_old_offsets = ds.family_row_offsets[source_globals]
+        valid_idx = (source_old_offsets >= 0) & (source_old_offsets < orig_polygon_count)
+        d_fro[source_globals[valid_idx]] = old_to_new[source_old_offsets[valid_idx]]
 
-    # Remap family_row_offsets and tags for repaired rows
-    poly_global_mask = d_tags == family_tag
-    poly_globals = cp.flatnonzero(poly_global_mask)
+    # Scatter repaired rows back using the repaired batch's own row metadata.
+    repair_ds = repaired_batch.device_state if repaired_batch.device_state is not None else repaired_batch._ensure_device_state()
+    d_repair_tags = cp.asarray(repair_ds.tags)
+    d_repair_validity = cp.asarray(repair_ds.validity)
+    d_repair_fro = cp.asarray(repair_ds.family_row_offsets)
+    d_invalid_globals = cp.asarray(
+        [fam_to_global[int(rr)] for rr in invalid_family_rows],
+        dtype=cp.int32,
+    )
 
-    if cross_family_map:
-        # The repaired batch has rows in a different family.
-        # For each invalid family row, determine if it went to same-family
-        # or cross-family. The repaired batch order matches invalid_family_rows
-        # order; rows in the batch are assigned to families by the batch output.
-        #
-        # Simple heuristic: if same_family_repair_count == 0 and there is
-        # exactly one cross-family, ALL repaired rows went to that family.
-        if same_family_repair_count == 0 and len(repair_families) == 1:
-            target_fam = next(iter(repair_families))
-            target_tag = FAMILY_TAGS[target_fam]
-            target_count = int(repair_families[target_fam].geometry_offsets.size) - 1
-            existing_in_target = 0
-            if target_fam in ds.families:
-                existing_in_target = int(ds.families[target_fam].geometry_offsets.size) - 1
+    d_tags[d_invalid_globals] = d_repair_tags
+    d_validity[d_invalid_globals] = d_repair_validity
 
-            # Remap valid original rows
-            if int(poly_globals.size) > 0:
-                old_offsets = d_fro[poly_globals]
-                valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
-                d_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
-
-            # Remap repaired rows: change tag and family_row_offset
-            for i, rr in enumerate(invalid_family_rows):
-                g = fam_to_global.get(int(rr))
-                if g is not None:
-                    d_tags[g] = target_tag
-                    d_fro[g] = existing_in_target + i
-                    if i < target_count:
-                        d_validity[g] = True
+    family_base_offsets: dict[GeometryFamily, int] = {}
+    for repair_family in repair_families.keys():
+        if repair_family == family:
+            family_base_offsets[repair_family] = valid_count
+        elif repair_family in ds.families:
+            family_base_offsets[repair_family] = int(ds.families[repair_family].geometry_offsets.size) - 1
         else:
-            # Mixed output: some same-family, some cross-family.
-            # Fall through to same-family-only mapping for now.
-            for i, rr in enumerate(invalid_family_rows):
-                old_to_new[rr] = valid_count + i
-            if int(poly_globals.size) > 0:
-                old_offsets = d_fro[poly_globals]
-                valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
-                d_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
-    else:
-        # All repairs stayed in the same family
-        for i, rr in enumerate(invalid_family_rows):
-            old_to_new[rr] = valid_count + i
-        if int(poly_globals.size) > 0:
-            old_offsets = d_fro[poly_globals]
-            valid_idx = (old_offsets >= 0) & (old_offsets < orig_polygon_count)
-            d_fro[poly_globals[valid_idx]] = old_to_new[old_offsets[valid_idx]]
+            family_base_offsets[repair_family] = 0
 
-        # Update validity for repaired rows that produced empty/invalid output
-        merged_family_buf = new_device_families.get(family)
-        if same_family_buf is not None and merged_family_buf is not None and hasattr(merged_family_buf, "empty_mask"):
-            d_merged_empty = merged_family_buf.empty_mask
-            if int(poly_globals.size) > 0:
-                mapped_offsets = d_fro[poly_globals]
-                valid_mapped = (mapped_offsets >= 0) & (mapped_offsets < d_merged_empty.size)
-                if bool(cp.any(valid_mapped)):
-                    mapped_globals = poly_globals[valid_mapped]
-                    mapped_offsets = mapped_offsets[valid_mapped]
-                    d_validity[mapped_globals[d_merged_empty[mapped_offsets]]] = False
+    for repair_family, base_offset in family_base_offsets.items():
+        family_mask = d_repair_tags == FAMILY_TAGS[repair_family]
+        if bool(cp.any(family_mask)):
+            d_fro[d_invalid_globals[family_mask]] = (
+                d_repair_fro[family_mask] + np.int32(base_offset)
+            )
 
     return build_device_resident_owned(
         device_families=new_device_families,

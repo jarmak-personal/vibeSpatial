@@ -23,6 +23,7 @@ from .schema import TimingSummary, timing_from_samples
 # ---------------------------------------------------------------------------
 
 _HARNESS_CODE = """\
+import faulthandler
 import io
 import json
 import os
@@ -38,6 +39,10 @@ result_path = sys.argv[2]
 repeat = int(sys.argv[3])
 do_warmup = sys.argv[4] == "1"
 do_pipeline_warm = sys.argv[5] == "1"
+dump_after = int(sys.argv[6])
+
+if dump_after > 0:
+    faulthandler.dump_traceback_later(dump_after, repeat=False)
 
 os.chdir(os.path.dirname(os.path.abspath(script)))
 
@@ -255,6 +260,7 @@ def _run_harness(
             str(repeat),
             "1" if warmup else "0",
             "1" if pipeline_warm else "0",
+            str(max(timeout - 5, 1)),
         ]
 
         if not quiet:
@@ -291,9 +297,15 @@ def _run_harness(
 
         return run
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
         if not quiet:
             print(" TIMEOUT", file=sys.stderr)
+        detail = (exc.stderr or exc.stdout or "").strip()
+        if detail:
+            return _error_run(
+                label,
+                f"timeout ({timeout}s limit exceeded)\n{detail}",
+            )
         return _error_run(label, f"timeout ({timeout}s limit exceeded)")
 
     except Exception as exc:

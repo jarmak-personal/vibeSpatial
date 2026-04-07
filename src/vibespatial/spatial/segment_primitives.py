@@ -21,7 +21,10 @@ request_warmup([
     "select_i64",
     "exclusive_scan_i32",
     "exclusive_scan_i64",
+    "lower_bound_f64",
     "lower_bound_i64",
+    "upper_bound_f64",
+    "upper_bound_i64",
 ])
 from vibespatial.cuda._runtime import (  # noqa: E402
     KERNEL_PARAM_I32,
@@ -2075,8 +2078,8 @@ def _classify_segment_intersections_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
     candidate_pairs: SegmentIntersectionCandidates | None = None,
-    left_segments: SegmentTable | None = None,
-    right_segments: SegmentTable | None = None,
+    left_segments: SegmentTable | DeviceSegmentTable | None = None,
+    right_segments: SegmentTable | DeviceSegmentTable | None = None,
     pairs: SegmentIntersectionCandidates | None = None,
     runtime_selection: RuntimeSelection,
     precision_plan: PrecisionPlan,
@@ -2093,6 +2096,9 @@ def _classify_segment_intersections_gpu(
 
     Parameters
     ----------
+    left_segments : DeviceSegmentTable, optional
+        Pre-extracted left-side segments. When provided, skips
+        ``_extract_segments_gpu(left)`` entirely.
     _cached_right_device_segments : DeviceSegmentTable, optional
         Pre-extracted right-side segments.  When provided, skips
         ``_extract_segments_gpu(right)`` entirely.  Used by
@@ -2108,12 +2114,20 @@ def _classify_segment_intersections_gpu(
 
     # --- Kernel 1: Extract segments on GPU ---
     with hotpath_stage("segment.classify.extract_left_segments", category="setup"):
-        d_left_segs = _extract_segments_gpu(left, compute_type)
+        d_left_segs = (
+            left_segments
+            if isinstance(left_segments, DeviceSegmentTable)
+            else _extract_segments_gpu(left, compute_type)
+        )
     with hotpath_stage("segment.classify.extract_right_segments", category="setup"):
         d_right_segs = (
+            right_segments
+            if isinstance(right_segments, DeviceSegmentTable)
+            else (
             _cached_right_device_segments
             if _cached_right_device_segments is not None
             else _extract_segments_gpu(right, compute_type)
+            )
         )
 
     if d_left_segs.count == 0 or d_right_segs.count == 0:
@@ -2465,6 +2479,7 @@ def classify_segment_intersections(
     tile_size: int = SEGMENT_TILE_SIZE,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _cached_left_device_segments: DeviceSegmentTable | None = None,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
     _require_same_row: bool = False,
 ) -> SegmentIntersectionResult:
@@ -2483,6 +2498,8 @@ def classify_segment_intersections(
         Force GPU, CPU, or AUTO dispatch.
     precision : PrecisionMode
         Force fp32, fp64, or AUTO precision.
+    _cached_left_device_segments : DeviceSegmentTable, optional
+        Pre-extracted left-side device segments for reuse.
     _cached_right_device_segments : DeviceSegmentTable, optional
         Pre-extracted right-side device segments for reuse (lyy.15).
 
@@ -2528,6 +2545,7 @@ def classify_segment_intersections(
             left=left,
             right=right,
             candidate_pairs=candidate_pairs,
+            left_segments=_cached_left_device_segments,
             runtime_selection=runtime_selection,
             precision_plan=precision_plan,
             robustness_plan=robustness_plan,

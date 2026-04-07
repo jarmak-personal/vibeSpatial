@@ -702,14 +702,32 @@ class OwnedGeometryArray:
     def cache_bounds(self, bounds: np.ndarray) -> None:
         self._record(DiagnosticKind.CACHE, "cached per-geometry bounds", visible=False)
         runtime = get_cuda_runtime() if self.device_state is not None else None
+        if self.device_state is not None:
+            validity = runtime.copy_device_to_host(self.device_state.validity)
+            tags = runtime.copy_device_to_host(self.device_state.tags)
+            family_row_offsets = runtime.copy_device_to_host(
+                self.device_state.family_row_offsets
+            )
+        else:
+            validity = self.validity
+            tags = self.tags
+            family_row_offsets = self.family_row_offsets
         for family, buffer in self.families.items():
-            row_indexes = np.flatnonzero(self.tags == FAMILY_TAGS[family])
+            device_buffer = None
+            buffer_row_count = buffer.row_count
+            if self.device_state is not None:
+                device_buffer = self.device_state.families.get(family)
+                if device_buffer is not None:
+                    buffer_row_count = int(device_buffer.geometry_offsets.size) - 1
+            row_indexes = np.flatnonzero(
+                validity & (tags == FAMILY_TAGS[family])
+            )
             if row_indexes.size == 0:
                 continue
-            family_rows = self.family_row_offsets[row_indexes]
-            if buffer.row_count == row_indexes.size and np.array_equal(
+            family_rows = family_row_offsets[row_indexes]
+            if buffer_row_count == row_indexes.size and np.array_equal(
                 family_rows,
-                np.arange(buffer.row_count, dtype=np.int32),
+                np.arange(buffer_row_count, dtype=np.int32),
             ):
                 family_bounds = np.ascontiguousarray(bounds[row_indexes], dtype=np.float64)
             else:
@@ -717,12 +735,12 @@ class OwnedGeometryArray:
                 # to the same physical family row. Cache per-family bounds
                 # using physical family-row indices so the family buffer shape
                 # stays aligned with buffer.row_count.
-                family_bounds = np.full((buffer.row_count, 4), np.nan, dtype=np.float64)
+                family_bounds = np.full((buffer_row_count, 4), np.nan, dtype=np.float64)
                 family_bounds[family_rows] = bounds[row_indexes]
             self.families[family] = FamilyGeometryBuffer(
                 family=buffer.family,
                 schema=buffer.schema,
-                row_count=buffer.row_count,
+                row_count=buffer_row_count,
                 x=buffer.x,
                 y=buffer.y,
                 geometry_offsets=buffer.geometry_offsets,
@@ -732,8 +750,7 @@ class OwnedGeometryArray:
                 bounds=family_bounds,
                 host_materialized=buffer.host_materialized,
             )
-            if self.device_state is not None:
-                device_buffer = self.device_state.families[family]
+            if device_buffer is not None:
                 if device_buffer.bounds is None:
                     device_buffer.bounds = runtime.from_host(family_bounds)
                 elif tuple(int(dim) for dim in device_buffer.bounds.shape) != family_bounds.shape:
@@ -2620,10 +2637,15 @@ def concat_owned_scatter(
     ``len(indices)`` must equal ``replacement.row_count``.
 
     Operates entirely at the buffer level — no Shapely materialisation.
-    When both inputs are host-resident the result is host-resident; when
-    both are device-resident, use :func:`device_concat_owned_scatter`
-    instead (future work).
+    When both inputs are device-resident, dispatches to
+    :func:`device_concat_owned_scatter` so the result stays on GPU.
     """
+    if (
+        base.residency is Residency.DEVICE
+        and replacement.residency is Residency.DEVICE
+    ):
+        return device_concat_owned_scatter(base, replacement, indices)
+
     from vibespatial.geometry.device_array import _concat_family_buffers
 
     indices = np.asarray(indices, dtype=np.int64)
@@ -2723,6 +2745,109 @@ def concat_owned_scatter(
     result._record(
         DiagnosticKind.CREATED,
         f"scatter {replacement.row_count} replacement rows into {base.row_count}-row base",
+        visible=False,
+    )
+    return result
+
+
+def device_concat_owned_scatter(
+    base: OwnedGeometryArray,
+    replacement: OwnedGeometryArray,
+    indices: np.ndarray | DeviceArray,
+) -> OwnedGeometryArray:
+    """Scatter *replacement* rows into *base* without leaving the device."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        raise RuntimeError("CuPy is required for device scatter assembly")
+
+    indices = cp.asarray(indices, dtype=cp.int64)
+    n_out = base.row_count
+    if int(indices.size) != replacement.row_count:
+        raise ValueError(
+            f"indices length ({int(indices.size)}) must equal replacement row_count "
+            f"({replacement.row_count})"
+        )
+
+    base_state = base._ensure_device_state()
+    replacement_state = replacement._ensure_device_state()
+
+    out_validity = cp.asarray(base_state.validity).copy()
+    out_tags = cp.asarray(base_state.tags).copy()
+    out_validity[indices] = replacement_state.validity
+    out_tags[indices] = replacement_state.tags
+
+    is_replacement = cp.zeros(n_out, dtype=cp.bool_)
+    is_replacement[indices] = True
+    inv_map = cp.full(n_out, -1, dtype=cp.int64)
+    inv_map[indices] = cp.arange(replacement.row_count, dtype=cp.int64)
+
+    out_family_row_offsets = cp.full(n_out, -1, dtype=cp.int32)
+    out_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+
+    all_families = set(base_state.families) | set(replacement_state.families)
+    for family in sorted(all_families, key=lambda item: FAMILY_TAGS[item]):
+        family_global_indices = cp.flatnonzero(out_tags == FAMILY_TAGS[family]).astype(
+            cp.int64, copy=False,
+        )
+        if int(family_global_indices.size) == 0:
+            continue
+
+        family_is_replacement = is_replacement[family_global_indices]
+        family_buffers: list[DeviceFamilyGeometryBuffer] = []
+        base_family_count = 0
+        repl_family_count = 0
+
+        if family in base_state.families and bool(cp.any(~family_is_replacement)):
+            base_global = family_global_indices[~family_is_replacement]
+            base_rows = cp.asarray(
+                base_state.family_row_offsets[base_global], dtype=cp.int64,
+            )
+            base_taken = _device_take_family_buffer(
+                base_state.families[family],
+                family,
+                base_rows,
+            )
+            family_buffers.append(base_taken)
+            base_family_count = int(base_taken.geometry_offsets.size) - 1
+            out_family_row_offsets[base_global] = cp.arange(
+                base_family_count, dtype=cp.int32,
+            )
+
+        if family in replacement_state.families and bool(cp.any(family_is_replacement)):
+            repl_global = family_global_indices[family_is_replacement]
+            repl_local = inv_map[repl_global]
+            repl_rows = cp.asarray(
+                replacement_state.family_row_offsets[repl_local], dtype=cp.int64,
+            )
+            repl_taken = _device_take_family_buffer(
+                replacement_state.families[family],
+                family,
+                repl_rows,
+            )
+            family_buffers.append(repl_taken)
+            repl_family_count = int(repl_taken.geometry_offsets.size) - 1
+            out_family_row_offsets[repl_global] = cp.arange(
+                base_family_count,
+                base_family_count + repl_family_count,
+                dtype=cp.int32,
+            )
+
+        if family_buffers:
+            out_families[family] = _concat_device_family_buffers(
+                family,
+                family_buffers,
+            )
+
+    result = build_device_resident_owned(
+        device_families=out_families,
+        row_count=n_out,
+        tags=out_tags,
+        validity=out_validity,
+        family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
+    )
+    result._record(
+        DiagnosticKind.CREATED,
+        f"device scatter {replacement.row_count} replacement rows into {base.row_count}-row base",
         visible=False,
     )
     return result

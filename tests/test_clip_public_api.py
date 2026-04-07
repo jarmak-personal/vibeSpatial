@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import importlib
+
+import numpy as np
 from shapely.geometry import LineString, MultiLineString, Point, Polygon, box
 
 import vibespatial
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.tools.clip import clip
+
+clip_module = importlib.import_module("vibespatial.api.tools.clip")
 
 
 def _build_mixed_viewport_fixture() -> vibespatial.GeoDataFrame:
@@ -27,14 +32,13 @@ def test_clip_scalar_mask_rectangle_fast_path_still_keeps_mixed_rows_stable(
     mask = box(1.0, 1.0, 6.0, 6.0)
     seen: list[tuple[str, ...]] = []
 
-    original = GeometryArray._constructive_or_fallback
+    original = GeometryArray.clip_by_rect
 
-    def wrapped(self, op, other, **kwargs):
-        if op == "intersection":
-            seen.append(tuple(self.geom_type.tolist()))
-        return original(self, op, other, **kwargs)
+    def wrapped(self, xmin, ymin, xmax, ymax):
+        seen.append(tuple(self.geom_type.tolist()))
+        return original(self, xmin, ymin, xmax, ymax)
 
-    monkeypatch.setattr(GeometryArray, "_constructive_or_fallback", wrapped)
+    monkeypatch.setattr(GeometryArray, "clip_by_rect", wrapped)
 
     result = clip(gdf, mask)
 
@@ -45,7 +49,7 @@ def test_clip_scalar_mask_rectangle_fast_path_still_keeps_mixed_rows_stable(
         "POINT (4 4)",
     }
     assert seen[0] == ("LineString",)
-    assert all(types == ("LineString",) for types in seen)
+    assert set(seen) == {("LineString",), ("Polygon",)}
     assert isinstance(result.geometry.values, GeometryArray)
 
 
@@ -108,3 +112,38 @@ def test_clip_polygon_rectangle_mask_preserves_polygon_line_slivers_as_geometry_
 
     assert result.geom_type.iloc[0] == "GeometryCollection"
     assert tuple(result.total_bounds) == tuple(mask.total_bounds)
+
+
+def test_clip_polygon_mask_zero_area_filter_copies_keep_mask_before_mutation(
+    monkeypatch,
+) -> None:
+    gdf = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 2.0, 2.0)]},
+        crs="EPSG:3857",
+    )
+    mask = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 2.0, 2.0)]},
+        crs="EPSG:3857",
+    )
+
+    real_asarray = clip_module.np.asarray
+
+    def _readonly_bool_asarray(value, *args, **kwargs):
+        arr = real_asarray(value, *args, **kwargs)
+        dtype = kwargs.get("dtype", args[0] if args else None)
+        if dtype is bool and getattr(arr, "ndim", 0) == 1 and getattr(arr, "size", -1) == len(gdf):
+            readonly = np.array(arr, copy=True)
+            readonly.setflags(write=False)
+            return readonly
+        return arr
+
+    monkeypatch.setattr(clip_module.np, "asarray", _readonly_bool_asarray)
+    monkeypatch.setattr(
+        clip_module.shapely,
+        "area",
+        lambda values: np.zeros(len(real_asarray(values, dtype=object)), dtype=np.float64),
+    )
+
+    result = clip(gdf, mask)
+
+    assert len(result) == 0

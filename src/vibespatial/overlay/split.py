@@ -21,6 +21,7 @@ import numpy as np
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
+    count_scatter_total,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import (
@@ -104,6 +105,17 @@ def _free_atomic_edge_excess(atomic_edges: AtomicEdgeTable) -> None:
 def _sync_hotpath(runtime) -> None:
     if hotpath_trace_enabled():
         runtime.synchronize()
+
+
+def _pack_split_keys(source_segment_ids, t_values):
+    """Match the NVRTC split-event pack_key(source_id, t) encoding."""
+    d_source_ids = cp.asarray(source_segment_ids, dtype=cp.uint64)
+    d_t = cp.asarray(t_values, dtype=cp.float64)
+    quantized_t = cp.rint(cp.clip(d_t, 0.0, 1.0) * 1_000_000_000.0).astype(
+        cp.uint64,
+        copy=False,
+    )
+    return (d_source_ids << cp.uint64(32)) | quantized_t
 
 
 def _deduplicate_atomic_edge_geometry(
@@ -303,6 +315,7 @@ def build_gpu_split_events(
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     require_same_row: bool = False,
+    right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> SplitEventTable:
     _require_gpu_arrays()
     runtime = get_cuda_runtime()
@@ -323,13 +336,40 @@ def build_gpu_split_events(
             if _cached_right_segments is not None
             else _extract_segments_gpu(right)
         )
+    effective_right_segments = right_segments
+    remapped_right_row_indices = None
+    if right_geometry_source_rows is not None:
+        d_right_geometry_source_rows = cp.asarray(
+            right_geometry_source_rows,
+            dtype=cp.int32,
+        )
+        if int(d_right_geometry_source_rows.size) != int(right.row_count):
+            raise ValueError(
+                "right_geometry_source_rows must match the right row_count "
+                f"({right.row_count}), got {int(d_right_geometry_source_rows.size)}"
+            )
+        remapped_right_row_indices = d_right_geometry_source_rows[
+            cp.asarray(right_segments.row_indices, dtype=cp.int32)
+        ].astype(cp.int32, copy=False)
+        effective_right_segments = DeviceSegmentTable(
+            row_indices=remapped_right_row_indices,
+            segment_indices=right_segments.segment_indices,
+            x0=right_segments.x0,
+            y0=right_segments.y0,
+            x1=right_segments.x1,
+            y1=right_segments.y1,
+            count=right_segments.count,
+            part_indices=right_segments.part_indices,
+            ring_indices=right_segments.ring_indices,
+        )
+    original_right_segment_rows = cp.asarray(right_segments.row_indices, dtype=cp.int32)
 
     with hotpath_stage("overlay.split.classify_intersections", category="refine"):
         result = intersection_result or classify_segment_intersections(
             left,
             right,
             dispatch_mode=dispatch_mode,
-            _cached_right_device_segments=_cached_right_segments,
+            _cached_right_device_segments=effective_right_segments,
             _require_same_row=require_same_row,
         )
     if result.runtime_selection.selected is not ExecutionMode.GPU:
@@ -357,7 +397,7 @@ def build_gpu_split_events(
         device_state = result.device_state
 
     left_count = int(left_segments.count)
-    right_count = int(right_segments.count)
+    right_count = int(effective_right_segments.count)
     segment_total = left_count + right_count
     base_event_count = segment_total * 2
     kernels = _overlay_split_kernels()
@@ -368,10 +408,10 @@ def build_gpu_split_events(
     left_y0 = left_segments.y0
     left_x1 = left_segments.x1
     left_y1 = left_segments.y1
-    right_x0 = right_segments.x0
-    right_y0 = right_segments.y0
-    right_x1 = right_segments.x1
-    right_y1 = right_segments.y1
+    right_x0 = effective_right_segments.x0
+    right_y0 = effective_right_segments.y0
+    right_x1 = effective_right_segments.x1
+    right_y1 = effective_right_segments.y1
 
     endpoint_source_ids = runtime.allocate((base_event_count,), np.int32)
     endpoint_t = runtime.allocate((base_event_count,), np.float64)
@@ -445,13 +485,25 @@ def build_gpu_split_events(
         with hotpath_stage("overlay.split.prefix_pair_events", category="sort"):
             pair_offsets = exclusive_sum(pair_counts)
             pair_event_count = (
-                int(cp.asnumpy(pair_offsets[-1] + pair_counts[-1])) if int(result.count) else 0  # hygiene:ok — allocation-fence: need pair_event_count to size 5 output buffers
+                count_scatter_total(runtime, pair_counts, pair_offsets)
+                if int(result.count)
+                else 0
             )
         extra_source_ids = runtime.allocate((pair_event_count,), np.int32)
         extra_t = runtime.allocate((pair_event_count,), np.float64)
         extra_x = runtime.allocate((pair_event_count,), np.float64)
         extra_y = runtime.allocate((pair_event_count,), np.float64)
         extra_keys = runtime.allocate((pair_event_count,), np.uint64)
+        rr_pair_counts = None
+        rr_pair_offsets = None
+        rr_extra_source_ids_raw = None
+        rr_extra_t = None
+        rr_extra_x = None
+        rr_extra_y = None
+        rr_extra_keys_raw = None
+        rr_event_source_ids = None
+        rr_event_keys = None
+        rr_state = None
 
         try:
             scatter_params = (
@@ -519,12 +571,164 @@ def build_gpu_split_events(
                     params=scatter_params,
                 )
 
+            if remapped_right_row_indices is not None:
+                with hotpath_stage("overlay.split.classify_right_right_intersections", category="refine"):
+                    right_right = classify_segment_intersections(
+                        right,
+                        right,
+                        dispatch_mode=dispatch_mode,
+                        _cached_left_device_segments=effective_right_segments,
+                        _cached_right_device_segments=effective_right_segments,
+                        _require_same_row=True,
+                    )
+                if right_right.runtime_selection.selected is not ExecutionMode.GPU:
+                    raise RuntimeError(
+                        "grouped right-right split-event classification requires GPU execution"
+                    )
+                rr_state = right_right.device_state
+                rr_keep = None
+                if rr_state is not None and right_right.count > 0:
+                    with hotpath_stage("overlay.split.filter_right_right_pairs", category="filter"):
+                        d_rr_left_lookup = cp.asarray(rr_state.left_lookup, dtype=cp.int32)
+                        d_rr_right_lookup = cp.asarray(rr_state.right_lookup, dtype=cp.int32)
+                        d_rr_left_rows = original_right_segment_rows[d_rr_left_lookup]
+                        d_rr_right_rows = original_right_segment_rows[d_rr_right_lookup]
+                        rr_keep = compact_indices(
+                            (d_rr_left_rows < d_rr_right_rows).astype(cp.uint8, copy=False)
+                        ).values
+                        _sync_hotpath(runtime)
+                if rr_keep is not None and int(rr_keep.size) > 0:
+                    rr_count = int(rr_keep.size)
+                    rr_left_lookup = cp.asarray(rr_state.left_lookup, dtype=cp.int32)[rr_keep]
+                    rr_right_lookup = cp.asarray(rr_state.right_lookup, dtype=cp.int32)[rr_keep]
+                    rr_kinds = cp.asarray(rr_state.kinds, dtype=cp.int8)[rr_keep]
+                    rr_point_x = cp.asarray(rr_state.point_x, dtype=cp.float64)[rr_keep]
+                    rr_point_y = cp.asarray(rr_state.point_y, dtype=cp.float64)[rr_keep]
+                    rr_overlap_x0 = cp.asarray(rr_state.overlap_x0, dtype=cp.float64)[rr_keep]
+                    rr_overlap_y0 = cp.asarray(rr_state.overlap_y0, dtype=cp.float64)[rr_keep]
+                    rr_overlap_x1 = cp.asarray(rr_state.overlap_x1, dtype=cp.float64)[rr_keep]
+                    rr_overlap_y1 = cp.asarray(rr_state.overlap_y1, dtype=cp.float64)[rr_keep]
+
+                    rr_pair_counts = runtime.allocate((rr_count,), np.int32)
+                    with hotpath_stage("overlay.split.count_right_right_events", category="filter"):
+                        rr_count_params = (
+                            (ptr(rr_kinds), ptr(rr_pair_counts), rr_count),
+                            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+                        )
+                        rr_count_grid, rr_count_block = runtime.launch_config(
+                            kernels["count_pair_split_events"], rr_count,
+                        )
+                        runtime.launch(
+                            kernels["count_pair_split_events"],
+                            grid=rr_count_grid,
+                            block=rr_count_block,
+                            params=rr_count_params,
+                        )
+
+                    with hotpath_stage("overlay.split.prefix_right_right_events", category="sort"):
+                        rr_pair_offsets = exclusive_sum(rr_pair_counts)
+                        rr_pair_event_count = (
+                            count_scatter_total(runtime, rr_pair_counts, rr_pair_offsets)
+                            if rr_count
+                            else 0
+                        )
+
+                    rr_extra_source_ids_raw = runtime.allocate((rr_pair_event_count,), np.int32)
+                    rr_extra_t = runtime.allocate((rr_pair_event_count,), np.float64)
+                    rr_extra_x = runtime.allocate((rr_pair_event_count,), np.float64)
+                    rr_extra_y = runtime.allocate((rr_pair_event_count,), np.float64)
+                    rr_extra_keys_raw = runtime.allocate((rr_pair_event_count,), np.uint64)
+
+                    rr_scatter_params = (
+                        (
+                            ptr(rr_left_lookup),
+                            ptr(rr_right_lookup),
+                            ptr(rr_kinds),
+                            ptr(rr_point_x),
+                            ptr(rr_point_y),
+                            ptr(rr_overlap_x0),
+                            ptr(rr_overlap_y0),
+                            ptr(rr_overlap_x1),
+                            ptr(rr_overlap_y1),
+                            ptr(right_x0),
+                            ptr(right_y0),
+                            ptr(right_x1),
+                            ptr(right_y1),
+                            ptr(right_x0),
+                            ptr(right_y0),
+                            ptr(right_x1),
+                            ptr(right_y1),
+                            ptr(rr_pair_offsets),
+                            right_count,
+                            ptr(rr_extra_source_ids_raw),
+                            ptr(rr_extra_t),
+                            ptr(rr_extra_x),
+                            ptr(rr_extra_y),
+                            ptr(rr_extra_keys_raw),
+                            rr_count,
+                        ),
+                        (
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_I32,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_PTR,
+                            KERNEL_PARAM_I32,
+                        ),
+                    )
+                    rr_scatter_grid, rr_scatter_block = runtime.launch_config(
+                        kernels["scatter_pair_split_events"], rr_count,
+                    )
+                    with hotpath_stage("overlay.split.scatter_right_right_events", category="emit"):
+                        runtime.launch(
+                            kernels["scatter_pair_split_events"],
+                            grid=rr_scatter_grid,
+                            block=rr_scatter_block,
+                            params=rr_scatter_params,
+                        )
+                        _sync_hotpath(runtime)
+
+                    rr_event_source_ids = (
+                        cp.asarray(rr_extra_source_ids_raw, dtype=cp.int32) % int(right_count)
+                    ).astype(cp.int32, copy=False) + np.int32(left_count)
+                    rr_event_keys = _pack_split_keys(rr_event_source_ids, rr_extra_t)
+
             with hotpath_stage("overlay.split.concat_events", category="emit"):
-                all_source_ids = cp.concatenate((endpoint_source_ids, extra_source_ids))
-                all_t = cp.concatenate((endpoint_t, extra_t))
-                all_x = cp.concatenate((endpoint_x, extra_x))
-                all_y = cp.concatenate((endpoint_y, extra_y))
-                all_keys = cp.concatenate((endpoint_keys, extra_keys))
+                event_source_ids = [endpoint_source_ids, extra_source_ids]
+                event_t = [endpoint_t, extra_t]
+                event_x = [endpoint_x, extra_x]
+                event_y = [endpoint_y, extra_y]
+                event_keys = [endpoint_keys, extra_keys]
+                if rr_event_source_ids is not None:
+                    event_source_ids.append(rr_event_source_ids)
+                    event_t.append(rr_extra_t)
+                    event_x.append(rr_extra_x)
+                    event_y.append(rr_extra_y)
+                    event_keys.append(rr_event_keys)
+                all_source_ids = cp.concatenate(tuple(event_source_ids))
+                all_t = cp.concatenate(tuple(event_t))
+                all_x = cp.concatenate(tuple(event_x))
+                all_y = cp.concatenate(tuple(event_y))
+                all_keys = cp.concatenate(tuple(event_keys))
                 _sync_hotpath(runtime)
 
             with hotpath_stage("overlay.split.sort_event_pairs", category="sort"):
@@ -562,7 +766,7 @@ def build_gpu_split_events(
                         unique_source_ids,
                         left_count=left_count,
                         left_segments=left_segments,
-                        right_segments=right_segments,
+                        right_segments=effective_right_segments,
                     )
                 )
             event_count = int(unique_source_ids.size)
@@ -592,6 +796,35 @@ def build_gpu_split_events(
             runtime.free(extra_x)
             runtime.free(extra_y)
             runtime.free(extra_keys)
+            if rr_pair_counts is not None:
+                runtime.free(rr_pair_counts)
+            if rr_pair_offsets is not None:
+                runtime.free(rr_pair_offsets)
+            if rr_extra_source_ids_raw is not None:
+                runtime.free(rr_extra_source_ids_raw)
+            if rr_extra_t is not None:
+                runtime.free(rr_extra_t)
+            if rr_extra_x is not None:
+                runtime.free(rr_extra_x)
+            if rr_extra_y is not None:
+                runtime.free(rr_extra_y)
+            if rr_extra_keys_raw is not None:
+                runtime.free(rr_extra_keys_raw)
+            if rr_state is not None:
+                runtime.free(rr_state.left_rows)
+                runtime.free(rr_state.left_segments)
+                runtime.free(rr_state.left_lookup)
+                runtime.free(rr_state.right_rows)
+                runtime.free(rr_state.right_segments)
+                runtime.free(rr_state.right_lookup)
+                runtime.free(rr_state.kinds)
+                runtime.free(rr_state.point_x)
+                runtime.free(rr_state.point_y)
+                runtime.free(rr_state.overlap_x0)
+                runtime.free(rr_state.overlap_y0)
+                runtime.free(rr_state.overlap_x1)
+                runtime.free(rr_state.overlap_y1)
+                runtime.free(rr_state.ambiguous_rows)
     finally:
         # Free DeviceSegmentTable arrays (x0/y0/x1/y1 are aliases of
         # left_x0 etc., plus row/segment/part/ring metadata).
@@ -611,6 +844,8 @@ def build_gpu_split_events(
                 runtime.free(_dst.part_indices)
             if _dst.ring_indices is not None:
                 runtime.free(_dst.ring_indices)
+        if remapped_right_row_indices is not None:
+            runtime.free(remapped_right_row_indices)
         runtime.free(endpoint_source_ids)
         runtime.free(endpoint_t)
         runtime.free(endpoint_x)

@@ -12,6 +12,7 @@ from vibespatial.cuda.cccl_precompile import (
     SPEC_REGISTRY,
     CCCLPrecompiler,
     _warm_many_vs_one_overlay_remainder_route,
+    _warm_overlay_difference_segmented_union_route,
     ensure_pipelines_warm,
     precompile_enabled,
     precompile_status,
@@ -61,8 +62,8 @@ class TestPrecompileEnabled:
 # ---------------------------------------------------------------------------
 
 class TestSpecRegistry:
-    def test_registry_has_23_specs(self):
-        assert len(SPEC_REGISTRY) == 23
+    def test_registry_has_26_specs(self):
+        assert len(SPEC_REGISTRY) == 26
 
     def test_all_expected_specs_present(self):
         expected = {
@@ -72,8 +73,8 @@ class TestSpecRegistry:
             "segmented_reduce_sum_f64", "segmented_reduce_sum_i32",
             "segmented_reduce_min_f64",
             "segmented_reduce_max_f64",
-            "lower_bound_i32", "lower_bound_i64", "lower_bound_u64",
-            "upper_bound_i32", "upper_bound_u64",
+            "lower_bound_i32", "lower_bound_i64", "lower_bound_f64", "lower_bound_u64",
+            "upper_bound_i32", "upper_bound_i64", "upper_bound_f64", "upper_bound_u64",
             "radix_sort_i32_i32", "radix_sort_i64_i32", "radix_sort_u64_i32",
             "merge_sort_u64_i32",
             "unique_by_key_i32_i32", "unique_by_key_u64_i32",
@@ -109,14 +110,55 @@ class TestCCCLPrecompilerNoGPU:
             "vibespatial.cuda.cccl_precompile._warm_exact_polygon_intersection_route",
         ) as probe:
             ensure_pipelines_warm()
-        probe.assert_called_once_with()
+        probe.assert_called_once_with(timeout=60.0)
 
     def test_ensure_pipelines_warm_calls_many_vs_one_overlay_probe(self):
         with patch(
             "vibespatial.cuda.cccl_precompile._warm_many_vs_one_overlay_remainder_route",
         ) as probe:
             ensure_pipelines_warm()
-        probe.assert_called_once_with()
+        probe.assert_called_once_with(timeout=60.0)
+
+    def test_ensure_pipelines_warm_calls_overlay_difference_probe(self):
+        with patch(
+            "vibespatial.cuda.cccl_precompile._warm_overlay_difference_segmented_union_route",
+        ) as probe:
+            ensure_pipelines_warm()
+        probe.assert_called_once_with(timeout=60.0)
+
+    def test_ensure_pipelines_warm_drains_second_wave_cccl_requests(self):
+        class _FakePrecompiler:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def ensure_warm(self, timeout: float = 30.0) -> list[str]:
+                self.calls += 1
+                if self.calls == 1:
+                    return ["first-wave"]
+                return ["second-wave"]
+
+        fake = _FakePrecompiler()
+        original_instance = CCCLPrecompiler._instance
+        try:
+            CCCLPrecompiler._instance = fake  # type: ignore[assignment]
+            with (
+                patch.object(CCCLPrecompiler, "get", return_value=fake),
+                patch(
+                    "vibespatial.cuda.cccl_precompile._warm_exact_polygon_intersection_route",
+                ),
+                patch(
+                    "vibespatial.cuda.cccl_precompile._warm_many_vs_one_overlay_remainder_route",
+                ),
+                patch(
+                    "vibespatial.cuda.cccl_precompile._warm_overlay_difference_segmented_union_route",
+                ),
+            ):
+                result = ensure_pipelines_warm(timeout=7.5)
+        finally:
+            CCCLPrecompiler._instance = original_instance
+
+        assert fake.calls == 2
+        assert result["cccl_cold"] == ["first-wave", "second-wave"]
 
 
 @pytest.mark.gpu
@@ -135,6 +177,24 @@ def test_warm_many_vs_one_overlay_probe_stays_off_cpu_fallback(
         _warm_many_vs_one_overlay_remainder_route()
 
     assert not any("many-vs-one remainder" in str(entry.message) for entry in caught)
+
+
+@pytest.mark.gpu
+def test_warm_overlay_difference_probe_stays_off_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    import vibespatial.cuda.cccl_precompile as precompile_module
+
+    monkeypatch.setattr(precompile_module, "_overlay_difference_warm_done", False)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _warm_overlay_difference_segmented_union_route()
+
+    assert not any("overlay difference segmented-union" in str(entry.message) for entry in caught)
 
 class TestCCCLPrecompilerCore:
     def test_deduplication(self):

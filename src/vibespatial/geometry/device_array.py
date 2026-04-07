@@ -589,30 +589,52 @@ class DeviceGeometryArray(ExtensionArray):
 
             elif family is GeometryFamily.LINESTRING and not has_empties:
                 from vibespatial.constructive.linestring import linestring_buffer_owned_array
+                from vibespatial.runtime.adaptive import plan_dispatch_selection
+                from vibespatial.runtime.precision import KernelClass
 
-                try:
-                    result = linestring_buffer_owned_array(
-                        owned, distance,
-                        quad_segs=quad_segs,
-                        cap_style=cap_style,
-                        join_style=join_style,
-                        mitre_limit=mitre_limit,
-                    )
-                    record_dispatch_event(
-                        surface="DeviceGeometryArray.buffer",
-                        operation="buffer",
-                        implementation="linestring_buffer_owned_array",
-                        reason="DGA direct linestring buffer dispatch",
-                        detail=f"rows={len(self)}, family=linestring",
-                        selected=ExecutionMode.GPU,
-                    )
-                    return DeviceGeometryArray._from_owned(result, crs=self._crs)
-                except Exception as exc:
+                # The direct DGA path bypasses GeometryArray.buffer(), so it
+                # must honor the normal AUTO crossover itself. Linestring
+                # buffer is not yet host-competitive below the public
+                # threshold; forcing tiny device-resident inputs through the
+                # GPU path regresses both correctness and throughput.
+                selection = plan_dispatch_selection(
+                    kernel_name="linestring_buffer",
+                    kernel_class=KernelClass.CONSTRUCTIVE,
+                    row_count=len(self),
+                )
+                if selection.selected is not ExecutionMode.GPU:
                     owned._record(
-                        DiagnosticKind.FALLBACK,
-                        f"DeviceGeometryArray.buffer: GPU linestring kernel failed: {exc!r}",
+                        DiagnosticKind.RUNTIME,
+                        (
+                            "DeviceGeometryArray.buffer: linestring buffer honored "
+                            f"AUTO crossover ({selection.reason})"
+                        ),
                         visible=True,
                     )
+                else:
+                    try:
+                        result = linestring_buffer_owned_array(
+                            owned, distance,
+                            quad_segs=quad_segs,
+                            cap_style=cap_style,
+                            join_style=join_style,
+                            mitre_limit=mitre_limit,
+                        )
+                        record_dispatch_event(
+                            surface="DeviceGeometryArray.buffer",
+                            operation="buffer",
+                            implementation="linestring_buffer_owned_array",
+                            reason="DGA direct linestring buffer dispatch",
+                            detail=f"rows={len(self)}, family=linestring",
+                            selected=ExecutionMode.GPU,
+                        )
+                        return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                    except Exception as exc:
+                        owned._record(
+                            DiagnosticKind.FALLBACK,
+                            f"DeviceGeometryArray.buffer: GPU linestring kernel failed: {exc!r}",
+                            visible=True,
+                        )
 
             elif family is GeometryFamily.POLYGON and not has_empties:
                 from vibespatial.constructive.polygon import polygon_buffer_owned_array

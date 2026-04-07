@@ -55,6 +55,8 @@ def _gpu_label_face_coverage(
     face_count: int,
     *,
     face_source_rows: cp.ndarray | None = None,
+    left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
+    right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> tuple[cp.ndarray, cp.ndarray]:
     """GPU face labeling: test face sample points against input geometries.
 
@@ -76,9 +78,9 @@ def _gpu_label_face_coverage(
         kernels["label_face_coverage_polygon"], face_count,
     )
 
-    for side_name, side_input, out_covered in [
-        ("left", left, left_covered),
-        ("right", right, right_covered),
+    for side_name, side_input, out_covered, geometry_source_rows in [
+        ("left", left, left_covered, left_geometry_source_rows),
+        ("right", right, right_covered, right_geometry_source_rows),
     ]:
         with hotpath_stage(f"overlay.faces.coverage.{side_name}.prepare", category="setup"):
             device_state = side_input._ensure_device_state()
@@ -105,6 +107,15 @@ def _gpu_label_face_coverage(
             d_poly_source_rows = None
             d_mp_source_rows = None
             if face_source_rows is not None:
+                logical_rows = None
+                if geometry_source_rows is not None:
+                    logical_rows = cp.asarray(geometry_source_rows, dtype=cp.int32)
+                    logical_row_count = logical_rows.shape[0]
+                    if logical_row_count != side_input.row_count:
+                        raise ValueError(
+                            f"{side_name}_geometry_source_rows must match row_count "
+                            f"({side_input.row_count}), got {logical_row_count}"
+                        )
                 d_tags = cp.asarray(device_state.tags)
                 d_validity = cp.asarray(device_state.validity)
                 d_family_rows = cp.asarray(device_state.family_row_offsets)
@@ -112,13 +123,19 @@ def _gpu_label_face_coverage(
                     d_poly_source_rows = cp.full(poly_count, -1, dtype=cp.int32)
                     d_poly_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
                     d_poly_slots = d_family_rows[d_poly_mask].astype(cp.int32, copy=False)
-                    d_poly_rows = cp.flatnonzero(d_poly_mask).astype(cp.int32, copy=False)
+                    if logical_rows is None:
+                        d_poly_rows = cp.flatnonzero(d_poly_mask).astype(cp.int32, copy=False)
+                    else:
+                        d_poly_rows = logical_rows[d_poly_mask].astype(cp.int32, copy=False)
                     d_poly_source_rows[d_poly_slots] = d_poly_rows
                 if launch_mpoly:
                     d_mp_source_rows = cp.full(mp_count, -1, dtype=cp.int32)
                     d_mp_mask = d_validity & (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
                     d_mp_slots = d_family_rows[d_mp_mask].astype(cp.int32, copy=False)
-                    d_mp_rows = cp.flatnonzero(d_mp_mask).astype(cp.int32, copy=False)
+                    if logical_rows is None:
+                        d_mp_rows = cp.flatnonzero(d_mp_mask).astype(cp.int32, copy=False)
+                    else:
+                        d_mp_rows = logical_rows[d_mp_mask].astype(cp.int32, copy=False)
                     d_mp_source_rows[d_mp_slots] = d_mp_rows
             _sync_hotpath(runtime)
 
@@ -294,6 +311,8 @@ def build_gpu_overlay_faces(
     intersection_result: SegmentIntersectionResult | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     row_isolated: bool = False,
+    left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
+    right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> OverlayFaceTable:
     from vibespatial.overlay.gpu import (
         build_gpu_atomic_edges,
@@ -361,6 +380,8 @@ def build_gpu_overlay_faces(
                 d_label_y,
                 face_count,
                 face_source_rows=d_face_source_rows,
+                left_geometry_source_rows=left_geometry_source_rows,
+                right_geometry_source_rows=right_geometry_source_rows,
             )
             # Mask out unbounded faces (keep on device -- ADR-0005)
             with hotpath_stage("overlay.faces.mask_unbounded", category="filter"):
@@ -459,7 +480,13 @@ def build_gpu_overlay_faces(
             d_label_x = runtime.from_host(label_x)
             d_label_y = runtime.from_host(label_y)
             d_lc, d_rc = _gpu_label_face_coverage(
-                left, right, d_label_x, d_label_y, cpu_face_count_for_label,
+                left,
+                right,
+                d_label_x,
+                d_label_y,
+                cpu_face_count_for_label,
+                left_geometry_source_rows=left_geometry_source_rows,
+                right_geometry_source_rows=right_geometry_source_rows,
             )
             runtime.synchronize()
             # Apply bounded_mask on device to avoid D->H->D roundtrip.

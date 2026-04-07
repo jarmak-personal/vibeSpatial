@@ -19,6 +19,7 @@ from shapely.geometry import MultiPolygon, Polygon, box
 
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.residency import Residency
 from vibespatial.testing import build_owned as _make_owned
 
 
@@ -366,6 +367,24 @@ class TestSegmentedUnionGPU:
         assert len(result_geoms) == 1
         _assert_geom_equal(result_geoms[0], ref[0])
 
+    @requires_gpu
+    def test_three_polygon_chain_gpu(self):
+        """GPU: 3-item chain must not lose a disjoint component in tree reduction."""
+        geoms = [
+            box(0, 0, 2, 2),
+            box(10, 0, 12, 2),
+            box(11, 0, 13, 2),
+        ]
+        owned = _make_owned(geoms)
+        offsets = np.array([0, 3], dtype=np.int64)
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+        ref = _shapely_segmented_union(geoms, offsets)
+
+        result_geoms = result.to_shapely()
+        assert len(result_geoms) == 1
+        _assert_geom_equal(result_geoms[0], ref[0])
+
 
 # ---------------------------------------------------------------------------
 # Auto-dispatch tests
@@ -387,6 +406,30 @@ class TestSegmentedUnionAutoDispatch:
         result_geoms = result.to_shapely()
         assert len(result_geoms) == 1
         _assert_geom_equal(result_geoms[0], ref[0])
+
+    def test_auto_dispatch_stays_on_gpu_for_device_resident_input(self, monkeypatch):
+        """Device-resident AUTO inputs should not demote below crossover."""
+        import vibespatial.kernels.constructive.segmented_union as segmented_union_module
+
+        geoms = [box(0, 0, 2, 2), box(1, 1, 3, 3)]
+        owned = _make_owned(geoms, residency=Residency.DEVICE)
+        offsets = np.array([0, 2], dtype=np.int64)
+        gpu_result = _make_owned([box(0, 0, 3, 3)], residency=Residency.DEVICE)
+
+        def _gpu(*_args, **_kwargs):
+            return gpu_result
+
+        def _cpu(*_args, **_kwargs):
+            raise AssertionError("device-resident AUTO segmented union should not demote to CPU")
+
+        monkeypatch.setattr(segmented_union_module, "_segmented_union_gpu", _gpu)
+        monkeypatch.setattr(segmented_union_module, "_segmented_union_cpu", _cpu)
+
+        result = segmented_union_module.segmented_union_all(
+            owned, offsets, dispatch_mode=ExecutionMode.AUTO,
+        )
+
+        assert result is gpu_result
 
 
 # ---------------------------------------------------------------------------

@@ -758,6 +758,9 @@ class GeometryArray(ExtensionArray):
 
     def supports_owned_spatial_input(self) -> bool:
         if self._owned_spatial_input_supported is None:
+            if self._owned is not None:
+                self._owned_spatial_input_supported = True
+                return True
             from vibespatial.spatial.query import supports_owned_spatial_input
 
             self._owned_spatial_input_supported = bool(supports_owned_spatial_input(self._data))

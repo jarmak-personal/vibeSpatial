@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 
 import pandas as pd
-from shapely.geometry import Point
+from shapely.geometry import LineString, Point, box
 
 import vibespatial.api as geopandas
 from vibespatial import (
@@ -12,7 +12,9 @@ from vibespatial import (
     fusion_plan_for_dissolve,
     plan_dissolve_pipeline,
 )
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.testing import assert_geodataframe_equal
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, execute_grouped_union
 from vibespatial.runtime.fusion import IntermediateDisposition
 
@@ -152,3 +154,67 @@ def test_benchmark_dissolve_pipeline_reports_group_count() -> None:
     assert benchmark.iterations == 1
     assert benchmark.pipeline_elapsed_seconds >= 0.0
     assert benchmark.baseline_elapsed_seconds >= 0.0
+
+
+def test_execute_grouped_union_codes_avoids_geometry_array_materialization_for_owned_unary(
+    monkeypatch,
+) -> None:
+    geometry_array = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                box(0, 0, 1, 1),
+                box(1, 1, 2, 2),
+            ]
+        )
+    )
+    owned = getattr(geometry_array, "_owned", None)
+    assert owned is not None
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("owned unary grouped union should not materialize the full GeometryArray")
+
+    monkeypatch.setattr(GeometryArray, "__array__", _fail, raising=False)
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        geometry_array,
+        pd.Index([0, 0], dtype="int32").to_numpy(),
+        group_count=1,
+        method="unary",
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.group_count == 1
+    assert grouped.non_empty_groups == 1
+
+
+def test_execute_grouped_union_codes_linestrings_skip_owned_segmented_union_fast_path(
+    monkeypatch,
+) -> None:
+    geometry_array = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                LineString([(0, 0), (1, 1)]),
+                LineString([(1, 1), (2, 2)]),
+            ]
+        )
+    )
+    owned = getattr(geometry_array, "_owned", None)
+    assert owned is not None
+
+    import vibespatial.kernels.constructive.segmented_union as segmented_union_module
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("linestring dissolve should not route through segmented_union_all")
+
+    monkeypatch.setattr(segmented_union_module, "segmented_union_all", _fail)
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        geometry_array,
+        pd.Index([0, 0], dtype="int32").to_numpy(),
+        group_count=1,
+        method="unary",
+        owned=owned,
+    )
+
+    assert grouped is None

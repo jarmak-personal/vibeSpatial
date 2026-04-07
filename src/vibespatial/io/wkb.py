@@ -31,7 +31,10 @@ from vibespatial.io.wkb_kernels import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.fallbacks import (
+    record_fallback_event,
+    strict_native_mode_enabled,
+)
 from vibespatial.runtime.residency import Residency
 
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
@@ -74,6 +77,21 @@ def has_pyarrow_support() -> bool:
 def has_pylibcudf_support() -> bool:
     return find_spec("pylibcudf") is not None
 
+
+def _authoritative_host_metadata(
+    owned: OwnedGeometryArray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return host metadata sourced from device state when available."""
+    if owned.device_state is not None:
+        runtime = get_cuda_runtime()
+        return (
+            runtime.copy_device_to_host(owned.device_state.validity),
+            runtime.copy_device_to_host(owned.device_state.tags),
+            runtime.copy_device_to_host(owned.device_state.family_row_offsets),
+        )
+    return owned.validity, owned.tags, owned.family_row_offsets
+
+
 def _wkb_encode_kernels():
     runtime = get_cuda_runtime()
     return runtime.compile_kernels(
@@ -87,9 +105,10 @@ def _device_family_row_selection(
     owned: OwnedGeometryArray,
     family: GeometryFamily,
 ) -> tuple[np.ndarray, np.ndarray]:
-    family_mask = (owned.tags == FAMILY_TAGS[family]) & owned.validity
+    validity, tags, family_row_offsets = _authoritative_host_metadata(owned)
+    family_mask = (tags == FAMILY_TAGS[family]) & validity
     row_indexes = np.flatnonzero(family_mask).astype(np.int32, copy=False)
-    family_rows = owned.family_row_offsets[row_indexes].astype(np.int32, copy=False)
+    family_rows = family_row_offsets[row_indexes].astype(np.int32, copy=False)
     return row_indexes, family_rows
 
 
@@ -315,17 +334,16 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
         [offsets_column],
     )
 
-    null_count = int((~owned.validity).sum())
+    validity_mask, null_count = _device_validity_gpumask(owned)
     if null_count:
-        validity_bytes = np.packbits(owned.validity.astype(np.uint8), bitorder="little")
-        validity_mask = cp.asarray(validity_bytes.view(np.uint8))
-        column = column.with_mask(plc.gpumemoryview(validity_mask), null_count)
+        column = column.with_mask(validity_mask, null_count)
     return column
 
 def _device_geoarrow_fast_path_reason_owned(owned: OwnedGeometryArray) -> str | None:
     if owned.row_count == 0:
         return "empty geometry column requires upstream GeoArrow constructor semantics"
-    if not bool(owned.validity.any()):
+    validity, _tags, _family_row_offsets = _authoritative_host_metadata(owned)
+    if not bool(validity.any()):
         return "all-missing geometry column requires upstream GeoArrow constructor semantics"
     try:
         _homogeneous_family(owned)
@@ -353,11 +371,12 @@ def _device_validity_gpumask(owned: OwnedGeometryArray):
     import cupy as cp
     import pylibcudf as plc
 
-    null_count = int((~owned.validity).sum())
+    validity = cp.asarray(owned._ensure_device_state().validity)
+    null_count = int(cp.count_nonzero(~validity).item())
     if null_count == 0:
         return None, 0
-    validity_bytes = np.packbits(owned.validity.astype(np.uint8), bitorder="little")
-    return plc.gpumemoryview(cp.asarray(validity_bytes.view(np.uint8))), null_count
+    validity_bytes = cp.packbits(validity.astype(cp.uint8), bitorder="little")
+    return plc.gpumemoryview(validity_bytes.view(cp.uint8)), null_count
 
 
 def _device_point_values_column(x_device, y_device, *, mask=None, null_count: int = 0):
@@ -1828,26 +1847,44 @@ def _pack_linestring_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
 
 
 def _pack_polygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
+    def _ring_needs_closure(coord_start: int, coord_end: int) -> bool:
+        if coord_end <= coord_start:
+            return False
+        return (
+            float(buffer.x[coord_start]) != float(buffer.x[coord_end - 1])
+            or float(buffer.y[coord_start]) != float(buffer.y[coord_end - 1])
+        )
+
     ring_start = int(buffer.geometry_offsets[row])
     ring_end = int(buffer.geometry_offsets[row + 1])
     size = 9
-    ring_ranges: list[tuple[int, int]] = []
+    ring_ranges: list[tuple[int, int, bool]] = []
     for ring_index in range(ring_start, ring_end):
         coord_start = int(buffer.ring_offsets[ring_index])
         coord_end = int(buffer.ring_offsets[ring_index + 1])
-        ring_ranges.append((coord_start, coord_end))
-        size += 4 + ((coord_end - coord_start) * 16)
+        needs_closure = _ring_needs_closure(coord_start, coord_end)
+        ring_ranges.append((coord_start, coord_end, needs_closure))
+        size += 4 + (((coord_end - coord_start) + int(needs_closure)) * 16)
     payload = bytearray(size)
     payload[0] = 1
     payload[1:5] = WKB_TYPE_IDS[GeometryFamily.POLYGON].to_bytes(4, "little")
     payload[5:9] = len(ring_ranges).to_bytes(4, "little")
     cursor = 9
-    for coord_start, coord_end in ring_ranges:
-        count = coord_end - coord_start
+    for coord_start, coord_end, needs_closure in ring_ranges:
+        count = (coord_end - coord_start) + int(needs_closure)
         payload[cursor : cursor + 4] = count.to_bytes(4, "little")
         cursor += 4
         for x, y in zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True):
             struct.pack_into("<dd", payload, cursor, float(x), float(y))
+            cursor += 16
+        if needs_closure:
+            struct.pack_into(
+                "<dd",
+                payload,
+                cursor,
+                float(buffer.x[coord_start]),
+                float(buffer.y[coord_start]),
+            )
             cursor += 16
     return bytes(payload)
 
@@ -1897,20 +1934,29 @@ def _pack_multilinestring_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
 
 
 def _pack_multipolygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
+    def _ring_needs_closure(coord_start: int, coord_end: int) -> bool:
+        if coord_end <= coord_start:
+            return False
+        return (
+            float(buffer.x[coord_start]) != float(buffer.x[coord_end - 1])
+            or float(buffer.y[coord_start]) != float(buffer.y[coord_end - 1])
+        )
+
     polygon_start = int(buffer.geometry_offsets[row])
     polygon_end = int(buffer.geometry_offsets[row + 1])
-    polygon_specs: list[list[tuple[int, int]]] = []
+    polygon_specs: list[list[tuple[int, int, bool]]] = []
     size = 9
     for polygon_index in range(polygon_start, polygon_end):
         ring_start = int(buffer.part_offsets[polygon_index])
         ring_end = int(buffer.part_offsets[polygon_index + 1])
-        ring_ranges: list[tuple[int, int]] = []
+        ring_ranges: list[tuple[int, int, bool]] = []
         polygon_size = 9
         for ring_index in range(ring_start, ring_end):
             coord_start = int(buffer.ring_offsets[ring_index])
             coord_end = int(buffer.ring_offsets[ring_index + 1])
-            ring_ranges.append((coord_start, coord_end))
-            polygon_size += 4 + ((coord_end - coord_start) * 16)
+            needs_closure = _ring_needs_closure(coord_start, coord_end)
+            ring_ranges.append((coord_start, coord_end, needs_closure))
+            polygon_size += 4 + (((coord_end - coord_start) + int(needs_closure)) * 16)
         polygon_specs.append(ring_ranges)
         size += polygon_size
     payload = bytearray(size)
@@ -1923,12 +1969,21 @@ def _pack_multipolygon_wkb(buffer: FamilyGeometryBuffer, row: int) -> bytes:
         payload[cursor + 1 : cursor + 5] = WKB_TYPE_IDS[GeometryFamily.POLYGON].to_bytes(4, "little")
         payload[cursor + 5 : cursor + 9] = len(ring_ranges).to_bytes(4, "little")
         cursor += 9
-        for coord_start, coord_end in ring_ranges:
-            count = coord_end - coord_start
+        for coord_start, coord_end, needs_closure in ring_ranges:
+            count = (coord_end - coord_start) + int(needs_closure)
             payload[cursor : cursor + 4] = count.to_bytes(4, "little")
             cursor += 4
             for x, y in zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True):
                 struct.pack_into("<dd", payload, cursor, float(x), float(y))
+                cursor += 16
+            if needs_closure:
+                struct.pack_into(
+                    "<dd",
+                    payload,
+                    cursor,
+                    float(buffer.x[coord_start]),
+                    float(buffer.y[coord_start]),
+                )
                 cursor += 16
     return bytes(payload)
 
@@ -2262,7 +2317,8 @@ def encode_wkb_owned(
     return values
 
 def _homogeneous_family(array: OwnedGeometryArray):
-    valid_tags = array.tags[array.validity]
+    validity, tags, _family_row_offsets = _authoritative_host_metadata(array)
+    valid_tags = tags[validity]
     if valid_tags.size == 0:
         raise ValueError("Cannot encode an all-null geometry array to native GeoArrow")
     unique_tags = np.unique(valid_tags)
@@ -2293,11 +2349,14 @@ def _encode_owned_wkb_array(
         )
         return gpu_result
 
-    # If the caller already handed us a device-resident owned array, make one
-    # final direct device-encode attempt before surfacing a host fallback. This
-    # avoids spurious strict-native failures when ambient requested-mode state
-    # or lightweight planner heuristics suppress the optimistic helper above.
-    if owned.residency is Residency.DEVICE and owned.device_state is not None:
+    # Make one final direct device-encode attempt before surfacing a host
+    # fallback.  Strict-native writers must not fail just because the generic
+    # helper declined GPU encode on a small batch or because the owned array is
+    # still host-resident at the write boundary; _encode_owned_wkb_column_device
+    # will materialize device state on demand.
+    if strict_native_mode_enabled() or (
+        owned.residency is Residency.DEVICE and owned.device_state is not None
+    ):
         try:
             import pyarrow as pa
 

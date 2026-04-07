@@ -10,6 +10,7 @@ from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_sch
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     DeviceFamilyGeometryBuffer,
+    FamilyGeometryBuffer,
     build_device_resident_owned,
     tile_single_row,
 )
@@ -133,6 +134,144 @@ def test_broadcast_device_bounds_cache_uses_physical_family_rows() -> None:
     np.testing.assert_allclose(
         bounds,
         np.repeat(family_bounds, 8, axis=0),
+        equal_nan=True,
+    )
+
+
+def test_cache_bounds_ignores_invalid_rows_with_stale_family_tags() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    polygon_family = next(family for family in owned.families if family.value == "polygon")
+    polygon_tag = FAMILY_TAGS[polygon_family]
+
+    owned._validity = np.asarray([True, False], dtype=np.bool_)
+    owned._tags = np.asarray([polygon_tag, polygon_tag], dtype=np.int8)
+    owned._family_row_offsets = np.asarray([0, 2], dtype=np.int32)
+
+    owned.cache_bounds(
+        np.asarray(
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [np.nan, np.nan, np.nan, np.nan],
+            ],
+            dtype=np.float64,
+        )
+    )
+
+    state = owned._ensure_device_state()
+    family_bounds = get_cuda_runtime().copy_device_to_host(state.families[polygon_family].bounds)
+
+    assert family_bounds.shape == (2, 4)
+    np.testing.assert_allclose(family_bounds[0], [0.0, 0.0, 2.0, 2.0], equal_nan=True)
+    assert np.isnan(family_bounds[1]).all()
+
+
+def test_cache_bounds_prefers_device_family_row_count_when_host_stub_lags() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    polygon_family = next(family for family in owned.families if family.value == "polygon")
+    host_buffer = owned.families[polygon_family]
+    owned.families[polygon_family] = FamilyGeometryBuffer(
+        family=host_buffer.family,
+        schema=host_buffer.schema,
+        row_count=1,
+        x=host_buffer.x,
+        y=host_buffer.y,
+        geometry_offsets=host_buffer.geometry_offsets,
+        empty_mask=host_buffer.empty_mask,
+        part_offsets=host_buffer.part_offsets,
+        ring_offsets=host_buffer.ring_offsets,
+        bounds=host_buffer.bounds,
+        host_materialized=host_buffer.host_materialized,
+    )
+
+    owned.cache_bounds(
+        np.asarray(
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [3.0, 0.0, 5.0, 2.0],
+            ],
+            dtype=np.float64,
+        )
+    )
+
+    family_bounds = get_cuda_runtime().copy_device_to_host(
+        owned._ensure_device_state().families[polygon_family].bounds
+    )
+
+    assert owned.families[polygon_family].row_count == 2
+    np.testing.assert_allclose(
+        family_bounds,
+        np.asarray(
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [3.0, 0.0, 5.0, 2.0],
+            ],
+            dtype=np.float64,
+        ),
+        equal_nan=True,
+    )
+
+
+def test_cache_bounds_prefers_device_family_offsets_when_host_metadata_lags() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    polygon_family = next(family for family in owned.families if family.value == "polygon")
+
+    owned._validity = np.asarray([True, True], dtype=np.bool_)
+    owned._tags = np.asarray(
+        [FAMILY_TAGS[polygon_family], FAMILY_TAGS[polygon_family]],
+        dtype=np.int8,
+    )
+    owned._family_row_offsets = np.asarray([0, 2], dtype=np.int32)
+
+    owned.cache_bounds(
+        np.asarray(
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [3.0, 0.0, 5.0, 2.0],
+            ],
+            dtype=np.float64,
+        )
+    )
+
+    family_bounds = get_cuda_runtime().copy_device_to_host(
+        owned._ensure_device_state().families[polygon_family].bounds
+    )
+
+    np.testing.assert_allclose(
+        family_bounds,
+        np.asarray(
+            [
+                [0.0, 0.0, 2.0, 2.0],
+                [3.0, 0.0, 5.0, 2.0],
+            ],
+            dtype=np.float64,
+        ),
         equal_nan=True,
     )
 

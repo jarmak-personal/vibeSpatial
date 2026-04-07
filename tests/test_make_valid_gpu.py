@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, Polygon
 
 from vibespatial import from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.make_valid_pipeline import (
@@ -386,6 +386,54 @@ def test_device_scatter_repaired_keeps_merged_metadata_lazy(strict_device_guard)
     assert result._validity is None
     assert result._tags is None
     assert result._family_row_offsets is None
+
+
+@requires_gpu
+def test_device_scatter_repaired_remaps_mixed_family_outputs(strict_device_guard):
+    """Mixed polygon/multipolygon repairs must remap family offsets from batch metadata."""
+    import cupy as cp
+
+    from vibespatial.constructive.make_valid_gpu import _device_scatter_repaired
+    from vibespatial.geometry.owned import TAG_FAMILIES
+    from vibespatial.runtime.residency import Residency
+
+    bowtie_left = shapely.from_wkt("POLYGON ((0 0, 2 2, 2 0, 0 2, 0 0))")
+    bowtie_right = shapely.from_wkt("POLYGON ((3 0, 5 2, 5 0, 3 2, 3 0))")
+    original_owned = from_shapely_geometries(
+        [bowtie_left, bowtie_right],
+        residency=Residency.DEVICE,
+    )
+    repaired_batch = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (2, 0), (2, 1), (0, 1), (0, 0)]),
+            MultiPolygon(
+                [
+                    Polygon([(3, 0), (4, 0), (4, 1), (3, 0)]),
+                    Polygon([(4, 1), (5, 1), (5, 2), (4, 1)]),
+                ]
+            ),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    result = _device_scatter_repaired(
+        original_owned,
+        repaired_batch,
+        "polygon",
+        np.asarray([0, 1], dtype=np.int32),
+        {0: 0, 1: 1},
+    )
+
+    state = result._ensure_device_state()
+    polygon_count = int(state.families[next(f for f in state.families if f.value == "polygon")].geometry_offsets.size) - 1
+    multipolygon_count = int(state.families[next(f for f in state.families if f.value == "multipolygon")].geometry_offsets.size) - 1
+    polygon_tag = next(tag for tag, family in TAG_FAMILIES.items() if family.value == "polygon")
+    multipolygon_tag = next(tag for tag, family in TAG_FAMILIES.items() if family.value == "multipolygon")
+
+    assert bool(cp.all(state.tags == cp.asarray([polygon_tag, multipolygon_tag], dtype=cp.int8)))
+    assert bool(cp.all(state.family_row_offsets == cp.asarray([0, 0], dtype=cp.int32)))
+    assert polygon_count == 1
+    assert multipolygon_count == 1
 
 
 @requires_gpu

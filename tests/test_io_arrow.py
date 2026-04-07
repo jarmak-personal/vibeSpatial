@@ -41,6 +41,7 @@ from vibespatial import (
     select_row_groups,
     write_geoparquet,
 )
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.geometry_array import to_wkb as array_to_wkb
 from vibespatial.constructive.point import clip_points_rect_owned
 from vibespatial.geometry.device_array import DeviceGeometryArray
@@ -210,7 +211,6 @@ def test_wkb_bridge_roundtrips_polygon_fast_path_without_fallback() -> None:
 
     assert decoded.to_shapely()[0].equals(polygon)
     assert geopandas.get_fallback_events(clear=True) == []
-
 
 def test_geoparquet_scan_plan_prefers_bbox_pushdown_when_covering_exists() -> None:
     metadata = {
@@ -1155,6 +1155,35 @@ def test_wkb_encode_from_owned_buffers_multilinestring() -> None:
     assert roundtripped.equals(mls)
 
 
+def test_wkb_encode_from_device_owned_ignores_stale_host_metadata() -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    import shapely
+
+    poly = Polygon([(0, 0), (2, 0), (2, 2), (0, 0)])
+    poly2 = Polygon([(3, 0), (5, 0), (5, 2), (3, 0)])
+    mpoly = MultiPolygon(
+        [
+            Polygon([(6, 0), (8, 0), (8, 2), (6, 0)]),
+            Polygon([(8, 2), (10, 2), (10, 4), (8, 2)]),
+        ]
+    )
+
+    owned = from_shapely_geometries([poly, poly2, mpoly], residency=Residency.DEVICE)
+    owned._validity = np.asarray([True, False, True], dtype=np.bool_)
+    owned._tags = np.asarray([0, 0, 0], dtype=np.int8)
+    owned._family_row_offsets = np.asarray([0, 99, 99], dtype=np.int32)
+
+    _field, arr = io_arrow._encode_owned_wkb_array(owned, field_name="g", crs=None)
+    restored = [shapely.from_wkb(value.as_py()) if value.as_py() is not None else None for value in arr]
+
+    assert len(restored) == 3
+    assert restored[0].equals(poly)
+    assert restored[1].equals(poly2)
+    assert restored[2].equals(mpoly)
+
+
 def test_write_geoparquet_device_wkb_has_no_transfer_or_materialization(tmp_path) -> None:
     if not has_gpu_runtime() or not has_pylibcudf_support():
         return
@@ -1196,6 +1225,40 @@ def test_write_geoparquet_strict_native_wkb_succeeds_for_geometry_array_with_dev
     )
 
     path = tmp_path / "strict_native_geometry_array_device_owned_wkb.parquet"
+    with strict_native_environment():
+        gdf.to_parquet(path, geometry_encoding="WKB")
+
+    result = geopandas.read_parquet(path)
+    assert len(result) == 2
+    assert result.geometry.iloc[0].equals(gdf.geometry.iloc[0])
+    assert result.geometry.iloc[1].equals(gdf.geometry.iloc[1])
+
+
+def test_write_geoparquet_strict_native_wkb_succeeds_for_geometry_array_with_host_owned(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    from vibespatial.testing import strict_native_environment
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            MultiPolygon(
+                [
+                    Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+                    Polygon([(6, 0), (8, 0), (8, 2), (6, 0)]),
+                ]
+            ),
+        ]
+    )
+    ga = GeometryArray.from_owned(owned, crs="EPSG:4326")
+    gdf = geopandas.GeoDataFrame(
+        {"value": [1, 2], "geometry": geopandas.GeoSeries(ga, crs="EPSG:4326")},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    path = tmp_path / "strict_native_geometry_array_host_owned_wkb.parquet"
     with strict_native_environment():
         gdf.to_parquet(path, geometry_encoding="WKB")
 

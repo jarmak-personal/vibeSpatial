@@ -34,6 +34,8 @@ _exact_polygon_intersection_warm_lock = threading.Lock()
 _exact_polygon_intersection_warm_done = False
 _many_vs_one_overlay_warm_lock = threading.Lock()
 _many_vs_one_overlay_warm_done = False
+_overlay_difference_warm_lock = threading.Lock()
+_overlay_difference_warm_done = False
 
 
 def precompile_enabled() -> bool:
@@ -1102,16 +1104,35 @@ def ensure_pipelines_warm(timeout: float = 60.0) -> dict[str, Any]:
     from .nvrtc_precompile import NVRTCPrecompiler
 
     result: dict[str, Any] = {"cccl_cold": [], "nvrtc_cold": []}
-    if CCCLPrecompiler._instance is not None:
-        result["cccl_cold"] = CCCLPrecompiler.get().ensure_warm(timeout=timeout)
+    result["cccl_cold"].extend(_drain_requested_cccl_specs(timeout))
     if NVRTCPrecompiler._instance is not None:
-        result["nvrtc_cold"] = NVRTCPrecompiler.get().ensure_warm(timeout=timeout)
-    _warm_exact_polygon_intersection_route()
-    _warm_many_vs_one_overlay_remainder_route()
+        result["nvrtc_cold"].extend(NVRTCPrecompiler.get().ensure_warm(timeout=timeout))
+    _warm_exact_polygon_intersection_route(timeout=timeout)
+    _warm_many_vs_one_overlay_remainder_route(timeout=timeout)
+    _warm_overlay_difference_segmented_union_route(timeout=timeout)
+    result["cccl_cold"].extend(_drain_requested_cccl_specs(timeout))
+    if NVRTCPrecompiler._instance is not None:
+        result["nvrtc_cold"].extend(NVRTCPrecompiler.get().ensure_warm(timeout=timeout))
+    result["cccl_cold"] = list(dict.fromkeys(result["cccl_cold"]))
+    result["nvrtc_cold"] = list(dict.fromkeys(result["nvrtc_cold"]))
     return result
 
 
-def _warm_exact_polygon_intersection_route() -> None:
+def _drain_requested_cccl_specs(timeout: float) -> list[str]:
+    if CCCLPrecompiler._instance is None:
+        return []
+    return CCCLPrecompiler.get().ensure_warm(timeout=timeout)
+
+
+def _drain_requested_pipeline_compilation(timeout: float) -> None:
+    from .nvrtc_precompile import NVRTCPrecompiler
+
+    _drain_requested_cccl_specs(timeout)
+    if NVRTCPrecompiler._instance is not None:
+        NVRTCPrecompiler.get().ensure_warm(timeout=timeout)
+
+
+def _warm_exact_polygon_intersection_route(timeout: float = 60.0) -> None:
     """Warm the exact rowwise polygon intersection route used by public clip().
 
     The default NVRTC/CCCL warm registry does not naturally touch the exact
@@ -1147,6 +1168,7 @@ def _warm_exact_polygon_intersection_route() -> None:
                     "POLYGON ((0 0, 5 0, 5 1, 2 1, 2 4, 0 4, 0 0))",
                 ],
             ).values.to_owned()
+            _drain_requested_pipeline_compilation(timeout)
             binary_constructive_owned(
                 "intersection",
                 left,
@@ -1164,7 +1186,7 @@ def _warm_exact_polygon_intersection_route() -> None:
         _exact_polygon_intersection_warm_done = True
 
 
-def _warm_many_vs_one_overlay_remainder_route() -> None:
+def _warm_many_vs_one_overlay_remainder_route(timeout: float = 60.0) -> None:
     """Warm the N-vs-1 polygon overlay remainder route used by public overlay().
 
     The public vegetation corridor workflow intersects many vegetation polygons
@@ -1211,6 +1233,7 @@ def _warm_many_vs_one_overlay_remainder_route() -> None:
                 trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
                 reason="warm many-vs-one overlay remainder route on device",
             )
+            _drain_requested_pipeline_compilation(timeout)
             _many_vs_one_intersection_owned(left, right, 0)
         except Exception:
             logger.debug(
@@ -1220,6 +1243,72 @@ def _warm_many_vs_one_overlay_remainder_route() -> None:
             return
 
         _many_vs_one_overlay_warm_done = True
+
+
+def _warm_overlay_difference_segmented_union_route(timeout: float = 60.0) -> None:
+    """Warm the overlay-difference segmented-union route used by redevelopment flows.
+
+    The strict-native redevelopment and site suitability shootouts hit
+    ``_batched_overlay_difference_owned``. That path unions grouped right-side
+    polygons via ``segmented_union_all(...)``, which in turn exercises the
+    overlay split/candidate pipeline and CCCL ``upper_bound``. If that binary
+    search callable is still cold, its first-use build cost lands inside the
+    timed shootout child and can dominate or even exhaust the per-script
+    timeout budget.
+    """
+    global _overlay_difference_warm_done
+
+    with _overlay_difference_warm_lock:
+        if _overlay_difference_warm_done:
+            return
+
+        try:
+            from vibespatial.api import overlay
+            from vibespatial.api.geodataframe import GeoDataFrame
+            from vibespatial.api.geoseries import GeoSeries
+            from vibespatial.runtime import has_gpu_runtime
+            from vibespatial.spatial import segment_primitives as _segment_primitives  # noqa: F401
+
+            if not has_gpu_runtime():
+                return
+
+            left = GeoDataFrame(
+                {
+                    "geometry": GeoSeries.from_wkt(
+                        [
+                            "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))",
+                            "POLYGON ((5 0, 9 0, 9 4, 5 4, 5 0))",
+                        ],
+                        crs="EPSG:4326",
+                    )
+                },
+                geometry="geometry",
+                crs="EPSG:4326",
+            )
+            right = GeoDataFrame(
+                {
+                    "geometry": GeoSeries.from_wkt(
+                        [
+                            "POLYGON ((1 1, 2 1, 2 3, 1 3, 1 1))",
+                            "POLYGON ((2 1, 3 1, 3 3, 2 3, 2 1))",
+                            "POLYGON ((6 1, 8 1, 8 3, 6 3, 6 1))",
+                        ],
+                        crs="EPSG:4326",
+                    )
+                },
+                geometry="geometry",
+                crs="EPSG:4326",
+            )
+            _drain_requested_pipeline_compilation(timeout)
+            overlay(left, right, how="difference", keep_geom_type=True, make_valid=False)
+        except Exception:
+            logger.debug(
+                "overlay difference segmented-union warm probe failed",
+                exc_info=True,
+            )
+            return
+
+        _overlay_difference_warm_done = True
 
 
 # Modules whose import triggers request_nvrtc_warmup() at module scope.

@@ -26,6 +26,7 @@ from vibespatial.runtime.config import (
 )
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
+from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.spatial.indexing import generate_bounds_pairs
 from vibespatial.spatial.query_types import DeviceSpatialJoinResult
@@ -38,6 +39,13 @@ _SHAPELY_TYPE_ID_MULTIPOLYGON = 6
 _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION = 7
 
 
+def _sync_hotpath() -> None:
+    if hotpath_trace_enabled():
+        from vibespatial.cuda._runtime import get_cuda_runtime
+
+        get_cuda_runtime().synchronize()
+
+
 def _geoseries_object_values(series: GeoSeries) -> np.ndarray:
     """Return a fast object array view of a GeoSeries-backed GeometryArray."""
     return np.asarray(series.array, dtype=object)
@@ -46,6 +54,37 @@ def _geoseries_object_values(series: GeoSeries) -> np.ndarray:
 def _take_geoseries_object_values(series: GeoSeries, rows: np.ndarray) -> np.ndarray:
     """Materialize only the selected rows from a GeoSeries-backed GeometryArray."""
     return np.asarray(series.array.take(rows), dtype=object)
+
+
+def _empty_owned_result_base(row_count: int, *, device: bool):
+    """Build an all-null owned array for scatter assembly."""
+    if device:
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover
+            device = False
+        else:
+            from vibespatial.geometry.owned import build_device_resident_owned
+
+            return build_device_resident_owned(
+                device_families={},
+                row_count=row_count,
+                tags=cp.full(row_count, -1, dtype=cp.int8),
+                validity=cp.zeros(row_count, dtype=cp.bool_),
+                family_row_offsets=cp.full(row_count, -1, dtype=cp.int32),
+                execution_mode="gpu",
+            )
+
+    from vibespatial.geometry.owned import OwnedGeometryArray
+    from vibespatial.runtime.residency import Residency
+
+    return OwnedGeometryArray(
+        validity=np.zeros(row_count, dtype=bool),
+        tags=np.full(row_count, -1, dtype=np.int8),
+        family_row_offsets=np.full(row_count, -1, dtype=np.int32),
+        families={},
+        residency=Residency.HOST,
+    )
 
 
 def _extract_owned_pair(df1, df2):
@@ -121,6 +160,8 @@ _MIN_GROUPS_PER_BATCH = 64
 # MAX_GROUPS_PER_BATCH: upper bound; larger batches reduce dispatch overhead
 # but risk OOM on skewed group-size distributions.
 _MAX_GROUPS_PER_BATCH = 10_000
+
+
 def _estimate_bytes_per_pair(right_owned) -> int:
     """Estimate average device bytes consumed per gathered right-side pair.
 
@@ -197,6 +238,169 @@ def _compute_batch_groups(
     return groups_per_batch
 
 
+def _group_source_rows_from_offsets(group_offsets: np.ndarray) -> np.ndarray:
+    """Expand CSR-style group offsets into one logical group id per right row."""
+    offsets = np.asarray(group_offsets, dtype=np.int64)
+    if offsets.ndim != 1 or offsets.size == 0:
+        raise ValueError("group_offsets must be a 1D array with length >= 1")
+    counts = np.diff(offsets)
+    if np.any(counts < 0):
+        raise ValueError("group_offsets must be monotonically nondecreasing")
+    if counts.size == 0:
+        return np.empty(0, dtype=np.int32)
+    return np.repeat(
+        np.arange(counts.size, dtype=np.int32),
+        counts.astype(np.int64, copy=False),
+    )
+
+
+def _sequential_grouped_difference_owned(
+    left_batch,
+    right_batch,
+    group_offsets,
+    *,
+    dispatch_mode: ExecutionMode,
+):
+    """Compute grouped exact difference via repeated pairwise exact differences."""
+    from vibespatial.constructive.binary_constructive import (
+        binary_constructive_owned,
+    )
+    with hotpath_stage("overlay.diff.group_metadata", category="setup"):
+        group_offsets = np.asarray(group_offsets, dtype=np.int64)
+        group_lengths = np.diff(group_offsets).astype(np.int64, copy=False)
+        max_group_size = int(group_lengths.max(initial=0))
+    if max_group_size <= 0:
+        return left_batch
+
+    group_starts = group_offsets[:-1].astype(np.int64, copy=False)
+    all_rows = np.arange(left_batch.row_count, dtype=np.int64)
+    current_owned = left_batch
+
+    for step in range(max_group_size):
+        with hotpath_stage("overlay.diff.exact.active_rows", category="filter"):
+            active_rows = all_rows[
+                (group_lengths > step)
+                & np.asarray(current_owned.validity, dtype=bool)
+            ]
+        if active_rows.size == 0:
+            break
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.exact.left_take", category="refine"):
+            active_left = current_owned.take(active_rows)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.exact.right_take", category="refine"):
+            right_step = right_batch.take(group_starts[active_rows] + step)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.exact.binary_difference", category="refine"):
+            active_diff = binary_constructive_owned(
+                "difference",
+                active_left,
+                right_step,
+                dispatch_mode=dispatch_mode,
+                _prefer_rowwise_polygon_difference_overlay=True,
+            )
+        _sync_hotpath()
+        if active_rows.size == current_owned.row_count:
+            current_owned = active_diff
+        else:
+            from vibespatial.geometry.owned import concat_owned_scatter
+
+            _sync_hotpath()
+            with hotpath_stage("overlay.diff.exact.scatter", category="refine"):
+                current_owned = concat_owned_scatter(
+                    current_owned,
+                    active_diff,
+                    active_rows,
+                )
+            _sync_hotpath()
+
+    return current_owned
+
+
+def _grouped_overlay_difference_owned(
+    left_batch,
+    right_batch,
+    group_offsets,
+    *,
+    dispatch_mode: ExecutionMode,
+):
+    """Compute grouped exact difference from one grouped overlay execution plan.
+
+    The grouped workload shape is:
+    - one left geometry row per group
+    - many right geometry rows packed together
+
+    The overlay planner already supports logical row isolation. By remapping
+    every right geometry row to its owning left-group id, the existing
+    same-row split, graph, and face-labeling pipeline becomes a true grouped
+    exact-difference executor without per-pair replanning.
+    """
+    from vibespatial.overlay.gpu import (
+        _build_overlay_execution_plan,
+        _materialize_overlay_execution_plan,
+    )
+
+    with hotpath_stage("overlay.diff.group_metadata", category="setup"):
+        group_offsets = np.asarray(group_offsets, dtype=np.int64)
+        group_lengths = np.diff(group_offsets).astype(np.int64, copy=False)
+        max_group_size = int(group_lengths.max(initial=0))
+    if max_group_size <= 0:
+        return left_batch
+
+    try:
+        with hotpath_stage("overlay.diff.group_rows.expand", category="setup"):
+            right_group_rows = _group_source_rows_from_offsets(group_offsets)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.grouped_plan.build", category="setup"):
+            plan = _build_overlay_execution_plan(
+                left_batch,
+                right_batch,
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=None,
+                _row_isolated=True,
+                _right_geometry_source_rows=right_group_rows,
+            )
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.grouped_plan.materialize", category="refine"):
+            diff_owned, _selected = _materialize_overlay_execution_plan(
+                plan,
+                operation="difference",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=left_batch.row_count,
+            )
+        _sync_hotpath()
+        if diff_owned.row_count != left_batch.row_count:
+            raise RuntimeError(
+                "grouped overlay difference produced "
+                f"{diff_owned.row_count} rows for {left_batch.row_count} groups"
+            )
+        if strict_native_mode_enabled() and _selected is not ExecutionMode.GPU:
+            record_fallback_event(
+                surface="geopandas.array.difference",
+                reason="grouped exact overlay difference materialized off GPU",
+                detail=(
+                    f"groups={left_batch.row_count}, "
+                    f"pairs={right_batch.row_count}"
+                ),
+                requested=ExecutionMode.GPU,
+                selected=_selected,
+                pipeline="overlay",
+                d2h_transfer=_selected is ExecutionMode.CPU,
+            )
+        return diff_owned
+    except Exception:
+        logger.debug(
+            "grouped exact overlay plan failed; falling back to sequential exact difference",
+            exc_info=True,
+        )
+        return _sequential_grouped_difference_owned(
+            left_batch,
+            right_batch,
+            group_offsets,
+            dispatch_mode=dispatch_mode,
+        )
+
+
 def _batched_overlay_difference_owned(
     left_owned,
     right_owned,
@@ -217,14 +421,8 @@ def _batched_overlay_difference_owned(
 
     Returns (diff_owned, idx1_unique) ready for concat_owned_scatter.
     """
-    from vibespatial.constructive.binary_constructive import (
-        binary_constructive_owned,
-    )
     from vibespatial.constructive.segmented_union_host import (
         concat_owned_arrays,
-    )
-    from vibespatial.kernels.constructive.segmented_union import (
-        segmented_union_all,
     )
 
     xp = np
@@ -236,10 +434,11 @@ def _batched_overlay_difference_owned(
             pass
 
     # --- Compute group structure (unique left indices + group offsets) ---
-    idx1_unique, idx1_split_at = xp.unique(idx1, return_index=True)
-    group_offsets_full = xp.concatenate(
-        [idx1_split_at, xp.asarray([len(idx2)])]
-    )
+    with hotpath_stage("overlay.diff.group_index_build", category="setup"):
+        idx1_unique, idx1_split_at = xp.unique(idx1, return_index=True)
+        group_offsets_full = xp.concatenate(
+            [idx1_split_at, xp.asarray([len(idx2)])]
+        )
 
     # Bring group structure to host for batch slicing.  These are small
     # metadata arrays (n_groups + 1 elements), so the D->H cost is trivial.
@@ -255,18 +454,25 @@ def _batched_overlay_difference_owned(
 
     # --- Single-batch fast path (original code, no overhead) ---
     if groups_per_batch >= n_groups:
-        if _has_device_indices:
-            right_gathered = right_owned.device_take(d_idx2)
-        else:
-            right_gathered = right_owned.take(idx2)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.single_batch.right_gather", category="refine"):
+            if _has_device_indices:
+                right_gathered = right_owned.device_take(d_idx2)
+            else:
+                right_gathered = right_owned.take(idx2)
 
-        right_unions_owned = segmented_union_all(right_gathered, group_offsets_full)
-        left_sub = left_owned.take(idx1_unique)
-        diff_owned = binary_constructive_owned(
-            "difference", left_sub, right_unions_owned,
-            dispatch_mode=_pairwise_mode,
-            _prefer_rowwise_polygon_difference_overlay=True,
-        )
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.single_batch.left_take", category="refine"):
+            left_sub = left_owned.take(idx1_unique)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.single_batch.grouped_difference", category="refine"):
+            diff_owned = _grouped_overlay_difference_owned(
+                left_sub,
+                right_gathered,
+                h_group_offsets,
+                dispatch_mode=_pairwise_mode,
+            )
+        _sync_hotpath()
         return diff_owned, idx1_unique
 
     # --- Multi-batch path ---
@@ -303,27 +509,30 @@ def _batched_overlay_difference_owned(
 
         # Gather right geometries for this batch only
         batch_idx2 = h_idx2[pair_start:pair_end]
-        right_gathered = right_owned.take(batch_idx2)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.batch.right_gather", category="refine"):
+            right_gathered = right_owned.take(batch_idx2)
 
         # Build local group offsets for this batch (0-based)
         batch_group_starts = h_group_offsets[batch_start:batch_end + 1] - pair_start
         batch_group_offsets = np.asarray(batch_group_starts, dtype=np.int64)
 
-        # Segmented union: one union per group in this batch
-        right_unions = segmented_union_all(right_gathered, batch_group_offsets)
-        del right_gathered  # free gathered array before difference
-
         # Take the corresponding left geometries
         batch_left_indices = h_idx1_unique[batch_start:batch_end]
-        left_sub = left_owned.take(batch_left_indices)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.batch.left_take", category="refine"):
+            left_sub = left_owned.take(batch_left_indices)
 
-        # Pairwise difference
-        batch_diff = binary_constructive_owned(
-            "difference", left_sub, right_unions,
-            dispatch_mode=_pairwise_mode,
-            _prefer_rowwise_polygon_difference_overlay=True,
-        )
-        del right_unions, left_sub  # free intermediates
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.batch.grouped_difference", category="refine"):
+            batch_diff = _grouped_overlay_difference_owned(
+                left_sub,
+                right_gathered,
+                batch_group_offsets,
+                dispatch_mode=_pairwise_mode,
+            )
+        _sync_hotpath()
+        del right_gathered, left_sub  # free intermediates
 
         batch_results.append(batch_diff)
         batch_unique_indices.append(batch_left_indices)
@@ -338,7 +547,10 @@ def _batched_overlay_difference_owned(
         diff_owned = batch_results[0]
         all_unique = batch_unique_indices[0]
     else:
-        diff_owned = concat_owned_arrays(batch_results)
+        _sync_hotpath()
+        with hotpath_stage("overlay.diff.batch.concat", category="refine"):
+            diff_owned = concat_owned_arrays(batch_results)
+        _sync_hotpath()
         all_unique = np.concatenate(batch_unique_indices)
 
     # Return in the same format as idx1_unique (host numpy)
@@ -359,6 +571,23 @@ def _make_valid_geoseries(gs):
         return gs
 
     if owned is not None:
+        from vibespatial.runtime.residency import Residency
+
+        if owned.residency is not Residency.DEVICE:
+            gs = gs.copy()
+            gs.loc[poly_ix] = gs[poly_ix].make_valid()
+            try:
+                from vibespatial.geometry.owned import from_shapely_geometries
+
+                new_owned = from_shapely_geometries(
+                    np.asarray(gs.array, dtype=object),
+                    residency=Residency.HOST,
+                )
+                new_ga = GeometryArray.from_owned(new_owned, crs=ga.crs)
+                return GeoSeries(new_ga, index=gs.index)
+            except NotImplementedError:
+                return gs
+
         from vibespatial.constructive.make_valid_pipeline import make_valid_owned
 
         mv_result = make_valid_owned(owned=owned)
@@ -700,6 +929,7 @@ def _filter_polygon_intersection_rows_for_keep_geom_type(
         validity = area_owned.validity
         row_offsets = area_owned.family_row_offsets
         keep_mask = np.zeros(len(tags), dtype=bool)
+        owned_metadata_consistent = True
 
         for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
             family_tag = FAMILY_TAGS[family]
@@ -707,35 +937,28 @@ def _filter_polygon_intersection_rows_for_keep_geom_type(
             if not family_mask.any():
                 continue
             family_rows = row_offsets[family_mask]
-            empty_mask = area_owned.families[family].empty_mask
+            empty_mask = np.asarray(area_owned.families[family].empty_mask, dtype=bool)
+            if empty_mask.size == 0 or np.any((family_rows < 0) | (family_rows >= empty_mask.size)):
+                owned_metadata_consistent = False
+                break
             keep_mask[np.flatnonzero(family_mask)] = ~empty_mask[family_rows]
 
-        dropped = 0
-        if keep_geom_type_warning and len(tags) > 0:
-            empty_rows = np.flatnonzero(~keep_mask)
-            if empty_rows.size > 0:
-                dropped += int(
-                    np.count_nonzero(
-                        np.asarray(
-                            left_pairs.take(empty_rows).intersects(right_pairs.take(empty_rows)),
-                            dtype=bool,
+        if owned_metadata_consistent:
+            dropped = 0
+            if keep_geom_type_warning and len(tags) > 0:
+                empty_rows = np.flatnonzero(~keep_mask)
+                if empty_rows.size > 0:
+                    dropped += int(
+                        np.count_nonzero(
+                            np.asarray(
+                                left_pairs.take(empty_rows).intersects(right_pairs.take(empty_rows)),
+                                dtype=bool,
+                            )
                         )
                     )
-                )
-            keep_rows = np.flatnonzero(keep_mask)
-            if keep_rows.size > 0:
-                kept_left = _take_geoseries_object_values(left_pairs, keep_rows)
-                kept_right = _take_geoseries_object_values(right_pairs, keep_rows)
-                kept_full = np.asarray(shapely.intersection(kept_left, kept_right), dtype=object)
-                kept_type_ids = shapely.get_type_id(kept_full)
-                collection_rows = np.flatnonzero(
-                    kept_type_ids == _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION
-                )
-                if collection_rows.size > 0:
-                    dropped += _count_non_polygon_collection_parts(kept_full[collection_rows])
 
-        filtered = area_pairs.take(np.flatnonzero(keep_mask)).reset_index(drop=True)
-        return filtered, dropped, keep_mask
+            filtered = area_pairs.take(np.flatnonzero(keep_mask)).reset_index(drop=True)
+            return filtered, dropped, keep_mask
 
     area_values = _geoseries_object_values(area_pairs)
     present_mask = ~(shapely.is_missing(area_values) | shapely.is_empty(area_values))
@@ -752,13 +975,6 @@ def _filter_polygon_intersection_rows_for_keep_geom_type(
                     shapely.intersects(left_values, right_values)
                 )
             )
-
-        area_type_ids = shapely.get_type_id(area_values)
-        collection_rows = np.flatnonzero(
-            keep_mask & (area_type_ids == _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION)
-        )
-        if collection_rows.size > 0:
-            dropped += _count_non_polygon_collection_parts(area_values[collection_rows])
 
     filtered_values = area_values[keep_mask].copy()
     if filtered_values.size > 0:
@@ -1619,7 +1835,7 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None, *, _index_r
         and right_owned is not None
         and not use_lower_dim_boundary_rebuild
     ):
-        from vibespatial.geometry.owned import OwnedGeometryArray, concat_owned_scatter
+        from vibespatial.geometry.owned import concat_owned_scatter
         from vibespatial.runtime.residency import Residency
 
         # Keep AUTO behavior for normal runs, but in strict-native mode force
@@ -1650,12 +1866,12 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None, *, _index_r
         # Rows with no spatial-join neighbors keep their original left geometry.
         # Rows in idx1_unique must take the differenced result verbatim, even
         # when that result is null/empty.
-        null_base = OwnedGeometryArray(
-            validity=np.zeros(n_left, dtype=bool),
-            tags=np.full(n_left, -1, dtype=np.int8),
-            family_row_offsets=np.full(n_left, -1, dtype=np.int32),
-            families={},
-            residency=Residency.HOST,
+        null_base = _empty_owned_result_base(
+            n_left,
+            device=(
+                left_owned.residency is Residency.DEVICE
+                or diff_owned.residency is Residency.DEVICE
+            ),
         )
         result_owned = null_base
         no_neighbor_idx = np.setdiff1d(
@@ -1693,13 +1909,29 @@ def _overlay_difference(df1, df2, left_owned=None, right_owned=None, *, _index_r
     # Post-difference make_valid: use GPU path when owned backing is
     # available to avoid Shapely materialisation on the critical path.
     differences = _make_valid_geoseries(differences)
-    empty_mask = differences.is_empty
-    if empty_mask.any():
-        differences = differences.copy()
-        differences.loc[empty_mask] = None
-    keep_rows = ~empty_mask
-    geom_diff = differences[keep_rows].copy()
-    dfdiff = df1[keep_rows].copy()
+    differences_owned = getattr(differences.values, "_owned", None)
+    if differences_owned is not None:
+        keep_rows = np.asarray(differences_owned.validity, dtype=bool)
+        keep_indices = np.flatnonzero(keep_rows).astype(np.int64, copy=False)
+        if keep_indices.size > 0:
+            geom_diff = GeoSeries(
+                GeometryArray.from_owned(
+                    differences_owned.take(keep_indices),
+                    crs=df1.crs,
+                ),
+                index=df1.index[keep_rows],
+            )
+        else:
+            geom_diff = GeoSeries([], index=df1.index[:0], crs=df1.crs)
+        dfdiff = df1[keep_rows].copy()
+    else:
+        empty_mask = differences.is_empty
+        if empty_mask.any():
+            differences = differences.copy()
+            differences.loc[empty_mask] = None
+        keep_rows = ~empty_mask
+        geom_diff = differences[keep_rows].copy()
+        dfdiff = df1[keep_rows].copy()
     geo_col = dfdiff._geometry_column_name
     # Use set_geometry to replace the geometry column while preserving
     # owned backing and the original geometry column name.  The plain

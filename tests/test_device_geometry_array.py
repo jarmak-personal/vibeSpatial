@@ -23,6 +23,7 @@ from vibespatial.geometry.owned import (
     DiagnosticKind,
     FamilyGeometryBuffer,
     OwnedGeometryArray,
+    concat_owned_scatter,
     from_shapely_geometries,
 )
 from vibespatial.runtime import has_gpu_runtime
@@ -345,6 +346,32 @@ class TestTakeCopyConcatNoRoundtrip:
                 e for e in dga._owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION
             ]
             assert len(mat_events) == 0
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+    def test_concat_owned_scatter_keeps_device_residency(self, points):
+        base = from_shapely_geometries(points, residency=Residency.DEVICE)
+        replacement = from_shapely_geometries(
+            [Point(99, 99), None],
+            residency=Residency.DEVICE,
+        )
+
+        result = concat_owned_scatter(
+            base,
+            replacement,
+            np.array([1, 3], dtype=np.int64),
+        )
+
+        assert result.residency is Residency.DEVICE
+        assert result._validity is None
+        assert result._tags is None
+        assert result._family_row_offsets is None
+
+        shapely_result = result.to_shapely()
+        assert shapely_result[0].equals(points[0])
+        assert shapely_result[1].equals(Point(99, 99))
+        assert shapely_result[2].equals(points[2])
+        assert shapely_result[3] is None
+        assert shapely_result[4].equals(points[4])
 
 
 # ---------------------------------------------------------------------------
@@ -941,6 +968,28 @@ class TestConstructiveOpsReturnDGA:
         assert isinstance(result, DeviceGeometryArray)
         assert len(result) == 5
         assert result[0].geom_type == "Polygon"
+
+    def test_small_linestring_buffer_honors_auto_crossover(self, monkeypatch):
+        import vibespatial.constructive.linestring as linestring_module
+
+        dga = DeviceGeometryArray._from_sequence(
+            [
+                LineString([(0, 0), (5, 5), (10, 0)]),
+                LineString([(10, 0), (15, 5), (20, 0)]),
+            ]
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("small DGA linestring buffer should not force the GPU kernel")
+
+        monkeypatch.setattr(linestring_module, "linestring_buffer_owned_array", _fail)
+
+        result = dga.buffer(1.0)
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert len(result) == 2
+        materialized = np.asarray(result, dtype=object)
+        assert bool(shapely.is_valid(materialized).all())
 
     def test_intersection_returns_dga(self, poly_dga):
         other = DeviceGeometryArray._from_sequence([
