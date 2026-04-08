@@ -116,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     p_shootout.add_argument(
         "--no-warmup",
         action="store_true",
-        help="Skip the untimed script warmup run; vibespatial still prewarms registered GPU pipelines before timing",
+        help="Skip the untimed script warmup run; vibespatial still precompiles the full GPU benchmark stack before timing",
     )
     p_shootout.add_argument(
         "--baseline-python", type=str, default=None,

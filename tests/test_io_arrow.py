@@ -1200,6 +1200,28 @@ def test_write_geoparquet_device_wkb_has_no_transfer_or_materialization(tmp_path
     assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
 
 
+def test_read_parquet_pylibcudf_keeps_device_geometry_unmaterialized(tmp_path) -> None:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return
+
+    gdf, _ = _make_device_dga_gdf(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            Polygon([(3, 0), (5, 0), (5, 2), (3, 0)]),
+        ]
+    )
+    path = tmp_path / "read_device_geometry_no_materialization.parquet"
+
+    write_geoparquet(gdf, path, geometry_encoding="geoarrow")
+    result = geopandas.read_parquet(path)
+
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert result.geometry.values._shapely_cache is None
+    owned = result.geometry.values.owned
+    assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.TRANSFER] == []
+    assert [e for e in owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION] == []
+
+
 def test_write_geoparquet_strict_native_wkb_succeeds_for_geometry_array_with_device_owned(tmp_path) -> None:
     if not has_gpu_runtime() or not has_pylibcudf_support():
         return

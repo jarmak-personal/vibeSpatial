@@ -1521,7 +1521,7 @@ def _profile_vegetation_corridor_pipeline(
             device=ExecutionMode.AUTO,
             rows_in=buffered_lines.row_count,
             detail="dissolve buffered corridor polygons into a single coverage polygon",
-        ) as stage:
+            ) as stage:
             try:
                 valid_result = make_valid_owned(owned=buffered_lines)
                 if valid_result.owned is not None:
@@ -1534,24 +1534,27 @@ def _profile_vegetation_corridor_pipeline(
                     corridor_owned = union_all_gpu_owned(valid_owned)
                 stage.rows_out = corridor_owned.row_count
                 stage.device = _selected_runtime_from_history(corridor_owned) or "cpu"
-            except Exception:
-                # Fallback to the GeoDataFrame path if tree-reduce fails
-                valid_result = make_valid_owned(owned=buffered_lines)
-                valid_geoms = _extract_polygonal_components(valid_result.geometries)
-                valid_owned = from_shapely_geometries(valid_geoms)
-                corridor_frame = geopandas.GeoDataFrame(
-                    {"group": np.zeros(valid_owned.row_count, dtype=np.int32),
-                     "geometry": geoseries_from_owned(valid_owned, crs="EPSG:4326")},
-                    geometry="geometry",
-                    crs="EPSG:4326",
+            except Exception as exc:
+                # Real host fallback: repair buffered polygons on host and union
+                # them there. Re-running make_valid_owned() here just repeats the
+                # same device failure without producing a usable corridor.
+                stage.metadata["fallback_note"] = (
+                    f"host dissolve fallback after device failure: {type(exc).__name__}"
                 )
-                dissolved = evaluate_geopandas_dissolve(
-                    corridor_frame, by="group", aggfunc="first", as_index=True,
-                    level=None, sort=False, observed=False, dropna=True,
-                    method="unary", grid_size=None, agg_kwargs={},
+                host_valid = shapely.make_valid(
+                    np.asarray(buffered_lines.to_shapely(), dtype=object)
                 )
-                corridor_owned = from_shapely_geometries(list(dissolved.geometry))
-                stage.rows_out = int(len(dissolved))
+                valid_geoms = [
+                    g
+                    for g in _extract_polygonal_components(host_valid)
+                    if g is not None and not shapely.is_empty(g)
+                ]
+                if valid_geoms:
+                    dissolved_geom = shapely.union_all(np.asarray(valid_geoms, dtype=object))
+                    corridor_owned = from_shapely_geometries([dissolved_geom])
+                else:
+                    corridor_owned = from_shapely_geometries([])
+                stage.rows_out = corridor_owned.row_count
                 stage.device = "cpu"
 
         # Release buffered lines (dissolved corridor replaces them)
@@ -3139,13 +3142,11 @@ def benchmark_pipeline_suite(
 ) -> list[PipelineBenchmarkResult]:
     if repeat < 1:
         raise ValueError("repeat must be >= 1")
-    # Level 3 pipeline-aware warmup (ADR-0034): block until all submitted
-    # CCCL and NVRTC compilations are finished.  This front-loads JIT cost
-    # into a single predictable wait instead of contaminating pipeline stage
-    # timings.  CCCL JIT is ~5-11s per unique algorithm (measured 2026-03-16),
-    # so the timeout must be generous.
-    from vibespatial.cuda.cccl_precompile import ensure_pipelines_warm
-    ensure_pipelines_warm(timeout=120.0)
+    # Benchmark timings should measure kernels and data movement, not first-use
+    # compilation. Front-load the full CCCL/NVRTC benchmark stack once before
+    # any pipeline sample starts so fresh-process suite runs are comparable.
+    from vibespatial.cuda.cccl_precompile import precompile_all
+    precompile_all(timeout=120.0)
     results: list[PipelineBenchmarkResult] = []
     for scale in pipeline_scales(suite):
         for pipeline in pipelines:

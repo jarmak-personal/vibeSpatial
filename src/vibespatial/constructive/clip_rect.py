@@ -113,6 +113,7 @@ class RectClipResult:
         "fallback_rows",
         "fast_rows",
         "owned_result",
+        "owned_result_rows",
         "precision_plan",
         "robustness_plan",
         "row_count",
@@ -132,6 +133,7 @@ class RectClipResult:
         precision_plan: PrecisionPlan,
         robustness_plan: RobustnessPlan,
         owned_result: OwnedGeometryArray | None = None,
+        owned_result_rows: np.ndarray | None = None,
     ):
         self._geometries = geometries
         self._geometries_factory = geometries_factory
@@ -143,6 +145,7 @@ class RectClipResult:
         self.precision_plan = precision_plan
         self.robustness_plan = robustness_plan
         self.owned_result = owned_result
+        self.owned_result_rows = owned_result_rows
 
     @property
     def geometries(self) -> np.ndarray:
@@ -2030,6 +2033,7 @@ def clip_by_rect_owned(
                     precision_plan=precision_plan,
                     robustness_plan=robustness_plan,
                     owned_result=gpu_owned_result,
+                    owned_result_rows=keep_rows_host,
                 )
             finally:
                 runtime.free(keep_rows)
@@ -2069,6 +2073,26 @@ def clip_by_rect_owned(
             # Prefer the polygon OGA as primary owned_result; when only
             # lines are present, carry the line OGA for zero-copy consumers.
             owned_result = poly_owned if poly_owned is not None else line_result
+            owned_result_rows = None
+            if (
+                poly_owned is not None
+                and line_result is None
+                and fallback_rows_arr.size == 0
+                and poly_validity_mask is not None
+            ):
+                owned_result_rows = np.flatnonzero(poly_validity_mask).astype(
+                    np.int32, copy=False,
+                )
+            elif (
+                line_result is not None
+                and poly_owned is None
+                and fallback_rows_arr.size == 0
+                and line_global_row_map is not None
+            ):
+                owned_result_rows = np.asarray(
+                    line_global_row_map,
+                    dtype=np.int32,
+                )
 
             # Capture references for lazy factory
             _owned_ref = owned
@@ -2134,6 +2158,7 @@ def clip_by_rect_owned(
                 precision_plan=precision_plan,
                 robustness_plan=robustness_plan,
                 owned_result=owned_result,
+                owned_result_rows=owned_result_rows,
             )
         raise NotImplementedError("clip_by_rect GPU variant currently supports point-only, polygon, and line owned arrays")
 

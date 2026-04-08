@@ -10,7 +10,9 @@ from pathlib import Path
 import pytest
 
 from vibespatial.bench.cli import main as vsbench_main
-from vibespatial.bench.shootout import _run_harness, run_shootout
+from vibespatial.bench.schema import timing_from_samples
+from vibespatial.bench.shootout import ShootoutRun, _run_harness, run_shootout
+from vibespatial.cuda.cccl_precompile import SPEC_REGISTRY
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.testing import strict_native_environment
 
@@ -208,7 +210,55 @@ def test_vibespatial_harness_pipeline_warm_drains_deferred_cache(
     assert cold.error is None
     assert warm.error is None
     assert cold_status["cccl"]["deferred"] > 0 or cold_status["nvrtc"]["deferred"] > 0
+    assert warm_status["cccl"]["submitted"] == len(SPEC_REGISTRY)
     assert warm_status["cccl"]["deferred"] == 0
     assert warm_status["nvrtc"]["deferred"] == 0
     assert warm_status["cccl"]["pending"] == 0
     assert warm_status["nvrtc"]["pending"] == 0
+
+
+def test_shootout_in_process_retry_keeps_full_precompile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_run_harness(**kwargs):
+        if kwargs["label"] == "geopandas":
+            return ShootoutRun(
+                label="geopandas",
+                timing=timing_from_samples([1.0]),
+                stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+            )
+        return ShootoutRun(
+            label="vibespatial",
+            timing=timing_from_samples([]),
+            error="GPU execution was requested, but no GPU runtime is available",
+        )
+
+    seen: dict[str, object] = {}
+
+    def _fake_run_harness_in_process(**kwargs):
+        seen.update(kwargs)
+        return ShootoutRun(
+            label="vibespatial",
+            timing=timing_from_samples([0.5]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr(
+        "vibespatial.bench.shootout._run_harness_in_process",
+        _fake_run_harness_in_process,
+    )
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: True)
+
+    result = run_shootout(
+        Path("benchmarks/shootout/network_service_area.py"),
+        repeat=1,
+        warmup=False,
+        timeout=30,
+        quiet=True,
+        baseline_python=sys.executable,
+    )
+
+    assert result.status == "pass"
+    assert result.metadata["vibespatial_launch"] == "in_process_retry"
+    assert seen["pipeline_warm"] is True

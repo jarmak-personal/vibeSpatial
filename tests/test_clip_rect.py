@@ -14,6 +14,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.geometry.device_array import DeviceGeometryArray
 
 
 def _assert_geometries_match(actual, expected) -> None:
@@ -223,3 +224,26 @@ def test_clip_lines_gpu_uses_device_family_buffers_when_host_stubs_are_empty() -
 
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
     _assert_geometries_match(result.geometries.tolist(), list(expected))
+
+
+@pytest.mark.gpu
+def test_device_geometry_array_clip_by_rect_preserves_device_residency_for_polygons() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
+        Polygon([(10, 10), (12, 10), (12, 12), (10, 12), (10, 10)]),
+        Polygon([(1, 1), (5, 1), (5, 5), (1, 5), (1, 1)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    array = DeviceGeometryArray._from_owned(owned)
+
+    result = array.clip_by_rect(0.0, 0.0, 2.0, 2.0)
+
+    assert isinstance(result, DeviceGeometryArray)
+    assert result.owned.residency is Residency.DEVICE
+    assert result.owned.device_state is not None
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
+    expected_list = [None if geom is not None and geom.is_empty else geom for geom in expected.tolist()]
+    _assert_geometries_match(list(result.owned.to_shapely()), expected_list)

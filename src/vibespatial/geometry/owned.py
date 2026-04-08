@@ -2456,6 +2456,40 @@ def from_shapely_geometries(
     return array
 
 
+def build_null_owned_array(
+    row_count: int,
+    *,
+    residency: Residency = Residency.HOST,
+) -> OwnedGeometryArray:
+    """Build an all-null OwnedGeometryArray without materializing Shapely."""
+    validity = np.zeros(int(row_count), dtype=np.bool_)
+    tags = np.full(int(row_count), NULL_TAG, dtype=np.int8)
+    family_row_offsets = np.full(int(row_count), -1, dtype=np.int32)
+
+    if residency is Residency.DEVICE:
+        return build_device_resident_owned(
+            device_families={},
+            row_count=int(row_count),
+            tags=tags,
+            validity=validity,
+            family_row_offsets=family_row_offsets,
+        )
+
+    array = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families={},
+        residency=Residency.HOST,
+    )
+    array._record(
+        DiagnosticKind.CREATED,
+        f"created null owned geometry array, {row_count} rows",
+        visible=False,
+    )
+    return array
+
+
 def from_wkb(
     values: list[bytes | str | None] | tuple[bytes | str | None, ...],
     *,

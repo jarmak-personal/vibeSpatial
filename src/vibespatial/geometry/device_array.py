@@ -40,6 +40,8 @@ from .owned import (
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
     _materialize_family_row,
+    build_null_owned_array,
+    concat_owned_scatter,
     from_shapely_geometries,
     get_geometry_buffer_schema,
 )
@@ -1231,6 +1233,27 @@ class DeviceGeometryArray(ExtensionArray):
             detail=f"rows={len(self)}, selected={selected.value}",
             selected=selected,
         )
+        if result.owned_result is not None and result.owned_result_rows is not None:
+            owned_result = result.owned_result
+            row_map = np.asarray(result.owned_result_rows, dtype=np.int64)
+            if (
+                owned_result.row_count != self._owned.row_count
+                or row_map.size != self._owned.row_count
+                or not np.array_equal(
+                    row_map,
+                    np.arange(self._owned.row_count, dtype=np.int64),
+                )
+            ):
+                base = build_null_owned_array(
+                    self._owned.row_count,
+                    residency=owned_result.residency,
+                )
+                owned_result = concat_owned_scatter(
+                    base,
+                    owned_result,
+                    row_map,
+                )
+            return DeviceGeometryArray._from_owned(owned_result, crs=self._crs)
         # result.geometries is np.ndarray of Shapely objects; convert to owned
         # clip_by_rect returns GEOMETRYCOLLECTION EMPTY for clipped-away rows;
         # from_shapely_geometries doesn't support GeometryCollection, so treat
@@ -1241,7 +1264,10 @@ class DeviceGeometryArray(ExtensionArray):
             empty = np.zeros(len(geoms), dtype=bool)
             empty[non_null] = np.asarray(shapely.is_empty(geoms[non_null]), dtype=bool)
             geoms[empty] = None
-        new_owned = from_shapely_geometries(geoms.tolist())
+        new_owned = from_shapely_geometries(
+            geoms.tolist(),
+            residency=self._owned.residency,
+        )
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def _binary_constructive(self, op: str, other, *args, **kwargs):

@@ -782,8 +782,19 @@ def _assemble_polygon_intersection_rows_with_lower_dim(
             edge_geom = None
 
         if area_geom is not None and edge_geom is not None:
-            edge_geom = edge_geom.difference(area_geom.boundary)
-            if edge_geom is not None and edge_geom.is_empty:
+            edge_parts = shapely.get_parts(np.asarray([edge_geom], dtype=object))
+            if len(edge_parts) > 0:
+                cleaned_parts = np.asarray(
+                    shapely.difference(
+                        edge_parts,
+                        np.full(len(edge_parts), area_geom.boundary, dtype=object),
+                    ),
+                    dtype=object,
+                )
+                edge_parts = shapely.get_parts(cleaned_parts)
+                edge_parts = edge_parts[~shapely.is_empty(edge_parts)]
+                edge_geom = shapely.union_all(edge_parts) if len(edge_parts) > 0 else None
+            else:
                 edge_geom = None
 
         if edge_geom is not None:
@@ -1374,8 +1385,15 @@ def _few_right_intersection_owned(
     dispatch_mode=ExecutionMode.AUTO,
     _has_device_indices=False,
     d_idx1=None,
+    d_idx2=None,
 ):
-    """Run grouped many-vs-one intersection with one exact remainder overlay pass."""
+    """Run few-right intersection as one gathered exact pairwise batch.
+
+    The earlier grouped-by-right shape decomposed a logically single overlay
+    into many per-right preparations and gathers. For warmed strict-native
+    workloads that was slower than simply gathering the intersecting pairs
+    once and running one exact rowwise GPU intersection batch.
+    """
     try:
         import cupy as cp
     except ModuleNotFoundError:  # pragma: no cover
@@ -1391,76 +1409,29 @@ def _few_right_intersection_owned(
         _dispatch_polygon_intersection_overlay_rowwise_gpu,
         binary_constructive_owned,
     )
-    from vibespatial.geometry.owned import (
-        OwnedGeometryArray,
-        materialize_broadcast,
-        tile_single_row,
+    if _has_device_indices:
+        if cp is None or d_idx1 is None or d_idx2 is None:
+            return None
+        left_pairs = left_owned.device_take(d_idx1)
+        right_pairs = right_owned.device_take(d_idx2)
+    else:
+        left_pairs = left_owned.take(np.asarray(idx1))
+        right_pairs = right_owned.take(np.asarray(idx2))
+
+    rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+        left_pairs,
+        right_pairs,
+        dispatch_mode=dispatch_mode,
     )
-
-    index_oga_pairs: list[tuple[np.ndarray, OwnedGeometryArray]] = []
-    complex_left_chunks: list[OwnedGeometryArray] = []
-    complex_right_chunks: list[OwnedGeometryArray] = []
-    complex_global_chunks: list[np.ndarray] = []
-    complex_mode = dispatch_mode
-
-    for right_idx in unique_right.tolist():
-        pair_positions = np.flatnonzero(idx2 == right_idx).astype(np.int64, copy=False)
-        if pair_positions.size == 0:
-            continue
-        pair_positions_host = pair_positions.astype(np.intp, copy=False)
-        if _has_device_indices:
-            if cp is None or d_idx1 is None:
-                return None
-            d_pair_positions = cp.asarray(pair_positions, dtype=cp.int64)
-            left_group = left_owned.device_take(d_idx1[d_pair_positions])
-        else:
-            left_group = left_owned.take(np.asarray(idx1[pair_positions]))
-
-        (
-            group_pairs,
-            complex_left,
-            complex_global_positions,
-            right_one,
-            _group_mode,
-        ) = _prepare_many_vs_one_intersection_chunks(
-            left_group,
-            right_owned,
-            int(right_idx),
-            global_positions=pair_positions_host,
-        )
-        index_oga_pairs.extend(group_pairs)
-        if complex_left is not None and complex_global_positions is not None:
-            complex_left_chunks.append(complex_left)
-            complex_right_chunks.append(
-                materialize_broadcast(
-                    tile_single_row(right_one, complex_left.row_count),
-                ),
-            )
-            complex_global_chunks.append(complex_global_positions)
-
-    if complex_left_chunks:
-        complex_left_all = OwnedGeometryArray.concat(complex_left_chunks)
-        complex_right_all = OwnedGeometryArray.concat(complex_right_chunks)
-        complex_global_all = np.concatenate(complex_global_chunks)
-        complex_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-            complex_left_all,
-            complex_right_all,
-            dispatch_mode=complex_mode,
-        )
-        if (
-            complex_result is None
-            or complex_result.row_count != complex_left_all.row_count
-        ):
-            complex_result = binary_constructive_owned(
-                "intersection",
-                complex_left_all,
-                complex_right_all,
-                dispatch_mode=complex_mode,
-                _prefer_exact_polygon_intersection=True,
-            )
-        index_oga_pairs.append((complex_global_all, complex_result))
-
-    return _assemble_indexed_owned_chunks(index_oga_pairs, len(idx1))
+    if rowwise_result is not None and rowwise_result.row_count == left_pairs.row_count:
+        return rowwise_result
+    return binary_constructive_owned(
+        "intersection",
+        left_pairs,
+        right_pairs,
+        dispatch_mode=dispatch_mode,
+        _prefer_exact_polygon_intersection=True,
+    )
 
 
 def _overlay_intersection(
@@ -1715,6 +1686,7 @@ def _overlay_intersection(
                         dispatch_mode=_pairwise_mode,
                         _has_device_indices=_has_device_indices,
                         d_idx1=d_idx1,
+                        d_idx2=d_idx2,
                     )
                     if result_owned is not None:
                         intersections = GeoSeries(

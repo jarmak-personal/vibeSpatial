@@ -36,6 +36,20 @@
       "sourceOfTruth": "Phase-0 performance gate policy for GPU kernel work.",
       "maxBodyLines": 240
     },
+    "docs/testing/gpu-performance-checklist.md": {
+      "scope": "Detailed GPU performance audit workflow, anti-pattern checklist, and repo-specific remediation queue.",
+      "readIf": "You are auditing GPU performance, reviewing CuPy or CCCL usage, or checking whether a path is still CPU-shaped.",
+      "stopIf": "You already have the specific hot path open and only need a local implementation detail.",
+      "sourceOfTruth": "Repo-specific GPU performance audit checklist and prioritization guide.",
+      "maxBodyLines": 460
+    },
+    "docs/testing/gpu-performance-remediation-plan.md": {
+      "scope": "Execution plan for the next GPU performance push, including milestone sequencing and exit criteria.",
+      "readIf": "You are planning or executing the next GPU performance remediation campaign.",
+      "stopIf": "You already have the active milestone surface open and only need local implementation detail.",
+      "sourceOfTruth": "Program plan for fixing structural GPU performance issues found in the audit.",
+      "maxBodyLines": 520
+    },
     "docs/testing/profiling-rails.md": {
       "scope": "Stage-timed profiling entrypoints, NVTX guidance, and trace interpretation for join and overlay work.",
       "readIf": "You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.",

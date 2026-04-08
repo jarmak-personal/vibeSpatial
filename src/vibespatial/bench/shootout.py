@@ -49,8 +49,8 @@ os.chdir(os.path.dirname(os.path.abspath(script)))
 if do_pipeline_warm:
     try:
         import geopandas as _shootout_gpd  # noqa: F401
-        from vibespatial.cuda.cccl_precompile import ensure_pipelines_warm
-        ensure_pipelines_warm()
+        from vibespatial.cuda.cccl_precompile import precompile_all
+        precompile_all(timeout=float(dump_after))
     except Exception:
         pass
 
@@ -327,6 +327,7 @@ def _run_harness_in_process(
     script: Path,
     repeat: int,
     warmup: bool,
+    pipeline_warm: bool = False,
     env: dict[str, str] | None = None,
 ) -> ShootoutRun:
     """Run the timing harness in-process.
@@ -349,6 +350,15 @@ def _run_harness_in_process(
     try:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore")
+
+            if pipeline_warm:
+                try:
+                    import geopandas as _shootout_gpd  # noqa: F401
+                    from vibespatial.cuda.cccl_precompile import precompile_all
+
+                    precompile_all(timeout=120.0)
+                except Exception:
+                    pass
 
             if warmup:
                 sys.stdout = io.StringIO()
@@ -498,6 +508,7 @@ def run_shootout(
             script=script,
             repeat=repeat,
             warmup=warmup,
+            pipeline_warm=True,
             env=vs_env,
         )
         launch_mode = "in_process_retry"

@@ -42,6 +42,25 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
     assert payload["metadata"]["repeat"] == 1
 
 
+def test_benchmark_pipeline_suite_precompiles_full_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float] = []
+
+    def _fake_precompile_all(timeout: float = 120.0):
+        calls.append(timeout)
+        return {"cccl": {}, "nvrtc": {}, "cccl_cold": [], "nvrtc_cold": []}
+
+    monkeypatch.setattr(
+        "vibespatial.cuda.cccl_precompile.precompile_all",
+        _fake_precompile_all,
+    )
+    monkeypatch.setattr(pipeline_module, "pipeline_scales", lambda _suite: ())
+
+    assert benchmark_pipeline_suite(suite="smoke", pipelines=("join-heavy",)) == []
+    assert calls == [120.0]
+
+
 def test_pipeline_smoke_suite_can_run_geopandas_predicate_baseline() -> None:
     results = benchmark_pipeline_suite(suite="smoke", pipelines=("predicate-heavy-geopandas",))
     assert len(results) == 1
@@ -75,15 +94,20 @@ def test_actual_array_device_label_requires_cuda_array_interface() -> None:
     assert _actual_array_device_label(_FakeGpuArray()) == "gpu"
 
 
-def test_predicate_pipeline_reports_cpu_when_runtime_unavailable(monkeypatch) -> None:
+def test_predicate_pipeline_reports_cpu_planner_when_runtime_unavailable(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(pipeline_module, "has_gpu_runtime", lambda: False)
 
     result = _profile_predicate_pipeline(scale=8)
 
-    assert result.selected_runtime == "cpu"
+    # The benchmark rail reports actual execution in selected_runtime. With a
+    # real GPU still present underneath, lower layers can remain hybrid even if
+    # the pipeline planner is forced to CPU here.
+    assert result.planner_selected_runtime == "cpu"
+    assert result.selected_runtime in {"cpu", "hybrid"}
     trace = result.stages[0]
-    filter_stage = next(stage for stage in trace["stages"] if stage["name"] == "filter_points")
-    assert filter_stage["device"] == "cpu"
+    assert trace["metadata"]["planner_selected_runtime"] == "cpu"
 
 
 def test_extract_gpu_util_ignores_nvml_only_cpu_traces() -> None:

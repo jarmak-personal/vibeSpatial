@@ -1660,7 +1660,7 @@ def test_overlay_intersection_many_vs_one_fast_path_retries_after_first_failure(
     assert list(result["col1"]) == [1, 2]
 
 
-def test_overlay_intersection_few_right_fast_path_groups_by_right(
+def test_overlay_intersection_few_right_fast_path_batches_exact_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
@@ -1687,35 +1687,7 @@ def test_overlay_intersection_few_right_fast_path_groups_by_right(
     idx1 = np.arange(24, dtype=np.int32)
     idx2 = np.repeat(np.arange(3, dtype=np.int32), 8)
 
-    prepare_calls: list[tuple[int, int]] = []
     exact_calls: list[int] = []
-
-    def _fake_prepare(left_arg, right_arg, right_row, *, global_positions):
-        prepare_calls.append((int(right_row), left_arg.row_count))
-        quick_positions = np.asarray(global_positions[:6], dtype=np.intp)
-        quick_geoms = [
-            box(float(right_row * 100 + i), 0.0, float(right_row * 100 + i + 0.5), 0.5)
-            for i in range(6)
-        ]
-        complex_left = from_shapely_geometries(
-            [
-                box(float(1000 + right_row * 10 + i), 0.0, float(1000 + right_row * 10 + i + 0.5), 0.5)
-                for i in range(2)
-            ],
-            residency=Residency.DEVICE,
-        )
-        return (
-            [
-                (
-                    quick_positions,
-                    from_shapely_geometries(quick_geoms, residency=Residency.DEVICE),
-                )
-            ],
-            complex_left,
-            np.asarray(global_positions[6:], dtype=np.intp),
-            right_arg.take(np.asarray([right_row], dtype=np.intp)),
-            ExecutionMode.GPU,
-        )
 
     def _fake_rowwise_exact(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
         exact_calls.append(left_arg.row_count)
@@ -1728,7 +1700,9 @@ def test_overlay_intersection_few_right_fast_path_groups_by_right(
     monkeypatch.setattr(
         overlay_module,
         "_prepare_many_vs_one_intersection_chunks",
-        _fake_prepare,
+        lambda *args, **kwargs: pytest.fail(
+            "few-right intersection should not decompose into many-vs-one preparations"
+        ),
     )
     monkeypatch.setattr(
         constructive_module,
@@ -1754,21 +1728,12 @@ def test_overlay_intersection_few_right_fast_path_groups_by_right(
     )
 
     assert used_owned is True
-    assert prepare_calls == [(0, 8), (1, 8), (2, 8)]
-    assert exact_calls == [6]
+    assert exact_calls == [24]
     assert result["col1"].tolist() == idx1.tolist()
     assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
     expected = [
-        box(float(group * 100 + local), 0.0, float(group * 100 + local + 0.5), 0.5)
-        if local < 6
-        else box(
-            float(5000 + group * 2 + (local - 6)),
-            0.0,
-            float(5000 + group * 2 + (local - 6) + 0.5),
-            0.5,
-        )
-        for group in range(3)
-        for local in range(8)
+        box(float(5000 + i), 0.0, float(5000 + i + 0.5), 0.5)
+        for i in range(24)
     ]
     for got_geom, expected_geom in zip(result.geometry, expected, strict=True):
         assert got_geom.normalize().equals(expected_geom.normalize())
@@ -1864,43 +1829,14 @@ def test_overlay_intersection_few_right_fallback_preserves_exact_polygon_mode(
     idx1 = np.arange(24, dtype=np.int32)
     idx2 = np.repeat(np.arange(3, dtype=np.int32), 8)
 
-    def _fake_prepare(left_arg, right_arg, right_row, *, global_positions):
-        quick_positions = np.asarray(global_positions[:6], dtype=np.intp)
-        quick_geoms = [
-            box(float(right_row * 100 + i), 0.0, float(right_row * 100 + i + 0.5), 0.5)
-            for i in range(6)
-        ]
-        complex_left = from_shapely_geometries(
-            [
-                box(
-                    float(1000 + right_row * 10 + i),
-                    0.0,
-                    float(1000 + right_row * 10 + i + 0.5),
-                    0.5,
-                )
-                for i in range(2)
-            ],
-            residency=Residency.DEVICE,
-        )
-        return (
-            [
-                (
-                    quick_positions,
-                    from_shapely_geometries(quick_geoms, residency=Residency.DEVICE),
-                )
-            ],
-            complex_left,
-            np.asarray(global_positions[6:], dtype=np.intp),
-            right_arg.take(np.asarray([right_row], dtype=np.intp)),
-            ExecutionMode.GPU,
-        )
-
     fallback_calls: list[tuple[int, bool]] = []
 
     monkeypatch.setattr(
         overlay_module,
         "_prepare_many_vs_one_intersection_chunks",
-        _fake_prepare,
+        lambda *args, **kwargs: pytest.fail(
+            "few-right intersection fallback should preserve one-batch semantics"
+        ),
     )
     monkeypatch.setattr(
         constructive_module,
@@ -1938,7 +1874,7 @@ def test_overlay_intersection_few_right_fallback_preserves_exact_polygon_mode(
     )
 
     assert used_owned is True
-    assert fallback_calls == [(6, True)]
+    assert fallback_calls == [(24, True)]
     assert result["col1"].tolist() == idx1.tolist()
     assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
 

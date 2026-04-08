@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pandas.api.types
 import shapely
-from shapely.geometry import GeometryCollection, MultiPolygon, Polygon, box
+from shapely.geometry import MultiPolygon, Polygon, box
 
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._compat import PANDAS_GE_30
@@ -63,70 +63,178 @@ def _rectangle_bounds_from_mask(mask):
     return (float(xs[0]), float(ys[0]), float(xs[1]), float(ys[1]))
 
 
+def _geometry_series_from_values(values, *, index, crs, name=None):
+    """Build a GeoSeries-like object without demoting extension-backed geometry."""
+    if isinstance(values, GeometryArray | DeviceGeometryArray):
+        result = pd.Series(values, index=index, copy=False, name=name)
+        result.__class__ = GeoSeries
+        result._crs = crs
+        return result
+    return GeoSeries(values, index=index, crs=crs, name=name)
+
+
+def _geometry_column_series(values, *, index, crs, name):
+    """Build a DataFrame geometry column while preserving extension backing."""
+    if isinstance(values, GeometryArray | DeviceGeometryArray):
+        return pd.Series(values, index=index, copy=False, name=name)
+    return GeoSeries(values, index=index, crs=crs, name=name)
+
+
+def _replace_geometry_column(frame, values):
+    """Replace the active geometry column while preserving extension backing."""
+    if isinstance(frame, GeoDataFrame):
+        geom_name = frame._geometry_column_name
+        geometry_series = _geometry_column_series(
+            values,
+            index=frame.index,
+            crs=frame.crs,
+            name=geom_name,
+        )
+        data_columns = {
+            column_name: (geometry_series if column_name == geom_name else frame[column_name])
+            for column_name in frame.columns
+        }
+        rebuilt = pd.DataFrame(data_columns, index=frame.index, copy=False)
+        rebuilt.__class__ = GeoDataFrame
+        rebuilt._geometry_column_name = geom_name
+        rebuilt.attrs = frame.attrs.copy()
+        return rebuilt
+
+    return _geometry_series_from_values(
+        values,
+        index=frame.index,
+        crs=frame.crs,
+        name=getattr(frame, "name", None),
+    )
+
+
 def _clip_polygon_partition_with_rectangle_mask(
     partition,
     rectangle_bounds: tuple[float, float, float, float],
 ):
     """Clip polygon rows to a rectangle mask while preserving sliver leftovers.
 
-    The owned rectangle clip path returns polygonal area correctly, but
-    `OwnedGeometryArray` still cannot represent per-row GeometryCollections.
-    For rectangle masks we recover lower-dimensional leftovers at the
-    GeoPandas/Shapely boundary, then assemble any mixed polygon+line result
-    there as well.
+    Rows fully inside the rectangle are pass-through. Only rows that cross or
+    touch the rectangle boundary require exact host-side intersection to
+    preserve lower-dimensional public clip semantics.
     """
     xmin, ymin, xmax, ymax = rectangle_bounds
+    from vibespatial.api.tools.overlay import (
+        _assemble_polygon_intersection_rows_with_lower_dim,
+    )
+    from vibespatial.geometry.owned import (
+        concat_owned_scatter,
+        from_shapely_geometries,
+    )
+    from vibespatial.runtime.residency import Residency
+
     rectangle_mask = box(xmin, ymin, xmax, ymax)
     source_values = partition.geometry.values if isinstance(partition, GeoDataFrame) else partition.values
-    source_geoms = np.asarray(source_values, dtype=object)
-    area_values = source_values.clip_by_rect(xmin, ymin, xmax, ymax)
-    area_geoms = np.asarray(area_values, dtype=object)
-    source_missing = np.asarray(
-        shapely.is_missing(source_geoms) | shapely.is_empty(source_geoms),
-        dtype=bool,
-    )
-    area_missing = np.asarray(
-        shapely.is_missing(area_geoms) | shapely.is_empty(area_geoms),
-        dtype=bool,
-    )
+    assembled = np.empty(len(partition), dtype=object)
+    assembled[:] = None
 
-    edge_geoms = np.asarray(
-        shapely.intersection(shapely.boundary(source_geoms), rectangle_mask),
-        dtype=object,
+    source_missing = np.asarray(source_values.isna() | source_values.is_empty, dtype=bool)
+    source_bounds = np.asarray(source_values.bounds, dtype=np.float64)
+    fully_inside_mask = (
+        ~source_missing
+        & (source_bounds[:, 0] >= xmin)
+        & (source_bounds[:, 1] >= ymin)
+        & (source_bounds[:, 2] <= xmax)
     )
-    if np.any(~area_missing):
-        area_rows = np.flatnonzero(~area_missing)
-        edge_geoms[area_rows] = np.asarray(
-            shapely.difference(
-                edge_geoms[area_rows],
-                shapely.boundary(area_geoms[area_rows]),
+    fully_inside_mask &= source_bounds[:, 3] <= ymax
+
+    inside_rows = np.flatnonzero(fully_inside_mask).astype(np.intp, copy=False)
+    if inside_rows.size > 0:
+        assembled[inside_rows] = np.asarray(
+            source_values.take(inside_rows),
+            dtype=object,
+        )
+
+    boundary_rows = np.flatnonzero(~source_missing & ~fully_inside_mask).astype(np.intp, copy=False)
+    if boundary_rows.size > 0:
+        boundary_index = partition.index.take(boundary_rows)
+        left_pairs = GeoSeries(
+            source_values.take(boundary_rows),
+            index=boundary_index,
+            crs=partition.crs,
+        )
+        area_pairs = GeoSeries(
+            left_pairs.values.clip_by_rect(xmin, ymin, xmax, ymax),
+            index=boundary_index,
+            crs=partition.crs,
+        )
+        repeated_mask = np.empty(boundary_rows.size, dtype=object)
+        repeated_mask[:] = rectangle_mask
+        right_pairs = GeoSeries(
+            repeated_mask,
+            index=boundary_index,
+            crs=partition.crs,
+        )
+        assembled[boundary_rows] = np.asarray(
+            _assemble_polygon_intersection_rows_with_lower_dim(
+                left_pairs,
+                right_pairs,
+                area_pairs,
             ),
             dtype=object,
         )
-    edge_missing = np.asarray(
-        shapely.is_missing(edge_geoms) | shapely.is_empty(edge_geoms),
-        dtype=bool,
+        changed_boundary_geoms = assembled[boundary_rows]
+        contains_collection = any(
+            geom is not None and getattr(geom, "geom_type", None) == "GeometryCollection"
+            for geom in changed_boundary_geoms
+        )
+        if (
+            not contains_collection
+            and (
+                isinstance(source_values, DeviceGeometryArray)
+                or getattr(source_values, "_owned", None) is not None
+            )
+        ):
+            source_owned = source_values.to_owned()
+            area_owned = area_pairs.values.to_owned()
+            result_owned = concat_owned_scatter(
+                source_owned,
+                area_owned,
+                boundary_rows,
+            )
+            area_objects = np.asarray(area_pairs, dtype=object)
+            changed_mask = np.ones(boundary_rows.size, dtype=bool)
+            for row_index, (assembled_geom, area_geom) in enumerate(
+                zip(assembled[boundary_rows], area_objects, strict=True)
+            ):
+                if assembled_geom is None and area_geom is None:
+                    changed_mask[row_index] = False
+                    continue
+                if assembled_geom is None or area_geom is None:
+                    continue
+                if bool(shapely.equals(assembled_geom, area_geom)):
+                    changed_mask[row_index] = False
+            changed_rows = boundary_rows[changed_mask]
+            if changed_rows.size > 0:
+                replacement_owned = from_shapely_geometries(
+                    assembled[changed_rows].tolist(),
+                    residency=result_owned.residency,
+                )
+                result_owned = concat_owned_scatter(
+                    result_owned,
+                    replacement_owned,
+                    changed_rows,
+                )
+
+            result_values = (
+                DeviceGeometryArray._from_owned(result_owned, crs=partition.crs)
+                if result_owned.residency is Residency.DEVICE
+                else GeometryArray.from_owned(result_owned, crs=partition.crs)
+            )
+            return _replace_geometry_column(
+                partition.copy(deep=not PANDAS_GE_30),
+                result_values,
+            )
+
+    return _replace_geometry_column(
+        partition.copy(deep=not PANDAS_GE_30),
+        assembled,
     )
-
-    assembled = np.empty(len(partition), dtype=object)
-    assembled[source_missing] = None
-    neither_mask = ~source_missing & area_missing & edge_missing
-    area_only_mask = ~source_missing & ~area_missing & edge_missing
-    edge_only_mask = ~source_missing & area_missing & ~edge_missing
-    both_mask = ~source_missing & ~area_missing & ~edge_missing
-
-    assembled[neither_mask] = None
-    assembled[area_only_mask] = area_geoms[area_only_mask]
-    assembled[edge_only_mask] = edge_geoms[edge_only_mask]
-    for row_index in np.flatnonzero(both_mask):
-        assembled[row_index] = GeometryCollection([area_geoms[row_index], edge_geoms[row_index]])
-
-    clipped_partition = partition.copy(deep=not PANDAS_GE_30)
-    if isinstance(clipped_partition, GeoDataFrame):
-        clipped_partition[clipped_partition._geometry_column_name] = assembled
-    else:
-        clipped_partition[:] = assembled
-    return clipped_partition
 
 
 def _clip_gdf_with_mask(gdf, mask, sort=False):
@@ -235,8 +343,6 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
             return GeometryArray.from_owned(result_owned, crs=partition.crs)
 
         if isinstance(partition, GeoDataFrame):
-            clipped_partition = partition.copy(deep=not PANDAS_GE_30)
-            geom_name = clipped_partition._geometry_column_name
             if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
                 from vibespatial.api.tools.overlay import (
                     _assemble_polygon_intersection_rows_with_lower_dim,
@@ -248,7 +354,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
                 repeated_mask = np.empty(len(partition), dtype=object)
                 repeated_mask[:] = mask
                 right_pairs = GeoSeries(repeated_mask, index=partition.index, crs=partition.crs)
-                clipped_partition[geom_name] = _assemble_polygon_intersection_rows_with_lower_dim(
+                geom_values = _assemble_polygon_intersection_rows_with_lower_dim(
                     partition.geometry,
                     right_pairs,
                     area_pairs,
@@ -259,10 +365,11 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
                     if use_rect_fast_path
                     else partition.geometry.values.intersection(mask)
                 )
-                clipped_partition[geom_name] = geom_values
-            return clipped_partition
+            return _replace_geometry_column(
+                partition.copy(deep=not PANDAS_GE_30),
+                geom_values,
+            )
 
-        clipped_partition = partition.copy(deep=not PANDAS_GE_30)
         if not clipping_by_rectangle and partition.geom_type.isin(POLYGON_GEOM_TYPES).all():
             from vibespatial.api.tools.overlay import (
                 _assemble_polygon_intersection_rows_with_lower_dim,
@@ -276,7 +383,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
             repeated_mask = np.empty(len(partition), dtype=object)
             repeated_mask[:] = mask
             right_pairs = GeoSeries(repeated_mask, index=partition.index, crs=partition.crs)
-            clipped_partition[:] = _assemble_polygon_intersection_rows_with_lower_dim(
+            geom_values = _assemble_polygon_intersection_rows_with_lower_dim(
                 partition,
                 right_pairs,
                 area_pairs,
@@ -287,8 +394,10 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
                 if use_rect_fast_path
                 else partition.values.intersection(mask)
             )
-            clipped_partition[:] = geom_values
-        return clipped_partition
+        return _replace_geometry_column(
+            partition.copy(deep=not PANDAS_GE_30),
+            geom_values,
+        )
 
     parts = []
     if point_mask.any():
@@ -324,30 +433,25 @@ def _clip_gdf_with_mask(gdf, mask, sort=False):
 
     clipped = pd.concat(parts).loc[gdf_sub.index]
     if isinstance(clipped, GeoDataFrame):
-        geom_name = clipped._geometry_column_name
-        geom_values = clipped[geom_name].values
-        clipped = clipped.copy(deep=not PANDAS_GE_30)
+        geom_values = clipped[clipped._geometry_column_name].values
         if isinstance(geom_values, GeometryArray | DeviceGeometryArray):
-            clipped[geom_name] = GeoSeries(
+            clipped = _replace_geometry_column(
+                clipped.copy(deep=not PANDAS_GE_30),
                 geom_values,
-                index=clipped.index,
-                crs=gdf.crs,
             )
         else:
-            clipped[geom_name] = GeoSeries(
-                _geometryarray_from_shapely(np.asarray(clipped[geom_name], dtype=object), crs=gdf.crs),
-                index=clipped.index,
-                crs=gdf.crs,
+            clipped = _replace_geometry_column(
+                clipped.copy(deep=not PANDAS_GE_30),
+                _geometryarray_from_shapely(np.asarray(clipped[clipped._geometry_column_name], dtype=object), crs=gdf.crs),
             )
     else:
         values = clipped.values
         if isinstance(values, GeometryArray | DeviceGeometryArray):
-            clipped = GeoSeries(values, index=clipped.index, crs=gdf.crs)
+            clipped = _replace_geometry_column(clipped, values)
         else:
-            clipped = GeoSeries(
+            clipped = _replace_geometry_column(
+                clipped,
                 _geometryarray_from_shapely(np.asarray(clipped, dtype=object), crs=gdf.crs),
-                index=clipped.index,
-                crs=gdf.crs,
             )
 
     clipped_geometry = clipped.geometry if isinstance(clipped, GeoDataFrame) else clipped

@@ -544,7 +544,7 @@ def _pylibcudf_table_to_geopandas(
     )
 
     columns_by_index = table.columns()
-    decoded_geometry: dict[str, DeviceGeometryArray] = {}
+    decoded_geometry_owned: dict[str, tuple[OwnedGeometryArray, Any]] = {}
     row_count = None
     for column_name in geometry_columns:
         column_index = result_column_names.index(column_name)
@@ -556,7 +556,7 @@ def _pylibcudf_table_to_geopandas(
         crs = _geoparquet_geometry_column_crs(column_meta)
         if row_count is None:
             row_count = owned.row_count
-        decoded_geometry[column_name] = DeviceGeometryArray._from_owned(owned, crs=crs)
+        decoded_geometry_owned[column_name] = (owned, crs)
 
     # ADR-0036 boundary: .to_pandas() deferred to GeoDataFrame construction.
     if to_pandas_kwargs is None:
@@ -566,13 +566,23 @@ def _pylibcudf_table_to_geopandas(
     if data.empty and not non_geometry_columns and row_count is not None:
         data = pd.DataFrame(index=pd.RangeIndex(row_count))
 
-    gdf = pd.DataFrame(index=data.index)
+    decoded_geometry: dict[str, pd.Series] = {}
+    for column_name, (owned, crs) in decoded_geometry_owned.items():
+        decoded_geometry[column_name] = pd.Series(
+            DeviceGeometryArray._from_owned(owned, crs=crs),
+            index=data.index,
+            copy=False,
+            name=column_name,
+        )
+
+    data_columns: dict[str, Any] = {}
     for column_name in result_column_names:
         if column_name in decoded_geometry:
-            gdf[column_name] = decoded_geometry[column_name]
+            data_columns[column_name] = decoded_geometry[column_name]
         elif column_name in data.columns:
-            gdf[column_name] = data[column_name]
+            data_columns[column_name] = data[column_name]
         # else: pandas index column, already restored into data.index
+    gdf = pd.DataFrame(data_columns, index=data.index, copy=False)
     gdf.__class__ = GeoDataFrame
     gdf._geometry_column_name = geometry
     if df_attrs:

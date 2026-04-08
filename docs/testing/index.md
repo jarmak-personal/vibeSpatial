@@ -6,6 +6,8 @@ Testing strategy, performance gates, and coverage tracking for vibeSpatial.
 :maxdepth: 1
 
 performance-tiers
+gpu-performance-checklist
+gpu-performance-remediation-plan
 native-coverage
 contract-promotion
 upstream-inventory
