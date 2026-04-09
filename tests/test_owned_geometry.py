@@ -53,6 +53,21 @@ def test_shapely_round_trip_preserves_null_and_empty() -> None:
     assert restored[3].equals(LineString([(0, 0), (2, 4)]))
 
 
+def test_owned_to_shapely_does_not_route_through_wkb_bridge(monkeypatch) -> None:
+    from vibespatial.io import wkb as wkb_module
+
+    def _fail_encode(*args, **kwargs):
+        raise AssertionError("owned->Shapely materialization should not use WKB bridge")
+
+    monkeypatch.setattr(wkb_module, "encode_wkb_owned", _fail_encode)
+
+    owned = from_shapely_geometries(_sample_geometries())
+    restored = owned.to_shapely()
+
+    assert restored[0].equals(Point(1, 2))
+    assert restored[4].equals(Polygon([(0, 0), (3, 0), (3, 3), (0, 0)]))
+
+
 def test_wkb_round_trip_matches_shapely_path() -> None:
     baseline = from_shapely_geometries(_sample_geometries())
     wkb = baseline.to_wkb()
@@ -145,8 +160,9 @@ def test_diagnostics_capture_residency_and_runtime_changes() -> None:
     owned.to_shapely()
     report = owned.diagnostics_report()
 
-    assert report["residency"] == Residency.HOST.value
+    assert report["residency"] == Residency.DEVICE.value
     assert any(event["kind"] == DiagnosticKind.TRANSFER.value for event in report["events"])
+    assert any(event["kind"] == DiagnosticKind.MATERIALIZATION.value for event in report["events"])
     assert any("CPU fallback" in reason for reason in report["runtime_history"])
 
 

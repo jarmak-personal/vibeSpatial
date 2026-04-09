@@ -354,6 +354,27 @@ class TestPolygonDecodeGpu:
         # 2 rings -> 3 offset entries
         assert len(host_ring_off) == 3
 
+    def test_polygon_decode_uses_count_scatter_total_helper(self, monkeypatch):
+        """Complex FGB decode uses async count-scatter total helpers."""
+        from vibespatial.cuda import _runtime as runtime_module
+        from vibespatial.io.fgb_gpu import read_fgb_gpu
+
+        calls = {"totals": []}
+        original_totals = runtime_module.count_scatter_totals
+
+        def _record_totals(runtime, count_offset_pairs):
+            calls["totals"].append(len(count_offset_pairs))
+            return original_totals(runtime, count_offset_pairs)
+
+        monkeypatch.setattr(runtime_module, "count_scatter_totals", _record_totals)
+
+        poly = Polygon([(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
+        path = _write_test_fgb([poly])
+        result = read_fgb_gpu(path)
+
+        assert result.n_features == 1
+        assert calls["totals"] == [3]
+
     def test_multiple_polygons(self):
         """Multiple polygons decode correctly."""
         from vibespatial.io.fgb_gpu import read_fgb_gpu

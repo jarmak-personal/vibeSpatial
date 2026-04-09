@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 from shapely.geometry import Point, Polygon, box
 
@@ -92,4 +93,82 @@ def test_build_flat_spatial_index_default_prefers_gpu_when_available() -> None:
     build_flat_spatial_index(owned)
 
     expected = "gpu" if has_gpu_runtime() else "cpu"
-    assert owned.runtime_history[-1].selected.value == expected
+    assert any(selection.selected.value == expected for selection in owned.runtime_history)
+
+
+@pytest.mark.gpu
+def test_build_flat_spatial_index_detects_regular_grid_from_device_polygon_stubs() -> None:
+    pytest.importorskip("cupy")
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+
+    runtime = get_cuda_runtime()
+    polygon_family = GeometryFamily.POLYGON
+    x = np.asarray(
+        [
+            0.0, 1.0, 1.0, 0.0, 0.0,
+            1.0, 2.0, 2.0, 1.0, 1.0,
+            0.0, 1.0, 1.0, 0.0, 0.0,
+            1.0, 2.0, 2.0, 1.0, 1.0,
+        ],
+        dtype=np.float64,
+    )
+    y = np.asarray(
+        [
+            0.0, 0.0, 1.0, 1.0, 0.0,
+            0.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 2.0, 2.0, 1.0,
+            1.0, 1.0, 2.0, 2.0, 1.0,
+        ],
+        dtype=np.float64,
+    )
+    geometry_offsets = np.asarray([0, 1, 2, 3, 4], dtype=np.int32)
+    ring_offsets = np.asarray([0, 5, 10, 15, 20], dtype=np.int32)
+    empty_mask = np.zeros(4, dtype=np.bool_)
+
+    owned = build_device_resident_owned(
+        device_families={
+            polygon_family: DeviceFamilyGeometryBuffer(
+                family=polygon_family,
+                x=runtime.from_host(x),
+                y=runtime.from_host(y),
+                geometry_offsets=runtime.from_host(geometry_offsets),
+                empty_mask=runtime.from_host(empty_mask),
+                ring_offsets=runtime.from_host(ring_offsets),
+            ),
+        },
+        row_count=4,
+        tags=np.full(4, FAMILY_TAGS[polygon_family], dtype=np.int8),
+        validity=np.ones(4, dtype=np.bool_),
+        family_row_offsets=np.arange(4, dtype=np.int32),
+    )
+
+    stub = owned.families[polygon_family]
+    assert not stub.host_materialized
+    assert stub.geometry_offsets.size == 0
+    assert stub.ring_offsets is None
+
+    index = build_flat_spatial_index(
+        owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+            reason="cpu baseline",
+        ),
+    )
+
+    hydrated = owned.families[polygon_family]
+    assert index.regular_grid is not None
+    assert index.regular_grid.cols == 2
+    assert index.regular_grid.rows == 2
+    assert hydrated.host_materialized is False
+    assert hydrated.x.size == 0
+    assert hydrated.y.size == 0
+    np.testing.assert_array_equal(hydrated.geometry_offsets, geometry_offsets)
+    np.testing.assert_array_equal(hydrated.ring_offsets, ring_offsets)

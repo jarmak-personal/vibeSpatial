@@ -101,7 +101,7 @@ def _confidence(top_score: int) -> str:
     return "low"
 
 
-MAX_EXPLICIT_FILE_SEEDS = 4
+MAX_EXPLICIT_FILE_SEEDS = 8
 
 
 def plan_request(request: str) -> dict[str, Any]:

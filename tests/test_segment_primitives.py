@@ -248,6 +248,54 @@ def test_segment_primitives_same_row_fast_path_swaps_large_right_rows(
     assert "segment.candidates.binary_search" not in summary
 
 
+@pytest.mark.gpu
+def test_segment_primitives_same_row_sort_sweep_path_matches_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries(
+        [
+            LineString([(0, 0), (3, 3)]),
+            LineString([(10, 0), (13, 3)]),
+            LineString([(20, 0), (23, 3)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            LineString([(0, 3), (3, 0)]),
+            LineString([(10, 3), (13, 0)]),
+            LineString([(20, 3), (23, 0)]),
+        ]
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+    cpu = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.CPU,
+        _require_same_row=True,
+    )
+    gpu = classify_segment_intersections(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _require_same_row=True,
+        _use_same_row_fast_path=False,
+    )
+
+    assert gpu.runtime_selection.selected is ExecutionMode.GPU
+    assert gpu.kind_names() == cpu.kind_names()
+    assert gpu.left_rows.tolist() == cpu.left_rows.tolist()
+    assert gpu.right_rows.tolist() == cpu.right_rows.tolist()
+
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.candidates.same_row_fast_path") is None
+    assert summary.get("segment.candidates.binary_search") == 1
+
+
 def test_benchmark_segment_intersections_reports_degenerate_mix() -> None:
     left = from_shapely_geometries([LineString([(0, 0), (4, 4)]), LineString([(0, 0), (5, 0)])])
     right = from_shapely_geometries([LineString([(0, 4), (4, 0)]), LineString([(2, 0), (7, 0)])])

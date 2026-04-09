@@ -361,8 +361,7 @@ def _count_scatter_complex(
     int,
     int,
     cp.ndarray | None,
-    cp.ndarray,
-    cp.ndarray,
+    bool,
 ]:
     """Two-pass count-scatter for PolyLine/Polygon/MultiPoint records.
 
@@ -386,11 +385,16 @@ def _count_scatter_complex(
         Total part count.
     d_ring_offsets_flat : cp.ndarray or None
         Flat ring/part offsets (device, int32) for PolyLine/Polygon, None for MultiPoint.
-    d_num_parts : cp.ndarray
-        Per-record part counts (device, int32).
-    d_num_points : cp.ndarray
-        Per-record point counts (device, int32).
+    has_multi_part : bool
+        Whether any record contained more than one part. Only meaningful
+        for ``SHP_POLYLINE`` assembly, where it selects LineString versus
+        MultiLineString without an extra device scalar read.
     """
+    from vibespatial.cuda._runtime import (
+        count_scatter_total_with_transfer,
+        count_scatter_totals,
+    )
+
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
 
@@ -431,26 +435,26 @@ def _count_scatter_complex(
     d_coord_offsets = exclusive_sum(d_num_points, synchronize=False)
     d_part_offsets_prefix = exclusive_sum(d_num_parts, synchronize=False)
 
-    # Get totals: last element of prefix sum + last element of counts
-    # Single sync before host read
-    runtime.synchronize()
-    total_points = (
-        int(d_coord_offsets[n_records - 1].get()) + int(d_num_points[n_records - 1].get())
-        if n_records > 0
-        else 0
-    )
-    total_parts = (
-        int(d_part_offsets_prefix[n_records - 1].get()) + int(d_num_parts[n_records - 1].get())
-        if n_records > 0
-        else 0
-    )
-
-    # Wait -- exclusive_sum returns length n+1 with the total at index n.
-    # Check the actual shape returned by exclusive_sum.
-    # exclusive_sum produces output of same length as input. Total = offsets[-1] + counts[-1].
-    # Actually let's verify by checking the CCCL exclusive_sum semantics:
-    # exclusive_sum(counts) returns offsets where offsets[i] = sum(counts[0:i])
-    # So total = offsets[n-1] + counts[n-1], and we already got that above.
+    if n_records > 0:
+        total_points, total_parts = count_scatter_totals(
+            runtime,
+            [
+                (d_num_points, d_coord_offsets),
+                (d_num_parts, d_part_offsets_prefix),
+            ],
+        )
+    else:
+        total_points = 0
+        total_parts = 0
+    part_count_xfer = None
+    h_num_parts = None
+    if shape_type == SHP_POLYLINE and n_records > 0:
+        total_parts, part_count_xfer, h_num_parts = count_scatter_total_with_transfer(
+            runtime,
+            d_num_parts,
+            d_part_offsets_prefix,
+            precomputed_total=total_parts,
+        )
 
     # ---- Pass 2: gather coordinates ----
     d_x = cp.empty(total_points, dtype=cp.float64)
@@ -526,6 +530,12 @@ def _count_scatter_complex(
         # Set the sentinel: last element = total_points
         d_ring_offsets_flat[total_parts] = np.int32(total_points)
 
+    has_multi_part = False
+    if part_count_xfer is not None:
+        part_count_xfer.synchronize()
+        has_multi_part = bool(np.any(h_num_parts > 1))
+        runtime.destroy_stream(part_count_xfer)
+
     return (
         d_x,
         d_y,
@@ -535,8 +545,7 @@ def _count_scatter_complex(
         total_points,
         total_parts,
         d_ring_offsets_flat,
-        d_num_parts,
-        d_num_points,
+        has_multi_part,
     )
 
 
@@ -609,7 +618,7 @@ def _assemble_linestring(
     d_ring_offsets_flat: cp.ndarray,
     d_part_offsets_prefix: cp.ndarray,
     d_is_null: cp.ndarray,
-    d_num_parts: cp.ndarray,
+    has_multi_part: bool,
     n_records: int,
     total_points: int,
     total_parts: int,
@@ -626,10 +635,7 @@ def _assemble_linestring(
     d_null_mask = d_is_null.astype(cp.bool_)
     d_validity = ~d_null_mask
 
-    # Check if all records have exactly 1 part (simple LineString)
-    max_parts = int(d_num_parts.max().get()) if n_records > 0 else 0
-
-    if max_parts <= 1:
+    if not has_multi_part:
         # Simple LineString: geometry_offsets = coord_offsets with sentinel
         d_geom_offsets = cp.empty(n_records + 1, dtype=cp.int32)
         d_geom_offsets[:n_records] = d_coord_offsets
@@ -674,7 +680,6 @@ def _assemble_polygon(
     d_ring_offsets_flat: cp.ndarray,
     d_part_offsets_prefix: cp.ndarray,
     d_is_null: cp.ndarray,
-    d_num_parts: cp.ndarray,
     n_records: int,
     total_points: int,
     total_parts: int,
@@ -742,7 +747,7 @@ def _decode_shp_records(
             d_shp, d_offsets, d_content_lengths, n_records, SHP_MULTIPOINT,
         )
         (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
-         total_points, total_parts, _, d_num_parts, d_num_points) = result
+         total_points, total_parts, _, _) = result
         return _assemble_multipoint(
             d_x, d_y, d_coord_offsets, d_is_null, n_records, total_points,
         )
@@ -752,10 +757,10 @@ def _decode_shp_records(
             d_shp, d_offsets, d_content_lengths, n_records, SHP_POLYLINE,
         )
         (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
-         total_points, total_parts, d_ring_flat, d_num_parts, d_num_points) = result
+         total_points, total_parts, d_ring_flat, has_multi_part) = result
         return _assemble_linestring(
             d_x, d_y, d_coord_offsets, d_ring_flat, d_part_offsets,
-            d_is_null, d_num_parts, n_records, total_points, total_parts,
+            d_is_null, has_multi_part, n_records, total_points, total_parts,
         )
 
     if header.shape_type == SHP_POLYGON:
@@ -763,10 +768,10 @@ def _decode_shp_records(
             d_shp, d_offsets, d_content_lengths, n_records, SHP_POLYGON,
         )
         (d_x, d_y, d_coord_offsets, d_part_offsets, d_is_null,
-         total_points, total_parts, d_ring_flat, d_num_parts, d_num_points) = result
+         total_points, total_parts, d_ring_flat, _) = result
         return _assemble_polygon(
             d_x, d_y, d_coord_offsets, d_ring_flat, d_part_offsets,
-            d_is_null, d_num_parts, n_records, total_points, total_parts,
+            d_is_null, n_records, total_points, total_parts,
         )
 
     raise ValueError(f"Unsupported SHP shape type: {header.shape_type}")

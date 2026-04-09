@@ -4,7 +4,6 @@ from typing import Any
 
 import numpy as np
 
-from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import exclusive_sum
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
@@ -25,6 +24,25 @@ from .wkb import (
 
 # CCCL warmup (ADR-0034)
 request_warmup(["exclusive_scan_i32"])
+
+
+def _build_lazy_host_family_stub(
+    family: GeometryFamily,
+    *,
+    row_count: int,
+) -> FamilyGeometryBuffer:
+    """Create an unmaterialized host placeholder for a device family buffer."""
+    return FamilyGeometryBuffer(
+        family=family,
+        schema=get_geometry_buffer_schema(family),
+        row_count=row_count,
+        x=np.empty(0, dtype=np.float64),
+        y=np.empty(0, dtype=np.float64),
+        geometry_offsets=np.empty(0, dtype=np.int32),
+        empty_mask=np.empty(0, dtype=np.bool_),
+        bounds=None,
+        host_materialized=False,
+    )
 
 def _pylibcudf_buffer_view(column, dtype: np.dtype[Any]):
     import cupy as cp
@@ -240,53 +258,17 @@ def _build_device_single_family_owned(
 ) -> OwnedGeometryArray:
     import cupy as cp
 
-    runtime = get_cuda_runtime()
     row_count = int(validity_device.size)
-    valid_count = int(cp.asnumpy(validity_device.astype(cp.int32).sum()))
+    valid_count = int(cp.count_nonzero(validity_device).item())
     tags_device = cp.where(validity_device, np.int8(FAMILY_TAGS[family]), np.int8(-1)).astype(cp.int8)
     family_row_offsets_device = cp.full(row_count, -1, dtype=cp.int32)
     if valid_count:
         family_row_offsets_device[validity_device] = cp.arange(valid_count, dtype=cp.int32)
-    validity = runtime.copy_device_to_host(validity_device).astype(np.bool_, copy=False)
-    tags = runtime.copy_device_to_host(tags_device).astype(np.int8, copy=False)
-    family_row_offsets = runtime.copy_device_to_host(family_row_offsets_device).astype(np.int32, copy=False)
-    # Populate structural metadata on host (offsets, masks -- small, KB-scale)
-    # while keeping coordinate arrays (x, y) device-only.  This lets host-side
-    # code (regular grid detection, morton key computation) inspect geometry
-    # structure without a full D->H transfer of coordinate data.
-    # _ensure_host_state() checks .size / is-not-None before re-transferring,
-    # so these populated fields are reused and only x/y get deferred-transferred.
-    host_geometry_offsets = np.ascontiguousarray(
-        runtime.copy_device_to_host(geometry_offsets_device), dtype=np.int32,
-    )
-    host_empty_mask = np.ascontiguousarray(
-        runtime.copy_device_to_host(empty_mask_device), dtype=np.bool_,
-    )
-    host_part_offsets = (
-        None if part_offsets_device is None
-        else np.ascontiguousarray(runtime.copy_device_to_host(part_offsets_device), dtype=np.int32)
-    )
-    host_ring_offsets = (
-        None if ring_offsets_device is None
-        else np.ascontiguousarray(runtime.copy_device_to_host(ring_offsets_device), dtype=np.int32)
-    )
-    buffer = FamilyGeometryBuffer(
-        family=family,
-        schema=get_geometry_buffer_schema(family),
-        row_count=valid_count,
-        x=np.empty(0, dtype=np.float64),
-        y=np.empty(0, dtype=np.float64),
-        geometry_offsets=host_geometry_offsets,
-        empty_mask=host_empty_mask,
-        part_offsets=host_part_offsets,
-        ring_offsets=host_ring_offsets,
-        bounds=None,
-        host_materialized=False,
-    )
+    buffer = _build_lazy_host_family_stub(family, row_count=valid_count)
     owned = OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
+        validity=None,
+        tags=None,
+        family_row_offsets=None,
         families={family: buffer},
         residency=Residency.DEVICE,
         device_state=OwnedGeometryDeviceState(
@@ -306,6 +288,7 @@ def _build_device_single_family_owned(
                 )
             },
         ),
+        _row_count=row_count,
     )
     owned._record(
         DiagnosticKind.CREATED,
@@ -322,40 +305,14 @@ def _build_device_mixed_owned(
     family_devices: dict[GeometryFamily, DeviceFamilyGeometryBuffer],
     detail: str,
 ) -> OwnedGeometryArray:
-    runtime = get_cuda_runtime()
-    validity = runtime.copy_device_to_host(validity_device).astype(np.bool_, copy=False)
-    tags = runtime.copy_device_to_host(tags_device).astype(np.int8, copy=False)
-    family_row_offsets = runtime.copy_device_to_host(family_row_offsets_device).astype(np.int32, copy=False)
     families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
     for family, device_buffer in family_devices.items():
         row_count = int(device_buffer.empty_mask.size)
-        families[family] = FamilyGeometryBuffer(
-            family=family,
-            schema=get_geometry_buffer_schema(family),
-            row_count=row_count,
-            x=np.empty(0, dtype=np.float64),
-            y=np.empty(0, dtype=np.float64),
-            geometry_offsets=np.ascontiguousarray(
-                runtime.copy_device_to_host(device_buffer.geometry_offsets), dtype=np.int32,
-            ),
-            empty_mask=np.ascontiguousarray(
-                runtime.copy_device_to_host(device_buffer.empty_mask), dtype=np.bool_,
-            ),
-            part_offsets=(
-                None if device_buffer.part_offsets is None
-                else np.ascontiguousarray(runtime.copy_device_to_host(device_buffer.part_offsets), dtype=np.int32)
-            ),
-            ring_offsets=(
-                None if device_buffer.ring_offsets is None
-                else np.ascontiguousarray(runtime.copy_device_to_host(device_buffer.ring_offsets), dtype=np.int32)
-            ),
-            bounds=None,
-            host_materialized=False,
-        )
+        families[family] = _build_lazy_host_family_stub(family, row_count=row_count)
     owned = OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
+        validity=None,
+        tags=None,
+        family_row_offsets=None,
         families=families,
         residency=Residency.DEVICE,
         device_state=OwnedGeometryDeviceState(
@@ -364,6 +321,7 @@ def _build_device_mixed_owned(
             family_row_offsets=family_row_offsets_device,
             families=family_devices,
         ),
+        _row_count=int(validity_device.size),
     )
     owned._record(
         DiagnosticKind.CREATED,
@@ -819,30 +777,38 @@ def _decode_pylibcudf_wkb_multipoint_column_to_owned(
     )
 
 
+def _decode_pylibcudf_wkb_homogeneous_nested_column_to_owned(
+    column,
+    family: GeometryFamily,
+    *,
+    scan: DeviceWKBHeaderScan | None = None,
+) -> OwnedGeometryArray:
+    header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
+    family_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[family])
+    if header_scan.native_count != header_scan.valid_count or _device_mask_count(family_mask) != header_scan.valid_count:
+        raise NotImplementedError(
+            f"pylibcudf device WKB decode currently supports only {family.value.lower()}-only columns; "
+            "mixed-family WKB rows still use the staged device pipeline"
+        )
+
+    from vibespatial.kernels.core.wkb_decode import decode_wkb_device_pipeline
+
+    return decode_wkb_device_pipeline(
+        _pylibcudf_wkb_payload(column),
+        _pylibcudf_wkb_offsets(column),
+        header_scan.row_count,
+    )
+
+
 def _decode_pylibcudf_wkb_multilinestring_column_to_owned(
     column,
     *,
     scan: DeviceWKBHeaderScan | None = None,
 ) -> OwnedGeometryArray:
-    header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
-    multilinestring_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
-    if header_scan.native_count != header_scan.valid_count or _device_mask_count(multilinestring_mask) != header_scan.valid_count:
-        raise NotImplementedError(
-            "pylibcudf device WKB decode currently supports only multilinestring-only columns; "
-            "mixed-family WKB rows still use the staged host bridge"
-        )
-
-    row_indexes = _device_select_true(multilinestring_mask)
-    family_buffer = _build_device_wkb_multilinestring_family(column, row_indexes)
-    return _build_device_single_family_owned(
-        family=GeometryFamily.MULTILINESTRING,
-        validity_device=header_scan.validity,
-        x_device=family_buffer.x,
-        y_device=family_buffer.y,
-        geometry_offsets_device=family_buffer.geometry_offsets,
-        empty_mask_device=family_buffer.empty_mask,
-        part_offsets_device=family_buffer.part_offsets,
-        detail="created device-resident owned geometry array from pylibcudf WKB multilinestring scan",
+    return _decode_pylibcudf_wkb_homogeneous_nested_column_to_owned(
+        column,
+        GeometryFamily.MULTILINESTRING,
+        scan=scan,
     )
 
 
@@ -851,26 +817,10 @@ def _decode_pylibcudf_wkb_multipolygon_column_to_owned(
     *,
     scan: DeviceWKBHeaderScan | None = None,
 ) -> OwnedGeometryArray:
-    header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
-    multipolygon_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
-    if header_scan.native_count != header_scan.valid_count or _device_mask_count(multipolygon_mask) != header_scan.valid_count:
-        raise NotImplementedError(
-            "pylibcudf device WKB decode currently supports only multipolygon-only columns; "
-            "mixed-family WKB rows still use the staged host bridge"
-        )
-
-    row_indexes = _device_select_true(multipolygon_mask)
-    family_buffer = _build_device_wkb_multipolygon_family(column, row_indexes)
-    return _build_device_single_family_owned(
-        family=GeometryFamily.MULTIPOLYGON,
-        validity_device=header_scan.validity,
-        x_device=family_buffer.x,
-        y_device=family_buffer.y,
-        geometry_offsets_device=family_buffer.geometry_offsets,
-        empty_mask_device=family_buffer.empty_mask,
-        part_offsets_device=family_buffer.part_offsets,
-        ring_offsets_device=family_buffer.ring_offsets,
-        detail="created device-resident owned geometry array from pylibcudf WKB multipolygon scan",
+    return _decode_pylibcudf_wkb_homogeneous_nested_column_to_owned(
+        column,
+        GeometryFamily.MULTIPOLYGON,
+        scan=scan,
     )
 
 
@@ -879,25 +829,10 @@ def _decode_pylibcudf_wkb_polygon_column_to_owned(
     *,
     scan: DeviceWKBHeaderScan | None = None,
 ) -> OwnedGeometryArray:
-    header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
-    polygon_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
-    if header_scan.native_count != header_scan.valid_count or _device_mask_count(polygon_mask) != header_scan.valid_count:
-        raise NotImplementedError(
-            "pylibcudf device WKB decode currently supports only polygon-only columns; "
-            "mixed-family WKB rows still use the staged host bridge"
-        )
-
-    row_indexes = _device_select_true(polygon_mask)
-    family_buffer = _build_device_wkb_polygon_family(column, row_indexes)
-    return _build_device_single_family_owned(
-        family=GeometryFamily.POLYGON,
-        validity_device=header_scan.validity,
-        x_device=family_buffer.x,
-        y_device=family_buffer.y,
-        geometry_offsets_device=family_buffer.geometry_offsets,
-        empty_mask_device=family_buffer.empty_mask,
-        ring_offsets_device=family_buffer.ring_offsets,
-        detail="created device-resident owned geometry array from pylibcudf WKB polygon scan",
+    return _decode_pylibcudf_wkb_homogeneous_nested_column_to_owned(
+        column,
+        GeometryFamily.POLYGON,
+        scan=scan,
     )
 
 
@@ -907,7 +842,6 @@ def _decode_pylibcudf_wkb_general_column_to_owned(
     scan: DeviceWKBHeaderScan | None = None,
 ) -> OwnedGeometryArray:
     """GPU WKB decode for any supported homogeneous or mixed-family column."""
-    import cupy as cp
 
     header_scan = _scan_pylibcudf_wkb_headers(column) if scan is None else scan
     if header_scan.native_count != header_scan.valid_count:
@@ -915,101 +849,26 @@ def _decode_pylibcudf_wkb_general_column_to_owned(
             "pylibcudf device WKB decode requires all valid rows to be native supported types"
         )
 
-    # Determine which families are present.
+    # Preserve the lightweight fast paths for point-only and point/linestring
+    # columns. Heavier polygon-family decode should use the staged kernel
+    # pipeline instead of the older Python-orchestrated pylibcudf helpers.
     point_count = _device_mask_count(header_scan.point_mask)
-    polygon_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
-    polygon_count = _device_mask_count(polygon_mask)
     linestring_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.LINESTRING])
     linestring_count = _device_mask_count(linestring_mask)
-    multipoint_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOINT])
-    multipoint_count = _device_mask_count(multipoint_mask)
-    multilinestring_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
-    multilinestring_count = _device_mask_count(multilinestring_mask)
-    multipolygon_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
-    multipolygon_count = _device_mask_count(multipolygon_mask)
-
-    # Single-family fast paths.
     valid = header_scan.valid_count
     if valid == point_count:
         return _decode_pylibcudf_wkb_point_column_to_owned(column, scan=header_scan)
     if valid == linestring_count:
         return _decode_pylibcudf_wkb_linestring_column_to_owned(column, scan=header_scan)
-    if valid == polygon_count:
-        return _decode_pylibcudf_wkb_polygon_column_to_owned(column, scan=header_scan)
-    if valid == multipoint_count:
-        return _decode_pylibcudf_wkb_multipoint_column_to_owned(column, scan=header_scan)
-    if valid == multilinestring_count:
-        return _decode_pylibcudf_wkb_multilinestring_column_to_owned(column, scan=header_scan)
-    if valid == multipolygon_count:
-        return _decode_pylibcudf_wkb_multipolygon_column_to_owned(column, scan=header_scan)
     if valid == point_count + linestring_count:
         return _decode_pylibcudf_wkb_point_linestring_column_to_owned(column, scan=header_scan)
 
-    # Mixed family: build each family separately, merge with tags.
-    family_devices: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+    from vibespatial.kernels.core.wkb_decode import decode_wkb_device_pipeline
 
-    if point_count:
-        point_rows = _device_select_true(header_scan.point_mask)
-        offsets = _pylibcudf_wkb_offsets(column)
-        pay = _pylibcudf_wkb_payload(column)
-        pt_starts = offsets[:-1][point_rows]
-        px = _pylibcudf_unpack_le_float64(pay, pt_starts + 5)
-        py = _pylibcudf_unpack_le_float64(pay, pt_starts + 13)
-        pt_empty = cp.isnan(px) | cp.isnan(py)
-        pt_nonempty = ~pt_empty
-        pt_geom_off = _device_compact_offsets(pt_nonempty.astype(cp.int32, copy=False))
-        family_devices[GeometryFamily.POINT] = DeviceFamilyGeometryBuffer(
-            family=GeometryFamily.POINT,
-            x=px[pt_nonempty], y=py[pt_nonempty],
-            geometry_offsets=pt_geom_off,
-            empty_mask=pt_empty, bounds=None,
-        )
-
-    if linestring_count:
-        ls_rows = _device_select_true(linestring_mask)
-        family_devices[GeometryFamily.LINESTRING] = _build_device_wkb_linestring_family(column, ls_rows)
-
-    if polygon_count:
-        pg_rows = _device_select_true(polygon_mask)
-        family_devices[GeometryFamily.POLYGON] = _build_device_wkb_polygon_family(column, pg_rows)
-
-    if multipoint_count:
-        mp_rows = _device_select_true(multipoint_mask)
-        family_devices[GeometryFamily.MULTIPOINT] = _build_device_wkb_multipoint_family(column, mp_rows)
-
-    if multilinestring_count:
-        mls_rows = _device_select_true(multilinestring_mask)
-        family_devices[GeometryFamily.MULTILINESTRING] = _build_device_wkb_multilinestring_family(column, mls_rows)
-
-    if multipolygon_count:
-        mpg_rows = _device_select_true(multipolygon_mask)
-        family_devices[GeometryFamily.MULTIPOLYGON] = _build_device_wkb_multipolygon_family(column, mpg_rows)
-
-    # Check for unsupported families.
-    supported_count = point_count + linestring_count + polygon_count + multipoint_count + multilinestring_count + multipolygon_count
-    if supported_count != valid:
-        raise NotImplementedError(
-            f"pylibcudf device WKB decode currently supports all six 2D families; "
-            f"{valid - supported_count} rows have unsupported types"
-        )
-
-    # Build per-family row offsets.
-    row_count = header_scan.row_count
-    tags_device = cp.where(header_scan.validity, header_scan.family_tags, np.int8(-1)).astype(cp.int8, copy=False)
-    family_row_offsets_device = cp.full(row_count, -1, dtype=cp.int32)
-    for family in family_devices:
-        fam_mask = header_scan.family_tags == np.int8(FAMILY_TAGS[family])
-        fam_mask = fam_mask & header_scan.validity
-        fam_count = _device_mask_count(fam_mask)
-        if fam_count:
-            family_row_offsets_device[fam_mask] = cp.arange(fam_count, dtype=cp.int32)
-
-    return _build_device_mixed_owned(
-        validity_device=header_scan.validity,
-        tags_device=tags_device,
-        family_row_offsets_device=family_row_offsets_device,
-        family_devices=family_devices,
-        detail="created device-resident owned geometry array from pylibcudf WKB mixed decode",
+    return decode_wkb_device_pipeline(
+        _pylibcudf_wkb_payload(column),
+        _pylibcudf_wkb_offsets(column),
+        header_scan.row_count,
     )
 
 

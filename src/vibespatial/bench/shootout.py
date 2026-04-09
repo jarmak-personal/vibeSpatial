@@ -18,6 +18,9 @@ from typing import Any
 
 from .schema import TimingSummary, timing_from_samples
 
+_TIMED_START_MARKER = "# --- timed work starts here ---"
+_TIMED_END_MARKER = "# --- timed work ends here ---"
+
 # ---------------------------------------------------------------------------
 # Harness script — executed inside the subprocess
 # ---------------------------------------------------------------------------
@@ -27,6 +30,7 @@ import faulthandler
 import io
 import json
 import os
+from pathlib import Path
 import runpy
 import sys
 import time
@@ -44,7 +48,40 @@ dump_after = int(sys.argv[6])
 if dump_after > 0:
     faulthandler.dump_traceback_later(dump_after, repeat=False)
 
+TIMED_START_MARKER = "# --- timed work starts here ---"
+TIMED_END_MARKER = "# --- timed work ends here ---"
+
+
+def _load_script_sections(script_path):
+    text = Path(script_path).read_text(encoding="utf-8")
+    start = text.find(TIMED_START_MARKER)
+    end = text.find(TIMED_END_MARKER)
+    if start == -1 or end == -1 or end < start:
+        return None
+    return (
+        compile(text[:start], script_path, "exec"),
+        compile(text[start + len(TIMED_START_MARKER):end], script_path, "exec"),
+        compile(text[end + len(TIMED_END_MARKER):], script_path, "exec"),
+    )
+
+
+def _run_timed_sections(script_path, sections, *, run_name):
+    preamble_code, timed_code, postamble_code = sections
+    globals_dict = {
+        "__name__": run_name,
+        "__file__": script_path,
+        "__package__": None,
+        "__cached__": None,
+    }
+    exec(preamble_code, globals_dict)
+    start = time.perf_counter()
+    exec(timed_code, globals_dict)
+    elapsed = time.perf_counter() - start
+    exec(postamble_code, globals_dict)
+    return elapsed
+
 os.chdir(os.path.dirname(os.path.abspath(script)))
+sections = _load_script_sections(script)
 
 if do_pipeline_warm:
     try:
@@ -58,7 +95,10 @@ if do_warmup:
     old = sys.stdout
     sys.stdout = io.StringIO()
     try:
-        runpy.run_path(script, run_name="__warmup__")
+        if sections is None:
+            runpy.run_path(script, run_name="__warmup__")
+        else:
+            _run_timed_sections(script, sections, run_name="__warmup__")
     except Exception:
         pass
     finally:
@@ -70,12 +110,16 @@ for i in range(repeat):
     old = sys.stdout
     sys.stdout = capture = io.StringIO()
     error = None
-    start = time.perf_counter()
     try:
-        runpy.run_path(script, run_name="__main__")
+        if sections is None:
+            start = time.perf_counter()
+            runpy.run_path(script, run_name="__main__")
+            elapsed = time.perf_counter() - start
+        else:
+            elapsed = _run_timed_sections(script, sections, run_name="__main__")
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-    elapsed = time.perf_counter() - start
+        elapsed = 0.0
     sys.stdout = old
     if i == 0:
         captured_stdout = capture.getvalue()
@@ -195,6 +239,48 @@ def _extract_fingerprint(stdout: str) -> str | None:
         if line.startswith(_FINGERPRINT_PREFIX):
             return line[len(_FINGERPRINT_PREFIX):].strip()
     return None
+
+
+def _load_script_sections(script: Path) -> tuple[object, object, object] | None:
+    """Split a shootout script into preamble, timed body, and postamble."""
+    text = script.read_text(encoding="utf-8")
+    start = text.find(_TIMED_START_MARKER)
+    end = text.find(_TIMED_END_MARKER)
+    if start == -1 or end == -1 or end < start:
+        return None
+    return (
+        compile(text[:start], str(script), "exec"),
+        compile(text[start + len(_TIMED_START_MARKER):end], str(script), "exec"),
+        compile(text[end + len(_TIMED_END_MARKER):], str(script), "exec"),
+    )
+
+
+def _run_timed_script_sections(
+    script: Path,
+    sections: tuple[object, object, object],
+    *,
+    run_name: str,
+) -> tuple[float, str]:
+    """Run a marker-delimited script and time only its body."""
+    preamble_code, timed_code, postamble_code = sections
+    original_stdout = sys.stdout
+    capture = io.StringIO()
+    globals_dict = {
+        "__name__": run_name,
+        "__file__": str(script),
+        "__package__": None,
+        "__cached__": None,
+    }
+    try:
+        sys.stdout = capture
+        exec(preamble_code, globals_dict)
+        start = time.perf_counter()
+        exec(timed_code, globals_dict)
+        elapsed = time.perf_counter() - start
+        exec(postamble_code, globals_dict)
+    finally:
+        sys.stdout = original_stdout
+    return elapsed, capture.getvalue()
 
 
 _FP_NUMBER_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
@@ -346,6 +432,7 @@ def _run_harness_in_process(
         os.environ.update(env)
 
     os.chdir(os.path.dirname(os.path.abspath(script)))
+    sections = _load_script_sections(script)
 
     try:
         with warnings.catch_warnings():
@@ -361,9 +448,16 @@ def _run_harness_in_process(
                     pass
 
             if warmup:
-                sys.stdout = io.StringIO()
                 try:
-                    runpy.run_path(script, run_name="__warmup__")
+                    if sections is None:
+                        sys.stdout = io.StringIO()
+                        runpy.run_path(script, run_name="__warmup__")
+                    else:
+                        _run_timed_script_sections(
+                            script,
+                            sections,
+                            run_name="__warmup__",
+                        )
                 except Exception:
                     pass
                 finally:
@@ -373,17 +467,27 @@ def _run_harness_in_process(
             errors: list[str] = []
             captured_stdout = ""
             for i in range(repeat):
-                sys.stdout = capture = io.StringIO()
                 error = None
-                start = time.perf_counter()
                 try:
-                    runpy.run_path(script, run_name="__main__")
+                    if sections is None:
+                        sys.stdout = capture = io.StringIO()
+                        start = time.perf_counter()
+                        runpy.run_path(script, run_name="__main__")
+                        elapsed = time.perf_counter() - start
+                        stdout = capture.getvalue()
+                    else:
+                        elapsed, stdout = _run_timed_script_sections(
+                            script,
+                            sections,
+                            run_name="__main__",
+                        )
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
-                elapsed = time.perf_counter() - start
+                    elapsed = 0.0
+                    stdout = ""
                 sys.stdout = original_stdout
                 if i == 0:
-                    captured_stdout = capture.getvalue()
+                    captured_stdout = stdout
                 samples.append(elapsed)
                 if error is not None:
                     errors.append(error)

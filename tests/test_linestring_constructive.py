@@ -20,6 +20,22 @@ def _buffer_matches_shapely(gpu_geom, shapely_geom, *, tol: float = 1e-6) -> boo
     return sym_diff.area < tol * max(gpu_geom.area, shapely_geom.area, 1e-12)
 
 
+def _buffer_matches_shapely_normalized_exact(
+    gpu_geom,
+    shapely_geom,
+    *,
+    tol: float = 1e-12,
+) -> bool:
+    if gpu_geom is None or shapely_geom is None:
+        return gpu_geom is shapely_geom
+    return bool(
+        shapely.normalize(gpu_geom).equals_exact(
+            shapely.normalize(shapely_geom),
+            tolerance=tol,
+        )
+    )
+
+
 @pytest.mark.gpu
 def test_linestring_buffer_gpu_simple_horizontal_line() -> None:
     if not has_gpu_runtime():
@@ -142,6 +158,35 @@ def test_linestring_buffer_gpu_keeps_metadata_lazy(strict_device_guard) -> None:
     assert isinstance(poly_buf.ring_offsets, cp.ndarray)
 
 
+@pytest.mark.gpu
+def test_linestring_buffer_gpu_scatter_does_not_force_runtime_sync(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+
+    def _fail_sync():
+        raise AssertionError("linestring buffer scatter should not force runtime.synchronize()")
+
+    monkeypatch.setattr(runtime, "synchronize", _fail_sync)
+
+    lines = from_shapely_geometries(
+        [LineString([(0, 0), (10, 0)])],
+        residency=Residency.DEVICE,
+    )
+    gpu = linestring_buffer_owned_array(
+        lines,
+        1.0,
+        quad_segs=4,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert gpu.device_state is not None
+    assert gpu.device_state.families[GeometryFamily.POLYGON].x.size > 0
+
+
 # --- Phase 3: cap/join style variants ---
 
 
@@ -164,6 +209,37 @@ def test_linestring_buffer_gpu_cap_join_combinations(cap_style: str, join_style:
     result = gpu.to_shapely()[0]
     assert _buffer_matches_shapely(result, expected), (
         f"cap={cap_style} join={join_style}: area diff={result.symmetric_difference(expected).area}"
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("join_style", ["round", "mitre", "bevel"])
+def test_linestring_buffer_gpu_square_cap_elbow_matches_shapely_exactly(join_style: str) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    line = LineString([(0, 0), (10, 0), (10, 10)])
+    lines = from_shapely_geometries([line])
+    gpu = linestring_buffer_owned_array(
+        lines,
+        1.0,
+        quad_segs=4,
+        cap_style="square",
+        join_style=join_style,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    expected = shapely.buffer(
+        line,
+        1.0,
+        quad_segs=4,
+        cap_style="square",
+        join_style=join_style,
+    )
+    result = gpu.to_shapely()[0]
+    assert len(result.exterior.coords) == len(expected.exterior.coords)
+    assert _buffer_matches_shapely_normalized_exact(result, expected), (
+        f"cap=square join={join_style}: normalized coords differ"
     )
 
 

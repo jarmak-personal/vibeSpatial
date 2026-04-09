@@ -1,4 +1,4 @@
-"""ADR-0036: cudf.pandas compatibility tests.
+"""ADR-0042: cudf.pandas compatibility tests.
 
 Validates that basic spatial operations work correctly under cudf.pandas proxy.
 Skips entirely if cudf is not available.

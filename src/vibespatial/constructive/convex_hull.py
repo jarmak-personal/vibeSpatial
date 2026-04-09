@@ -481,6 +481,7 @@ def _convex_hull_family_gpu(runtime, device_buf, family, row_count):
             values=d_indices,
             starts=d_seg_starts,
             ends=d_seg_ends,
+            synchronize=False,
         )
         d_sorted_x = sort_result.keys
         d_sorted_y = d_y[sort_result.values]

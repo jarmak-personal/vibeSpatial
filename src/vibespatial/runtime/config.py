@@ -11,10 +11,12 @@ __all__ = [
     "BOUNDS_SPAN_EPSILON",
     "COARSE_BOUNDS_TILE_SIZE",
     "GEOM_EQUALS_DEFAULT_TOLERANCE",
+    "LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD",
     "OVERLAY_BATCH_PIP_GPU_THRESHOLD",
     "OVERLAY_GPU_FAILURE_THRESHOLD",
     "OVERLAY_GPU_REMAINDER_THRESHOLD",
     "OVERLAY_GROUPED_BOX_GPU_THRESHOLD",
+    "OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD",
     "OVERLAY_PAIR_BATCH_THRESHOLD",
     "OVERLAY_UNION_ALL_GPU_THRESHOLD",
     "SEGMENT_TILE_SIZE",
@@ -26,6 +28,12 @@ __all__ = [
 # coordinate equality, collinearity, zero-span guards, and boundary
 # classification in the current GPU/CPU kernels.
 SPATIAL_EPSILON = 1e-12
+
+# The generic linestring buffer crossover is intentionally conservative because
+# multi-vertex linestring buffering is still more host-competitive at small
+# sizes. Simple two-point segment workloads are materially cheaper on the GPU
+# and need their own lower threshold to keep grid/network pipelines off the CPU.
+LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD = 512
 
 # Span guards use the same numeric floor today but keep a distinct name
 # so Morton/grid normalization can diverge later without code search.
@@ -51,6 +59,10 @@ OVERLAY_BATCH_PIP_GPU_THRESHOLD = 100
 # Coverage-style grouped box union stays on the CPU below this row count;
 # above it the grouped GPU box path changes the runtime shape materially.
 OVERLAY_GROUPED_BOX_GPU_THRESHOLD = 50_000
+
+# Shared-edge grouped coverage dissolve has a larger fixed setup cost than the
+# box fast path and only changes throughput once the grouped workload is large.
+OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD = 50_000
 
 # Small grouped union-all reductions are cheaper through the direct CPU path.
 OVERLAY_UNION_ALL_GPU_THRESHOLD = 50

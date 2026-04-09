@@ -5,7 +5,7 @@ Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggrega
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 74/220 lines
+Body Budget: 75/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
@@ -17,9 +17,9 @@ Section Map (Body Lines)
 | 17-23 | Open First |
 | 24-28 | Verify |
 | 29-34 | Risks |
-| 35-43 | Decision |
-| 44-52 | Pipeline |
-| 53-74 | Performance Notes |
+| 35-44 | Decision |
+| 45-53 | Pipeline |
+| 54-75 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -59,7 +59,8 @@ iteration.
 - Encode dissolve groups once and preserve stable per-group row order.
 - Keep attribute aggregation and geometry union as separate stages.
 - Use grouped union as the canonical geometry stage for `GeoDataFrame.dissolve`.
-- Treat pandas aggregation semantics as the public contract boundary.
+- Build a native grouped constructive result first, then export to GeoPandas at
+  the explicit public boundary.
 - Favor CCCL-style building blocks: stable sort, run-length encode, reduce-by-key,
   compaction, and scatter/gather.
 

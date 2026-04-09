@@ -120,13 +120,6 @@ def _containment_bypass_gpu(
     if right.row_count != 1:
         return None, None
 
-    clip_eligible, _clip_vert_count = _is_clip_polygon_sh_eligible(right)
-    if not clip_eligible:
-        # All-vertex containment is only a correct bypass for convex clip
-        # polygons. Concave masks can contain every vertex of the subject
-        # while still having an edge cross outside the clip polygon.
-        return None, None
-
     # Supported operations: intersection, difference.
     # - intersection: contained -> pass-through, disjoint -> skip (empty)
     # - difference: contained -> empty (L-R=nothing), disjoint -> pass-through (L-R=L)
@@ -176,12 +169,20 @@ def _containment_bypass_gpu(
 
     # Ensure left has per-row device bounds.
     if left_state.row_bounds is None:
-        _compute_geometry_bounds_gpu_impl(left, compute_type="double")
+        _compute_geometry_bounds_gpu_impl(
+            left,
+            compute_type="double",
+            materialize_host=False,
+        )
     d_left_bounds = left_state.row_bounds  # shape (n_left, 4), fp64
 
     # Compute corridor bounds (single row).
     if right_state.row_bounds is None:
-        _compute_geometry_bounds_gpu_impl(right, compute_type="double")
+        _compute_geometry_bounds_gpu_impl(
+            right,
+            compute_type="double",
+            materialize_host=False,
+        )
     d_right_bounds = right_state.row_bounds  # shape (1, 4), fp64
 
     # CuPy element-wise bbox containment (Tier 2).

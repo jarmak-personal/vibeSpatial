@@ -168,6 +168,58 @@ class TestSpatialOverlayUnion:
         assert abs(total_area - expected.area) < 1e-10
 
 
+@pytest.mark.gpu
+@pytest.mark.parametrize("how", ["intersection", "union"])
+def test_grouped_overlay_batches_row_isolated_plan_once(
+    monkeypatch: pytest.MonkeyPatch,
+    how: str,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.overlay import gpu as overlay_gpu
+
+    left = from_shapely_geometries(
+        [
+            box(0, 0, 3, 3),
+            box(4, 0, 7, 3),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 0, 2, 3),
+            box(2, 0, 5, 3),
+            box(5, 0, 6, 3),
+        ]
+    )
+
+    original_build = overlay_gpu._build_overlay_execution_plan
+    build_calls: list[dict[str, int | bool]] = []
+
+    def _wrapped_build(*args, **kwargs):
+        build_calls.append(
+            {
+                "left_rows": args[0].row_count,
+                "right_rows": args[1].row_count,
+                "row_isolated": bool(kwargs.get("_row_isolated", False)),
+            }
+        )
+        return original_build(*args, **kwargs)
+
+    monkeypatch.setattr(overlay_gpu, "_build_overlay_execution_plan", _wrapped_build)
+
+    result = spatial_overlay_owned(left, right, how=how, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.row_count == 4
+    assert build_calls == [
+        {
+            "left_rows": 4,
+            "right_rows": 4,
+            "row_isolated": True,
+        }
+    ]
+
+
 class TestSpatialOverlaySymmetricDifference:
     """Symmetric difference overlay tests."""
 

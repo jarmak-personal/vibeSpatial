@@ -686,8 +686,6 @@ def decode_wkb_device_pipeline(
     """
     import cupy as cp
 
-    runtime = get_cuda_runtime()
-
     if record_count == 0:
         validity = cp.zeros(0, dtype=cp.bool_)
         return _build_device_single_family_owned(
@@ -749,9 +747,6 @@ def decode_wkb_device_pipeline(
             family_buffers[family] = _decode_multipolygon_family(
                 payload_device, record_offsets_device, row_indexes,
             )
-
-    # Sync once before reading results to host (Stage 5 assembly reads host arrays)
-    runtime.synchronize()
 
     # Stage 5: Assembly
     families_present = list(family_buffers.keys())

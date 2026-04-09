@@ -372,7 +372,8 @@ def materialize_candidates_vectorized(
     owned: OwnedGeometryArray,
     candidate_rows: np.ndarray,
 ) -> np.ndarray:
-    from vibespatial.geometry.owned import TAG_FAMILIES, _materialize_family_row
+    from vibespatial.geometry.host_bridge import materialize_family_row
+    from vibespatial.geometry.owned import TAG_FAMILIES
 
     if candidate_rows.size == 0:
         return np.empty(0, dtype=object)
@@ -446,7 +447,7 @@ def materialize_candidates_vectorized(
         family = TAG_FAMILIES[int(owned.tags[i])]
         buf = owned.families[family]
         local_row = int(owned.family_row_offsets[i])
-        candidate_geoms.append(_materialize_family_row(buf, local_row))
+        candidate_geoms.append(materialize_family_row(buf, local_row))
     return np.asarray(candidate_geoms, dtype=object)
 
 

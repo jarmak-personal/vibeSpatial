@@ -6,10 +6,14 @@ import numpy as np
 
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+from vibespatial.kernels.core.geometry_analysis import (
+    compute_geometry_bounds,
+    compute_geometry_bounds_device,
+)
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import Residency
 
 from .indexing import build_flat_spatial_index, generate_bounds_pairs
 from .nearest import (  # noqa: F401
@@ -486,10 +490,22 @@ def query_spatial_index(
     # Compute bounds for candidate generation.  If we already extracted
     # Shapely bounds earlier (no _to_owned needed), reuse them.
     # Otherwise compute from the owned geometry array.
+    query_bounds_on_device = False
     if _shapely_query_bounds is not None:
         query_bounds = _shapely_query_bounds
     else:
-        query_bounds = compute_geometry_bounds(query_owned, dispatch_mode=_gpu_bounds_dispatch_mode(query_owned))
+        if (
+            predicate == "dwithin"
+            and query_owned.residency is Residency.DEVICE
+            and has_gpu_runtime()
+        ):
+            query_bounds = compute_geometry_bounds_device(query_owned)
+            query_bounds_on_device = True
+        else:
+            query_bounds = compute_geometry_bounds(
+                query_owned,
+                dispatch_mode=_gpu_bounds_dispatch_mode(query_owned),
+            )
     tree_bounds = flat_index.bounds
     query_size = len(query_values) if query_values is not None else query_owned.row_count
 
@@ -519,8 +535,23 @@ def query_spatial_index(
             gpu_candidate_gen = True
             left_idx = None
             right_idx = None
+        elif query_bounds_on_device and _dwithin_exec.selected is ExecutionMode.GPU:
+            left_idx = np.empty(0, dtype=np.int32)
+            right_idx = np.empty(0, dtype=np.int32)
         else:
-            left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)
+            host_query_bounds = (
+                compute_geometry_bounds(
+                    query_owned,
+                    dispatch_mode=_gpu_bounds_dispatch_mode(query_owned),
+                )
+                if query_bounds_on_device
+                else query_bounds
+            )
+            left_idx, right_idx = _generate_distance_pairs(
+                host_query_bounds,
+                tree_bounds,
+                per_row_distance,
+            )
 
         # Try GPU dwithin refinement first.
         # When return_device is requested, ask _dwithin_refine_gpu to keep

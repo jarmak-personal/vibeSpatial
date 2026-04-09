@@ -169,6 +169,60 @@ class TestUnionAllGPU:
 
         assert _geom_equiv(result_geom, expected)
 
+    def test_union_all_spatially_localizes_polygon_inputs(self, monkeypatch):
+        """Polygon union should apply spatial-local ordering before tree reduction."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        polys = [box(i, 0, i + 2, 2) for i in range(4)]
+        owned = from_shapely_geometries(polys)
+        called: dict[str, int] = {}
+
+        original = union_all_module._spatially_localize_polygon_union_inputs
+
+        def _wrapped(owned_input):
+            called["rows"] = owned_input.row_count
+            return original(owned_input)
+
+        monkeypatch.setattr(
+            union_all_module,
+            "_spatially_localize_polygon_union_inputs",
+            _wrapped,
+        )
+
+        result = union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+
+        assert called == {"rows": 4}
+        assert result.row_count == 1
+
+    def test_tree_reduce_batches_rounds(self, monkeypatch):
+        """Tree reduction should issue one batched pairwise call per reduction round."""
+        from vibespatial.constructive import union_all as union_all_module
+        from vibespatial.constructive.binary_constructive import (
+            binary_constructive_owned as original_binary_constructive_owned,
+        )
+
+        call_rows: list[tuple[int, int]] = []
+
+        def _wrapped_binary_constructive_owned(op, left, right, **kwargs):
+            call_rows.append((left.row_count, right.row_count))
+            return original_binary_constructive_owned(op, left, right, **kwargs)
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.binary_constructive.binary_constructive_owned",
+            _wrapped_binary_constructive_owned,
+        )
+
+        polys = [box(i, 0, i + 2, 2) for i in range(8)]
+        owned = from_shapely_geometries(polys)
+        result = union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+
+        arr = np.empty(len(polys), dtype=object)
+        arr[:] = polys
+        expected = shapely.union_all(arr)
+
+        assert _geom_equiv(_to_shapely(result), expected)
+        assert call_rows == [(4, 4), (2, 2), (1, 1)]
+
     def test_odd_count_polygons(self):
         """Odd number of polygons (tests carry-forward of unpaired element)."""
         from vibespatial.constructive.union_all import union_all_gpu_owned
@@ -183,6 +237,35 @@ class TestUnionAllGPU:
         expected = shapely.union_all(arr)
 
         assert _geom_equiv(result_geom, expected)
+
+    def test_tree_reduce_carries_odd_row_between_rounds(self, monkeypatch):
+        """Odd-count reduction should carry the tail row without exploding into per-row calls."""
+        from vibespatial.constructive import union_all as union_all_module
+        from vibespatial.constructive.binary_constructive import (
+            binary_constructive_owned as original_binary_constructive_owned,
+        )
+
+        call_rows: list[tuple[int, int]] = []
+
+        def _wrapped_binary_constructive_owned(op, left, right, **kwargs):
+            call_rows.append((left.row_count, right.row_count))
+            return original_binary_constructive_owned(op, left, right, **kwargs)
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.binary_constructive.binary_constructive_owned",
+            _wrapped_binary_constructive_owned,
+        )
+
+        polys = [box(i, 0, i + 2, 2) for i in range(5)]
+        owned = from_shapely_geometries(polys)
+        result = union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+
+        arr = np.empty(len(polys), dtype=object)
+        arr[:] = polys
+        expected = shapely.union_all(arr)
+
+        assert _geom_equiv(_to_shapely(result), expected)
+        assert call_rows == [(2, 2), (1, 1), (1, 1)]
 
     def test_multipolygon_assembly_stays_device_resident(self, strict_device_guard):
         """Single-row union assembly helper should keep routing metadata on device."""

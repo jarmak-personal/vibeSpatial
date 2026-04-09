@@ -33,14 +33,12 @@ from vibespatial.cuda.cccl_primitives import (
     exclusive_sum,
     segmented_reduce_sum,
     sort_pairs,
-    unique_sorted_pairs,
 )
 
 request_warmup([
     "exclusive_scan_i32", "exclusive_scan_i64",
     "select_i32", "select_i64",
     "radix_sort_i32_i32", "radix_sort_u64_i32",
-    "unique_by_key_i32_i32", "unique_by_key_u64_i32",
     "segmented_reduce_sum_f64",
 ])
 from vibespatial.cuda._runtime import (  # noqa: E402
@@ -226,7 +224,9 @@ def _gpu_remove_duplicate_vertices(
     d_starts = d_ring_offsets[:-1]
     d_ends = d_ring_offsets[1:]
     seg_result = segmented_reduce_sum(
-        d_keep_i32, d_starts, d_ends, num_segments=ring_count,
+        d_keep_i32, d_starts, d_ends,
+        num_segments=ring_count,
+        synchronize=False,
     )
     d_new_sizes = seg_result.values.astype(cp.int32)
     d_new_offsets = cp.zeros(ring_count + 1, dtype=cp.int32)
@@ -286,7 +286,9 @@ def _gpu_fix_ring_orientation(
     d_starts = d_ring_offsets[:-1]
     d_ends = d_ring_offsets[1:]
     seg_result = segmented_reduce_sum(
-        d_cross, d_starts, d_ends, num_segments=ring_count,
+        d_cross, d_starts, d_ends,
+        num_segments=ring_count,
+        synchronize=False,
     )
     d_ring_areas = seg_result.values * 0.5
 
@@ -546,7 +548,7 @@ def _split_self_intersections_gpu(
         ),
     )
 
-    d_event_offsets = exclusive_sum(d_event_counts)
+    d_event_offsets = exclusive_sum(d_event_counts, synchronize=False)
     total_events = count_scatter_total(runtime, d_event_counts, d_event_offsets)
     if total_events == 0:
         return d_x, d_y, d_ring_offsets, False
@@ -576,13 +578,10 @@ def _split_self_intersections_gpu(
         ),
     )
 
-    # Sort events by (segment_id, t) via packed key
-    sorted_result = sort_pairs(d_out_key, d_out_seg_ids)
-    d_sorted_keys = sorted_result.keys
-
-    # Gather sorted t, x, y using the sorted order
+    # Sort once, keep the permutation, and gather all payload columns from it.
     d_indices = cp.arange(total_events, dtype=cp.int32)
-    idx_sort = sort_pairs(d_out_key, d_indices)
+    idx_sort = sort_pairs(d_out_key, d_indices, synchronize=False)
+    d_sorted_keys = idx_sort.keys
     d_perm = idx_sort.values
     d_perm_i64 = d_perm.astype(cp.int64)
 
@@ -591,15 +590,13 @@ def _split_self_intersections_gpu(
     d_sorted_x = d_out_x[d_perm_i64]
     d_sorted_y = d_out_y[d_perm_i64]
 
-    # --- Phase 9: GPU-resident dedup (CuPy mask instead of host loop) ---
+    # --- Phase 9: GPU-resident dedup by first-occurrence mask ---
     if total_events > 1:
-        unique_result = unique_sorted_pairs(d_sorted_keys, d_sorted_seg_ids)
-        unique_count = unique_result.count
+        d_mask = cp.ones(total_events, dtype=cp.bool_)
+        d_mask[1:] = d_sorted_keys[1:] != d_sorted_keys[:-1]
+        keep_idx = cp.flatnonzero(d_mask).astype(cp.int64)
+        unique_count = int(keep_idx.size)
         if unique_count < total_events:
-            # CuPy device-side mask: keep first occurrence of each key
-            d_mask = cp.ones(total_events, dtype=cp.bool_)
-            d_mask[1:] = d_sorted_keys[1:] != d_sorted_keys[:-1]
-            keep_idx = cp.flatnonzero(d_mask).astype(cp.int64)
             d_sorted_seg_ids = d_sorted_seg_ids[keep_idx]
             d_sorted_t = d_sorted_t[keep_idx]
             d_sorted_x = d_sorted_x[keep_idx]
@@ -613,12 +610,12 @@ def _split_self_intersections_gpu(
     d_seg_split_counts = cp.bincount(
         d_sorted_seg_ids, minlength=total_segments
     ).astype(cp.int32)
-    d_seg_split_offsets = exclusive_sum(d_seg_split_counts)
+    d_seg_split_offsets = exclusive_sum(d_seg_split_counts, synchronize=False)
 
     # --- Phase 9: GPU-resident ring size computation ---
     # ring_seg_offsets and ring_seg_counts via device ops
     d_ring_seg_counts = cp.bincount(d_seg_ring_ids, minlength=ring_count).astype(cp.int32)
-    d_ring_seg_offsets = exclusive_sum(d_ring_seg_counts)
+    d_ring_seg_offsets = exclusive_sum(d_ring_seg_counts, synchronize=False)
 
     # Per-ring extra splits = sum of seg_split_counts for segments in that ring
     # Use segmented_reduce_sum on d_seg_split_counts grouped by ring
@@ -628,6 +625,7 @@ def _split_self_intersections_gpu(
         d_seg_split_counts.astype(cp.float64),
         d_seg_starts, d_seg_ends,
         num_segments=ring_count,
+        synchronize=False,
     )
     d_extra_per_ring = seg_extra_result.values.astype(cp.int32)
 

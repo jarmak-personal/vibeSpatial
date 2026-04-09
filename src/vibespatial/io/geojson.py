@@ -1311,7 +1311,12 @@ def _read_geojson_owned_tokenizer(text: str) -> GeoJSONOwnedBatch:
     return _owned_batch_from_features(features)
 
 
-def read_geojson_owned(source: str | Path, *, prefer: str = "auto") -> GeoJSONOwnedBatch:
+def read_geojson_owned(
+    source: str | Path,
+    *,
+    prefer: str = "auto",
+    track_properties: bool = True,
+) -> GeoJSONOwnedBatch:
     plan = plan_geojson_ingest(prefer=prefer)
     if plan.selected_strategy == "gpu-byte-classify":
         from .geojson_gpu import read_geojson_gpu
@@ -1324,7 +1329,10 @@ def read_geojson_owned(source: str | Path, *, prefer: str = "auto") -> GeoJSONOw
         )
         resolved = Path(source) if not isinstance(source, Path) else source
         try:
-            result = read_geojson_gpu(resolved)
+            result = read_geojson_gpu(
+                resolved,
+                capture_feature_boundaries=track_properties,
+            )
             return GeoJSONOwnedBatch(
                 geometry=result.owned,
                 _properties_loader=result.properties_loader(),

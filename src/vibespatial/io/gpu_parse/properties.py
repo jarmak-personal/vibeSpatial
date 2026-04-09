@@ -48,9 +48,7 @@ from vibespatial.io.gpu_parse.numeric import (
     parse_ascii_floats,
 )
 from vibespatial.io.gpu_parse.pattern import (
-    mark_spans,
     pattern_match,
-    span_boundaries,
 )
 from vibespatial.io.gpu_parse.properties_kernels import (
     _CLASSIFY_VALUE_NAMES,
@@ -193,12 +191,12 @@ def _find_property_keys(
     d_depth: cp.ndarray,
     key_name: str,
     *,
-    property_depth: int = 5,
+    property_depth: int = 4,
 ) -> cp.ndarray:
     """Find positions of a specific property key at the correct depth.
 
-    For GeoJSON FeatureCollection documents, property keys are at depth 5:
-    FeatureCollection{1} > features[2] > Feature{3} > properties{4} > key{5}.
+    For GeoJSON FeatureCollection documents, property keys are at depth 4:
+    FeatureCollection{1} > features[2] > Feature{3} > properties{4}.
 
     Parameters
     ----------
@@ -211,7 +209,7 @@ def _find_property_keys(
     key_name : str
         The property key to search for (without quotes/colon).
     property_depth : int
-        The bracket depth at which property keys appear.  Default 5
+        The bracket depth at which property keys appear.  Default 4
         for standard GeoJSON FeatureCollection.
 
     Returns
@@ -304,50 +302,42 @@ def _extract_numeric_column(
     d_bytes: cp.ndarray,
     d_quote_parity: cp.ndarray,
     d_colon_positions: cp.ndarray,
-    d_depth: cp.ndarray,
-    n_features: int,
 ) -> cp.ndarray:
     """Extract a float64 value for each feature from a numeric property column.
 
-    Uses span_boundaries to find the extent of each numeric value,
-    then property_number_boundaries + parse_ascii_floats within those spans.
+    Numeric property values are scalars. After locating each property's
+    colon, take the first numeric token that starts after that position.
+    This avoids widening the scan to sibling properties or geometry payloads.
 
     Returns
     -------
     cp.ndarray
-        Device-resident float64 array of shape ``(n_features,)``.
+        Device-resident float64 array of shape ``(len(d_colon_positions),)``.
     """
-    n_bytes = d_bytes.shape[0]
+    if d_colon_positions.shape[0] == 0:
+        return cp.empty(0, dtype=cp.float64)
 
-    # Find span end for each value (from colon to next structural delimiter).
-    # skip_bytes=1 to skip past the colon itself.
-    d_span_ends = span_boundaries(
-        d_depth, d_colon_positions, n_bytes, skip_bytes=1,
-    )
-
-    # Create a region mask covering the value spans
-    d_value_starts = d_colon_positions + 1
-    d_mask = mark_spans(d_value_starts, d_span_ends, n_bytes)
-
-    # Detect number boundaries within those spans.
-    # Uses property-specific kernel that includes ':' as a start separator
-    # and '}' as an end separator (the generic kernel misses "key":42 patterns).
+    # Detect numeric boundaries across the full file.
+    # The property-specific kernel includes ':' as a start separator and
+    # '}' as an end separator so JSON properties like ``"population":42``
+    # are recognized correctly.
     d_is_start, d_is_end = _property_number_boundaries(d_bytes, d_quote_parity)
-    d_num_starts, d_num_ends = extract_number_positions(
-        d_is_start, d_is_end, d_mask,
+    d_num_starts, d_num_ends = extract_number_positions(d_is_start, d_is_end)
+    if d_num_starts.shape[0] == 0:
+        return cp.empty(0, dtype=cp.float64)
+
+    d_lookup = cp.searchsorted(
+        d_num_starts,
+        d_colon_positions + 1,
+        side="left",
     )
+    d_valid = d_lookup < d_num_starts.shape[0]
+    if not bool(cp.any(d_valid)):
+        return cp.empty(0, dtype=cp.float64)
 
-    # Parse the numbers
-    d_values = parse_ascii_floats(d_bytes, d_num_starts, d_num_ends)
-
-    # We expect exactly one number per feature.  If there are fewer
-    # (e.g., some features have null for this key), the caller handles
-    # alignment via the per-feature mask.  If there are more (shouldn't
-    # happen for scalar properties), take only the first n_features.
-    if d_values.shape[0] > n_features:
-        d_values = d_values[:n_features]
-
-    return d_values
+    d_selected_starts = d_num_starts[d_lookup[d_valid]]
+    d_selected_ends = d_num_ends[d_lookup[d_valid]]
+    return parse_ascii_floats(d_bytes, d_selected_starts, d_selected_ends)
 
 
 def _extract_boolean_column(
@@ -401,7 +391,7 @@ def infer_property_schema(
     d_feature_ends: cp.ndarray,
     *,
     sample_size: int = 100,
-    property_depth: int = 5,
+    property_depth: int = 4,
 ) -> dict[str, int]:
     """Infer property names and their types from a sample of features.
 
@@ -427,7 +417,7 @@ def infer_property_schema(
     sample_size : int
         Number of features to sample for schema detection.
     property_depth : int
-        Bracket depth of property keys (default 5 for GeoJSON).
+        Bracket depth of property keys (default 4 for GeoJSON).
 
     Returns
     -------
@@ -436,86 +426,47 @@ def infer_property_schema(
         String columns are included (VTYPE_STRING) so the caller knows
         which columns need CPU fallback.
     """
+    from vibespatial.io.geojson import _fast_json_loads
+
     n_features = d_feature_starts.shape[0]
     n_sample = min(sample_size, n_features)
 
     if n_sample == 0:
         return {}
 
-    # Restrict scanning to the first n_sample features.
-    # Create a byte mask covering the sample feature spans.
-    d_sample_starts = d_feature_starts[:n_sample]
-    d_sample_ends = d_feature_ends[:n_sample]
-    # Find all bytes at property_depth that are opening quotes of keys.
-    # Property keys in JSON are strings at the right depth.
-    # Strategy: find all '"' bytes that are outside strings (qp==0),
-    # at the correct depth, and preceded by '{', ',', or whitespace.
-    # We detect key-colon patterns: look for '":' sequences at the
-    # right depth within the sample region.
-
-    # Simpler approach: scan the sample bytes on host.
-    # The sample is tiny (first 100 features, maybe ~10KB), so this
-    # D->H transfer is acceptable per the bead specification.
-    sample_end_byte = int(d_sample_ends[n_sample - 1].item())
-    sample_start_byte = int(d_sample_starts[0].item())
-
-    # Transfer only the sample region to host
+    # Restrict parsing to the sampled feature spans. Parsing the feature
+    # payloads on host is acceptable at this scale and correctly isolates
+    # keys inside ``properties`` from sibling geometry keys like ``type``.
+    h_starts = cp.asnumpy(d_feature_starts[:n_sample]).astype(np.int64, copy=False)
+    h_ends = cp.asnumpy(d_feature_ends[:n_sample]).astype(np.int64, copy=False)
+    sample_start_byte = int(h_starts[0])
+    sample_end_byte = int(h_ends[-1])
     h_bytes = cp.asnumpy(d_bytes[sample_start_byte:sample_end_byte])
-    h_qp = cp.asnumpy(d_quote_parity[sample_start_byte:sample_end_byte])
-    h_depth = cp.asnumpy(d_depth[sample_start_byte:sample_end_byte])
 
-    # Walk the sample bytes to find property key names
     schema: dict[str, int] = {}
-    local_len = len(h_bytes)
-    i = 0
-    while i < local_len:
-        b = h_bytes[i]
-        d = h_depth[i]
-        qp = h_qp[i]
-
-        # Look for opening quote of a key at the right depth, outside strings
-        if b == ord('"') and qp == 1 and d == property_depth:
-            # Find the closing quote
-            j = i + 1
-            while j < local_len and h_bytes[j] != ord('"'):
-                j += 1
-            if j >= local_len:
-                break
-
-            key_name = h_bytes[i + 1:j].tobytes().decode("ascii", errors="replace")
-
-            # Find the colon after the closing quote
-            k = j + 1
-            while k < local_len and h_bytes[k] in (ord(' '), ord('\t'), ord('\n'), ord('\r')):
-                k += 1
-
-            if k < local_len and h_bytes[k] == ord(':'):
-                # Classify the value after the colon
-                v = k + 1
-                while v < local_len and h_bytes[v] in (ord(' '), ord('\t'), ord('\n'), ord('\r')):
-                    v += 1
-
-                if v < local_len:
-                    vc = h_bytes[v]
-                    if vc == ord('"'):
-                        vtype = VTYPE_STRING
-                    elif vc == ord('t') or vc == ord('f'):
-                        vtype = VTYPE_BOOLEAN
-                    elif vc == ord('n'):
-                        vtype = VTYPE_NULL
-                    elif (vc >= ord('0') and vc <= ord('9')) or vc == ord('-'):
-                        vtype = VTYPE_NUMBER
-                    elif vc == ord('[') or vc == ord('{'):
-                        vtype = VTYPE_COMPLEX
-                    else:
-                        vtype = -1
-
-                    if vtype >= 0 and key_name not in schema:
-                        schema[key_name] = vtype
-
-            i = j + 1
-        else:
-            i += 1
+    for start, end in zip(h_starts, h_ends, strict=True):
+        rel_start = int(start - sample_start_byte)
+        rel_end = int(end - sample_start_byte)
+        try:
+            feature = _fast_json_loads(h_bytes[rel_start:rel_end].tobytes())
+        except Exception:
+            continue
+        properties = feature.get("properties") if isinstance(feature, dict) else None
+        if not isinstance(properties, dict):
+            continue
+        for key_name, value in properties.items():
+            if key_name in schema:
+                continue
+            if isinstance(value, str):
+                schema[key_name] = VTYPE_STRING
+            elif isinstance(value, bool):
+                schema[key_name] = VTYPE_BOOLEAN
+            elif value is None:
+                schema[key_name] = VTYPE_NULL
+            elif isinstance(value, int | float):
+                schema[key_name] = VTYPE_NUMBER
+            elif isinstance(value, list | dict):
+                schema[key_name] = VTYPE_COMPLEX
 
     return schema
 
@@ -531,7 +482,7 @@ def extract_gpu_properties(
     d_quote_parity: cp.ndarray,
     d_depth: cp.ndarray,
     *,
-    property_depth: int = 5,
+    property_depth: int = 4,
     sample_size: int = 100,
 ) -> dict[str, cp.ndarray]:
     """Extract numeric/boolean properties on GPU.
@@ -552,7 +503,7 @@ def extract_gpu_properties(
     d_depth : cp.ndarray
         Device-resident int32 bracket depth array.
     property_depth : int
-        Bracket depth of property keys (default 5 for GeoJSON).
+        Bracket depth of property keys (default 4 for GeoJSON).
     sample_size : int
         Number of features to sample for schema inference.
 
@@ -625,8 +576,9 @@ def extract_gpu_properties(
             d_numeric_colon_pos = d_colon_pos[d_is_numeric]
 
             d_values = _extract_numeric_column(
-                d_bytes, d_quote_parity, d_numeric_colon_pos,
-                d_depth, n_numeric,
+                d_bytes,
+                d_quote_parity,
+                d_numeric_colon_pos,
             )
 
             if n_found == n_features and n_numeric == n_features:

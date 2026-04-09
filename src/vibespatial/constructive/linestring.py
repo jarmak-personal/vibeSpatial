@@ -52,6 +52,60 @@ _CAP_STYLE_MAP = {"round": 0, "flat": 1, "square": 2}
 _JOIN_STYLE_MAP = {"round": 0, "mitre": 1, "bevel": 2}
 
 
+def supports_two_point_linestring_buffer_fast_path(
+    lines: OwnedGeometryArray,
+    *,
+    quad_segs: int,
+    cap_style: str,
+    join_style: str,
+    single_sided: bool,
+) -> bool:
+    """Return True when every row is a simple two-point linestring.
+
+    The general GPU linestring buffer path is not yet competitive on small AUTO
+    workloads, but the exact two-point segment case used by the network/grid
+    shootouts is. Recognizing that shape lets the public buffer surface stay on
+    GPU without forcing broader multi-vertex linestring workloads down the same
+    path.
+    """
+
+    if (
+        single_sided
+        or quad_segs < 1
+        or cap_style != "round"
+        or join_style != "round"
+        or GeometryFamily.LINESTRING not in lines.families
+        or len(lines.families) != 1
+        or not np.all(lines.validity)
+    ):
+        return False
+
+    line_buffer = lines.families[GeometryFamily.LINESTRING]
+    if line_buffer.host_materialized:
+        if np.any(line_buffer.empty_mask):
+            return False
+        offsets = np.asarray(line_buffer.geometry_offsets, dtype=np.int32)
+        return bool(
+            offsets.shape == (lines.row_count + 1,)
+            and np.all((offsets[1:] - offsets[:-1]) == 2)
+        )
+
+    state = lines.device_state
+    if cp is None or state is None or GeometryFamily.LINESTRING not in state.families:
+        return False
+
+    try:
+        device_line_buffer = state.families[GeometryFamily.LINESTRING]
+        if bool(cp.any(device_line_buffer.empty_mask).item()):
+            return False
+        offsets = cp.asarray(device_line_buffer.geometry_offsets)
+        if int(offsets.size) != lines.row_count + 1:
+            return False
+        return bool(cp.all((offsets[1:] - offsets[:-1]) == 2).item())
+    except Exception:
+        return False
+
+
 def linestring_buffer_owned_array(
     lines: OwnedGeometryArray,
     distance: float | np.ndarray,
@@ -226,7 +280,6 @@ def _build_linestring_buffers_gpu(
         scatter_grid, scatter_block = runtime.launch_config(kernels["linestring_buffer_scatter"], lines.row_count)
         runtime.launch(kernels["linestring_buffer_scatter"],
                        grid=scatter_grid, block=scatter_block, params=scatter_params)
-        runtime.synchronize()
 
         d_geometry_offsets = cp.arange(lines.row_count + 1, dtype=cp.int32)
         d_ring_offsets = cp.empty(lines.row_count + 1, dtype=cp.int32)

@@ -6,22 +6,22 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import shapely
 from pandas import Series
 from pandas.core.internals import SingleBlockManager
-
-import shapely
 from shapely.geometry import GeometryCollection
 from shapely.geometry.base import BaseGeometry
 
 import vibespatial.api as geopandas
-from vibespatial.api.geo_base import GeoPandasBase, _delegate_property
-from vibespatial.api.explore import _explore_geoseries
-from vibespatial.api.plotting import plot_series
-
-from . import _compat as compat
 from vibespatial.api._decorator import doc
+from vibespatial.api.explore import _explore_geoseries
+from vibespatial.api.geo_base import (
+    GeoPandasBase,
+    _delegate_property,
+    _is_geometry_like_dtype,
+    is_geometry_type,
+)
 from vibespatial.api.geometry_array import (
-    GeometryDtype,
     from_shapely,
     from_wkb,
     from_wkt,
@@ -29,7 +29,9 @@ from vibespatial.api.geometry_array import (
     to_wkb,
     to_wkt,
 )
-from vibespatial.api.geo_base import _is_geometry_like_dtype, is_geometry_type
+from vibespatial.api.plotting import plot_series
+
+from . import _compat as compat
 
 if typing.TYPE_CHECKING:
     import os
@@ -42,7 +44,7 @@ def _geoseries_constructor_with_fallback(
     """A flexible constructor for GeoSeries._constructor, which needs to be able
     to fall back to a Series (if a certain operation does not produce
     geometries).
-    """  # noqa: D401
+    """
     try:
         return GeoSeries(data=data, index=index, crs=crs, **kwargs)
     except TypeError:
@@ -153,6 +155,12 @@ class GeoSeries(GeoPandasBase, Series):
     """
 
     def __init__(self, data=None, index=None, crs: Any | None = None, **kwargs):
+        source_provenance = None
+        if hasattr(data, "_provenance"):
+            source_provenance = data._provenance
+        elif isinstance(data, Series) and hasattr(data, "values") and hasattr(data.values, "_provenance"):
+            source_provenance = data.values._provenance
+
         if (
             hasattr(data, "crs")
             or (isinstance(data, pd.Series) and hasattr(data.array, "crs"))
@@ -219,17 +227,22 @@ class GeoSeries(GeoPandasBase, Series):
             # try to convert to GeometryArray
             try:
                 data = from_shapely(data, crs)
-            except TypeError:
+            except TypeError as err:
                 raise TypeError(
                     "Non geometry data passed to GeoSeries constructor, "
                     f"received data of dtype '{s.dtype}'"
-                )
+                ) from err
             index = s.index
             name = s.name
 
         super().__init__(data, index=index, name=name, **kwargs)
         if not self.crs:
             self.crs = crs
+        if source_provenance is not None:
+            try:
+                self.geometry.values._provenance = source_provenance
+            except Exception:
+                pass
 
     @GeoPandasBase.crs.setter
     def crs(self, value):

@@ -20,6 +20,7 @@ from .nonpolygon_binary import (
 )
 from .polygon_difference import polygon_difference
 from .polygon_intersection import polygon_intersection
+from .polygon_rect_intersection import polygon_rect_intersection
 from .segmented_union import segmented_union_all
 from .stroke import offset_curve_kernel, point_buffer_kernel
 
@@ -41,5 +42,6 @@ __all__ = [
     "point_point_union",
     "polygon_difference",
     "polygon_intersection",
+    "polygon_rect_intersection",
     "segmented_union_all",
 ]

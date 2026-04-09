@@ -373,9 +373,7 @@ def test_strict_clip_concave_polygon_mask_drops_bbox_false_positives() -> None:
 
 
 @pytest.mark.gpu
-def test_strict_clip_polygon_mask_uses_many_vs_one_intersection_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_strict_clip_polygon_mask_uses_rectangle_kernel_fast_path() -> None:
     _require_gpu_runtime()
     buildings = vibespatial.GeoDataFrame(
         {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
@@ -398,33 +396,21 @@ def test_strict_clip_polygon_mask_uses_many_vs_one_intersection_fast_path(
         crs="EPSG:3857",
     )
 
-    overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
-
-    called = False
-    original = overlay_module._many_vs_one_intersection_owned
-
-    def _wrapped_many_vs_one(*args, **kwargs):
-        nonlocal called
-        called = True
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        overlay_module,
-        "_many_vs_one_intersection_owned",
-        _wrapped_many_vs_one,
-    )
-
+    vibespatial.clear_dispatch_events()
     with strict_native_environment():
         result = vibespatial.clip(buildings, admin)
+    events = vibespatial.get_dispatch_events(clear=True)
 
-    assert called
     assert len(result) == 2
+    assert any(
+        event.surface == "vibespatial.kernels.constructive.polygon_rect_intersection"
+        and event.selected.value == "gpu"
+        for event in events
+    )
 
 
 @pytest.mark.gpu
-def test_strict_clip_concave_polygon_mask_skips_many_vs_one_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_strict_clip_concave_polygon_mask_keeps_exact_subset_on_gpu() -> None:
     _require_gpu_runtime()
     buildings = vibespatial.GeoDataFrame(
         {"geometry": [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 14.0, 14.0)]},
@@ -449,27 +435,22 @@ def test_strict_clip_concave_polygon_mask_skips_many_vs_one_fast_path(
         crs="EPSG:3857",
     )
 
-    overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
-
-    called = False
-    original = overlay_module._many_vs_one_intersection_owned
-
-    def _wrapped_many_vs_one(*args, **kwargs):
-        nonlocal called
-        called = True
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(
-        overlay_module,
-        "_many_vs_one_intersection_owned",
-        _wrapped_many_vs_one,
-    )
-
+    vibespatial.clear_dispatch_events()
     with strict_native_environment():
         result = vibespatial.clip(buildings, admin)
+    events = vibespatial.get_dispatch_events(clear=True)
 
-    assert not called
     assert len(result) == 1
+    assert any(
+        event.surface == "vibespatial.predicates.binary"
+        and event.operation == "intersects"
+        and event.selected.value == "gpu"
+        for event in events
+    )
+    assert all(
+        getattr(getattr(event, "selected", None), "value", None) != "cpu"
+        for event in events
+    )
 
 
 @pytest.mark.gpu

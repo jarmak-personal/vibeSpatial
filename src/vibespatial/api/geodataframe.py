@@ -7,21 +7,23 @@ from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
+import shapely.errors
 from pandas import DataFrame, Series
 from pandas.api.extensions import ExtensionArray
-
-import shapely.errors
 from shapely.geometry import mapping, shape
 from shapely.geometry.base import BaseGeometry
 
 import vibespatial.api as geopandas
-from vibespatial.api.geo_base import GeoPandasBase, _is_geometry_like_dtype, is_geometry_type
-from vibespatial.api.geometry_array import GeometryArray, from_shapely, to_wkb, to_wkt
-from vibespatial.api.explore import _explore
-from vibespatial.api.geoseries import GeoSeries
 from vibespatial.api._compat import HAS_PYPROJ, PANDAS_GE_30
 from vibespatial.api._decorator import doc
-from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, evaluate_geopandas_lazy_dissolve
+from vibespatial.api.explore import _explore
+from vibespatial.api.geo_base import GeoPandasBase, _is_geometry_like_dtype, is_geometry_type
+from vibespatial.api.geometry_array import GeometryArray, from_shapely, to_wkb, to_wkt
+from vibespatial.api.geoseries import GeoSeries
+from vibespatial.overlay.dissolve import (
+    evaluate_geopandas_dissolve,
+    evaluate_geopandas_lazy_dissolve,
+)
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
 
@@ -37,7 +39,6 @@ if typing.TYPE_CHECKING:
 
     import folium
     import sqlalchemy.text
-
     from pyproj import CRS
 
     from vibespatial.api.io.arrow import (
@@ -214,7 +215,7 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
             # If "geometry" is potentially coercible to geometry, we try and convert it
             geom_dtype = self["geometry"].dtype
             if (
-                geom_dtype == "geometry"  # noqa: PLR1714
+                geom_dtype == "geometry"
                 or getattr(geom_dtype, "name", None) == "device_geometry"
                 or geom_dtype == "object"
                 # special case for geometry = [], has float dtype
@@ -426,8 +427,8 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         else:  # should be a colname
             try:
                 level = frame[col]
-            except KeyError:
-                raise ValueError(f"Unknown column {col}")
+            except KeyError as err:
+                raise ValueError(f"Unknown column {col}") from err
             if isinstance(level, DataFrame):
                 raise ValueError(
                     "GeoDataFrame does not support setting the geometry column where "
@@ -596,12 +597,12 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         """
         try:
             return self.geometry.crs
-        except AttributeError:
+        except AttributeError as err:
             raise AttributeError(
                 "The CRS attribute of a GeoDataFrame without an active "
                 "geometry column is not defined. Use GeoDataFrame.set_geometry "
                 "to set the active geometry column."
-            )
+            ) from err
 
     @property
     def gpu_spatial_index(self):
@@ -1436,7 +1437,7 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
         self,
         path: os.PathLike | typing.IO,
         index: bool | None = None,
-        compression: str = "snappy",
+        compression: str | None = "snappy",
         geometry_encoding: PARQUET_GEOMETRY_ENCODINGS = "WKB",
         write_covering_bbox: bool = False,
         schema_version: SUPPORTED_VERSIONS_LITERAL | None = None,
@@ -2071,7 +2072,7 @@ default 'snappy'
         """A flexible constructor for GeoDataFrame._constructor, which falls back
         to returning a DataFrame (if a certain operation does not preserve the
         geometry column).
-        """  # noqa: D401
+        """
         df = cls(*args, **kwargs)
 
         geometry_cols_mask = df.dtypes.map(_is_geometry_like_dtype)
@@ -2117,7 +2118,7 @@ default 'snappy'
               thus could have a geometry dtype). Therefore, we don't return a
               GeoSeries if we are sure we are in a row selection case (by
               checking the identity of the index)
-            """  # noqa: D401
+            """
             srs = pd.Series(*args, **kwargs)
             is_row_proxy = srs.index.is_(self.columns)
             if is_geometry_type(srs) and not is_row_proxy:
@@ -2137,7 +2138,7 @@ default 'snappy'
         self, other, method: str | None = None, **kwargs
     ) -> GeoDataFrame | GeoSeries:
         """Propagate metadata from other to self."""
-        self = super().__finalize__(other, method=method, **kwargs)  # noqa: PLW0642
+        self = super().__finalize__(other, method=method, **kwargs)
 
         # merge operation: using metadata of the left object
         if method == "merge":
@@ -2306,14 +2307,6 @@ default 'snappy'
         if by is None and level is None:
             by = np.zeros(len(self), dtype="int64")  # type: ignore [assignment]
 
-        record_dispatch_event(
-            surface="geopandas.geodataframe.dissolve",
-            operation="dissolve",
-            implementation="grouped_union_pipeline",
-            reason="route grouped geometry unions through the repo-owned grouped dissolve pipeline",
-            detail=f"rows={len(self)}, method={method}, sort={sort}, observed={observed}",
-            selected=ExecutionMode.CPU,
-        )
         aggregated = evaluate_geopandas_dissolve(
             self,
             by=by,
@@ -2326,6 +2319,21 @@ default 'snappy'
             method=method,
             grid_size=grid_size,
             agg_kwargs=kwargs,
+        )
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        selected = (
+            ExecutionMode.GPU
+            if isinstance(aggregated.geometry.values, DeviceGeometryArray)
+            else ExecutionMode.CPU
+        )
+        record_dispatch_event(
+            surface="geopandas.geodataframe.dissolve",
+            operation="dissolve",
+            implementation="grouped_union_pipeline",
+            reason="route grouped geometry unions through the repo-owned grouped dissolve pipeline",
+            detail=f"rows={len(self)}, method={method}, sort={sort}, observed={observed}",
+            selected=selected,
         )
 
         return aggregated

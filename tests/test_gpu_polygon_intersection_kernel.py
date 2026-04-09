@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Polygon, box
+from shapely.geometry import Point, Polygon, box
 
 from vibespatial.runtime import ExecutionMode
 from vibespatial.testing import build_owned as _make_owned_polygons
@@ -256,6 +256,29 @@ def test_triangle_intersection():
 
     assert len(result_geoms) == 1
     _assert_geom_equal(result_geoms[0], ref_geoms[0], msg="triangle intersection")
+
+
+@requires_gpu
+def test_convex_diamond_overlap_normalizes_without_duplicate_vertices():
+    """Diamond overlaps should not retain duplicate corner vertices after clipping."""
+    left_geoms = [Point(0, 0).buffer(1, quad_segs=2)]
+    right_geoms = [Point(1, 1).buffer(1, quad_segs=2)]
+
+    left = _make_owned_polygons(left_geoms)
+    right = _make_owned_polygons(right_geoms)
+
+    from vibespatial.kernels.constructive.polygon_intersection import polygon_intersection
+
+    result = polygon_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    result_geoms = result.to_shapely()
+    ref_geoms = _shapely_intersection(left_geoms, right_geoms)
+
+    assert len(result_geoms) == 1
+    assert shapely.equals_exact(
+        shapely.normalize(result_geoms[0]),
+        shapely.normalize(ref_geoms[0]),
+        tolerance=0.5 * 10 ** (-6),
+    )
 
 
 # ---------------------------------------------------------------------------

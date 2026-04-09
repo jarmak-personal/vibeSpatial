@@ -90,11 +90,11 @@ class DeviceSpatialJoinResult:
 
 @dataclass(frozen=True)
 class SpatialJoinIndices:
-    """ADR-0036: Typed contract for spatial kernel index-array output.
+    """ADR-0042: Typed contract for low-level spatial kernel index output.
 
-    Spatial kernels produce only index arrays; attribute assembly is always
-    pandas on host.  This frozen dataclass enforces the dtype invariant at
-    construction time.
+    Device-native workflows may carry richer result objects, but the low-level
+    spatial-query seam still uses integer index arrays. This frozen dataclass
+    enforces that dtype invariant at construction time.
     """
 
     left: np.ndarray   # dtype np.intp

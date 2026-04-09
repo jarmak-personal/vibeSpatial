@@ -29,6 +29,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+from vibespatial.runtime.residency import Residency
 from vibespatial.testing import strict_native_environment
 
 # The four constructive operations.
@@ -289,8 +290,8 @@ def test_multirow_polygon_constructive_prefers_contraction_path(
         Point(10, 10).buffer(4),
     ]
     right = [
-        box(-1, -1, 3, 3),
-        box(8, 8, 12, 12),
+        Point(1, 1).buffer(2.5),
+        Point(9.5, 9.5).buffer(2.0),
     ]
     sentinel = from_shapely_geometries([
         box(0, 0, 1, 1),
@@ -301,7 +302,6 @@ def test_multirow_polygon_constructive_prefers_contraction_path(
     right_owned = from_shapely_geometries(right)
 
     contraction_module = importlib.import_module("vibespatial.overlay.contraction")
-
     calls: list[tuple[str, int]] = []
 
     def _fake_contraction(left_arg, right_arg, *, operation: str, dispatch_mode=ExecutionMode.GPU):
@@ -334,8 +334,8 @@ def test_polygon_intersection_tries_rowwise_overlay_after_overlay_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Polygon intersection recovers with rowwise overlay when bulk overlay raises."""
-    left = from_shapely_geometries([box(0, 0, 2, 2), box(4, 4, 6, 6)])
-    right = from_shapely_geometries([box(1, 1, 3, 3), box(4, 4, 5, 5)])
+    left = from_shapely_geometries([Point(0, 0).buffer(2.0), Point(5, 5).buffer(2.0)])
+    right = from_shapely_geometries([Point(1, 0).buffer(1.5), Point(5, 5).buffer(1.0)])
     sentinel = from_shapely_geometries([box(1, 1, 2, 2), box(4, 4, 5, 5)])
 
     monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *_: False)
@@ -386,6 +386,114 @@ def test_polygon_difference_tries_legacy_rowwise_after_batched_exception(
     )
 
     assert result is sentinel
+
+
+@requires_gpu
+def test_polygon_intersection_prefers_rectangle_kernel_for_high_vertex_left_polygons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rect_module = importlib.import_module(
+        "vibespatial.kernels.constructive.polygon_rect_intersection"
+    )
+
+    left = from_shapely_geometries(
+        [Point(0, 0).buffer(5.0), Point(20, 0).buffer(5.0)]
+    )
+    right = from_shapely_geometries(
+        [box(-2.0, -2.0, 2.0, 2.0), box(18.0, -2.0, 22.0, 2.0)]
+    )
+    sentinel = from_shapely_geometries(
+        [box(-1.0, -1.0, 1.0, 1.0), box(19.0, -1.0, 21.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    calls: list[int] = []
+
+    def _fake_rect_kernel(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
+        calls.append(left_arg.row_count)
+        return sentinel
+
+    monkeypatch.setattr(
+        rect_module,
+        "polygon_rect_intersection",
+        _fake_rect_kernel,
+    )
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        lambda *args, **kwargs: pytest.fail(
+            "high-vertex polygon vs rectangle intersection should avoid rowwise overlay"
+        ),
+    )
+
+    result = binary_constructive_owned(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert calls == [2]
+    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
+        assert shapely.equals(got, exp)
+
+
+@requires_gpu
+def test_polygon_intersection_prefers_rectangle_kernel_when_left_is_rectangle_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rect_module = importlib.import_module(
+        "vibespatial.kernels.constructive.polygon_rect_intersection"
+    )
+
+    left = from_shapely_geometries(
+        [box(-2.0, -2.0, 2.0, 2.0), box(18.0, -2.0, 22.0, 2.0)]
+    )
+    right = from_shapely_geometries(
+        [Point(0, 0).buffer(5.0), Point(20, 0).buffer(5.0)]
+    )
+    sentinel = from_shapely_geometries(
+        [box(-1.0, -1.0, 1.0, 1.0), box(19.0, -1.0, 21.0, 1.0)],
+        residency=Residency.DEVICE,
+    )
+    calls: list[tuple[int, int]] = []
+
+    def _fake_can_handle(left_arg, right_arg):
+        calls.append((left_arg.row_count, right_arg.row_count))
+        return left_arg is right and right_arg is left
+
+    def _fake_rect_kernel(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
+        assert left_arg is right
+        assert right_arg is left
+        return sentinel
+
+    monkeypatch.setattr(
+        rect_module,
+        "polygon_rect_intersection_can_handle",
+        _fake_can_handle,
+    )
+    monkeypatch.setattr(
+        rect_module,
+        "polygon_rect_intersection",
+        _fake_rect_kernel,
+    )
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        lambda *args, **kwargs: pytest.fail(
+            "rectangle-left polygon intersection should use swapped rectangle kernel before rowwise overlay"
+        ),
+    )
+
+    result = binary_constructive_owned(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert calls == [(2, 2), (2, 2)]
+    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
+        assert shapely.equals(got, exp)
 
 
 @requires_gpu

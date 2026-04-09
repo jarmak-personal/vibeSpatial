@@ -187,7 +187,7 @@ def test_grouped_coverage_edge_union_preserves_holes() -> None:
 
 
 @pytest.mark.gpu
-def test_gpu_dissolve_can_route_non_rectangular_coverages_to_disjoint_subset_union(
+def test_gpu_dissolve_can_route_non_rectangular_coverages_to_edge_union_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not has_gpu_runtime():
@@ -209,15 +209,15 @@ def test_gpu_dissolve_can_route_non_rectangular_coverages_to_disjoint_subset_uni
     expected = frame.dissolve(by="group", aggfunc="first", method="coverage")
 
     calls = 0
-    real_fn = dissolve_module.execute_grouped_disjoint_subset_union_codes
+    real_fn = dissolve_module.execute_grouped_coverage_edge_union_codes
 
     def _counting_gpu(*args, **kwargs):
         nonlocal calls
         calls += 1
         return real_fn(*args, **kwargs)
 
-    monkeypatch.setattr(dissolve_module, "OVERLAY_UNION_ALL_GPU_THRESHOLD", 1)
-    monkeypatch.setattr(dissolve_module, "execute_grouped_disjoint_subset_union_codes", _counting_gpu)
+    monkeypatch.setattr(dissolve_module, "OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD", 1)
+    monkeypatch.setattr(dissolve_module, "execute_grouped_coverage_edge_union_codes", _counting_gpu)
 
     actual = evaluate_geopandas_dissolve(
         frame,

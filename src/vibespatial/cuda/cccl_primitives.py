@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import Any
 
 import numpy as np
 
@@ -142,6 +144,7 @@ _DTYPE_SUFFIX = {
     np.dtype(np.uint64): "u64",
     np.dtype(np.float64): "f64",
 }
+_ASYNC_PRECOMPILED_STREAMS: dict[int, Any] = {}
 
 
 def _dtype_suffix(dtype: np.dtype) -> str:
@@ -180,6 +183,60 @@ def _ensure_temp(precompiled, num_items: int, query_fn):
     return precompiled.temp_storage
 
 
+def _effective_stream(cp_module, stream):
+    if stream is not None:
+        return stream
+    return cp_module.cuda.get_current_stream()
+
+
+def _stream_context(cp_module, stream):
+    if stream is None:
+        return nullcontext()
+    from cuda.compute._utils.protocols import validate_and_get_stream
+
+    return cp_module.cuda.ExternalStream(validate_and_get_stream(stream))
+
+
+def _stream_synchronize(cp_module, stream) -> None:
+    effective = _effective_stream(cp_module, stream)
+    synchronize = getattr(effective, "synchronize", None)
+    if callable(synchronize):
+        synchronize()
+        return
+    from cuda.compute._utils.protocols import validate_and_get_stream
+
+    cp_module.cuda.ExternalStream(validate_and_get_stream(effective)).synchronize()
+
+
+def _invoke_precompiled(make_callable, *args, stream=None):
+    if stream is None:
+        return make_callable(*args)
+    try:
+        return make_callable(*args, stream=stream)
+    except TypeError as exc:
+        if "unexpected keyword argument 'stream'" not in str(exc):
+            raise
+        return make_callable(*args)
+
+
+def _prepare_precompiled_call(precompiled, cp_module, *, stream=None) -> None:
+    """Fence before reusing temp storage from a prior async launch."""
+    key = id(precompiled)
+    prior_stream = _ASYNC_PRECOMPILED_STREAMS.pop(key, None)
+    if prior_stream is not None:
+        _stream_synchronize(cp_module, prior_stream)
+
+
+def _finish_precompiled_call(precompiled, cp_module, *, stream=None, synchronize: bool) -> None:
+    """Record temp-storage reuse state after a precompiled launch."""
+    key = id(precompiled)
+    if synchronize:
+        _stream_synchronize(cp_module, stream)
+        _ASYNC_PRECOMPILED_STREAMS.pop(key, None)
+        return
+    _ASYNC_PRECOMPILED_STREAMS[key] = _effective_stream(cp_module, stream)
+
+
 # ---------------------------------------------------------------------------
 # Compaction (bool mask → indices)
 # ---------------------------------------------------------------------------
@@ -187,7 +244,7 @@ def _ensure_temp(precompiled, num_items: int, query_fn):
 # scales once JIT is warm.  make_* is 1.4-3.1x faster than CuPy.
 # Cold-call penalty is ~950ms (one-time per process).
 
-def _compact_indices_cccl(mask: DeviceArray) -> CompactionResult:
+def _compact_indices_cccl(mask: DeviceArray, *, stream=None) -> CompactionResult:
     cp_module, cccl_algorithms = _require_cccl_primitives()
     _validate_vector("mask", mask)
     item_count = int(mask.size)
@@ -201,8 +258,9 @@ def _compact_indices_cccl(mask: DeviceArray) -> CompactionResult:
     def _selected(index):  # pragma: no cover - exercised through CCCL JIT
         return mask[index] != 0
 
-    cccl_algorithms.select(indices, out, count, _selected, item_count)
-    cp_module.cuda.Stream.null.synchronize()
+    cccl_algorithms.select(indices, out, count, _selected, item_count, stream=stream)
+    # Returning a sliced output requires an explicit host count materialization.
+    _stream_synchronize(cp_module, stream)
     selected_count = int(count.item())
     return CompactionResult(values=out[:selected_count], count=selected_count)
 
@@ -211,6 +269,7 @@ def compact_indices(
     mask: DeviceArray,
     *,
     strategy: CompactionStrategy | str = CompactionStrategy.AUTO,
+    stream=None,
 ) -> CompactionResult:
     cp_module, _ = _require_cccl_primitives()
     _validate_vector("mask", mask)
@@ -225,10 +284,10 @@ def compact_indices(
         # JIT and comparable warm throughput.
         resolved = CompactionStrategy.CUPY
     if resolved is CompactionStrategy.CUPY:
-        out = cp_module.flatnonzero(mask).astype(cp_module.int32, copy=False)
-        cp_module.cuda.Stream.null.synchronize()
+        with _stream_context(cp_module, stream):
+            out = cp_module.flatnonzero(mask).astype(cp_module.int32, copy=False)
         return CompactionResult(values=out, count=int(out.size))
-    return _compact_indices_cccl(mask)
+    return _compact_indices_cccl(mask, stream=stream)
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +297,12 @@ def compact_indices(
 # >=1M elements even without make_*.  make_* is 1.8-3.7x faster than CuPy
 # across all scales.  Cold-call penalty is ~1460ms (one-time per process).
 
-def _exclusive_sum_cccl(values: DeviceArray, *, synchronize: bool = True) -> DeviceArray:
+def _exclusive_sum_cccl(
+    values: DeviceArray,
+    *,
+    synchronize: bool = False,
+    stream=None,
+) -> DeviceArray:
     cp_module, cccl_algorithms = _require_cccl_primitives()
     _validate_vector("values", values)
     out = cp_module.empty_like(values)
@@ -249,16 +313,16 @@ def _exclusive_sum_cccl(values: DeviceArray, *, synchronize: bool = True) -> Dev
     # make_* fast path (ADR-0034)
     precompiled = _get_precompiled(f"exclusive_scan_{_dtype_suffix(values.dtype)}")
     if precompiled is not None:
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n,
             lambda: precompiled.make_callable(None, values, out, _sum_op, n, init))
-        precompiled.make_callable(temp, values, out, _sum_op, n, init)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(precompiled.make_callable, temp, values, out, _sum_op, n, init, stream=stream)
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return out
     # Fallback: one-shot API
-    cccl_algorithms.exclusive_scan(values, out, _sum_op, init, n)
+    cccl_algorithms.exclusive_scan(values, out, _sum_op, init, n, stream=stream)
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return out
 
 
@@ -266,7 +330,8 @@ def exclusive_sum(
     values: DeviceArray,
     *,
     strategy: ScanStrategy | str = ScanStrategy.AUTO,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> DeviceArray:
     cp_module, _ = _require_cccl_primitives()
     _validate_vector("values", values)
@@ -278,12 +343,13 @@ def exclusive_sum(
         spec = f"exclusive_scan_{_dtype_suffix(values.dtype)}"
         resolved = ScanStrategy.CCCL_EXCLUSIVE_SCAN if _cccl_is_warm(spec) else ScanStrategy.CUPY
     if resolved is ScanStrategy.CUPY:
-        out = cp_module.cumsum(values, dtype=values.dtype)
-        out -= values
+        with _stream_context(cp_module, stream):
+            out = cp_module.cumsum(values, dtype=values.dtype)
+            out -= values
         if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+            _stream_synchronize(cp_module, stream)
         return out
-    return _exclusive_sum_cccl(values, synchronize=synchronize)
+    return _exclusive_sum_cccl(values, synchronize=synchronize, stream=stream)
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +364,8 @@ def reduce_sum(
     values: DeviceArray,
     *,
     strategy: ReductionStrategy | str = ReductionStrategy.AUTO,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> DeviceArray:
     """Reduce values to a single sum.  Returns a 1-element device array."""
     cp_module, cccl_algorithms = _require_cccl_primitives()
@@ -309,10 +376,11 @@ def reduce_sum(
         # competitive but the win is small enough to keep CuPy as default.
         resolved = ReductionStrategy.CUPY
     if resolved is ReductionStrategy.CUPY:
-        out = cp_module.empty(1, dtype=values.dtype)
-        out[0] = cp_module.sum(values)
+        with _stream_context(cp_module, stream):
+            out = cp_module.empty(1, dtype=values.dtype)
+            out[0] = cp_module.sum(values)
         if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+            _stream_synchronize(cp_module, stream)
         return out
     out = cp_module.empty(1, dtype=values.dtype)
     h_init = np.asarray(0, dtype=values.dtype)
@@ -320,16 +388,16 @@ def reduce_sum(
     # make_* fast path (ADR-0034)
     precompiled = _get_precompiled(f"reduce_sum_{_dtype_suffix(values.dtype)}")
     if precompiled is not None:
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n,
             lambda: precompiled.make_callable(None, values, out, _sum_op, n, h_init))
-        precompiled.make_callable(temp, values, out, _sum_op, n, h_init)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(precompiled.make_callable, temp, values, out, _sum_op, n, h_init, stream=stream)
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return out
     # Fallback: one-shot API
-    cccl_algorithms.reduce_into(values, out, _sum_op, n, h_init)
+    cccl_algorithms.reduce_into(values, out, _sum_op, n, h_init, stream=stream)
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return out
 
 
@@ -346,7 +414,8 @@ def segmented_reduce_sum(
     ends: DeviceArray,
     *,
     num_segments: int | None = None,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> SegmentedReduceResult:
     """Sum values within offset-delimited segments.
 
@@ -375,19 +444,22 @@ def segmented_reduce_sum(
     precompiled = _get_precompiled(f"segmented_reduce_sum_{_dtype_suffix(values.dtype)}")
     if precompiled is not None:
         n = int(values.size)
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n,
             lambda: precompiled.make_callable(
                 None, values, out, starts, ends, _sum_op, n_segs, h_init))
-        precompiled.make_callable(temp, values, out, starts, ends, _sum_op, n_segs, h_init)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(
+            precompiled.make_callable,
+            temp, values, out, starts, ends, _sum_op, n_segs, h_init, stream=stream,
+        )
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return SegmentedReduceResult(values=out, segment_count=n_segs)
     # Fallback: one-shot API
     cccl_algorithms.segmented_reduce(
-        values, out, starts, ends, _sum_op, h_init, n_segs,
+        values, out, starts, ends, _sum_op, h_init, n_segs, stream=stream,
     )
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return SegmentedReduceResult(values=out, segment_count=n_segs)
 
 
@@ -397,7 +469,8 @@ def segmented_reduce_min(
     ends: DeviceArray,
     *,
     num_segments: int | None = None,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> SegmentedReduceResult:
     """Min-reduce values within offset-delimited segments."""
     cp_module, cccl_algorithms = _require_cccl_primitives()
@@ -415,19 +488,22 @@ def segmented_reduce_min(
     precompiled = _get_precompiled(f"segmented_reduce_min_{_dtype_suffix(values.dtype)}")
     if precompiled is not None:
         n = int(values.size)
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n,
             lambda: precompiled.make_callable(
                 None, values, out, starts, ends, _min_op, n_segs, h_init))
-        precompiled.make_callable(temp, values, out, starts, ends, _min_op, n_segs, h_init)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(
+            precompiled.make_callable,
+            temp, values, out, starts, ends, _min_op, n_segs, h_init, stream=stream,
+        )
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return SegmentedReduceResult(values=out, segment_count=n_segs)
     # Fallback: one-shot API
     cccl_algorithms.segmented_reduce(
-        values, out, starts, ends, _min_op, h_init, n_segs,
+        values, out, starts, ends, _min_op, h_init, n_segs, stream=stream,
     )
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return SegmentedReduceResult(values=out, segment_count=n_segs)
 
 
@@ -437,7 +513,8 @@ def segmented_reduce_max(
     ends: DeviceArray,
     *,
     num_segments: int | None = None,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> SegmentedReduceResult:
     """Max-reduce values within offset-delimited segments."""
     cp_module, cccl_algorithms = _require_cccl_primitives()
@@ -455,19 +532,22 @@ def segmented_reduce_max(
     precompiled = _get_precompiled(f"segmented_reduce_max_{_dtype_suffix(values.dtype)}")
     if precompiled is not None:
         n = int(values.size)
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n,
             lambda: precompiled.make_callable(
                 None, values, out, starts, ends, _max_op, n_segs, h_init))
-        precompiled.make_callable(temp, values, out, starts, ends, _max_op, n_segs, h_init)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(
+            precompiled.make_callable,
+            temp, values, out, starts, ends, _max_op, n_segs, h_init, stream=stream,
+        )
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return SegmentedReduceResult(values=out, segment_count=n_segs)
     # Fallback: one-shot API
     cccl_algorithms.segmented_reduce(
-        values, out, starts, ends, _max_op, h_init, n_segs,
+        values, out, starts, ends, _max_op, h_init, n_segs, stream=stream,
     )
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return SegmentedReduceResult(values=out, segment_count=n_segs)
 
 
@@ -479,7 +559,8 @@ def lower_bound(
     sorted_data: DeviceArray,
     query_values: DeviceArray,
     *,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> DeviceArray:
     """Find the first insertion point for each query value in a sorted array.
 
@@ -496,19 +577,22 @@ def lower_bound(
     # make_* fast path (ADR-0034)
     precompiled = _get_precompiled(f"lower_bound_{_dtype_suffix(sorted_data.dtype)}")
     if precompiled is not None:
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n_sorted + n_query,
             lambda: precompiled.make_callable(
                 None, sorted_data, query_values, out, n_sorted, n_query))
-        precompiled.make_callable(temp, sorted_data, query_values, out, n_sorted, n_query)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(
+            precompiled.make_callable,
+            temp, sorted_data, query_values, out, n_sorted, n_query, stream=stream,
+        )
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return out
     # Fallback: one-shot API
     cccl_algorithms.lower_bound(
-        sorted_data, query_values, out, n_sorted, n_query,
+        sorted_data, query_values, out, n_sorted, n_query, stream=stream,
     )
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return out
 
 
@@ -518,7 +602,8 @@ def lower_bound_counting(
     count: int,
     *,
     dtype=np.int32,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> DeviceArray:
     """Find insertion points for a lazy ``[start, start + count)`` sequence.
 
@@ -534,9 +619,9 @@ def lower_bound_counting(
     query_values = counting_iterator(start=start, dtype=dtype)
     n_sorted = int(sorted_data.size)
     n_query = int(count)
-    cccl_algorithms.lower_bound(sorted_data, query_values, out, n_sorted, n_query)
+    cccl_algorithms.lower_bound(sorted_data, query_values, out, n_sorted, n_query, stream=stream)
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return out
 
 
@@ -544,7 +629,8 @@ def upper_bound(
     sorted_data: DeviceArray,
     query_values: DeviceArray,
     *,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> DeviceArray:
     """Find the last insertion point for each query value in a sorted array.
 
@@ -561,19 +647,46 @@ def upper_bound(
     # make_* fast path (ADR-0034)
     precompiled = _get_precompiled(f"upper_bound_{_dtype_suffix(sorted_data.dtype)}")
     if precompiled is not None:
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, n_sorted + n_query,
             lambda: precompiled.make_callable(
                 None, sorted_data, query_values, out, n_sorted, n_query))
-        precompiled.make_callable(temp, sorted_data, query_values, out, n_sorted, n_query)
-        if synchronize:
-            cp_module.cuda.Stream.null.synchronize()
+        _invoke_precompiled(
+            precompiled.make_callable,
+            temp, sorted_data, query_values, out, n_sorted, n_query, stream=stream,
+        )
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return out
     # Fallback: one-shot API
     cccl_algorithms.upper_bound(
-        sorted_data, query_values, out, n_sorted, n_query,
+        sorted_data, query_values, out, n_sorted, n_query, stream=stream,
     )
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
+    return out
+
+
+def upper_bound_counting(
+    sorted_data: DeviceArray,
+    start: int,
+    count: int,
+    *,
+    dtype=np.int32,
+    synchronize: bool = False,
+    stream=None,
+) -> DeviceArray:
+    """Find upper-bound insertion points for a lazy ``[start, start + count)`` sequence."""
+    cp_module, cccl_algorithms = _require_cccl_primitives()
+    _validate_vector("sorted_data", sorted_data)
+    out = cp_module.empty(int(count), dtype=np.uintp)
+    if int(count) == 0:
+        return out
+    query_values = counting_iterator(start=start, dtype=dtype)
+    n_sorted = int(sorted_data.size)
+    n_query = int(count)
+    cccl_algorithms.upper_bound(sorted_data, query_values, out, n_sorted, n_query, stream=stream)
+    if synchronize:
+        _stream_synchronize(cp_module, stream)
     return out
 
 
@@ -609,7 +722,8 @@ def sort_pairs(
     *,
     descending: bool = False,
     strategy: PairSortStrategy | str = PairSortStrategy.AUTO,
-    synchronize: bool = True,
+    synchronize: bool = False,
+    stream=None,
 ) -> PairSortResult:
     cp_module, cccl_algorithms = _require_cccl_primitives()
     _validate_vector("keys", keys)
@@ -628,12 +742,13 @@ def sort_pairs(
 
     if resolved is PairSortStrategy.CUPY:
         # CuPy argsort fallback — avoids CCCL JIT when specs are cold.
-        if descending:
-            idx = cp_module.argsort(-keys)
-        else:
-            idx = cp_module.argsort(keys)
-        out_keys = keys[idx]
-        out_values = values[idx] if values is not None else None
+        with _stream_context(cp_module, stream):
+            if descending:
+                idx = cp_module.argsort(-keys)
+            else:
+                idx = cp_module.argsort(keys)
+            out_keys = keys[idx]
+            out_values = values[idx] if values is not None else None
     elif resolved is PairSortStrategy.RADIX:
         order = (
             cccl_algorithms.SortOrder.DESCENDING
@@ -646,6 +761,7 @@ def sort_pairs(
                 f"radix_sort_{_dtype_suffix(keys.dtype)}_{_dtype_suffix(values.dtype)}",
             )
         if precompiled is not None:
+            _prepare_precompiled_call(precompiled, cp_module, stream=stream)
             temp = _ensure_temp(
                 precompiled,
                 item_count,
@@ -653,11 +769,15 @@ def sort_pairs(
                     None, keys, out_keys, values, out_values, item_count,
                 ),
             )
-            precompiled.make_callable(
-                temp, keys, out_keys, values, out_values, item_count,
+            _invoke_precompiled(
+                precompiled.make_callable,
+                temp, keys, out_keys, values, out_values, item_count, stream=stream,
             )
+            _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         else:
-            cccl_algorithms.radix_sort(keys, out_keys, values, out_values, order, item_count)
+            cccl_algorithms.radix_sort(
+                keys, out_keys, values, out_values, order, item_count, stream=stream,
+            )
     else:
         comparison = _greater_than if descending else _less_than
         precompiled = None
@@ -666,6 +786,7 @@ def sort_pairs(
                 f"merge_sort_{_dtype_suffix(keys.dtype)}_{_dtype_suffix(values.dtype)}",
             )
         if precompiled is not None:
+            _prepare_precompiled_call(precompiled, cp_module, stream=stream)
             temp = _ensure_temp(
                 precompiled,
                 item_count,
@@ -673,13 +794,17 @@ def sort_pairs(
                     None, keys, values, out_keys, out_values, comparison, item_count,
                 ),
             )
-            precompiled.make_callable(
-                temp, keys, values, out_keys, out_values, comparison, item_count,
+            _invoke_precompiled(
+                precompiled.make_callable,
+                temp, keys, values, out_keys, out_values, comparison, item_count, stream=stream,
             )
+            _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         else:
-            cccl_algorithms.merge_sort(keys, values, out_keys, out_values, comparison, item_count)
+            cccl_algorithms.merge_sort(
+                keys, values, out_keys, out_values, comparison, item_count, stream=stream,
+            )
     if synchronize:
-        cp_module.cuda.Stream.null.synchronize()
+        _stream_synchronize(cp_module, stream)
     return PairSortResult(keys=out_keys, values=out_values, strategy=resolved)
 
 
@@ -687,7 +812,13 @@ def sort_pairs(
 # Unique-by-key
 # ---------------------------------------------------------------------------
 
-def unique_sorted_pairs(keys: DeviceArray, values: DeviceArray) -> UniqueByKeyResult:
+def unique_sorted_pairs(
+    keys: DeviceArray,
+    values: DeviceArray,
+    *,
+    synchronize: bool = False,
+    stream=None,
+) -> UniqueByKeyResult:
     cp_module, cccl_algorithms = _require_cccl_primitives()
     _validate_vector("keys", keys)
     _validate_vector("values", values)
@@ -706,14 +837,17 @@ def unique_sorted_pairs(keys: DeviceArray, values: DeviceArray) -> UniqueByKeyRe
     val_suffix = _dtype_suffix(values.dtype)
     precompiled = _get_precompiled(f"unique_by_key_{key_suffix}_{val_suffix}")
     if precompiled is not None:
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, item_count,
             lambda: precompiled.make_callable(
                 None, keys, values, out_keys, out_values,
                 out_count, _equal_to, item_count))
-        precompiled.make_callable(
+        # Returning a trimmed output still requires a host-materialized count.
+        _invoke_precompiled(
+            precompiled.make_callable,
             temp, keys, values, out_keys, out_values,
-            out_count, _equal_to, item_count)
-        cp_module.cuda.Stream.null.synchronize()
+            out_count, _equal_to, item_count, stream=stream)
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=True)
         selected_count = int(out_count.item())
         return UniqueByKeyResult(
             keys=out_keys[:selected_count],
@@ -729,8 +863,10 @@ def unique_sorted_pairs(keys: DeviceArray, values: DeviceArray) -> UniqueByKeyRe
         out_count,
         _equal_to,
         item_count,
+        stream=stream,
     )
-    cp_module.cuda.Stream.null.synchronize()
+    # Returning a trimmed output still requires a host-materialized count.
+    _stream_synchronize(cp_module, stream)
     selected_count = int(out_count.item())
     return UniqueByKeyResult(
         keys=out_keys[:selected_count],
@@ -753,6 +889,8 @@ def _segmented_sort_cccl(
     *,
     descending: bool = False,
     num_segments: int | None = None,
+    synchronize: bool = False,
+    stream=None,
 ) -> SegmentedSortResult:
     cp_module, cccl_algorithms = _require_cccl_primitives()
     n_segs = num_segments if num_segments is not None else int(starts.size)
@@ -771,21 +909,24 @@ def _segmented_sort_cccl(
     suffix = f"{'desc' if descending else 'asc'}_{_dtype_suffix(keys.dtype)}"
     precompiled = _get_precompiled(f"segmented_sort_{suffix}")
     if precompiled is not None:
+        _prepare_precompiled_call(precompiled, cp_module, stream=stream)
         temp = _ensure_temp(precompiled, item_count,
             lambda: precompiled.make_callable(
                 None, keys, out_keys, values, out_values,
                 item_count, n_segs, starts, ends, order))
-        precompiled.make_callable(
+        _invoke_precompiled(
+            precompiled.make_callable,
             temp, keys, out_keys, values, out_values,
-            item_count, n_segs, starts, ends, order)
-        cp_module.cuda.Stream.null.synchronize()
+            item_count, n_segs, starts, ends, order, stream=stream)
+        _finish_precompiled_call(precompiled, cp_module, stream=stream, synchronize=synchronize)
         return SegmentedSortResult(keys=out_keys, values=out_values, segment_count=n_segs)
     # Fallback: one-shot API
     cccl_algorithms.segmented_sort(
         keys, out_keys, values, out_values,
-        item_count, n_segs, starts, ends, order,
+        item_count, n_segs, starts, ends, order, stream=stream,
     )
-    cp_module.cuda.Stream.null.synchronize()
+    if synchronize:
+        _stream_synchronize(cp_module, stream)
     return SegmentedSortResult(keys=out_keys, values=out_values, segment_count=n_segs)
 
 
@@ -798,6 +939,8 @@ def segmented_sort(
     descending: bool = False,
     num_segments: int | None = None,
     strategy: SegmentedSortStrategy | str = SegmentedSortStrategy.AUTO,
+    synchronize: bool = False,
+    stream=None,
 ) -> SegmentedSortResult:
     """Sort key-value pairs within offset-delimited segments.
 
@@ -810,6 +953,7 @@ def segmented_sort(
     descending : sort in descending order within each segment
     num_segments : optional, inferred from starts.size if omitted
     strategy : dispatch strategy (AUTO always routes to CCCL)
+    synchronize : if False, skip the trailing null-stream synchronize
 
     Returns
     -------
@@ -825,7 +969,10 @@ def segmented_sort(
             raise ValueError("values must match keys size")
     return _segmented_sort_cccl(
         keys, values, starts, ends,
-        descending=descending, num_segments=num_segments,
+        descending=descending,
+        num_segments=num_segments,
+        synchronize=synchronize,
+        stream=stream,
     )
 
 
@@ -854,7 +1001,6 @@ def _three_way_partition_cccl(
         values, d_first, d_second, d_unselected, d_counts,
         first_pred, second_pred, item_count,
     )
-    cp_module.cuda.Stream.null.synchronize()
     h_counts = d_counts.get()
     first_count = int(h_counts[0])
     second_count = int(h_counts[1])

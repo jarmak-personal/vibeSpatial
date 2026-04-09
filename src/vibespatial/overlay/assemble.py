@@ -209,8 +209,6 @@ def _build_polygon_output_from_faces_gpu(
     ptr = runtime.pointer
     edge_count = half_edge_graph.edge_count
     face_count = faces.face_count
-    block = (256, 1, 1)
-    edge_grid = (max(1, (edge_count + 255) // 256), 1, 1)
 
     device = half_edge_graph.device_state
     face_device = faces.device_state
@@ -235,9 +233,13 @@ def _build_polygon_output_from_faces_gpu(
     with hotpath_stage("overlay.assemble.boundary_edges", category="refine"):
         # --- Step 3: Identify boundary edges via GPU kernel ---
         d_is_boundary = cp.empty(edge_count, dtype=cp.int8)
+        edge_grid, edge_block = runtime.launch_config(
+            kernels["compute_boundary_edges"],
+            edge_count,
+        )
         runtime.launch(
             kernels["compute_boundary_edges"],
-            grid=edge_grid, block=block,
+            grid=edge_grid, block=edge_block,
             params=(
                 (ptr(d_edge_face_ids), ptr(d_face_selected), ptr(device.next_edge_ids),
                  ptr(d_is_boundary), edge_count),
@@ -247,20 +249,17 @@ def _build_polygon_output_from_faces_gpu(
         )
         _sync_hotpath(runtime)
 
-    boundary_count = int(cp.sum(d_is_boundary != 0))
-    if boundary_count == 0:
-        return _empty_polygon_output(
-            faces.runtime_selection,
-            row_count=preserve_row_count or 0,
-        )
-
     with hotpath_stage("overlay.assemble.boundary_next", category="refine"):
         # --- Step 4: Compute boundary next pointers via GPU kernel ---
         d_boundary_next = cp.full(edge_count, -1, dtype=cp.int32)
         max_steps = edge_count
+        boundary_next_grid, boundary_next_block = runtime.launch_config(
+            kernels["compute_boundary_next"],
+            edge_count,
+        )
         runtime.launch(
             kernels["compute_boundary_next"],
-            grid=edge_grid, block=block,
+            grid=boundary_next_grid, block=boundary_next_block,
             params=(
                 (ptr(d_edge_face_ids), ptr(d_face_selected), ptr(device.next_edge_ids),
                  ptr(d_is_boundary), ptr(d_boundary_next), edge_count, max_steps),
@@ -274,6 +273,11 @@ def _build_polygon_output_from_faces_gpu(
         # --- Step 5: Detect boundary cycles via GPU pointer jumping ---
         boundary_edge_indices = cp.flatnonzero(d_is_boundary != 0).astype(cp.int32, copy=False)
         boundary_count = int(boundary_edge_indices.size)
+        if boundary_count == 0:
+            return _empty_polygon_output(
+                faces.runtime_selection,
+                row_count=preserve_row_count or 0,
+            )
         # Phase 25 memory: d_is_boundary, d_edge_face_ids, d_face_selected,
         # and the Step 1 face_offsets/edge_ids copies are dead.
         del d_is_boundary, d_edge_face_ids, d_face_selected
@@ -299,7 +303,10 @@ def _build_polygon_output_from_faces_gpu(
         # List ranking: compute position within each cycle using NVRTC kernel
         d_rank_b = cp.empty(boundary_count, dtype=cp.int32)
         d_compact_next_i64 = compact_next.astype(cp.int64)
-        boundary_grid = (max(1, (boundary_count + 255) // 256), 1, 1)
+        boundary_grid, boundary_block = runtime.launch_config(
+            kernels["list_rank_within_cycle"],
+            boundary_count,
+        )
         rank_params = (
             (ptr(cycle_label), ptr(d_compact_next_i64),
              ptr(d_rank_b), boundary_count, boundary_count),
@@ -308,7 +315,7 @@ def _build_polygon_output_from_faces_gpu(
         )
         runtime.launch(
             kernels["list_rank_within_cycle"],
-            grid=boundary_grid, block=block, params=rank_params,
+            grid=boundary_grid, block=boundary_block, params=rank_params,
         )
         _sync_hotpath(runtime)
 
@@ -406,10 +413,13 @@ def _build_polygon_output_from_faces_gpu(
         # (e.g. 4e-316) that crash GEOS with TopologyException.
         d_out_x = cp.zeros(total_coords, dtype=cp.float64)
         d_out_y = cp.zeros(total_coords, dtype=cp.float64)
-        ring_grid = (max(1, (ring_count + 255) // 256), 1, 1)
+        ring_grid, ring_block = runtime.launch_config(
+            kernels["scatter_ring_coordinates"],
+            ring_count,
+        )
         runtime.launch(
             kernels["scatter_ring_coordinates"],
-            grid=ring_grid, block=block,
+            grid=ring_grid, block=ring_block,
             params=(
                 (ptr(device.src_x), ptr(device.src_y),
                  ptr(d_ring_edge_starts), ptr(d_ring_coord_offsets),
@@ -472,10 +482,13 @@ def _build_polygon_output_from_faces_gpu(
 
                 d_hole_x = cp.zeros(total_hole_coords, dtype=cp.float64)
                 d_hole_y = cp.zeros(total_hole_coords, dtype=cp.float64)
-                hole_grid = (max(1, (n_valid_holes + 255) // 256), 1, 1)
+                hole_grid, hole_block = runtime.launch_config(
+                    kernels["scatter_ring_coordinates"],
+                    n_valid_holes,
+                )
                 runtime.launch(
                     kernels["scatter_ring_coordinates"],
-                    grid=hole_grid, block=block,
+                    grid=hole_grid, block=hole_block,
                     params=(
                         (ptr(device.src_x), ptr(device.src_y),
                          ptr(d_hole_edge_starts), ptr(d_hole_coord_offsets),
@@ -594,11 +607,14 @@ def _build_polygon_output_from_faces_gpu(
         # assembly logic used for ring containment and hole assignment.
         d_ring_sample_x = cp.empty(total_ring_count, dtype=cp.float64)
         d_ring_sample_y = cp.empty(total_ring_count, dtype=cp.float64)
-        sample_grid = (max(1, (total_ring_count + 255) // 256), 1, 1)
+        sample_grid, sample_block = runtime.launch_config(
+            kernels["compute_ring_sample_points"],
+            total_ring_count,
+        )
         runtime.launch(
             kernels["compute_ring_sample_points"],
             grid=sample_grid,
-            block=block,
+            block=sample_block,
             params=(
                 (
                     ptr(d_all_coord_offsets),
@@ -636,15 +652,20 @@ def _build_polygon_output_from_faces_gpu(
     d_is_boundary_flag = cp.zeros(total_ring_count, dtype=cp.bool_)
     d_is_boundary_flag[:boundary_ring_count] = True
     d_pos_area_boundary = d_is_boundary_flag & (d_all_area > 0.0)
-    n_pos_boundary = int(cp.sum(d_pos_area_boundary))
+    n_pos_boundary = int(
+        cp.flatnonzero(d_pos_area_boundary).astype(cp.int32, copy=False).size
+    )
 
     with hotpath_stage("overlay.assemble.nesting_depth", category="refine"):
         if n_pos_boundary > 1:
             d_boundary_depth = cp.zeros(boundary_ring_count, dtype=cp.int32)
-            boundary_depth_grid = (max(1, (boundary_ring_count + 255) // 256), 1, 1)
+            boundary_depth_grid, boundary_depth_block = runtime.launch_config(
+                kernels["count_boundary_nesting_depth"],
+                boundary_ring_count,
+            )
             runtime.launch(
                 kernels["count_boundary_nesting_depth"],
-                grid=boundary_depth_grid, block=block,
+                grid=boundary_depth_grid, block=boundary_depth_block,
                 params=(
                     (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
                      ptr(d_all_source_rows), ptr(d_all_coord_offsets),
@@ -671,15 +692,21 @@ def _build_polygon_output_from_faces_gpu(
     exterior_count = int(d_exterior_indices.size)
 
     if exterior_count == 0:
-        return _empty_polygon_output(faces.runtime_selection)
+        return _empty_polygon_output(
+            faces.runtime_selection,
+            row_count=preserve_row_count or 0,
+        )
 
     with hotpath_stage("overlay.assemble.hole_assignment", category="refine"):
         # --- Step 9: Assign holes to exteriors via GPU kernel ---
         d_exterior_id = cp.full(total_ring_count, -1, dtype=cp.int32)
-        ring_grid_all = (max(1, (total_ring_count + 255) // 256), 1, 1)
+        ring_grid_all, ring_block_all = runtime.launch_config(
+            kernels["assign_holes_to_exteriors"],
+            total_ring_count,
+        )
         runtime.launch(
-                kernels["assign_holes_to_exteriors"],
-            grid=ring_grid_all, block=block,
+            kernels["assign_holes_to_exteriors"],
+            grid=ring_grid_all, block=ring_block_all,
             params=(
                 (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
                  ptr(d_exterior_mask_full.astype(cp.int8, copy=False)),
@@ -706,12 +733,18 @@ def _build_polygon_output_from_faces_gpu(
 
     # Check if there are any holes assigned
     d_is_hole = (d_exterior_id >= 0) & (d_exterior_id != cp.arange(total_ring_count, dtype=cp.int32))
-    n_assigned_holes = int(cp.sum(d_is_hole))
+    n_assigned_holes = int(
+        cp.flatnonzero(d_is_hole).astype(cp.int32, copy=False).size
+    )
 
     if n_assigned_holes > 1:
+        sibling_depth_grid, sibling_depth_block = runtime.launch_config(
+            kernels["count_sibling_hole_depth"],
+            total_ring_count,
+        )
         runtime.launch(
             kernels["count_sibling_hole_depth"],
-            grid=ring_grid_all, block=block,
+            grid=sibling_depth_grid, block=sibling_depth_block,
             params=(
                 (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
                  ptr(d_exterior_id), ptr(d_all_coord_offsets),
@@ -749,7 +782,10 @@ def _build_polygon_output_from_faces_gpu(
         n_output_rings = int(d_output_ring_ids.size)
 
         if n_output_rings == 0:
-            return _empty_polygon_output(faces.runtime_selection)
+            return _empty_polygon_output(
+                faces.runtime_selection,
+                row_count=preserve_row_count or 0,
+            )
 
         d_out_ext_id = cp.where(
             d_exterior_mask_full[d_output_ring_ids],
@@ -775,7 +811,10 @@ def _build_polygon_output_from_faces_gpu(
         n_polygons = int(d_poly_starts.size)
 
         if n_polygons == 0:
-            return _empty_polygon_output(faces.runtime_selection)
+            return _empty_polygon_output(
+                faces.runtime_selection,
+                row_count=preserve_row_count or 0,
+            )
 
         d_poly_ends = cp.concatenate((d_poly_starts[1:], cp.asarray([n_output_rings], dtype=cp.int32)))
         d_rings_per_poly = d_poly_ends - d_poly_starts

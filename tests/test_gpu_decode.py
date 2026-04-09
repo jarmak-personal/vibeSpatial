@@ -32,6 +32,18 @@ def _assert_geometry_lists_equal(left, right) -> None:
         assert got.equals(expected)
 
 
+def _assert_lazy_device_owned(owned) -> None:
+    assert owned._validity is None
+    assert owned._tags is None
+    assert owned._family_row_offsets is None
+    for buffer in owned.families.values():
+        assert buffer.host_materialized is False
+        assert buffer.x.size == 0
+        assert buffer.y.size == 0
+        assert buffer.geometry_offsets.size == 0
+        assert buffer.empty_mask.size == 0
+
+
 @pytest.mark.parametrize(
     ("family", "geometries"),
     [
@@ -88,6 +100,7 @@ def test_read_geoparquet_owned_gpu_geoarrow_decode_matches_cpu_for_each_family(
     assert gpu_owned.device_state is not None
     decoded_family = next(iter(gpu_owned.families))
     assert gpu_owned.families[decoded_family].host_materialized is False
+    _assert_lazy_device_owned(gpu_owned)
 
     _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())
 
@@ -142,6 +155,7 @@ def test_pylibcudf_wkb_header_scan_matches_mixed_family_reference(tmp_path) -> N
 
 def test_read_geoparquet_owned_gpu_wkb_point_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "point-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -150,13 +164,15 @@ def test_read_geoparquet_owned_gpu_wkb_point_decode_matches_cpu(tmp_path) -> Non
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    gpu_owned = read_geoparquet_owned(path, backend="gpu")
+    with assert_zero_d2h_transfers():
+        gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
     assert gpu_owned.residency is Residency.DEVICE
     assert gpu_owned.device_state is not None
     point_family = next(iter(gpu_owned.families))
     assert gpu_owned.families[point_family].host_materialized is False
+    _assert_lazy_device_owned(gpu_owned)
 
     _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())
 
@@ -221,6 +237,36 @@ def test_read_geoparquet_owned_gpu_wkb_mixed_point_linestring_decode_matches_cpu
     _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())
 
 
+def test_read_geoparquet_owned_gpu_wkb_polygon_decode_matches_cpu(tmp_path) -> None:
+    _require_gpu_decode_runtime()
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+    path = tmp_path / "polygon-wkb.parquet"
+    frame = geopandas.GeoDataFrame(
+        {
+            "geometry": [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon(),
+                None,
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+            ]
+        },
+        geometry="geometry",
+    )
+    frame.to_parquet(path, geometry_encoding="WKB")
+
+    with assert_zero_d2h_transfers():
+        gpu_owned = read_geoparquet_owned(path, backend="gpu")
+    cpu_owned = read_geoparquet_owned(path, backend="cpu")
+
+    assert gpu_owned.residency is Residency.DEVICE
+    assert gpu_owned.device_state is not None
+    polygon_family = next(iter(gpu_owned.families))
+    assert gpu_owned.families[polygon_family].host_materialized is False
+
+    _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())
+
+
 # --- WKB multipoint decode tests ---
 
 
@@ -281,6 +327,7 @@ def test_read_geoparquet_owned_gpu_wkb_multipoint_varied_part_counts(tmp_path) -
 
 def test_read_geoparquet_owned_gpu_wkb_multilinestring_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "multilinestring-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -296,7 +343,8 @@ def test_read_geoparquet_owned_gpu_wkb_multilinestring_decode_matches_cpu(tmp_pa
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    gpu_owned = read_geoparquet_owned(path, backend="gpu")
+    with assert_zero_d2h_transfers():
+        gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
     assert gpu_owned.residency is Residency.DEVICE
@@ -340,6 +388,7 @@ def test_read_geoparquet_owned_gpu_wkb_multilinestring_varied_part_counts(tmp_pa
 
 def test_read_geoparquet_owned_gpu_wkb_multipolygon_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "multipolygon-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -355,7 +404,8 @@ def test_read_geoparquet_owned_gpu_wkb_multipolygon_decode_matches_cpu(tmp_path)
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    gpu_owned = read_geoparquet_owned(path, backend="gpu")
+    with assert_zero_d2h_transfers():
+        gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
     assert gpu_owned.residency is Residency.DEVICE
@@ -401,11 +451,81 @@ def test_read_geoparquet_owned_gpu_wkb_multipolygon_varied_structure(tmp_path) -
     _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())
 
 
+@pytest.mark.parametrize(
+    ("path_name", "geometries", "decoder_name", "legacy_builder_name"),
+    [
+        (
+            "polygon-direct-wkb.parquet",
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                Polygon(),
+                None,
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+            ],
+            "_decode_pylibcudf_wkb_polygon_column_to_owned",
+            "_build_device_wkb_polygon_family",
+        ),
+        (
+            "multilinestring-direct-wkb.parquet",
+            [
+                MultiLineString([[(0, 0), (1, 1)], [(2, 2), (3, 3)]]),
+                MultiLineString([]),
+                None,
+                MultiLineString([[(4, 4), (5, 5)]]),
+            ],
+            "_decode_pylibcudf_wkb_multilinestring_column_to_owned",
+            "_build_device_wkb_multilinestring_family",
+        ),
+        (
+            "multipolygon-direct-wkb.parquet",
+            [
+                MultiPolygon([Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])]),
+                MultiPolygon([]),
+                None,
+                MultiPolygon([Polygon([(2, 2), (3, 2), (3, 3), (2, 2)])]),
+            ],
+            "_decode_pylibcudf_wkb_multipolygon_column_to_owned",
+            "_build_device_wkb_multipolygon_family",
+        ),
+    ],
+)
+def test_direct_pylibcudf_nested_wkb_helpers_use_staged_gpu_pipeline(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    path_name: str,
+    geometries,
+    decoder_name: str,
+    legacy_builder_name: str,
+) -> None:
+    _require_gpu_decode_runtime()
+    import vibespatial.io.pylibcudf as io_pylibcudf
+
+    path = tmp_path / path_name
+    frame = geopandas.GeoDataFrame({"geometry": geometries}, geometry="geometry")
+    frame.to_parquet(path, geometry_encoding="WKB")
+
+    table = io_arrow._read_geoparquet_table_with_pylibcudf(path, columns=["geometry"])
+    column = table.columns()[0]
+
+    def _fail_legacy_builder(*_args, **_kwargs):
+        raise AssertionError("legacy nested WKB helper should not be used")
+
+    monkeypatch.setattr(io_pylibcudf, legacy_builder_name, _fail_legacy_builder)
+
+    gpu_owned = getattr(io_pylibcudf, decoder_name)(column)
+    cpu_owned = read_geoparquet_owned(path, backend="cpu")
+
+    assert gpu_owned.residency is Residency.DEVICE
+    assert gpu_owned.device_state is not None
+    _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())
+
+
 # --- Mixed all-family WKB decode test ---
 
 
 def test_read_geoparquet_owned_gpu_wkb_mixed_all_families_decode_matches_cpu(tmp_path) -> None:
     _require_gpu_decode_runtime()
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
 
     path = tmp_path / "mixed-all-families-wkb.parquet"
     frame = geopandas.GeoDataFrame(
@@ -424,11 +544,13 @@ def test_read_geoparquet_owned_gpu_wkb_mixed_all_families_decode_matches_cpu(tmp
     )
     frame.to_parquet(path, geometry_encoding="WKB")
 
-    gpu_owned = read_geoparquet_owned(path, backend="gpu")
+    with assert_zero_d2h_transfers():
+        gpu_owned = read_geoparquet_owned(path, backend="gpu")
     cpu_owned = read_geoparquet_owned(path, backend="cpu")
 
     assert gpu_owned.residency is Residency.DEVICE
     assert gpu_owned.device_state is not None
     assert len(gpu_owned.families) == 6
+    _assert_lazy_device_owned(gpu_owned)
 
     _assert_geometry_lists_equal(gpu_owned.to_shapely(), cpu_owned.to_shapely())

@@ -698,13 +698,13 @@ def _format_query_indices(
 ) -> Any:
     formatted = _sort_indices(indices) if sort else indices
     if output_format == "indices":
-        # ADR-0036: spatial kernels produce integer index arrays only.
+        # ADR-0042: low-level spatial-query kernels still use integer index arrays.
         if __debug__:
             assert isinstance(formatted, np.ndarray), (
-                f"ADR-0036: expected ndarray, got {type(formatted).__name__}"
+                f"ADR-0042: expected ndarray, got {type(formatted).__name__}"
             )
             assert np.issubdtype(formatted.dtype, np.integer), (
-                f"ADR-0036: expected integer dtype, got {formatted.dtype}"
+                f"ADR-0042: expected integer dtype, got {formatted.dtype}"
             )
         return formatted
     if output_format == "dense":

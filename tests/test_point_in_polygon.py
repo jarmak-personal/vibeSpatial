@@ -13,6 +13,7 @@ from vibespatial import (
     has_gpu_runtime,
 )
 from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+from vibespatial.runtime.residency import Residency
 from vibespatial.testing import compare_with_shapely, point_in_polygon_reference
 
 
@@ -164,3 +165,141 @@ def test_gpu_strategies_produce_equivalent_results() -> None:
             f"  auto: {results['auto']}\n"
             f"  {strategy}: {results[strategy]}"
         )
+
+
+@pytest.mark.gpu
+def test_binned_strategy_return_device_stays_device_resident(strict_device_guard) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.kernels.predicates.point_in_polygon import (
+        _evaluate_point_in_polygon_gpu,
+    )
+    from vibespatial.kernels.predicates.point_within_bounds import (
+        NormalizedBoundsInput,
+    )
+
+    def dense_ngon(center_x: float, center_y: float, radius: float, n: int) -> Polygon:
+        angles = np.linspace(0.0, 2.0 * np.pi, num=n, endpoint=False)
+        coords = [
+            (
+                center_x + radius * float(np.cos(angle)),
+                center_y + radius * float(np.sin(angle)),
+            )
+            for angle in angles
+        ]
+        coords.append(coords[0])
+        return Polygon(coords)
+
+    polygons = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            dense_ngon(10.0, 10.0, 2.0, 2048),
+            MultiPolygon([box(20, 20, 22, 22), box(30, 30, 32, 32)]),
+            MultiPolygon([dense_ngon(40.0, 40.0, 2.0, 1536)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        [Point(1, 1), Point(10, 10), Point(21, 21), Point(100, 100)],
+        residency=Residency.DEVICE,
+    )
+    right = NormalizedBoundsInput(
+        bounds=np.zeros((points.row_count, 4), dtype=np.float64),
+        null_mask=np.zeros(points.row_count, dtype=bool),
+        empty_mask=np.zeros(points.row_count, dtype=bool),
+        geometry_array=polygons,
+    )
+    runtime = get_cuda_runtime()
+    original_sync = runtime.synchronize
+
+    def _fail_sync() -> None:
+        raise AssertionError("binned return_device path should not helper-synchronize")
+
+    stream = cp.cuda.Stream(non_blocking=True)
+    runtime.synchronize = _fail_sync
+    try:
+        with stream:
+            result = _evaluate_point_in_polygon_gpu(
+                points,
+                right,
+                strategy="binned",
+                return_device=True,
+            )
+            assert hasattr(result, "__cuda_array_interface__")
+            assert result.shape == (4,)
+            device_sum = cp.asarray(result, dtype=cp.int32).sum()
+            device_last = cp.asarray(result)[3]
+        stream.synchronize()
+        assert int(device_sum.item()) == 3
+        assert bool(device_last.item()) is False
+    finally:
+        runtime.synchronize = original_sync
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("strategy", ["dense", "compacted", "fused"])
+def test_return_device_strategies_stay_device_resident(
+    strategy: str,
+    strict_device_guard,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.kernels.predicates.point_in_polygon import (
+        _evaluate_point_in_polygon_gpu,
+    )
+    from vibespatial.kernels.predicates.point_within_bounds import (
+        NormalizedBoundsInput,
+    )
+
+    polygons = from_shapely_geometries(
+        [
+            box(0, 0, 2, 2),
+            MultiPolygon([box(5, 5, 8, 8), box(10, 10, 12, 12)]),
+            Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]),
+            MultiPolygon([]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        [Point(1, 1), Point(11, 11), Point(2, 2), Point(0, 0)],
+        residency=Residency.DEVICE,
+    )
+    right = NormalizedBoundsInput(
+        bounds=np.zeros((points.row_count, 4), dtype=np.float64),
+        null_mask=np.zeros(points.row_count, dtype=bool),
+        empty_mask=np.zeros(points.row_count, dtype=bool),
+        geometry_array=polygons,
+    )
+    runtime = get_cuda_runtime()
+    original_sync = runtime.synchronize
+
+    def _fail_sync() -> None:
+        raise AssertionError(f"{strategy} return_device path should not helper-synchronize")
+
+    stream = cp.cuda.Stream(non_blocking=True)
+    runtime.synchronize = _fail_sync
+    try:
+        with stream:
+            result = _evaluate_point_in_polygon_gpu(
+                points,
+                right,
+                strategy=strategy,
+                return_device=True,
+            )
+            assert hasattr(result, "__cuda_array_interface__")
+            assert result.shape == (4,)
+            device_sum = cp.asarray(result, dtype=cp.int32).sum()
+            device_last = cp.asarray(result)[3]
+        stream.synchronize()
+        assert int(device_sum.item()) == 3
+        assert bool(device_last.item()) is False
+    finally:
+        runtime.synchronize = original_sync

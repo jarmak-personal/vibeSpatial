@@ -8,11 +8,13 @@ compile_kernel_group wrappers remain in gpu.py.
 
 from __future__ import annotations
 
+from vibespatial.cuda.device_functions.orient2d import ORIENT2D_DEVICE
 from vibespatial.cuda.device_functions.point_in_ring import (
     POINT_IN_RING_BOUNDARY_DEVICE,
     POINT_IN_RING_DEVICE,
 )
 from vibespatial.cuda.device_functions.point_on_segment import POINT_ON_SEGMENT_DEVICE
+from vibespatial.cuda.device_functions.segment_crossing import SEGMENT_CROSSING_DEVICE
 from vibespatial.cuda.preamble import SPATIAL_TOLERANCE_PREAMBLE
 
 # ---------------------------------------------------------------------------
@@ -1033,7 +1035,7 @@ _BATCH_POINT_IN_RING_KERNEL_NAMES = ("batch_point_in_ring",)
 # Kernels: containment_poly_vs_poly, containment_poly_vs_mpoly,
 #          containment_mpoly_vs_poly, containment_mpoly_vs_mpoly
 
-_CONTAINMENT_BYPASS_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
+_CONTAINMENT_BYPASS_KERNEL_SOURCE = ORIENT2D_DEVICE + SEGMENT_CROSSING_DEVICE + POINT_IN_RING_DEVICE + r"""
 // Device helper: polygon containment via even-odd rule across all rings.
 extern "C" __device__ inline bool _cb_polygon_contains(
     double px, double py,
@@ -1084,12 +1086,166 @@ extern "C" __device__ inline bool _cb_multipolygon_contains(
     return false;
 }
 
+extern "C" __device__ inline bool _cb_ring_has_proper_crossing(
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    int left_start,
+    int left_end,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    int corr_start,
+    int corr_end
+) {
+    for (int li = left_start; li + 1 < left_end; ++li) {
+        const double p1x = left_x[li];
+        const double p1y = left_y[li];
+        const double p2x = left_x[li + 1];
+        const double p2y = left_y[li + 1];
+        const double left_min_x = p1x < p2x ? p1x : p2x;
+        const double left_max_x = p1x > p2x ? p1x : p2x;
+        const double left_min_y = p1y < p2y ? p1y : p2y;
+        const double left_max_y = p1y > p2y ? p1y : p2y;
+        for (int ri = corr_start; ri + 1 < corr_end; ++ri) {
+            const double q1x = corr_x[ri];
+            const double q1y = corr_y[ri];
+            const double q2x = corr_x[ri + 1];
+            const double q2y = corr_y[ri + 1];
+            const double corr_min_x = q1x < q2x ? q1x : q2x;
+            const double corr_max_x = q1x > q2x ? q1x : q2x;
+            const double corr_min_y = q1y < q2y ? q1y : q2y;
+            const double corr_max_y = q1y > q2y ? q1y : q2y;
+            if (left_max_x < corr_min_x || corr_max_x < left_min_x
+                    || left_max_y < corr_min_y || corr_max_y < left_min_y) {
+                continue;
+            }
+            if (vs_segments_properly_cross(
+                    p1x, p1y, p2x, p2y,
+                    q1x, q1y, q2x, q2y)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+extern "C" __device__ inline bool _cb_polygon_crosses_polygon_boundary(
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_ring_offsets,
+    int left_row,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row
+) {
+    const int left_ring_start = left_geom_offsets[left_row];
+    const int left_ring_end = left_geom_offsets[left_row + 1];
+    const int corr_ring_start = corr_geom_offsets[corr_row];
+    const int corr_ring_end = corr_geom_offsets[corr_row + 1];
+    for (int lring = left_ring_start; lring < left_ring_end; ++lring) {
+        const int left_start = left_ring_offsets[lring];
+        const int left_end = left_ring_offsets[lring + 1];
+        for (int cring = corr_ring_start; cring < corr_ring_end; ++cring) {
+            const int corr_start = corr_ring_offsets[cring];
+            const int corr_end = corr_ring_offsets[cring + 1];
+            if (_cb_ring_has_proper_crossing(
+                    left_x, left_y, left_start, left_end,
+                    corr_x, corr_y, corr_start, corr_end)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+extern "C" __device__ inline bool _cb_polygon_crosses_multipolygon_boundary(
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_part_offsets,
+    const int* __restrict__ left_ring_offsets,
+    int left_row,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_part_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row,
+    bool left_is_multi
+) {
+    const int left_part_start = left_geom_offsets[left_row];
+    const int left_part_end = left_geom_offsets[left_row + 1];
+    const int corr_poly_start = corr_geom_offsets[corr_row];
+    const int corr_poly_end = corr_geom_offsets[corr_row + 1];
+    for (int lpart = left_part_start; lpart < left_part_end; ++lpart) {
+        const int left_ring_start = left_is_multi ? left_part_offsets[lpart] : lpart;
+        const int left_ring_end = left_is_multi ? left_part_offsets[lpart + 1] : (lpart + 1);
+        for (int lring = left_ring_start; lring < left_ring_end; ++lring) {
+            const int left_start = left_ring_offsets[lring];
+            const int left_end = left_ring_offsets[lring + 1];
+            for (int cpoly = corr_poly_start; cpoly < corr_poly_end; ++cpoly) {
+                const int corr_ring_start = corr_part_offsets[cpoly];
+                const int corr_ring_end = corr_part_offsets[cpoly + 1];
+                for (int cring = corr_ring_start; cring < corr_ring_end; ++cring) {
+                    const int corr_start = corr_ring_offsets[cring];
+                    const int corr_end = corr_ring_offsets[cring + 1];
+                    if (_cb_ring_has_proper_crossing(
+                            left_x, left_y, left_start, left_end,
+                            corr_x, corr_y, corr_start, corr_end)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
+extern "C" __device__ inline bool _cb_multipolygon_crosses_polygon_boundary(
+    const double* __restrict__ left_x,
+    const double* __restrict__ left_y,
+    const int* __restrict__ left_geom_offsets,
+    const int* __restrict__ left_part_offsets,
+    const int* __restrict__ left_ring_offsets,
+    int left_row,
+    const double* __restrict__ corr_x,
+    const double* __restrict__ corr_y,
+    const int* __restrict__ corr_geom_offsets,
+    const int* __restrict__ corr_ring_offsets,
+    int corr_row
+) {
+    const int left_part_start = left_geom_offsets[left_row];
+    const int left_part_end = left_geom_offsets[left_row + 1];
+    const int corr_ring_start = corr_geom_offsets[corr_row];
+    const int corr_ring_end = corr_geom_offsets[corr_row + 1];
+    for (int lpart = left_part_start; lpart < left_part_end; ++lpart) {
+        const int left_ring_start = left_part_offsets[lpart];
+        const int left_ring_end = left_part_offsets[lpart + 1];
+        for (int lring = left_ring_start; lring < left_ring_end; ++lring) {
+            const int left_start = left_ring_offsets[lring];
+            const int left_end = left_ring_offsets[lring + 1];
+            for (int cring = corr_ring_start; cring < corr_ring_end; ++cring) {
+                const int corr_start = corr_ring_offsets[cring];
+                const int corr_end = corr_ring_offsets[cring + 1];
+                if (_cb_ring_has_proper_crossing(
+                        left_x, left_y, left_start, left_end,
+                        corr_x, corr_y, corr_start, corr_end)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 // -----------------------------------------------------------------
-// Thread-per-polygon kernel: test all vertices of each candidate
-// polygon against the corridor.  Output 1 if ALL vertices are
-// inside, 0 otherwise.  Reads vertices directly from the source
-// family coordinate buffers using offset indirection -- no vertex
-// scatter required.
+// Thread-per-polygon kernel: test one sample point per candidate ring
+// against the corridor, then reject any proper boundary crossings.
+// If a simple ring has one point inside the corridor and its boundary
+// does not cross the corridor boundary, the whole ring is inside.
+// Reads directly from source family coordinate buffers -- no scatter.
 // -----------------------------------------------------------------
 
 // Polygon candidates vs. polygon corridor.
@@ -1113,16 +1269,23 @@ containment_poly_vs_poly(
     const int frow = cand_family_rows[cid];
     const int first_ring = left_geom_offsets[frow];
     const int last_ring = left_geom_offsets[frow + 1];
-    const int coord_start = left_ring_offsets[first_ring];
-    const int coord_end = left_ring_offsets[last_ring];
-    for (int v = coord_start; v < coord_end; ++v) {
+    for (int lring = first_ring; lring < last_ring; ++lring) {
+        const int sample = left_ring_offsets[lring];
         if (!_cb_polygon_contains(
-                left_x[v], left_y[v],
+                left_x[sample], left_y[sample],
                 corr_x, corr_y,
                 corr_geom_offsets, corr_ring_offsets, corr_row)) {
             out[cid] = 0;
             return;
         }
+    }
+    if (_cb_polygon_crosses_polygon_boundary(
+            left_x, left_y,
+            left_geom_offsets, left_ring_offsets, frow,
+            corr_x, corr_y,
+            corr_geom_offsets, corr_ring_offsets, corr_row)) {
+        out[cid] = 0;
+        return;
     }
     out[cid] = 1;
 }
@@ -1149,17 +1312,26 @@ containment_poly_vs_mpoly(
     const int frow = cand_family_rows[cid];
     const int first_ring = left_geom_offsets[frow];
     const int last_ring = left_geom_offsets[frow + 1];
-    const int coord_start = left_ring_offsets[first_ring];
-    const int coord_end = left_ring_offsets[last_ring];
-    for (int v = coord_start; v < coord_end; ++v) {
+    for (int lring = first_ring; lring < last_ring; ++lring) {
+        const int sample = left_ring_offsets[lring];
         if (!_cb_multipolygon_contains(
-                left_x[v], left_y[v],
+                left_x[sample], left_y[sample],
                 corr_x, corr_y,
                 corr_geom_offsets, corr_part_offsets,
                 corr_ring_offsets, corr_row)) {
             out[cid] = 0;
             return;
         }
+    }
+    if (_cb_polygon_crosses_multipolygon_boundary(
+            left_x, left_y,
+            left_geom_offsets, left_geom_offsets,
+            left_ring_offsets, frow,
+            corr_x, corr_y,
+            corr_geom_offsets, corr_part_offsets, corr_ring_offsets, corr_row,
+            false)) {
+        out[cid] = 0;
+        return;
     }
     out[cid] = 1;
 }
@@ -1186,18 +1358,28 @@ containment_mpoly_vs_poly(
     const int frow = cand_family_rows[cid];
     const int first_part = left_geom_offsets[frow];
     const int last_part = left_geom_offsets[frow + 1];
-    const int first_ring = left_part_offsets[first_part];
-    const int last_ring = left_part_offsets[last_part];
-    const int coord_start = left_ring_offsets[first_ring];
-    const int coord_end = left_ring_offsets[last_ring];
-    for (int v = coord_start; v < coord_end; ++v) {
-        if (!_cb_polygon_contains(
-                left_x[v], left_y[v],
-                corr_x, corr_y,
-                corr_geom_offsets, corr_ring_offsets, corr_row)) {
-            out[cid] = 0;
-            return;
+    for (int part = first_part; part < last_part; ++part) {
+        const int first_ring = left_part_offsets[part];
+        const int last_ring = left_part_offsets[part + 1];
+        for (int lring = first_ring; lring < last_ring; ++lring) {
+            const int sample = left_ring_offsets[lring];
+            if (!_cb_polygon_contains(
+                    left_x[sample], left_y[sample],
+                    corr_x, corr_y,
+                    corr_geom_offsets, corr_ring_offsets, corr_row)) {
+                out[cid] = 0;
+                return;
+            }
         }
+    }
+    if (_cb_multipolygon_crosses_polygon_boundary(
+            left_x, left_y,
+            left_geom_offsets, left_part_offsets,
+            left_ring_offsets, frow,
+            corr_x, corr_y,
+            corr_geom_offsets, corr_ring_offsets, corr_row)) {
+        out[cid] = 0;
+        return;
     }
     out[cid] = 1;
 }
@@ -1225,19 +1407,30 @@ containment_mpoly_vs_mpoly(
     const int frow = cand_family_rows[cid];
     const int first_part = left_geom_offsets[frow];
     const int last_part = left_geom_offsets[frow + 1];
-    const int first_ring = left_part_offsets[first_part];
-    const int last_ring = left_part_offsets[last_part];
-    const int coord_start = left_ring_offsets[first_ring];
-    const int coord_end = left_ring_offsets[last_ring];
-    for (int v = coord_start; v < coord_end; ++v) {
-        if (!_cb_multipolygon_contains(
-                left_x[v], left_y[v],
-                corr_x, corr_y,
-                corr_geom_offsets, corr_part_offsets,
-                corr_ring_offsets, corr_row)) {
-            out[cid] = 0;
-            return;
+    for (int part = first_part; part < last_part; ++part) {
+        const int first_ring = left_part_offsets[part];
+        const int last_ring = left_part_offsets[part + 1];
+        for (int lring = first_ring; lring < last_ring; ++lring) {
+            const int sample = left_ring_offsets[lring];
+            if (!_cb_multipolygon_contains(
+                    left_x[sample], left_y[sample],
+                    corr_x, corr_y,
+                    corr_geom_offsets, corr_part_offsets,
+                    corr_ring_offsets, corr_row)) {
+                out[cid] = 0;
+                return;
+            }
         }
+    }
+    if (_cb_polygon_crosses_multipolygon_boundary(
+            left_x, left_y,
+            left_geom_offsets, left_part_offsets,
+            left_ring_offsets, frow,
+            corr_x, corr_y,
+            corr_geom_offsets, corr_part_offsets, corr_ring_offsets, corr_row,
+            true)) {
+        out[cid] = 0;
+        return;
     }
     out[cid] = 1;
 }

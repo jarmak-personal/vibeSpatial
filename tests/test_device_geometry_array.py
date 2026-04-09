@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pickle
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ from shapely.geometry import (
     box,
 )
 
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.device_array import DeviceGeometryArray, DeviceGeometryDtype
 from vibespatial.geometry.owned import (
     DiagnosticKind,
@@ -536,6 +538,25 @@ class TestEmptyGeometries:
 # ---------------------------------------------------------------------------
 
 class TestDiagnostics:
+    def test_geometry_array_from_owned_materializes_without_wkb_bridge(
+        self, points, monkeypatch
+    ):
+        from vibespatial.io import wkb as wkb_module
+
+        def _fail_encode(*args, **kwargs):
+            raise AssertionError("GeometryArray host materialization should not use WKB bridge")
+
+        monkeypatch.setattr(wkb_module, "encode_wkb_owned", _fail_encode)
+
+        owned = from_shapely_geometries(points)
+        ga = GeometryArray.from_owned(owned)
+
+        result = ga._data
+
+        assert result.shape == (len(points),)
+        assert result[0].equals(Point(0, 0))
+        assert result[-1].equals(Point(4, 4))
+
     def test_materialization_event_on_shapely_access(self, points):
         owned = from_shapely_geometries(points)
         dga = DeviceGeometryArray._from_owned(owned)
@@ -968,6 +989,29 @@ class TestConstructiveOpsReturnDGA:
         assert isinstance(result, DeviceGeometryArray)
         assert len(result) == 5
         assert result[0].geom_type == "Polygon"
+        assert result._provenance is not None
+        assert result._provenance.operation == "buffer"
+
+    def test_linestring_buffer_preserves_provenance_through_geodataframe_assignment(self):
+        import vibespatial.api as geopandas
+
+        dga = DeviceGeometryArray._from_sequence(
+            [
+                LineString([(0, 0), (10, 0)]),
+                LineString([(0, 5), (10, 5)]),
+            ]
+        )
+
+        frame = geopandas.GeoDataFrame(
+            geometry=geopandas.GeoSeries(dga, crs="EPSG:3857"),
+            crs="EPSG:3857",
+        )
+        frame["geometry"] = frame.geometry.buffer(1.0)
+
+        tag = getattr(frame.geometry.values, "_provenance", None)
+        assert tag is not None
+        assert tag.operation == "buffer"
+        assert tag.source_array is not None
 
     def test_small_linestring_buffer_honors_auto_crossover(self, monkeypatch):
         import vibespatial.constructive.linestring as linestring_module
@@ -990,6 +1034,114 @@ class TestConstructiveOpsReturnDGA:
         assert len(result) == 2
         materialized = np.asarray(result, dtype=object)
         assert bool(shapely.is_valid(materialized).all())
+
+    def test_large_two_point_linestring_buffer_uses_specialized_gpu_route(self, monkeypatch):
+        import vibespatial.constructive.linestring as linestring_module
+        import vibespatial.runtime.adaptive as adaptive_module
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+        dga = DeviceGeometryArray._from_sequence(
+            [
+                LineString([(0.0, float(i)), (10.0, float(i))])
+                for i in range(600)
+            ]
+        )
+
+        called: dict[str, object] = {}
+
+        def _fake_linestring_buffer_owned_array(owned, *_args, **_kwargs):
+            called["row_count"] = owned.row_count
+            return from_shapely_geometries(
+                [
+                    Polygon(
+                        [
+                            (0.0, float(i)),
+                            (10.0, float(i)),
+                            (10.0, float(i) + 1.0),
+                            (0.0, float(i) + 1.0),
+                            (0.0, float(i)),
+                        ]
+                    )
+                    for i in range(owned.row_count)
+                ]
+            )
+
+        monkeypatch.setattr(
+            adaptive_module,
+            "plan_dispatch_selection",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                selected=ExecutionMode.CPU,
+                reason="forced cpu for test",
+            ),
+        )
+        monkeypatch.setattr(
+            linestring_module,
+            "linestring_buffer_owned_array",
+            _fake_linestring_buffer_owned_array,
+        )
+
+        clear_dispatch_events()
+        result = dga.buffer(1.0)
+        dispatch_events = get_dispatch_events(clear=True)
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert len(result) == 600
+        assert called["row_count"] == 600
+        buffer_events = [event for event in dispatch_events if event.surface == "DeviceGeometryArray.buffer"]
+        assert buffer_events
+        assert buffer_events[-1].implementation == "linestring_buffer_owned_array"
+        assert buffer_events[-1].selected.value == "gpu"
+
+    def test_two_point_linestring_buffer_honors_auto_crossover(self, monkeypatch):
+        import vibespatial.constructive.linestring as linestring_module
+        import vibespatial.runtime.adaptive as adaptive_module
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+        dga = DeviceGeometryArray._from_sequence(
+            [
+                LineString([(0, 0), (10, 0)]),
+                LineString([(0, 5), (10, 5)]),
+            ]
+        )
+
+        called: dict[str, object] = {}
+
+        def _fake_linestring_buffer_owned_array(owned, *_args, **_kwargs):
+            called["row_count"] = owned.row_count
+            return from_shapely_geometries(
+                [
+                    Polygon([(0, 0), (10, 0), (10, 1), (0, 1), (0, 0)]),
+                    Polygon([(0, 5), (10, 5), (10, 6), (0, 6), (0, 5)]),
+                ]
+            )
+
+        monkeypatch.setattr(
+            adaptive_module,
+            "plan_dispatch_selection",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                selected=ExecutionMode.CPU,
+                reason="forced cpu for test",
+            ),
+        )
+        monkeypatch.setattr(
+            linestring_module,
+            "linestring_buffer_owned_array",
+            _fake_linestring_buffer_owned_array,
+        )
+
+        clear_dispatch_events()
+        result = dga.buffer(1.0)
+        dispatch_events = get_dispatch_events(clear=True)
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert len(result) == 2
+        assert dispatch_events
+        assert "row_count" not in called
+        buffer_events = [event for event in dispatch_events if event.surface == "DeviceGeometryArray.buffer"]
+        assert buffer_events
+        assert all(event.selected.value == "cpu" for event in buffer_events)
 
     def test_intersection_returns_dga(self, poly_dga):
         other = DeviceGeometryArray._from_sequence([

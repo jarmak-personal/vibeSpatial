@@ -8,6 +8,7 @@ import shapely
 
 from vibespatial.api import read_file
 from vibespatial.constructive.binary_constructive import _dispatch_overlay_gpu
+from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
 from vibespatial.overlay.faces import _select_overlay_face_indices_gpu, build_gpu_overlay_faces
@@ -126,3 +127,57 @@ def test_row_isolated_difference_preserves_sparse_multipolygon_rows() -> None:
     assert got[2] is not None
     assert got[2].geom_type == "MultiPolygon"
     assert got[2].normalize().equals_exact(expected[2].normalize(), tolerance=1e-6)
+
+
+@pytest.mark.gpu
+def test_row_isolated_difference_preserves_all_empty_rows() -> None:
+    left = from_shapely_geometries([
+        shapely.box(0.0, 0.0, 2.0, 2.0),
+        shapely.box(4.0, 0.0, 6.0, 2.0),
+    ])
+    right = from_shapely_geometries([
+        shapely.box(0.0, 0.0, 2.0, 2.0),
+        shapely.box(4.0, 0.0, 6.0, 2.0),
+    ])
+
+    result = _dispatch_overlay_gpu(
+        "difference",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    )
+
+    assert result.row_count == 2
+    assert np.asarray(result.validity, dtype=bool).tolist() == [False, False]
+
+
+@pytest.mark.gpu
+def test_gpu_face_assembly_uses_runtime_launch_config(monkeypatch) -> None:
+    left = from_shapely_geometries([
+        shapely.box(0.0, 0.0, 4.0, 4.0),
+    ])
+    right = from_shapely_geometries([
+        shapely.box(2.0, 1.0, 5.0, 3.0),
+    ])
+
+    split_events = build_gpu_split_events(left, right)
+    atomic_edges = build_gpu_atomic_edges(split_events)
+    half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
+    faces = build_gpu_overlay_faces(left, right, half_edge_graph=half_edge_graph)
+    selected = _select_overlay_face_indices_gpu(faces, operation="intersection")
+
+    runtime = get_cuda_runtime()
+    original_launch_config = runtime.launch_config
+    launch_config_calls = 0
+
+    def _wrapped_launch_config(kernel, item_count, shared_mem_bytes=0):
+        nonlocal launch_config_calls
+        launch_config_calls += 1
+        return original_launch_config(kernel, item_count, shared_mem_bytes)
+
+    monkeypatch.setattr(runtime, "launch_config", _wrapped_launch_config)
+
+    gpu_result = _build_polygon_output_from_faces_gpu(half_edge_graph, faces, selected)
+    assert launch_config_calls >= 5
+    assert gpu_result.to_shapely()[0].is_valid

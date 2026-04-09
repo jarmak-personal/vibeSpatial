@@ -94,13 +94,41 @@ def test_kvikio_path_returns_none_host_bytes(tmp_path):
     if not has_kvikio():
         pytest.skip("kvikio not installed")
 
+    import vibespatial.io.kvikio_reader as mod
+
     data = np.arange(512, dtype=np.uint8)
     path = tmp_path / "kvikio_path.bin"
     data.tofile(str(path))
 
-    result = read_file_to_device(path, file_size=len(data))
+    original_threshold = mod._KVIKIO_DIRECT_READ_MIN_FILE_SIZE
+    mod._KVIKIO_DIRECT_READ_MIN_FILE_SIZE = 0
+    try:
+        result = read_file_to_device(path, file_size=len(data))
+    finally:
+        mod._KVIKIO_DIRECT_READ_MIN_FILE_SIZE = original_threshold
 
     assert result.host_bytes is None
+    np.testing.assert_array_equal(cp.asnumpy(result.device_bytes), data)
+
+
+@needs_gpu
+def test_small_files_prefer_host_path_even_with_kvikio(tmp_path, monkeypatch):
+    """Small files stay on the cheaper host read path despite kvikio availability."""
+    import vibespatial.io.kvikio_reader as mod
+
+    data = np.arange(1024, dtype=np.uint8)
+    path = tmp_path / "small_host_pref.bin"
+    data.tofile(str(path))
+
+    if not has_kvikio():
+        pytest.skip("kvikio not installed")
+
+    monkeypatch.setattr(mod, "_KVIKIO_DIRECT_READ_MIN_FILE_SIZE", 1 << 30)
+
+    result = read_file_to_device(path, file_size=len(data))
+
+    assert result.host_bytes is not None
+    np.testing.assert_array_equal(result.host_bytes, data)
     np.testing.assert_array_equal(cp.asnumpy(result.device_bytes), data)
 
 

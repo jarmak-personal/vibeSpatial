@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib
 
+import numpy as np
 import pandas as pd
+import shapely
 from shapely.geometry import LineString, Point, box
 
 import vibespatial.api as geopandas
@@ -10,13 +12,18 @@ from vibespatial import (
     DissolveUnionMethod,
     benchmark_dissolve_pipeline,
     fusion_plan_for_dissolve,
+    has_gpu_runtime,
     plan_dissolve_pipeline,
 )
+from vibespatial.api._native_results import GroupedConstructiveResult
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.testing import assert_geodataframe_equal
+from vibespatial.bench.pipeline import _dissolve_join_heavy_groups, _regular_polygons_frame
+from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, execute_grouped_union
 from vibespatial.runtime.fusion import IntermediateDisposition
+from vibespatial.runtime.provenance import clear_rewrite_events, get_rewrite_events
 
 dissolve_module = importlib.import_module("vibespatial.overlay.dissolve")
 
@@ -186,6 +193,309 @@ def test_execute_grouped_union_codes_avoids_geometry_array_materialization_for_o
     assert grouped is not None
     assert grouped.group_count == 1
     assert grouped.non_empty_groups == 1
+    assert grouped.owned is not None
+    assert grouped.geometries is None
+
+
+def test_evaluate_geopandas_dissolve_rewrites_buffered_line_unary_to_disjoint_subset() -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(64, dtype=np.int32),
+            "value": np.arange(64, dtype=np.int32),
+            "geometry": [
+                LineString([(float(i), 0.0), (float(i), 10.0)])
+                for i in range(64)
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+
+    clear_rewrite_events()
+    actual = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    expected = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="disjoint_subset",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert any(
+        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+        for event in rewrite_events
+    )
+    actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
+    expected_geom = np.asarray(expected.geometry.array, dtype=object)[0]
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+    assert actual.iloc[0]["value"] == expected.iloc[0]["value"]
+
+
+def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines_to_exact_gpu_union(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    lines = [
+        LineString([(0.0, 0.0), (10.0, 0.0)]),
+        LineString([(10.0, 0.0), (0.0, 0.0)]),
+        LineString([(0.0, 5.0), (10.0, 5.0)]),
+        LineString([(10.0, 5.0), (0.0, 5.0)]),
+    ] * 32
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(len(lines), dtype=np.int32),
+            "value": np.arange(len(lines), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(lines),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("duplicate two-point buffered-line dissolve should bypass the generic grouped union path")
+
+    monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
+
+    clear_rewrite_events()
+    actual = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    expected = geopandas.GeoDataFrame(
+        {
+            "geometry": [shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))],
+            "value": [0],
+        },
+        geometry="geometry",
+        index=pd.Index([0], name="group"),
+        crs=buffered.crs,
+    )
+
+    assert any(
+        event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
+        for event in rewrite_events
+    )
+    actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
+    expected_geom = np.asarray(expected.geometry.array, dtype=object)[0]
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+    assert actual.iloc[0]["value"] == expected.iloc[0]["value"]
+
+
+def test_dedupe_two_point_linestring_rows_prefers_host_metadata_when_available(
+    monkeypatch,
+) -> None:
+    lines = [
+        LineString([(0.0, 0.0), (10.0, 0.0)]),
+        LineString([(10.0, 0.0), (0.0, 0.0)]),
+        LineString([(0.0, 5.0), (10.0, 5.0)]),
+        LineString([(10.0, 5.0), (0.0, 5.0)]),
+        LineString([(2.0, 2.0), (2.0, 8.0)]),
+    ] * 8
+    owned = from_shapely_geometries(lines)
+    owned._ensure_host_state()
+
+    if dissolve_module.cp is not None:
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("host-materialized dedupe should not call device-side lexsort")
+
+        monkeypatch.setattr(dissolve_module.cp, "lexsort", _fail)
+
+    unique_rows = dissolve_module._dedupe_two_point_linestring_rows_gpu(owned)
+
+    assert unique_rows is not None
+    deduped = np.asarray(owned.take(unique_rows.astype(np.int64, copy=False)).to_shapely(), dtype=object)
+    assert deduped.shape == (3,)
+
+    def _normalized_endpoints(geom) -> tuple[tuple[float, float], tuple[float, float]]:
+        start = (float(geom.coords[0][0]), float(geom.coords[0][1]))
+        end = (float(geom.coords[-1][0]), float(geom.coords[-1][1]))
+        return (start, end) if start <= end else (end, start)
+
+    assert {_normalized_endpoints(geom) for geom in deduped} == {
+        ((0.0, 0.0), (10.0, 0.0)),
+        ((0.0, 5.0), (10.0, 5.0)),
+        ((2.0, 2.0), (2.0, 8.0)),
+    }
+
+
+def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(64, dtype=np.int32),
+            "value": np.arange(64, dtype=np.int32),
+            "geometry": [
+                box(float(i), 0.0, float(i) + 0.5, 0.5)
+                for i in range(64)
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.25)
+
+    clear_rewrite_events()
+    evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    assert not any(
+        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+        for event in rewrite_events
+    )
+
+
+def test_device_backed_buffered_line_dissolve_preserves_provenance_for_rewrite() -> None:
+    lines = [
+        LineString([(float(i), 0.0), (float(i), 10.0)])
+        for i in range(64)
+    ]
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(64, dtype=np.int32),
+            "value": np.arange(64, dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(lines),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+    assert getattr(buffered.geometry.values, "_provenance", None) is not None
+
+    clear_rewrite_events()
+    result = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    assert len(result) == 1
+    assert any(
+        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+        for event in rewrite_events
+    )
+
+
+def test_execute_grouped_box_union_gpu_owned_codes_builds_device_backed_coverage_rectangles() -> None:
+    if not has_gpu_runtime():
+        return
+
+    geometry_array = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                box(0, 0, 1, 1),
+                box(1, 0, 2, 1),
+                box(10, 10, 11, 11),
+                box(11, 10, 12, 11),
+            ]
+        )
+    )
+    owned = getattr(geometry_array, "_owned", None)
+    assert owned is not None
+
+    grouped = dissolve_module.execute_grouped_box_union_gpu_owned_codes(
+        pd.Index([0, 0, 1, 1], dtype="int32").to_numpy(),
+        group_count=2,
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.group_count == 2
+    assert grouped.non_empty_groups == 2
+    assert grouped.owned is not None
+    assert grouped.geometries is None
+    actual = np.asarray(grouped.owned.to_shapely(), dtype=object)
+    expected = np.asarray([box(0, 0, 2, 1), box(10, 10, 12, 11)], dtype=object)
+    assert all(actual_geom.equals(expected_geom) for actual_geom, expected_geom in zip(actual, expected, strict=True))
+
+
+def test_execute_grouped_box_union_gpu_owned_codes_accepts_fractional_rectangles() -> None:
+    if not has_gpu_runtime():
+        return
+
+    frame = _regular_polygons_frame(32)
+    geometry_array = GeometryArray.from_owned(
+        from_shapely_geometries(list(frame.geometry))
+    )
+    owned = getattr(geometry_array, "_owned", None)
+    assert owned is not None
+
+    grouped = dissolve_module.execute_grouped_box_union_gpu_owned_codes(
+        np.arange(len(frame), dtype=np.int32) % 16,
+        group_count=16,
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.owned is not None
+    assert grouped.geometries is None
 
 
 def test_execute_grouped_union_codes_linestrings_skip_owned_segmented_union_fast_path(
@@ -218,3 +528,87 @@ def test_execute_grouped_union_codes_linestrings_skip_owned_segmented_union_fast
     )
 
     assert grouped is None
+
+
+def test_join_heavy_synthetic_groups_match_between_coverage_and_unary() -> None:
+    frame = _regular_polygons_frame(256)
+    frame["group"] = pd.Categorical(np.arange(len(frame), dtype=np.int32) % 128)
+
+    coverage = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="coverage",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    unary = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert_geodataframe_equal(unary, coverage)
+
+
+def test_join_heavy_direct_grouped_dissolve_matches_public_coverage_dissolve(
+    monkeypatch,
+) -> None:
+    frame = _regular_polygons_frame(256)
+    unique_right_index = np.arange(len(frame), dtype=np.int64)
+    calls: list[DissolveUnionMethod] = []
+    real_codes = dissolve_module.execute_grouped_union_codes
+
+    def _count_codes(*args, **kwargs):
+        calls.append(DissolveUnionMethod(kwargs["method"]))
+        return real_codes(*args, **kwargs)
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("join-heavy benchmark helper should not fall back to public dissolve here")
+
+    monkeypatch.setattr("vibespatial.bench.pipeline.execute_grouped_union_codes", _count_codes)
+    monkeypatch.setattr("vibespatial.bench.pipeline.evaluate_geopandas_dissolve", _fail)
+
+    dissolved, used_direct = _dissolve_join_heavy_groups(
+        frame.geometry,
+        unique_right_index,
+        scale=len(frame),
+    )
+    expected = evaluate_geopandas_dissolve(
+        geopandas.GeoDataFrame(
+            {
+                "group": pd.Categorical(unique_right_index % 128),
+                "geometry": frame.geometry,
+            },
+            geometry="geometry",
+            crs=frame.crs,
+        ),
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="coverage",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert used_direct is True
+    assert calls == [DissolveUnionMethod.COVERAGE]
+    assert isinstance(dissolved, GroupedConstructiveResult)
+    assert_geodataframe_equal(dissolved.to_geodataframe(), expected)

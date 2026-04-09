@@ -20,6 +20,7 @@ _NVTX_COLORS = {
 
 
 _SPARKLINE_BARS = " ▁▂▃▄▅▆▇█"
+_CUPY_MODULE: Any | bool | None = None
 
 
 def _format_percent(value: float) -> str:
@@ -28,6 +29,18 @@ def _format_percent(value: float) -> str:
 
 def _format_bytes_mib(value: int) -> str:
     return f"{value / (1024 * 1024):.0f}MiB"
+
+
+def _format_elapsed_compact(seconds: float) -> str:
+    if seconds <= 0.0:
+        return "0us"
+    if seconds < 0.001:
+        return f"{seconds * 1_000_000:.0f}us"
+    if seconds < 0.1:
+        return f"{seconds * 1_000:.2f}ms"
+    if seconds < 1.0:
+        return f"{seconds * 1_000:.1f}ms"
+    return f"{seconds:.2f}s"
 
 
 def _sparkline(values: list[float], *, width: int = 28) -> str:
@@ -52,6 +65,65 @@ def _sparkline(values: list[float], *, width: int = 28) -> str:
 
 
 _NvmlGpuSampler = NvmlGpuSampler
+
+
+def _load_cupy() -> Any | None:
+    global _CUPY_MODULE
+    if _CUPY_MODULE is False:
+        return None
+    if _CUPY_MODULE is None:
+        try:
+            _CUPY_MODULE = import_module("cupy")
+        except Exception:
+            _CUPY_MODULE = False
+            return None
+    return _CUPY_MODULE
+
+
+@dataclass
+class _StageCudaEventTimer:
+    _cp: Any | None = field(default=None, init=False)
+    _start_event: Any | None = field(default=None, init=False)
+    _end_event: Any | None = field(default=None, init=False)
+    _elapsed_seconds: float | None = field(default=None, init=False)
+
+    @property
+    def available(self) -> bool:
+        if self._cp is None:
+            self._cp = _load_cupy()
+        return self._cp is not None
+
+    def start(self) -> None:
+        if not self.available:
+            return
+        try:
+            self._start_event = self._cp.cuda.Event()
+            self._end_event = self._cp.cuda.Event()
+            self._start_event.record(self._cp.cuda.get_current_stream())
+        except Exception:
+            self._start_event = None
+            self._end_event = None
+
+    def stop(self) -> None:
+        if self._cp is None or self._start_event is None or self._end_event is None:
+            return
+        try:
+            self._end_event.record(self._cp.cuda.get_current_stream())
+            self._end_event.synchronize()
+            elapsed_ms = float(self._cp.cuda.get_elapsed_time(self._start_event, self._end_event))
+        except Exception:
+            self._elapsed_seconds = None
+            return
+        self._elapsed_seconds = max(0.0, elapsed_ms / 1000.0)
+
+    def summarize(self) -> dict[str, Any]:
+        if self._elapsed_seconds is None:
+            return {}
+        return {
+            "gpu_event_elapsed_seconds": self._elapsed_seconds,
+            "gpu_event_elapsed_display": _format_elapsed_compact(self._elapsed_seconds),
+            "gpu_timing_source": "cuda_event",
+        }
 
 
 @dataclass
@@ -215,6 +287,7 @@ class StageProfiler:
         selected_runtime: ExecutionMode | str,
         enable_nvtx: bool = False,
         gpu_sampler: Any | None = None,
+        gpu_event_timer_factory: Any | None = None,
         gpu_sample_interval_seconds: float = 0.001,
         retain_gpu_trace: bool = False,
         include_gpu_sparklines: bool = False,
@@ -229,6 +302,9 @@ class StageProfiler:
         )
         self.enable_nvtx = enable_nvtx
         self._gpu_sampler = gpu_sampler if gpu_sampler is not None else _NvmlGpuSampler()
+        self._gpu_event_timer_factory = (
+            gpu_event_timer_factory if gpu_event_timer_factory is not None else _StageCudaEventTimer
+        )
         self._gpu_sample_interval_seconds = gpu_sample_interval_seconds
         self._retain_gpu_trace = retain_gpu_trace
         self._include_gpu_sparklines = include_gpu_sparklines
@@ -249,24 +325,40 @@ class StageProfiler:
         measurement = StageMeasurement(detail=detail, device=device, metadata=dict(metadata or {}))
         label = f"{self.operation}:{name}"
         selected_device = device.value if isinstance(device, ExecutionMode) else str(device)
+        track_gpu_events = selected_device != ExecutionMode.CPU.value
         gpu_collector = _StageGpuTelemetryCollector(
             sampler=self._gpu_sampler,
             interval_seconds=self._gpu_sample_interval_seconds,
             retain_trace=self._retain_gpu_trace,
             include_sparklines=self._include_gpu_sparklines,
         )
+        gpu_event_timer = self._gpu_event_timer_factory()
         gpu_collector.start()
+        if track_gpu_events:
+            gpu_event_timer.start()
         started = perf_counter()
         with _maybe_nvtx_context(label, category, enabled=self.enable_nvtx):
             yield measurement
         elapsed = perf_counter() - started
         gpu_collector.stop()
+        if track_gpu_events:
+            gpu_event_timer.stop()
+        resolved_device = (
+            measurement.device.value
+            if isinstance(measurement.device, ExecutionMode)
+            else str(measurement.device or selected_device)
+        )
+        measurement.metadata["elapsed_display"] = _format_elapsed_compact(elapsed)
         measurement.metadata.update(gpu_collector.summarize())
+        if resolved_device == ExecutionMode.GPU.value:
+            gpu_event_summary = gpu_event_timer.summarize()
+            if gpu_event_summary:
+                measurement.metadata.update(gpu_event_summary)
         self._stages.append(
             ProfileStageTrace(
                 name=name,
                 category=category,
-                device=measurement.device.value if isinstance(measurement.device, ExecutionMode) else (measurement.device or selected_device),
+                device=resolved_device,
                 elapsed_seconds=elapsed,
                 rows_in=rows_in,
                 rows_out=measurement.rows_out,

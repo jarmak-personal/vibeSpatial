@@ -12,11 +12,16 @@ Each test is parametrized across CPU and GPU dispatch modes.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import shapely
 from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 
+from vibespatial import has_gpu_runtime
 from vibespatial.constructive.validity import is_valid_owned
 from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+from vibespatial.runtime.residency import Residency
 
 
 def _build_owned(*geoms) -> tuple:
@@ -27,6 +32,11 @@ def _build_owned(*geoms) -> tuple:
     geom_array = np.array(list(geoms), dtype=object)
     owned = from_shapely_geometries(list(geoms))
     return owned, geom_array
+
+
+requires_gpu = pytest.mark.skipif(
+    not has_gpu_runtime(), reason="GPU runtime not available",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +149,28 @@ class TestMixedTypes:
         owned, geoms = _build_owned(None)
         result = is_valid_owned(owned, dispatch_mode=dispatch_mode)
         assert result[0] is np.bool_(True)
+
+
+@requires_gpu
+def test_is_valid_owned_auto_stays_gpu_on_device_resident_buffers() -> None:
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+            Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    clear_dispatch_events()
+    result = is_valid_owned(owned, dispatch_mode=ExecutionMode.AUTO)
+    events = get_dispatch_events(clear=True)
+
+    np.testing.assert_array_equal(result, np.array([True, True], dtype=bool))
+    assert events, "expected is_valid_owned to record a dispatch event"
+    event = events[-1]
+    assert event.surface == "geopandas.array.is_valid"
+    assert event.selected is ExecutionMode.GPU
+    assert event.implementation != "is_valid_cpu"
 
 
 # ---------------------------------------------------------------------------

@@ -624,7 +624,12 @@ def make_valid_owned(
         null_mask = ~owned.validity
         from vibespatial.constructive.validity import is_valid_owned
 
-        gpu_mask = is_valid_owned(owned)
+        # Once the public make_valid boundary has selected GPU, keep the
+        # internal validity pass on GPU as well instead of replanning below
+        # a smaller unary crossover.
+        if owned.device_state is None:
+            owned._ensure_device_state()
+        gpu_mask = is_valid_owned(owned, dispatch_mode=ExecutionMode.GPU)
         gpu_mask[null_mask] = False
         # Non-polygon families: validate from owned buffers (no Shapely needed)
         _non_polygon_validity_from_owned(owned, gpu_mask)

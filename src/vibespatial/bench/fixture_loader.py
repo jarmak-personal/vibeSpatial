@@ -50,7 +50,7 @@ def load_owned(
         case InputFormat.GEOJSON:
             from vibespatial.io.geojson import read_geojson_owned
 
-            batch = read_geojson_owned(str(path))
+            batch = read_geojson_owned(str(path), track_properties=False)
             owned = batch.geometry
         case InputFormat.SHAPEFILE:
             from vibespatial.io.file import read_shapefile_owned

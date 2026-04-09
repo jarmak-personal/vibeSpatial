@@ -2,14 +2,14 @@ from warnings import warn
 
 import numpy as np
 import pandas as pd
-from pandas import DataFrame, Series
-
 import shapely
+from pandas import DataFrame, Series
 from shapely.geometry import MultiPoint, box
 from shapely.geometry.base import BaseGeometry
 
+from vibespatial.api.geometry_array import GeometryDtype, points_from_xy
+
 from . import _compat as compat
-from vibespatial.api.geometry_array import GeometryArray, GeometryDtype, points_from_xy
 
 
 def _is_geometry_like_dtype(dtype) -> bool:
@@ -116,6 +116,7 @@ def _delegate_geo_method(op, this, **kwargs):
     """Unary operation that returns a GeoSeries."""
     from vibespatial.api.geodataframe import GeoDataFrame
     from vibespatial.api.geoseries import GeoSeries
+    from vibespatial.runtime.provenance import make_buffer_tag
 
     if isinstance(this, GeoSeries):
         klass, var_name = "GeoSeries", "gs"
@@ -139,7 +140,20 @@ def _delegate_geo_method(op, this, **kwargs):
 
     a_this = this.geometry.values
     data = getattr(a_this, op)(**kwargs)
-    return GeoSeries(data, index=this.index, crs=this.crs)
+    result = GeoSeries(data, index=this.index, crs=this.crs)
+    if op == "buffer":
+        try:
+            result.geometry.values._provenance = make_buffer_tag(
+                a_this,
+                kwargs["distance"],
+                kwargs.get("cap_style", "round"),
+                kwargs.get("join_style", "round"),
+                kwargs.get("single_sided", False),
+                kwargs.get("quad_segs", 16),
+            )
+        except Exception:
+            pass
+    return result
 
 
 class GeoPandasBase:
@@ -6453,7 +6467,7 @@ GeometryCollection
         0    MULTIPOINT ((0.1045 -0.10294), (0.35249 -0.264...
         1    MULTIPOINT ((3.03261 -0.43069), (3.10068 0.114...
         Name: sampled_points, dtype: geometry
-        """  # noqa: E501
+        """
         from vibespatial.api.geoseries import GeoSeries
         from vibespatial.api.tools._random import uniform
 

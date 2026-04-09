@@ -927,6 +927,7 @@ def _main_sweep_scatter_and_filter(
     *,
     runtime,
     left: DeviceSegmentTable,
+    right: DeviceSegmentTable,
     d_cand_offsets,
     range_start,
     range_end,
@@ -939,6 +940,9 @@ def _main_sweep_scatter_and_filter(
     right_maxx,
     right_miny,
     right_maxy,
+    left_rows_all,
+    right_rows_all,
+    require_same_row: bool,
     outlier_mask_bool,
     total_raw_candidates: int,
 ):
@@ -961,6 +965,7 @@ def _main_sweep_scatter_and_filter(
         return _scatter_and_filter_single(
             runtime=runtime,
             left=left,
+            right=right,
             d_cand_offsets=d_cand_offsets,
             range_start=range_start,
             range_end=range_end,
@@ -973,6 +978,9 @@ def _main_sweep_scatter_and_filter(
             right_maxx=right_maxx,
             right_miny=right_miny,
             right_maxy=right_maxy,
+            left_rows_all=left_rows_all,
+            right_rows_all=right_rows_all,
+            require_same_row=require_same_row,
             outlier_mask_bool=outlier_mask_bool,
             left_start=0,
             left_end=left.count,
@@ -1039,6 +1047,7 @@ def _main_sweep_scatter_and_filter(
         b_left, b_right = _scatter_and_filter_single(
             runtime=runtime,
             left=left,
+            right=right,
             d_cand_offsets=d_cand_offsets,
             range_start=range_start,
             range_end=range_end,
@@ -1051,6 +1060,9 @@ def _main_sweep_scatter_and_filter(
             right_maxx=right_maxx,
             right_miny=right_miny,
             right_maxy=right_maxy,
+            left_rows_all=left_rows_all,
+            right_rows_all=right_rows_all,
+            require_same_row=require_same_row,
             outlier_mask_bool=outlier_mask_bool,
             left_start=b_lo,
             left_end=b_hi,
@@ -1075,6 +1087,7 @@ def _scatter_and_filter_single(
     *,
     runtime,
     left: DeviceSegmentTable,
+    right: DeviceSegmentTable,
     d_cand_offsets,
     range_start,
     range_end,
@@ -1087,6 +1100,9 @@ def _scatter_and_filter_single(
     right_maxx,
     right_miny,
     right_maxy,
+    left_rows_all,
+    right_rows_all,
+    require_same_row: bool,
     outlier_mask_bool,
     left_start: int,
     left_end: int,
@@ -1160,6 +1176,23 @@ def _scatter_and_filter_single(
         (d_lminx <= d_rmaxx) & (d_lmaxx >= d_rminx) &
         (d_lminy <= d_rmaxy) & (d_lmaxy >= d_rminy)
     )
+    if require_same_row:
+        try:
+            main_overlap &= left_rows_all[d_left_pair] == right_rows_all[d_right_pair]
+        except Exception as exc:
+            import cupy as cp
+
+            left_pair_max = int(cp.max(d_left_pair).item()) if int(d_left_pair.size) else -1
+            right_pair_max = int(cp.max(d_right_pair).item()) if int(d_right_pair.size) else -1
+            raise RuntimeError(
+                "same-row main candidate filter failed: "
+                f"left_rows={int(left_rows_all.size)}, "
+                f"right_rows={int(right_rows_all.size)}, "
+                f"left_pair_count={int(d_left_pair.size)}, "
+                f"right_pair_count={int(d_right_pair.size)}, "
+                f"left_pair_max={left_pair_max}, "
+                f"right_pair_max={right_pair_max}"
+            ) from exc
     # Free gathered bounds immediately — they dominate per-batch memory
     # (8 × batch_raw_count × 8 bytes) and are no longer needed.
     del d_lminx, d_lmaxx, d_lminy, d_lmaxy
@@ -1184,6 +1217,7 @@ def _generate_candidates_gpu(
     right: DeviceSegmentTable,
     *,
     require_same_row: bool = False,
+    use_same_row_fast_path: bool = True,
 ) -> DeviceSegmentIntersectionCandidates:
     """GPU-native O(n log n) candidate generation via sort-sweep."""
     import cupy as cp
@@ -1202,7 +1236,7 @@ def _generate_candidates_gpu(
             count=0,
         )
 
-    if require_same_row:
+    if require_same_row and use_same_row_fast_path:
         with hotpath_stage("segment.candidates.same_row_fast_path", category="filter"):
             same_row_candidates = _generate_candidates_gpu_same_row_warp(left, right)
         if same_row_candidates is not None:
@@ -1219,6 +1253,16 @@ def _generate_candidates_gpu(
         right_maxx = cp.maximum(right.x0, right.x1)
         right_miny = cp.minimum(right.y0, right.y1)
         right_maxy = cp.maximum(right.y0, right.y1)
+        left_rows_all = (
+            cp.asarray(left.row_indices, dtype=cp.int32)
+            if require_same_row
+            else None
+        )
+        right_rows_all = (
+            cp.asarray(right.row_indices, dtype=cp.int32)
+            if require_same_row
+            else None
+        )
 
     # Sort right segments by x-midpoint for sweep-based candidate search.
     # Algorithm: sort right segments by x-midpoint, then for each left segment
@@ -1322,6 +1366,7 @@ def _generate_candidates_gpu(
             main_final_left, main_final_right = _main_sweep_scatter_and_filter(
                 runtime=runtime,
                 left=left,
+                right=right,
                 d_cand_offsets=d_cand_offsets,
                 range_start=range_start,
                 range_end=range_end,
@@ -1334,6 +1379,9 @@ def _generate_candidates_gpu(
                 right_maxx=right_maxx,
                 right_miny=right_miny,
                 right_maxy=right_maxy,
+                left_rows_all=left_rows_all,
+                right_rows_all=right_rows_all,
+                require_same_row=require_same_row,
                 outlier_mask_bool=outlier_mask_bool,
                 total_raw_candidates=total_raw_candidates,
             )
@@ -1381,6 +1429,19 @@ def _generate_candidates_gpu(
                         (left_miny[ol_left_idx] <= right_maxy[ol_right_idx]) &
                         (left_maxy[ol_left_idx] >= right_miny[ol_right_idx])
                     )
+                    if require_same_row:
+                        try:
+                            ol_overlap &= (
+                                left_rows_all[ol_left_idx] == right_rows_all[ol_right_idx]
+                            )
+                        except Exception as exc:
+                            raise RuntimeError(
+                                "same-row outlier candidate filter failed: "
+                                f"left_rows={left_rows_all.shape[0]}, "
+                                f"right_rows={right_rows_all.shape[0]}, "
+                                f"left_pair_count={ol_left_idx.size}, "
+                                f"right_pair_count={ol_right_idx.size}"
+                            ) from exc
                     ol_compact = compact_indices(ol_overlap.astype(cp.uint8))
 
                     if ol_compact.count > 0:
@@ -1432,29 +1493,6 @@ def _generate_candidates_gpu(
         out_left_segs = left.segment_indices[final_left]
         out_right_rows = right.row_indices[final_right]
         out_right_segs = right.segment_indices[final_right]
-
-        if require_same_row:
-            same_row_mask = (out_left_rows == out_right_rows).astype(cp.uint8, copy=False)
-            same_row_keep = compact_indices(same_row_mask)
-            if same_row_keep.count == 0:
-                empty_d = runtime.allocate((0,), np.int32)
-                return DeviceSegmentIntersectionCandidates(
-                    left_rows=empty_d,
-                    left_segments=empty_d,
-                    left_lookup=runtime.allocate((0,), np.int32),
-                    right_rows=empty_d,
-                    right_segments=empty_d,
-                    right_lookup=runtime.allocate((0,), np.int32),
-                    count=0,
-                )
-            keep = same_row_keep.values
-            final_left = final_left[keep]
-            final_right = final_right[keep]
-            out_left_rows = out_left_rows[keep]
-            out_left_segs = out_left_segs[keep]
-            out_right_rows = out_right_rows[keep]
-            out_right_segs = out_right_segs[keep]
-            total_candidates = int(final_left.size)
 
     return DeviceSegmentIntersectionCandidates(
         left_rows=out_left_rows,
@@ -2077,16 +2115,17 @@ def _classify_segment_intersections_gpu(
     *,
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
-    candidate_pairs: SegmentIntersectionCandidates | None = None,
+    candidate_pairs: SegmentIntersectionCandidates | DeviceSegmentIntersectionCandidates | None = None,
     left_segments: SegmentTable | DeviceSegmentTable | None = None,
     right_segments: SegmentTable | DeviceSegmentTable | None = None,
-    pairs: SegmentIntersectionCandidates | None = None,
+    pairs: SegmentIntersectionCandidates | DeviceSegmentIntersectionCandidates | None = None,
     runtime_selection: RuntimeSelection,
     precision_plan: PrecisionPlan,
     robustness_plan: RobustnessPlan,
     tile_size: int = SEGMENT_TILE_SIZE,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
     _require_same_row: bool = False,
+    _use_same_row_fast_path: bool = True,
 ) -> SegmentIntersectionResult:
     """Full GPU-native segment intersection pipeline.
 
@@ -2114,21 +2153,31 @@ def _classify_segment_intersections_gpu(
 
     # --- Kernel 1: Extract segments on GPU ---
     with hotpath_stage("segment.classify.extract_left_segments", category="setup"):
-        d_left_segs = (
-            left_segments
-            if isinstance(left_segments, DeviceSegmentTable)
-            else _extract_segments_gpu(left, compute_type)
-        )
-    with hotpath_stage("segment.classify.extract_right_segments", category="setup"):
-        d_right_segs = (
-            right_segments
-            if isinstance(right_segments, DeviceSegmentTable)
-            else (
-            _cached_right_device_segments
-            if _cached_right_device_segments is not None
-            else _extract_segments_gpu(right, compute_type)
+        try:
+            d_left_segs = (
+                left_segments
+                if isinstance(left_segments, DeviceSegmentTable)
+                else _extract_segments_gpu(left, compute_type)
             )
-        )
+        except Exception as exc:
+            raise RuntimeError(
+                f"segment left extraction failed: {type(exc).__name__}: {exc}"
+            ) from exc
+    with hotpath_stage("segment.classify.extract_right_segments", category="setup"):
+        try:
+            d_right_segs = (
+                right_segments
+                if isinstance(right_segments, DeviceSegmentTable)
+                else (
+                _cached_right_device_segments
+                if _cached_right_device_segments is not None
+                else _extract_segments_gpu(right, compute_type)
+                )
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"segment right extraction failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     if d_left_segs.count == 0 or d_right_segs.count == 0:
         return _empty_segment_intersection_result(
@@ -2139,11 +2188,31 @@ def _classify_segment_intersections_gpu(
 
     # --- Kernel 2: Generate candidates on GPU ---
     with hotpath_stage("segment.classify.generate_candidates", category="filter"):
-        d_candidates = _generate_candidates_gpu(
-            d_left_segs,
-            d_right_segs,
-            require_same_row=_require_same_row,
-        )
+        precomputed_candidates = candidate_pairs if candidate_pairs is not None else pairs
+        try:
+            if isinstance(precomputed_candidates, DeviceSegmentIntersectionCandidates):
+                d_candidates = precomputed_candidates
+            elif isinstance(precomputed_candidates, SegmentIntersectionCandidates):
+                d_candidates = DeviceSegmentIntersectionCandidates(
+                    left_rows=runtime.from_host(precomputed_candidates.left_rows),
+                    left_segments=runtime.from_host(precomputed_candidates.left_segments),
+                    left_lookup=runtime.from_host(precomputed_candidates.left_lookup),
+                    right_rows=runtime.from_host(precomputed_candidates.right_rows),
+                    right_segments=runtime.from_host(precomputed_candidates.right_segments),
+                    right_lookup=runtime.from_host(precomputed_candidates.right_lookup),
+                    count=precomputed_candidates.count,
+                )
+            else:
+                d_candidates = _generate_candidates_gpu(
+                    d_left_segs,
+                    d_right_segs,
+                    require_same_row=_require_same_row,
+                    use_same_row_fast_path=_use_same_row_fast_path,
+                )
+        except Exception as exc:
+            raise RuntimeError(
+                f"segment candidate generation failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     if d_candidates.count == 0:
         return _empty_segment_intersection_result(
@@ -2210,8 +2279,13 @@ def _classify_segment_intersections_gpu(
         ),
     )
     with hotpath_stage("segment.classify.launch_kernel", category="refine"):
-        grid, block = runtime.launch_config(classify_kernel, n_pairs)
-        runtime.launch(classify_kernel, grid=grid, block=block, params=classify_params)
+        try:
+            grid, block = runtime.launch_config(classify_kernel, n_pairs)
+            runtime.launch(classify_kernel, grid=grid, block=block, params=classify_params)
+        except Exception as exc:
+            raise RuntimeError(
+                f"segment classify kernel launch failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # Preserve the CPU-visible ambiguous-row contract on device: rows whose
     # fast orientation filter was numerically ambiguous or degenerate still
@@ -2246,31 +2320,36 @@ def _classify_segment_intersections_gpu(
         return det, cp.abs(det) <= errbound
 
     with hotpath_stage("segment.classify.ambiguous_rows", category="refine"):
-        o1, a1 = _orient2d_fast_device(ax, ay, bx, by, cx, cy)
-        o2, a2 = _orient2d_fast_device(ax, ay, bx, by, dx, dy)
-        o3, a3 = _orient2d_fast_device(cx, cy, dx, dy, ax, ay)
-        o4, a4 = _orient2d_fast_device(cx, cy, dx, dy, bx, by)
+        try:
+            o1, a1 = _orient2d_fast_device(ax, ay, bx, by, cx, cy)
+            o2, a2 = _orient2d_fast_device(ax, ay, bx, by, dx, dy)
+            o3, a3 = _orient2d_fast_device(cx, cy, dx, dy, ax, ay)
+            o4, a4 = _orient2d_fast_device(cx, cy, dx, dy, bx, by)
 
-        zero_left = (ax == bx) & (ay == by)
-        zero_right = (cx == dx) & (cy == dy)
-        sign1 = cp.sign(o1).astype(cp.int8, copy=False)
-        sign2 = cp.sign(o2).astype(cp.int8, copy=False)
-        sign3 = cp.sign(o3).astype(cp.int8, copy=False)
-        sign4 = cp.sign(o4).astype(cp.int8, copy=False)
+            zero_left = (ax == bx) & (ay == by)
+            zero_right = (cx == dx) & (cy == dy)
+            sign1 = cp.sign(o1).astype(cp.int8, copy=False)
+            sign2 = cp.sign(o2).astype(cp.int8, copy=False)
+            sign3 = cp.sign(o3).astype(cp.int8, copy=False)
+            sign4 = cp.sign(o4).astype(cp.int8, copy=False)
 
-        ambiguous_mask = (
-            a1
-            | a2
-            | a3
-            | a4
-            | zero_left
-            | zero_right
-            | (sign1 == 0)
-            | (sign2 == 0)
-            | (sign3 == 0)
-            | (sign4 == 0)
-        )
-        d_ambiguous_rows = compact_indices(ambiguous_mask.astype(cp.uint8)).values
+            ambiguous_mask = (
+                a1
+                | a2
+                | a3
+                | a4
+                | zero_left
+                | zero_right
+                | (sign1 == 0)
+                | (sign2 == 0)
+                | (sign3 == 0)
+                | (sign4 == 0)
+            )
+            d_ambiguous_rows = compact_indices(ambiguous_mask.astype(cp.uint8)).values
+        except Exception as exc:
+            raise RuntimeError(
+                f"segment ambiguous-row detection failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
     # Sync GPU before returning device-primary result.
     with hotpath_stage("segment.classify.synchronize", category="emit"):
@@ -2482,6 +2561,7 @@ def classify_segment_intersections(
     _cached_left_device_segments: DeviceSegmentTable | None = None,
     _cached_right_device_segments: DeviceSegmentTable | None = None,
     _require_same_row: bool = False,
+    _use_same_row_fast_path: bool = True,
 ) -> SegmentIntersectionResult:
     """Classify all segment-segment intersections between two geometry arrays.
 
@@ -2508,62 +2588,74 @@ def classify_segment_intersections(
     SegmentIntersectionResult
         Classification of all candidate segment pairs.
     """
-    # Estimate candidate count for dispatch decision
-    # Use a rough heuristic: total coords across both arrays
-    total_coords = sum(
-        buf.x.size for buf in left.families.values()
-        if buf.family in {GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
-                          GeometryFamily.MULTILINESTRING, GeometryFamily.MULTIPOLYGON}
-    ) + sum(
-        buf.x.size for buf in right.families.values()
-        if buf.family in {GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
-                          GeometryFamily.MULTILINESTRING, GeometryFamily.MULTIPOLYGON}
-    )
-    estimated_candidates = max(total_coords, 1)
-
-    runtime_selection = _select_segment_runtime(
-        dispatch_mode, candidate_count=estimated_candidates,
-    )
-    if precision is PrecisionMode.AUTO:
-        precision_plan = runtime_selection.precision_plan
-    else:
-        runtime_selection = plan_dispatch_selection(
-            kernel_name="segment_classify",
-            kernel_class=KernelClass.PREDICATE,
-            row_count=estimated_candidates,
-            requested_mode=dispatch_mode,
-            requested_precision=precision,
+    stage = "estimate_candidate_count"
+    try:
+        # Estimate candidate count for dispatch decision
+        # Use a rough heuristic: total coords across both arrays
+        total_coords = sum(
+            buf.x.size for buf in left.families.values()
+            if buf.family in {GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
+                              GeometryFamily.MULTILINESTRING, GeometryFamily.MULTIPOLYGON}
+        ) + sum(
+            buf.x.size for buf in right.families.values()
+            if buf.family in {GeometryFamily.LINESTRING, GeometryFamily.POLYGON,
+                              GeometryFamily.MULTILINESTRING, GeometryFamily.MULTIPOLYGON}
         )
-        precision_plan = runtime_selection.precision_plan
-    robustness_plan = select_robustness_plan(
-        kernel_class=KernelClass.PREDICATE,
-        precision_plan=precision_plan,
-    )
+        estimated_candidates = max(total_coords, 1)
 
-    if runtime_selection.selected is ExecutionMode.GPU:
-        return _classify_segment_intersections_gpu(
+        stage = "select_runtime"
+        runtime_selection = _select_segment_runtime(
+            dispatch_mode, candidate_count=estimated_candidates,
+        )
+        if precision is PrecisionMode.AUTO:
+            precision_plan = runtime_selection.precision_plan
+        else:
+            runtime_selection = plan_dispatch_selection(
+                kernel_name="segment_classify",
+                kernel_class=KernelClass.PREDICATE,
+                row_count=estimated_candidates,
+                requested_mode=dispatch_mode,
+                requested_precision=precision,
+            )
+            precision_plan = runtime_selection.precision_plan
+
+        stage = "select_robustness"
+        robustness_plan = select_robustness_plan(
+            kernel_class=KernelClass.PREDICATE,
+            precision_plan=precision_plan,
+        )
+
+        if runtime_selection.selected is ExecutionMode.GPU:
+            stage = "gpu_dispatch"
+            return _classify_segment_intersections_gpu(
+                left=left,
+                right=right,
+                candidate_pairs=candidate_pairs,
+                left_segments=_cached_left_device_segments,
+                runtime_selection=runtime_selection,
+                precision_plan=precision_plan,
+                robustness_plan=robustness_plan,
+                tile_size=tile_size,
+                _cached_right_device_segments=_cached_right_device_segments,
+                _require_same_row=_require_same_row,
+                _use_same_row_fast_path=_use_same_row_fast_path,
+            )
+
+        stage = "cpu_dispatch"
+        return _classify_segment_intersections_cpu(
             left=left,
             right=right,
             candidate_pairs=candidate_pairs,
-            left_segments=_cached_left_device_segments,
             runtime_selection=runtime_selection,
             precision_plan=precision_plan,
             robustness_plan=robustness_plan,
             tile_size=tile_size,
-            _cached_right_device_segments=_cached_right_device_segments,
-            _require_same_row=_require_same_row,
         )
-
-    # CPU fallback
-    return _classify_segment_intersections_cpu(
-        left=left,
-        right=right,
-        candidate_pairs=candidate_pairs,
-        runtime_selection=runtime_selection,
-        precision_plan=precision_plan,
-        robustness_plan=robustness_plan,
-        tile_size=tile_size,
-    )
+    except Exception as exc:
+        raise RuntimeError(
+            f"classify_segment_intersections failed at {stage}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def summarize_exact_local_events(

@@ -36,10 +36,10 @@ from vibespatial.cuda._runtime import (
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import (
     compact_indices,
-    lower_bound,
+    lower_bound_counting,
     segmented_sort,
     sort_pairs,
-    upper_bound,
+    upper_bound_counting,
 )
 from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
@@ -260,9 +260,12 @@ def _topk_per_query(
     d_sorted_dist = d_distances[d_order]
 
     # Step 3: Build segment boundaries from sorted query indices (Tier 3a CCCL).
-    query_keys = cp.arange(n_queries, dtype=cp.int32)
-    seg_starts = lower_bound(d_sorted_query, query_keys, synchronize=False).astype(cp.int32, copy=False)
-    seg_ends = upper_bound(d_sorted_query, query_keys, synchronize=False).astype(cp.int32, copy=False)
+    seg_starts = lower_bound_counting(
+        d_sorted_query, 0, n_queries, dtype=np.int32,
+    ).astype(cp.int32, copy=False)
+    seg_ends = upper_bound_counting(
+        d_sorted_query, 0, n_queries, dtype=np.int32,
+    ).astype(cp.int32, copy=False)
 
     # Step 4: Segmented sort by distance within each query segment (Tier 3a CCCL).
     seg_sort_result = segmented_sort(
@@ -271,6 +274,7 @@ def _topk_per_query(
         starts=seg_starts,
         ends=seg_ends,
         num_segments=n_queries,
+        synchronize=False,
     )
     d_segdist = seg_sort_result.keys
     d_segtarget = seg_sort_result.values

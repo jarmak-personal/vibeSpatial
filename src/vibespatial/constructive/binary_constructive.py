@@ -397,6 +397,43 @@ def _dispatch_overlay_gpu(
     )
 
 
+def _collapse_polygon_overlay_sub_result(
+    sub_result: OwnedGeometryArray,
+) -> OwnedGeometryArray | None:
+    """Collapse a polygonal overlay sub-result back to one logical row."""
+    if sub_result.row_count <= 1:
+        return sub_result
+    if not _is_polygon_only(sub_result):
+        return None
+
+    from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+    collapsed = segmented_union_all(
+        sub_result,
+        np.asarray([0, sub_result.row_count], dtype=np.int64),
+    )
+    if collapsed.row_count != 1:
+        return None
+    return collapsed
+
+
+def _free_device_segment_table(device_segments: DeviceSegmentTable) -> None:
+    """Release a cached device segment table allocated by _extract_segments_gpu."""
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    runtime.free(device_segments.x0)
+    runtime.free(device_segments.y0)
+    runtime.free(device_segments.x1)
+    runtime.free(device_segments.y1)
+    runtime.free(device_segments.row_indices)
+    runtime.free(device_segments.segment_indices)
+    if device_segments.part_indices is not None:
+        runtime.free(device_segments.part_indices)
+    if device_segments.ring_indices is not None:
+        runtime.free(device_segments.ring_indices)
+
+
 def _dispatch_polygon_overlay_rowwise_gpu(
     op: str,
     left: OwnedGeometryArray,
@@ -421,22 +458,6 @@ def _dispatch_polygon_overlay_rowwise_gpu(
 
     if left.row_count != right.row_count:
         return None
-
-    def _collapse_to_single_row(sub_result: OwnedGeometryArray) -> OwnedGeometryArray | None:
-        if sub_result.row_count <= 1:
-            return sub_result
-        if not _is_polygon_only(sub_result):
-            return None
-
-        from vibespatial.kernels.constructive.segmented_union import segmented_union_all
-
-        collapsed = segmented_union_all(
-            sub_result,
-            np.asarray([0, sub_result.row_count], dtype=np.int64),
-        )
-        if collapsed.row_count != 1:
-            return None
-        return collapsed
 
     if left.row_count > 1:
         try:
@@ -482,7 +503,7 @@ def _dispatch_polygon_overlay_rowwise_gpu(
             # single-row overlay subcall.
             _cached_right_segments=None,
         )
-        sub_result = _collapse_to_single_row(sub_result)
+        sub_result = _collapse_polygon_overlay_sub_result(sub_result)
         if sub_result is None:
             logger.debug(
                 "row-preserving polygon %s fallback could not collapse multi-row result",
@@ -528,6 +549,121 @@ def _dispatch_polygon_overlay_rowwise_gpu(
         out_family_row_offsets[row_index] = base_row
         family_buffers.setdefault(family, []).append(buffer)
         family_row_bases[family] = base_row + (int(buffer.geometry_offsets.size) - 1)
+
+    device_families = {
+        family: _concat_device_family_buffers(family, buffers)
+        for family, buffers in family_buffers.items()
+    }
+    return build_device_resident_owned(
+        device_families=device_families,
+        row_count=left.row_count,
+        tags=out_tags,
+        validity=out_validity,
+        family_row_offsets=out_family_row_offsets,
+        execution_mode="gpu",
+    )
+
+
+def _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
+) -> OwnedGeometryArray | None:
+    """Preserve row cardinality for polygon intersection against a scalar right polygon.
+
+    This keeps the right operand truly broadcast-right: one right geometry,
+    one extracted right-side segment table, many left rows. It avoids
+    materializing a tiled right OwnedGeometryArray just to feed the exact
+    overlay path.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if right.row_count != 1:
+        return None
+    if left.row_count == 0:
+        return _empty_device_constructive_output(0)
+
+    right_valid = bool(right.validity[0])
+    if not right_valid:
+        return _empty_device_constructive_output(left.row_count)
+
+    cached_right_segments = _cached_right_segments
+    owns_cached_right_segments = False
+    if cached_right_segments is None and left.row_count > 1:
+        from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+        cached_right_segments = _extract_segments_gpu(right)
+        owns_cached_right_segments = True
+
+    out_validity = cp.zeros(left.row_count, dtype=cp.bool_)
+    out_tags = cp.full(left.row_count, NULL_TAG, dtype=cp.int8)
+    out_family_row_offsets = cp.full(left.row_count, -1, dtype=cp.int32)
+    family_buffers: dict[GeometryFamily, list] = {}
+    family_row_bases: dict[GeometryFamily, int] = {}
+
+    try:
+        for row_index in range(left.row_count):
+            if not bool(left.validity[row_index]):
+                continue
+
+            d_row = cp.asarray([row_index], dtype=cp.int64)
+            left_row = left.take(d_row)
+            sub_result = _dispatch_overlay_gpu(
+                "intersection",
+                left_row,
+                right,
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=cached_right_segments,
+                _row_isolated=True,
+            )
+            sub_result = _collapse_polygon_overlay_sub_result(sub_result)
+            if sub_result is None:
+                logger.debug(
+                    "broadcast-right polygon intersection could not collapse "
+                    "multi-row exact sub-result",
+                )
+                return None
+            if sub_result.row_count == 0:
+                continue
+            if sub_result.row_count != 1:
+                logger.debug(
+                    "broadcast-right polygon intersection expected 1 row, got %d",
+                    sub_result.row_count,
+                )
+                return None
+
+            sub_state = sub_result._ensure_device_state()
+            if not bool(sub_state.validity[0]):
+                continue
+
+            tag_value = int(sub_state.tags[0])
+            family = TAG_FAMILIES.get(tag_value)
+            if family is None:
+                logger.debug(
+                    "broadcast-right polygon intersection saw unsupported tag %d",
+                    tag_value,
+                )
+                return None
+
+            buffer = sub_state.families.get(family)
+            if buffer is None:
+                logger.debug(
+                    "broadcast-right polygon intersection missing %s family buffer",
+                    family.value,
+                )
+                return None
+
+            base_row = family_row_bases.get(family, 0)
+            out_validity[row_index] = sub_state.validity[0]
+            out_tags[row_index] = sub_state.tags[0]
+            out_family_row_offsets[row_index] = base_row
+            family_buffers.setdefault(family, []).append(buffer)
+            family_row_bases[family] = base_row + (int(buffer.geometry_offsets.size) - 1)
+    finally:
+        if owns_cached_right_segments and cached_right_segments is not None:
+            _free_device_segment_table(cached_right_segments)
 
     device_families = {
         family: _concat_device_family_buffers(family, buffers)
@@ -1740,7 +1876,51 @@ def _binary_constructive_gpu(
                     exc_info=True,
                 )
 
+        def _try_polygon_rect_intersection():
+            try:
+                from vibespatial.kernels.constructive.polygon_rect_intersection import (
+                    polygon_rect_intersection,
+                    polygon_rect_intersection_can_handle,
+                )
+
+                if polygon_rect_intersection_can_handle(left, right):
+                    result = polygon_rect_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+                    if result.row_count == left.row_count:
+                        return result
+                # Intersection is commutative. Allow rectangle-capable batches on
+                # either side so parcel-like rectangle inputs can still use the
+                # specialized GPU clip kernel instead of the generic overlay path.
+                if polygon_rect_intersection_can_handle(right, left):
+                    result = polygon_rect_intersection(right, left, dispatch_mode=ExecutionMode.GPU)
+                    if result.row_count == left.row_count:
+                        return result
+            except Exception:
+                logger.debug(
+                    "polygon-rectangle GPU intersection fast path failed",
+                    exc_info=True,
+                )
+            return None
+
+        if op == "intersection":
+            rect_result = _try_polygon_rect_intersection()
+            if rect_result is not None:
+                return rect_result
+
         if op == "intersection" and _prefer_exact_polygon_intersection:
+            if _sh_kernel_can_handle(left, right):
+                try:
+                    from vibespatial.kernels.constructive.polygon_intersection import (
+                        polygon_intersection,
+                    )
+
+                    result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
+                    if result.row_count == left.row_count:
+                        return result
+                except Exception:
+                    logger.debug(
+                        "preferred exact polygon_intersection GPU kernel failed; escalating to rowwise overlay",
+                        exc_info=True,
+                    )
             try:
                 rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
                     left,

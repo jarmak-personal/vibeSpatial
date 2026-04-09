@@ -95,9 +95,9 @@ See also [adr-index.md](adr-index.md) for the Sphinx toctree listing.
 | `ADR-0033` | accepted | 2026-03-12 | [ADR-0033: GPU Primitive Dispatch Rules](docs/decisions/0033-gpu-primitive-dispatch-rules.md) |
 | `ADR-0034` | accepted | 2026-03-14 | [ADR-0034: CCCL make_* Pre-Compilation and Warmup Strategy](docs/decisions/0034-cccl-precompile-warmup-strategy.md) |
 | `ADR-0035` | deferred | 2026-03-14 | [ADR-0035: Geodesic Distance Kernel and CRS-Aware Dispatch](docs/decisions/0035-geodesic-distance-kernel.md) |
-| `ADR-0036` | accepted | 2026-03-16 | [Index-Array Boundary Attribute Model](docs/decisions/0036-index-array-boundary-attribute-model.md) |
 | `ADR-0037` | deferred | 2026-03-16 | [ADR-0037: GPU Voronoi Diagram Kernel](docs/decisions/0037-gpu-voronoi-diagram-kernel.md) |
 | `ADR-0038` | accepted | 2026-03-17 | [ADR-0038: GPU Byte-Classification GeoJSON Parser](docs/decisions/0038-gpu-byte-classify-geojson-parser.md) |
 | `ADR-0039` | accepted | 2026-03-20 | [ADR-0039: Provenance Tagging and Rewrite System](docs/decisions/0039-provenance-tagging-rewrites.md) |
 | `ADR-0040` | accepted | 2026-03-25 | [ADR-0040: Tiered GPU Memory Pool (RMM)](docs/decisions/0040-tiered-gpu-memory-pool.md) |
 | `ADR-0041` | accepted | 2026-03-26 | [ADR-0041: GPU Text Parsing Framework](docs/decisions/0041-gpu-text-parsing-framework.md) |
+| `ADR-0042` | accepted | 2026-04-08 | [Device-Native Result Boundary And Explicit Compatibility Export](docs/decisions/0042-device-native-result-boundary.md) |

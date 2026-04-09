@@ -4,6 +4,7 @@ import numpy as np
 import shapely
 from shapely.geometry import Polygon
 
+from vibespatial.geometry.host_bridge import owned_to_shapely
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -26,10 +27,18 @@ def segmented_union_pair_cpu(
     right: OwnedGeometryArray,
 ) -> OwnedGeometryArray:
     """Union a single pair on host for tree-reduce fallback."""
-    left_geoms = left.to_shapely()
-    right_geoms = right.to_shapely()
-    left_geom = left_geoms[0] if left_geoms and left_geoms[0] is not None else _EMPTY_POLYGON
-    right_geom = right_geoms[0] if right_geoms and right_geoms[0] is not None else _EMPTY_POLYGON
+    left_geoms = owned_to_shapely(left)
+    right_geoms = owned_to_shapely(right)
+    left_geom = (
+        left_geoms[0]
+        if left_geoms.size > 0 and left_geoms[0] is not None
+        else _EMPTY_POLYGON
+    )
+    right_geom = (
+        right_geoms[0]
+        if right_geoms.size > 0 and right_geoms[0] is not None
+        else _EMPTY_POLYGON
+    )
 
     merged = shapely.union(left_geom, right_geom)
     if merged is not None and not shapely.is_valid(merged):
@@ -68,7 +77,7 @@ def segmented_union_cpu(
     n_groups: int,
 ) -> OwnedGeometryArray:
     """CPU implementation: per-group shapely.union_all."""
-    all_geoms = np.asarray(geometries.to_shapely(), dtype=object)
+    all_geoms = owned_to_shapely(geometries)
 
     results: list[object] = []
     for g in range(n_groups):

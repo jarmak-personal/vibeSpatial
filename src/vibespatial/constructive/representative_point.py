@@ -33,7 +33,7 @@ from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.precision import KernelClass
-from vibespatial.runtime.residency import combined_residency
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 
 from .point import point_owned_from_xy
 
@@ -195,6 +195,12 @@ def representative_point_owned(
         current_residency=combined_residency(owned),
     )
     use_gpu = selection.selected is ExecutionMode.GPU
+    if not use_gpu:
+        owned.move_to(
+            Residency.HOST,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="CPU representative_point requires host geometry payloads",
+        )
 
     cx = np.full(row_count, np.nan, dtype=np.float64)
     cy = np.full(row_count, np.nan, dtype=np.float64)
@@ -385,6 +391,7 @@ def _fill_polygon_representatives_gpu(
 
     runtime = get_cuda_runtime()
     kernels = _representative_point_kernels()
+    device_state = owned._ensure_device_state()
 
     # Upload centroid arrays to device
     d_cx = cp.asarray(cx)
@@ -393,22 +400,22 @@ def _fill_polygon_representatives_gpu(
     # Process Polygon family
     poly_tag = FAMILY_TAGS.get(GeometryFamily.POLYGON)
     if poly_tag is not None and GeometryFamily.POLYGON in owned.families:
-        buf = owned.families[GeometryFamily.POLYGON]
-        if buf.row_count > 0:
+        device_buf = device_state.families[GeometryFamily.POLYGON]
+        if int(device_buf.geometry_offsets.size) > 1:
             mask = tags == poly_tag
             global_rows = np.flatnonzero(mask).astype(np.int32)
             if global_rows.size > 0:
                 family_rows = family_row_offsets[global_rows].astype(np.int32)
 
-                d_poly_x = cp.asarray(buf.x)
-                d_poly_y = cp.asarray(buf.y)
-                d_ring_offsets = cp.asarray(buf.ring_offsets.astype(np.int32))
-                d_geom_offsets = cp.asarray(buf.geometry_offsets.astype(np.int32))
+                d_poly_x = cp.asarray(device_buf.x)
+                d_poly_y = cp.asarray(device_buf.y)
+                d_ring_offsets = cp.asarray(device_buf.ring_offsets).astype(cp.int32, copy=False)
+                d_geom_offsets = cp.asarray(device_buf.geometry_offsets).astype(cp.int32, copy=False)
                 d_global_rows = cp.asarray(global_rows)
                 d_family_rows = cp.asarray(family_rows)
 
                 # Determine max_intersections from the maximum ring vertex count
-                max_intersections = _compute_max_intersections(buf.ring_offsets)
+                max_intersections = _compute_max_intersections(device_buf.ring_offsets)
 
                 num_polygons = global_rows.size
                 block_size = min(256, num_polygons)
@@ -466,22 +473,22 @@ def _fill_polygon_representatives_gpu(
     # Process MultiPolygon family
     mpoly_tag = FAMILY_TAGS.get(GeometryFamily.MULTIPOLYGON)
     if mpoly_tag is not None and GeometryFamily.MULTIPOLYGON in owned.families:
-        buf = owned.families[GeometryFamily.MULTIPOLYGON]
-        if buf.row_count > 0:
+        device_buf = device_state.families[GeometryFamily.MULTIPOLYGON]
+        if int(device_buf.geometry_offsets.size) > 1:
             mask = tags == mpoly_tag
             global_rows = np.flatnonzero(mask).astype(np.int32)
             if global_rows.size > 0:
                 family_rows = family_row_offsets[global_rows].astype(np.int32)
 
-                d_poly_x = cp.asarray(buf.x)
-                d_poly_y = cp.asarray(buf.y)
-                d_ring_offsets = cp.asarray(buf.ring_offsets.astype(np.int32))
-                d_part_offsets = cp.asarray(buf.part_offsets.astype(np.int32))
-                d_geom_offsets = cp.asarray(buf.geometry_offsets.astype(np.int32))
+                d_poly_x = cp.asarray(device_buf.x)
+                d_poly_y = cp.asarray(device_buf.y)
+                d_ring_offsets = cp.asarray(device_buf.ring_offsets).astype(cp.int32, copy=False)
+                d_part_offsets = cp.asarray(device_buf.part_offsets).astype(cp.int32, copy=False)
+                d_geom_offsets = cp.asarray(device_buf.geometry_offsets).astype(cp.int32, copy=False)
                 d_global_rows = cp.asarray(global_rows)
                 d_family_rows = cp.asarray(family_rows)
 
-                max_intersections = _compute_max_intersections(buf.ring_offsets)
+                max_intersections = _compute_max_intersections(device_buf.ring_offsets)
 
                 num_polygons = global_rows.size
                 block_size = min(256, num_polygons)
@@ -540,17 +547,26 @@ def _fill_polygon_representatives_gpu(
     return d_cx, d_cy
 
 
-def _compute_max_intersections(ring_offsets: np.ndarray) -> int:
+def _compute_max_intersections(ring_offsets) -> int:
     """Compute the maximum number of ray-ring intersections per polygon.
 
     Uses the maximum ring coordinate count as an upper bound on the number
     of edges that can be crossed by a horizontal ray.  Capped at
     _MAX_INTERSECTIONS_DEFAULT to limit shared memory usage.
     """
-    if ring_offsets is None or len(ring_offsets) < 2:
+    if ring_offsets is None:
         return _MAX_INTERSECTIONS_DEFAULT
-    ring_lengths = np.diff(ring_offsets)
-    if ring_lengths.size == 0:
+    if hasattr(ring_offsets, "__cuda_array_interface__"):
+        import cupy as cp
+
+        if int(ring_offsets.size) < 2:
+            return _MAX_INTERSECTIONS_DEFAULT
+        ring_lengths = cp.diff(ring_offsets)
+    else:
+        if len(ring_offsets) < 2:
+            return _MAX_INTERSECTIONS_DEFAULT
+        ring_lengths = np.diff(ring_offsets)
+    if int(ring_lengths.size) == 0:
         return _MAX_INTERSECTIONS_DEFAULT
     # The total number of edges across all rings of a polygon is an upper
     # bound on the intersection count.  We use the total coordinate count

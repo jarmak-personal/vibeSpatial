@@ -301,6 +301,7 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         starts=d_seg_starts,
         ends=d_seg_ends,
         num_segments=n_valid,
+        synchronize=False,
     )
     # Reorder x by the y-sort permutation
     d_x_after_ysort = d_x_flat[sort_y.values]
@@ -312,6 +313,7 @@ def _extract_unique_points_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
         starts=d_seg_starts,
         ends=d_seg_ends,
         num_segments=n_valid,
+        synchronize=False,
     )
 
     # Final sorted arrays: apply the composed permutation

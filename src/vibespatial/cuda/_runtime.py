@@ -316,9 +316,42 @@ class CudaStream:
 
     handle: Any  # CUstream from cuda.bindings.driver
 
+    def __cuda_stream__(self) -> tuple[int, int]:
+        """Expose the CUDA Array Interface stream protocol."""
+        return (0, int(self.handle))
+
     def synchronize(self) -> None:
         """Block the host until all operations on this stream complete."""
         _check_driver(cu.cuStreamSynchronize(self.handle))
+
+
+def _normalize_stream_handle(stream: Any | None) -> Any | None:
+    """Return a driver-compatible CUDA stream handle.
+
+    Accepts repo-native ``CudaStream`` objects plus foreign stream objects
+    that implement the CUDA stream protocol or expose a raw ``ptr``.
+    """
+    if stream is None:
+        return None
+    if isinstance(stream, CudaStream):
+        return stream.handle
+    handle = getattr(stream, "handle", None)
+    if handle is not None:
+        return handle
+    protocol = getattr(stream, "__cuda_stream__", None)
+    if callable(protocol):
+        version, handle = protocol()
+        if int(version) != 0:
+            raise ValueError(
+                f"unsupported CUDA stream protocol version {version!r}; expected 0"
+            )
+        return cu.CUstream(int(handle))
+    pointer = getattr(stream, "ptr", None)
+    if pointer is not None:
+        return cu.CUstream(int(pointer))
+    raise TypeError(
+        "stream must be None, a CudaStream, or expose __cuda_stream__()/ptr"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -693,7 +726,7 @@ class CudaDriverRuntime:
     def copy_device_to_host_async(
         self,
         device_array: DeviceArray,
-        stream: CudaStream,
+        stream: Any,
         host_array: np.ndarray | None = None,
     ) -> np.ndarray:
         """Enqueue an asynchronous device-to-host copy on *stream*.
@@ -707,12 +740,13 @@ class CudaDriverRuntime:
         """
         _require_gpu_arrays()
         _increment_d2h_transfer_count()
+        stream_handle = _normalize_stream_handle(stream)
         with self.activate():
             if host_array is None:
                 host_array = np.empty(device_array.shape, dtype=device_array.dtype)
             nbytes = host_array.nbytes
             _check_driver(cu.cuMemcpyDtoHAsync(
-                host_array.ctypes.data, int(device_array.data.ptr), nbytes, stream.handle,
+                host_array.ctypes.data, int(device_array.data.ptr), nbytes, stream_handle,
             ))
         return host_array
 
@@ -720,7 +754,7 @@ class CudaDriverRuntime:
         self,
         host_array: np.ndarray,
         device_array: DeviceArray,
-        stream: CudaStream,
+        stream: Any,
     ) -> None:
         """Enqueue an asynchronous host-to-device copy on *stream*.
 
@@ -732,10 +766,11 @@ class CudaDriverRuntime:
         """
         _require_gpu_arrays()
         host = np.ascontiguousarray(host_array)
+        stream_handle = _normalize_stream_handle(stream)
         with self.activate():
             nbytes = host.nbytes
             _check_driver(cu.cuMemcpyHtoDAsync(
-                int(device_array.data.ptr), host.ctypes.data, nbytes, stream.handle,
+                int(device_array.data.ptr), host.ctypes.data, nbytes, stream_handle,
             ))
 
     def allocate_pinned(self, shape: tuple[int, ...], dtype: np.dtype[Any]) -> np.ndarray:
@@ -762,8 +797,9 @@ class CudaDriverRuntime:
         block: tuple[int, int, int],
         params: tuple[tuple[Any, ...], tuple[Any, ...]],
         shared_mem_bytes: int = 0,
-        stream: CudaStream | None = None,
+        stream: Any | None = None,
     ) -> None:
+        stream_handle = _normalize_stream_handle(stream)
         with self.activate():
             _check_driver(
                 cu.cuLaunchKernel(
@@ -775,7 +811,7 @@ class CudaDriverRuntime:
                     int(block[1]),
                     int(block[2]),
                     int(shared_mem_bytes),
-                    stream.handle if stream is not None else None,
+                    stream_handle,
                     params,
                     0,
                 )
@@ -956,10 +992,36 @@ def count_scatter_total(
     return int(h_buf[0]) + int(h_buf[1])
 
 
+def count_scatter_totals(
+    runtime: CudaDriverRuntime,
+    count_offset_pairs: list[tuple[DeviceArray, DeviceArray]],
+) -> list[int]:
+    """Get multiple count-scatter totals with one transfer-stream sync.
+
+    Each pair still transfers only the final count and final offset, but all
+    copies are issued on one dedicated stream so the host pays a single sync
+    for the whole batch instead of one sync per total.
+    """
+    if not count_offset_pairs:
+        return []
+
+    host_buffers: list[np.ndarray] = []
+    with runtime.stream_context() as xfer:
+        for device_counts, device_offsets in count_offset_pairs:
+            dtype = np.dtype(device_counts.dtype)
+            h_buf = runtime.allocate_pinned((2,), dtype)
+            runtime.copy_device_to_host_async(device_counts[-1:], xfer, h_buf[:1])
+            runtime.copy_device_to_host_async(device_offsets[-1:], xfer, h_buf[1:])
+            host_buffers.append(h_buf)
+    return [int(h_buf[0]) + int(h_buf[1]) for h_buf in host_buffers]
+
+
 def count_scatter_total_with_transfer(
     runtime: CudaDriverRuntime,
     device_counts: DeviceArray,
     device_offsets: DeviceArray,
+    *,
+    precomputed_total: int | None = None,
 ) -> tuple[int, CudaStream, np.ndarray]:
     """Get total and start async full-counts transfer on a background stream.
 
@@ -973,7 +1035,11 @@ def count_scatter_total_with_transfer(
     n = int(device_counts.size)
 
     # 1. Get total via single-sync async transfer of last elements.
-    total = count_scatter_total(runtime, device_counts, device_offsets)
+    total = (
+        int(precomputed_total)
+        if precomputed_total is not None
+        else count_scatter_total(runtime, device_counts, device_offsets)
+    )
 
     # 2. Start async full-array transfer on a dedicated stream.
     xfer = runtime.create_stream()

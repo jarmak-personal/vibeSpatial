@@ -3,10 +3,15 @@ from __future__ import annotations
 import numpy as np
 from shapely.affinity import translate
 
+try:
+    import cupy as cp
+except ImportError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
+
+from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds, compute_morton_keys
+from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 from vibespatial.overlay.reconstruction import OverlayOperation, plan_overlay_reconstruction
-from vibespatial.predicates.binary import evaluate_binary_predicate
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime, select_runtime
 from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE, SEGMENT_TILE_SIZE
 from vibespatial.runtime.precision import KernelClass, PrecisionMode, select_precision_plan
@@ -30,8 +35,13 @@ from vibespatial.spatial.query import (
 )
 from vibespatial.spatial.segment_primitives import (
     _classify_segment_intersections_from_tables,
+    _classify_segment_intersections_gpu,
+    _extract_segments_gpu,
     _generate_segment_candidates_from_tables,
     extract_segments,
+)
+from vibespatial.spatial.segment_primitives import (
+    _generate_candidates_gpu as _generate_segment_candidates_gpu,
 )
 from vibespatial.testing.synthetic import SyntheticSpec, generate_polygons
 
@@ -48,6 +58,12 @@ def _actual_query_implementation() -> str:
         if has_gpu_runtime()
         else "owned_cpu_spatial_query"
     )
+
+
+def _sync_gpu_profile_stage() -> None:
+    if cp is None or not has_gpu_runtime():
+        return
+    get_cuda_runtime().synchronize()
 
 
 def _build_join_inputs(rows: int, *, overlap_ratio: float) -> tuple[np.ndarray, np.ndarray]:
@@ -96,7 +112,7 @@ def profile_join_kernel(
         operation="join",
         dataset=f"polygon-{rows}",
         requested_runtime=dispatch_mode,
-        selected_runtime=ExecutionMode.CPU,
+        selected_runtime=runtime_selection.selected,
         enable_nvtx=enable_nvtx,
     )
 
@@ -122,84 +138,139 @@ def profile_join_kernel(
         stage.rows_out = query_owned.row_count
 
     with profiler.stage(
-        "compute_tree_bounds",
-        category="filter",
-        device=ExecutionMode.CPU,
-        rows_in=tree_owned.row_count,
-        detail="derive tree bounds for coarse pruning",
-    ) as stage:
-        tree_bounds = compute_geometry_bounds(tree_owned)
-        stage.rows_out = int(tree_bounds.shape[0])
-
-    with profiler.stage(
-        "compute_query_bounds",
-        category="filter",
-        device=ExecutionMode.CPU,
-        rows_in=query_owned.row_count,
-        detail="derive query bounds for coarse pruning",
-    ) as stage:
-        query_bounds = compute_geometry_bounds(query_owned)
-        stage.rows_out = int(query_bounds.shape[0])
-
-    with profiler.stage(
-        "sort_tree_morton",
+        "build_index",
         category="sort",
         device=ExecutionMode.CPU,
         rows_in=tree_owned.row_count,
-        detail="compute Morton keys and stable-sort tree rows",
+        detail="build the current flat polygon spatial index before query execution",
     ) as stage:
-        morton_keys = compute_morton_keys(tree_owned)
-        order = np.argsort(morton_keys, kind="stable").astype(np.int32, copy=False)
-        stage.rows_out = int(order.size)
+        flat_index = build_flat_spatial_index(tree_owned)
+        stage.rows_out = int(flat_index.size)
+        stage.metadata["planner_selected_runtime"] = runtime_selection.selected.value
+        stage.metadata["regular_grid_detected"] = flat_index.regular_grid is not None
+
+    actual_selected_runtime = ExecutionMode.CPU.value
+    selected_path = "generic_query_pipeline"
+    execution_reason = "profiled repo-owned join query pipeline"
 
     with profiler.stage(
         "coarse_filter",
         category="filter",
         device=ExecutionMode.CPU,
-        rows_in=int(query_owned.row_count * tree_owned.row_count),
-        detail="generate coarse candidate pairs from bounds overlap",
-        metadata={"tile_size": tile_size},
+        rows_in=int(query_owned.row_count * flat_index.size),
+        detail="generate candidate join pairs through the repo-owned spatial query path",
+        metadata={"tile_size": tile_size, "predicate": predicate},
     ) as stage:
-        pairs = generate_bounds_pairs(query_owned, tree_owned, tile_size=tile_size)
-        stage.rows_out = pairs.count
-        stage.metadata["pairs_examined"] = pairs.pairs_examined
-        stage.metadata["left_bounds_rows"] = int(query_bounds.shape[0])
-        stage.metadata["right_bounds_rows"] = int(tree_bounds.shape[0])
+        regular_grid_box_pairs = _query_regular_grid_rect_box_index(
+            flat_index,
+            _extract_box_query_bounds_from_owned("intersects", query_owned),
+            predicate=predicate,
+        )
+        if regular_grid_box_pairs is not None:
+            selected_path = "regular_grid_rect_box"
+            actual_selected_runtime = _actual_query_runtime_label()
+            stage.device = actual_selected_runtime
+            stage.metadata["candidate_mode"] = selected_path
+            stage.metadata["fast_path_hit"] = True
+            if isinstance(regular_grid_box_pairs, _DeviceCandidates):
+                left_idx = regular_grid_box_pairs.d_left
+                right_idx = regular_grid_box_pairs.d_right
+                stage.rows_out = regular_grid_box_pairs.total_pairs
+            else:
+                left_idx, right_idx = regular_grid_box_pairs
+                stage.rows_out = int(left_idx.size)
+            execution_reason = (
+                "repo-owned regular-grid rectangle box query executed on GPU with exact range expansion"
+                if actual_selected_runtime == ExecutionMode.GPU.value
+                else "repo-owned regular-grid rectangle box query executed on CPU"
+            )
+        else:
+            stage.metadata["fast_path_hit"] = False
+            query_bounds = compute_geometry_bounds(
+                query_owned,
+                dispatch_mode=_gpu_bounds_dispatch_mode(query_owned),
+            )
+            gpu_candidates = _generate_candidates_gpu(query_bounds, flat_index.bounds)
+            if gpu_candidates is not None:
+                left_idx, right_idx = gpu_candidates
+                actual_selected_runtime = ExecutionMode.GPU.value
+                stage.device = ExecutionMode.GPU.value
+                stage.metadata["candidate_mode"] = "gpu"
+                stage.rows_out = int(left_idx.size)
+                execution_reason = "repo-owned GPU bbox candidate generation selected the join coarse filter"
+            else:
+                pairs = generate_bounds_pairs(query_owned, flat_index.geometry_array, tile_size=tile_size)
+                left_idx = pairs.left_indices
+                right_idx = pairs.right_indices
+                stage.metadata["candidate_mode"] = "cpu"
+                stage.metadata["pairs_examined"] = int(pairs.pairs_examined)
+                stage.rows_out = int(pairs.count)
+                execution_reason = "repo-owned CPU bbox candidate generation selected the join coarse filter"
 
     with profiler.stage(
         "refine_predicate",
         category="refine",
         device=ExecutionMode.CPU,
-        rows_in=pairs.count,
-        detail="evaluate exact predicate on coarse survivors",
+        rows_in=int(left_idx.size),
+        detail="evaluate exact predicate on coarse survivors when the join path needs refinement",
+        metadata={"predicate": predicate},
     ) as stage:
-        refined = evaluate_binary_predicate(
-            predicate,
-            query_values[pairs.left_indices],
-            tree_values[pairs.right_indices],
-            dispatch_mode=dispatch_mode,
-            null_behavior="false",
-        )
-        keep = np.asarray(refined.values, dtype=bool)
-        left_idx = pairs.left_indices[keep]
-        right_idx = pairs.right_indices[keep]
-        stage.rows_out = int(keep.sum())
-        stage.metadata["predicate"] = predicate
+        if selected_path == "regular_grid_rect_box":
+            stage.device = actual_selected_runtime
+            stage.rows_out = int(left_idx.size)
+            stage.metadata["refine_elided"] = True
+            stage.metadata["refine_selected_runtime"] = actual_selected_runtime
+        else:
+            left_idx, right_idx, refine_selection = _filter_predicate_pairs_owned(
+                predicate,
+                query_owned,
+                tree_owned,
+                left_idx,
+                right_idx,
+            )
+            stage.rows_out = int(left_idx.size)
+            stage.device = refine_selection.selected.value
+            stage.metadata["refine_elided"] = False
+            stage.metadata["refine_selected_runtime"] = refine_selection.selected.value
+            if actual_selected_runtime != ExecutionMode.GPU.value:
+                actual_selected_runtime = refine_selection.selected.value
+            execution_reason = (
+                "repo-owned GPU bbox candidate generation with GPU exact predicate refinement"
+                if actual_selected_runtime == ExecutionMode.GPU.value
+                else "repo-owned CPU exact predicate refinement selected the join path"
+            )
 
     with profiler.stage(
         "sort_output",
         category="sort",
-        device=ExecutionMode.CPU,
+        device=actual_selected_runtime,
         rows_in=int(left_idx.size),
         detail="stable-sort surviving join pairs for deterministic output",
     ) as stage:
-        if left_idx.size:
-            order = np.lexsort((right_idx, left_idx))
-            left_idx = left_idx[order]
-            right_idx = right_idx[order]
+        if int(left_idx.size):
+            if (
+                actual_selected_runtime == ExecutionMode.GPU.value
+                and cp is not None
+                and hasattr(left_idx, "__cuda_array_interface__")
+            ):
+                order = cp.lexsort(
+                    cp.stack(
+                        (
+                            cp.asarray(right_idx, dtype=cp.int64),
+                            cp.asarray(left_idx, dtype=cp.int64),
+                        )
+                    )
+                )
+                left_idx = left_idx[order]
+                right_idx = right_idx[order]
+                _sync_gpu_profile_stage()
+            else:
+                order = np.lexsort((right_idx, left_idx))
+                left_idx = left_idx[order]
+                right_idx = right_idx[order]
         stage.rows_out = int(left_idx.size)
 
-    return profiler.finish(
+    trace = profiler.finish(
         metadata={
             "rows": rows,
             "overlap_ratio": overlap_ratio,
@@ -209,7 +280,25 @@ def profile_join_kernel(
             "tree_rows": int(tree_owned.row_count),
             "query_rows": int(query_owned.row_count),
             "planner_selected_runtime": runtime_selection.selected.value,
+            "actual_selected_runtime": actual_selected_runtime,
+            "execution_implementation": (
+                "owned_gpu_spatial_query"
+                if actual_selected_runtime == ExecutionMode.GPU.value
+                else "owned_cpu_spatial_query"
+            ),
+            "execution_reason": execution_reason,
+            "selected_path": selected_path,
         }
+    )
+    return ProfileTrace(
+        operation=trace.operation,
+        dataset=trace.dataset,
+        requested_runtime=trace.requested_runtime,
+        selected_runtime=actual_selected_runtime,
+        total_elapsed_seconds=trace.total_elapsed_seconds,
+        nvtx_enabled=trace.nvtx_enabled,
+        stages=trace.stages,
+        metadata=trace.metadata,
     )
 
 
@@ -221,13 +310,27 @@ def profile_overlay_kernel(
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     enable_nvtx: bool = False,
 ) -> ProfileTrace:
-    runtime_selection = select_runtime(dispatch_mode)
+    requested_runtime = select_runtime(dispatch_mode)
+    actual_selected_runtime = (
+        ExecutionMode.GPU
+        if requested_runtime.requested is not ExecutionMode.CPU and has_gpu_runtime() and cp is not None
+        else ExecutionMode.CPU
+    )
+    runtime_selection = RuntimeSelection(
+        requested=requested_runtime.requested,
+        selected=actual_selected_runtime,
+        reason=(
+            "overlay profiling rail uses the GPU-native segment pipeline"
+            if actual_selected_runtime is ExecutionMode.GPU
+            else "overlay profiling rail uses the CPU fallback segment pipeline"
+        ),
+    )
     normalized_operation = operation if isinstance(operation, OverlayOperation) else OverlayOperation(operation)
     profiler = StageProfiler(
         operation="overlay",
         dataset=f"polygon-{rows}",
         requested_runtime=dispatch_mode,
-        selected_runtime=ExecutionMode.CPU,
+        selected_runtime=actual_selected_runtime,
         enable_nvtx=enable_nvtx,
     )
 
@@ -255,21 +358,29 @@ def profile_overlay_kernel(
     with profiler.stage(
         "extract_left_segments",
         category="setup",
-        device=ExecutionMode.CPU,
+        device=actual_selected_runtime,
         rows_in=left_owned.row_count,
         detail="extract left edge segments for overlay candidate generation",
     ) as stage:
-        left_segments = extract_segments(left_owned)
+        if actual_selected_runtime is ExecutionMode.GPU:
+            left_segments = _extract_segments_gpu(left_owned)
+            _sync_gpu_profile_stage()
+        else:
+            left_segments = extract_segments(left_owned)
         stage.rows_out = int(left_segments.count)
 
     with profiler.stage(
         "extract_right_segments",
         category="setup",
-        device=ExecutionMode.CPU,
+        device=actual_selected_runtime,
         rows_in=right_owned.row_count,
         detail="extract right edge segments for overlay candidate generation",
     ) as stage:
-        right_segments = extract_segments(right_owned)
+        if actual_selected_runtime is ExecutionMode.GPU:
+            right_segments = _extract_segments_gpu(right_owned)
+            _sync_gpu_profile_stage()
+        else:
+            right_segments = extract_segments(right_owned)
         stage.rows_out = int(right_segments.count)
 
     with profiler.stage(
@@ -280,14 +391,22 @@ def profile_overlay_kernel(
         detail="coarse-filter segment pairs by segment MBR overlap",
         metadata={"tile_size": tile_size},
     ) as stage:
-        candidates = _generate_segment_candidates_from_tables(left_segments, right_segments, tile_size=tile_size)
+        if actual_selected_runtime is ExecutionMode.GPU:
+            candidates = _generate_segment_candidates_gpu(left_segments, right_segments)
+            _sync_gpu_profile_stage()
+            stage.device = ExecutionMode.GPU.value
+            stage.metadata["candidate_mode"] = "gpu_sort_sweep"
+            stage.metadata["left_segment_count"] = int(left_segments.count)
+            stage.metadata["right_segment_count"] = int(right_segments.count)
+        else:
+            candidates = _generate_segment_candidates_from_tables(left_segments, right_segments, tile_size=tile_size)
+            stage.metadata["pairs_examined"] = candidates.pairs_examined
         stage.rows_out = candidates.count
-        stage.metadata["pairs_examined"] = candidates.pairs_examined
 
     with profiler.stage(
         "refine_intersections",
         category="refine",
-        device=ExecutionMode.CPU,
+        device=actual_selected_runtime,
         rows_in=candidates.count,
         detail="classify exact segment intersections on filtered pairs",
     ) as stage:
@@ -300,37 +419,71 @@ def profile_overlay_kernel(
             kernel_class=KernelClass.CONSTRUCTIVE,
             precision_plan=precision_plan,
         )
-        result = _classify_segment_intersections_from_tables(
-            left_segments=left_segments,
-            right_segments=right_segments,
-            pairs=candidates,
-            runtime_selection=runtime_selection,
-            precision_plan=precision_plan,
-            robustness_plan=robustness_plan,
-        )
+        if actual_selected_runtime is ExecutionMode.GPU:
+            result = _classify_segment_intersections_gpu(
+                left=left_owned,
+                right=right_owned,
+                left_segments=left_segments,
+                right_segments=right_segments,
+                pairs=candidates,
+                runtime_selection=runtime_selection,
+                precision_plan=precision_plan,
+                robustness_plan=robustness_plan,
+                tile_size=tile_size,
+            )
+        else:
+            result = _classify_segment_intersections_from_tables(
+                left_segments=left_segments,
+                right_segments=right_segments,
+                pairs=candidates,
+                runtime_selection=runtime_selection,
+                precision_plan=precision_plan,
+                robustness_plan=robustness_plan,
+            )
         stage.rows_out = result.count
-        stage.metadata["ambiguous_pairs"] = int(result.ambiguous_rows.size)
-        stage.metadata["proper_pairs"] = int(np.count_nonzero(result.kinds == 1))
-        stage.metadata["touch_pairs"] = int(np.count_nonzero(result.kinds == 2))
-        stage.metadata["overlap_pairs"] = int(np.count_nonzero(result.kinds == 3))
+        if actual_selected_runtime is ExecutionMode.GPU and result.device_state is not None and cp is not None:
+            d_kinds = cp.asarray(result.device_state.kinds)
+            stage.metadata["ambiguous_pairs"] = int(result.device_state.ambiguous_rows.size)
+            stage.metadata["proper_pairs"] = int(cp.count_nonzero(d_kinds == 1))
+            stage.metadata["touch_pairs"] = int(cp.count_nonzero(d_kinds == 2))
+            stage.metadata["overlap_pairs"] = int(cp.count_nonzero(d_kinds == 3))
+        else:
+            stage.metadata["ambiguous_pairs"] = int(result.ambiguous_rows.size)
+            stage.metadata["proper_pairs"] = int(np.count_nonzero(result.kinds == 1))
+            stage.metadata["touch_pairs"] = int(np.count_nonzero(result.kinds == 2))
+            stage.metadata["overlap_pairs"] = int(np.count_nonzero(result.kinds == 3))
 
     with profiler.stage(
         "sort_reconstruction_events",
         category="sort",
-        device=ExecutionMode.CPU,
+        device=actual_selected_runtime,
         rows_in=result.count,
         detail="stable-sort emitted intersection events for deterministic overlay reconstruction",
     ) as stage:
         if result.count:
-            _ = np.lexsort(
-                (
-                    result.right_segments,
-                    result.right_rows,
-                    result.left_segments,
-                    result.left_rows,
-                    result.kinds,
+            if actual_selected_runtime is ExecutionMode.GPU and result.device_state is not None and cp is not None:
+                _ = cp.lexsort(
+                    cp.stack(
+                        (
+                            result.device_state.right_segments,
+                            result.device_state.right_rows,
+                            result.device_state.left_segments,
+                            result.device_state.left_rows,
+                            result.device_state.kinds,
+                        )
+                    )
                 )
-            )
+                _sync_gpu_profile_stage()
+            else:
+                _ = np.lexsort(
+                    (
+                        result.right_segments,
+                        result.right_rows,
+                        result.left_segments,
+                        result.left_rows,
+                        result.kinds,
+                    )
+                )
         stage.rows_out = result.count
 
     plan = plan_overlay_reconstruction(normalized_operation)
@@ -340,8 +493,19 @@ def profile_overlay_kernel(
             "tile_size": tile_size,
             "operation": normalized_operation.value,
             "candidate_pairs": int(candidates.count),
-            "pairs_examined": int(candidates.pairs_examined),
+            "pairs_examined": (
+                int(candidates.pairs_examined)
+                if hasattr(candidates, "pairs_examined")
+                else None
+            ),
+            "actual_selected_runtime": actual_selected_runtime.value,
+            "execution_implementation": (
+                "gpu_segment_overlay_profile"
+                if actual_selected_runtime is ExecutionMode.GPU
+                else "cpu_segment_overlay_profile"
+            ),
             "planner_selected_runtime": runtime_selection.selected.value,
+            "planner_reason": runtime_selection.reason,
             "plan_stages": [stage.name for stage in plan.stages],
             "plan_reason": plan.reason,
         }

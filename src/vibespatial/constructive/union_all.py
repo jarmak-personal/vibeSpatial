@@ -39,9 +39,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
+from vibespatial.constructive.binary_constructive_cpu import binary_constructive_cpu
 from vibespatial.constructive.union_all_cpu import (
     empty_owned,
-    merge_pair_cpu,
     reduce_all_cpu,
 )
 from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
@@ -59,7 +59,11 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-from vibespatial.runtime.residency import Residency, combined_residency
+from vibespatial.runtime.residency import (
+    Residency,
+    TransferTrigger,
+    combined_residency,
+)
 
 if TYPE_CHECKING:
     from vibespatial.geometry.owned import OwnedGeometryDeviceState
@@ -75,6 +79,50 @@ _MERGE_TARGETS: dict[GeometryFamily, GeometryFamily] = {
     GeometryFamily.POLYGON: GeometryFamily.MULTIPOLYGON,
     GeometryFamily.MULTIPOLYGON: GeometryFamily.MULTIPOLYGON,
 }
+
+
+def _polygonal_family_only(owned: OwnedGeometryArray) -> bool:
+    """Return True when all valid rows are polygon-family geometries."""
+    valid_tags = np.asarray(owned.tags[owned.validity])
+    if valid_tags.size == 0:
+        return True
+    polygon_tags = np.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=valid_tags.dtype,
+    )
+    return bool(np.all(np.isin(valid_tags, polygon_tags)))
+
+
+def _spatially_localize_polygon_union_inputs(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Reorder polygon rows so nearby inputs union in early tree-reduce rounds.
+
+    Arbitrary input order can create large, fragmented intermediates very early
+    in the exact-union tree reduction. Sorting by coarse spatial position keeps
+    the first reduction rounds local, which substantially reduces downstream
+    overlay complexity on corridor/network workloads.
+    """
+    if cp is None or owned.row_count <= 2 or not _polygonal_family_only(owned):
+        return owned
+
+    try:
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+        bounds = cp.asarray(compute_geometry_bounds_device(owned))
+        if int(bounds.shape[0]) != owned.row_count:
+            return owned
+        order = cp.lexsort(cp.stack([bounds[:, 1], bounds[:, 0]])).astype(cp.int64)
+        return owned.take(order)
+    except Exception:
+        logger.debug(
+            "spatially local polygon union ordering failed; keeping input order",
+            exc_info=True,
+        )
+        return owned
 
 
 # ---------------------------------------------------------------------------
@@ -769,6 +817,59 @@ def _is_owned_empty(owned: OwnedGeometryArray) -> bool:
     return True
 
 
+def _owned_valid_nonempty_mask(
+    owned: OwnedGeometryArray,
+) -> np.ndarray | cp.ndarray:
+    """Return a validity-and-nonempty mask without forcing host geometry materialization."""
+    if cp is not None and owned.device_state is not None:
+        ds = owned._ensure_device_state()
+        validity = cp.asarray(ds.validity).astype(cp.bool_, copy=True)
+        if int(validity.size) == 0:
+            return validity
+
+        tags = cp.asarray(ds.tags)
+        row_offsets = cp.asarray(ds.family_row_offsets)
+        keep_mask = validity.copy()
+
+        for family, device_buf in ds.families.items():
+            family_mask = validity & (tags == FAMILY_TAGS[family])
+            if not bool(cp.any(family_mask)):
+                continue
+            family_rows = row_offsets[family_mask]
+            keep_mask[family_mask] = ~device_buf.empty_mask[family_rows]
+
+        return keep_mask
+
+    validity = np.asarray(owned.validity, dtype=bool)
+    if not validity.any():
+        return validity
+
+    tags = np.asarray(owned.tags)
+    row_offsets = np.asarray(owned.family_row_offsets)
+    keep_mask = validity.copy()
+
+    for family in owned.families:
+        owned._ensure_host_family_structure(family)
+        family_mask = validity & (tags == FAMILY_TAGS[family])
+        if not family_mask.any():
+            continue
+        family_rows = row_offsets[family_mask]
+        keep_mask[family_mask] = ~np.asarray(
+            owned.families[family].empty_mask[family_rows],
+            dtype=bool,
+        )
+
+    return keep_mask
+
+
+def _all_owned_rows_nonempty(owned: OwnedGeometryArray) -> bool:
+    """Return True when every valid output row is non-empty."""
+    keep_mask = _owned_valid_nonempty_mask(owned)
+    if cp is not None and hasattr(keep_mask, "__cuda_array_interface__"):
+        return bool(cp.all(keep_mask).item())
+    return bool(np.all(np.asarray(keep_mask, dtype=bool)))
+
+
 def _tree_reduce_global(
     owned: OwnedGeometryArray,
     op: str,
@@ -792,59 +893,66 @@ def _tree_reduce_global(
     OwnedGeometryArray
         Single-row result.
     """
-    from vibespatial.overlay.gpu import (
-        overlay_intersection_owned,
-        overlay_union_owned,
-    )
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
 
-    overlay_fn = overlay_union_owned if op == "union" else overlay_intersection_owned
+    if cp is not None:
+        owned = owned.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason=f"{op}_all GPU tree reduction",
+        )
+        xp = cp
+    else:
+        xp = np
 
-    # Split into single-row OwnedGeometryArrays for pairwise reduction.
-    current: list[OwnedGeometryArray] = [
-        owned.take(np.array([i], dtype=np.intp))
-        for i in range(owned.row_count)
-    ]
+    current = owned
 
     rounds = 0
-    max_rounds = int(math.ceil(math.log2(max(len(current), 2)))) + 2
+    max_rounds = int(math.ceil(math.log2(max(current.row_count, 2)))) + 2
     consecutive_gpu_failures = 0
-    while len(current) > 1 and rounds < max_rounds:
-        next_round: list[OwnedGeometryArray] = []
-        for i in range(0, len(current), 2):
-            if i + 1 < len(current):
-                gpu_ok = False
-                if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
-                    try:
-                        merged = overlay_fn(
-                            current[i],
-                            current[i + 1],
-                            dispatch_mode=ExecutionMode.GPU,
-                        )
-                        next_round.append(merged)
-                        gpu_ok = True
-                        consecutive_gpu_failures = 0
-                    except Exception:
-                        consecutive_gpu_failures += 1
+    while current.row_count > 1 and rounds < max_rounds:
+        pair_count = current.row_count // 2
+        left_indices = (xp.arange(pair_count, dtype=xp.int64) * 2)
+        right_indices = left_indices + 1
 
-                if not gpu_ok:
-                    # CPU fallback for this pair.
-                    next_round.append(merge_pair_cpu(current[i], current[i + 1], op=op))
+        carry_row: OwnedGeometryArray | None = None
+        if current.row_count % 2:
+            carry_index = xp.asarray([current.row_count - 1], dtype=xp.int64)
+            carry_row = current.take(carry_index)
 
-                # Early termination: if result is empty and op is intersection,
-                # the final result must be empty regardless of remaining elements.
-                if early_termination_on_empty and _is_owned_empty(next_round[-1]):
-                    return empty_owned()
-            else:
-                # Odd element passes through.
-                next_round.append(current[i])
+        left_batch = current.take(left_indices)
+        right_batch = current.take(right_indices)
 
-        # Explicit cleanup: release previous round's intermediates promptly
-        # to avoid accumulating device memory across reduction rounds.
-        del current
-        current = next_round
+        gpu_ok = False
+        if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
+            try:
+                next_round = binary_constructive_owned(
+                    op,
+                    left_batch,
+                    right_batch,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                gpu_ok = True
+                consecutive_gpu_failures = 0
+            except Exception:
+                consecutive_gpu_failures += 1
+
+        if not gpu_ok:
+            next_round = binary_constructive_cpu(op, left_batch, right_batch)
+
+        if early_termination_on_empty and not _all_owned_rows_nonempty(next_round):
+            return empty_owned()
+
+        if carry_row is not None:
+            reduced = OwnedGeometryArray.concat([next_round, carry_row])
+        else:
+            reduced = next_round
+
+        del current, left_batch, right_batch, next_round, carry_row
+        current = reduced
         rounds += 1
 
-    return current[0]
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1044,7 @@ def union_all_gpu_owned(
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
+            owned = _spatially_localize_polygon_union_inputs(owned)
             result = _tree_reduce_global(owned, "union")
             record_dispatch_event(
                 surface="constructive.union_all_gpu",
@@ -1046,6 +1155,7 @@ def coverage_union_all_gpu_owned(
 
     if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
+            owned = _spatially_localize_polygon_union_inputs(owned)
             # Coverage union uses the same tree reduction as regular union.
             # The coverage property (non-overlapping input) means the overlay
             # pipeline processes simpler topology, but the algorithm is identical.

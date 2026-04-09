@@ -498,6 +498,26 @@ def test_nearest_spatial_index_unbounded_matches_expected_ties_and_distances() -
     assert impl in {"strtree_host", "owned_cpu_nearest", "owned_gpu_nearest"}
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for exact GPU nearest fallback")
+def test_nearest_spatial_index_gpu_unbounded_small_point_set_covers_all_queries() -> None:
+    tree = np.asarray([Point(1, 1)], dtype=object)
+    query = np.asarray([Point(0, 0), Point(1, 1)], dtype=object)
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("point-point GPU nearest should not hit STRtree fallback"),
+        return_all=True,
+        max_distance=None,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert impl == "owned_gpu_nearest"
+    assert indices.tolist() == [[0, 1], [0, 0]]
+    assert np.allclose(distances, [np.sqrt(2.0), 0.0])
+
+
 def test_nearest_spatial_index_gpu_unbounded_avoids_bruteforce_candidate_generation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

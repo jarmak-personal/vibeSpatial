@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from vibespatial.overlay.contraction import (
     summarize_overlay_contraction_canary,
 )
 
+contract_module = importlib.import_module("vibespatial.overlay.contract")
 DATA_ROOT = Path(__file__).resolve().parents[1] / "tests" / "upstream" / "geopandas" / "tests" / "data"
 LEFT_NYBB = DATA_ROOT / "nybb_16a.zip"
 RIGHT_NYBB = DATA_ROOT / "overlay" / "nybb_qgis" / "polydf2.shp"
@@ -85,3 +87,24 @@ def test_overlay_contraction_owned_matches_simple_rectangles(operation, expected
     got = result.to_shapely()[0]
 
     assert shapely.equals(got, expected)
+
+
+@pytest.mark.gpu
+def test_overlay_contraction_gpu_path_bypasses_host_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    monkeypatch.setattr(
+        contract_module,
+        "_contract_overlay_microcells_host",
+        lambda *args, **kwargs: pytest.fail("GPU contraction should not need the host helper on simple rectangles"),
+    )
+
+    left = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
+    right = from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)])
+
+    result = overlay_contraction_owned(left, right, operation="intersection")
+
+    assert shapely.equals(result.to_shapely()[0], box(1.0, 0.0, 2.0, 2.0))

@@ -5,7 +5,7 @@ Scope: GPU-first runtime rules, fallback policy, and execution invariants.
 Read If: You are changing runtime selection, GPU execution, fallback visibility, or kernels.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Runtime architecture policy for GPU-first execution.
-Body Budget: 169/200 lines
+Body Budget: 166/200 lines
 Document: docs/architecture/runtime.md
 
 Section Map (Body Lines)
@@ -17,13 +17,13 @@ Section Map (Body Lines)
 | 21-27 | Open First |
 | 28-31 | Verify |
 | 32-37 | Risks |
-| 38-68 | Core Rules |
-| 69-78 | Fallback |
-| 79-92 | Session Execution Mode Override |
-| 93-107 | Provenance Rewrite Override |
-| 108-135 | Index-Array Boundary Model (ADR-0036) |
-| 136-163 | Memory Pool Tiers (ADR-0040) |
-| 164-169 | Compatibility |
+| 38-70 | Core Rules |
+| 71-80 | Fallback |
+| 81-94 | Session Execution Mode Override |
+| 95-109 | Provenance Rewrite Override |
+| 110-132 | Device-Native Result Boundary (ADR-0042) |
+| 133-160 | Memory Pool Tiers (ADR-0040) |
+| 161-166 | Compatibility |
 DOC_HEADER:END -->
 
 `vibeSpatial` is GPU-first, not GPU-optional.
@@ -78,6 +78,8 @@ files to inspect when execution behavior changes.
   just a precision mode.
 - Deterministic reproducibility is opt-in; default mode stays performance-first.
 - `auto` dispatch must use per-kernel crossover thresholds, not one global size gate.
+- Public API workflows should make one CPU/GPU dispatch decision at the
+  boundary, not re-plan execution family at each internal step.
 - `auto` crossover thresholds apply at promotion time while inputs are host-resident;
   once a workload is already device-resident, `auto` stays on GPU and only
   re-plans among GPU variants.
@@ -131,33 +133,28 @@ The provenance rewrite system (ADR-0039) follows the same pattern:
   `geometry_array.py:simplify()`, and the R2 branch in
   `sjoin.py:_geom_predicate_query()`.
 
-## Index-Array Boundary Model (ADR-0036)
+## Device-Native Result Boundary (ADR-0042)
 
-Spatial kernels produce only index arrays (`np.ndarray` with integer dtype).
-Attribute assembly is always pandas on host.  GPU VRAM is reserved for geometry.
+GPU-selected workflows should remain device-native until an explicit
+compatibility or materialization surface is requested.
 
-- The boundary is enforced by `SpatialJoinIndices` (frozen dataclass in
-  `spatial_query_types.py`) and `__debug__`-gated dtype assertions at kernel
-  return points in `spatial_query_utils.py` and `spatial_nearest.py`.
-- `sjoin._frame_join` is structured into three delineated blocks: geometry
-  extraction, attribute reindexing (geometry-free), and geometry reassembly.
-  The outer-join geometry path is isolated in `_reassemble_outer_geometry`.
-- Overlay's `_overlay_intersection` delegates attribute merging to
-  `_assemble_intersection_attributes`, which receives only index arrays and
-  attribute-only DataFrames.  When both operands have owned geometry backing,
-  `_overlay_intersection` dispatches through `binary_constructive_owned` at
-  buffer level (via `OwnedGeometryArray.take`), bypassing Shapely
-  materialization.  Falls back to the standard GeoSeries path on
-  `NotImplementedError` (e.g. GeometryCollection results).
-- `_overlay_difference` also dispatches through `binary_constructive_owned`
-  when owned backing is available: selective right materialization
-  (only unique participating rows via `take`), grouped union on host,
-  then GPU-accelerated difference.  `_overlay_symmetric_diff`,
-  `_overlay_union`, and `_overlay_identity` inherit this via delegation.
-- I/O paths (`io_geoparquet.py`) keep Arrow tables through geometry decode and
-  defer `.to_pandas()` to the GeoDataFrame construction boundary.
-- Contract tests in `tests/test_index_array_boundary.py` validate the boundary
-  invariants across spatial query, sjoin, overlay, dissolve, and clip.
+- Low-level spatial query kernels may still return typed integer index arrays.
+  `SpatialJoinIndices` and related dtype assertions remain useful for that
+  narrow contract.
+- The architectural target for overlay, clip, dissolve, and other
+  constructive/relational workflows is broader: device-resident geometry,
+  provenance, and relation data should stay off host until an explicit export
+  boundary such as `to_geopandas()`, `to_pandas()`, or `to_shapely()`.
+- `sjoin._frame_join` and similar pandas assembly seams remain transitional
+  compatibility layers, not the desired steady-state execution model.
+- Overlay's current attribute assembly and keep-geometry-type handling remain
+  migration surfaces. New work should move semantics handling toward typed
+  device-side classification instead of host inspection.
+- I/O paths should keep Arrow or other columnar tables alive as long as
+  possible and defer host conversion to explicit construction/materialization
+  points.
+- Once `auto` has selected GPU for a workflow, internal steps must not silently
+  pivot back to host execution just because a host-shaped helper exists.
 
 ## Memory Pool Tiers (ADR-0040)
 

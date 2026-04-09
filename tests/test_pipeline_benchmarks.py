@@ -8,10 +8,12 @@ from shapely.geometry import GeometryCollection, LineString, Point
 import vibespatial.bench.pipeline as pipeline_module
 from vibespatial.bench.compare import compare_results
 from vibespatial.bench.pipeline import (
+    PipelineBenchmarkResult,
     _actual_array_device_label,
     _from_shapely_safe,
     _profile_predicate_pipeline,
     benchmark_pipeline_suite,
+    render_gpu_sparkline_report,
     suite_to_json,
 )
 from vibespatial.bench.runner import _extract_gpu_util
@@ -159,6 +161,51 @@ def test_extract_gpu_util_requires_gpu_labeled_stage() -> None:
 
     assert gpu_util is not None
     assert gpu_util.device_name == "fake-gpu"
+
+
+def test_render_gpu_sparkline_report_prefers_cuda_event_timing_for_gpu_stage() -> None:
+    result = PipelineBenchmarkResult(
+        pipeline="join-heavy",
+        scale=1000,
+        status="ok",
+        elapsed_seconds=0.0123,
+        selected_runtime="gpu",
+        planner_selected_runtime="gpu",
+        output_rows=1,
+        transfer_count=0,
+        materialization_count=0,
+        fallback_event_count=0,
+        peak_device_memory_bytes=None,
+        stages=(
+            {
+                "stages": [
+                    {
+                        "name": "sjoin_query",
+                        "device": "gpu",
+                        "elapsed_seconds": 0.0123,
+                        "metadata": {
+                            "elapsed_display": "12.3ms",
+                            "gpu_event_elapsed_seconds": 0.000245,
+                            "gpu_event_elapsed_display": "245us",
+                            "gpu_util_sparkline": "0% |▁| 4%",
+                            "gpu_memory_util_sparkline": "0% |▁| 0%",
+                            "gpu_vram_sparkline": "10MiB |▁| 10MiB",
+                            "gpu_substage_timings": {
+                                "coerce_left_s": 0.000002,
+                                "strategy": "fused",
+                            },
+                        },
+                    }
+                ]
+            },
+        ),
+    )
+
+    report = render_gpu_sparkline_report([result])
+
+    assert "stage=sjoin_query gpu=245us wall=12.3ms" in report
+    assert "coerce_left_s=2us" in report
+    assert "strategy=fused" in report
 
 
 def test_from_shapely_safe_flattens_supported_geometry_collections() -> None:

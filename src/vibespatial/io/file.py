@@ -58,6 +58,122 @@ class ShapefileIngestBenchmark:
     rows_per_second: float
 
 
+def _native_payload_geometry_type(payload) -> str:
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    family_names = {
+        GeometryFamily.POINT: "Point",
+        GeometryFamily.LINESTRING: "LineString",
+        GeometryFamily.POLYGON: "Polygon",
+        GeometryFamily.MULTIPOINT: "MultiPoint",
+        GeometryFamily.MULTILINESTRING: "MultiLineString",
+        GeometryFamily.MULTIPOLYGON: "MultiPolygon",
+    }
+
+    owned = payload.geometry.owned
+    if owned is not None:
+        geometry_types = sorted(
+            family_names[family]
+            for family in owned.families
+            if family in family_names
+        )
+        return geometry_types[0] if len(geometry_types) == 1 else "Unknown"
+
+    series = payload.geometry.series
+    if series is None:
+        return "Unknown"
+    geometry_types = sorted(series.geom_type.dropna().unique())
+    return geometry_types[0] if len(geometry_types) == 1 else "Unknown"
+
+
+def _native_payload_file_crs(payload) -> str | None:
+    crs = payload.geometry.crs
+    if crs is None:
+        return None
+    if hasattr(crs, "to_wkt"):
+        return crs.to_wkt()
+    try:
+        from pyproj import CRS
+
+        return CRS.from_user_input(crs).to_wkt()
+    except Exception:
+        return str(crs)
+
+
+def _prepare_native_payload_for_file(payload, *, index: bool | None):
+    from pandas.api.types import is_integer_dtype
+
+    from vibespatial.api._native_results import NativeTabularResult
+
+    include_index = index
+    if include_index is None:
+        include_index = list(payload.attributes.index.names) != [None] or not is_integer_dtype(
+            payload.attributes.index.dtype
+        )
+    if not include_index:
+        return payload
+
+    attributes = payload.attributes.reset_index(drop=False)
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=payload.geometry,
+        geometry_name=payload.geometry_name,
+        column_order=tuple([*attributes.columns, payload.geometry_name]),
+        attrs=payload.attrs,
+    )
+
+
+def _write_vector_file_native_pyogrio(
+    payload,
+    filename,
+    *,
+    driver=None,
+    schema=None,
+    index=None,
+    mode="w",
+    crs=None,
+    metadata=None,
+    **kwargs,
+):
+    import pyogrio
+
+    from vibespatial.api.io.file import _check_metadata_supported, _detect_driver, _expand_user
+
+    if schema is not None:
+        raise ValueError(
+            "The 'schema' argument is not supported with the 'pyogrio' engine."
+        )
+    if crs is not None:
+        raise ValueError("Passing 'crs' is not supported with the 'pyogrio' engine.")
+    append = kwargs.pop("append", None)
+    if append is not None:
+        mode = "a" if append else "w"
+    if mode not in ("w", "a"):
+        raise ValueError(f"'mode' should be one of 'w' or 'a', got '{mode}' instead")
+
+    normalized = _prepare_native_payload_for_file(payload, index=index)
+    if not normalized.attributes.columns.is_unique:
+        raise ValueError("GeoDataFrame cannot contain duplicated column names.")
+
+    filename = _expand_user(filename)
+    driver_name = _detect_driver(filename) if driver is None else driver
+    _check_metadata_supported(metadata, "pyogrio", driver_name)
+    geometry_type = kwargs.pop("geometry_type", _native_payload_geometry_type(normalized))
+    arrow_table = normalized.to_arrow(index=False, geometry_encoding="WKB")
+
+    pyogrio.write_arrow(
+        arrow_table,
+        filename,
+        driver=driver_name,
+        geometry_name=normalized.geometry_name,
+        geometry_type=geometry_type,
+        crs=_native_payload_file_crs(normalized),
+        metadata=metadata,
+        append=(mode == "a"),
+        **kwargs,
+    )
+
+
 def plan_shapefile_ingest(*, prefer: str = "arrow-wkb") -> ShapefileIngestPlan:
     selected_strategy = "arrow-wkb" if prefer == "auto" else prefer
     implementation = {
@@ -1051,8 +1167,8 @@ def _try_gpu_read_file(
             crs=effective_crs,
         )
 
-        # ADR-0036 boundary: keep Arrow table through intermediate processing;
-        # defer .to_pandas() to the GeoDataFrame construction point.
+        # ADR-0042: keep Arrow tables through intermediate processing and defer
+        # host conversion to the explicit GeoDataFrame construction point.
         import datetime
 
         attrs_table = table.remove_column(geom_idx)
@@ -1274,14 +1390,19 @@ def write_vector_file(
     index=None,
     **kwargs,
 ):
+    from vibespatial.api import GeoDataFrame, GeoSeries
+    from vibespatial.api._native_results import (
+        _spatial_to_native_tabular_result,
+        to_native_tabular_result,
+    )
+    from vibespatial.api.geo_base import _is_geometry_like_dtype
+    from vibespatial.api.io import file as api_file
+
     plan = plan_vector_file_io(filename, operation=IOOperation.WRITE, driver=driver)
     chosen_engine = kwargs.pop("engine", None)
     if plan.format in {IOFormat.GEOJSON, IOFormat.SHAPEFILE} and chosen_engine is None:
         chosen_engine = "pyogrio"
-    if chosen_engine is not None:
-        from vibespatial.api.io import file as api_file
-
-        chosen_engine = api_file._check_engine(chosen_engine, "'to_file' method")
+    chosen_engine = api_file._check_engine(chosen_engine, "'to_file' method")
     record_dispatch_event(
         surface="geopandas.geodataframe.to_file",
         operation="to_file",
@@ -1289,6 +1410,41 @@ def write_vector_file(
         reason=plan.reason,
         selected=ExecutionMode.CPU,
     )
+
+    payload = None
+    is_public_spatial = isinstance(df, GeoDataFrame | GeoSeries)
+    if hasattr(df, "dtypes") and hasattr(df, "columns"):
+        geometry_column_count = int(df.dtypes.map(_is_geometry_like_dtype).sum())
+        if geometry_column_count <= 1:
+            payload = to_native_tabular_result(df)
+            if payload is None and hasattr(df, "_geometry_column_name"):
+                payload = _spatial_to_native_tabular_result(df)
+    else:
+        payload = to_native_tabular_result(df)
+    if payload is not None and chosen_engine == "pyogrio" and not is_public_spatial:
+        column_names = [*payload.attributes.columns, payload.geometry_name]
+        driver_name = driver or plan.driver
+        api_file._check_metadata_supported(kwargs.get("metadata"), chosen_engine, driver_name)
+        if driver_name == "ESRI Shapefile" and any(len(str(column)) > 10 for column in column_names):
+            import warnings
+
+            warnings.warn(
+                "Column names longer than 10 characters will be truncated when saved to "
+                "ESRI Shapefile.",
+                stacklevel=3,
+            )
+        return _write_vector_file_native_pyogrio(
+            payload,
+            filename,
+            driver=driver,
+            schema=schema,
+            index=index,
+            **kwargs,
+        )
+
+    if payload is not None and not is_public_spatial:
+        df = payload.to_geodataframe()
+
     from vibespatial.api.io.file import _to_file
 
     return _to_file(

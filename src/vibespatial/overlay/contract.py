@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import numpy as np
 
 from vibespatial.overlay.microcells import OverlayMicrocellLabels
+
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
+
+logger = logging.getLogger(__name__)
+_MAX_EDGE_COMPARE_CELLS = 8_000_000
 
 
 @dataclass(frozen=True)
@@ -40,16 +49,198 @@ def _union(parent: np.ndarray, rank: np.ndarray, left: int, right: int) -> None:
 
 
 def _to_host_array(arr) -> np.ndarray:
-    try:
-        import cupy as cp
-    except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
-        cp = None
     if cp is not None and hasattr(arr, "__cuda_array_interface__"):
         return cp.asnumpy(arr)
     return np.asarray(arr)
 
 
-def contract_overlay_microcells(
+def _sorted_span_starts_ends_device(values):
+    d_values = cp.asarray(values, dtype=cp.int32)
+    n = int(d_values.size)
+    if n == 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty
+    d_change = cp.empty(n, dtype=cp.bool_)
+    d_change[0] = True
+    if n > 1:
+        d_change[1:] = d_values[1:] != d_values[:-1]
+    d_starts = cp.flatnonzero(d_change).astype(cp.int32, copy=False)
+    d_ends = cp.concatenate((d_starts[1:], cp.asarray([n], dtype=cp.int32)))
+    return d_starts, d_ends
+
+
+def _build_contraction_edges_device(
+    labels: OverlayMicrocellLabels,
+    *,
+    vertical_tolerance: float = 1e-12,
+) -> tuple:
+    bands = labels.bands
+    row_indices = cp.asarray(bands.row_indices, dtype=cp.int32)
+    interval_indices = cp.asarray(bands.interval_indices, dtype=cp.int32)
+    x_left = cp.asarray(bands.x_left, dtype=cp.float64)
+    x_right = cp.asarray(bands.x_right, dtype=cp.float64)
+    y_lower_left = cp.asarray(bands.y_lower_left, dtype=cp.float64)
+    y_upper_left = cp.asarray(bands.y_upper_left, dtype=cp.float64)
+    y_lower_right = cp.asarray(bands.y_lower_right, dtype=cp.float64)
+    y_upper_right = cp.asarray(bands.y_upper_right, dtype=cp.float64)
+    left_inside = cp.asarray(labels.left_inside, dtype=cp.bool_)
+    right_inside = cp.asarray(labels.right_inside, dtype=cp.bool_)
+
+    count = int(row_indices.size)
+    if count == 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty
+
+    group_breaks = cp.empty(count, dtype=cp.bool_)
+    group_breaks[0] = True
+    if count > 1:
+        group_breaks[1:] = (
+            (row_indices[1:] != row_indices[:-1])
+            | (interval_indices[1:] != interval_indices[:-1])
+        )
+    group_starts = cp.flatnonzero(group_breaks).astype(cp.int32, copy=False)
+    group_ends = cp.concatenate((group_starts[1:], cp.asarray([count], dtype=cp.int32)))
+    if int(group_starts.size) <= 1:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty
+
+    group_rows = row_indices[group_starts]
+    group_intervals = interval_indices[group_starts]
+    group_x_left = x_left[group_starts]
+    group_x_right = x_right[group_starts]
+    adjacent_group_mask = (
+        (group_rows[1:] == group_rows[:-1])
+        & (group_intervals[1:] == (group_intervals[:-1] + 1))
+        & (cp.abs(group_x_right[:-1] - group_x_left[1:]) <= vertical_tolerance)
+    )
+    left_group_ids = cp.flatnonzero(adjacent_group_mask).astype(cp.int32, copy=False)
+    if int(left_group_ids.size) == 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty
+    right_group_ids = left_group_ids + 1
+    left_group_starts = group_starts[left_group_ids]
+    left_group_ends = group_ends[left_group_ids]
+    right_group_starts = group_starts[right_group_ids]
+    right_group_ends = group_ends[right_group_ids]
+    left_sizes = (left_group_ends - left_group_starts).astype(cp.int32, copy=False)
+    right_sizes = (right_group_ends - right_group_starts).astype(cp.int32, copy=False)
+    max_left = int(cp.max(left_sizes).item())
+    max_right = int(cp.max(right_sizes).item())
+    if max_left <= 0 or max_right <= 0:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty
+
+    pair_count = int(left_group_ids.size)
+    compare_cells_per_pair = max_left * max_right
+    pairs_per_batch = max(1, _MAX_EDGE_COMPARE_CELLS // max(compare_cells_per_pair, 1))
+
+    left_positions = cp.arange(max_left, dtype=cp.int32)
+    right_positions = cp.arange(max_right, dtype=cp.int32)
+    edge_left_parts: list = []
+    edge_right_parts: list = []
+
+    for batch_start in range(0, pair_count, pairs_per_batch):
+        batch_end = min(batch_start + pairs_per_batch, pair_count)
+        batch_slice = slice(batch_start, batch_end)
+
+        batch_left_starts = left_group_starts[batch_slice]
+        batch_left_sizes = left_sizes[batch_slice]
+        batch_right_starts = right_group_starts[batch_slice]
+        batch_right_sizes = right_sizes[batch_slice]
+
+        left_valid = left_positions[None, :] < batch_left_sizes[:, None]
+        right_valid = right_positions[None, :] < batch_right_sizes[:, None]
+        left_indices = batch_left_starts[:, None] + left_positions[None, :]
+        right_indices = batch_right_starts[:, None] + right_positions[None, :]
+
+        safe_left_indices = cp.where(left_valid, left_indices, 0).astype(cp.int32, copy=False)
+        safe_right_indices = cp.where(right_valid, right_indices, 0).astype(cp.int32, copy=False)
+
+        left_lo = y_lower_right[safe_left_indices]
+        left_hi = y_upper_right[safe_left_indices]
+        right_lo = y_lower_left[safe_right_indices]
+        right_hi = y_upper_left[safe_right_indices]
+        left_left_inside = left_inside[safe_left_indices]
+        left_right_inside = right_inside[safe_left_indices]
+        right_left_inside = left_inside[safe_right_indices]
+        right_right_inside = right_inside[safe_right_indices]
+
+        valid_pairs = left_valid[:, :, None] & right_valid[:, None, :]
+        same_left_inside = left_left_inside[:, :, None] == right_left_inside[:, None, :]
+        same_right_inside = left_right_inside[:, :, None] == right_right_inside[:, None, :]
+        overlap = (
+            cp.minimum(left_hi[:, :, None], right_hi[:, None, :])
+            - cp.maximum(left_lo[:, :, None], right_lo[:, None, :])
+        ) > vertical_tolerance
+        matches = valid_pairs & same_left_inside & same_right_inside & overlap
+        if not bool(cp.any(matches).item()):
+            continue
+
+        batch_ids, left_match_ids, right_match_ids = cp.nonzero(matches)
+        edge_left_parts.append(
+            safe_left_indices[batch_ids, left_match_ids].astype(cp.int32, copy=False)
+        )
+        edge_right_parts.append(
+            safe_right_indices[batch_ids, right_match_ids].astype(cp.int32, copy=False)
+        )
+
+    if not edge_left_parts:
+        empty = cp.empty(0, dtype=cp.int32)
+        return empty, empty
+
+    return (
+        cp.concatenate(edge_left_parts).astype(cp.int32, copy=False),
+        cp.concatenate(edge_right_parts).astype(cp.int32, copy=False),
+    )
+
+
+def _contract_component_ids_device(
+    count: int,
+    edge_left,
+    edge_right,
+    *,
+    max_iterations: int = 128,
+):
+    labels = cp.arange(count, dtype=cp.int32)
+    edge_count = int(edge_left.size)
+    if count == 0 or edge_count == 0:
+        return labels, count
+
+    edge_left = cp.asarray(edge_left, dtype=cp.int32)
+    edge_right = cp.asarray(edge_right, dtype=cp.int32)
+    converged = False
+
+    for _ in range(min(max_iterations, max(count, 1))):
+        next_labels = labels.copy()
+        cp.minimum.at(next_labels, edge_left, labels[edge_right])
+        cp.minimum.at(next_labels, edge_right, labels[edge_left])
+        next_labels = cp.minimum(
+            next_labels,
+            next_labels[next_labels.astype(cp.int64, copy=False)],
+        )
+        if bool(cp.all(next_labels == labels).item()):
+            labels = next_labels
+            converged = True
+            break
+        labels = next_labels
+
+    if not converged:
+        raise RuntimeError(
+            "device contraction label propagation did not converge within "
+            f"{min(max_iterations, max(count, 1))} iterations"
+        )
+
+    roots = labels.astype(cp.int64, copy=False)
+    compressed = cp.minimum(roots, roots[roots])
+    while not bool(cp.all(compressed == roots).item()):
+        roots = compressed
+        compressed = cp.minimum(roots, roots[roots])
+
+    unique_roots, inverse = cp.unique(compressed, return_inverse=True)
+    return inverse.astype(cp.int32, copy=False), int(unique_roots.size)
+
+
+def _contract_overlay_microcells_host(
     labels: OverlayMicrocellLabels,
     *,
     vertical_tolerance: float = 1e-12,
@@ -150,4 +341,50 @@ def contract_overlay_microcells(
         labels=labels,
         component_ids=component_ids,
         component_count=next_component,
+    )
+
+
+def contract_overlay_microcells(
+    labels: OverlayMicrocellLabels,
+    *,
+    vertical_tolerance: float = 1e-12,
+) -> OverlayMicrocellComponents:
+    count = labels.count
+    if count == 0:
+        return OverlayMicrocellComponents(
+            labels=labels,
+            component_ids=np.empty(0, dtype=np.int32),
+            component_count=0,
+        )
+
+    if (
+        cp is not None
+        and hasattr(labels.bands.row_indices, "__cuda_array_interface__")
+        and hasattr(labels.left_inside, "__cuda_array_interface__")
+        and hasattr(labels.right_inside, "__cuda_array_interface__")
+    ):
+        try:
+            edge_left, edge_right = _build_contraction_edges_device(
+                labels,
+                vertical_tolerance=vertical_tolerance,
+            )
+            component_ids, component_count = _contract_component_ids_device(
+                count,
+                edge_left,
+                edge_right,
+            )
+            return OverlayMicrocellComponents(
+                labels=labels,
+                component_ids=component_ids,
+                component_count=component_count,
+            )
+        except Exception:
+            logger.debug(
+                "device microcell contraction failed; falling back to host union-find",
+                exc_info=True,
+            )
+
+    return _contract_overlay_microcells_host(
+        labels,
+        vertical_tolerance=vertical_tolerance,
     )

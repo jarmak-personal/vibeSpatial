@@ -36,6 +36,7 @@ from vibespatial.constructive.stroke import (
 )
 from vibespatial.geometry.api_registry import register_host_transform_helpers
 from vibespatial.geometry.buffers import GeometryFamily
+from vibespatial.geometry.host_bridge import owned_to_shapely
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     NULL_TAG,
@@ -522,7 +523,7 @@ class GeometryArray(ExtensionArray):
     def _data(self) -> np.ndarray:
         if self._shapely_data is None:
             assert self._owned is not None
-            self._shapely_data = np.asarray(self._owned.to_shapely(), dtype=object)
+            self._shapely_data = owned_to_shapely(self._owned)
         return self._shapely_data
 
     @property
@@ -1057,7 +1058,7 @@ class GeometryArray(ExtensionArray):
             # Convert MultiLineString OGA to the GeoPandas-expected format:
             # np.ndarray of object, each element is a list of LinearRings
             # (or None for non-polygon / null rows).
-            result_geoms = result_owned.to_shapely()
+            result_geoms = owned_to_shapely(result_owned)
             from shapely.geometry import LinearRing
 
             has_non_poly = False
@@ -1858,8 +1859,8 @@ class GeometryArray(ExtensionArray):
                 if result_owned is not None:
                     # union_all returns a single Shapely geometry, so
                     # materialise the 1-row OGA to Shapely for API compat.
-                    result_geoms = result_owned.to_shapely()
-                    if result_geoms:
+                    result_geoms = owned_to_shapely(result_owned)
+                    if result_geoms.size > 0:
                         return result_geoms[0]
                 # None return means mixed families -- fall through to Shapely.
             if not GEOS_GE_312:
@@ -1908,8 +1909,8 @@ class GeometryArray(ExtensionArray):
                 return None
             result_owned = fn(self._owned, **kwargs)
             if result_owned is not None:
-                result_geoms = result_owned.to_shapely()
-                if result_geoms:
+                result_geoms = owned_to_shapely(result_owned)
+                if result_geoms.size > 0:
                     return result_geoms[0]
         except Exception:
             pass

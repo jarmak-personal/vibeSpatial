@@ -145,22 +145,61 @@ def _classify_type_kernels():
 class GeoJSONGpuResult:
     owned: OwnedGeometryArray
     n_features: int
-    host_bytes: np.ndarray
-    feature_starts: np.ndarray
-    feature_ends: np.ndarray
+    path: Path
+    source_nbytes: int
+    source_mtime_ns: int
+    host_bytes: np.ndarray | None
+    feature_starts: np.ndarray | None = None
+    feature_ends: np.ndarray | None = None
+    device_feature_starts: object | None = None
+    device_feature_ends: object | None = None
+
+    def _ensure_host_bytes(self) -> np.ndarray:
+        if self.host_bytes is None:
+            stat = self.path.stat()
+            if stat.st_size != self.source_nbytes or stat.st_mtime_ns != self.source_mtime_ns:
+                raise OSError(
+                    "GeoJSON source changed since GPU parse; lazy property extraction requires a stable source file"
+                )
+            self.host_bytes = np.fromfile(str(self.path), dtype=np.uint8)
+            if len(self.host_bytes) != self.source_nbytes:
+                raise OSError(
+                    f"File size changed between reads: geometry parse used {self.source_nbytes} bytes, "
+                    f"property extraction saw {len(self.host_bytes)} bytes"
+                )
+        return self.host_bytes
+
+    def _ensure_host_property_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        host_bytes = self._ensure_host_bytes()
+
+        if self.feature_starts is None or self.feature_ends is None:
+            if self.device_feature_starts is None or self.device_feature_ends is None:
+                self.feature_starts = np.empty(0, dtype=np.int64)
+                self.feature_ends = np.empty(0, dtype=np.int64)
+            else:
+                self.feature_starts = cp.asnumpy(self.device_feature_starts)
+                self.feature_ends = cp.asnumpy(self.device_feature_ends)
+                self.device_feature_starts = None
+                self.device_feature_ends = None
+
+        return host_bytes, self.feature_starts, self.feature_ends
 
     def properties_loader(self) -> Callable[[], list[dict[str, object]]]:
-        host_bytes = self.host_bytes
-        feature_starts = self.feature_starts
-        feature_ends = self.feature_ends
-
         def _load() -> list[dict[str, object]]:
-            return _extract_properties_cpu(host_bytes, feature_starts, feature_ends)
+            if (
+                self.feature_starts is not None
+                or self.feature_ends is not None
+                or self.device_feature_starts is not None
+                or self.device_feature_ends is not None
+            ):
+                host_bytes, feature_starts, feature_ends = self._ensure_host_property_state()
+                return _extract_properties_cpu(host_bytes, feature_starts, feature_ends)
+            return _extract_properties_stream_cpu(self._ensure_host_bytes())
         return _load
 
     def extract_properties_dataframe(self):
         import pandas as pd
-        props = _extract_properties_cpu(self.host_bytes, self.feature_starts, self.feature_ends)
+        props = self.properties_loader()()
         if not props:
             return pd.DataFrame()
         return pd.DataFrame(props)
@@ -192,6 +231,16 @@ def _extract_properties_cpu(
     return result
 
 
+def _extract_properties_stream_cpu(host_bytes: np.ndarray) -> list[dict[str, object]]:
+    from .geojson import _iter_feature_collection
+
+    text = host_bytes.tobytes().decode("utf-8")
+    return [
+        dict(feature.get("properties") or {}) if isinstance(feature, dict) else {}
+        for feature in _iter_feature_collection(text)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -205,6 +254,7 @@ def read_geojson_gpu(
     path: Path,
     *,
     target_crs: str | None = None,
+    capture_feature_boundaries: bool = True,
 ) -> GeoJSONGpuResult:
     """Parse a GeoJSON file using GPU byte-classification pipeline.
 
@@ -222,26 +272,20 @@ def read_geojson_gpu(
     and host data for lazy CPU property extraction.
     """
     runtime = get_cuda_runtime()
+    source_stat = path.stat()
 
     # S0: Read file to device via kvikio (parallel POSIX with pinned
     # bounce buffers) or cp.asarray fallback.
     from .kvikio_reader import read_file_to_device
 
-    file_size = path.stat().st_size
+    file_size = source_stat.st_size
     result = read_file_to_device(path, file_size)
     d_bytes = result.device_bytes
-    if result.host_bytes is not None:
-        # Fallback path: host_bytes already read, reuse them.
-        host_bytes = result.host_bytes
-    else:
-        # kvikio path: buffered POSIX read populated the OS page cache,
-        # so this np.fromfile hits warm cache (~memcpy speed).
-        host_bytes = np.fromfile(str(path), dtype=np.uint8)
     n = len(d_bytes)
-    if len(host_bytes) != n:
+    if result.host_bytes is not None and len(result.host_bytes) != n:
         raise OSError(
             f"File size changed between reads: device has {n} bytes, "
-            f"host has {len(host_bytes)} bytes"
+            f"host has {len(result.host_bytes)} bytes"
         )
     n_i64 = np.int64(n)
     ptr = runtime.pointer
@@ -277,7 +321,10 @@ def read_geojson_gpu(
         return GeoJSONGpuResult(
             owned=owned,
             n_features=0,
-            host_bytes=host_bytes,
+            path=path,
+            source_nbytes=n,
+            source_mtime_ns=source_stat.st_mtime_ns,
+            host_bytes=result.host_bytes,
             feature_starts=np.empty(0, dtype=np.int64),
             feature_ends=np.empty(0, dtype=np.int64),
         )
@@ -504,19 +551,25 @@ def read_geojson_gpu(
         del d_mp_part_psum, d_mp_ring_psum
         del d_mp_part_offset_starts, d_mp_ring_offset_starts, d_mp_pair_offset_starts
 
-    # S8: Find feature boundaries for property extraction.
-    # Moved before S4 so that d_depth (n*4 bytes = 8.6 GB for a 2 GB file)
-    # can be freed before the memory-intensive number extraction stage.
-    fb_kernels = _feature_boundary_kernels()
-    d_feat_start = cp.zeros(n, dtype=cp.uint8)
-    d_feat_end = cp.zeros(n, dtype=cp.uint8)
-    _launch_kernel(runtime, fb_kernels["find_feature_boundaries"], n, (
-        (ptr(d_bytes), ptr(d_depth), ptr(d_feat_start), ptr(d_feat_end), n_i64),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-    ))
-    d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
-    d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1
-    del d_feat_start, d_feat_end
+    d_feat_start_pos = None
+    d_feat_end_pos = None
+    if capture_feature_boundaries:
+        # S8: Find feature boundaries for property extraction.
+        # Moved before S4 so that d_depth (n*4 bytes = 8.6 GB for a 2 GB file)
+        # can be freed before the memory-intensive number extraction stage.
+        fb_kernels = _feature_boundary_kernels()
+        d_feat_start = cp.zeros(n, dtype=cp.uint8)
+        d_feat_end = cp.zeros(n, dtype=cp.uint8)
+        _launch_kernel(runtime, fb_kernels["find_feature_boundaries"], n, (
+            (ptr(d_bytes), ptr(d_depth), ptr(d_feat_start), ptr(d_feat_end), n_i64),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+        ))
+        d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
+        d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1
+        if int(d_feat_start_pos.size) > n_features:
+            d_feat_start_pos = d_feat_start_pos[-n_features:]
+            d_feat_end_pos = d_feat_end_pos[-n_features:]
+        del d_feat_start, d_feat_end
 
     # Free d_depth early: it is the single largest allocation (n*4 bytes,
     # ~8.6 GB for a 2 GB input file).  All consumers (type detection, span
@@ -576,12 +629,9 @@ def read_geojson_gpu(
 
         transform_coordinates_inplace(d_x, d_y, src_crs="EPSG:4326", dst_crs=target_crs)
 
-    del d_bytes, d_coord_positions, d_coord_ends
+    del d_bytes
+    del d_coord_positions, d_coord_ends
     del d_coords
-
-    h_feat_starts = cp.asnumpy(d_feat_start_pos)
-    h_feat_ends = cp.asnumpy(d_feat_end_pos)
-    del d_feat_start_pos, d_feat_end_pos
 
     # S7: Family-aware assembly
     if is_homogeneous:
@@ -609,9 +659,12 @@ def read_geojson_gpu(
     return GeoJSONGpuResult(
         owned=owned,
         n_features=n_features,
-        host_bytes=host_bytes,
-        feature_starts=h_feat_starts,
-        feature_ends=h_feat_ends,
+        path=path,
+        source_nbytes=n,
+        source_mtime_ns=source_stat.st_mtime_ns,
+        host_bytes=result.host_bytes,
+        device_feature_starts=d_feat_start_pos,
+        device_feature_ends=d_feat_end_pos,
     )
 
 

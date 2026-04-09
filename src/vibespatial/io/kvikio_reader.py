@@ -27,6 +27,14 @@ except ImportError:  # pragma: no cover
     cp = None
 
 
+_2GIB = 2 * 1024 * 1024 * 1024
+# Local warmed-file profiling showed kvikio setup cost dominating for
+# sub-256 MiB reads in the GPU byte-classify GeoJSON path. Keep the direct
+# device read for larger files, but prefer the cheaper host read + H2D copy
+# for small and medium files where page cache and cp.asarray win.
+_KVIKIO_DIRECT_READ_MIN_FILE_SIZE = 256 * 1024 * 1024
+
+
 @dataclass
 class FileReadResult:
     """Result of reading a file to device memory.
@@ -85,7 +93,7 @@ def read_file_to_device(path: Path, file_size: int) -> FileReadResult:
             host_bytes=np.empty(0, dtype=np.uint8),
         )
 
-    if _HAS_KVIKIO:
+    if _HAS_KVIKIO and file_size >= _KVIKIO_DIRECT_READ_MIN_FILE_SIZE:
         d_buf = cp.empty(file_size, dtype=cp.uint8)
         with kvikio.CuFile(str(path), "r") as f:
             nbytes = f.read(d_buf)
@@ -99,7 +107,6 @@ def read_file_to_device(path: Path, file_size: int) -> FileReadResult:
     # Return the host array so the caller can reuse it without a
     # redundant second read.
     host_bytes = np.fromfile(str(path), dtype=np.uint8)
-    _2GIB = 2 * 1024 * 1024 * 1024
     if len(host_bytes) > _2GIB:
         d_buf = cp.empty(len(host_bytes), dtype=cp.uint8)
         offset = 0

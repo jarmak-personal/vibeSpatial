@@ -39,14 +39,23 @@ __device__ int arc_vertex_count(double sweep_angle, int quad_segs) {
     return n < 1 ? 1 : n;
 }
 
+__device__ double snap_unit_trig(double value) {
+    if (fabs(value) <= EPSILON) return 0.0;
+    if (fabs(value - 1.0) <= EPSILON) return 1.0;
+    if (fabs(value + 1.0) <= EPSILON) return -1.0;
+    return value;
+}
+
 __device__ void emit_arc_verts(double cx, double cy, double radius,
                                double start_angle, double sweep,
                                int n_steps,
                                double* out_x, double* out_y, int* pos) {
     for (int i = 1; i <= n_steps; i++) {
         double angle = start_angle + sweep * ((double)i / (double)n_steps);
-        out_x[*pos] = cx + radius * cos(angle);
-        out_y[*pos] = cy + radius * sin(angle);
+        double cos_a = snap_unit_trig(cos(angle));
+        double sin_a = snap_unit_trig(sin(angle));
+        out_x[*pos] = cx + radius * cos_a;
+        out_y[*pos] = cy + radius * sin_a;
         (*pos)++;
     }
 }
@@ -54,19 +63,17 @@ __device__ void emit_arc_verts(double cx, double cy, double radius,
 /* Count vertices for a convex join (outside of turn).
    Returns number of vertices to emit. */
 __device__ int convex_join_count(
-    double prev_nx, double prev_ny, double curr_nx, double curr_ny,
-    double prev_dx, double prev_dy, double curr_dx, double curr_dy,
+    double cross, double dot_d,
     int join_style, int quad_segs, double mitre_limit
 ) {
     if (join_style == JOIN_ROUND) {
-        double start_a = atan2(prev_ny, prev_nx);
-        double end_a   = atan2(curr_ny, curr_nx);
-        double sweep = end_a - start_a;
-        if (sweep > 0.0) sweep -= 2.0 * PI;
+        /* Use the turn angle directly instead of normal-angle subtraction.
+           This matches the emitted arc length while avoiding branch-cut
+           instability from atan2() on near-cardinal normals. */
+        double sweep = atan2(fabs(cross), dot_d);
         return 1 + arc_vertex_count(sweep, quad_segs);  /* arrival + arc */
     }
     if (join_style == JOIN_MITRE) {
-        double dot_d = prev_dx * curr_dx + prev_dy * curr_dy;
         /* mitre_ratio^2 = 2/(1-dot_d).  Exceeds limit → bevel. */
         if ((1.0 - dot_d) * mitre_limit * mitre_limit < 2.0) {
             return 2;  /* bevel fallback: arrival + departure */
@@ -77,10 +84,10 @@ __device__ int convex_join_count(
     return 2;  /* arrival + departure */
 }
 
-/* Count vertices for a cap.
-   Round=2*q, Flat=0, Square=2. */
+/* Count vertices for cap-only additions.
+   Round=2*q-1 interior arc vertices, Flat=0, Square=2 cap corners. */
 __device__ int cap_count(int cap_style, int quad_segs) {
-    if (cap_style == CAP_ROUND)  return 2 * quad_segs;
+    if (cap_style == CAP_ROUND)  return 2 * quad_segs - 1;
     if (cap_style == CAP_SQUARE) return 2;
     return 0;  /* CAP_FLAT */
 }
@@ -136,8 +143,14 @@ extern "C" __global__ void linestring_buffer_count(
 
     int total = 0;
 
+    /* Square caps already contribute both transition corners, so the
+       left offset start and right offset start would be redundant. */
+    const int emit_cap_transition_offsets = (cap_style != CAP_SQUARE);
+
     /* === Left side forward === */
-    total += 1;  /* start vertex */
+    if (emit_cap_transition_offsets) {
+        total += 1;  /* start vertex */
+    }
 
     normalize_2d(line_x[coord_start + 1] - line_x[coord_start],
                  line_y[coord_start + 1] - line_y[coord_start],
@@ -154,11 +167,11 @@ extern "C" __global__ void linestring_buffer_count(
         curr_ny =  curr_dx;
 
         double cross = cross_2d(prev_dx, prev_dy, curr_dx, curr_dy);
+        double dot_d = prev_dx * curr_dx + prev_dy * curr_dy;
         if (cross < -EPSILON) {
             /* Right turn → convex on left */
             total += convex_join_count(
-                prev_nx, prev_ny, curr_nx, curr_ny,
-                prev_dx, prev_dy, curr_dx, curr_dy,
+                cross, dot_d,
                 join_style, q, mitre_limit);
         } else {
             /* Left turn (concave) or collinear → single point */
@@ -173,7 +186,9 @@ extern "C" __global__ void linestring_buffer_count(
 
     /* === Right cap === */
     total += cap_count(cap_style, q);
-    total += 1;  /* right side start vertex */
+    if (emit_cap_transition_offsets) {
+        total += 1;  /* right side start vertex */
+    }
 
     /* === Right side backward === */
     normalize_2d(line_x[coord_end - 1] - line_x[coord_end - 2],
@@ -192,13 +207,12 @@ extern "C" __global__ void linestring_buffer_count(
 
         /* cross = forward cross at vertex j */
         double cross = cross_2d(curr_dx, curr_dy, prev_dx, prev_dy);
+        double dot_d = prev_dx * curr_dx + prev_dy * curr_dy;
         if (cross > EPSILON) {
             /* Left turn → convex on right.
-               Arc sweep magnitude is the same for left/right normals,
-               and mitre/bevel don't use normals, so we can pass left normals. */
+               Use the turn angle directly so count matches the emitter. */
             total += convex_join_count(
-                prev_nx, prev_ny, curr_nx, curr_ny,
-                prev_dx, prev_dy, curr_dx, curr_dy,
+                cross, dot_d,
                 join_style, q, mitre_limit);
         } else {
             /* Right turn (concave) or collinear → single point */
@@ -238,9 +252,8 @@ __device__ void emit_convex_join_left(
         out_y[*pos] = vy + d * prev_ny;
         (*pos)++;
         double start_a = atan2(prev_ny, prev_nx);
-        double end_a   = atan2(curr_ny, curr_nx);
-        double sweep = end_a - start_a;
-        if (sweep > 0.0) sweep -= 2.0 * PI;
+        double dot_d = prev_dx * curr_dx + prev_dy * curr_dy;
+        double sweep = -atan2(fabs(cross), dot_d);
         int n_steps = arc_vertex_count(sweep, quad_segs);
         emit_arc_verts(vx, vy, d, start_a, sweep, n_steps,
                        out_x, out_y, pos);
@@ -289,9 +302,8 @@ __device__ void emit_convex_join_right(
         out_y[*pos] = vy - d * prev_ny;
         (*pos)++;
         double start_a = atan2(-prev_ny, -prev_nx);
-        double end_a   = atan2(-curr_ny, -curr_nx);
-        double sweep = end_a - start_a;
-        if (sweep > 0.0) sweep -= 2.0 * PI;
+        double dot_d = prev_dx * curr_dx + prev_dy * curr_dy;
+        double sweep = -atan2(fabs(cross), dot_d);
         int n_steps = arc_vertex_count(sweep, quad_segs);
         emit_arc_verts(vx, vy, d, start_a, sweep, n_steps,
                        out_x, out_y, pos);
@@ -341,8 +353,15 @@ __device__ void emit_cap(
             /* Clockwise semicircle from right normal to left normal */
             start_a = atan2(-left_ny, -left_nx);
         }
-        emit_arc_verts(vx, vy, d, start_a, -PI, 2 * quad_segs,
-                       out_x, out_y, pos);
+        int n_steps = 2 * quad_segs;
+        for (int i = 1; i < n_steps; i++) {
+            double angle = start_a + (-PI) * ((double)i / (double)n_steps);
+            double cos_a = snap_unit_trig(cos(angle));
+            double sin_a = snap_unit_trig(sin(angle));
+            out_x[*pos] = vx + d * cos_a;
+            out_y[*pos] = vy + d * sin_a;
+            (*pos)++;
+        }
         return;
     }
     if (cap_style == CAP_SQUARE) {
@@ -411,8 +430,10 @@ extern "C" __global__ void linestring_buffer_scatter(
             double step = -2.0 * PI / (double)n_arc;
             for (int i = 0; i < n_arc; i++) {
                 double angle = (double)i * step;
-                out_x[pos] = px + d * cos(angle);
-                out_y[pos] = py + d * sin(angle);
+                double cos_a = snap_unit_trig(cos(angle));
+                double sin_a = snap_unit_trig(sin(angle));
+                out_x[pos] = px + d * cos_a;
+                out_y[pos] = py + d * sin_a;
                 pos++;
             }
             out_x[pos] = out_x[output_offsets[row]];
@@ -427,6 +448,10 @@ extern "C" __global__ void linestring_buffer_scatter(
     double curr_dx, curr_dy, curr_nx, curr_ny;
     double seg_len;
 
+    /* Square caps already emit the transition corners that would otherwise
+       be duplicated by the explicit offset start/end vertices. */
+    const int emit_cap_transition_offsets = (cap_style != CAP_SQUARE);
+
     /* --- First segment --- */
     normalize_2d(line_x[coord_start + 1] - line_x[coord_start],
                  line_y[coord_start + 1] - line_y[coord_start],
@@ -438,9 +463,11 @@ extern "C" __global__ void linestring_buffer_scatter(
     double first_nx = prev_nx, first_ny = prev_ny;
 
     /* === Left side forward === */
-    out_x[pos] = line_x[coord_start] + d * prev_nx;
-    out_y[pos] = line_y[coord_start] + d * prev_ny;
-    pos++;
+    if (emit_cap_transition_offsets) {
+        out_x[pos] = line_x[coord_start] + d * prev_nx;
+        out_y[pos] = line_y[coord_start] + d * prev_ny;
+        pos++;
+    }
 
     double last_nx = prev_nx, last_ny = prev_ny;
 
@@ -496,10 +523,12 @@ extern "C" __global__ void linestring_buffer_scatter(
              cap_style, q, 1,
              out_x, out_y, &pos);
 
-    /* Right side start: right offset of v[N-1] */
-    out_x[pos] = line_x[coord_end - 1] - d * last_nx;
-    out_y[pos] = line_y[coord_end - 1] - d * last_ny;
-    pos++;
+    if (emit_cap_transition_offsets) {
+        /* Right side start: right offset of v[N-1] */
+        out_x[pos] = line_x[coord_end - 1] - d * last_nx;
+        out_y[pos] = line_y[coord_end - 1] - d * last_ny;
+        pos++;
+    }
 
     /* === Right side backward === */
     normalize_2d(line_x[coord_end - 1] - line_x[coord_end - 2],

@@ -21,6 +21,7 @@ from pandas.api.extensions import ExtensionArray, ExtensionDtype, register_exten
 from shapely.geometry.base import BaseGeometry
 
 from vibespatial.cuda._runtime import get_cuda_runtime
+from vibespatial.runtime.config import LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 from .api_registry import (
@@ -29,6 +30,7 @@ from .api_registry import (
     build_host_transform_func,
 )
 from .buffers import GeometryFamily
+from .host_bridge import materialize_family_row, owned_to_shapely
 from .owned import (
     FAMILY_TAGS,
     NULL_TAG,
@@ -39,7 +41,6 @@ from .owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     OwnedGeometryDeviceState,
-    _materialize_family_row,
     build_null_owned_array,
     concat_owned_scatter,
     from_shapely_geometries,
@@ -118,6 +119,7 @@ class DeviceGeometryArray(ExtensionArray):
         self._shapely_cache: np.ndarray | None = None
         self._owned_flat_sindex_cache = None
         self._sindex_cache = None
+        self._provenance = None
 
     @classmethod
     def _from_owned(
@@ -125,9 +127,12 @@ class DeviceGeometryArray(ExtensionArray):
         owned: OwnedGeometryArray,
         *,
         crs: Any | None = None,
+        provenance=None,
     ) -> DeviceGeometryArray:
         """Construct directly from an OwnedGeometryArray (zero-copy)."""
-        return cls(owned, crs=crs)
+        result = cls(owned, crs=crs)
+        result._provenance = provenance
+        return result
 
     @classmethod
     def _from_sequence(
@@ -505,6 +510,7 @@ class DeviceGeometryArray(ExtensionArray):
         """Buffer -- routes through owned dispatch with GPU kernel when possible."""
         from vibespatial.runtime import ExecutionMode
         from vibespatial.runtime.dispatch import record_dispatch_event
+        from vibespatial.runtime.provenance import make_buffer_tag
 
         self.check_geographic_crs(stacklevel=5)
         if isinstance(distance, pd.Series):
@@ -532,6 +538,14 @@ class DeviceGeometryArray(ExtensionArray):
         join_style = kwargs.pop("join_style", "round")
         mitre_limit = float(kwargs.pop("mitre_limit", 5.0))
         single_sided = bool(kwargs.pop("single_sided", False))
+        provenance = make_buffer_tag(
+            self,
+            distance,
+            cap_style,
+            join_style,
+            single_sided,
+            quad_segs,
+        )
 
         # Route via owned metadata -- no Shapely materialization for classification
         owned = self._owned
@@ -581,7 +595,11 @@ class DeviceGeometryArray(ExtensionArray):
                         detail=f"rows={len(self)}, family=point",
                         selected=ExecutionMode.GPU,
                     )
-                    return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                    return DeviceGeometryArray._from_owned(
+                        result,
+                        crs=self._crs,
+                        provenance=provenance,
+                    )
                 except Exception as exc:
                     owned._record(
                         DiagnosticKind.FALLBACK,
@@ -590,21 +608,31 @@ class DeviceGeometryArray(ExtensionArray):
                     )
 
             elif family is GeometryFamily.LINESTRING and not has_empties:
-                from vibespatial.constructive.linestring import linestring_buffer_owned_array
+                from vibespatial.constructive.linestring import (
+                    linestring_buffer_owned_array,
+                    supports_two_point_linestring_buffer_fast_path,
+                )
                 from vibespatial.runtime.adaptive import plan_dispatch_selection
                 from vibespatial.runtime.precision import KernelClass
 
                 # The direct DGA path bypasses GeometryArray.buffer(), so it
-                # must honor the normal AUTO crossover itself. Linestring
-                # buffer is not yet host-competitive below the public
-                # threshold; forcing tiny device-resident inputs through the
-                # GPU path regresses both correctness and throughput.
+                # must honor the normal AUTO crossover itself.
                 selection = plan_dispatch_selection(
                     kernel_name="linestring_buffer",
                     kernel_class=KernelClass.CONSTRUCTIVE,
                     row_count=len(self),
                 )
-                if selection.selected is not ExecutionMode.GPU:
+                force_two_point_gpu = (
+                    len(self) >= LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
+                    and supports_two_point_linestring_buffer_fast_path(
+                        owned,
+                        quad_segs=quad_segs,
+                        cap_style=cap_style,
+                        join_style=join_style,
+                        single_sided=single_sided,
+                    )
+                )
+                if selection.selected is not ExecutionMode.GPU and not force_two_point_gpu:
                     owned._record(
                         DiagnosticKind.RUNTIME,
                         (
@@ -621,16 +649,32 @@ class DeviceGeometryArray(ExtensionArray):
                             cap_style=cap_style,
                             join_style=join_style,
                             mitre_limit=mitre_limit,
+                            dispatch_mode=ExecutionMode.GPU,
                         )
                         record_dispatch_event(
                             surface="DeviceGeometryArray.buffer",
                             operation="buffer",
                             implementation="linestring_buffer_owned_array",
-                            reason="DGA direct linestring buffer dispatch",
-                            detail=f"rows={len(self)}, family=linestring",
+                            reason=(
+                                "DGA direct two-point linestring buffer dispatch"
+                                if force_two_point_gpu and selection.selected is not ExecutionMode.GPU
+                                else "DGA direct linestring buffer dispatch"
+                            ),
+                            detail=(
+                                f"rows={len(self)}, family=linestring"
+                                + (
+                                    ", shape=simple_two_point"
+                                    if force_two_point_gpu
+                                    else ""
+                                )
+                            ),
                             selected=ExecutionMode.GPU,
                         )
-                        return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                        return DeviceGeometryArray._from_owned(
+                            result,
+                            crs=self._crs,
+                            provenance=provenance,
+                        )
                     except Exception as exc:
                         owned._record(
                             DiagnosticKind.FALLBACK,
@@ -656,7 +700,11 @@ class DeviceGeometryArray(ExtensionArray):
                         detail=f"rows={len(self)}, family=polygon",
                         selected=ExecutionMode.GPU,
                     )
-                    return DeviceGeometryArray._from_owned(result, crs=self._crs)
+                    return DeviceGeometryArray._from_owned(
+                        result,
+                        crs=self._crs,
+                        provenance=provenance,
+                    )
                 except Exception as exc:
                     owned._record(
                         DiagnosticKind.FALLBACK,
@@ -672,7 +720,7 @@ class DeviceGeometryArray(ExtensionArray):
             "DeviceGeometryArray.buffer: Shapely fallback",
             visible=True,
         )
-        shapely_geoms = self._owned.to_shapely()
+        shapely_geoms = owned_to_shapely(self._owned)
         result = shapely.buffer(
             shapely_geoms, distance, quad_segs=quad_segs,
             cap_style=cap_style, join_style=join_style,
@@ -688,7 +736,11 @@ class DeviceGeometryArray(ExtensionArray):
             selected=ExecutionMode.CPU,
         )
         new_owned = from_shapely_geometries(result.tolist())
-        return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        return DeviceGeometryArray._from_owned(
+            new_owned,
+            crs=self._crs,
+            provenance=provenance,
+        )
 
     def simplify(self, tolerance, preserve_topology=True):
         from vibespatial.constructive.simplify import simplify_owned
@@ -731,7 +783,7 @@ class DeviceGeometryArray(ExtensionArray):
             "DeviceGeometryArray.offset_curve: Shapely materialization",
             visible=True,
         )
-        shapely_geoms = owned.to_shapely()
+        shapely_geoms = owned_to_shapely(owned)
 
         if is_eligible:
             from vibespatial.constructive.stroke import offset_curve_owned
@@ -1334,9 +1386,7 @@ class DeviceGeometryArray(ExtensionArray):
             "DeviceGeometryArray: full Shapely cache materialized",
             visible=True,
         )
-        shapely_list = self._owned.to_shapely()
-        cache = np.empty(len(shapely_list), dtype=object)
-        cache[:] = shapely_list
+        cache = owned_to_shapely(self._owned, record_event=False)
         self._shapely_cache = cache
         return cache
 
@@ -1352,7 +1402,7 @@ class DeviceGeometryArray(ExtensionArray):
         family = TAG_FAMILIES[int(self._owned.tags[row_index])]
         family_buffer = self._owned.families[family]
         family_row = int(self._owned.family_row_offsets[row_index])
-        return _materialize_family_row(family_buffer, family_row)
+        return materialize_family_row(family_buffer, family_row)
 
     # ------------------------------------------------------------------
     # Indexing
@@ -1365,7 +1415,11 @@ class DeviceGeometryArray(ExtensionArray):
         full ``take``; override to share the backing OwnedGeometryArray
         directly (semantically identical for immutable-in-practice DGA).
         """
-        result = DeviceGeometryArray._from_owned(self._owned, crs=self._crs)
+        result = DeviceGeometryArray._from_owned(
+            self._owned,
+            crs=self._crs,
+            provenance=getattr(self, "_provenance", None),
+        )
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache
         return result
@@ -1387,7 +1441,11 @@ class DeviceGeometryArray(ExtensionArray):
                 indices = np.flatnonzero(indices)
 
         new_owned = self._owned.take(indices)
-        result = DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        result = DeviceGeometryArray._from_owned(
+            new_owned,
+            crs=self._crs,
+            provenance=getattr(self, "_provenance", None),
+        )
         # Propagate shapely cache subset if available
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache[indices]
@@ -1405,6 +1463,7 @@ class DeviceGeometryArray(ExtensionArray):
                     # Full replacement: just swap the owned array.
                     self._owned = value._owned
                     self._shapely_cache = None
+                    self._provenance = getattr(value, "_provenance", None)
                     return
                 if len(indices) == value._owned.row_count:
                     from vibespatial.geometry.owned import concat_owned_scatter
@@ -1412,6 +1471,7 @@ class DeviceGeometryArray(ExtensionArray):
                         self._owned, value._owned, indices,
                     )
                     self._shapely_cache = None
+                    self._provenance = None
                     return
 
         # Slow path: Shapely materialization for scalar or non-DGA values.
@@ -1428,6 +1488,7 @@ class DeviceGeometryArray(ExtensionArray):
         # Rebuild owned from modified shapely cache
         self._owned = from_shapely_geometries(cache.tolist())
         self._shapely_cache = cache
+        self._provenance = None
 
     @staticmethod
     def _resolve_setitem_indices(
@@ -1487,10 +1548,18 @@ class DeviceGeometryArray(ExtensionArray):
                 new_owned.validity[mask] = False
                 new_owned.tags[mask] = NULL_TAG
                 new_owned.family_row_offsets[mask] = -1
-                return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+                return DeviceGeometryArray._from_owned(
+                    new_owned,
+                    crs=self._crs,
+                    provenance=getattr(self, "_provenance", None),
+                )
 
         new_owned = self._owned.take(indices)
-        result = DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        result = DeviceGeometryArray._from_owned(
+            new_owned,
+            crs=self._crs,
+            provenance=getattr(self, "_provenance", None),
+        )
         # Propagate shapely cache subset if available
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache[indices]
@@ -1499,7 +1568,11 @@ class DeviceGeometryArray(ExtensionArray):
     def copy(self) -> DeviceGeometryArray:
         new_owned = _copy_owned_array(self._owned)
         new_owned._record(DiagnosticKind.CREATED, "DeviceGeometryArray: copy", visible=False)
-        result = DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+        result = DeviceGeometryArray._from_owned(
+            new_owned,
+            crs=self._crs,
+            provenance=getattr(self, "_provenance", None),
+        )
         if self._shapely_cache is not None:
             result._shapely_cache = self._shapely_cache.copy()
         return result
@@ -1527,7 +1600,11 @@ class DeviceGeometryArray(ExtensionArray):
                 crs = arr._crs
                 break
 
-        return cls._from_owned(new_owned, crs=crs)
+        provenance = getattr(to_concat[0], "_provenance", None)
+        if any(getattr(arr, "_provenance", None) != provenance for arr in to_concat[1:]):
+            provenance = None
+
+        return cls._from_owned(new_owned, crs=crs, provenance=provenance)
 
     # ------------------------------------------------------------------
     # Serialization
@@ -1555,6 +1632,7 @@ class DeviceGeometryArray(ExtensionArray):
             )
         self._crs = crs
         self._shapely_cache = None
+        self._provenance = None
 
     # ------------------------------------------------------------------
     # pandas interop
@@ -2254,23 +2332,18 @@ def _ensure_device_row_bounds(owned: OwnedGeometryArray):
     """Return cached device per-row bounds (N, 4) CuPy array, computing if needed."""
     import cupy as cp
 
-    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
-    from vibespatial.runtime import ExecutionMode
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
     state = owned._ensure_device_state()
     if state.row_bounds is not None:
         return cp.asarray(state.row_bounds)
 
     # Trigger GPU bounds computation which now caches state.row_bounds.
-    compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
+    compute_geometry_bounds_device(owned)
     if state.row_bounds is not None:
         return cp.asarray(state.row_bounds)
 
-    # Fallback: upload host bounds (shouldn't happen after the cache fix).
-    bounds = compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
-    d_bounds = cp.asarray(bounds)
-    state.row_bounds = d_bounds
-    return d_bounds
+    raise RuntimeError("device row bounds were requested but GPU bounds were not cached")
 
 
 def _dwithin_dispatch_distance(

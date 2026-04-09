@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 258/260 lines
+Body Budget: 259/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -23,8 +23,8 @@ Section Map (Body Lines)
 | 86-104 | Execution Model |
 | 105-135 | Property Convergence |
 | 136-147 | Test Strategy |
-| 148-157 | Build And Tooling |
-| 158-184 | Verification |
+| 148-156 | Build And Tooling |
+| 157-183 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -43,10 +43,10 @@ property dashboard.
 
 - intake
 - agent workflow
+- autonomous mode / PRD execution
 - docs-only
 - verification
-- repo map
-- handoff
+- repo map / handoff
 
 ## Open First
 
@@ -92,8 +92,8 @@ Build a new NVIDIA GPU-accelerated spatial analytics library from scratch.
    a design decision.
 4. Make the smallest coherent change that advances target properties.
 5. Run the narrowest meaningful verification before expanding scope.
-6. Refresh generated docs with `uv run python scripts/check_docs.py --refresh`
-   when doc metadata changes.
+6. Refresh generated docs with `uv run python scripts/check_docs.py --refresh` when doc metadata changes.
+7. If the user provides a PRD or tasklist, treat it as the mandate and execute end-to-end without confirmation loops.
 
 For session orientation: `uv run python scripts/health.py --check`
 
@@ -180,8 +180,7 @@ The pre-commit hook enforces all property checks automatically. The
 - Put GPU-specific dependencies behind focused dependency groups.
 - If adopting CCCL Python, prefer a first-class refactor to native
   CCCL-compatible device arrays rather than layering a temporary adapter.
-- Pre-commit hook installs via:
-  `uv run python scripts/install_githooks.py`
+- Pre-commit hook installs via `uv run python scripts/install_githooks.py`
 
 ## Verification
 
@@ -212,13 +211,15 @@ deterministic checks and AI-powered sub-agent reviews.
 
 ## Working Rules
 
-- Correctness first, performance second, ergonomics third.
+- Correctness is non-negotiable. Performance is king. UX is queen.
 - Never accept a workaround. Never consider timelines. Never optimize for
   appearing done. The only question is: what is the correct solution?
 - Quick fixes are ALWAYS wrong. If you're tempted to add a try/except,
   a special case, or a flag — stop. Find the root cause.
 - Do not spend time tuning an approach that cannot hit the target
   performance envelope. Throw it out and try a different shape.
+- A provided PRD or tasklist is sufficient authority. Do not stop for fallback questions or preference polls about local implementation choices; resolve them from repo principles and continue.
+- Interrupt only for real external blockers: missing credentials, required sandbox or network approval, destructive irreversible actions not already authorized, or contradictory requirements.
 - Prefer ASCII in new files unless Unicode is already established.
 - Keep docs short, specific, and discoverable by agents.
 - Avoid broad abstractions before the test suite forces them.

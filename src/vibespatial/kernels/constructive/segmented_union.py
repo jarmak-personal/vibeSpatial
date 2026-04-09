@@ -236,6 +236,28 @@ def _segmented_union_gpu(
         # Non-polygon geometry present: fall back to CPU.
         return None
 
+    # Single-group dissolve is common in workflow benchmarks and should not
+    # route through the legacy per-row Python reduction. Reuse the global
+    # batched GPU tree-reduce path so each round processes whole batches.
+    if n_groups == 1:
+        from vibespatial.constructive.union_all import union_all_gpu_owned
+
+        keep = valid_row_indices(geometries)
+        if keep.size == 0:
+            return _get_empty_owned()
+        if keep.size < geometries.row_count:
+            geometries = geometries.take(keep)
+        if geometries.row_count == 1:
+            return geometries
+        try:
+            return union_all_gpu_owned(
+                geometries,
+                dispatch_mode=ExecutionMode.GPU,
+                precision=precision_plan.compute_precision,
+            )
+        except Exception:
+            return None
+
     group_results: list[OwnedGeometryArray] = []
 
     for g in range(n_groups):

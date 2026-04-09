@@ -18,7 +18,10 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
     unique_tag_pairs,
 )
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+from vibespatial.kernels.core.geometry_analysis import (
+    compute_geometry_bounds,
+    compute_geometry_bounds_device,
+)
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.crossover import WorkloadShape
@@ -626,7 +629,7 @@ def _evaluate_gpu_point_region_fast_path(
         for family in region_state.families
         if family in _REGION_FAMILIES
     ):
-        compute_geometry_bounds(regions, dispatch_mode=ExecutionMode.GPU)
+        compute_geometry_bounds_device(regions)
 
     from vibespatial.kernels.predicates.point_in_polygon import launch_point_region_candidate_rows
 
@@ -959,7 +962,7 @@ def _fused_gpu_binary_predicate(
     for arr, state_ref in ((left, "left"), (right, "right")):
         state = arr._ensure_device_state()
         if state.row_bounds is None:
-            compute_geometry_bounds(arr, dispatch_mode=ExecutionMode.GPU)
+            compute_geometry_bounds_device(arr)
             state = arr._ensure_device_state()
             if state.row_bounds is None:
                 record_fallback_event(

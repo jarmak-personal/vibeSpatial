@@ -128,6 +128,87 @@ def test_representative_point_stays_device_resident(strict_device_guard):
     assert result.residency == Residency.DEVICE
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+@pytest.mark.parametrize(
+    ("family", "device_buffer", "source_geom"),
+    [
+        (
+            GeometryFamily.POLYGON,
+            {
+                "x": np.asarray([0.0, 4.0, 4.0, 0.0, 0.0], dtype=np.float64),
+                "y": np.asarray([0.0, 0.0, 4.0, 4.0, 0.0], dtype=np.float64),
+                "geometry_offsets": np.asarray([0, 1], dtype=np.int32),
+                "ring_offsets": np.asarray([0, 5], dtype=np.int32),
+            },
+            Polygon([(0, 0), (4, 0), (4, 4), (0, 4)]),
+        ),
+        (
+            GeometryFamily.MULTIPOLYGON,
+            {
+                "x": np.asarray([0.0, 4.0, 4.0, 0.0, 0.0], dtype=np.float64),
+                "y": np.asarray([0.0, 0.0, 4.0, 4.0, 0.0], dtype=np.float64),
+                "geometry_offsets": np.asarray([0, 1], dtype=np.int32),
+                "part_offsets": np.asarray([0, 1], dtype=np.int32),
+                "ring_offsets": np.asarray([0, 5], dtype=np.int32),
+            },
+            MultiPolygon([Polygon([(0, 0), (4, 0), (4, 4), (0, 4)])]),
+        ),
+    ],
+)
+def test_representative_point_handles_lazy_device_family_stubs(
+    strict_device_guard,
+    family,
+    device_buffer,
+    source_geom,
+):
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+    )
+    from vibespatial.runtime import ExecutionMode
+
+    runtime = get_cuda_runtime()
+    tags = np.asarray([FAMILY_TAGS[family]], dtype=np.int8)
+    validity = np.asarray([True], dtype=np.bool_)
+    family_row_offsets = np.asarray([0], dtype=np.int32)
+
+    device_families = {
+        family: DeviceFamilyGeometryBuffer(
+            family=family,
+            x=runtime.from_host(device_buffer["x"]),
+            y=runtime.from_host(device_buffer["y"]),
+            geometry_offsets=runtime.from_host(device_buffer["geometry_offsets"]),
+            empty_mask=runtime.from_host(np.asarray([False], dtype=np.bool_)),
+            part_offsets=(
+                None
+                if "part_offsets" not in device_buffer
+                else runtime.from_host(device_buffer["part_offsets"])
+            ),
+            ring_offsets=runtime.from_host(device_buffer["ring_offsets"]),
+        )
+    }
+
+    owned = build_device_resident_owned(
+        device_families=device_families,
+        row_count=1,
+        tags=tags,
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+    )
+
+    stub = owned.families[family]
+    assert not stub.host_materialized
+    assert stub.x.size == 0
+    assert stub.ring_offsets is None
+
+    result = representative_point_owned(owned, dispatch_mode=ExecutionMode.GPU)
+
+    assert result.residency.value == "device"
+    _assert_point_inside(result.to_shapely(), [source_geom])
+
+
 # ---------------------------------------------------------------------------
 # Tests: Basic Functionality
 # ---------------------------------------------------------------------------

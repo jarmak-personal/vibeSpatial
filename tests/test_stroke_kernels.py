@@ -16,6 +16,9 @@ from vibespatial import (
 )
 from vibespatial.api import GeoSeries
 from vibespatial.api.testing import assert_geoseries_equal
+from vibespatial.constructive.linestring import linestring_buffer_owned_array
+from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.fusion import IntermediateDisposition
 
 
@@ -66,7 +69,10 @@ def test_geopandas_buffer_mixed_rows_route_to_host_surface() -> None:
     assert len(result) == 2
     assert not events
     assert dispatch_events
-    assert dispatch_events[-1].surface == "geopandas.array.buffer"
+    assert dispatch_events[-1].surface in {
+        "geopandas.array.buffer",
+        "DeviceGeometryArray.buffer",
+    }
     assert dispatch_events[-1].implementation == "shapely_host"
 
 
@@ -86,8 +92,127 @@ def test_geopandas_buffer_dispatch_claims_point_surface() -> None:
     )
     assert not fallback_events
     assert dispatch_events
-    assert dispatch_events[-1].surface == "geopandas.array.buffer"
+    assert dispatch_events[-1].surface in {
+        "geopandas.array.buffer",
+        "DeviceGeometryArray.buffer",
+    }
     assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+
+
+def test_linestring_buffer_owned_gpu_matches_shapely_after_normalize() -> None:
+    line = LineString([(0, 0), (0, 2), (2, 2)])
+    owned = from_shapely_geometries([line])
+
+    result = linestring_buffer_owned_array(
+        owned,
+        1.0,
+        quad_segs=1,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    actual = result.to_shapely()[0]
+    expected = shapely.buffer(line, 1.0, quad_segs=1)
+
+    assert bool(shapely.is_valid(actual))
+    assert bool(
+        shapely.normalize(actual).equals_exact(
+            shapely.normalize(expected),
+            tolerance=1e-12,
+        )
+    )
+
+
+def test_linestring_buffer_owned_gpu_two_point_grid_segments_match_shapely() -> None:
+    lines = np.asarray(
+        [
+            LineString([(0, 0), (10, 0)]),
+            LineString([(0, 0), (0, 10)]),
+        ],
+        dtype=object,
+    )
+    owned = from_shapely_geometries(lines.tolist())
+
+    result = linestring_buffer_owned_array(
+        owned,
+        1.0,
+        quad_segs=16,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    actual = np.asarray(result.to_shapely(), dtype=object)
+    expected = shapely.buffer(lines, 1.0, quad_segs=16)
+
+    assert bool(shapely.is_valid(actual).all())
+    assert np.all(
+        [
+            bool(
+                shapely.normalize(left).equals_exact(
+                    shapely.normalize(right),
+                    tolerance=1e-12,
+                )
+            )
+            for left, right in zip(actual, expected, strict=True)
+        ]
+    )
+
+
+def test_linestring_buffer_owned_gpu_square_cap_elbow_matches_shapely_after_normalize() -> None:
+    line = LineString([(0, 0), (10, 0), (10, 10)])
+    owned = from_shapely_geometries([line])
+
+    result = linestring_buffer_owned_array(
+        owned,
+        1.0,
+        quad_segs=4,
+        cap_style="square",
+        join_style="round",
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    actual = result.to_shapely()[0]
+    expected = shapely.buffer(
+        line,
+        1.0,
+        quad_segs=4,
+        cap_style="square",
+        join_style="round",
+    )
+
+    assert len(actual.exterior.coords) == len(expected.exterior.coords)
+    assert bool(
+        shapely.normalize(actual).equals_exact(
+            shapely.normalize(expected),
+            tolerance=1e-12,
+        )
+    )
+
+
+def test_linestring_buffer_owned_gpu_real_vegetation_corridor_line_has_stable_vertex_count() -> None:
+    line = LineString(
+        [
+            (0.0, 1000.0),
+            (90.9090909090909, 1000.0),
+            (181.8181818181818, 1000.0),
+            (272.72727272727275, 997.297227770596),
+            (363.6363636363636, 935.678498916312),
+            (454.5454545454545, 879.0356008412407),
+            (545.4545454545455, 841.2366904842921),
+            (636.3636363636364, 831.5362593839325),
+            (727.2727272727273, 852.3093113878917),
+            (818.1818181818181, 898.4698788800844),
+            (909.090909090909, 958.7162450323488),
+            (1000.0, 1000.0),
+        ]
+    )
+    owned = from_shapely_geometries([line])
+
+    result = linestring_buffer_owned_array(
+        owned,
+        10.0,
+        quad_segs=16,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    actual = result.to_shapely()[0]
+
+    assert bool(shapely.is_valid(actual))
+    assert len(actual.exterior.coords) == 111
 
 
 def test_geopandas_offset_curve_fallback_is_observable_for_multiline() -> None:

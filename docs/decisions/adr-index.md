@@ -41,10 +41,10 @@ context, the decision made, consequences, and alternatives considered.
 0033-gpu-primitive-dispatch-rules
 0034-cccl-precompile-warmup-strategy
 0035-geodesic-distance-kernel
-0036-index-array-boundary-attribute-model
 0037-gpu-voronoi-diagram-kernel
 0038-gpu-byte-classify-geojson-parser
 0039-provenance-tagging-rewrites
 0040-tiered-gpu-memory-pool
 0041-gpu-text-parsing-framework
+0042-device-native-result-boundary
 ```

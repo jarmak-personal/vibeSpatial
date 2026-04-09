@@ -5,7 +5,7 @@ Scope: GeoPandas method delegation, dispatch events, and object-construction avo
 Read If: You are changing public method delegation, dispatch events, or GeoPandas adapter wiring.
 STOP IF: Your task already has the adapter implementation open and only needs local detail.
 Source Of Truth: API dispatch policy for GeoPandas-facing method boundaries.
-Body Budget: 68/220 lines
+Body Budget: 74/220 lines
 Document: docs/architecture/api-dispatch.md
 
 Section Map (Body Lines)
@@ -17,9 +17,9 @@ Section Map (Body Lines)
 | 17-24 | Open First |
 | 25-29 | Verify |
 | 30-35 | Risks |
-| 36-51 | Decision |
-| 52-61 | Performance Notes |
-| 62-68 | Current Behavior |
+| 36-54 | Decision |
+| 55-67 | Performance Notes |
+| 68-74 | Current Behavior |
 DOC_HEADER:END -->
 
 ## Intent
@@ -61,6 +61,9 @@ or hiding which implementation actually ran.
   `GeoDataFrame` instead of rebuilding wrapper arrays inside delegate helpers.
 - Allow `GeometryArray` to cache its owned-geometry conversion for repo-owned
   kernels that need it repeatedly.
+- Make the CPU/GPU dispatch decision at the public method boundary, then keep
+  the internal workflow inside that execution family unless an explicit,
+  observable fallback boundary is crossed.
 - Record explicit dispatch events at the public method boundary for
   high-traffic surfaces (currently `buffer`, `offset_curve`, `clip_by_rect`,
   `make_valid`, `dissolve`, `intersection`, `union`, `difference`,
@@ -78,6 +81,9 @@ or hiding which implementation actually ran.
 - Caching owned conversions is important because owned-buffer construction is
   the real bridge cost between the extension-array surface and GPU-oriented
   kernels.
+- Re-planning CPU vs GPU at each internal step of a composite workflow adds
+  orchestration cost and tends to shed residency. Prefer one boundary decision,
+  then compose internal helpers inside the chosen execution shape.
 - Dispatch events should be lightweight metadata only; they must not materialize
   host buffers or alter row order.
 

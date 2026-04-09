@@ -23,6 +23,11 @@ from __future__ import annotations
 
 import numpy as np
 
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+    cp = None
+
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_F64,
     KERNEL_PARAM_I32,
@@ -69,11 +74,35 @@ request_warmup([
 _MORTON_RANGE_CROSSOVER = 1_000_000
 
 
+def _is_device_array(value) -> bool:
+    return hasattr(value, "__cuda_array_interface__")
+
+
+def _prepare_query_bounds_device(
+    bounds,
+    runtime,
+):
+    """Return `(device_bounds_flat, temp_allocation)` for kernel launch input."""
+    if _is_device_array(bounds):
+        if cp is None:  # pragma: no cover - exercised on CPU-only installs
+            raise RuntimeError("CuPy is not installed; device bounds are unavailable")
+        base = cp.asarray(bounds)
+        prepared = base
+        if prepared.dtype != cp.float64:
+            prepared = prepared.astype(cp.float64, copy=True)
+        if not prepared.flags.c_contiguous:
+            prepared = cp.ascontiguousarray(prepared)
+        return prepared.ravel(), None if prepared is base else prepared
+
+    device_bounds = runtime.from_host(np.ascontiguousarray(bounds, dtype=np.float64).ravel())
+    return device_bounds, device_bounds
+
+
 def spatial_index_device_query(
     flat_index,
-    query_bounds: np.ndarray,
+    query_bounds,
     *,
-    distance: np.ndarray | None = None,
+    distance: np.ndarray | object | None = None,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> tuple[_DeviceCandidates | None, SpatialQueryExecution]:
     """GPU-accelerated spatial index query — replaces CPU STRtree traversal.
@@ -98,7 +127,7 @@ def spatial_index_device_query(
         ``candidates`` is None when GPU dispatch is skipped or no pairs
         are found.  ``execution`` carries the dispatch decision metadata.
     """
-    query_count = query_bounds.shape[0]
+    query_count = int(query_bounds.shape[0])
     tree_count = flat_index.size
     if query_count == 0 or tree_count == 0:
         return None, SpatialQueryExecution(
@@ -170,7 +199,7 @@ def spatial_index_device_query(
             )
 
     # Fall through to brute-force O(N*M).
-    if query_count == 1:
+    if query_count == 1 and not _is_device_array(effective_bounds):
         result = _brute_force_scalar(effective_bounds[0], flat_index)
     else:
         result = _brute_force_multi(effective_bounds, flat_index)
@@ -200,11 +229,25 @@ def spatial_index_device_query(
 
 
 def _expand_bounds_for_distance(
-    bounds: np.ndarray,
-    distances: np.ndarray,
-) -> np.ndarray:
+    bounds,
+    distances: np.ndarray | object,
+):
     """Expand query bounds by per-row distances for dwithin."""
-    expanded = bounds.copy()
+    if _is_device_array(bounds):
+        if cp is None:  # pragma: no cover - exercised on CPU-only installs
+            raise RuntimeError("CuPy is not installed; device bounds are unavailable")
+        expanded = cp.array(bounds, dtype=cp.float64, copy=True)
+        if np.isscalar(distances):
+            dist = float(distances)
+        else:
+            dist = cp.asarray(distances, dtype=cp.float64)
+        expanded[:, 0] -= dist
+        expanded[:, 1] -= dist
+        expanded[:, 2] += dist
+        expanded[:, 3] += dist
+        return expanded
+
+    expanded = np.array(bounds, dtype=np.float64, copy=True, order="C")
     if np.isscalar(distances):
         d = float(distances)
         expanded[:, 0] -= d
@@ -280,7 +323,7 @@ def _brute_force_scalar(
 
 
 def _brute_force_multi(
-    query_bounds: np.ndarray,
+    query_bounds,
     flat_index,
 ) -> _DeviceCandidates | None:
     """GPU brute-force for Q>1: count + exclusive_sum + scatter."""
@@ -288,12 +331,10 @@ def _brute_force_multi(
 
     runtime = get_cuda_runtime()
     tree_bounds = flat_index.bounds
-    query_count = query_bounds.shape[0]
+    query_count = int(query_bounds.shape[0])
     tree_count = flat_index.size
 
-    d_query_bounds = runtime.from_host(
-        np.ascontiguousarray(query_bounds, dtype=np.float64).ravel()
-    )
+    d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(query_bounds, runtime)
     d_tree_bounds = runtime.from_host(
         np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
     )
@@ -383,7 +424,7 @@ def _brute_force_multi(
             total_pairs=total_pairs,
         )
     finally:
-        runtime.free(d_query_bounds)
+        runtime.free(temp_query_bounds)
         runtime.free(d_tree_bounds)
         runtime.free(d_counts)
         runtime.free(d_offsets)
@@ -391,8 +432,8 @@ def _brute_force_multi(
 
 def _morton_range_query(
     flat_index,
-    original_bounds: np.ndarray,
-    effective_bounds: np.ndarray,
+    original_bounds,
+    effective_bounds,
 ) -> _DeviceCandidates | None:
     """Morton range query — O(N*log(M)+K).
 
@@ -413,7 +454,7 @@ def _morton_range_query(
     import cupy as cp
 
     runtime = get_cuda_runtime()
-    query_count = original_bounds.shape[0]
+    query_count = int(original_bounds.shape[0])
     total_bounds = flat_index.total_bounds
 
     # Morton codes encode bbox centers, so a tree geometry whose center is
@@ -438,15 +479,17 @@ def _morton_range_query(
     sorted_tree_bounds_host = np.ascontiguousarray(
         flat_index.bounds[flat_index.order], dtype=np.float64,
     )
-    query_bounds_host = np.ascontiguousarray(original_bounds, dtype=np.float64)
-    expanded_bounds_host = np.ascontiguousarray(expanded_bounds, dtype=np.float64)
     order_host = np.ascontiguousarray(flat_index.order, dtype=np.int32)
 
     # Upload to device.
     d_sorted_keys = runtime.from_host(sorted_keys_host)
     d_sorted_tree_bounds = runtime.from_host(sorted_tree_bounds_host.ravel())
-    d_query_bounds = runtime.from_host(query_bounds_host.ravel())
-    d_expanded_bounds = runtime.from_host(expanded_bounds_host.ravel())
+    d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(
+        original_bounds, runtime,
+    )
+    d_expanded_bounds, temp_expanded_bounds = _prepare_query_bounds_device(
+        expanded_bounds, runtime,
+    )
     d_order = runtime.from_host(order_host)
     d_range_low = runtime.allocate((query_count,), cp.uint64)
     d_range_high = runtime.allocate((query_count,), cp.uint64)
@@ -593,8 +636,8 @@ def _morton_range_query(
     finally:
         runtime.free(d_sorted_keys)
         runtime.free(d_sorted_tree_bounds)
-        runtime.free(d_query_bounds)
-        runtime.free(d_expanded_bounds)
+        runtime.free(temp_query_bounds)
+        runtime.free(temp_expanded_bounds)
         runtime.free(d_order)
         runtime.free(d_range_low)
         runtime.free(d_range_high)

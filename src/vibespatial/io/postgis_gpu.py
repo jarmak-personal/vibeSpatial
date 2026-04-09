@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
     from vibespatial.api import GeoDataFrame
+    from vibespatial.api._native_results import NativeTabularResult
     from vibespatial.geometry.owned import OwnedGeometryArray
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,32 @@ def _get_connection_uri(con: object) -> str | None:
     if hasattr(con, "engine") and hasattr(con.engine, "url"):
         return str(con.engine.url)
     return None
+
+
+def _coerce_native_write_payload(spatial) -> NativeTabularResult | None:
+    from vibespatial.api._native_results import (
+        _spatial_to_native_tabular_result,
+        to_native_tabular_result,
+    )
+
+    payload = to_native_tabular_result(spatial)
+    if payload is None and hasattr(spatial, "_geometry_column_name"):
+        payload = _spatial_to_native_tabular_result(spatial)
+    return payload
+
+
+def _srid_from_crs(crs) -> int:
+    srid = 0
+    if crs is not None:
+        try:
+            for confidence in (100, 70, 25):
+                epsg = crs.to_epsg(min_confidence=confidence)
+                if epsg is not None:
+                    srid = epsg
+                    break
+        except Exception:
+            pass
+    return srid
 
 
 def _detect_crs_from_table(
@@ -274,7 +301,7 @@ def read_postgis_gpu(
 
 
 def to_postgis_gpu(
-    gdf: GeoDataFrame,
+    gdf: GeoDataFrame | NativeTabularResult,
     name: str,
     con: str | object,
     if_exists: str = "fail",
@@ -315,12 +342,28 @@ def to_postgis_gpu(
 
     import pyarrow as pa
 
-    # --- extract geometry as WKB bytes ---------------------------------------
-    geom_name = gdf.geometry.name
-    geom_values = gdf.geometry.values
+    payload = _coerce_native_write_payload(gdf)
+    if payload is not None:
+        geom_name = payload.geometry_name
+        geometry_crs = payload.geometry.crs
+        owned: OwnedGeometryArray | None = payload.geometry.owned
+        attributes = payload.attributes
+        geom_values = None
+        if owned is None:
+            geom_values = payload.geometry.to_geoseries(
+                index=payload.attributes.index,
+                name=geom_name,
+            ).values
+    else:
+        import pandas as pd
 
-    # Try GPU WKB encode if owned backing exists
-    owned: OwnedGeometryArray | None = getattr(geom_values, "_owned", None)
+        geom_name = gdf.geometry.name
+        geometry_crs = gdf.crs
+        geom_values = gdf.geometry.values
+        owned = getattr(geom_values, "_owned", None)
+        attributes = pd.DataFrame(gdf.drop(columns=[geom_name]), copy=False)
+
+    # --- extract geometry as WKB bytes ---------------------------------------
     wkb_list: list[bytes | None]
     if owned is not None:
         from vibespatial.io.wkb import encode_wkb_owned
@@ -343,26 +386,17 @@ def to_postgis_gpu(
         )
 
     # --- determine SRID ------------------------------------------------------
-    srid = 0
-    if gdf.crs is not None:
-        try:
-            for confidence in (100, 70, 25):
-                epsg = gdf.crs.to_epsg(min_confidence=confidence)
-                if epsg is not None:
-                    srid = epsg
-                    break
-        except Exception:
-            pass
+    srid = _srid_from_crs(geometry_crs)
 
     # --- build Arrow table with WKB binary column + attributes ---------------
-    import pandas as pd
-
-    df = pd.DataFrame(gdf.drop(columns=[geom_name]), copy=False)
-    if index:
-        df = df.reset_index()
-
     wkb_array = pa.array(wkb_list, type=pa.binary())
-    attr_table = pa.Table.from_pandas(df, preserve_index=False)
+    if payload is not None and not index:
+        attr_table = attributes.to_arrow(index=False, columns=attributes.columns)
+    else:
+        df = attributes
+        if index:
+            df = df.reset_index()
+        attr_table = pa.Table.from_pandas(df, preserve_index=False)
     # Append the WKB column
     write_table = attr_table.append_column(geom_name, wkb_array)
 

@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 212/280 lines
+Body Budget: 227/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -17,10 +17,10 @@ Section Map (Body Lines)
 | 18-23 | Open First |
 | 24-29 | Verify |
 | 30-35 | Risks |
-| 36-44 | Decision |
-| 45-54 | Performance Notes |
-| 55-122 | Current Behavior |
-| 123-212 | Measured Local Baseline |
+| 36-50 | Decision |
+| 51-60 | Performance Notes |
+| 61-137 | Current Behavior |
+| 138-227 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -64,6 +64,12 @@ keeping GPU-native formats primary and legacy formats explicit.
 - Other GDAL vector formats stay behind an explicit legacy fallback adapter.
 - Public `geopandas.read_file` and `GeoDataFrame.to_file` should dispatch
   through repo-owned wrappers so the chosen path is observable.
+- On the `pyogrio` write path, terminal export should prefer the shared
+  native tabular Arrow boundary over rebuilding a GeoDataFrame-shaped host
+  export when the input is already a native result. Public
+  `GeoDataFrame.to_file(...)` remains on the compatibility writer unless the
+  repo-owned native sink can match GeoPandas file semantics exactly. Fiona
+  remains an explicit host compatibility boundary.
 
 ## Performance Notes
 
@@ -80,6 +86,15 @@ keeping GPU-native formats primary and legacy formats explicit.
 - `geopandas.read_file` now classifies GeoJSON, Shapefile, and legacy GDAL
   paths through one repo-owned router.
 - `GeoDataFrame.to_file` uses the same routing policy.
+- Repo-owned `to_file(..., engine="pyogrio")` now writes through
+  `pyogrio.write_arrow(...)` from the shared native tabular boundary whenever
+  a native result is available, instead of rebuilding a host GeoDataFrame as
+  the execution model for terminal export.
+- Public `GeoDataFrame.to_file(..., engine="pyogrio")` stays on
+  `pyogrio.write_dataframe(...)` for compatibility-sensitive cases such as
+  append mode, timezone-preserving datetime fields, unsupported metadata
+  combinations, and other legacy driver semantics that the native Arrow sink
+  does not yet match exactly.
 - GeoJSON and Shapefile record dispatch events without fallback events.
 - Legacy formats such as GPKG emit explicit fallback events.
 - Repo-owned GeoJSON ingest now also has an internal staged owned path:

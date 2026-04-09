@@ -26,10 +26,11 @@ from vibespatial.runtime.residency import Residency, TransferTrigger
 
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb import (
-    _decode_native_wkb,
     _encode_native_wkb,
     _homogeneous_family,
     decode_wkb_arrow_array_owned,
+    decode_wkb_owned,
+    plan_wkb_partition,
 )
 
 
@@ -204,7 +205,11 @@ def _encode_list_family(
 
     mask = None if bool(array.validity.all()) else pa.array(~array.validity, type=pa.bool_())
     if interleaved:
-        point_values = pa.FixedSizeListArray.from_arrays(pa.array(np.column_stack([buffer.x, buffer.y]).ravel(), type=pa.float64()), 2)
+        point_type = pa.list_(pa.field("xy", pa.float64(), nullable=False), 2)
+        point_values = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.column_stack([buffer.x, buffer.y]).ravel(), type=pa.float64()),
+            type=point_type,
+        )
     else:
         point_values = pa.StructArray.from_arrays(
             [pa.array(buffer.x), pa.array(buffer.y)],
@@ -746,6 +751,7 @@ def benchmark_native_geometry_codec(
         raise ValueError(f"Unsupported native geometry benchmark operation: {operation}")
 
     field, geom_arr = encode_owned_geoarrow_array(owned, field_name="geometry")
+    _decode_geoarrow_array_to_owned(field, geom_arr)
     start = perf_counter()
     for _ in range(repeat):
         _decode_geoarrow_array_to_owned(field, geom_arr)
@@ -762,6 +768,7 @@ def benchmark_native_geometry_codec(
     )
     from vibespatial.api.io._geoarrow import construct_shapely_array
 
+    construct_shapely_array(geom_arr, field.metadata[b"ARROW:extension:name"].decode())
     start = perf_counter()
     for _ in range(repeat):
         construct_shapely_array(geom_arr, field.metadata[b"ARROW:extension:name"].decode())
@@ -826,6 +833,7 @@ def benchmark_wkb_bridge(
     if operation != "decode":
         raise ValueError(f"Unsupported WKB bridge benchmark operation: {operation}")
 
+    from_wkb(wkb_values)
     start = perf_counter()
     for _ in range(repeat):
         from_wkb(wkb_values)
@@ -841,9 +849,11 @@ def benchmark_wkb_bridge(
             rows_per_second=rows / host_elapsed if host_elapsed else float("inf"),
         )
     )
+    fallback_rows = plan_wkb_partition(wkb_values).fallback_rows
+    decode_wkb_owned(wkb_values)
     start = perf_counter()
     for _ in range(repeat):
-        native, plan = _decode_native_wkb(wkb_values)
+        decode_wkb_owned(wkb_values)
     native_elapsed = (perf_counter() - start) / repeat
     results.append(
         WKBBridgeBenchmark(
@@ -851,7 +861,7 @@ def benchmark_wkb_bridge(
             geometry_type=geometry_type,
             implementation="native_owned",
             rows=rows,
-            fallback_rows=plan.fallback_rows,
+            fallback_rows=fallback_rows,
             elapsed_seconds=native_elapsed,
             rows_per_second=rows / native_elapsed if native_elapsed else float("inf"),
         )
@@ -908,6 +918,87 @@ def geodataframe_to_arrow(
         include_z=include_z,
     )
     return ArrowTable(table)
+
+
+def native_tabular_to_arrow(
+    payload,
+    *,
+    index: bool | None = None,
+    geometry_encoding: str = "WKB",
+    interleaved: bool = True,
+    include_z: bool | None = None,
+):
+    import pyarrow as pa
+
+    from vibespatial.api._native_results import NativeTabularResult
+    from vibespatial.api.io._geoarrow import construct_wkb_array
+    from vibespatial.io.wkb import _encode_owned_wkb_array
+
+    if not isinstance(payload, NativeTabularResult):
+        raise TypeError("native_tabular_to_arrow expects a NativeTabularResult")
+
+    record_dispatch_event(
+        surface="vibespatial.native_tabular.to_arrow",
+        operation="to_arrow",
+        implementation="repo_owned_geoarrow_adapter",
+        reason="Native tabular export lowers directly to Arrow without rebuilding a GeoDataFrame.",
+        selected=ExecutionMode.CPU,
+    )
+
+    geometry_series = payload.geometry.to_geoseries(
+        index=payload.attributes.index,
+        name=payload.geometry_name,
+    )
+    attr_columns = [column for column in payload.column_order if column != payload.geometry_name]
+    if attr_columns:
+        table = payload.attributes.to_arrow(
+            index=index,
+            columns=attr_columns,
+        )
+    else:
+        table = None
+
+    geometry_column_index = list(payload.column_order).index(payload.geometry_name)
+    geometry_encoding_dict: dict[str, str] = {}
+    if geometry_encoding.lower() == "geoarrow":
+        field, geom_arr = _construct_geoarrow_array_with_explicit_fallback(
+            geometry_series,
+            field_name=payload.geometry_name,
+            interleaved=interleaved,
+            include_z=include_z,
+            surface="vibespatial.native_tabular.to_arrow",
+            fallback_to_wkb_on_error=False,
+        )
+        geometry_encoding_dict[payload.geometry_name] = (
+            field.metadata[b"ARROW:extension:name"]
+            .decode()
+            .removeprefix("geoarrow.")
+        )
+    elif geometry_encoding.lower() == "wkb":
+        owned = payload.geometry.owned or getattr(geometry_series.values, "_owned", None)
+        if owned is not None:
+            field, geom_arr = _encode_owned_wkb_array(
+                owned,
+                field_name=payload.geometry_name,
+                crs=geometry_series.crs,
+            )
+        else:
+            field, geom_arr = construct_wkb_array(
+                np.asarray(geometry_series.array),
+                field_name=payload.geometry_name,
+                crs=geometry_series.crs,
+            )
+        geometry_encoding_dict[payload.geometry_name] = "WKB"
+    else:
+        raise ValueError(
+            f"Expected geometry encoding 'WKB' or 'geoarrow' got {geometry_encoding}"
+        )
+
+    if table is None:
+        table = pa.Table.from_arrays([geom_arr], schema=pa.schema([field]))
+    else:
+        table = table.add_column(geometry_column_index, field, geom_arr)
+    return table, geometry_encoding_dict
 
 def geoseries_to_arrow(
     series,

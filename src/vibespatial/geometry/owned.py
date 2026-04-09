@@ -14,14 +14,6 @@ except ModuleNotFoundError:  # pragma: no cover
     cp = None
 
 import shapely
-from shapely.geometry import (
-    LineString,
-    MultiLineString,
-    MultiPoint,
-    MultiPolygon,
-    Point,
-    Polygon,
-)
 
 from vibespatial.cuda._runtime import DeviceArray, get_cuda_runtime
 from vibespatial.runtime import RuntimeSelection
@@ -1378,42 +1370,9 @@ class OwnedGeometryArray:
         return result
 
     def to_shapely(self) -> list[object | None]:
-        # Indexed-view fast path: materialize only the compact base array
-        # (e.g. 38K unique polygons) and expand via index map (76.8M Python
-        # object references).  This avoids materializing 76.8M coordinate
-        # rows -- Shapely objects are refcounted, so the reference expansion
-        # is nearly free.
-        if self.is_indexed_view:
-            base_shapely = self._base.to_shapely()
-            # Convert to numpy object array for O(1) index-map expansion
-            base_arr = np.empty(len(base_shapely), dtype=object)
-            base_arr[:] = base_shapely
-            # If the index map is device-resident (CuPy), bring it to host
-            # for the numpy object-array expansion.  This is an intentional
-            # D2H transfer of the small index map only -- NOT the coordinate
-            # buffers -- and is required because Shapely objects are
-            # CPU-only Python objects.
-            h_index_map = self._index_map
-            if cp is not None and hasattr(h_index_map, "__cuda_array_interface__"):
-                h_index_map = h_index_map.get()
-            expanded = base_arr[h_index_map]
-            self._record(
-                DiagnosticKind.MATERIALIZATION,
-                f"materialized shapely geometries (indexed view: "
-                f"{self._base.row_count} base -> {self._row_count} expanded)",
-                visible=True,
-            )
-            return list(expanded)
+        from vibespatial.geometry.host_bridge import owned_to_shapely
 
-        from vibespatial.io.wkb import encode_wkb_owned
-
-        # The Shapely bridge is a host-only surface.  If this array is backed
-        # by lazy device stubs, materialize host buffers before attempting the
-        # host-side WKB encode path.
-        self._ensure_host_state()
-        self._record(DiagnosticKind.MATERIALIZATION, "materialized shapely geometries", visible=True)
-        wkb_values = encode_wkb_owned(self, hex=False)
-        return list(shapely.from_wkb(np.asarray(wkb_values, dtype=object)))
+        return list(owned_to_shapely(self))
 
     def to_wkb(self, *, hex: bool = False) -> list[bytes | str | None]:
         from vibespatial.io.wkb import encode_wkb_owned
@@ -2593,70 +2552,6 @@ def from_geoarrow(
     return array
 
 
-def _materialize_family_row(buffer: FamilyGeometryBuffer, row_index: int) -> object:
-    if bool(buffer.empty_mask[row_index]):
-        return {
-            GeometryFamily.POINT: Point(),
-            GeometryFamily.LINESTRING: LineString(),
-            GeometryFamily.POLYGON: Polygon(),
-            GeometryFamily.MULTIPOINT: MultiPoint([]),
-            GeometryFamily.MULTILINESTRING: MultiLineString([]),
-            GeometryFamily.MULTIPOLYGON: MultiPolygon([]),
-        }[buffer.family]
-
-    if buffer.family in {GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
-        start = int(buffer.geometry_offsets[row_index])
-        end = int(buffer.geometry_offsets[row_index + 1])
-        coords = list(zip(buffer.x[start:end], buffer.y[start:end], strict=True))
-        if buffer.family is GeometryFamily.POINT:
-            x, y = coords[0]
-            return Point(float(x), float(y))
-        if buffer.family is GeometryFamily.LINESTRING:
-            return LineString(coords)
-        return MultiPoint(coords)
-
-    if buffer.family is GeometryFamily.POLYGON:
-        ring_start = int(buffer.geometry_offsets[row_index])
-        ring_end = int(buffer.geometry_offsets[row_index + 1])
-        rings = []
-        for ring_index in range(ring_start, ring_end):
-            coord_start = int(buffer.ring_offsets[ring_index])
-            coord_end = int(buffer.ring_offsets[ring_index + 1])
-            rings.append(list(zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True)))
-        valid_holes = [r for r in rings[1:] if len(r) >= 3]
-        return Polygon(rings[0], holes=valid_holes)
-
-    if buffer.family is GeometryFamily.MULTILINESTRING:
-        part_start = int(buffer.geometry_offsets[row_index])
-        part_end = int(buffer.geometry_offsets[row_index + 1])
-        parts = []
-        for part_index in range(part_start, part_end):
-            coord_start = int(buffer.part_offsets[part_index])
-            coord_end = int(buffer.part_offsets[part_index + 1])
-            parts.append(list(zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True)))
-        return MultiLineString(parts)
-
-    if buffer.family is GeometryFamily.MULTIPOLYGON:
-        polygon_start = int(buffer.geometry_offsets[row_index])
-        polygon_end = int(buffer.geometry_offsets[row_index + 1])
-        polygons = []
-        for polygon_index in range(polygon_start, polygon_end):
-            ring_start = int(buffer.part_offsets[polygon_index])
-            ring_end = int(buffer.part_offsets[polygon_index + 1])
-            rings = []
-            for ring_index in range(ring_start, ring_end):
-                coord_start = int(buffer.ring_offsets[ring_index])
-                coord_end = int(buffer.ring_offsets[ring_index + 1])
-                rings.append(
-                    list(zip(buffer.x[coord_start:coord_end], buffer.y[coord_start:coord_end], strict=True))
-                )
-            valid_holes = [r for r in rings[1:] if len(r) >= 3]
-            polygons.append(Polygon(rings[0], holes=valid_holes))
-        return MultiPolygon(polygons)
-
-    raise NotImplementedError(f"unsupported geometry family: {buffer.family.value}")
-
-
 def concat_owned_scatter(
     base: OwnedGeometryArray,
     replacement: OwnedGeometryArray,
@@ -2779,6 +2674,136 @@ def concat_owned_scatter(
     result._record(
         DiagnosticKind.CREATED,
         f"scatter {replacement.row_count} replacement rows into {base.row_count}-row base",
+        visible=False,
+    )
+    return result
+
+
+def concatenate_owned_arrays(arrays: list[OwnedGeometryArray]) -> OwnedGeometryArray:
+    """Concatenate owned geometry arrays without materializing geometry objects."""
+    if len(arrays) == 1:
+        return arrays[0]
+    if (
+        arrays
+        and all(array.residency is Residency.DEVICE for array in arrays)
+        and all(set(array.families) == {GeometryFamily.POINT} for array in arrays)
+        and all(array.device_state is not None for array in arrays)
+        and all(not array.families[GeometryFamily.POINT].host_materialized for array in arrays)
+        and all(np.all(array.validity) for array in arrays)
+    ):
+        runtime = get_cuda_runtime()
+        row_count = sum(array.row_count for array in arrays)
+        validity = np.ones(row_count, dtype=bool)
+        tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
+        family_row_offsets = np.arange(row_count, dtype=np.int32)
+        geometry_offsets = np.arange(row_count + 1, dtype=np.int32)
+        empty_mask = np.zeros(row_count, dtype=bool)
+        x_device = cp.concatenate(
+            [array.device_state.families[GeometryFamily.POINT].x for array in arrays]
+        )
+        y_device = cp.concatenate(
+            [array.device_state.families[GeometryFamily.POINT].y for array in arrays]
+        )
+        point_buffer = FamilyGeometryBuffer(
+            family=GeometryFamily.POINT,
+            schema=get_geometry_buffer_schema(GeometryFamily.POINT),
+            row_count=row_count,
+            x=np.empty(0, dtype=np.float64),
+            y=np.empty(0, dtype=np.float64),
+            geometry_offsets=np.empty(0, dtype=np.int32),
+            empty_mask=np.empty(0, dtype=np.bool_),
+            bounds=None,
+            host_materialized=False,
+        )
+        owned = OwnedGeometryArray(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families={GeometryFamily.POINT: point_buffer},
+            residency=Residency.DEVICE,
+            device_state=OwnedGeometryDeviceState(
+                validity=runtime.from_host(validity),
+                tags=runtime.from_host(tags),
+                family_row_offsets=runtime.from_host(family_row_offsets),
+                families={
+                    GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
+                        family=GeometryFamily.POINT,
+                        x=x_device,
+                        y=y_device,
+                        geometry_offsets=runtime.from_host(geometry_offsets),
+                        empty_mask=runtime.from_host(empty_mask),
+                        bounds=None,
+                    )
+                },
+            ),
+        )
+        owned._record(
+            DiagnosticKind.CREATED,
+            "concatenated device-resident point geometry buffers without host materialization",
+            visible=True,
+        )
+        return owned
+
+    def _concat_offsets(buffers: list[np.ndarray]) -> np.ndarray:
+        if not buffers:
+            return np.asarray([0], dtype=np.int32)
+        parts = [buffers[0]]
+        current = int(buffers[0][-1])
+        for offsets in buffers[1:]:
+            parts.append(offsets[1:] + current)
+            current += int(offsets[-1])
+        return np.concatenate(parts).astype(np.int32, copy=False)
+
+    validity = np.concatenate([array.validity for array in arrays])
+    tags = np.concatenate([array.tags for array in arrays]).astype(np.int8, copy=False)
+    family_row_offsets = np.full(validity.size, -1, dtype=np.int32)
+    families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+    for family in GeometryFamily:
+        family_chunks = [array.families[family] for array in arrays if family in array.families]
+        if not family_chunks:
+            continue
+        x = np.concatenate([chunk.x for chunk in family_chunks]) if family_chunks else np.asarray([], dtype=np.float64)
+        y = np.concatenate([chunk.y for chunk in family_chunks]) if family_chunks else np.asarray([], dtype=np.float64)
+        empty_mask = np.concatenate([chunk.empty_mask for chunk in family_chunks]).astype(bool, copy=False)
+        geometry_offsets = _concat_offsets([chunk.geometry_offsets for chunk in family_chunks])
+        part_offsets = None
+        ring_offsets = None
+        if family_chunks[0].part_offsets is not None:
+            part_offsets = _concat_offsets(
+                [chunk.part_offsets for chunk in family_chunks if chunk.part_offsets is not None]
+            )
+        if family_chunks[0].ring_offsets is not None:
+            ring_offsets = _concat_offsets(
+                [chunk.ring_offsets for chunk in family_chunks if chunk.ring_offsets is not None]
+            )
+        bounds = None
+        if family_chunks[0].bounds is not None:
+            bounds = np.concatenate([chunk.bounds for chunk in family_chunks if chunk.bounds is not None])
+        families[family] = FamilyGeometryBuffer(
+            family=family,
+            schema=family_chunks[0].schema,
+            row_count=int(empty_mask.size),
+            x=x,
+            y=y,
+            geometry_offsets=geometry_offsets,
+            empty_mask=empty_mask,
+            part_offsets=part_offsets,
+            ring_offsets=ring_offsets,
+            bounds=bounds,
+        )
+        family_mask = tags == FAMILY_TAGS[family]
+        family_row_offsets[family_mask] = np.arange(int(family_mask.sum()), dtype=np.int32)
+
+    result = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=families,
+        residency=arrays[0].residency,
+    )
+    result._record(
+        DiagnosticKind.CREATED,
+        f"concatenated {len(arrays)} owned geometry arrays",
         visible=False,
     )
     return result

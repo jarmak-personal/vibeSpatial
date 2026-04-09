@@ -1,11 +1,11 @@
-import warnings
-from functools import partial
-
 import numpy as np
-import pandas as pd
 
 from vibespatial.api import GeoDataFrame
-from vibespatial.api._compat import PANDAS_GE_30
+from vibespatial.api._native_results import (
+    RelationIndexResult,
+    RelationJoinExportResult,
+    RelationJoinResult,
+)
 from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
@@ -151,11 +151,14 @@ def sjoin(
         allowed_hows=["left", "right", "inner", "outer"],
     )
 
-    indices, query_implementation, query_execution = _geom_predicate_query(
+    export_result, query_implementation, query_execution = _sjoin_export_result(
         left_df,
         right_df,
+        how,
         predicate,
         distance,
+        lsuffix,
+        rsuffix,
         on_attribute=on_attribute,
     )
     # Use the actual execution mode from the query engine when available.
@@ -176,19 +179,7 @@ def sjoin(
         selected=sjoin_selected,
     )
 
-    joined, _ = _frame_join(
-        left_df,
-        right_df,
-        indices,
-        None,
-        how,
-        lsuffix,
-        rsuffix,
-        predicate,
-        on_attribute=on_attribute,
-    )
-
-    return joined
+    return export_result.to_geodataframe()
 
 
 def _maybe_make_list(obj):
@@ -197,6 +188,59 @@ def _maybe_make_list(obj):
     if obj is not None and not isinstance(obj, list):
         return [obj]
     return obj
+
+
+def _sjoin_relation_result(
+    left_df,
+    right_df,
+    predicate,
+    distance,
+    *,
+    on_attribute=None,
+):
+    """Build the native relation result before any DataFrame materialization."""
+    indices, query_implementation, query_execution = _geom_predicate_query(
+        left_df,
+        right_df,
+        predicate,
+        distance,
+        on_attribute=on_attribute,
+    )
+    return RelationJoinResult(RelationIndexResult(*indices)), query_implementation, query_execution
+
+
+def _sjoin_export_result(
+    left_df,
+    right_df,
+    how,
+    predicate,
+    distance,
+    lsuffix,
+    rsuffix,
+    *,
+    on_attribute=None,
+):
+    """Build the deferred public sjoin export result before GeoDataFrame assembly."""
+    native_result, query_implementation, query_execution = _sjoin_relation_result(
+        left_df,
+        right_df,
+        predicate,
+        distance,
+        on_attribute=on_attribute,
+    )
+    return (
+        RelationJoinExportResult(
+            relation_result=native_result,
+            left_df=left_df,
+            right_df=right_df,
+            how=how,
+            lsuffix=lsuffix,
+            rsuffix=rsuffix,
+            on_attribute=on_attribute,
+        ),
+        query_implementation,
+        query_execution,
+    )
 
 
 def _basic_checks(left_df, right_df, how, lsuffix, rsuffix, on_attribute=None, allowed_hows=None):
@@ -423,207 +467,26 @@ def _geom_predicate_query(
     return (l_idx, r_idx), query_implementation, query_execution
 
 
-def _reset_index_with_suffix(df, suffix, other):
-    """
-    Equivalent of df.reset_index(), but with adding 'suffix' to auto-generated
-    column names.
-    """
-    index_original = df.index.names
-    if PANDAS_GE_30:
-        df_reset = df.reset_index()
-    else:
-        # we already made a copy of the dataframe in _frame_join before getting here
-        df_reset = df
-        df_reset.reset_index(inplace=True)
-    column_names = df_reset.columns.to_numpy(copy=True)
-    for i, label in enumerate(index_original):
-        # if the original label was None, add suffix to auto-generated name
-        if label is None:
-            new_label = column_names[i]
-            if "level" in new_label:
-                # reset_index of MultiIndex gives "level_i" names, preserve the "i"
-                lev = new_label.split("_")[1]
-                new_label = f"index_{suffix}{lev}"
-            else:
-                new_label = f"index_{suffix}"
-            # check new label will not be in other dataframe
-            if new_label in df.columns or new_label in other.columns:
-                raise ValueError(
-                    f"'{new_label}' cannot be a column name in the frames being joined"
-                )
-            column_names[i] = new_label
-    return df_reset, pd.Index(column_names)
-
-
-def _process_column_names_with_suffix(
-    left: pd.Index, right: pd.Index, suffixes, left_df, right_df
+def _frame_join_from_relation_result(
+    left_df,
+    right_df,
+    relation_result: RelationIndexResult,
+    distances,
+    how,
+    lsuffix,
+    rsuffix,
+    predicate,
+    on_attribute=None,
 ):
-    """
-    Add suffixes to overlapping labels (ignoring the geometry column).
-
-    This is based on pandas' merge logic at https://github.com/pandas-dev/pandas/blob/
-    a0779adb183345a8eb4be58b3ad00c223da58768/pandas/core/reshape/merge.py#L2300-L2370
-    """
-    to_rename = left.intersection(right)
-    if len(to_rename) == 0:
-        return left, right
-
-    lsuffix, rsuffix = suffixes
-
-    if not lsuffix and not rsuffix:
-        raise ValueError(f"columns overlap but no suffix specified: {to_rename}")
-
-    def renamer(x, suffix, geometry):
-        if x in to_rename and x != geometry and suffix is not None:
-            return f"{x}_{suffix}"
-        return x
-
-    lrenamer = partial(
-        renamer,
-        suffix=lsuffix,
-        geometry=getattr(left_df, "_geometry_column_name", None),
-    )
-    rrenamer = partial(
-        renamer,
-        suffix=rsuffix,
-        geometry=getattr(right_df, "_geometry_column_name", None),
-    )
-
-    # TODO retain index name?
-    left_renamed = pd.Index([lrenamer(lab) for lab in left])
-    right_renamed = pd.Index([rrenamer(lab) for lab in right])
-
-    dups = []
-    if not left_renamed.is_unique:
-        # Only warn when duplicates are caused because of suffixes, already duplicated
-        # columns in origin should not warn
-        dups = left_renamed[(left_renamed.duplicated()) & (~left.duplicated())].tolist()
-    if not right_renamed.is_unique:
-        dups.extend(
-            right_renamed[(right_renamed.duplicated()) & (~right.duplicated())].tolist()
-        )
-    # TODO turn this into an error (pandas has done so as well)
-    if dups:
-        warnings.warn(
-            f"Passing 'suffixes' which cause duplicate columns {set(dups)} in the "
-            f"result is deprecated and will raise a MergeError in a future version.",
-            FutureWarning,
-            stacklevel=4,
-        )
-
-    return left_renamed, right_renamed
-
-
-def _restore_index(joined, index_names, index_names_original):
-    """
-    Set back the original index columns, and restoring their name as `None`
-    if they didn't have a name originally.
-    """
-    if PANDAS_GE_30:
-        joined = joined.set_index(list(index_names))
-    else:
-        joined.set_index(list(index_names), inplace=True)
-
-    # restore the fact that the index didn't have a name
-    joined_index_names = list(joined.index.names)
-    for i, label in enumerate(index_names_original):
-        if label is None:
-            joined_index_names[i] = None
-    joined.index.names = joined_index_names
-    return joined
-
-
-def _adjust_indexers(indices, distances, left_length, right_length, how, predicate):
-    """Adjust the indexers for the join based on the `how` parameter.
-
-    The left/right indexers from the query represents an inner join.
-    For a left or right join, we need to adjust them to include the rows
-    that would not be present in an inner join.
-    """
-    # the indices represent an inner join, no adjustment needed
-    if how == "inner":
-        return indices, distances
-
-    l_idx, r_idx = indices
-
-    if how == "outer":
-        if l_idx.size:
-            order = np.lexsort((r_idx, l_idx))
-            l_idx = l_idx[order]
-            r_idx = r_idx[order]
-            if distances is not None:
-                distances = distances[order]
-        matched_left = np.zeros(left_length, dtype=bool)
-        matched_right = np.zeros(right_length, dtype=bool)
-        if l_idx.size:
-            matched_left[l_idx] = True
-            matched_right[r_idx] = True
-        right_missing = np.flatnonzero(~matched_right)
-        counts = np.bincount(l_idx, minlength=left_length) if l_idx.size else np.zeros(left_length, dtype=np.intp)
-        repeats = np.maximum(counts, 1)
-        left_row_count = int(repeats.sum())
-        left_positions = np.arange(left_length, dtype=np.intp)
-        outer_l_idx = np.repeat(left_positions, repeats)
-        outer_r_idx = np.full(left_row_count, -1, dtype=np.intp)
-        outer_distances = None if distances is None else np.full(left_row_count, np.nan, dtype=np.float64)
-        if l_idx.size:
-            match_offsets = np.cumsum(counts, dtype=np.intp) - counts
-            rank_in_left = np.arange(l_idx.size, dtype=np.intp) - np.repeat(match_offsets, counts)
-            row_starts = np.cumsum(repeats, dtype=np.intp) - repeats
-            target = row_starts[l_idx] + rank_in_left
-            outer_r_idx[target] = r_idx
-            if outer_distances is not None:
-                outer_distances[target] = distances
-        l_idx = np.concatenate((outer_l_idx, np.full(right_missing.size, -1, dtype=np.intp)))
-        r_idx = np.concatenate((outer_r_idx, right_missing.astype(np.intp, copy=False)))
-        if distances is not None:
-            distances = np.concatenate((outer_distances, np.full(right_missing.size, np.nan, dtype=np.float64)))
-        return (l_idx, r_idx), distances
-
-    if how == "right":
-        # re-sort so it is sorted by the right indexer
-        indexer = np.lexsort((l_idx, r_idx))
-        l_idx, r_idx = l_idx[indexer], r_idx[indexer]
-        if distances is not None:
-            distances = distances[indexer]
-
-        # switch order
-        r_idx, l_idx = l_idx, r_idx
-
-    # determine which indices are missing and where they would need to be inserted
-    original_length = right_length if how == "right" else left_length
-    idx = np.arange(original_length)
-    l_idx_missing = idx[~np.isin(idx, l_idx)]
-    insert_idx = np.searchsorted(l_idx, l_idx_missing)
-    # for the left indexer, insert those missing indices
-    l_idx = np.insert(l_idx, insert_idx, l_idx_missing)
-    # for the right indexer, insert -1 -> to get missing values in pandas' reindexing
-    r_idx = np.insert(r_idx, insert_idx, -1)
-    # for the indices, already insert those missing values manually
-    if distances is not None:
-        distances = np.insert(distances, insert_idx, np.nan)
-
-    if how == "right":
-        # switch back
-        l_idx, r_idx = r_idx, l_idx
-
-    return (l_idx, r_idx), distances
-
-
-def _reassemble_outer_geometry(left_geometry, right_geometry, l_idx, r_idx, new_index):
-    """ADR-0036 boundary: reassemble geometry for outer joins from index arrays.
-
-    Takes only geometry DataFrames and integer index arrays — no attribute
-    DataFrames cross this boundary.
-    """
-    left_geometry_series = left_geometry._reindex_with_indexers(
-        {0: (new_index, l_idx)}
-    ).iloc[:, 0]
-    right_geometry_series = right_geometry._reindex_with_indexers(
-        {0: (new_index, r_idx)}
-    ).iloc[:, 0]
-    return left_geometry_series.where(
-        left_geometry_series.notna(), right_geometry_series
+    """Compatibility wrapper around the ADR-0042 native join export seam."""
+    native_result = RelationJoinResult(relation_result, distances=distances)
+    return native_result.materialize(
+        left_df,
+        right_df,
+        how=how,
+        lsuffix=lsuffix,
+        rsuffix=rsuffix,
+        on_attribute=on_attribute,
     )
 
 
@@ -638,108 +501,19 @@ def _frame_join(
     predicate,
     on_attribute=None,
 ):
-    """Join the GeoDataFrames at the DataFrame level.
-
-    Parameters
-    ----------
-    left_df : GeoDataFrame
-    right_df : GeoDataFrame
-    indices : tuple of ndarray
-        Indices returned by the geometric join. Tuple with with integer
-        indices representing the matches from `left_df` and `right_df`
-        respectively.
-    distances : ndarray, optional
-        Passed through and adapted based on the indices, if needed.
-    how : string
-        The type of join to use on the DataFrame level.
-    lsuffix : string
-        Suffix to apply to overlapping column names (left GeoDataFrame).
-    rsuffix : string
-        Suffix to apply to overlapping column names (right GeoDataFrame).
-    on_attribute: list, default None
-        list of column names to merge on along with geometry
-
-
-    Returns
-    -------
-    GeoDataFrame
-        Joined GeoDataFrame.
-    """
-    if on_attribute:  # avoid renaming or duplicating shared column
-        right_df = right_df.drop(on_attribute, axis=1)
-
-    # --- ADR-0036 boundary: geometry extraction --------------------------------
-    # Separate geometry columns from attribute DataFrames before attribute
-    # assembly.  After this block, left_df and right_df contain only attributes.
-    left_geometry = None
-    right_geometry = None
-    if how in ("inner", "left"):
-        right_df = right_df.drop(right_df.geometry.name, axis=1)
-    elif how == "right":
-        left_df = left_df.drop(left_df.geometry.name, axis=1)
-    else:  # how == 'outer'
-        left_geometry = left_df[[left_df.geometry.name]].copy(deep=False)
-        right_geometry = right_df[[right_df.geometry.name]].copy(deep=False)
-        left_df = left_df.drop(left_df.geometry.name, axis=1)
-        right_df = right_df.drop(right_df.geometry.name, axis=1)
-
-    # --- ADR-0036 boundary: attribute reindexing -------------------------------
-    # Operates on geometry-free DataFrames only.  Index arrays (l_idx, r_idx)
-    # drive the reindex — no geometry data flows through this block.
-    left_df = left_df.copy(deep=False)
-    left_nlevels = left_df.index.nlevels
-    left_index_original = left_df.index.names
-    left_df, left_column_names = _reset_index_with_suffix(left_df, lsuffix, right_df)
-
-    right_df = right_df.copy(deep=False)
-    right_nlevels = right_df.index.nlevels
-    right_index_original = right_df.index.names
-    right_df, right_column_names = _reset_index_with_suffix(right_df, rsuffix, left_df)
-
-    # if conflicting names in left and right, add suffix
-    left_column_names, right_column_names = _process_column_names_with_suffix(
-        left_column_names,
-        right_column_names,
-        (lsuffix, rsuffix),
+    """Compatibility wrapper around native relation-join materialization."""
+    native_result = RelationJoinResult(
+        RelationIndexResult(*indices),
+        distances=distances,
+    )
+    return native_result.materialize(
         left_df,
         right_df,
+        how=how,
+        lsuffix=lsuffix,
+        rsuffix=rsuffix,
+        on_attribute=on_attribute,
     )
-    left_df.columns = left_column_names
-    right_df.columns = right_column_names
-    left_index = left_df.columns[:left_nlevels]
-    right_index = right_df.columns[:right_nlevels]
-
-    # perform join on the dataframes
-    (l_idx, r_idx), distances = _adjust_indexers(
-        indices, distances, len(left_df), len(right_df), how, predicate
-    )
-    # the `take` method doesn't allow introducing NaNs with -1 indices
-    # left = left_df.take(l_idx)
-    # therefore we are using the private _reindex_with_indexers as workaround
-    new_index = pd.RangeIndex(len(l_idx))
-    left = left_df._reindex_with_indexers({0: (new_index, l_idx)})
-    right = right_df._reindex_with_indexers({0: (new_index, r_idx)})
-    if PANDAS_GE_30:
-        kwargs = {}
-    else:
-        kwargs = dict(copy=False)
-    joined = pd.concat([left, right], axis=1, **kwargs)
-
-    # --- ADR-0036 boundary: geometry reassembly --------------------------------
-    # Geometry is reattached using only index arrays, not attribute DataFrames.
-    if how in ("inner", "left"):
-        joined = _restore_index(joined, left_index, left_index_original)
-    elif how == "right":
-        joined = joined.set_geometry(right_df.geometry.name)
-        joined = _restore_index(joined, right_index, right_index_original)
-    else:  # how == 'outer'
-        geometry = _reassemble_outer_geometry(
-            left_geometry, right_geometry, l_idx, r_idx, new_index
-        )
-        joined[left_geometry.columns[0]] = geometry
-        joined = GeoDataFrame(joined, geometry=left_geometry.columns[0], crs=left_geometry.crs)
-
-    return joined, distances
 
 
 def _nearest_query(
@@ -813,6 +587,32 @@ def _filter_shared_attribute(left_df, right_df, l_idx, r_idx, attribute):
     l_idx = l_idx[shared_attribute_rows]
     r_idx = r_idx[shared_attribute_rows]
     return (l_idx, r_idx), shared_attribute_rows
+
+
+def _sjoin_nearest_relation_result(
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    max_distance: float,
+    how: str,
+    return_distance: bool,
+    exclusive: bool,
+    *,
+    on_attribute: list | None = None,
+):
+    """Build the native nearest-join relation result before host export."""
+    indices, distances, nearest_selected = _nearest_query(
+        left_df,
+        right_df,
+        max_distance,
+        how,
+        return_distance,
+        exclusive,
+        on_attribute=on_attribute,
+    )
+    return RelationJoinResult(
+        RelationIndexResult(*indices),
+        distances=distances,
+    ), nearest_selected
 
 
 def sjoin_nearest(
@@ -943,14 +743,14 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
     left_df.geometry.values.check_geographic_crs(stacklevel=1)
     right_df.geometry.values.check_geographic_crs(stacklevel=1)
 
-    return_distance = distance_col is not None
-
-    indices, distances, nearest_selected = _nearest_query(
+    export_result, nearest_selected = _sjoin_nearest_export_result(
         left_df,
         right_df,
-        max_distance,
         how,
-        return_distance,
+        max_distance,
+        lsuffix,
+        rsuffix,
+        distance_col,
         exclusive,
     )
     # Dispatch event for sjoin_nearest surface -- sindex.nearest already
@@ -963,18 +763,37 @@ chicago_w_groceries[chicago_w_groceries["community"] == "UPTOWN"]
         detail=f"how={how}, max_distance={max_distance!r}, exclusive={exclusive}",
         selected=nearest_selected,
     )
-    joined, distances = _frame_join(
+    return export_result.to_geodataframe()
+
+
+def _sjoin_nearest_export_result(
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    how: str,
+    max_distance: float | None,
+    lsuffix: str,
+    rsuffix: str,
+    distance_col: str | None,
+    exclusive: bool,
+) -> tuple[RelationJoinExportResult, ExecutionMode]:
+    """Build the deferred public nearest-join export result before GeoDataFrame assembly."""
+    native_result, nearest_selected = _sjoin_nearest_relation_result(
         left_df,
         right_df,
-        indices,
-        distances,
+        max_distance,
         how,
-        lsuffix,
-        rsuffix,
-        None,
+        distance_col is not None,
+        exclusive,
     )
-
-    if return_distance:
-        joined[distance_col] = distances
-
-    return joined
+    return (
+        RelationJoinExportResult(
+            relation_result=native_result,
+            left_df=left_df,
+            right_df=right_df,
+            how=how,
+            lsuffix=lsuffix,
+            rsuffix=rsuffix,
+            distance_col=distance_col,
+        ),
+        nearest_selected,
+    )

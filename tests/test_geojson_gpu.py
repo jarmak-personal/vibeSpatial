@@ -237,6 +237,138 @@ def test_hybrid_properties(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Test 6b: Property host state stays deferred until properties are requested
+# ---------------------------------------------------------------------------
+@needs_gpu
+def test_hybrid_properties_stay_deferred_until_requested(monkeypatch, tmp_path):
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+    import vibespatial.io.kvikio_reader as io_kvikio
+
+    features = [
+        _make_polygon_feature(_simple_square(0, 0), {"id": 1}),
+        _make_polygon_feature(_simple_square(1, 1), {"id": 2}),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "test_props_deferred.geojson"
+    _write_geojson(path, fc)
+
+    raw = path.read_bytes()
+
+    def fake_read_file_to_device(path_arg: Path, file_size: int):
+        assert path_arg == path
+        assert file_size == len(raw)
+        return io_kvikio.FileReadResult(
+            device_bytes=cp.asarray(np.frombuffer(raw, dtype=np.uint8)),
+            host_bytes=None,
+        )
+
+    def fail_fromfile(*_args, **_kwargs):
+        raise AssertionError("geometry-only GPU GeoJSON read should not re-read host bytes")
+
+    def fail_asnumpy(*_args, **_kwargs):
+        raise AssertionError("geometry-only GPU GeoJSON read should not copy feature boundaries to host")
+
+    monkeypatch.setattr(io_kvikio, "read_file_to_device", fake_read_file_to_device)
+    monkeypatch.setattr(io_geojson_gpu.np, "fromfile", fail_fromfile)
+    monkeypatch.setattr(io_geojson_gpu.cp, "asnumpy", fail_asnumpy)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+
+    assert batch.geometry.row_count == 2
+    assert batch._properties is None
+
+
+@needs_gpu
+def test_hybrid_properties_materialize_host_state_lazily(monkeypatch, tmp_path):
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+    import vibespatial.io.kvikio_reader as io_kvikio
+
+    features = [
+        _make_polygon_feature(_simple_square(0, 0), {"id": 1, "name": "alpha"}),
+        _make_polygon_feature(_simple_square(1, 1), {"id": 2, "name": "beta"}),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "test_props_lazy_materialize.geojson"
+    _write_geojson(path, fc)
+
+    raw = path.read_bytes()
+    original_fromfile = io_geojson_gpu.np.fromfile
+    original_asnumpy = io_geojson_gpu.cp.asnumpy
+    fromfile_calls = 0
+    asnumpy_calls = 0
+
+    def fake_read_file_to_device(path_arg: Path, file_size: int):
+        assert path_arg == path
+        assert file_size == len(raw)
+        return io_kvikio.FileReadResult(
+            device_bytes=cp.asarray(np.frombuffer(raw, dtype=np.uint8)),
+            host_bytes=None,
+        )
+
+    def traced_fromfile(*args, **kwargs):
+        nonlocal fromfile_calls
+        fromfile_calls += 1
+        return original_fromfile(*args, **kwargs)
+
+    def traced_asnumpy(*args, **kwargs):
+        nonlocal asnumpy_calls
+        asnumpy_calls += 1
+        return original_asnumpy(*args, **kwargs)
+
+    monkeypatch.setattr(io_kvikio, "read_file_to_device", fake_read_file_to_device)
+    monkeypatch.setattr(io_geojson_gpu.np, "fromfile", traced_fromfile)
+    monkeypatch.setattr(io_geojson_gpu.cp, "asnumpy", traced_asnumpy)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+
+    assert fromfile_calls == 0
+    assert asnumpy_calls == 0
+
+    props = batch.properties
+
+    assert props[0]["id"] == 1
+    assert props[0]["name"] == "alpha"
+    assert props[1]["id"] == 2
+    assert props[1]["name"] == "beta"
+    assert fromfile_calls == 1
+    assert asnumpy_calls == 2
+
+
+@needs_gpu
+def test_track_properties_false_skips_boundary_host_copy_and_keeps_lazy_properties(
+    monkeypatch,
+    tmp_path,
+):
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+
+    features = [
+        _make_polygon_feature(_simple_square(0, 0), {"id": 1, "name": "alpha"}),
+        _make_polygon_feature(_simple_square(1, 1), {"id": 2, "name": "beta"}),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "test_props_geometry_only.geojson"
+    _write_geojson(path, fc)
+
+    def fail_asnumpy(*_args, **_kwargs):
+        raise AssertionError("geometry-only GPU GeoJSON read should not copy feature boundaries to host")
+
+    monkeypatch.setattr(io_geojson_gpu.cp, "asnumpy", fail_asnumpy)
+
+    batch = read_geojson_owned(
+        path,
+        prefer="gpu-byte-classify",
+        track_properties=False,
+    )
+
+    props = batch.properties
+
+    assert props[0]["id"] == 1
+    assert props[0]["name"] == "alpha"
+    assert props[1]["id"] == 2
+    assert props[1]["name"] == "beta"
+
+
+# ---------------------------------------------------------------------------
 # Test 7: Device residency
 # ---------------------------------------------------------------------------
 @needs_gpu

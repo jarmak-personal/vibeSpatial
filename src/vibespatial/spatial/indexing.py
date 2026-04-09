@@ -508,6 +508,47 @@ class RegularGridRectIndex:
     size: int
 
 
+def _sample_regular_grid_polygon_vertices(
+    geometry_array: OwnedGeometryArray,
+    sample_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load only the polygon vertices needed for regular-grid verification."""
+    if sample_indices.size == 0:
+        empty = np.empty((0, 5), dtype=np.float64)
+        return empty, empty
+
+    polygon_buffer = geometry_array.families[GeometryFamily.POLYGON]
+    if polygon_buffer.host_materialized:
+        ring_x_full = polygon_buffer.x.reshape(geometry_array.row_count, 5)
+        ring_y_full = polygon_buffer.y.reshape(geometry_array.row_count, 5)
+        return ring_x_full[sample_indices], ring_y_full[sample_indices]
+
+    if (
+        cp is None
+        or geometry_array.device_state is None
+        or GeometryFamily.POLYGON not in geometry_array.device_state.families
+    ):
+        geometry_array._ensure_host_state()
+        polygon_buffer = geometry_array.families[GeometryFamily.POLYGON]
+        ring_x_full = polygon_buffer.x.reshape(geometry_array.row_count, 5)
+        ring_y_full = polygon_buffer.y.reshape(geometry_array.row_count, 5)
+        return ring_x_full[sample_indices], ring_y_full[sample_indices]
+
+    runtime = get_cuda_runtime()
+    device_buffer = geometry_array.device_state.families[GeometryFamily.POLYGON]
+    sample_coord_indices = (
+        sample_indices.astype(np.int64, copy=False)[:, None] * 5
+        + np.arange(5, dtype=np.int64)[None, :]
+    ).reshape(-1)
+    d_sample_coord_indices = cp.asarray(sample_coord_indices)
+    ring_x = runtime.copy_device_to_host(device_buffer.x[d_sample_coord_indices]).reshape(sample_indices.size, 5)
+    ring_y = runtime.copy_device_to_host(device_buffer.y[d_sample_coord_indices]).reshape(sample_indices.size, 5)
+    return (
+        np.ascontiguousarray(ring_x, dtype=np.float64),
+        np.ascontiguousarray(ring_y, dtype=np.float64),
+    )
+
+
 
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 
@@ -534,6 +575,21 @@ def _detect_regular_grid_rect_index(
         return None
     if geometry_array.row_count == 0:
         return None
+    # Device-resident decode paths keep metadata and offsets lazy on host.
+    # Hydrate only the routing/structure arrays needed for these checks;
+    # coordinate payload stays on device until the sampled verification below.
+    if geometry_array._validity is None:
+        geometry_array._ensure_host_metadata()
+    if (
+        not polygon_buffer.host_materialized
+        and (
+            polygon_buffer.geometry_offsets.size == 0
+            or polygon_buffer.empty_mask.size == 0
+            or polygon_buffer.ring_offsets is None
+        )
+    ):
+        geometry_array._ensure_host_family_structure(GeometryFamily.POLYGON)
+        polygon_buffer = geometry_array.families[GeometryFamily.POLYGON]
     if not np.all(geometry_array.validity):
         return None
     if np.any(polygon_buffer.empty_mask):
@@ -579,19 +635,10 @@ def _detect_regular_grid_rect_index(
     if not np.array_equal(expected_index, actual_index):
         return None
 
-    # Structural checks above use only offsets/bounds (available on host
-    # even for device-resident OGAs).  The rectangle vertex verification
-    # below needs coordinate data.  Lazily materialise host state here --
-    # _ensure_host_state only transfers x/y since offsets are already
-    # populated.
-    #
-    # Performance: for large arrays (>256 rows), verify a random sample
-    # of 128 rows instead of all rows.  The structural checks above
-    # (uniform offsets, uniform cell dimensions, grid-aligned indices,
-    # consecutive grid ordering) are already strong enough filters that
-    # a 128-row sample virtually guarantees correctness.  This reduces
-    # vertex verification from O(N) to O(1) for large datasets, avoiding
-    # an expensive D->H transfer + np.isclose scan at 1M+ rows.
+    # Structural checks above use only metadata/offsets. The rectangle
+    # verification below still needs coordinates, but only for a small sample.
+    # Pull those sampled vertices directly from device instead of
+    # materializing the full polygon batch on host.
     n = geometry_array.row_count
     _SAMPLE_THRESHOLD = 256
     _SAMPLE_SIZE = 128
@@ -601,21 +648,13 @@ def _detect_regular_grid_rect_index(
         step = max(1, n // _SAMPLE_SIZE)
         sample_indices = np.arange(0, n, step, dtype=np.intp)[:_SAMPLE_SIZE]
     else:
-        sample_indices = None  # verify all rows
+        sample_indices = np.arange(n, dtype=np.intp)
 
-    geometry_array._ensure_host_state()
-    polygon_buffer = geometry_array.families[GeometryFamily.POLYGON]
-    ring_x_full = polygon_buffer.x.reshape(n, 5)
-    ring_y_full = polygon_buffer.y.reshape(n, 5)
-
-    if sample_indices is not None:
-        ring_x = ring_x_full[sample_indices]
-        ring_y = ring_y_full[sample_indices]
-        sample_bounds = bounds[sample_indices]
-    else:
-        ring_x = ring_x_full
-        ring_y = ring_y_full
-        sample_bounds = bounds
+    ring_x, ring_y = _sample_regular_grid_polygon_vertices(
+        geometry_array,
+        sample_indices,
+    )
+    sample_bounds = bounds[sample_indices]
 
     # Use direct absolute-difference comparisons instead of np.isclose
     # (which has high per-call overhead) since rtol=0.0 makes them identical.
@@ -750,17 +789,12 @@ def build_flat_spatial_index(
 ) -> FlatSpatialIndex:
     selection = runtime_selection or _default_index_runtime_selection()
     geometry_array.record_runtime_selection(selection)
-    # Use GPU for bounds when geometry is device-resident to avoid pulling
-    # the full coordinate arrays to host just for min/max.  Structural
-    # metadata (offsets, masks) is host-available even on device-resident
-    # OGAs (populated at GPU read time), so regular grid detection and
-    # morton key computation still work.
+    # Use GPU for bounds only when geometry is already device-resident.
+    # Host-resident arrays should not be uploaded purely to compute bounds;
+    # the GPU sort path can still take over later if selected.
     bounds_dispatch = (
         ExecutionMode.GPU
-        if (
-            selection.selected is ExecutionMode.GPU
-            or (geometry_array.residency is Residency.DEVICE and has_gpu_runtime())
-        )
+        if geometry_array.residency is Residency.DEVICE and has_gpu_runtime()
         else ExecutionMode.CPU
     )
     bounds = compute_geometry_bounds(geometry_array, dispatch_mode=bounds_dispatch)

@@ -25,9 +25,11 @@ if TYPE_CHECKING:
     from vibespatial.geometry.owned import OwnedGeometryArray
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.config import LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import Residency, combined_residency
 
 from .point import point_buffer_owned_array
 
@@ -297,6 +299,11 @@ def evaluate_geopandas_buffer(
 
     with execution_trace("buffer"):
         geometries = np.asarray(values, dtype=object)
+        current_residency = (
+            combined_residency(prebuilt_owned)
+            if prebuilt_owned is not None
+            else Residency.HOST
+        )
         detail = (
             f"cap_style={cap_style}, join_style={join_style}, mitre_limit={mitre_limit}, "
             f"single_sided={single_sided}, quad_segs={quad_segs}, rows={len(geometries)}"
@@ -320,6 +327,7 @@ def evaluate_geopandas_buffer(
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=len(geometries),
                 gpu_available=gpu_available,
+                current_residency=current_residency,
             )
             if selection.selected is ExecutionMode.GPU:
                 owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
@@ -350,14 +358,33 @@ def evaluate_geopandas_buffer(
             quad_segs=quad_segs,
             single_sided=single_sided,
         ):
-            from .linestring import linestring_buffer_owned_array
+            from .linestring import (
+                linestring_buffer_owned_array,
+                supports_two_point_linestring_buffer_fast_path,
+            )
 
-            if plan_dispatch_selection(
+            selection = plan_dispatch_selection(
                 kernel_name="linestring_buffer",
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=len(geometries),
-            ).selected is ExecutionMode.GPU:
-                owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
+                current_residency=current_residency,
+            )
+            owned = prebuilt_owned if prebuilt_owned is not None else None
+            force_two_point_gpu = False
+            if selection.selected is not ExecutionMode.GPU and len(geometries) >= LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD:
+                if owned is None:
+                    owned = from_shapely_geometries(geometries.tolist())
+                force_two_point_gpu = supports_two_point_linestring_buffer_fast_path(
+                    owned,
+                    quad_segs=quad_segs,
+                    cap_style=cap_style,
+                    join_style=join_style,
+                    single_sided=single_sided,
+                )
+
+            if selection.selected is ExecutionMode.GPU or force_two_point_gpu:
+                if owned is None:
+                    owned = from_shapely_geometries(geometries.tolist())
                 result = linestring_buffer_owned_array(
                     owned,
                     distance,
@@ -381,6 +408,7 @@ def evaluate_geopandas_buffer(
                 kernel_name="polygon_buffer",
                 kernel_class=KernelClass.CONSTRUCTIVE,
                 row_count=len(geometries),
+                current_residency=current_residency,
             ).selected is ExecutionMode.GPU:
                 owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
                 result = polygon_buffer_owned_array(

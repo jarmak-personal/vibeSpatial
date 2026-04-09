@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import numpy as np
 import pytest
 import shapely
@@ -17,6 +19,8 @@ from vibespatial.overlay.microcells import (
     build_and_label_overlay_microcells,
     build_overlay_microcell_bands,
 )
+
+microcells_module = importlib.import_module("vibespatial.overlay.microcells")
 
 try:
     import cupy as cp
@@ -162,6 +166,29 @@ def test_overlay_microcells_support_row_isolated_batches() -> None:
     assert set(_to_host_array(labels.bands.row_indices).tolist()) == {0, 1}
     both_inside = _to_host_bool(labels.left_inside) & _to_host_bool(labels.right_inside)
     assert int(np.count_nonzero(both_inside)) >= 2
+
+
+@pytest.mark.gpu
+def test_overlay_microcells_gpu_generic_path_bypasses_host_row_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    monkeypatch.setattr(
+        microcells_module,
+        "_row_microcell_bands",
+        lambda *args, **kwargs: pytest.fail("GPU generic microcell labeling should not use host row bands"),
+    )
+
+    left = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
+    right = from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)])
+
+    labels = build_and_label_overlay_microcells(left, right)
+
+    assert labels.count == 3
+    assert _to_host_bool(labels.left_inside).tolist() == [True, True, False]
+    assert _to_host_bool(labels.right_inside).tolist() == [False, True, True]
 
 
 @pytest.mark.gpu

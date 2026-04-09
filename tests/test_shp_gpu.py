@@ -572,6 +572,41 @@ class TestPolyLineDecode:
         x = cp.asnumpy(buf.x)
         assert len(x) == 5  # 2 + 3
 
+    def test_polyline_uses_count_scatter_helpers(self, monkeypatch):
+        """Polyline decode uses async count-scatter helper paths."""
+        from vibespatial.cuda import _runtime as runtime_module
+        from vibespatial.io.shp_gpu import read_shp_gpu
+
+        calls = {"totals": [], "with_transfer": []}
+        original_totals = runtime_module.count_scatter_totals
+        original_with_transfer = runtime_module.count_scatter_total_with_transfer
+
+        def _record_totals(runtime, count_offset_pairs):
+            calls["totals"].append(len(count_offset_pairs))
+            return original_totals(runtime, count_offset_pairs)
+
+        def _record_with_transfer(*args, **kwargs):
+            calls["with_transfer"].append(kwargs.get("precomputed_total"))
+            return original_with_transfer(*args, **kwargs)
+
+        monkeypatch.setattr(runtime_module, "count_scatter_totals", _record_totals)
+        monkeypatch.setattr(runtime_module, "count_scatter_total_with_transfer", _record_with_transfer)
+
+        line = [(0.0, 0.0), (1.0, 1.0), (2.0, 0.0)]
+        shp_bytes, shx_bytes = _build_shp_shx_polyline([[line]])
+
+        with tempfile.TemporaryDirectory() as td:
+            shp_path = _write_shp_shx(Path(td), "line", shp_bytes, shx_bytes)
+            owned = read_shp_gpu(shp_path)
+
+        ds = owned._ensure_device_state()
+        from vibespatial.geometry.buffers import GeometryFamily
+
+        assert GeometryFamily.LINESTRING in ds.families
+        assert calls["totals"] == [2]
+        assert len(calls["with_transfer"]) == 1
+        assert calls["with_transfer"][0] is not None
+
     def test_multiple_linestrings(self):
         """Multiple single-part polylines."""
         from vibespatial.io.shp_gpu import read_shp_gpu

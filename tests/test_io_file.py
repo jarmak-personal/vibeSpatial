@@ -15,8 +15,10 @@ from vibespatial import (
     read_geojson_owned,
     read_shapefile_owned,
 )
+from vibespatial.api._native_results import _spatial_to_native_tabular_result
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.io.file import write_vector_file
 
 
 def _sample_frame() -> geopandas.GeoDataFrame:
@@ -92,15 +94,20 @@ def test_pyogrio_shapefile_write_passes_explicit_geometry_type_for_null_rows(mon
     frame = geopandas.GeoDataFrame({"name": ["null", "line"], "geometry": geometry}, crs="EPSG:4326")
     path = tmp_path / "null_geom.shp"
     captured: dict[str, object] = {}
-    real_write_dataframe = pyogrio.write_dataframe
+    real_write_arrow = pyogrio.write_arrow
 
-    def capture_write_dataframe(df, filename, *args, **kwargs):
+    def capture_write_arrow(arrow_obj, filename, *args, **kwargs):
         captured["geometry_type"] = kwargs.get("geometry_type")
-        return real_write_dataframe(df, filename, *args, **kwargs)
+        return real_write_arrow(arrow_obj, filename, *args, **kwargs)
 
-    monkeypatch.setattr(pyogrio, "write_dataframe", capture_write_dataframe)
+    monkeypatch.setattr(pyogrio, "write_arrow", capture_write_arrow)
 
-    frame.to_file(path, driver="ESRI Shapefile", engine="pyogrio")
+    write_vector_file(
+        _spatial_to_native_tabular_result(frame),
+        path,
+        driver="ESRI Shapefile",
+        engine="pyogrio",
+    )
     result = geopandas.read_file(path, engine="pyogrio")
 
     assert captured["geometry_type"] == "LineString"
@@ -108,6 +115,91 @@ def test_pyogrio_shapefile_write_passes_explicit_geometry_type_for_null_rows(mon
     assert len(result) == 2
     assert result.geometry.iloc[0] is None
     assert result.geometry.iloc[1].equals(LineString([(0, 0), (1, 1)]))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_pyogrio_native_write_uses_write_arrow_not_write_dataframe(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    geometry = geopandas.GeoSeries(
+        DeviceGeometryArray._from_owned(from_shapely_geometries([Point(0, 0), Point(1, 1)])),
+        crs="EPSG:4326",
+    )
+    frame = geopandas.GeoDataFrame({"value": [10, 20], "geometry": geometry}, crs="EPSG:4326")
+    path = tmp_path / "native.geojson"
+    payload = _spatial_to_native_tabular_result(frame)
+    arrow_calls = 0
+    real_write_arrow = pyogrio.write_arrow
+
+    def fail_write_dataframe(*_args, **_kwargs):
+        raise AssertionError("pyogrio file export should use write_arrow via the native boundary")
+
+    def capture_write_arrow(arrow_obj, filename, *args, **kwargs):
+        nonlocal arrow_calls
+        arrow_calls += 1
+        return real_write_arrow(arrow_obj, filename, *args, **kwargs)
+
+    monkeypatch.setattr(pyogrio, "write_dataframe", fail_write_dataframe)
+    monkeypatch.setattr(pyogrio, "write_arrow", capture_write_arrow)
+
+    write_vector_file(payload, path, driver="GeoJSON", engine="pyogrio")
+    result = geopandas.read_file(path, engine="pyogrio")
+
+    assert arrow_calls == 1
+    assert result["value"].tolist() == [10, 20]
+    assert result.geometry.iloc[1].equals(Point(1, 1))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_pyogrio_to_file_uses_compat_writer(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    frame = geopandas.GeoDataFrame(
+        {"value": [10, 20], "geometry": [Point(0, 0), Point(1, 1)]},
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "public.geojson"
+    dataframe_calls = 0
+    real_write_dataframe = pyogrio.write_dataframe
+
+    def fail_write_arrow(*_args, **_kwargs):
+        raise AssertionError("public GeoDataFrame.to_file should stay on the compatibility writer")
+
+    def capture_write_dataframe(*args, **kwargs):
+        nonlocal dataframe_calls
+        dataframe_calls += 1
+        return real_write_dataframe(*args, **kwargs)
+
+    monkeypatch.setattr(pyogrio, "write_arrow", fail_write_arrow)
+    monkeypatch.setattr(pyogrio, "write_dataframe", capture_write_dataframe)
+
+    frame.to_file(path, driver="GeoJSON", engine="pyogrio")
+    result = geopandas.read_file(path, engine="pyogrio")
+
+    assert dataframe_calls == 1
+    assert result["value"].tolist() == [10, 20]
+    assert result.geometry.iloc[1].equals(Point(1, 1))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_pyogrio_duplicate_columns_raises_upstream_message(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    frame = geopandas.GeoDataFrame(
+        data=[[1, 2, 3]],
+        columns=["a", "b", "a"],
+        geometry=[Point(1, 1)],
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "duplicate.geojson"
+
+    def fail_write_arrow(*_args, **_kwargs):
+        raise AssertionError("public GeoDataFrame.to_file should not route duplicate-column cases through native write_arrow")
+
+    monkeypatch.setattr(pyogrio, "write_arrow", fail_write_arrow)
+
+    with pytest.raises(ValueError, match="GeoDataFrame cannot contain duplicated column names"):
+        frame.to_file(path, driver="GeoJSON", engine="pyogrio")
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")

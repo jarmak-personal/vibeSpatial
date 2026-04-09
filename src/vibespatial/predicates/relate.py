@@ -401,7 +401,9 @@ def relate_de9im(
     # --- GPU path for Point-* pairs ---
     if gpu_rows.size > 0:
         # Ensure bounds are computed for region families (needed by PIP).
-        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+        from vibespatial.kernels.core.geometry_analysis import (
+            compute_geometry_bounds_device,
+        )
 
         for arr in (left, right):
             arr.move_to(
@@ -412,7 +414,7 @@ def relate_de9im(
             state = arr._ensure_device_state()
             for family in _REGION_FAMILIES:
                 if family in state.families and state.families[family].bounds is None:
-                    compute_geometry_bounds(arr, dispatch_mode=ExecutionMode.GPU)
+                    compute_geometry_bounds_device(arr)
                     break
 
         _evaluate_gpu_relate(left, right, gpu_rows, out)

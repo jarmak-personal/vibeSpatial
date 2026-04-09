@@ -286,32 +286,56 @@ def _build_overlay_execution_plan(
     _left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
     _right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> OverlayExecutionPlan:
-    split_events = build_gpu_split_events(
-        left,
-        right,
-        dispatch_mode=dispatch_mode,
-        _cached_right_segments=_cached_right_segments,
-        require_same_row=_row_isolated,
-        right_geometry_source_rows=_right_geometry_source_rows,
-    )
-    atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
+    try:
+        split_events = build_gpu_split_events(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=_cached_right_segments,
+            require_same_row=_row_isolated,
+            right_geometry_source_rows=_right_geometry_source_rows,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"overlay plan build_gpu_split_events failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        atomic_edges = build_gpu_atomic_edges(split_events, isolate_rows=_row_isolated)
+    except Exception as exc:
+        _free_split_event_device_state(split_events)
+        maybe_trim_pool_memory()
+        raise RuntimeError(
+            f"overlay plan build_gpu_atomic_edges failed: {type(exc).__name__}: {exc}"
+        ) from exc
     # split_events are fully consumed by build_gpu_atomic_edges.
     _free_split_event_device_state(split_events)
     maybe_trim_pool_memory()
 
-    half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=_row_isolated)
+    try:
+        half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=_row_isolated)
+    except Exception as exc:
+        _free_atomic_edge_excess(atomic_edges)
+        maybe_trim_pool_memory()
+        raise RuntimeError(
+            f"overlay plan build_gpu_half_edge_graph failed: {type(exc).__name__}: {exc}"
+        ) from exc
     # half_edge_graph retains the atomic-edge arrays it still needs.
     _free_atomic_edge_excess(atomic_edges)
     maybe_trim_pool_memory()
 
-    faces = build_gpu_overlay_faces(
-        left,
-        right,
-        half_edge_graph=half_edge_graph,
-        row_isolated=_row_isolated,
-        left_geometry_source_rows=_left_geometry_source_rows,
-        right_geometry_source_rows=_right_geometry_source_rows,
-    )
+    try:
+        faces = build_gpu_overlay_faces(
+            left,
+            right,
+            half_edge_graph=half_edge_graph,
+            row_isolated=_row_isolated,
+            left_geometry_source_rows=_left_geometry_source_rows,
+            right_geometry_source_rows=_right_geometry_source_rows,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"overlay plan build_gpu_overlay_faces failed: {type(exc).__name__}: {exc}"
+        ) from exc
     return OverlayExecutionPlan(
         split_events=None,
         atomic_edges=None,
@@ -381,6 +405,43 @@ def _materialize_overlay_execution_plan(
     finally:
         del d_selected_face_indices
         maybe_trim_pool_memory()
+
+
+def _expand_group_pair_positions(group_starts, group_ends):
+    """Expand grouped pair boundaries into flat sorted-pair positions."""
+    if cp is not None and hasattr(group_starts, "__cuda_array_interface__"):
+        d_group_starts = cp.asarray(group_starts, dtype=cp.int64)
+        d_group_ends = cp.asarray(group_ends, dtype=cp.int64)
+        if int(d_group_starts.size) == 0:
+            return cp.empty(0, dtype=cp.int64)
+        d_counts = (d_group_ends - d_group_starts).astype(cp.int64, copy=False)
+        total = int(cp.sum(d_counts, dtype=cp.int64).item())
+        if total == 0:
+            return cp.empty(0, dtype=cp.int64)
+        d_offsets = cp.cumsum(d_counts, dtype=cp.int64) - d_counts
+        d_positions = cp.arange(total, dtype=cp.int64)
+        d_group_ids = (
+            cp.searchsorted(d_offsets + d_counts, d_positions, side="right")
+            .astype(cp.int64, copy=False)
+        )
+        return (
+            d_positions
+            - d_offsets[d_group_ids].astype(cp.int64, copy=False)
+            + d_group_starts[d_group_ids].astype(cp.int64, copy=False)
+        )
+
+    h_group_starts = np.asarray(group_starts, dtype=np.int64)
+    h_group_ends = np.asarray(group_ends, dtype=np.int64)
+    if h_group_starts.size == 0:
+        return np.empty(0, dtype=np.int64)
+    h_counts = (h_group_ends - h_group_starts).astype(np.int64, copy=False)
+    total = int(h_counts.sum(dtype=np.int64))
+    if total == 0:
+        return np.empty(0, dtype=np.int64)
+    h_offsets = np.cumsum(h_counts, dtype=np.int64) - h_counts
+    h_positions = np.arange(total, dtype=np.int64)
+    h_group_ids = np.searchsorted(h_offsets + h_counts, h_positions, side="right")
+    return h_positions - h_offsets[h_group_ids] + h_group_starts[h_group_ids]
 
 
 def overlay_intersection_owned(
@@ -991,11 +1052,42 @@ def spatial_overlay_owned(
                 dispatch_mode=_pairwise_mode,
             )
 
+        elif how in ("intersection", "union") and strategy.name != "broadcast_right":
+            # Batch all surviving pairs into one row-isolated overlay plan.
+            # This keeps per-pair topology isolated without materializing
+            # group boundaries to host or iterating group-by-group in Python.
+            if _pairs_on_device:
+                d_pair_positions = _expand_group_pair_positions(group_starts, group_ends)
+                if int(d_pair_positions.size) == 0:
+                    result_owned = left.take(d_pair_positions)
+                else:
+                    left_pairs = left.take(d_left_indices[d_pair_positions])
+                    right_pairs = right.take(d_right_indices[d_pair_positions])
+                    result_owned = _overlay_owned(
+                        left_pairs,
+                        right_pairs,
+                        operation=how,
+                        dispatch_mode=_pairwise_mode,
+                        _row_isolated=True,
+                    )
+            else:
+                h_pair_positions = _expand_group_pair_positions(group_starts, group_ends)
+                if int(h_pair_positions.size) == 0:
+                    result_owned = left.take(h_pair_positions)
+                else:
+                    left_pairs = left.take(left_indices[h_pair_positions])
+                    right_pairs = right.take(right_indices[h_pair_positions])
+                    result_owned = _overlay_owned(
+                        left_pairs,
+                        right_pairs,
+                        operation=how,
+                        dispatch_mode=_pairwise_mode,
+                        _row_isolated=True,
+                    )
         else:
-            # intersection / union: process per-pair within each group.
-            # Each (L_i, R_j) pair produces an independent result fragment.
-            # Processing per-group keeps segment sets isolated, avoiding
-            # global O(n**2) cross-contamination.
+            # Legacy per-group path for shapes that still need group-managed
+            # control flow (currently broadcast-right variants plus grouped
+            # difference / symmetric_difference).
             result_parts: list[OwnedGeometryArray] = []
             _xp = cp if _pairs_on_device else np  # array module for index construction
 

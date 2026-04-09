@@ -5,7 +5,7 @@ Scope: Spatial-index query assembly, sjoin result semantics, bounded nearest str
 Read If: You are changing sindex query behavior, spatial join materialization, dwithin, or nearest result assembly.
 STOP IF: You already have the spatial-query engine and vendored join helpers open and only need local implementation detail.
 Source Of Truth: Phase-4 spatial query and join assembly policy before broader API dispatch work.
-Body Budget: 136/220 lines
+Body Budget: 149/220 lines
 Document: docs/architecture/spatial-joins.md
 
 Section Map (Body Lines)
@@ -16,12 +16,12 @@ Section Map (Body Lines)
 | 14-21 | Open First |
 | 22-30 | Verify |
 | 31-36 | Risks |
-| 37-41 | Intent |
-| 42-62 | Decision |
-| 63-102 | Query Strategy |
-| 103-120 | Nearest Strategy |
-| 121-130 | Pandas Semantics |
-| 131-136 | Consequences |
+| 37-42 | Intent |
+| 43-71 | Decision |
+| 72-111 | Query Strategy |
+| 112-129 | Nearest Strategy |
+| 130-141 | Pandas Semantics |
+| 142-149 | Consequences |
 DOC_HEADER:END -->
 
 ## Request Signals
@@ -60,13 +60,14 @@ DOC_HEADER:END -->
 
 ## Intent
 
-Define how repo-owned spatial query primitives plug into vendored GeoPandas
-`sindex` and `sjoin` surfaces while preserving pandas-compatible output rules.
+Define how repo-owned spatial query primitives plug into GeoPandas-compatible
+`sindex` and `sjoin` surfaces while preserving pandas-compatible output rules
+without making pandas assembly the internal execution model.
 
 ## Decision
 
-Land a repo-owned spatial-query engine and keep the vendored DataFrame-level
-join assembly.
+Land a repo-owned spatial-query engine and make relation results the internal
+join boundary, with explicit GeoPandas export only at the public surface.
 
 This means:
 
@@ -77,8 +78,16 @@ This means:
   bbox-tiling cost
 - vendored `SpatialIndex` stays on STRtree by default for current host
   execution because the owned host path is not yet performance-competitive
-- `sjoin` continues to rely on vendored `_frame_join(...)` so suffixes, index
-  restoration, and geometry-column rules stay GeoPandas-compatible
+- `sjoin` and `sjoin_nearest` build low-level `RelationJoinResult` objects
+  first, then wrap them in a deferred export result that owns join context
+  until the explicit `GeoDataFrame` boundary so suffixes, index restoration,
+  and geometry-column rules stay GeoPandas-compatible
+- `RelationJoinExportResult -> NativeTabularResult` now builds a native
+  attribute payload directly, so terminal Arrow-family and file sinks do not
+  need to go back through the joined-frame materializer just to emit join rows
+- those deferred join exports can also lower into the shared
+  `NativeTabularResult` boundary so terminal writers do not need to rebuild a
+  public frame just to emit join results
 - `dwithin` uses distance-expanded bounds as the coarse pass, then exact
   `shapely.dwithin` on the compacted candidate set
 - bounded nearest uses exact-distance reduction over compacted candidates
@@ -144,8 +153,10 @@ prune candidates, then exact distance reduction per input geometry.
 
 ## Pandas Semantics
 
-GeoPandas-compatible result assembly remains in the vendored layer:
+GeoPandas-compatible result assembly is an explicit export step from native
+relation results:
 
+- relation pairs stay separate from join/export context until the boundary
 - `how` semantics for `left`, `right`, and `inner`
 - index restoration and unnamed-index handling
 - overlapping-column suffix policy
@@ -158,3 +169,5 @@ GeoPandas-compatible result assembly remains in the vendored layer:
 - targeted upstream `sindex` and `sjoin` families validate the result semantics
 - the default host adapter avoids a measured regression by staying on STRtree for now
 - future GPU work can replace query/nearest internals without re-implementing DataFrame join behavior
+- downstream native workflows can consume join relation results without paying
+  immediate pandas materialization

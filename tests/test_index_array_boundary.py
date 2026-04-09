@@ -1,18 +1,51 @@
-"""ADR-0036: Index-array boundary contract tests.
+"""ADR-0042 result-boundary contract tests.
 
-These tests validate that spatial kernels produce only index arrays and that
-attribute assembly happens entirely on the host via pandas.
+These tests cover the current compatibility seams where low-level query kernels
+produce native relation results and GeoPandas assembly happens only at the
+explicit export boundary.
 """
 from __future__ import annotations
 
+import importlib
+
 import numpy as np
+import pyarrow as pa
 import pytest
 from shapely.geometry import Point, box
 
 import vibespatial.api as geopandas
+import vibespatial.api._native_results as native_results_module
+from vibespatial import write_geoparquet
 from vibespatial.api import GeoDataFrame, GeoSeries
+from vibespatial.api._native_results import (
+    GroupedConstructiveResult,
+    NativeAttributeTable,
+    NativeTabularResult,
+    RelationIndexResult,
+    RelationJoinExportResult,
+    RelationJoinResult,
+    to_native_tabular_result,
+)
+from vibespatial.api.testing import assert_geodataframe_equal
+from vibespatial.api.tools.clip import evaluate_geopandas_clip_native
+from vibespatial.api.tools.sjoin import (
+    _frame_join,
+    _frame_join_from_relation_result,
+    _nearest_query,
+    _sjoin_export_result,
+    _sjoin_nearest_export_result,
+    _sjoin_nearest_relation_result,
+    _sjoin_relation_result,
+)
+from vibespatial.io.file import write_vector_file
+from vibespatial.overlay.dissolve import (
+    evaluate_geopandas_dissolve,
+    evaluate_geopandas_dissolve_native,
+)
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.spatial.query import build_owned_spatial_index, query_spatial_index
+
+clip_module = importlib.import_module("vibespatial.api.tools.clip")
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -84,6 +117,988 @@ class TestSpatialNearestReturnsIndexArrays:
         assert "index_right" in result.columns
         assert np.issubdtype(result["index_right"].dtype, np.integer)
 
+    def test_relation_result_wrapper_matches_direct_frame_join_for_nearest(self):
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([Point(0, 0), Point(1, 1)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10]},
+            geometry=GeoSeries([Point(1, 1)]),
+        )
+
+        indices, distances, _selected = _nearest_query(
+            left,
+            right,
+            max_distance=None,
+            how="inner",
+            return_distance=False,
+            exclusive=False,
+        )
+
+        direct, _ = _frame_join(
+            left,
+            right,
+            indices,
+            distances,
+            "inner",
+            "left",
+            "right",
+            None,
+        )
+        wrapped, _ = _frame_join_from_relation_result(
+            left,
+            right,
+            RelationIndexResult(*indices),
+            distances,
+            "inner",
+            "left",
+            "right",
+            None,
+        )
+
+        assert_geodataframe_equal(direct, wrapped)
+
+    def test_sjoin_native_result_defers_frame_materialization(self, monkeypatch):
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+            crs="EPSG:4326",
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+            crs="EPSG:4326",
+        )
+
+        real_materialize = RelationJoinResult.materialize
+        materialize_calls = 0
+
+        def _counting_materialize(self, *args, **kwargs):
+            nonlocal materialize_calls
+            materialize_calls += 1
+            return real_materialize(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            RelationJoinResult,
+            "materialize",
+            _counting_materialize,
+        )
+
+        native_result, _implementation, _execution = _sjoin_relation_result(
+            left,
+            right,
+            "intersects",
+            None,
+        )
+
+        assert isinstance(native_result, RelationJoinResult)
+        assert materialize_calls == 0
+
+        materialized = native_result.to_geodataframe(
+            left,
+            right,
+            how="inner",
+            lsuffix="left",
+            rsuffix="right",
+        )
+        wrapped = geopandas.sjoin(left, right)
+
+        assert materialize_calls == 2
+        assert_geodataframe_equal(materialized, wrapped)
+
+    def test_sjoin_export_result_defers_frame_materialization(self, monkeypatch):
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+            crs="EPSG:4326",
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+            crs="EPSG:4326",
+        )
+
+        real_materialize = RelationJoinResult.materialize
+        materialize_calls = 0
+
+        def _counting_materialize(self, *args, **kwargs):
+            nonlocal materialize_calls
+            materialize_calls += 1
+            return real_materialize(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            RelationJoinResult,
+            "materialize",
+            _counting_materialize,
+        )
+
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+
+        assert isinstance(export_result, RelationJoinExportResult)
+        assert materialize_calls == 0
+
+        materialized = export_result.to_geodataframe()
+        wrapped = geopandas.sjoin(left, right)
+
+        assert materialize_calls == 2
+        assert_geodataframe_equal(materialized, wrapped)
+
+    def test_sjoin_export_result_writes_without_frame_materialization(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+            crs="EPSG:4326",
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+            crs="EPSG:4326",
+        )
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+        expected = geopandas.sjoin(left, right)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native sjoin GeoParquet write should not require GeoDataFrame export"
+            )
+
+        monkeypatch.setattr(
+            RelationJoinExportResult,
+            "to_geodataframe",
+            _fail,
+        )
+
+        path = tmp_path / "sjoin-native.parquet"
+        write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+
+        result = geopandas.read_parquet(path)
+        assert_geodataframe_equal(result, expected)
+
+    def test_sjoin_export_result_writes_without_relation_materialization(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+            crs="EPSG:4326",
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+            crs="EPSG:4326",
+        )
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+        expected = geopandas.sjoin(left, right)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native sjoin GeoParquet write should not require relation materialization"
+            )
+
+        monkeypatch.setattr(RelationJoinResult, "materialize", _fail)
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+
+        path = tmp_path / "sjoin-native-no-materialize.parquet"
+        write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+
+        result = geopandas.read_parquet(path)
+        assert_geodataframe_equal(result, expected)
+
+    def test_sjoin_export_result_builds_native_tabular_result(self) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+        )
+
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+
+        native_result = to_native_tabular_result(export_result)
+
+        assert isinstance(native_result, NativeTabularResult)
+        assert native_result.geometry_name == "geometry"
+        assert_geodataframe_equal(
+            native_result.to_geodataframe(),
+            geopandas.sjoin(left, right),
+        )
+
+    def test_sjoin_export_result_native_tabular_skips_join_frame_materializer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+        )
+
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+        expected = pa.table(geopandas.sjoin(left, right).to_arrow(geometry_encoding="WKB"))
+
+        real_native_parts = native_results_module._native_relation_join_parts
+        native_calls = 0
+
+        def _counting_native_parts(*args, **kwargs):
+            nonlocal native_calls
+            native_calls += 1
+            return real_native_parts(*args, **kwargs)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native sjoin tabular export should not require joined-frame materialization"
+            )
+
+        monkeypatch.setattr(
+            native_results_module,
+            "_native_relation_join_parts",
+            _counting_native_parts,
+        )
+        monkeypatch.setattr(
+            native_results_module,
+            "_materialize_relation_join_parts",
+            _fail,
+        )
+
+        native_result = to_native_tabular_result(export_result)
+
+        assert native_calls == 1
+        assert isinstance(native_result, NativeTabularResult)
+        assert isinstance(native_result.attributes, NativeAttributeTable)
+        assert native_result.attributes.arrow_table is not None
+        result = pa.table(native_result.to_arrow(geometry_encoding="WKB"))
+        assert result.column_names == expected.column_names
+        assert result.to_pydict() == expected.to_pydict()
+
+    def test_sjoin_export_result_builds_arrow_without_frame_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+        )
+
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+        native_result = to_native_tabular_result(export_result)
+
+        assert isinstance(native_result, NativeTabularResult)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("native Arrow export should not require GeoDataFrame export")
+
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+
+        expected = pa.table(geopandas.sjoin(left, right).to_arrow(geometry_encoding="WKB"))
+        result = pa.table(native_result.to_arrow(geometry_encoding="WKB"))
+
+        assert result.column_names == expected.column_names
+        assert result.to_pydict() == expected.to_pydict()
+
+    def test_sjoin_export_result_native_tabular_writes_feather_without_frame_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+        )
+
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+        native_result = to_native_tabular_result(export_result)
+
+        assert isinstance(native_result, NativeTabularResult)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("native Feather write should not require GeoDataFrame export")
+
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+
+        path = tmp_path / "sjoin-native-no-materialize.feather"
+        native_result.to_feather(path)
+
+        result = geopandas.read_feather(path)
+        assert_geodataframe_equal(result, geopandas.sjoin(left, right))
+
+    def test_sjoin_export_result_writes_file_without_frame_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
+            crs="EPSG:4326",
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
+            crs="EPSG:4326",
+        )
+        export_result, _implementation, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("native file export should not require GeoDataFrame export")
+
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+
+        path = tmp_path / "sjoin-native-no-materialize.geojson"
+        write_vector_file(export_result, path, driver="GeoJSON", engine="pyogrio")
+
+        result = geopandas.read_file(path, engine="pyogrio")
+        assert_geodataframe_equal(
+            result,
+            geopandas.sjoin(left, right),
+            check_like=True,
+            check_dtype=False,
+        )
+
+    def test_sjoin_nearest_native_result_defers_frame_materialization(self, monkeypatch):
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([Point(0, 0), Point(5, 0)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20, 30]},
+            geometry=GeoSeries([Point(1, 0), Point(6, 0), Point(20, 0)]),
+        )
+
+        real_materialize = RelationJoinResult.materialize
+        materialize_calls = 0
+
+        def _counting_materialize(self, *args, **kwargs):
+            nonlocal materialize_calls
+            materialize_calls += 1
+            return real_materialize(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            RelationJoinResult,
+            "materialize",
+            _counting_materialize,
+        )
+
+        native_result, _selected = _sjoin_nearest_relation_result(
+            left,
+            right,
+            max_distance=None,
+            how="inner",
+            return_distance=True,
+            exclusive=False,
+        )
+
+        assert isinstance(native_result, RelationJoinResult)
+        assert materialize_calls == 0
+
+        materialized = native_result.to_geodataframe(
+            left,
+            right,
+            how="inner",
+            lsuffix="left",
+            rsuffix="right",
+            distance_col="dist",
+        )
+        wrapped = geopandas.sjoin_nearest(left, right, how="inner", distance_col="dist")
+
+        assert materialize_calls == 2
+        assert_geodataframe_equal(
+            materialized.drop(columns=["dist"]),
+            wrapped.drop(columns=["dist"]),
+        )
+        np.testing.assert_allclose(materialized["dist"], wrapped["dist"])
+
+    def test_sjoin_nearest_export_result_defers_frame_materialization(self, monkeypatch):
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([Point(0, 0), Point(5, 0)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20, 30]},
+            geometry=GeoSeries([Point(1, 0), Point(6, 0), Point(20, 0)]),
+        )
+
+        real_materialize = RelationJoinResult.materialize
+        materialize_calls = 0
+
+        def _counting_materialize(self, *args, **kwargs):
+            nonlocal materialize_calls
+            materialize_calls += 1
+            return real_materialize(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            RelationJoinResult,
+            "materialize",
+            _counting_materialize,
+        )
+
+        export_result, _selected = _sjoin_nearest_export_result(
+            left,
+            right,
+            "inner",
+            None,
+            "left",
+            "right",
+            "dist",
+            False,
+        )
+
+        assert isinstance(export_result, RelationJoinExportResult)
+        assert materialize_calls == 0
+
+        materialized = export_result.to_geodataframe()
+        wrapped = geopandas.sjoin_nearest(left, right, how="inner", distance_col="dist")
+
+        assert materialize_calls == 2
+        assert_geodataframe_equal(
+            materialized.drop(columns=["dist"]),
+            wrapped.drop(columns=["dist"]),
+        )
+        np.testing.assert_allclose(materialized["dist"], wrapped["dist"])
+
+    def test_sjoin_nearest_export_result_native_tabular_skips_join_frame_materializer(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([Point(0, 0), Point(5, 0)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20, 30]},
+            geometry=GeoSeries([Point(1, 0), Point(6, 0), Point(20, 0)]),
+        )
+
+        export_result, _selected = _sjoin_nearest_export_result(
+            left,
+            right,
+            "inner",
+            None,
+            "left",
+            "right",
+            "dist",
+            False,
+        )
+        expected = geopandas.sjoin_nearest(left, right, how="inner", distance_col="dist")
+
+        real_native_parts = native_results_module._native_relation_join_parts
+        native_calls = 0
+
+        def _counting_native_parts(*args, **kwargs):
+            nonlocal native_calls
+            native_calls += 1
+            return real_native_parts(*args, **kwargs)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native nearest tabular export should not require joined-frame materialization"
+            )
+
+        monkeypatch.setattr(
+            native_results_module,
+            "_native_relation_join_parts",
+            _counting_native_parts,
+        )
+        monkeypatch.setattr(
+            native_results_module,
+            "_materialize_relation_join_parts",
+            _fail,
+        )
+
+        native_result = to_native_tabular_result(export_result)
+
+        assert native_calls == 1
+        assert isinstance(native_result, NativeTabularResult)
+        assert isinstance(native_result.attributes, NativeAttributeTable)
+        assert native_result.attributes.arrow_table is not None
+        result = native_result.to_geodataframe()
+        assert_geodataframe_equal(
+            result.drop(columns=["dist"]),
+            expected.drop(columns=["dist"]),
+        )
+        np.testing.assert_allclose(result["dist"], expected["dist"])
+
+    def test_sjoin_nearest_export_result_writes_without_relation_materialization(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([Point(0, 0), Point(5, 0)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20, 30]},
+            geometry=GeoSeries([Point(1, 0), Point(6, 0), Point(20, 0)]),
+        )
+        export_result, _selected = _sjoin_nearest_export_result(
+            left,
+            right,
+            "inner",
+            None,
+            "left",
+            "right",
+            "dist",
+            False,
+        )
+        expected = geopandas.sjoin_nearest(left, right, how="inner", distance_col="dist")
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native nearest GeoParquet write should not require relation materialization"
+            )
+
+        monkeypatch.setattr(RelationJoinResult, "materialize", _fail)
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+
+        path = tmp_path / "sjoin-nearest-native-no-materialize.parquet"
+        write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+
+        result = geopandas.read_parquet(path)
+        assert_geodataframe_equal(
+            result.drop(columns=["dist"]),
+            expected.drop(columns=["dist"]),
+        )
+        np.testing.assert_allclose(result["dist"], expected["dist"])
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for exact nearest coverage regression")
+    def test_sjoin_nearest_right_unbounded_preserves_all_right_rows(self) -> None:
+        left = GeoDataFrame(
+            {"geometry": GeoSeries([Point(0, 0), Point(1, 1)])},
+        )
+        right = GeoDataFrame(
+            {"geometry": GeoSeries([Point(x, y) for x, y in zip(range(10), range(10))])},
+        )
+
+        joined = geopandas.sjoin_nearest(
+            left,
+            right,
+            how="right",
+            distance_col="dist",
+        )
+
+        assert len(joined) == len(right) == 10
+        assert joined["index_left"].tolist() == [0, 1] + [1] * 8
+        np.testing.assert_allclose(
+            joined["dist"].to_numpy(),
+            np.asarray([0.0, 0.0] + [np.sqrt(2.0 * i * i) for i in range(1, 9)], dtype=np.float64),
+        )
+
+    def test_dissolve_native_result_defers_frame_materialization(self, monkeypatch) -> None:
+        frame = GeoDataFrame(
+            {
+                "group": ["a", "a", "b"],
+                "value": [1, 2, 3],
+            },
+            geometry=GeoSeries(
+                [
+                    box(0, 0, 1, 1),
+                    box(1, 0, 2, 1),
+                    box(10, 10, 11, 11),
+                ]
+            ),
+        )
+
+        real_export = GroupedConstructiveResult.to_geodataframe
+        export_calls = 0
+
+        def _counting_export(self, *args, **kwargs):
+            nonlocal export_calls
+            export_calls += 1
+            return real_export(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            GroupedConstructiveResult,
+            "to_geodataframe",
+            _counting_export,
+        )
+
+        native_result = evaluate_geopandas_dissolve_native(
+            frame,
+            by="group",
+            aggfunc="first",
+            as_index=True,
+            level=None,
+            sort=False,
+            observed=False,
+            dropna=True,
+            method="coverage",
+            grid_size=None,
+            agg_kwargs={},
+        )
+
+        assert isinstance(native_result, GroupedConstructiveResult)
+        assert export_calls == 0
+
+        materialized = native_result.to_geodataframe()
+        wrapped = evaluate_geopandas_dissolve(
+            frame,
+            by="group",
+            aggfunc="first",
+            as_index=True,
+            level=None,
+            sort=False,
+            observed=False,
+            dropna=True,
+            method="coverage",
+            grid_size=None,
+            agg_kwargs={},
+        )
+
+        assert export_calls == 2
+        assert_geodataframe_equal(materialized, wrapped)
+
+    def test_dissolve_native_result_writes_without_frame_materialization(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        frame = GeoDataFrame(
+            {
+                "group": ["a", "a", "b"],
+                "value": [1, 2, 3],
+            },
+            geometry=GeoSeries(
+                [
+                    box(0, 0, 1, 1),
+                    box(1, 0, 2, 1),
+                    box(10, 10, 11, 11),
+                ]
+            ),
+        )
+
+        native_result = evaluate_geopandas_dissolve_native(
+            frame,
+            by="group",
+            aggfunc="first",
+            as_index=True,
+            level=None,
+            sort=False,
+            observed=False,
+            dropna=True,
+            method="coverage",
+            grid_size=None,
+            agg_kwargs={},
+        )
+        expected = evaluate_geopandas_dissolve(
+            frame,
+            by="group",
+            aggfunc="first",
+            as_index=True,
+            level=None,
+            sort=False,
+            observed=False,
+            dropna=True,
+            method="coverage",
+            grid_size=None,
+            agg_kwargs={},
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native grouped GeoParquet write should not require GeoDataFrame export"
+            )
+
+        monkeypatch.setattr(
+            GroupedConstructiveResult,
+            "to_geodataframe",
+            _fail,
+        )
+
+        path = tmp_path / "dissolve-native.parquet"
+        write_geoparquet(native_result, path, geometry_encoding="geoarrow")
+
+        result = geopandas.read_parquet(path)
+        assert_geodataframe_equal(result, expected)
+
+    def test_clip_native_result_defers_frame_materialization(self, monkeypatch) -> None:
+        frame = GeoDataFrame(
+            {
+                "value": [1, 2, 3],
+                "geometry": GeoSeries(
+                    [
+                        box(0, 0, 2, 2),
+                        box(1, 1, 3, 3),
+                        box(10, 10, 12, 12),
+                    ]
+                ),
+            }
+        )
+        mask = box(0.5, 0.5, 2.5, 2.5)
+
+        real_export = clip_module.ClipNativeResult.to_spatial
+        export_calls = 0
+
+        def _counting_export(self, *args, **kwargs):
+            nonlocal export_calls
+            export_calls += 1
+            return real_export(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            clip_module.ClipNativeResult,
+            "to_spatial",
+            _counting_export,
+        )
+
+        native_result = evaluate_geopandas_clip_native(
+            frame,
+            mask,
+            keep_geom_type=False,
+            sort=False,
+        )
+
+        assert isinstance(native_result, clip_module.ClipNativeResult)
+        assert export_calls == 0
+
+        materialized = native_result.to_spatial()
+        wrapped = geopandas.clip(frame, mask)
+
+        assert export_calls == 2
+        assert_geodataframe_equal(materialized, wrapped)
+
+    def test_clip_native_result_writes_without_frame_materialization(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        frame = GeoDataFrame(
+            {
+                "value": [1, 2, 3],
+                "geometry": GeoSeries(
+                    [
+                        box(0, 0, 2, 2),
+                        box(1, 1, 3, 3),
+                        box(10, 10, 12, 12),
+                    ]
+                ),
+            }
+        )
+        mask = box(0.5, 0.5, 2.5, 2.5)
+        native_result = evaluate_geopandas_clip_native(
+            frame,
+            mask,
+            keep_geom_type=False,
+            sort=False,
+        )
+        expected = geopandas.clip(frame, mask)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native clip GeoParquet write should not require GeoDataFrame export"
+            )
+
+        monkeypatch.setattr(
+            clip_module.ClipNativeResult,
+            "to_spatial",
+            _fail,
+        )
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+
+        path = tmp_path / "clip-native.parquet"
+        write_geoparquet(native_result, path, geometry_encoding="geoarrow")
+
+        result = geopandas.read_parquet(path)
+        assert_geodataframe_equal(result, expected)
+
+    def test_clip_native_result_builds_native_tabular_result(self) -> None:
+        frame = GeoDataFrame(
+            {
+                "value": [1, 2, 3],
+                "geometry": GeoSeries(
+                    [
+                        box(0, 0, 2, 2),
+                        box(1, 1, 3, 3),
+                        box(10, 10, 12, 12),
+                    ]
+                ),
+            }
+        )
+        mask = box(0.5, 0.5, 2.5, 2.5)
+
+        native_result = evaluate_geopandas_clip_native(
+            frame,
+            mask,
+            keep_geom_type=False,
+            sort=False,
+        )
+
+        tabular = to_native_tabular_result(native_result)
+
+        assert isinstance(tabular, NativeTabularResult)
+        assert_geodataframe_equal(
+            tabular.to_geodataframe(),
+            geopandas.clip(frame, mask),
+        )
+
+    def test_point_only_clip_native_tabular_skips_spatial_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        frame = GeoDataFrame(
+            {
+                "value": [1, 2, 3],
+                "geometry": GeoSeries([Point(0, 0), Point(2, 2), Point(10, 10)]),
+            }
+        )
+        mask = box(-1, -1, 3, 3)
+        native_result = evaluate_geopandas_clip_native(
+            frame,
+            mask,
+            keep_geom_type=False,
+            sort=False,
+        )
+        expected = geopandas.clip(frame, mask)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "point-only native clip tabular export should not require ClipNativeResult.to_spatial()"
+            )
+
+        monkeypatch.setattr(clip_module.ClipNativeResult, "to_spatial", _fail)
+
+        tabular = to_native_tabular_result(native_result)
+
+        assert isinstance(tabular, NativeTabularResult)
+        assert isinstance(tabular.attributes, NativeAttributeTable)
+        assert tabular.attributes.arrow_table is not None
+        assert_geodataframe_equal(tabular.to_geodataframe(), expected)
+
+    def test_polygon_clip_native_tabular_skips_spatial_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vibespatial.geometry.owned import OwnedGeometryArray
+
+        frame = GeoDataFrame(
+            {
+                "value": [1, 2, 3],
+                "geometry": GeoSeries(
+                    [
+                        box(0, 0, 2, 2),
+                        box(1, 1, 3, 3),
+                        box(10, 10, 12, 12),
+                    ]
+                ),
+            }
+        )
+        mask = box(0.5, 0.5, 2.5, 2.5)
+        native_result = evaluate_geopandas_clip_native(
+            frame,
+            mask,
+            keep_geom_type=False,
+            sort=False,
+        )
+        expected = geopandas.clip(frame, mask)
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "non-point native clip tabular export should not require ClipNativeResult.to_spatial()"
+            )
+
+        monkeypatch.setattr(clip_module.ClipNativeResult, "to_spatial", _fail)
+        to_shapely_calls = 0
+
+        real_to_shapely = OwnedGeometryArray.to_shapely
+
+        def _counting_to_shapely(self, *args, **kwargs):
+            nonlocal to_shapely_calls
+            to_shapely_calls += 1
+            return real_to_shapely(self, *args, **kwargs)
+
+        monkeypatch.setattr(OwnedGeometryArray, "to_shapely", _counting_to_shapely)
+
+        tabular = to_native_tabular_result(native_result)
+
+        assert isinstance(tabular, NativeTabularResult)
+        assert isinstance(tabular.attributes, NativeAttributeTable)
+        assert tabular.attributes.arrow_table is not None
+        assert to_shapely_calls == 0
+        monkeypatch.undo()
+        assert_geodataframe_equal(tabular.to_geodataframe(), expected)
+
 
 # ---------------------------------------------------------------------------
 # Phase 2: sjoin preserves attributes across all join types
@@ -104,9 +1119,13 @@ class TestSjoinPreservesAttributes:
                 assert col in result.columns, f"Missing right column {col} in {how} join"
 
     def test_sjoin_no_geometry_in_attribute_reindex(self, left_gdf, right_gdf):
-        """The joined result should have exactly one geometry column."""
+        """The joined result should have exactly one active geometry-like column."""
         result = geopandas.sjoin(left_gdf, right_gdf, how="inner")
-        geom_cols = [c for c in result.columns if result[c].dtype.name == "geometry"]
+        geom_cols = [
+            c
+            for c in result.columns
+            if result[c].dtype.name in {"geometry", "device_geometry"}
+        ]
         assert len(geom_cols) == 1
 
 

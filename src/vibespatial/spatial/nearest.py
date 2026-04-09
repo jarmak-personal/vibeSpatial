@@ -11,9 +11,11 @@ from vibespatial.cuda.cccl_primitives import (
     compact_indices,
     exclusive_sum,
     lower_bound,
+    lower_bound_counting,
     segmented_reduce_min,
     sort_pairs,
     upper_bound,
+    upper_bound_counting,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.adaptive import plan_dispatch_selection
@@ -342,9 +344,8 @@ def _refine_nearest_from_device_distances(
     ptr = runtime.pointer
 
     # Build segments from sorted left_idx (Tier 3a CCCL).
-    query_keys = cp.arange(n_queries, dtype=cp.int32)
-    seg_starts = lower_bound(d_left, query_keys, synchronize=False)
-    seg_ends = upper_bound(d_left, query_keys, synchronize=False)
+    seg_starts = lower_bound_counting(d_left, 0, n_queries, dtype=np.int32)
+    seg_ends = upper_bound_counting(d_left, 0, n_queries, dtype=np.int32)
     seg_starts_i32 = seg_starts.astype(cp.int32, copy=False)
     seg_ends_i32 = seg_ends.astype(cp.int32, copy=False)
 
@@ -972,11 +973,18 @@ def _nearest_grid_gpu(
                 valid_mask &= np.sqrt(h_min_sq) <= max_distance
             valid_q = np.flatnonzero(valid_mask)
             if valid_q.size == 0:
+                if max_distance is None:
+                    return None
                 result = _empty_nearest_result(return_distance)
                 return result, "owned_gpu_nearest"
 
             left = query_global_idx[valid_q].astype(np.intp)
             right = h_min_idx[valid_q].astype(np.intp)
+            if max_distance is None and left.size != query_global_idx.size:
+                # The zero-copy grid path must cover every valid query row for
+                # unbounded nearest. If it does not, decline and let the exact
+                # indexed GPU path take over.
+                return None
             indices = np.vstack((left, right))
             if return_distance:
                 dists = np.sqrt(h_min_sq[valid_q])
@@ -1015,6 +1023,8 @@ def _nearest_grid_gpu(
         d_offsets = exclusive_sum(d_counts)
         total_pairs = count_scatter_total(runtime, d_counts, d_offsets) if n_query > 0 else 0
         if total_pairs == 0:
+            if max_distance is None:
+                return None
             result = _empty_nearest_result(return_distance)
             return result, "owned_gpu_nearest"
 
@@ -1071,8 +1081,14 @@ def _nearest_grid_gpu(
             pair_dists = pair_dists[within]
 
         if left.size == 0:
+            if max_distance is None:
+                return None
             result = _empty_nearest_result(return_distance)
             return result, "owned_gpu_nearest"
+        if max_distance is None and np.unique(left).size != query_global_idx.size:
+            # Same contract as above: for unbounded nearest every valid query
+            # row must appear at least once in the returned pairs.
+            return None
 
         indices = np.vstack((left, right))
         if return_distance:
@@ -1113,15 +1129,6 @@ def _nearest_indexed_point_gpu(
     if not _points_only(query_owned) or not _points_only(tree_owned):
         return None
     if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
-        return None
-
-    selection = plan_dispatch_selection(
-        kernel_name="nearest_knn_indexed",
-        kernel_class=KernelClass.COARSE,
-        row_count=query_owned.row_count + tree_owned.row_count,
-        gpu_available=True,
-    )
-    if selection.selected is not ExecutionMode.GPU:
         return None
 
     import cupy as cp
@@ -2555,10 +2562,10 @@ def nearest_spatial_index(
         keep[order[first]] = True
     keep &= distances <= effective_max_distance
     indices = np.vstack((left_idx[keep].astype(np.intp, copy=False), right_idx[keep].astype(np.intp, copy=False)))
-    # ADR-0036: spatial kernels produce integer index arrays only.
+    # ADR-0042: low-level spatial-query kernels still use integer index arrays.
     if __debug__:
         assert isinstance(indices, np.ndarray) and np.issubdtype(indices.dtype, np.integer), (
-            f"ADR-0036: nearest indices must be integer ndarray, got {type(indices).__name__} dtype={getattr(indices, 'dtype', None)}"
+            f"ADR-0042: nearest indices must be integer ndarray, got {type(indices).__name__} dtype={getattr(indices, 'dtype', None)}"
         )
     if return_distance:
         return (indices, distances[keep]), impl

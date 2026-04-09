@@ -333,7 +333,6 @@ def _shortest_line_gpu(
     Output assembly stays device-resident, including all-empty result rows.
     """
     n = left.row_count
-    runtime = get_cuda_runtime()
 
     # Ensure geometry buffers are device-resident
     left.move_to(
@@ -399,7 +398,6 @@ def _shortest_line_gpu(
         )
 
         if ok:
-            runtime.synchronize()
             out_ax[d_idx] = d_sub_ax
             out_ay[d_idx] = d_sub_ay
             out_bx[d_idx] = d_sub_bx

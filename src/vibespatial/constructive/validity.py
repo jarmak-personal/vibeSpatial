@@ -69,6 +69,7 @@ from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.residency import combined_residency
 
 request_nvrtc_warmup([
     ("is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES),
@@ -1085,10 +1086,11 @@ def _launch_ring_pair_interaction_kernel(runtime, d_buf, d_poly_ring_starts,
          KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
     )
-    # 1 block per polygon part — use occupancy API for optimal block size
+    # 1 block per polygon part — use occupancy API for optimal block size.
+    # CudaDriverRuntime.launch expects 3D launch tuples.
     block_size = runtime.optimal_block_size(kernel)
-    grid = (poly_count,)
-    block = (block_size,)
+    grid = (poly_count, 1, 1)
+    block = (block_size, 1, 1)
     runtime.launch(kernel, grid=grid, block=block, params=params)
     return d_poly_valid
 
@@ -1393,10 +1395,10 @@ def _launch_is_simple_kernel(runtime, d_buf_x, d_buf_y, d_span_offsets, span_cou
         (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
          KERNEL_PARAM_PTR, KERNEL_PARAM_I32, KERNEL_PARAM_I32),
     )
-    # 1 block per span: grid = (span_count,), block size from __launch_bounds__ = 256
+    # 1 block per span. CudaDriverRuntime.launch expects 3D launch tuples.
     block_size = 256
-    grid = (span_count,)
-    block = (block_size,)
+    grid = (span_count, 1, 1)
+    block = (block_size, 1, 1)
     runtime.launch(kernel, grid=grid, block=block, params=params)
     return d_result
 
@@ -1729,6 +1731,7 @@ def is_valid_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(owned),
     )
 
     # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons

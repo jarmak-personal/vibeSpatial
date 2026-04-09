@@ -17,6 +17,7 @@ import pytest
 import shapely
 from shapely.geometry import MultiPolygon, Polygon, box
 
+import vibespatial.kernels.constructive.segmented_union as segmented_union_module
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.residency import Residency
@@ -366,6 +367,40 @@ class TestSegmentedUnionGPU:
         result_geoms = result.to_shapely()
         assert len(result_geoms) == 1
         _assert_geom_equal(result_geoms[0], ref[0])
+
+    @requires_gpu
+    def test_single_group_gpu_uses_global_tree_reduce_fast_path(self, monkeypatch):
+        """GPU: single-group unions should bypass the legacy per-row reducer."""
+        geoms = [box(0, 0, 1, 1), box(0.5, 0, 1.5, 1), box(1.0, 0, 2.0, 1)]
+        owned = _make_owned(geoms)
+        offsets = np.array([0, 3], dtype=np.int64)
+
+        called: dict[str, object] = {}
+
+        def _fake_union_all_gpu_owned(geometries, **kwargs):
+            called["row_count"] = geometries.row_count
+            called["dispatch_mode"] = kwargs.get("dispatch_mode")
+            return geometries.take(np.array([0], dtype=np.int64))
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.union_all.union_all_gpu_owned",
+            _fake_union_all_gpu_owned,
+        )
+        monkeypatch.setattr(
+            segmented_union_module,
+            "_tree_reduce_group",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("single-group path should not use legacy per-row reducer")
+            ),
+        )
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+
+        assert called == {
+            "row_count": 3,
+            "dispatch_mode": ExecutionMode.GPU,
+        }
+        assert result.row_count == 1
 
     @requires_gpu
     def test_three_polygon_chain_gpu(self):

@@ -429,7 +429,6 @@ def _clip_polygon_rings_gpu_device(
         block=clip_block,
         params=clip_params,
     )
-    runtime.synchronize()
 
     return d_out_x, d_out_y, d_full_offsets
 

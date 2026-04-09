@@ -12,14 +12,21 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection
 
+from vibespatial.api._native_results import (
+    GeometryNativeResult,
+    GroupedConstructiveResult,
+)
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.config import (
     OVERLAY_GPU_FAILURE_THRESHOLD,
     OVERLAY_GROUPED_BOX_GPU_THRESHOLD,
+    OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD,
     OVERLAY_UNION_ALL_GPU_THRESHOLD,
+    SPATIAL_EPSILON,
 )
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
+from vibespatial.runtime.provenance import provenance_rewrites_enabled, record_rewrite_event
 
 try:
     import cupy as cp
@@ -77,11 +84,12 @@ class DissolvePipelinePlan:
 
 @dataclass(frozen=True)
 class GroupedUnionResult:
-    geometries: np.ndarray
+    geometries: np.ndarray | None
     group_count: int
     non_empty_groups: int
     empty_groups: int
     method: DissolveUnionMethod
+    owned: OwnedGeometryArray | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +106,42 @@ class DissolveBenchmark:
         if self.pipeline_elapsed_seconds == 0.0:
             return float("inf")
         return self.baseline_elapsed_seconds / self.pipeline_elapsed_seconds
+
+
+def _grouped_union_geometry_result(
+    grouped_union: GroupedUnionResult,
+    *,
+    geometry_name: str,
+    crs,
+) -> GeometryNativeResult:
+    if grouped_union.owned is not None:
+        return GeometryNativeResult.from_owned(grouped_union.owned, crs=crs)
+
+    from vibespatial.api.geoseries import GeoSeries
+
+    return GeometryNativeResult.from_geoseries(
+        GeoSeries(grouped_union.geometries, name=geometry_name, crs=crs)
+    )
+
+
+def _grouped_constructive_result(
+    grouped_union: GroupedUnionResult,
+    *,
+    frame,
+    aggregated_data: pd.DataFrame,
+    as_index: bool,
+) -> GroupedConstructiveResult:
+    return GroupedConstructiveResult(
+        geometry=_grouped_union_geometry_result(
+            grouped_union,
+            geometry_name=frame.geometry.name,
+            crs=frame.crs,
+        ),
+        attributes=aggregated_data,
+        geometry_name=frame.geometry.name,
+        as_index=as_index,
+        frame_type=type(frame),
+    )
 
 
 class LazyDissolvedFrame:
@@ -147,9 +191,18 @@ class LazyDissolvedFrame:
     def geometry(self):
         return self.materialize()[self._geometry_name]
 
-    def materialize(self):
-        if self._materialized is not None:
-            return self._materialized
+    def _materialized_geometry_column(self, grouped_union: GroupedUnionResult):
+        if grouped_union.owned is not None:
+            from vibespatial.io.geoarrow import geoseries_from_owned
+
+            return geoseries_from_owned(
+                grouped_union.owned,
+                name=self._geometry_name,
+                crs=self._frame.crs,
+            )
+        return grouped_union.geometries
+
+    def to_native_result(self) -> GroupedConstructiveResult:
         self._ensure_group_positions()
         if self._row_group_codes is not None:
             grouped_union = execute_grouped_union_codes(
@@ -170,17 +223,18 @@ class LazyDissolvedFrame:
                 grid_size=self._grid_size,
                 owned=self._owned,
             )
-        geometry_frame = type(self._frame)(
-            {self._geometry_name: grouped_union.geometries},
-            geometry=self._geometry_name,
-            index=self._aggregated_data.index,
-            crs=self._frame.crs,
+        return _grouped_constructive_result(
+            grouped_union,
+            frame=self._frame,
+            aggregated_data=self._aggregated_data,
+            as_index=self._as_index,
         )
-        aggregated = geometry_frame.join(self._aggregated_data)
-        if not self._as_index:
-            aggregated = aggregated.reset_index()
-        self._materialized = aggregated
-        return aggregated
+
+    def materialize(self):
+        if self._materialized is not None:
+            return self._materialized
+        self._materialized = self.to_native_result().to_geodataframe()
+        return self._materialized
 
     def to_geodataframe(self):
         return self.materialize()
@@ -608,6 +662,141 @@ def _rectangle_bounds(values: np.ndarray) -> np.ndarray | None:
     if not np.allclose(np.asarray(shapely.area(values), dtype=np.float64), expected_area):
         return None
     return bounds
+
+
+def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
+    if cp is None:
+        return None
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+    device_state = owned._ensure_device_state()
+    if set(device_state.families) != {GeometryFamily.POLYGON}:
+        return None
+
+    polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    d_validity = cp.asarray(device_state.validity).astype(cp.bool_, copy=False)
+    d_tags = cp.asarray(device_state.tags).astype(cp.int8, copy=False)
+    if not bool(cp.all(d_validity)) or not bool(cp.all(d_tags == polygon_tag)):
+        return None
+
+    polygon_buffer = device_state.families[GeometryFamily.POLYGON]
+    if polygon_buffer.ring_offsets is None or bool(cp.any(polygon_buffer.empty_mask)):
+        return None
+
+    d_geom_starts = cp.asarray(polygon_buffer.geometry_offsets[:-1]).astype(cp.int32, copy=False)
+    d_geom_ends = cp.asarray(polygon_buffer.geometry_offsets[1:]).astype(cp.int32, copy=False)
+    if not bool(cp.all((d_geom_ends - d_geom_starts) == 1)):
+        return None
+
+    d_ring_offsets = cp.asarray(polygon_buffer.ring_offsets).astype(cp.int32, copy=False)
+    d_coord_starts = d_ring_offsets[d_geom_starts]
+    d_coord_ends = d_ring_offsets[d_geom_ends]
+    if not bool(cp.all((d_coord_ends - d_coord_starts) == 5)):
+        return None
+
+    compute_geometry_bounds_device(owned)
+    d_bounds = cp.asarray(owned.device_state.row_bounds).reshape(owned.row_count, 4)
+
+    d_offsets = d_coord_starts[:, None] + cp.arange(5, dtype=cp.int32)[None, :]
+    d_x = cp.asarray(polygon_buffer.x)[d_offsets]
+    d_y = cp.asarray(polygon_buffer.y)[d_offsets]
+
+    d_xmin = d_bounds[:, 0][:, None]
+    d_ymin = d_bounds[:, 1][:, None]
+    d_xmax = d_bounds[:, 2][:, None]
+    d_ymax = d_bounds[:, 3][:, None]
+    on_corners = (
+        ((d_x == d_xmin) | (d_x == d_xmax))
+        & ((d_y == d_ymin) | (d_y == d_ymax))
+    )
+    closed = (d_x[:, 0] == d_x[:, 4]) & (d_y[:, 0] == d_y[:, 4])
+    twice_area = cp.abs(cp.sum(d_x[:, :-1] * d_y[:, 1:] - d_y[:, :-1] * d_x[:, 1:], axis=1))
+    expected_twice_area = 2.0 * (d_bounds[:, 2] - d_bounds[:, 0]) * (d_bounds[:, 3] - d_bounds[:, 1])
+    # Bounds kernels can use a lower-precision plan on consumer GPUs; keep
+    # the bow-tie rejection but allow the small fp rounding error that shows
+    # up on larger regular grids.
+    if not bool(
+        cp.all(
+            cp.all(on_corners, axis=1)
+            & closed
+            & cp.isclose(twice_area, expected_twice_area, rtol=1.0e-10, atol=SPATIAL_EPSILON)
+        )
+    ):
+        return None
+    return d_bounds
+
+
+def execute_grouped_box_union_gpu_owned_codes(
+    row_group_codes: np.ndarray,
+    *,
+    group_count: int,
+    owned: OwnedGeometryArray,
+) -> GroupedUnionResult | None:
+    if cp is None:
+        return None
+
+    d_bounds = _owned_rectangle_bounds_device(owned)
+    if d_bounds is None:
+        return None
+
+    d_codes = cp.asarray(row_group_codes, dtype=cp.int32)
+    d_observed_mask = d_codes >= 0
+    if not bool(cp.any(d_observed_mask)):
+        merged = np.full(group_count, _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=DissolveUnionMethod.COVERAGE,
+        )
+
+    from vibespatial.constructive.envelope import _build_device_boxes_from_bounds
+    from vibespatial.cuda.cccl_primitives import (
+        lower_bound_counting,
+        segmented_reduce_max,
+        segmented_reduce_min,
+        sort_pairs,
+        upper_bound_counting,
+    )
+
+    d_observed_rows = cp.flatnonzero(d_observed_mask).astype(cp.int32)
+    d_observed_codes = d_codes[d_observed_rows]
+    sort_result = sort_pairs(
+        d_observed_codes,
+        d_observed_rows,
+        synchronize=False,
+    )
+    d_sorted_codes = cp.asarray(sort_result.keys).astype(cp.int32, copy=False)
+    d_sorted_rows = cp.asarray(sort_result.values).astype(cp.int32, copy=False)
+    d_starts = lower_bound_counting(d_sorted_codes, 0, group_count, dtype=np.int32).astype(cp.int32, copy=False)
+    d_ends = upper_bound_counting(d_sorted_codes, 0, group_count, dtype=np.int32).astype(cp.int32, copy=False)
+    if not bool(cp.all(d_ends > d_starts)):
+        return None
+
+    d_sorted_bounds = d_bounds[d_sorted_rows]
+    # CCCL segmented_reduce expects contiguous input vectors; a gathered
+    # bounds matrix is row-major, so column slices are strided views.
+    d_bound_columns = cp.ascontiguousarray(d_sorted_bounds.T)
+    d_xmin = segmented_reduce_min(d_bound_columns[0], d_starts, d_ends, num_segments=group_count).values
+    d_ymin = segmented_reduce_min(d_bound_columns[1], d_starts, d_ends, num_segments=group_count).values
+    d_xmax = segmented_reduce_max(d_bound_columns[2], d_starts, d_ends, num_segments=group_count).values
+    d_ymax = segmented_reduce_max(d_bound_columns[3], d_starts, d_ends, num_segments=group_count).values
+    d_group_bounds = cp.stack((d_xmin, d_ymin, d_xmax, d_ymax), axis=1)
+    reduced = _build_device_boxes_from_bounds(d_group_bounds, row_count=group_count)
+
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=reduced,
+    )
 
 
 def execute_grouped_box_union_gpu(
@@ -1230,6 +1419,19 @@ def execute_grouped_union_codes(
         sorted_rows = observed_rows[order]
         offsets, unique_codes = _group_offsets_from_sorted_codes(sorted_codes)
         reduced = segmented_union_all(owned.take(sorted_rows), offsets)
+        if unique_codes.size == group_count and np.array_equal(
+            unique_codes,
+            np.arange(group_count, dtype=unique_codes.dtype),
+        ):
+            non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+            return GroupedUnionResult(
+                geometries=None,
+                group_count=group_count,
+                non_empty_groups=non_empty_groups,
+                empty_groups=empty_groups,
+                method=normalized,
+                owned=reduced,
+            )
         reduced_geometries = np.asarray(reduced.to_shapely(), dtype=object)
         merged = np.full(group_count, _EMPTY, dtype=object)
         merged[unique_codes.astype(np.intp, copy=False)] = reduced_geometries
@@ -1255,6 +1457,17 @@ def execute_grouped_union_codes(
             return accelerated
     if (
         normalized is DissolveUnionMethod.COVERAGE
+        and geometry_count >= OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD
+    ):
+        accelerated = execute_grouped_coverage_edge_union_codes(
+            _values(),
+            row_group_codes,
+            group_count=group_count,
+        )
+        if accelerated is not None:
+            return accelerated
+    if (
+        normalized is DissolveUnionMethod.COVERAGE
         and geometry_count >= OVERLAY_UNION_ALL_GPU_THRESHOLD
     ):
         accelerated = execute_grouped_disjoint_subset_union_codes(
@@ -1268,13 +1481,14 @@ def execute_grouped_union_codes(
         normalized is DissolveUnionMethod.COVERAGE
         and geometry_count >= OVERLAY_UNION_ALL_GPU_THRESHOLD
     ):
-        accelerated = execute_grouped_coverage_edge_union_codes(
-            _values(),
-            row_group_codes,
-            group_count=group_count,
-        )
-        if accelerated is not None:
-            return accelerated
+        if owned is not None:
+            accelerated = execute_grouped_coverage_union_gpu(
+                _values(),
+                _group_positions_from_codes(row_group_codes, group_count),
+                owned=owned,
+            )
+            if accelerated is not None:
+                return accelerated
     return None
 
 
@@ -1298,7 +1512,7 @@ def execute_grouped_union(
             return accelerated
     if (
         normalized is DissolveUnionMethod.COVERAGE
-        and int(values.size) >= OVERLAY_UNION_ALL_GPU_THRESHOLD
+        and int(values.size) >= OVERLAY_GROUPED_COVERAGE_EDGE_THRESHOLD
     ):
         accelerated = execute_grouped_coverage_edge_union(
             values,
@@ -1397,7 +1611,429 @@ def _prepare_grouped_dissolve(
     return aggregated_data, group_positions, owned, row_group_codes
 
 
-def evaluate_geopandas_dissolve(
+def _max_group_size(
+    row_group_codes: np.ndarray | None,
+    group_positions: list[np.ndarray],
+    group_count: int,
+) -> int:
+    if group_count == 0:
+        return 0
+    if row_group_codes is not None:
+        observed = row_group_codes[row_group_codes >= 0]
+        if observed.size == 0:
+            return 0
+        counts = np.bincount(observed.astype(np.int32, copy=False), minlength=group_count)
+        return int(counts.max(initial=0))
+    if not group_positions:
+        return 0
+    return max((int(len(positions)) for positions in group_positions), default=0)
+
+
+def _provenance_source_owned(tag) -> OwnedGeometryArray | None:
+    if tag is None:
+        return None
+
+    source = getattr(tag, "source_array", None)
+    if source is None:
+        return None
+
+    owned = getattr(source, "_owned", None)
+    if owned is not None:
+        return owned
+
+    to_owned = getattr(source, "to_owned", None)
+    if callable(to_owned):
+        try:
+            return to_owned()
+        except Exception:
+            return None
+
+    values = getattr(source, "values", None)
+    return getattr(values, "_owned", None)
+
+
+def _dedupe_two_point_linestring_rows_gpu(
+    lines: OwnedGeometryArray,
+) -> np.ndarray | None:
+    from vibespatial.geometry.buffers import GeometryFamily
+    if GeometryFamily.LINESTRING not in lines.families or len(lines.families) != 1:
+        return None
+
+    line_buffer = lines.families[GeometryFamily.LINESTRING]
+    if line_buffer.host_materialized:
+        offsets = np.asarray(line_buffer.geometry_offsets, dtype=np.int32)
+        if offsets.shape != (lines.row_count + 1,) or not np.all((offsets[1:] - offsets[:-1]) == 2):
+            return None
+
+        coord_starts = offsets[:-1]
+        x = np.asarray(line_buffer.x, dtype=np.float64)
+        y = np.asarray(line_buffer.y, dtype=np.float64)
+        x0 = x[coord_starts]
+        y0 = y[coord_starts]
+        x1 = x[coord_starts + 1]
+        y1 = y[coord_starts + 1]
+        swap = (x0 > x1) | ((x0 == x1) & (y0 > y1))
+        ax = np.where(swap, x1, x0)
+        ay = np.where(swap, y1, y0)
+        bx = np.where(swap, x0, x1)
+        by = np.where(swap, y0, y1)
+        order = np.lexsort((by, bx, ay, ax))
+        sorted_ax = ax[order]
+        sorted_ay = ay[order]
+        sorted_bx = bx[order]
+        sorted_by = by[order]
+        unique_mask = np.empty(order.size, dtype=bool)
+        unique_mask[0] = True
+        unique_mask[1:] = (
+            (sorted_ax[1:] != sorted_ax[:-1])
+            | (sorted_ay[1:] != sorted_ay[:-1])
+            | (sorted_bx[1:] != sorted_bx[:-1])
+            | (sorted_by[1:] != sorted_by[:-1])
+        )
+        return np.sort(order[unique_mask]).astype(np.int64, copy=False)
+
+    if cp is not None:
+        try:
+            from vibespatial.runtime.residency import Residency, TransferTrigger
+
+            lines.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="buffered-line dissolve rewrite needs device-resident line endpoints for duplicate elimination",
+            )
+            state = lines._ensure_device_state()
+            line_buf = state.families[GeometryFamily.LINESTRING]
+            offsets = cp.asarray(line_buf.geometry_offsets)
+            if int(offsets.size) == lines.row_count + 1 and bool(cp.all((offsets[1:] - offsets[:-1]) == 2).item()):
+                coord_starts = offsets[:-1]
+                d_x = cp.asarray(line_buf.x)
+                d_y = cp.asarray(line_buf.y)
+                x0 = d_x[coord_starts]
+                y0 = d_y[coord_starts]
+                x1 = d_x[coord_starts + 1]
+                y1 = d_y[coord_starts + 1]
+
+                swap = (x0 > x1) | ((x0 == x1) & (y0 > y1))
+                ax = cp.where(swap, x1, x0)
+                ay = cp.where(swap, y1, y0)
+                bx = cp.where(swap, x0, x1)
+                by = cp.where(swap, y0, y1)
+                order = cp.lexsort((by, bx, ay, ax)).astype(cp.int64, copy=False)
+                if int(order.size) > 0:
+                    sorted_ax = ax[order]
+                    sorted_ay = ay[order]
+                    sorted_bx = bx[order]
+                    sorted_by = by[order]
+                    unique_mask = cp.empty(order.size, dtype=cp.bool_)
+                    unique_mask[0] = True
+                    if int(order.size) > 1:
+                        unique_mask[1:] = (
+                            (sorted_ax[1:] != sorted_ax[:-1])
+                            | (sorted_ay[1:] != sorted_ay[:-1])
+                            | (sorted_bx[1:] != sorted_bx[:-1])
+                            | (sorted_by[1:] != sorted_by[:-1])
+                        )
+                    unique_rows = cp.sort(order[unique_mask]).astype(cp.int64, copy=False)
+                    return cp.asnumpy(unique_rows)
+        except Exception:
+            pass
+
+    lines._ensure_host_state()
+    line_buf = lines.families[GeometryFamily.LINESTRING]
+    offsets = np.asarray(line_buf.geometry_offsets, dtype=np.int32)
+    if offsets.shape != (lines.row_count + 1,) or not np.all((offsets[1:] - offsets[:-1]) == 2):
+        return None
+
+    coord_starts = offsets[:-1]
+    x = np.asarray(line_buf.x, dtype=np.float64)
+    y = np.asarray(line_buf.y, dtype=np.float64)
+    x0 = x[coord_starts]
+    y0 = y[coord_starts]
+    x1 = x[coord_starts + 1]
+    y1 = y[coord_starts + 1]
+    swap = (x0 > x1) | ((x0 == x1) & (y0 > y1))
+    ax = np.where(swap, x1, x0)
+    ay = np.where(swap, y1, y0)
+    bx = np.where(swap, x0, x1)
+    by = np.where(swap, y0, y1)
+    order = np.lexsort((by, bx, ay, ax))
+    sorted_ax = ax[order]
+    sorted_ay = ay[order]
+    sorted_bx = bx[order]
+    sorted_by = by[order]
+    unique_mask = np.empty(order.size, dtype=bool)
+    unique_mask[0] = True
+    unique_mask[1:] = (
+        (sorted_ax[1:] != sorted_ax[:-1])
+        | (sorted_ay[1:] != sorted_ay[:-1])
+        | (sorted_bx[1:] != sorted_bx[:-1])
+        | (sorted_by[1:] != sorted_by[:-1])
+    )
+    return np.sort(order[unique_mask]).astype(np.int64, copy=False)
+
+
+def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
+    *,
+    normalized_method: DissolveUnionMethod,
+    grid_size: float | None,
+    row_group_codes: np.ndarray | None,
+    group_count: int,
+    tag,
+) -> GroupedUnionResult | None:
+    if (
+        normalized_method is not DissolveUnionMethod.UNARY
+        or grid_size is not None
+        or row_group_codes is None
+        or group_count != 1
+        or not provenance_rewrites_enabled()
+        or cp is None
+    ):
+        return None
+
+    if tag is None or tag.operation != "buffer":
+        return None
+
+    source_types = tag.source_geom_types
+    if not source_types or source_types != frozenset({"linestring"}):
+        return None
+
+    try:
+        distance_value = float(tag.get_param("distance", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if distance_value <= 0.0 or bool(tag.get_param("single_sided", False)):
+        return None
+
+    observed_rows = np.flatnonzero(row_group_codes >= 0).astype(np.int64, copy=False)
+    if observed_rows.size < OVERLAY_UNION_ALL_GPU_THRESHOLD:
+        return None
+
+    source_owned = _provenance_source_owned(tag)
+    if source_owned is None:
+        return None
+    if observed_rows.size != source_owned.row_count:
+        source_owned = source_owned.take(observed_rows)
+
+    from vibespatial.constructive.linestring import (
+        linestring_buffer_owned_array,
+        supports_two_point_linestring_buffer_fast_path,
+    )
+    from vibespatial.constructive.union_all import union_all_gpu_owned
+
+    quad_segs_param = tag.get_param("quad_segs", 16)
+    quad_segs = 16 if quad_segs_param is None else int(quad_segs_param)
+    cap_style_param = tag.get_param("cap_style", "round")
+    join_style_param = tag.get_param("join_style", "round")
+    cap_style = "round" if cap_style_param is None else str(cap_style_param)
+    join_style = "round" if join_style_param is None else str(join_style_param)
+    if not supports_two_point_linestring_buffer_fast_path(
+        source_owned,
+        quad_segs=quad_segs,
+        cap_style=cap_style,
+        join_style=join_style,
+        single_sided=False,
+    ):
+        return None
+
+    unique_rows = _dedupe_two_point_linestring_rows_gpu(source_owned)
+    if unique_rows is None or unique_rows.size == 0 or unique_rows.size >= source_owned.row_count:
+        return None
+    if unique_rows.size > 8:
+        return None
+
+    unique_owned = source_owned.take(unique_rows.astype(np.int64, copy=False))
+    buffered_unique = linestring_buffer_owned_array(
+        unique_owned,
+        distance_value,
+        quad_segs=quad_segs,
+        cap_style=cap_style,
+        join_style=join_style,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    reduced = union_all_gpu_owned(
+        buffered_unique,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    record_rewrite_event(
+        rule_name="R9_dissolve_buffered_two_point_lines_exact_union",
+        surface="geopandas.geodataframe.dissolve",
+        original_operation="dissolve(method=unary)",
+        rewritten_operation="buffer(unique(two_point_lines)).union_all_gpu",
+        reason="single-group buffered two-point lines dissolve rewrites to deduped source-line buffering plus exact GPU union",
+        detail=(
+            f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"buffer_distance={distance_value}, quad_segs={quad_segs}"
+        ),
+    )
+    record_dispatch_event(
+        surface="geopandas.geodataframe.dissolve",
+        operation="dissolve",
+        implementation="buffered_two_point_line_exact_union_gpu",
+        reason="deduped single-group buffered-line dissolve rewrite",
+        detail=(
+            f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"buffer_distance={distance_value}"
+        ),
+        selected=ExecutionMode.GPU,
+    )
+
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=normalized_method,
+        owned=reduced,
+    )
+
+
+def _maybe_execute_buffered_two_point_line_host_disjoint_subset_rewrite(
+    *,
+    normalized_method: DissolveUnionMethod,
+    row_group_codes: np.ndarray | None,
+    group_count: int,
+    tag,
+) -> GroupedUnionResult | None:
+    if (
+        normalized_method is not DissolveUnionMethod.DISJOINT_SUBSET
+        or row_group_codes is None
+        or group_count != 1
+        or not provenance_rewrites_enabled()
+    ):
+        return None
+
+    if tag is None or tag.operation != "buffer":
+        return None
+
+    source_types = tag.source_geom_types
+    if not source_types or source_types != frozenset({"linestring"}):
+        return None
+
+    source_owned = _provenance_source_owned(tag)
+    if source_owned is None:
+        return None
+
+    observed_rows = np.flatnonzero(row_group_codes >= 0).astype(np.int64, copy=False)
+    if observed_rows.size < OVERLAY_UNION_ALL_GPU_THRESHOLD:
+        return None
+    if observed_rows.size != source_owned.row_count:
+        source_owned = source_owned.take(observed_rows)
+
+    unique_rows = _dedupe_two_point_linestring_rows_gpu(source_owned)
+    if unique_rows is None or unique_rows.size == 0 or unique_rows.size >= source_owned.row_count:
+        return None
+
+    quad_segs_param = tag.get_param("quad_segs", 16)
+    quad_segs = 16 if quad_segs_param is None else int(quad_segs_param)
+    cap_style_param = tag.get_param("cap_style", "round")
+    join_style_param = tag.get_param("join_style", "round")
+    cap_style = "round" if cap_style_param is None else str(cap_style_param)
+    join_style = "round" if join_style_param is None else str(join_style_param)
+    distance_value = float(tag.get_param("distance", 0.0))
+    if distance_value <= 0.0 or bool(tag.get_param("single_sided", False)):
+        return None
+
+    source_unique_owned = source_owned.take(unique_rows.astype(np.int64, copy=False))
+    unique_lines = np.asarray(source_unique_owned.to_shapely(), dtype=object)
+    buffered_unique = shapely.buffer(
+        unique_lines,
+        distance_value,
+        quad_segs=quad_segs,
+        cap_style=cap_style,
+        join_style=join_style,
+        single_sided=False,
+    )
+    reduced = shapely.disjoint_subset_union_all(np.asarray(buffered_unique, dtype=object))
+    merged = np.asarray([reduced], dtype=object)
+
+    record_rewrite_event(
+        rule_name="R10_dissolve_buffered_two_point_lines_to_source_disjoint_subset",
+        surface="geopandas.geodataframe.dissolve",
+        original_operation="dissolve(method=disjoint_subset)",
+        rewritten_operation="disjoint_subset_union_all(buffer(unique(two_point_lines)))",
+        reason="single-group buffered two-point lines dissolve rebuilds the exact host disjoint-subset input from deduped source lines",
+        detail=(
+            f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"buffer_distance={distance_value}, quad_segs={quad_segs}"
+        ),
+    )
+    record_dispatch_event(
+        surface="geopandas.geodataframe.dissolve",
+        operation="dissolve",
+        implementation="buffered_two_point_line_source_disjoint_subset",
+        reason="source-aware disjoint-subset rewrite for large duplicated buffered-line groups",
+        detail=(
+            f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"buffer_distance={distance_value}"
+        ),
+        selected=ExecutionMode.CPU,
+    )
+
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=normalized_method,
+    )
+
+
+def _maybe_rewrite_buffered_line_dissolve_method(
+    frame,
+    *,
+    normalized_method: DissolveUnionMethod,
+    grid_size: float | None,
+    row_group_codes: np.ndarray | None,
+    group_positions: list[np.ndarray],
+    group_count: int,
+) -> DissolveUnionMethod:
+    if (
+        normalized_method is not DissolveUnionMethod.UNARY
+        or grid_size is not None
+        or not provenance_rewrites_enabled()
+        or shapely.geos_version < (3, 12, 0)
+    ):
+        return normalized_method
+
+    geometry_values = frame.geometry.values
+    tag = getattr(geometry_values, "_provenance", None)
+    if tag is None or tag.operation != "buffer":
+        return normalized_method
+
+    source_types = tag.source_geom_types
+    if not source_types or not source_types <= frozenset({"linestring", "multilinestring"}):
+        return normalized_method
+
+    distance = tag.get_param("distance", 0.0)
+    try:
+        distance_value = float(distance)
+    except (TypeError, ValueError):
+        return normalized_method
+    if distance_value <= 0.0 or bool(tag.get_param("single_sided", False)):
+        return normalized_method
+
+    max_group_size = _max_group_size(row_group_codes, group_positions, group_count)
+    if max_group_size < OVERLAY_UNION_ALL_GPU_THRESHOLD:
+        return normalized_method
+
+    record_rewrite_event(
+        rule_name="R8_dissolve_buffered_lines_to_disjoint_subset",
+        surface="geopandas.geodataframe.dissolve",
+        original_operation="dissolve(method=unary)",
+        rewritten_operation="dissolve(method=disjoint_subset)",
+        reason="buffered line unary dissolve rewrites to the exact disjoint-subset union engine for large grouped workloads",
+        detail=(
+            f"rows={len(frame)}, groups={group_count}, max_group_size={max_group_size}, "
+            f"buffer_distance={distance_value}"
+        ),
+    )
+    return DissolveUnionMethod.DISJOINT_SUBSET
+
+
+def evaluate_geopandas_dissolve_native(
     frame,
     *,
     by,
@@ -1410,7 +2046,7 @@ def evaluate_geopandas_dissolve(
     method: str,
     grid_size: float | None,
     agg_kwargs: dict[str, Any],
-):
+) -> GroupedConstructiveResult:
     from vibespatial.runtime.execution_trace import execution_trace
 
     with execution_trace("dissolve"):
@@ -1428,7 +2064,31 @@ def evaluate_geopandas_dissolve(
             normalized_method=normalized_method,
             agg_kwargs=agg_kwargs,
         )
-        if row_group_codes is not None:
+        provenance_tag = getattr(frame.geometry.values, "_provenance", None)
+        grouped_union = _maybe_execute_buffered_two_point_line_exact_union_rewrite(
+            normalized_method=normalized_method,
+            grid_size=grid_size,
+            row_group_codes=row_group_codes,
+            group_count=len(aggregated_data.index),
+            tag=provenance_tag,
+        )
+        if grouped_union is None:
+            normalized_method = _maybe_rewrite_buffered_line_dissolve_method(
+                frame,
+                normalized_method=normalized_method,
+                grid_size=grid_size,
+                row_group_codes=row_group_codes,
+                group_positions=group_positions,
+                group_count=len(aggregated_data.index),
+            )
+        if grouped_union is None:
+            grouped_union = _maybe_execute_buffered_two_point_line_host_disjoint_subset_rewrite(
+                normalized_method=normalized_method,
+                row_group_codes=row_group_codes,
+                group_count=len(aggregated_data.index),
+                tag=provenance_tag,
+            )
+        if grouped_union is None and row_group_codes is not None:
             grouped_union = execute_grouped_union_codes(
                 frame.geometry.array,
                 row_group_codes,
@@ -1437,8 +2097,6 @@ def evaluate_geopandas_dissolve(
                 grid_size=grid_size,
                 owned=owned,
             )
-        else:
-            grouped_union = None
         if grouped_union is None:
             if row_group_codes is not None and not group_positions:
                 group_positions = _group_positions_from_codes(
@@ -1452,17 +2110,41 @@ def evaluate_geopandas_dissolve(
                 grid_size=grid_size,
                 owned=owned,
             )
-
-        geometry_frame = type(frame)(
-            {frame.geometry.name: grouped_union.geometries},
-            geometry=frame.geometry.name,
-            index=aggregated_data.index,
-            crs=frame.crs,
+        return _grouped_constructive_result(
+            grouped_union,
+            frame=frame,
+            aggregated_data=aggregated_data,
+            as_index=as_index,
         )
-        aggregated = geometry_frame.join(aggregated_data)
-        if not as_index:
-            aggregated = aggregated.reset_index()
-        return aggregated
+
+
+def evaluate_geopandas_dissolve(
+    frame,
+    *,
+    by,
+    aggfunc,
+    as_index: bool,
+    level,
+    sort: bool,
+    observed: bool,
+    dropna: bool,
+    method: str,
+    grid_size: float | None,
+    agg_kwargs: dict[str, Any],
+):
+    return evaluate_geopandas_dissolve_native(
+        frame,
+        by=by,
+        aggfunc=aggfunc,
+        as_index=as_index,
+        level=level,
+        sort=sort,
+        observed=observed,
+        dropna=dropna,
+        method=method,
+        grid_size=grid_size,
+        agg_kwargs=agg_kwargs,
+    ).to_geodataframe()
 
 
 def evaluate_geopandas_lazy_dissolve(

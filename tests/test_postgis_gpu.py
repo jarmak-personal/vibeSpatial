@@ -15,6 +15,8 @@ VIBESPATIAL_TEST_POSTGIS_URI env var is set) verify:
 from __future__ import annotations
 
 import os
+import sys
+import types
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -23,6 +25,12 @@ import pytest
 from shapely import to_wkb
 from shapely.geometry import LineString, Point, Polygon
 
+from vibespatial.api._native_results import (
+    GeometryNativeResult,
+    NativeAttributeTable,
+    NativeTabularResult,
+)
+from vibespatial.api.io.sql import _try_gpu_write_postgis
 from vibespatial.io.postgis_gpu import (
     _arrow_table_to_geodataframe,
     _get_connection_uri,
@@ -293,6 +301,120 @@ class TestGracefulFallback:
         )
         result = to_postgis_gpu(gdf, "test_table", 42)
         assert result is False
+
+    def test_try_gpu_write_postgis_passes_native_payload(self, monkeypatch) -> None:
+        """Public GPU write handoff should use the shared native payload boundary."""
+        import vibespatial.api as geopandas
+        import vibespatial.io.postgis_gpu as postgis_gpu
+
+        captured = {}
+
+        def _fake_to_postgis_gpu(payload, *args, **kwargs):
+            captured["payload"] = payload
+            return True
+
+        monkeypatch.setattr(postgis_gpu, "to_postgis_gpu", _fake_to_postgis_gpu)
+
+        gdf = geopandas.GeoDataFrame(
+            {"id": [1]},
+            geometry=geopandas.GeoSeries.from_wkt(["POINT (0 0)"], crs="EPSG:4326"),
+        )
+
+        result = _try_gpu_write_postgis(
+            gdf,
+            "test_table",
+            "postgresql://user:pass@host/db",
+        )
+
+        assert result is True
+        assert isinstance(captured["payload"], NativeTabularResult)
+
+    def test_write_accepts_native_payload_without_frame_materialization(
+        self,
+        monkeypatch,
+    ) -> None:
+        """Native payload writes should not require GeoDataFrame export."""
+        import vibespatial.api as geopandas
+
+        gdf = geopandas.GeoDataFrame(
+            {"id": [1, 2]},
+            geometry=geopandas.GeoSeries.from_wkt(
+                ["POINT (0 0)", "POINT (1 1)"],
+                crs="EPSG:4326",
+            ),
+        )
+        payload = NativeTabularResult(
+            attributes=NativeAttributeTable(
+                arrow_table=pa.table({"id": [1, 2]}),
+            ),
+            geometry=GeometryNativeResult.from_geoseries(gdf.geometry),
+            geometry_name="geometry",
+            column_order=("id", "geometry"),
+        )
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("native PostGIS write should not require GeoDataFrame export")
+
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
+        monkeypatch.setattr(NativeAttributeTable, "to_pandas", _fail)
+        monkeypatch.setattr(
+            "vibespatial.io.postgis_gpu._get_connection_uri",
+            lambda _con: "postgresql://user:pass@host/db",
+        )
+
+        captured: dict[str, object] = {}
+
+        class _FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, sql):
+                captured.setdefault("sql", []).append(sql)
+
+            def fetchone(self):
+                return (False,)
+
+            def adbc_ingest(self, name, table, mode="create"):
+                captured["name"] = name
+                captured["table"] = table
+                captured["mode"] = mode
+
+        class _FakeConnection:
+            def __init__(self):
+                self._cursor = _FakeCursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def cursor(self):
+                return self._cursor
+
+            def commit(self):
+                captured["commits"] = int(captured.get("commits", 0)) + 1
+
+        dbapi_module = types.ModuleType("adbc_driver_postgresql.dbapi")
+        dbapi_module.connect = lambda _uri: _FakeConnection()
+        package_module = types.ModuleType("adbc_driver_postgresql")
+        package_module.dbapi = dbapi_module
+        monkeypatch.setitem(sys.modules, "adbc_driver_postgresql", package_module)
+        monkeypatch.setitem(sys.modules, "adbc_driver_postgresql.dbapi", dbapi_module)
+
+        result = to_postgis_gpu(
+            payload,
+            "test_table",
+            "postgresql://user:pass@host/db",
+        )
+
+        assert result is True
+        assert captured["name"] == "test_table"
+        assert captured["mode"] == "create"
+        assert captured["table"].column_names == ["id", "geometry"]
 
     def test_read_returns_none_for_chunked(self) -> None:
         """Chunked reading is not supported; should return None."""

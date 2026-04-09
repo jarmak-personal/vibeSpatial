@@ -63,11 +63,28 @@ WKB_POINT_RECORD_DTYPE = np.dtype(
         "itemsize": 21,
     }
 )
+DEVICE_WKB_LIST_DECODE_MIN_ROWS = 8_000
 
 
 _request_nvrtc_warmup([
     ("wkb-encode", _WKB_ENCODE_KERNEL_SOURCE, _WKB_ENCODE_KERNEL_NAMES),
 ])
+
+
+@dataclass(frozen=True)
+class _GpuWkbDecodeAttempt:
+    result: OwnedGeometryArray | None
+    fallback_detail: str | None = None
+
+
+@dataclass(frozen=True)
+class _NativeDeviceWriteStatus:
+    written: bool
+    fallback_detail: str | None = None
+
+
+class _GpuWkbOnInvalidError(ValueError):
+    """Raised when the GPU WKB decode path must honor on_invalid='raise'."""
 
 
 def has_pyarrow_support() -> bool:
@@ -342,12 +359,11 @@ def _encode_owned_wkb_column_device(owned: OwnedGeometryArray):
 def _device_geoarrow_fast_path_reason_owned(owned: OwnedGeometryArray) -> str | None:
     if owned.row_count == 0:
         return "empty geometry column requires upstream GeoArrow constructor semantics"
-    validity, _tags, _family_row_offsets = _authoritative_host_metadata(owned)
-    if not bool(validity.any()):
-        return "all-missing geometry column requires upstream GeoArrow constructor semantics"
     try:
         _homogeneous_family(owned)
     except ValueError as exc:
+        if str(exc) == "Cannot encode an all-null geometry array to native GeoArrow":
+            return "all-missing geometry column requires upstream GeoArrow constructor semantics"
         return str(exc)
     return None
 
@@ -416,6 +432,14 @@ def _encode_owned_geoarrow_column_device(owned: OwnedGeometryArray):
 
     if family is GeometryFamily.POINT:
         row_count = owned.row_count
+        if null_count == 0 and int(cp.count_nonzero(device_buffer.empty_mask).item()) == 0:
+            family_rows = cp.asarray(state.family_row_offsets).astype(cp.int32, copy=False)
+            coord_indices = device_buffer.geometry_offsets[family_rows]
+            column = _device_point_values_column(
+                device_buffer.x[coord_indices],
+                device_buffer.y[coord_indices],
+            )
+            return column, "point"
         x_full = cp.full(row_count, cp.nan, dtype=cp.float64)
         y_full = cp.full(row_count, cp.nan, dtype=cp.float64)
         valid_mask = state.validity
@@ -521,6 +545,348 @@ def _attribute_column_to_plc(arrow_column, col_name, *, plc):
     return plc.Column.from_arrow(combined)
 
 
+def _native_host_attribute_table_from_pandas(df, non_geometry_columns, *, index, pa):
+    import pandas as pd
+
+    df_attr = pd.DataFrame(
+        {column_name: df[column_name] for column_name in non_geometry_columns},
+        index=df.index,
+        copy=False,
+    )
+    return pa.Table.from_pandas(df_attr, preserve_index=index)
+
+
+def _build_native_host_attribute_table_from_frame(attribute_frame, ordered_columns, *, index, pa):
+    """Build a host Arrow attribute table from a non-geometry frame."""
+    if hasattr(attribute_frame, "to_arrow"):
+        try:
+            return attribute_frame.to_arrow(index=index, columns=ordered_columns)
+        except TypeError:
+            pass
+
+    import pandas as pd
+
+    df_attr = pd.DataFrame(
+        {column_name: attribute_frame[column_name] for column_name in ordered_columns},
+        index=attribute_frame.index,
+        copy=False,
+    )
+    pandas_metadata = pa.Schema.from_pandas(df_attr, preserve_index=index).metadata
+
+    if index not in (None, False):
+        return pa.Table.from_pandas(df_attr, preserve_index=index)
+
+    if not ordered_columns:
+        return pa.table({}).replace_schema_metadata(pandas_metadata)
+
+    arrays = []
+    names = []
+    for column_name in ordered_columns:
+        values = df_attr[column_name].to_numpy(copy=False)
+        if not isinstance(values, np.ndarray) or values.dtype == object:
+            return pa.Table.from_pandas(df_attr, preserve_index=index)
+        try:
+            arrays.append(pa.array(values, from_pandas=True))
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+            return pa.Table.from_pandas(df_attr, preserve_index=index)
+        names.append(column_name)
+    return pa.Table.from_arrays(arrays, names=names).replace_schema_metadata(pandas_metadata)
+
+
+def _build_native_host_attribute_table(df, non_geometry_columns, *, index, pa):
+    """Build the host Arrow table for native device writes.
+
+    Fast path: when there is no explicit index request and all non-geometry
+    columns are plain NumPy-backed, build Arrow columns directly and skip the
+    heavier DataFrame->Arrow conversion path. Fall back to ``from_pandas`` for
+    categoricals, object columns, nullable extension arrays, or index writes.
+    """
+    return _build_native_host_attribute_table_from_frame(
+        df,
+        non_geometry_columns,
+        index=index,
+        pa=pa,
+    )
+
+
+def _write_geoparquet_native_device_payload(
+    attribute_frame,
+    geometry_series,
+    path,
+    *,
+    index,
+    compression,
+    geometry_encoding,
+    schema_version,
+    write_covering_bbox,
+    column_order,
+    frame_attrs=None,
+    **kwargs,
+) -> _NativeDeviceWriteStatus:
+    import base64
+    import json
+    import os
+
+    import pyarrow as pa
+
+    try:
+        import pylibcudf as plc
+    except ModuleNotFoundError:
+        plc = None
+
+    from vibespatial.api.io._geoarrow import (
+        _linestring_type,
+        _multilinestring_type,
+        _multipoint_type,
+        _multipolygon_type,
+        _polygon_type,
+    )
+    from vibespatial.api.io.arrow import _create_geometry_metadata, _encode_metadata
+    from vibespatial.io.geoarrow import _geoarrow_field_metadata
+
+    _RECOGNIZED_KWARGS = {"row_group_size", "max_page_size"}
+    recognized_kwargs = {k: v for k, v in kwargs.items() if k in _RECOGNIZED_KWARGS}
+    unrecognized_kwargs = {k: v for k, v in kwargs.items() if k not in _RECOGNIZED_KWARGS}
+    geometry_name = getattr(geometry_series, "name", None) or "geometry"
+    geometry_array = geometry_series.array
+    owned = getattr(geometry_array, "_owned", None)
+    if owned is None:
+        return _NativeDeviceWriteStatus(written=False)
+    if owned.residency is not Residency.DEVICE or owned.device_state is None:
+        return _NativeDeviceWriteStatus(written=False)
+    if unrecognized_kwargs:
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail=(
+                "native device GeoParquet payload writer does not support "
+                f"kwargs={sorted(unrecognized_kwargs)}"
+            ),
+        )
+    if not _native_parquet_compression_supported(compression):
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail=(
+                "native device GeoParquet payload writer does not support "
+                f"compression={compression!r}"
+            ),
+        )
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail="native device GeoParquet payload writer requires a filesystem path sink",
+        )
+    if plc is None or not has_pylibcudf_support():
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail="pylibcudf support is unavailable for the native device GeoParquet payload writer",
+        )
+
+    non_geometry_columns = [column for column in column_order if column != geometry_name]
+    host_table = _build_native_host_attribute_table_from_frame(
+        attribute_frame,
+        non_geometry_columns,
+        index=index,
+        pa=pa,
+    )
+    ordered_column_names = list(column_order)
+    table_columns = []
+    geometry_encoding_dict = {}
+
+    for column_name in ordered_column_names:
+        if column_name == geometry_name:
+            if geometry_encoding.lower() == "geoarrow":
+                fast_path_reason = _device_geoarrow_fast_path_reason_owned(owned)
+                if fast_path_reason is None:
+                    column, encoding_name = _encode_owned_geoarrow_column_device(owned)
+                    table_columns.append(column)
+                    geometry_encoding_dict[column_name] = encoding_name
+                    continue
+                record_fallback_event(
+                    surface="geopandas.geodataframe.to_parquet",
+                    reason=f"device-side GeoArrow fast path unavailable for column {column_name}; falling back to WKB",
+                    detail=fast_path_reason,
+                    selected=ExecutionMode.CPU,
+                    pipeline="io/to_parquet",
+                    d2h_transfer=True,
+                )
+            table_columns.append(_encode_owned_wkb_column_device(owned))
+            geometry_encoding_dict[column_name] = "WKB"
+        else:
+            table_columns.append(_attribute_column_to_plc(host_table[column_name], column_name, plc=plc))
+
+    bbox_column_names: list[str] = []
+    if write_covering_bbox:
+        try:
+            import cupy as _cp
+        except ModuleNotFoundError:
+            _cp = None
+        if _cp is None:
+            return _NativeDeviceWriteStatus(
+                written=False,
+                fallback_detail="covering bbox export requires CuPy for the native device GeoParquet payload writer",
+            )
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+        bounds = _cp.asarray(compute_geometry_bounds_device(owned))
+        d_xmin = _cp.ascontiguousarray(bounds[:, 0])
+        d_ymin = _cp.ascontiguousarray(bounds[:, 1])
+        d_xmax = _cp.ascontiguousarray(bounds[:, 2])
+        d_ymax = _cp.ascontiguousarray(bounds[:, 3])
+        bbox_children = [
+            plc.Column.from_cuda_array_interface(d_xmin),
+            plc.Column.from_cuda_array_interface(d_ymin),
+            plc.Column.from_cuda_array_interface(d_xmax),
+            plc.Column.from_cuda_array_interface(d_ymax),
+        ]
+        bbox_struct = plc.Column.struct_from_children(bbox_children)
+        table_columns.append(bbox_struct)
+        bbox_column_names = ["bbox"]
+
+    all_column_names = ordered_column_names + bbox_column_names
+    plc_table = plc.Table(table_columns)
+    metadata = plc.io.types.TableInputMetadata(plc_table)
+    for idx, column_name in enumerate(all_column_names):
+        metadata.column_metadata[idx].set_name(column_name)
+        if column_name == geometry_name:
+            if geometry_encoding_dict[column_name] == "WKB":
+                metadata.column_metadata[idx].set_output_as_binary(True)
+            else:
+                _apply_geoarrow_child_metadata(
+                    metadata.column_metadata[idx],
+                    _homogeneous_family(owned),
+                )
+        elif column_name == "bbox":
+            for child_idx, child_name in enumerate(("xmin", "ymin", "xmax", "ymax")):
+                metadata.column_metadata[idx].child(child_idx).set_name(child_name)
+
+    geo_metadata = _create_geometry_metadata(
+        {geometry_name: geometry_series},
+        primary_column=geometry_name,
+        schema_version=schema_version,
+        geometry_encoding=geometry_encoding_dict,
+        write_covering_bbox=write_covering_bbox,
+    )
+    footer_metadata = {
+        (key.decode() if isinstance(key, bytes) else str(key)): (
+            value.decode() if isinstance(value, bytes) else str(value)
+        )
+        for key, value in (host_table.schema.metadata or {}).items()
+    }
+    footer_metadata["geo"] = _encode_metadata(geo_metadata).decode()
+    if frame_attrs:
+        footer_metadata["PANDAS_ATTRS"] = json.dumps(frame_attrs)
+
+    point_type = pa.struct(
+        [
+            pa.field("x", pa.float64(), nullable=False),
+            pa.field("y", pa.float64(), nullable=False),
+        ]
+    )
+
+    def _geometry_field() -> pa.Field:
+        if geometry_encoding_dict[geometry_name] == "WKB":
+            field_metadata = {}
+            if geometry_series.crs is not None:
+                try:
+                    crs_json = geometry_series.crs.to_json_dict()
+                except AttributeError:
+                    crs_json = None
+                if crs_json is not None:
+                    field_metadata[b"ARROW:extension:metadata"] = json.dumps(
+                        {"crs": crs_json}
+                    ).encode()
+            field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
+            if b"ARROW:extension:metadata" not in field_metadata:
+                field_metadata[b"ARROW:extension:metadata"] = b"{}"
+            return pa.field(
+                geometry_name,
+                pa.binary(),
+                nullable=True,
+                metadata=field_metadata,
+            )
+
+        family = _homogeneous_family(owned)
+        if family is GeometryFamily.POINT:
+            field_type = point_type
+        elif family is GeometryFamily.LINESTRING:
+            field_type = _linestring_type(point_type)
+        elif family is GeometryFamily.POLYGON:
+            field_type = _polygon_type(point_type)
+        elif family is GeometryFamily.MULTIPOINT:
+            field_type = _multipoint_type(point_type)
+        elif family is GeometryFamily.MULTILINESTRING:
+            field_type = _multilinestring_type(point_type)
+        elif family is GeometryFamily.MULTIPOLYGON:
+            field_type = _multipolygon_type(point_type)
+        else:  # pragma: no cover
+            raise ValueError(f"Unsupported family for native GeoArrow schema: {family}")
+
+        extension_name = f"geoarrow.{geometry_encoding_dict[geometry_name].lower()}"
+        return pa.field(
+            geometry_name,
+            field_type,
+            nullable=True,
+            metadata=_geoarrow_field_metadata(
+                extension_name=extension_name,
+                crs=geometry_series.crs,
+            ),
+        )
+
+    schema_fields = []
+    host_fields = {field.name: field for field in host_table.schema}
+    for column_name in all_column_names:
+        if column_name == geometry_name:
+            schema_fields.append(_geometry_field())
+        elif column_name == "bbox":
+            schema_fields.append(
+                pa.field(
+                    "bbox",
+                    pa.struct(
+                        [
+                            pa.field("xmin", pa.float64(), nullable=False),
+                            pa.field("ymin", pa.float64(), nullable=False),
+                            pa.field("xmax", pa.float64(), nullable=False),
+                            pa.field("ymax", pa.float64(), nullable=False),
+                        ]
+                    ),
+                    nullable=True,
+                )
+            )
+        else:
+            schema_fields.append(host_fields[column_name])
+
+    schema_metadata = dict(host_table.schema.metadata or {})
+    schema_metadata[b"geo"] = _encode_metadata(geo_metadata)
+    if frame_attrs:
+        schema_metadata[b"PANDAS_ATTRS"] = json.dumps(frame_attrs).encode()
+    arrow_schema = pa.schema(schema_fields, metadata=schema_metadata)
+    footer_metadata["ARROW:schema"] = base64.b64encode(
+        arrow_schema.serialize().to_pybytes()
+    ).decode()
+
+    builder = plc.io.parquet.ParquetWriterOptions.builder(
+        plc.io.types.SinkInfo([str(path)]),
+        plc_table,
+    )
+    builder.metadata(metadata)
+    builder.key_value_metadata([footer_metadata])
+    builder.write_arrow_schema(False)
+    builder.compression(_compression_type_from_name(compression))
+    if "row_group_size" in recognized_kwargs:
+        builder.row_group_size_rows(int(recognized_kwargs["row_group_size"]))
+    if "max_page_size" in recognized_kwargs:
+        builder.max_page_size_bytes(int(recognized_kwargs["max_page_size"]))
+    plc.io.parquet.write_parquet(builder.build())
+    record_dispatch_event(
+        surface="vibespatial.io.geoparquet",
+        operation="to_parquet",
+        implementation="pylibcudf_device_parquet_writer",
+        reason="device-side GeoParquet write via pylibcudf",
+        selected=ExecutionMode.GPU,
+    )
+    return _NativeDeviceWriteStatus(written=True)
+
+
 def _write_geoparquet_native_device(
     df,
     path,
@@ -532,18 +898,17 @@ def _write_geoparquet_native_device(
     write_covering_bbox,
     geometry_columns,
     **kwargs,
-) -> bool:
+) -> _NativeDeviceWriteStatus:
     import base64
     import json
     import os
 
-    import pandas as pd
     import pyarrow as pa
 
     try:
         import pylibcudf as plc
     except ModuleNotFoundError:
-        return False
+        plc = None
 
     from vibespatial.api.io._geoarrow import (
         _linestring_type,
@@ -559,45 +924,60 @@ def _write_geoparquet_native_device(
     _RECOGNIZED_KWARGS = {"row_group_size", "max_page_size"}
     recognized_kwargs = {k: v for k, v in kwargs.items() if k in _RECOGNIZED_KWARGS}
     unrecognized_kwargs = {k: v for k, v in kwargs.items() if k not in _RECOGNIZED_KWARGS}
-    if unrecognized_kwargs:
-        return False
-    if not _native_parquet_compression_supported(compression):
-        record_fallback_event(
-            surface="geopandas.geodataframe.to_parquet",
-            reason="device-side parquet writer does not support the requested compression codec",
-            detail=f"compression={compression!r}",
-            selected=ExecutionMode.CPU,
-            pipeline="io/to_parquet",
-            d2h_transfer=False,
-        )
-        return False
-    if not isinstance(path, (str, bytes, os.PathLike)):
-        return False
-
     geometry_columns = list(geometry_columns)
     geometry_arrays = [df[col].array for col in geometry_columns]
     if not geometry_arrays or not all(isinstance(arr, DeviceGeometryArray) for arr in geometry_arrays):
-        return False
+        return _NativeDeviceWriteStatus(written=False)
 
     owned_by_name = {col: df[col].array.to_owned() for col in geometry_columns}
     if not all(owned.residency is Residency.DEVICE and owned.device_state is not None for owned in owned_by_name.values()):
-        return False
-    if not has_pylibcudf_support():
-        return False
+        return _NativeDeviceWriteStatus(written=False)
+    if unrecognized_kwargs:
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail=(
+                "native device GeoParquet writer does not support "
+                f"kwargs={sorted(unrecognized_kwargs)}"
+            ),
+        )
+    if not _native_parquet_compression_supported(compression):
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail=(
+                "native device GeoParquet writer does not support "
+                f"compression={compression!r}"
+            ),
+        )
+    if not isinstance(path, (str, bytes, os.PathLike)):
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail="native device GeoParquet writer requires a filesystem path sink",
+        )
+    if plc is None or not has_pylibcudf_support():
+        return _NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail="pylibcudf support is unavailable for the native device GeoParquet writer",
+        )
 
     geometry_columns_set = set(geometry_columns)
-    df_attr = pd.DataFrame(
-        {
-            col: (None if col in geometry_columns_set else df[col])
-            for col in df.columns
-        },
-        index=df.index,
+    non_geometry_columns = [
+        column_name for column_name in df.columns
+        if column_name not in geometry_columns_set
+    ]
+    host_table = _build_native_host_attribute_table(
+        df,
+        non_geometry_columns,
+        index=index,
+        pa=pa,
     )
-    host_table = pa.Table.from_pandas(df_attr, preserve_index=index)
+    ordered_column_names = list(df.columns)
+    for column_name in host_table.column_names:
+        if column_name not in ordered_column_names:
+            ordered_column_names.append(column_name)
     table_columns = []
     geometry_encoding_dict = {}
 
-    for column_name in host_table.column_names:
+    for column_name in ordered_column_names:
         if column_name in geometry_columns_set:
             owned = owned_by_name[column_name]
             if geometry_encoding.lower() == "geoarrow":
@@ -631,20 +1011,19 @@ def _write_geoparquet_native_device(
         if _cp is None:
             # cupy unavailable -- fall back to host path so the bbox column
             # and covering metadata stay consistent.
-            return False
-        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+            return _NativeDeviceWriteStatus(
+                written=False,
+                fallback_detail="covering bbox export requires CuPy for the native device GeoParquet writer",
+            )
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
         # Use the primary geometry column (first) for the covering bbox.
         primary_owned = owned_by_name[geometry_columns[0]]
-        bounds = compute_geometry_bounds(
-            primary_owned,
-            dispatch_mode=ExecutionMode.GPU,
-        )
-        # bounds is (N, 4) float64 numpy: [xmin, ymin, xmax, ymax]
-        d_xmin = _cp.asarray(np.ascontiguousarray(bounds[:, 0]))
-        d_ymin = _cp.asarray(np.ascontiguousarray(bounds[:, 1]))
-        d_xmax = _cp.asarray(np.ascontiguousarray(bounds[:, 2]))
-        d_ymax = _cp.asarray(np.ascontiguousarray(bounds[:, 3]))
+        bounds = _cp.asarray(compute_geometry_bounds_device(primary_owned))
+        d_xmin = _cp.ascontiguousarray(bounds[:, 0])
+        d_ymin = _cp.ascontiguousarray(bounds[:, 1])
+        d_xmax = _cp.ascontiguousarray(bounds[:, 2])
+        d_ymax = _cp.ascontiguousarray(bounds[:, 3])
         bbox_children = [
             plc.Column.from_cuda_array_interface(d_xmin),
             plc.Column.from_cuda_array_interface(d_ymin),
@@ -655,7 +1034,7 @@ def _write_geoparquet_native_device(
         table_columns.append(bbox_struct)
         bbox_column_names = ["bbox"]
 
-    all_column_names = list(host_table.column_names) + bbox_column_names
+    all_column_names = ordered_column_names + bbox_column_names
     plc_table = plc.Table(table_columns)
     metadata = plc.io.types.TableInputMetadata(plc_table)
     for idx, column_name in enumerate(all_column_names):
@@ -798,7 +1177,7 @@ def _write_geoparquet_native_device(
         reason="device-side GeoParquet write via pylibcudf",
         selected=ExecutionMode.GPU,
     )
-    return True
+    return _NativeDeviceWriteStatus(written=True)
 
 @dataclass(frozen=True)
 class WKBBridgePlan:
@@ -898,6 +1277,61 @@ def _normalize_wkb_value(value: bytes | str | None) -> bytes | None:
     if isinstance(value, str):
         return bytes.fromhex(value)
     return value
+
+
+def _prepare_native_wkb_list_for_device(
+    values: list[bytes | str | None] | tuple[bytes | str | None, ...],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    row_count = len(values)
+    lengths = np.empty(row_count, dtype=np.int32)
+    payload_parts: list[bytes] = []
+
+    for row_index, value in enumerate(values):
+        normalized = _normalize_wkb_value(value)
+        if normalized is None:
+            lengths[row_index] = 0
+            continue
+        family, reason = _scan_wkb_value(normalized)
+        if reason is not None or family is None:
+            return None
+        lengths[row_index] = len(normalized)
+        payload_parts.append(normalized)
+
+    offsets = np.empty(row_count + 1, dtype=np.int32)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    payload_size = int(offsets[-1])
+    if payload_size == 0:
+        payload = np.empty(0, dtype=np.uint8)
+    else:
+        payload = np.frombuffer(
+            b"".join(payload_parts),
+            dtype=np.uint8,
+        )
+    return offsets, payload
+
+
+def _non_null_wkb_input_mask(
+    values: list[bytes | str | None] | tuple[bytes | str | None, ...],
+) -> np.ndarray:
+    return np.asarray(
+        [_normalize_wkb_value(value) is not None for value in values],
+        dtype=bool,
+    )
+
+
+def _raise_on_invalid_gpu_wkb_decode(
+    result: OwnedGeometryArray,
+    non_null_mask: np.ndarray,
+) -> None:
+    validity, _tags, _family_row_offsets = _authoritative_host_metadata(result)
+    invalid_rows = np.flatnonzero(non_null_mask & ~np.asarray(validity, dtype=bool))
+    if invalid_rows.size == 0:
+        return
+    first_row = int(invalid_rows[0])
+    raise _GpuWkbOnInvalidError(
+        f"Invalid WKB geometry encountered during GPU decode at row {first_row}"
+    )
 
 
 def _scan_wkb_value(value: bytes) -> tuple[GeometryFamily | None, str | None]:
@@ -2041,19 +2475,29 @@ def decode_wkb_owned(
     *,
     on_invalid: str = "raise",
 ) -> OwnedGeometryArray:
-    # Try GPU-accelerated decode first: convert list[bytes] to PyArrow binary
-    # array (single bulk allocation) and use the existing device WKB pipeline.
-    # This eliminates the per-geometry Python parsing loop that dominates cost.
-    gpu_result = _try_gpu_wkb_list_decode(values)
-    if gpu_result is not None:
+    # Try the GPU-first staged device pipeline before falling back to the
+    # host-side bridge. Large native list[bytes] inputs stage directly into
+    # contiguous payload/offset buffers to avoid the extra Arrow/pylibcudf
+    # bridge overhead on this public decode surface.
+    gpu_attempt = _try_gpu_wkb_list_decode(values, on_invalid=on_invalid)
+    if gpu_attempt.result is not None:
         record_dispatch_event(
             surface="vibespatial.io.wkb",
             operation="decode",
             implementation="device_wkb_decode",
-            reason="GPU WKB decode via pylibcudf device pipeline (list[bytes] input)",
+            reason="GPU WKB decode via the staged device pipeline (list[bytes] input)",
             selected=ExecutionMode.GPU,
         )
-        return gpu_result
+        return gpu_attempt.result
+    if gpu_attempt.fallback_detail is not None:
+        record_fallback_event(
+            surface="vibespatial.io.wkb",
+            reason="explicit CPU fallback after staged GPU WKB decode could not complete",
+            detail=gpu_attempt.fallback_detail,
+            selected=ExecutionMode.CPU,
+            pipeline="io/wkb_decode",
+            d2h_transfer=True,
+        )
 
     # Fall through to host-side staged decode.
     plan = plan_wkb_bridge(IOOperation.DECODE)
@@ -2078,26 +2522,52 @@ def decode_wkb_owned(
 
 def _try_gpu_wkb_list_decode(
     values: list[bytes | str | None] | tuple[bytes | str | None, ...],
-) -> OwnedGeometryArray | None:
-    """Convert list[bytes] to PyArrow binary array and use GPU WKB decode pipeline.
+    *,
+    on_invalid: str = "raise",
+) -> _GpuWkbDecodeAttempt:
+    """Attempt GPU WKB decode of list[bytes] input.
 
-    This avoids the per-geometry Python parsing loop in _decode_native_wkb by
-    doing a single bulk H2D transfer via PyArrow -> pylibcudf -> device decode.
+    Large native lists stage directly into contiguous payload/offset buffers and
+    feed the device decode kernels without first materializing a pyarrow /
+    pylibcudf bridge. The older bridge remains as a fallback for cases where the
+    direct staged path cannot run.
     """
     from vibespatial.runtime import ExecutionMode, get_requested_mode
 
     if get_requested_mode() is ExecutionMode.CPU:
-        return None
+        return _GpuWkbDecodeAttempt(result=None)
     try:
         runtime = get_cuda_runtime()
         if not runtime.available():
-            return None
+            return _GpuWkbDecodeAttempt(result=None)
     except Exception:
-        return None
+        return _GpuWkbDecodeAttempt(result=None)
 
-    # Not worth GPU overhead for tiny arrays.
-    if len(values) < 500:
-        return None
+    # Avoid GPU staging for small WKB batches where host decode is cheaper.
+    if len(values) < DEVICE_WKB_LIST_DECODE_MIN_ROWS:
+        return _GpuWkbDecodeAttempt(result=None)
+
+    staged_records = _prepare_native_wkb_list_for_device(values)
+    if staged_records is None:
+        return _GpuWkbDecodeAttempt(result=None)
+
+    non_null_mask = _non_null_wkb_input_mask(values)
+    staged_error: str | None = None
+
+    try:
+        from vibespatial.kernels.core.wkb_decode import decode_wkb_device_pipeline
+
+        offsets_host, payload_host = staged_records
+        payload_device = runtime.from_host(payload_host)
+        offsets_device = runtime.from_host(offsets_host)
+        result = decode_wkb_device_pipeline(payload_device, offsets_device, len(values))
+        if on_invalid == "raise":
+            _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
+        return _GpuWkbDecodeAttempt(result=result)
+    except _GpuWkbOnInvalidError:
+        raise
+    except Exception as exc:
+        staged_error = f"staged device decode failed: {type(exc).__name__}: {exc}"
 
     try:
         import pyarrow as pa
@@ -2105,10 +2575,7 @@ def _try_gpu_wkb_list_decode(
 
         from .pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
 
-        # Normalize hex strings to bytes before creating the Arrow array.
-        normalized: list[bytes | None] = [
-            _normalize_wkb_value(v) for v in values
-        ]
+        normalized: list[bytes | None] = [_normalize_wkb_value(v) for v in values]
 
         # Single bulk allocation: list[bytes|None] -> pa.BinaryArray.
         arrow_array = pa.array(normalized, type=pa.binary())
@@ -2122,17 +2589,45 @@ def _try_gpu_wkb_list_decode(
         )
 
         plc_column = plc.Column.from_arrow(arrow_str)
-        return _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
-    except (ImportError, NotImplementedError):
-        return None
-    except Exception:
-        return None
+        result = _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
+        if on_invalid == "raise":
+            _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
+        return _GpuWkbDecodeAttempt(result=result)
+    except _GpuWkbOnInvalidError:
+        raise
+    except (ImportError, NotImplementedError) as exc:
+        detail = staged_error or "staged device decode did not produce a result"
+        return _GpuWkbDecodeAttempt(
+            result=None,
+            fallback_detail=(
+                f"{detail}; pylibcudf WKB decode bridge unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+    except Exception as exc:
+        detail = staged_error or "staged device decode did not produce a result"
+        return _GpuWkbDecodeAttempt(
+            result=None,
+            fallback_detail=(
+                f"{detail}; pylibcudf WKB decode bridge failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
 
 
 def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGeometryArray:
-    gpu_result = _try_gpu_wkb_arrow_decode(array)
-    if gpu_result is not None:
-        return gpu_result
+    gpu_attempt = _try_gpu_wkb_arrow_decode(array, on_invalid=on_invalid)
+    if gpu_attempt.result is not None:
+        return gpu_attempt.result
+    if gpu_attempt.fallback_detail is not None:
+        record_fallback_event(
+            surface="vibespatial.io.wkb",
+            reason="explicit CPU fallback after GPU Arrow WKB decode could not complete",
+            detail=gpu_attempt.fallback_detail,
+            selected=ExecutionMode.CPU,
+            pipeline="io/wkb_decode",
+            d2h_transfer=True,
+        )
     point_fast = _decode_arrow_wkb_point_fast(array)
     if point_fast is not None:
         return point_fast
@@ -2155,15 +2650,20 @@ def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGe
     return decode_wkb_owned(list(values), on_invalid=on_invalid)
 
 
-def _try_gpu_wkb_arrow_decode(array) -> OwnedGeometryArray | None:
+def _try_gpu_wkb_arrow_decode(
+    array,
+    *,
+    on_invalid: str = "raise",
+) -> _GpuWkbDecodeAttempt:
     """Attempt GPU WKB decode of a PyArrow binary/large_binary array via pylibcudf."""
     from vibespatial.runtime import ExecutionMode, get_requested_mode
 
     if get_requested_mode() is ExecutionMode.CPU:
-        return None
+        return _GpuWkbDecodeAttempt(result=None)
     runtime = get_cuda_runtime()
     if not runtime.available():
-        return None
+        return _GpuWkbDecodeAttempt(result=None)
+    non_null_mask = np.asarray(array.is_valid().to_numpy(zero_copy_only=False), dtype=bool)
     try:
         import pyarrow as pa
         import pylibcudf as plc
@@ -2180,11 +2680,28 @@ def _try_gpu_wkb_arrow_decode(array) -> OwnedGeometryArray | None:
             )
 
         plc_column = plc.Column.from_arrow(array)
-        return _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
-    except (ImportError, NotImplementedError):
-        return None
-    except Exception:
-        return None
+        result = _decode_pylibcudf_wkb_general_column_to_owned(plc_column)
+        if on_invalid == "raise":
+            _raise_on_invalid_gpu_wkb_decode(result, non_null_mask)
+        return _GpuWkbDecodeAttempt(result=result)
+    except _GpuWkbOnInvalidError:
+        raise
+    except (ImportError, NotImplementedError) as exc:
+        return _GpuWkbDecodeAttempt(
+            result=None,
+            fallback_detail=(
+                "GPU Arrow WKB decode bridge unavailable: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+    except Exception as exc:
+        return _GpuWkbDecodeAttempt(
+            result=None,
+            fallback_detail=(
+                "GPU Arrow WKB decode bridge failed: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
 
 
 def _try_gpu_wkb_encode(
@@ -2317,6 +2834,25 @@ def encode_wkb_owned(
     return values
 
 def _homogeneous_family(array: OwnedGeometryArray):
+    if array.device_state is not None:
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+            cp = None
+    else:
+        cp = None
+    if cp is not None:
+        state = array._ensure_device_state()
+        validity = cp.asarray(state.validity)
+        valid_count = int(cp.count_nonzero(validity).item())
+        if valid_count == 0:
+            raise ValueError("Cannot encode an all-null geometry array to native GeoArrow")
+        valid_tags = cp.asarray(state.tags)[validity]
+        min_tag = int(valid_tags.min().item())
+        max_tag = int(valid_tags.max().item())
+        if min_tag != max_tag:
+            raise ValueError("Native GeoArrow fast path requires a homogeneous geometry family")
+        return TAG_FAMILIES[min_tag]
     validity, tags, _family_row_offsets = _authoritative_host_metadata(array)
     valid_tags = tags[validity]
     if valid_tags.size == 0:

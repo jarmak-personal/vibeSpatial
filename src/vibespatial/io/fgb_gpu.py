@@ -664,6 +664,7 @@ def _decode_complex_gpu(
     Returns (d_x, d_y, d_geom_offsets, d_ring_offsets, d_part_offsets).
     d_ring_offsets and d_part_offsets may be None for LineString.
     """
+    from vibespatial.cuda._runtime import count_scatter_totals
     from vibespatial.cuda.cccl_primitives import exclusive_sum
 
     runtime = get_cuda_runtime()
@@ -707,11 +708,19 @@ def _decode_complex_gpu(
     d_ring_offsets_prefix = exclusive_sum(d_ring_counts, synchronize=False)
     d_part_offsets_prefix = exclusive_sum(d_part_counts, synchronize=False)
 
-    # Get totals (last element + last count)
-    runtime.synchronize()
-    total_coords = int(d_coord_offsets[-1].get()) + int(d_coord_counts[-1].get())
-    total_rings = int(d_ring_offsets_prefix[-1].get()) + int(d_ring_counts[-1].get())
-    total_parts = int(d_part_offsets_prefix[-1].get()) + int(d_part_counts[-1].get())
+    if n_features > 0:
+        total_coords, total_rings, total_parts = count_scatter_totals(
+            runtime,
+            [
+                (d_coord_counts, d_coord_offsets),
+                (d_ring_counts, d_ring_offsets_prefix),
+                (d_part_counts, d_part_offsets_prefix),
+            ],
+        )
+    else:
+        total_coords = 0
+        total_rings = 0
+        total_parts = 0
 
     if total_coords == 0:
         d_x = cp.empty(0, dtype=cp.float64)

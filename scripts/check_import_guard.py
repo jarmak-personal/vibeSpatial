@@ -46,6 +46,7 @@ _EXEMPT_DIRS = {"api", "testing", "bench", "_vendor"}
 _SHAPELY_ALLOWLIST: dict[str, str] = {
     # geometry/ — host↔device serialization boundary
     "geometry/device_array.py": "Pandas ExtensionArray: shapely for materialization, type checks",
+    "geometry/host_bridge.py": "Explicit host materialization boundary from device-owned geometry",
     "geometry/owned.py": "WKB serialization, from_shapely_geometries construction",
     "geometry/equality.py": "Geometry comparison via shapely normalization",
     # overlay/ — tracked fallback paths (shrink over time)

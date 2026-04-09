@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import weakref
 from time import perf_counter
 
 try:
@@ -83,6 +84,12 @@ if cp is not None:
     request_warmup(["select_i32", "select_i64"])
 
 _POINT_IN_POLYGON_KERNEL_SOURCE = _format_pip_kernel_source("double")
+
+
+def _current_cuda_stream():
+    if cp is None:
+        return None
+    return cp.cuda.get_current_stream()
 
 
 
@@ -176,7 +183,35 @@ def _scatter_bin_results(
         ),
     )
     grid, block = runtime.launch_config(kernel, bin_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
+
+
+def _free_device_buffers(runtime, buffers) -> None:
+    for buffer in buffers:
+        runtime.free(buffer)
+
+
+_DEVICE_RESULT_KEEPALIVES: dict[int, tuple[object, ...]] = {}
+
+
+def _release_device_result_keepalive(key: int) -> None:
+    _DEVICE_RESULT_KEEPALIVES.pop(key, None)
+
+
+def _wrap_device_result_with_keepalive(device_array, *buffers):
+    keepalive = tuple(buffer for buffer in buffers if buffer is not None)
+    if not keepalive:
+        return device_array
+    key = id(device_array)
+    _DEVICE_RESULT_KEEPALIVES[key] = keepalive
+    weakref.finalize(device_array, _release_device_result_keepalive, key)
+    return device_array
 
 
 def _binned_polygon_dispatch(
@@ -219,18 +254,24 @@ def _binned_polygon_dispatch(
         work_estimates.mean(), work_estimates.std(),
     )
 
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (d_work >= lo) & (d_work < hi)
-        bin_count = int(mask.sum())
-        if bin_count == 0:
-            continue
+    pending_free = []
+    try:
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+            mask = (d_work >= lo) & (d_work < hi)
+            bin_count = int(mask.sum())
+            if bin_count == 0:
+                continue
 
-        # Device-side binning: no D->H or H->D transfers.
-        device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
-        device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
-        device_bin_out = runtime.allocate((bin_count,), cp.uint8)
+            # Keep per-bin arrays alive until the caller hits a real
+            # synchronization boundary. Scatter reads these buffers on the
+            # same stream, so freeing them eagerly forces avoidable syncs.
+            device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
+            device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
+            device_bin_out = runtime.allocate((bin_count,), cp.uint8)
+            pending_free.extend(
+                (device_bin_candidates, device_bin_indices, device_bin_out)
+            )
 
-        try:
             use_block_per_pair = lo >= _PIP_WORK_BINS[-1]
 
             if use_block_per_pair:
@@ -263,7 +304,13 @@ def _binned_polygon_dispatch(
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
-                runtime.launch(kernel, grid=grid, block=block, params=params)
+                runtime.launch(
+                    kernel,
+                    grid=grid,
+                    block=block,
+                    params=params,
+                    stream=_current_cuda_stream(),
+                )
             else:
                 kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_polygon_compacted_tagged"]
                 params = (
@@ -294,19 +341,24 @@ def _binned_polygon_dispatch(
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
-                runtime.launch(kernel, grid=grid, block=block, params=params)
+                runtime.launch(
+                    kernel,
+                    grid=grid,
+                    block=block,
+                    params=params,
+                    stream=_current_cuda_stream(),
+                )
 
             _scatter_bin_results(
                 device_bin_indices, device_bin_out, device_out, bin_count,
                 compute_type=compute_type, center_x=center_x, center_y=center_y,
             )
-
-        finally:
-            runtime.free(device_bin_candidates)
-            runtime.free(device_bin_indices)
-            runtime.free(device_bin_out)
-
-    return device_out
+        return device_out, pending_free
+    except Exception:
+        runtime.synchronize()
+        _free_device_buffers(runtime, pending_free)
+        runtime.free(device_out)
+        raise
 
 
 def _binned_multipolygon_dispatch(
@@ -342,18 +394,24 @@ def _binned_multipolygon_dispatch(
         candidate_count, work_estimates.min(), work_estimates.max(),
     )
 
-    for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
-        mask = (d_work >= lo) & (d_work < hi)
-        bin_count = int(mask.sum())
-        if bin_count == 0:
-            continue
+    pending_free = []
+    try:
+        for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
+            mask = (d_work >= lo) & (d_work < hi)
+            bin_count = int(mask.sum())
+            if bin_count == 0:
+                continue
 
-        # Device-side binning: no D->H or H->D transfers.
-        device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
-        device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
-        device_bin_out = runtime.allocate((bin_count,), cp.uint8)
+            # Keep per-bin arrays alive until the caller hits a real
+            # synchronization boundary. Scatter reads these buffers on the
+            # same stream, so freeing them eagerly forces avoidable syncs.
+            device_bin_indices = _cp.flatnonzero(mask).astype(_cp.int32)
+            device_bin_candidates = candidate_rows_device[device_bin_indices].astype(_cp.int32)
+            device_bin_out = runtime.allocate((bin_count,), cp.uint8)
+            pending_free.extend(
+                (device_bin_candidates, device_bin_indices, device_bin_out)
+            )
 
-        try:
             use_block_per_pair = lo >= _PIP_WORK_BINS[-1]
 
             if use_block_per_pair:
@@ -387,7 +445,13 @@ def _binned_multipolygon_dispatch(
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
-                runtime.launch(kernel, grid=grid, block=block, params=params)
+                runtime.launch(
+                    kernel,
+                    grid=grid,
+                    block=block,
+                    params=params,
+                    stream=_current_cuda_stream(),
+                )
             else:
                 kernel = _point_in_polygon_kernels(compute_type)["point_in_polygon_multipolygon_compacted_tagged"]
                 params = (
@@ -419,19 +483,24 @@ def _binned_multipolygon_dispatch(
                     ),
                 )
                 grid, block = runtime.launch_config(kernel, bin_count)
-                runtime.launch(kernel, grid=grid, block=block, params=params)
+                runtime.launch(
+                    kernel,
+                    grid=grid,
+                    block=block,
+                    params=params,
+                    stream=_current_cuda_stream(),
+                )
 
             _scatter_bin_results(
                 device_bin_indices, device_bin_out, device_out, bin_count,
                 compute_type=compute_type, center_x=center_x, center_y=center_y,
             )
-
-        finally:
-            runtime.free(device_bin_candidates)
-            runtime.free(device_bin_indices)
-            runtime.free(device_bin_out)
-
-    return device_out
+        return device_out, pending_free
+    except Exception:
+        runtime.synchronize()
+        _free_device_buffers(runtime, pending_free)
+        runtime.free(device_out)
+        raise
 
 
 def _compute_work_estimates_for_candidates(
@@ -439,6 +508,65 @@ def _compute_work_estimates_for_candidates(
     right_array: OwnedGeometryArray,
 ):
     return _compute_work_estimates_for_candidates_host(candidate_rows_host, right_array)
+
+
+def _compute_work_estimates_for_candidates_device(
+    candidate_rows_device,
+    right_array: OwnedGeometryArray,
+):
+    """Compute per-candidate polygon work estimates fully on device."""
+    right_state = right_array._ensure_device_state()
+    d_candidate_rows = cp.asarray(candidate_rows_device, dtype=cp.int32)
+    d_tags = cp.asarray(right_state.tags)[d_candidate_rows]
+    d_family_row_offsets = cp.asarray(right_state.family_row_offsets)[d_candidate_rows]
+    d_work = cp.zeros(d_candidate_rows.size, dtype=cp.int32)
+
+    if GeometryFamily.POLYGON in right_state.families:
+        poly_indices = cp.flatnonzero(
+            d_tags == FAMILY_TAGS[GeometryFamily.POLYGON]
+        ).astype(cp.int32, copy=False)
+        if poly_indices.size > 0:
+            poly_family_rows = d_family_row_offsets[poly_indices]
+            poly_valid = poly_family_rows >= 0
+            poly_valid_indices = poly_indices[poly_valid]
+            poly_family_rows = poly_family_rows[poly_valid].astype(cp.int32, copy=False)
+            if poly_family_rows.size > 0:
+                poly_buf = right_state.families[GeometryFamily.POLYGON]
+                d_geometry_offsets = cp.asarray(poly_buf.geometry_offsets)
+                d_ring_offsets = cp.asarray(poly_buf.ring_offsets)
+                ring_start = d_geometry_offsets[poly_family_rows]
+                ring_end = d_geometry_offsets[poly_family_rows + 1]
+                coord_start = d_ring_offsets[ring_start]
+                coord_end = d_ring_offsets[ring_end]
+                d_work[poly_valid_indices] = (coord_end - coord_start).astype(
+                    cp.int32, copy=False,
+                )
+
+    if GeometryFamily.MULTIPOLYGON in right_state.families:
+        mp_indices = cp.flatnonzero(
+            d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+        ).astype(cp.int32, copy=False)
+        if mp_indices.size > 0:
+            mp_family_rows = d_family_row_offsets[mp_indices]
+            mp_valid = mp_family_rows >= 0
+            mp_valid_indices = mp_indices[mp_valid]
+            mp_family_rows = mp_family_rows[mp_valid].astype(cp.int32, copy=False)
+            if mp_family_rows.size > 0:
+                mp_buf = right_state.families[GeometryFamily.MULTIPOLYGON]
+                d_geometry_offsets = cp.asarray(mp_buf.geometry_offsets)
+                d_part_offsets = cp.asarray(mp_buf.part_offsets)
+                d_ring_offsets = cp.asarray(mp_buf.ring_offsets)
+                poly_start = d_geometry_offsets[mp_family_rows]
+                poly_end = d_geometry_offsets[mp_family_rows + 1]
+                ring_start = d_part_offsets[poly_start]
+                ring_end = d_part_offsets[poly_end]
+                coord_start = d_ring_offsets[ring_start]
+                coord_end = d_ring_offsets[ring_end]
+                d_work[mp_valid_indices] = (coord_end - coord_start).astype(
+                    cp.int32, copy=False,
+                )
+
+    return d_work
 
 
 
@@ -489,14 +617,15 @@ def _launch_polygon_dense(
     compute_type: str = "double",
     center_x: float = 0.0,
     center_y: float = 0.0,
-) -> None:
-    """Launch dense polygon PIP kernel writing into caller-owned *device_out*."""
+) -> tuple[object, object]:
+    """Launch dense polygon PIP kernel and return temporary buffers to keep alive."""
     runtime = get_cuda_runtime()
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     polygon_buffer = right_state.families[GeometryFamily.POLYGON]
     n = left.row_count
+    stream = _current_cuda_stream()
     device_mask = runtime.allocate((n,), cp.uint8, zero=True)
     device_indices = runtime.from_host(candidate_indices.astype("int32", copy=False))
     device_mask[device_indices] = cp.uint8(1)
@@ -539,11 +668,19 @@ def _launch_polygon_dense(
             ),
         )
         grid, block = runtime.launch_config(kernel, left.row_count)
-        runtime.launch(kernel, grid=grid, block=block, params=params)
+        runtime.launch(
+            kernel,
+            grid=grid,
+            block=block,
+            params=params,
+            stream=stream,
+        )
+        return device_indices, device_mask
+    except Exception:
         runtime.synchronize()
-    finally:
         runtime.free(device_indices)
         runtime.free(device_mask)
+        raise
 
 
 def _launch_polygon_compacted(
@@ -603,8 +740,13 @@ def _launch_polygon_compacted(
         ),
     )
     grid, block = runtime.launch_config(kernel, candidate_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
-    runtime.synchronize()
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
     return device_out
 
 
@@ -616,14 +758,15 @@ def _launch_multipolygon_dense(
     compute_type: str = "double",
     center_x: float = 0.0,
     center_y: float = 0.0,
-) -> None:
-    """Launch dense multipolygon PIP kernel writing into caller-owned *device_out*."""
+) -> tuple[object, object]:
+    """Launch dense multipolygon PIP kernel and return temporary buffers to keep alive."""
     runtime = get_cuda_runtime()
     left_state = left._ensure_device_state()
     right_state = right._ensure_device_state()
     point_buffer = left_state.families[GeometryFamily.POINT]
     multipolygon_buffer = right_state.families[GeometryFamily.MULTIPOLYGON]
     n = left.row_count
+    stream = _current_cuda_stream()
     device_mask = runtime.allocate((n,), cp.uint8, zero=True)
     device_indices = runtime.from_host(candidate_indices.astype("int32", copy=False))
     device_mask[device_indices] = cp.uint8(1)
@@ -668,11 +811,19 @@ def _launch_multipolygon_dense(
             ),
         )
         grid, block = runtime.launch_config(kernel, left.row_count)
-        runtime.launch(kernel, grid=grid, block=block, params=params)
+        runtime.launch(
+            kernel,
+            grid=grid,
+            block=block,
+            params=params,
+            stream=stream,
+        )
+        return device_indices, device_mask
+    except Exception:
         runtime.synchronize()
-    finally:
         runtime.free(device_indices)
         runtime.free(device_mask)
+        raise
 
 
 def _launch_multipolygon_compacted(
@@ -734,8 +885,13 @@ def _launch_multipolygon_compacted(
         ),
     )
     grid, block = runtime.launch_config(kernel, candidate_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
-    runtime.synchronize()
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
     return device_out
 
 
@@ -769,7 +925,13 @@ def _scatter_compacted_hits(
         ),
     )
     grid, block = runtime.launch_config(kernel, candidate_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
 
 
 def _launch_fused(
@@ -866,8 +1028,13 @@ def _launch_fused(
         ),
     )
     grid, block = runtime.launch_config(kernel, points.row_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
-    runtime.synchronize()
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
     return device_out
 
 
@@ -932,7 +1099,13 @@ def _launch_bounds_candidate_rows(
             ),
         )
         grid, block = runtime.launch_config(kernel, points.row_count)
-        runtime.launch(kernel, grid=grid, block=block, params=params)
+        runtime.launch(
+            kernel,
+            grid=grid,
+            block=block,
+            params=params,
+            stream=_current_cuda_stream(),
+        )
         return compact_indices(device_mask)
     finally:
         runtime.free(device_mask)
@@ -996,6 +1169,13 @@ def _evaluate_point_in_polygon_gpu(
     selected_strategy = _select_gpu_strategy(
         points.row_count, strategy=strategy, right_array=right_array,
     )
+    timings["requested_strategy"] = selected_strategy
+    if return_device and selected_strategy == "dense":
+        # Dense builds a full-row mask from a host candidate list, which is
+        # the least GPU-native variant in this stack. For device-resident
+        # consumers, keep execution on the compacted path instead.
+        selected_strategy = "compacted"
+        timings["strategy_rewrite"] = "dense->compacted(return_device)"
     timings["strategy"] = selected_strategy
 
     if selected_strategy == "dense":
@@ -1024,18 +1204,52 @@ def _evaluate_point_in_polygon_gpu(
         runtime = get_cuda_runtime()
         device_dense_out = runtime.allocate((points.row_count,), cp.uint8, zero=True)
         _returned = False
+        pending_free = []
+        cleanup_requires_sync = False
         try:
             if GeometryFamily.POLYGON in rows_by_family:
-                _launch_polygon_dense(rows_by_family[GeometryFamily.POLYGON], points, right_array, device_dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+                pending_free.extend(
+                    _launch_polygon_dense(
+                        rows_by_family[GeometryFamily.POLYGON],
+                        points,
+                        right_array,
+                        device_dense_out,
+                        compute_type=compute_type,
+                        center_x=center_x,
+                        center_y=center_y,
+                    )
+                )
+                cleanup_requires_sync = True
             if GeometryFamily.MULTIPOLYGON in rows_by_family:
-                _launch_multipolygon_dense(rows_by_family[GeometryFamily.MULTIPOLYGON], points, right_array, device_dense_out, compute_type=compute_type, center_x=center_x, center_y=center_y)
+                pending_free.extend(
+                    _launch_multipolygon_dense(
+                        rows_by_family[GeometryFamily.MULTIPOLYGON],
+                        points,
+                        right_array,
+                        device_dense_out,
+                        compute_type=compute_type,
+                        center_x=center_x,
+                        center_y=center_y,
+                    )
+                )
+                cleanup_requires_sync = True
             timings["kernel_launch_and_sync_s"] = perf_counter() - t0
             if return_device:
+                cleanup_requires_sync = False
+                keepalive_out = _wrap_device_result_with_keepalive(
+                    device_dense_out,
+                    *pending_free,
+                )
+                pending_free.clear()
                 _last_gpu_substage_timings = timings
                 _returned = True
-                return device_dense_out
+                return keepalive_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
+            cleanup_requires_sync = False
         finally:
+            if cleanup_requires_sync:
+                runtime.synchronize()
+            _free_device_buffers(runtime, pending_free)
             if not _returned:
                 runtime.free(device_dense_out)
         coarse[candidate_rows] = dense_out[candidate_rows].astype(bool, copy=False)
@@ -1070,6 +1284,8 @@ def _evaluate_point_in_polygon_gpu(
         device_dense_out = runtime.allocate((points.row_count,), cp.uint8)
         device_dense_out[...] = 0
         _returned = False
+        pending_free = []
+        cleanup_requires_sync = False
         try:
             t0 = perf_counter()
             if GeometryFamily.POLYGON in right_array.families:
@@ -1082,18 +1298,17 @@ def _evaluate_point_in_polygon_gpu(
                     center_x=center_x,
                     center_y=center_y,
                 )
-                try:
-                    _scatter_compacted_hits(
-                        candidate_rows.values,
-                        polygon_hits,
-                        device_dense_out,
-                        candidate_rows.count,
-                        compute_type=compute_type,
-                        center_x=center_x,
-                        center_y=center_y,
-                    )
-                finally:
-                    runtime.free(polygon_hits)
+                pending_free.append(polygon_hits)
+                cleanup_requires_sync = True
+                _scatter_compacted_hits(
+                    candidate_rows.values,
+                    polygon_hits,
+                    device_dense_out,
+                    candidate_rows.count,
+                    compute_type=compute_type,
+                    center_x=center_x,
+                    center_y=center_y,
+                )
             if GeometryFamily.MULTIPOLYGON in right_array.families:
                 multipolygon_hits = _launch_multipolygon_compacted(
                     candidate_rows.values,
@@ -1104,27 +1319,35 @@ def _evaluate_point_in_polygon_gpu(
                     center_x=center_x,
                     center_y=center_y,
                 )
-                try:
-                    _scatter_compacted_hits(
-                        candidate_rows.values,
-                        multipolygon_hits,
-                        device_dense_out,
-                        candidate_rows.count,
-                        compute_type=compute_type,
-                        center_x=center_x,
-                        center_y=center_y,
-                    )
-                finally:
-                    runtime.free(multipolygon_hits)
+                pending_free.append(multipolygon_hits)
+                cleanup_requires_sync = True
+                _scatter_compacted_hits(
+                    candidate_rows.values,
+                    multipolygon_hits,
+                    device_dense_out,
+                    candidate_rows.count,
+                    compute_type=compute_type,
+                    center_x=center_x,
+                    center_y=center_y,
+                )
             timings["kernel_launch_and_sync_s"] = perf_counter() - t0
             if return_device:
-                # Caller owns device_dense_out; free only candidate indices.
-                runtime.free(candidate_rows.values)
+                cleanup_requires_sync = False
+                keepalive_out = _wrap_device_result_with_keepalive(
+                    device_dense_out,
+                    candidate_rows.values,
+                    *pending_free,
+                )
+                pending_free.clear()
                 _last_gpu_substage_timings = timings
                 _returned = True
-                return device_dense_out
+                return keepalive_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
+            cleanup_requires_sync = False
         finally:
+            if cleanup_requires_sync:
+                runtime.synchronize()
+            _free_device_buffers(runtime, pending_free)
             if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
@@ -1161,11 +1384,13 @@ def _evaluate_point_in_polygon_gpu(
             _last_gpu_substage_timings = timings
             return coarse
 
-        # Compute per-candidate work estimates on host
+        # Compute per-candidate work estimates on device from the cached
+        # family routing metadata and offset buffers. This avoids copying
+        # the candidate row vector back to host just to bin work.
         t0 = perf_counter()
-        candidate_rows_host = runtime.copy_device_to_host(candidate_rows.values)
-        work_estimates = _compute_work_estimates_for_candidates(
-            candidate_rows_host, right_array,
+        work_estimates = _compute_work_estimates_for_candidates_device(
+            candidate_rows.values,
+            right_array,
         )
         timings["work_estimation_s"] = perf_counter() - t0
         timings["work_cv"] = work_cv(work_estimates)
@@ -1173,10 +1398,12 @@ def _evaluate_point_in_polygon_gpu(
         device_dense_out = runtime.allocate((points.row_count,), cp.uint8)
         device_dense_out[...] = 0
         _returned = False
+        pending_free = []
+        cleanup_requires_sync = False
         try:
             t0 = perf_counter()
             if GeometryFamily.POLYGON in right_array.families:
-                polygon_hits = _binned_polygon_dispatch(
+                polygon_hits, polygon_temps = _binned_polygon_dispatch(
                     candidate_rows.values,
                     candidate_rows.count,
                     points,
@@ -1186,20 +1413,20 @@ def _evaluate_point_in_polygon_gpu(
                     center_x=center_x,
                     center_y=center_y,
                 )
-                try:
-                    _scatter_compacted_hits(
-                        candidate_rows.values,
-                        polygon_hits,
-                        device_dense_out,
-                        candidate_rows.count,
-                        compute_type=compute_type,
-                        center_x=center_x,
-                        center_y=center_y,
-                    )
-                finally:
-                    runtime.free(polygon_hits)
+                pending_free.extend(polygon_temps)
+                pending_free.append(polygon_hits)
+                cleanup_requires_sync = True
+                _scatter_compacted_hits(
+                    candidate_rows.values,
+                    polygon_hits,
+                    device_dense_out,
+                    candidate_rows.count,
+                    compute_type=compute_type,
+                    center_x=center_x,
+                    center_y=center_y,
+                )
             if GeometryFamily.MULTIPOLYGON in right_array.families:
-                multipolygon_hits = _binned_multipolygon_dispatch(
+                multipolygon_hits, multipolygon_temps = _binned_multipolygon_dispatch(
                     candidate_rows.values,
                     candidate_rows.count,
                     points,
@@ -1209,27 +1436,36 @@ def _evaluate_point_in_polygon_gpu(
                     center_x=center_x,
                     center_y=center_y,
                 )
-                try:
-                    _scatter_compacted_hits(
-                        candidate_rows.values,
-                        multipolygon_hits,
-                        device_dense_out,
-                        candidate_rows.count,
-                        compute_type=compute_type,
-                        center_x=center_x,
-                        center_y=center_y,
-                    )
-                finally:
-                    runtime.free(multipolygon_hits)
+                pending_free.extend(multipolygon_temps)
+                pending_free.append(multipolygon_hits)
+                cleanup_requires_sync = True
+                _scatter_compacted_hits(
+                    candidate_rows.values,
+                    multipolygon_hits,
+                    device_dense_out,
+                    candidate_rows.count,
+                    compute_type=compute_type,
+                    center_x=center_x,
+                    center_y=center_y,
+                )
             timings["kernel_launch_and_sync_s"] = perf_counter() - t0
             if return_device:
-                # Caller owns device_dense_out; free only candidate indices.
-                runtime.free(candidate_rows.values)
+                cleanup_requires_sync = False
+                keepalive_out = _wrap_device_result_with_keepalive(
+                    device_dense_out,
+                    candidate_rows.values,
+                    *pending_free,
+                )
+                pending_free.clear()
                 _last_gpu_substage_timings = timings
                 _returned = True
-                return device_dense_out
+                return keepalive_out
             dense_out = runtime.copy_device_to_host(device_dense_out)
+            cleanup_requires_sync = False
         finally:
+            if cleanup_requires_sync:
+                runtime.synchronize()
+            _free_device_buffers(runtime, pending_free)
             if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
@@ -1366,7 +1602,10 @@ def point_in_polygon(
         # zero-copy pipelines (feeds into device_take).
         if _return_device:
             import cupy as _cp
-            return _cp.asarray(gpu_out, dtype=_cp.bool_)
+            bool_out = _cp.asarray(gpu_out, dtype=_cp.bool_)
+            if bool_out is gpu_out:
+                return bool_out
+            return _wrap_device_result_with_keepalive(bool_out, gpu_out)
 
         # All strategies now return a normalized object-dtype ndarray.
         return _to_python_result(gpu_out)

@@ -15,8 +15,12 @@ import pytest
 from shapely.geometry import Point, box
 
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+from vibespatial.kernels.core.geometry_analysis import (
+    compute_geometry_bounds,
+    compute_geometry_bounds_device,
+)
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     query_spatial_index,
@@ -211,6 +215,30 @@ def test_device_query_with_distance_expansion():
     # With distance=3.0, query box [2,2,3,3] expands to [-1,-1,6,6]
     # which should overlap both tree boxes.
     assert gpu_right.size == 2, f"Expected 2 candidates, got {gpu_right.size}"
+
+
+@requires_gpu
+def test_device_query_accepts_device_bounds_without_d2h(strict_device_guard):
+    """Device-resident query bounds stay on device through candidate generation."""
+    tree_geoms = np.asarray([box(0, 0, 1, 1), box(5, 5, 6, 6)], dtype=object)
+    query_geoms = [box(2, 2, 3, 3)]
+
+    tree_owned, flat_index = build_owned_spatial_index(tree_geoms)
+    query_owned = from_shapely_geometries(query_geoms, residency=Residency.DEVICE)
+
+    query_bounds = compute_geometry_bounds_device(query_owned)
+    cands, execution = spatial_index_device_query(
+        flat_index,
+        query_bounds,
+        distance=np.asarray([3.0], dtype=np.float64),
+    )
+
+    assert execution.selected is ExecutionMode.GPU
+    assert cands is not None
+    assert hasattr(query_bounds, "__cuda_array_interface__")
+    gpu_left, gpu_right = cands.to_host()
+    assert gpu_left.tolist() == [0, 0]
+    assert gpu_right.tolist() == [0, 1]
 
 
 # ---------------------------------------------------------------------------

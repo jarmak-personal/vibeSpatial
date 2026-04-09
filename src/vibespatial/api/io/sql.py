@@ -3,7 +3,6 @@ from contextlib import contextmanager
 from functools import lru_cache
 
 import pandas as pd
-
 import shapely
 import shapely.wkb
 
@@ -409,7 +408,7 @@ def _write_postgis(
         from geoalchemy2 import Geometry
         from sqlalchemy import text
     except ImportError:
-        raise ImportError("'to_postgis()' requires geoalchemy2 package.")
+        raise ImportError("'to_postgis()' requires geoalchemy2 package.") from None
 
     gdf = gdf.copy()
     geom_name = gdf.geometry.name
@@ -496,10 +495,22 @@ def _try_gpu_write_postgis(gdf, name, con, *, if_exists="fail", schema=None,
     fall through to the Shapely/GeoAlchemy2 path.
     """
     try:
+        from vibespatial.api._native_results import (
+            _spatial_to_native_tabular_result,
+            to_native_tabular_result,
+        )
         from vibespatial.io.postgis_gpu import to_postgis_gpu
 
+        payload = to_native_tabular_result(gdf)
+        if payload is None and hasattr(gdf, "_geometry_column_name"):
+            payload = _spatial_to_native_tabular_result(gdf)
         return to_postgis_gpu(
-            gdf, name, con, if_exists=if_exists, schema=schema, index=index,
+            payload if payload is not None else gdf,
+            name,
+            con,
+            if_exists=if_exists,
+            schema=schema,
+            index=index,
         )
     except Exception:
         return False

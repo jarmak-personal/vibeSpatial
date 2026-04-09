@@ -177,8 +177,6 @@ def test_warm_many_vs_one_overlay_probe_stays_off_cpu_fallback(
         _warm_many_vs_one_overlay_remainder_route()
 
     assert not any("many-vs-one remainder" in str(entry.message) for entry in caught)
-
-
 @pytest.mark.gpu
 def test_warm_overlay_difference_probe_stays_off_cpu_fallback(
     monkeypatch: pytest.MonkeyPatch,

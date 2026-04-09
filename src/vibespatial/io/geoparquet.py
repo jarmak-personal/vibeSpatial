@@ -8,26 +8,21 @@ from typing import Any
 
 import numpy as np
 
-from vibespatial.cuda._runtime import get_cuda_runtime
-from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.api._native_results import NativeTabularResult, to_native_tabular_result
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import (
-    FAMILY_TAGS,
-    DeviceFamilyGeometryBuffer,
-    DiagnosticKind,
-    FamilyGeometryBuffer,
     OwnedGeometryArray,
-    OwnedGeometryDeviceState,
+    concatenate_owned_arrays,
 )
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
-from vibespatial.runtime.residency import Residency
 
 from .geoarrow import (
     _decode_geoarrow_array_to_owned,
     _owned_geoarrow_fast_path_reason,
     encode_owned_geoarrow_array,
+    native_tabular_to_arrow,
 )
 from .geoparquet_planner import (
     GeoParquetMetadataSummary,
@@ -43,10 +38,93 @@ from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb import (
     _encode_owned_wkb_array,
     _write_geoparquet_native_device,
+    _write_geoparquet_native_device_payload,
     has_pyarrow_support,
     has_pylibcudf_support,
 )
 
+
+def _payload_geometry_series(payload: NativeTabularResult):
+    return payload.geometry.to_geoseries(
+        index=payload.attributes.index,
+        name=payload.geometry_name,
+    )
+
+
+def _write_geoparquet_native_tabular_result(
+    payload: NativeTabularResult,
+    path,
+    *,
+    index,
+    compression,
+    geometry_encoding,
+    schema_version,
+    write_covering_bbox,
+    **kwargs,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from vibespatial.api.io.arrow import _create_geometry_metadata, _replace_table_schema_metadata
+
+    geometry_series = _payload_geometry_series(payload)
+
+    device_write = _write_geoparquet_native_device_payload(
+        payload.attributes,
+        geometry_series,
+        path,
+        index=index,
+        compression=compression,
+        geometry_encoding=geometry_encoding,
+        schema_version=schema_version,
+        write_covering_bbox=write_covering_bbox,
+        column_order=payload.column_order,
+        frame_attrs=payload.attrs,
+        **kwargs,
+    )
+    if device_write.written:
+        return
+    if device_write.fallback_detail is not None:
+        record_fallback_event(
+            surface="geopandas.geodataframe.to_parquet",
+            reason="explicit CPU fallback from the native device GeoParquet payload writer to the Arrow writer",
+            detail=device_write.fallback_detail,
+            selected=ExecutionMode.CPU,
+            pipeline="io/to_parquet",
+            d2h_transfer=True,
+        )
+
+    table, geometry_encoding_dict = native_tabular_to_arrow(
+        payload,
+        index=index,
+        geometry_encoding=geometry_encoding,
+        interleaved=False,
+        include_z=None,
+    )
+
+    geo_metadata = _create_geometry_metadata(
+        {payload.geometry_name: geometry_series},
+        primary_column=payload.geometry_name,
+        schema_version=schema_version,
+        geometry_encoding=geometry_encoding_dict,
+        write_covering_bbox=write_covering_bbox,
+    )
+
+    if write_covering_bbox:
+        bounds = geometry_series.bounds
+        bbox_array = pa.StructArray.from_arrays(
+            [bounds["minx"], bounds["miny"], bounds["maxx"], bounds["maxy"]],
+            names=["xmin", "ymin", "xmax", "ymax"],
+        )
+        table = table.append_column("bbox", bbox_array)
+
+    table = _replace_table_schema_metadata(
+        table,
+        geo_metadata=geo_metadata,
+        attrs=payload.attrs,
+    )
+
+    pq.write_table(table, path, compression=compression, **kwargs)
 
 @dataclass(frozen=True)
 class GeoParquetScanPlan:
@@ -318,129 +396,6 @@ def plan_geoparquet_engine(
         ),
     )
 
-def _concat_offsets(buffers: list[np.ndarray]) -> np.ndarray:
-    if not buffers:
-        return np.asarray([0], dtype=np.int32)
-    parts = [buffers[0]]
-    current = int(buffers[0][-1])
-    for offsets in buffers[1:]:
-        parts.append(offsets[1:] + current)
-        current += int(offsets[-1])
-    return np.concatenate(parts).astype(np.int32, copy=False)
-
-
-def _concatenate_owned_arrays(arrays: list[OwnedGeometryArray]) -> OwnedGeometryArray:
-    from vibespatial.geometry.buffers import GeometryFamily
-    from vibespatial.geometry.owned import FamilyGeometryBuffer
-
-    if len(arrays) == 1:
-        return arrays[0]
-    if (
-        arrays
-        and all(array.residency is Residency.DEVICE for array in arrays)
-        and all(set(array.families) == {GeometryFamily.POINT} for array in arrays)
-        and all(array.device_state is not None for array in arrays)
-        and all(not array.families[GeometryFamily.POINT].host_materialized for array in arrays)
-        and all(np.all(array.validity) for array in arrays)
-    ):
-        import cupy as cp
-
-        runtime = get_cuda_runtime()
-        row_count = sum(array.row_count for array in arrays)
-        validity = np.ones(row_count, dtype=bool)
-        tags = np.full(row_count, FAMILY_TAGS[GeometryFamily.POINT], dtype=np.int8)
-        family_row_offsets = np.arange(row_count, dtype=np.int32)
-        geometry_offsets = np.arange(row_count + 1, dtype=np.int32)
-        empty_mask = np.zeros(row_count, dtype=bool)
-        x_device = cp.concatenate(
-            [array.device_state.families[GeometryFamily.POINT].x for array in arrays]
-        )
-        y_device = cp.concatenate(
-            [array.device_state.families[GeometryFamily.POINT].y for array in arrays]
-        )
-        point_buffer = FamilyGeometryBuffer(
-            family=GeometryFamily.POINT,
-            schema=get_geometry_buffer_schema(GeometryFamily.POINT),
-            row_count=row_count,
-            x=np.empty(0, dtype=np.float64),
-            y=np.empty(0, dtype=np.float64),
-            geometry_offsets=np.empty(0, dtype=np.int32),
-            empty_mask=np.empty(0, dtype=np.bool_),
-            bounds=None,
-            host_materialized=False,
-        )
-        owned = OwnedGeometryArray(
-            validity=validity,
-            tags=tags,
-            family_row_offsets=family_row_offsets,
-            families={GeometryFamily.POINT: point_buffer},
-            residency=Residency.DEVICE,
-            device_state=OwnedGeometryDeviceState(
-                validity=runtime.from_host(validity),
-                tags=runtime.from_host(tags),
-                family_row_offsets=runtime.from_host(family_row_offsets),
-                families={
-                    GeometryFamily.POINT: DeviceFamilyGeometryBuffer(
-                        family=GeometryFamily.POINT,
-                        x=x_device,
-                        y=y_device,
-                        geometry_offsets=runtime.from_host(geometry_offsets),
-                        empty_mask=runtime.from_host(empty_mask),
-                        bounds=None,
-                    )
-                },
-            ),
-        )
-        owned._record(
-            DiagnosticKind.CREATED,
-            "concatenated device-resident point GeoParquet chunks without host materialization",
-            visible=True,
-        )
-        return owned
-    validity = np.concatenate([array.validity for array in arrays])
-    tags = np.concatenate([array.tags for array in arrays]).astype(np.int8, copy=False)
-    family_row_offsets = np.full(validity.size, -1, dtype=np.int32)
-    families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
-    for family in GeometryFamily:
-        family_chunks = [array.families[family] for array in arrays if family in array.families]
-        if not family_chunks:
-            continue
-        x = np.concatenate([chunk.x for chunk in family_chunks]) if family_chunks else np.asarray([], dtype=np.float64)
-        y = np.concatenate([chunk.y for chunk in family_chunks]) if family_chunks else np.asarray([], dtype=np.float64)
-        empty_mask = np.concatenate([chunk.empty_mask for chunk in family_chunks]).astype(bool, copy=False)
-        geometry_offsets = _concat_offsets([chunk.geometry_offsets for chunk in family_chunks])
-        part_offsets = None
-        ring_offsets = None
-        if family_chunks[0].part_offsets is not None:
-            part_offsets = _concat_offsets([chunk.part_offsets for chunk in family_chunks if chunk.part_offsets is not None])
-        if family_chunks[0].ring_offsets is not None:
-            ring_offsets = _concat_offsets([chunk.ring_offsets for chunk in family_chunks if chunk.ring_offsets is not None])
-        bounds = None
-        if family_chunks[0].bounds is not None:
-            bounds = np.concatenate([chunk.bounds for chunk in family_chunks if chunk.bounds is not None])
-        families[family] = FamilyGeometryBuffer(
-            family=family,
-            schema=family_chunks[0].schema,
-            row_count=int(empty_mask.size),
-            x=x,
-            y=y,
-            geometry_offsets=geometry_offsets,
-            empty_mask=empty_mask,
-            part_offsets=part_offsets,
-            ring_offsets=ring_offsets,
-            bounds=bounds,
-        )
-        family_mask = tags == FAMILY_TAGS[family]
-        family_row_offsets[family_mask] = np.arange(int(family_mask.sum()), dtype=np.int32)
-    combined = OwnedGeometryArray(
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-        families=families,
-        residency=arrays[0].residency,
-    )
-    return combined
-
 def _plan_geoparquet_chunks(
     *,
     metadata_summary: GeoParquetMetadataSummary | None,
@@ -492,6 +447,7 @@ def _pylibcudf_table_to_geopandas(
     filesystem=None,
     geo_metadata: dict[str, Any] | None,
     schema=None,
+    table_column_names=None,
     to_pandas_kwargs=None,
     df_attrs=None,
 ):
@@ -534,8 +490,15 @@ def _pylibcudf_table_to_geopandas(
             )
 
     non_geometry_columns = [col for col in result_column_names if col not in geometry_columns]
-    # ADR-0036: keep Arrow table through geometry decode; defer .to_pandas()
-    # to the GeoDataFrame construction boundary.
+    if table_column_names is None:
+        if hasattr(table, "column_names"):
+            table_column_names = list(table.column_names)
+        else:
+            table_column_names = list(geometry_columns)
+    else:
+        table_column_names = list(table_column_names)
+    # ADR-0042: keep Arrow tables through geometry decode and defer host
+    # materialization to the explicit GeoDataFrame construction boundary.
     attrs_arrow = _read_non_geometry_geoparquet_columns_as_arrow(
         path,
         columns=non_geometry_columns,
@@ -547,7 +510,7 @@ def _pylibcudf_table_to_geopandas(
     decoded_geometry_owned: dict[str, tuple[OwnedGeometryArray, Any]] = {}
     row_count = None
     for column_name in geometry_columns:
-        column_index = result_column_names.index(column_name)
+        column_index = table_column_names.index(column_name)
         column_meta = geo_metadata["columns"][column_name]
         owned = _decode_pylibcudf_geoparquet_column_to_owned(
             columns_by_index[column_index],
@@ -558,7 +521,7 @@ def _pylibcudf_table_to_geopandas(
             row_count = owned.row_count
         decoded_geometry_owned[column_name] = (owned, crs)
 
-    # ADR-0036 boundary: .to_pandas() deferred to GeoDataFrame construction.
+    # ADR-0042 transitional boundary: host conversion deferred until GeoDataFrame construction.
     if to_pandas_kwargs is None:
         to_pandas_kwargs = {}
     data = attrs_arrow.to_pandas(**to_pandas_kwargs)
@@ -599,9 +562,21 @@ def _read_geoparquet_with_pylibcudf(
     geo_metadata=None,
     to_pandas_kwargs=None,
 ):
+    geometry_scan_columns = None
+    if geo_metadata is not None:
+        if columns is None:
+            geometry_scan_columns = list(geo_metadata["columns"])
+        else:
+            requested_columns = set(columns)
+            geometry_scan_columns = [
+                name for name in geo_metadata["columns"]
+                if name in requested_columns
+            ]
+        if not geometry_scan_columns:
+            geometry_scan_columns = None
     gpu_table = _read_geoparquet_table_with_pylibcudf(
         path,
-        columns=columns,
+        columns=geometry_scan_columns or columns,
         row_groups=row_groups,
         filesystem=filesystem,
     )
@@ -623,6 +598,7 @@ def _read_geoparquet_with_pylibcudf(
         filesystem=filesystem,
         geo_metadata=geo_metadata,
         schema=schema,
+        table_column_names=geometry_scan_columns,
         to_pandas_kwargs=to_pandas_kwargs,
         df_attrs=df_attrs,
     )
@@ -634,7 +610,7 @@ def _read_non_geometry_geoparquet_columns_as_arrow(
     row_groups=None,
     filesystem=None,
 ):
-    """ADR-0036: Read non-geometry columns as an Arrow table.
+    """ADR-0042: Read non-geometry columns as an Arrow table.
 
     Returns a PyArrow Table instead of a pandas DataFrame so that the
     caller can defer ``.to_pandas()`` to the GeoDataFrame construction
@@ -1060,19 +1036,45 @@ def read_geoparquet_owned(
                 column_index=decode_column_index,
             )
         )
-    return _concatenate_owned_arrays(chunks)
+    return concatenate_owned_arrays(chunks)
 
 def write_geoparquet(
     df,
     path,
     *,
     index: bool | None = None,
-    compression: str = "snappy",
+    compression: str | None = "snappy",
     geometry_encoding: str = "WKB",
     schema_version: str | None = None,
     write_covering_bbox: bool = False,
     **kwargs,
 ) -> None:
+    payload = to_native_tabular_result(df)
+    if payload is not None:
+        if write_covering_bbox and "bbox" in payload.attributes.columns:
+            raise ValueError(
+                "An existing column 'bbox' already exists in the dataframe. "
+                "Please rename to write covering bbox."
+            )
+        record_dispatch_event(
+            surface="geopandas.geodataframe.to_parquet",
+            operation="to_parquet",
+            implementation="repo_owned_geoparquet_adapter",
+            reason="GeoParquet export routes through the repo-owned adapter and preserves the GPU-first metadata contract.",
+            selected=ExecutionMode.CPU,
+        )
+        _write_geoparquet_native_tabular_result(
+            payload,
+            path,
+            index=index,
+            compression=compression,
+            geometry_encoding=geometry_encoding,
+            schema_version=schema_version,
+            write_covering_bbox=write_covering_bbox,
+            **kwargs,
+        )
+        return
+
     record_dispatch_event(
         surface="geopandas.geodataframe.to_parquet",
         operation="to_parquet",
@@ -1145,13 +1147,13 @@ def _write_geoparquet_native(
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from vibespatial.api.io.arrow import _create_metadata, _encode_metadata
+    from vibespatial.api.io.arrow import _create_metadata, _replace_table_schema_metadata
 
     geometry_indices = np.asarray(
         df.dtypes.map(lambda d: d.name in ("geometry", "device_geometry"))
     ).nonzero()[0]
 
-    if _write_geoparquet_native_device(
+    device_write = _write_geoparquet_native_device(
         df,
         path,
         index=index,
@@ -1161,8 +1163,18 @@ def _write_geoparquet_native(
         write_covering_bbox=write_covering_bbox,
         geometry_columns=geometry_columns,
         **kwargs,
-    ):
+    )
+    if device_write.written:
         return
+    if device_write.fallback_detail is not None:
+        record_fallback_event(
+            surface="geopandas.geodataframe.to_parquet",
+            reason="explicit CPU fallback from the native device GeoParquet writer to the Arrow writer",
+            detail=device_write.fallback_detail,
+            selected=ExecutionMode.CPU,
+            pipeline="io/to_parquet",
+            d2h_transfer=True,
+        )
 
     # Build a table from non-geometry columns
     geometry_columns_set = set(geometry_columns)
@@ -1241,12 +1253,11 @@ def _write_geoparquet_native(
         )
         table = table.append_column("bbox", bbox_array)
 
-    metadata = table.schema.metadata
-    metadata.update({b"geo": _encode_metadata(geo_metadata)})
-    if df.attrs:
-        import json
-        metadata |= {"PANDAS_ATTRS": json.dumps(df.attrs)}
-    table = table.replace_schema_metadata(metadata)
+    table = _replace_table_schema_metadata(
+        table,
+        geo_metadata=geo_metadata,
+        attrs=df.attrs or None,
+    )
 
     pq.write_table(table, path, compression=compression, **kwargs)
 
@@ -1469,7 +1480,7 @@ def benchmark_geoparquet_scan_engine(
                 decode_elapsed += perf_counter() - decode_start
 
             concat_start = perf_counter()
-            _concatenate_owned_arrays(chunks)
+            concatenate_owned_arrays(chunks)
             concat_elapsed += perf_counter() - concat_start
             total_elapsed += perf_counter() - iteration_start
         elapsed = total_elapsed / repeat

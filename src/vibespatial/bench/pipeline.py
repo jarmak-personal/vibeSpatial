@@ -13,6 +13,10 @@ import shapely
 from shapely.geometry import box
 
 import vibespatial.api as geopandas
+from vibespatial.api._native_results import (
+    GeometryNativeResult,
+    GroupedConstructiveResult,
+)
 from vibespatial.constructive.clip_rect import clip_by_rect_owned
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
 from vibespatial.constructive.make_valid_pipeline import make_valid_owned
@@ -38,7 +42,13 @@ from vibespatial.kernels.predicates.point_in_polygon import (
     get_last_gpu_substage_timings,
     point_in_polygon,
 )
-from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, union_all_gpu_owned
+from vibespatial.overlay.dissolve import (
+    DissolveUnionMethod,
+    evaluate_geopandas_dissolve,
+    evaluate_geopandas_dissolve_native,
+    execute_grouped_union_codes,
+    union_all_gpu_owned,
+)
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
@@ -53,7 +63,7 @@ from vibespatial.testing.synthetic import (
     generate_polygons,
 )
 
-from .profiling import ProfileTrace, StageProfiler
+from .profiling import ProfileTrace, StageProfiler, _format_elapsed_compact
 
 PIPELINE_DEFINITIONS = (
     "join-heavy",
@@ -76,6 +86,7 @@ PIPELINE_DEFINITIONS = (
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".benchmark_fixtures"
+_BENCHMARK_OUTPUT_COMPRESSION = None
 _SUPPORTED_COLLECTION_GEOM_TYPES = {
     "Point",
     "LineString",
@@ -203,6 +214,9 @@ def _iter_owned_arrays(value):
     if isinstance(value, DeviceGeometryArray):
         yield value.to_owned()
         return
+    owned = getattr(value, "owned", None)
+    if isinstance(owned, OwnedGeometryArray):
+        yield owned
     if isinstance(value, geopandas.GeoDataFrame):
         yield from _iter_owned_arrays(value.geometry.values)
         return
@@ -349,16 +363,6 @@ def _take_dga_frame(frame, indices: np.ndarray):
     return result
 
 
-def _owned_to_dga_frame(owned: OwnedGeometryArray, *, crs: str | None = None):
-    geometry_name = "geometry"
-    geometry = DeviceGeometryArray._from_owned(owned, crs=crs)
-    result = pd.DataFrame({geometry_name: pd.Series(geometry, copy=False, name=geometry_name)}, copy=False)
-    result.__class__ = geopandas.GeoDataFrame
-    result._geometry_column_name = geometry_name
-    result[geometry_name].array.crs = crs
-    return result
-
-
 def _trace_to_stage_dict(trace: ProfileTrace) -> dict:
     selected_runtime = trace.metadata.get("actual_selected_runtime", trace.selected_runtime)
     return {
@@ -393,6 +397,8 @@ def _selected_runtime_from_history(*values) -> str | None:
         for owned in _iter_owned_arrays(value):
             if owned.runtime_history:
                 return owned.runtime_history[-1].selected.value
+            if owned.device_state is not None:
+                return "gpu"
     return None
 
 
@@ -429,18 +435,34 @@ def _read_geoparquet_owned_preferred(path: Path, *, preferred_backend: str) -> t
 def _read_geojson_owned_preferred(path: Path, *, preferred_mode: str):
     if preferred_mode == "pylibcudf":
         try:
-            return read_geojson_owned(path, prefer="pylibcudf"), "gpu", ""
+            return read_geojson_owned(
+                path,
+                prefer="pylibcudf",
+                track_properties=False,
+            ), "gpu", ""
         except Exception as exc:
-            return read_geojson_owned(path, prefer="fast-json"), "cpu", f"gpu read fallback: {exc.__class__.__name__}"
+            return read_geojson_owned(
+                path,
+                prefer="fast-json",
+                track_properties=False,
+            ), "cpu", f"gpu read fallback: {exc.__class__.__name__}"
 
     # For "auto" or "gpu-byte-classify", pass through to read_geojson_owned
     # which will select the strategy (auto now prefers GPU when available).
     try:
-        batch = read_geojson_owned(path, prefer=preferred_mode)
+        batch = read_geojson_owned(
+            path,
+            prefer=preferred_mode,
+            track_properties=False,
+        )
         device = "gpu" if batch.geometry.device_state is not None else "cpu"
         return batch, device, ""
     except Exception as exc:
-        batch = read_geojson_owned(path, prefer="fast-json")
+        batch = read_geojson_owned(
+            path,
+            prefer="fast-json",
+            track_properties=False,
+        )
         return batch, "cpu", f"gpu read fallback: {exc.__class__.__name__}"
 
 
@@ -452,6 +474,96 @@ def _read_geojson_geopandas_preferred(path: Path) -> tuple[geopandas.GeoDataFram
         return geopandas.read_file(path, engine="pyogrio"), requested_engine, "pyogrio", ""
     except Exception as exc:
         return geopandas.read_file(path), requested_engine, "default", f"pyogrio fallback: {exc.__class__.__name__}"
+
+
+def _join_heavy_group_categories(scale: int) -> np.ndarray:
+    return np.arange(max(min(scale, 128), 1), dtype=np.int32)
+
+
+def _dissolve_join_heavy_groups(
+    joined_geometry,
+    unique_right_index: np.ndarray,
+    *,
+    scale: int,
+):
+    if isinstance(joined_geometry, GeometryNativeResult):
+        geometry_result = joined_geometry
+    else:
+        geometry_result = GeometryNativeResult.from_geoseries(joined_geometry)
+
+    geometry_name = "geometry"
+    group_categories = _join_heavy_group_categories(scale)
+    group_labels = np.remainder(
+        np.asarray(unique_right_index, dtype=np.int64),
+        int(group_categories.size),
+    )
+    row_group_codes = group_labels.astype(np.int32, copy=False)
+    observed_codes = np.unique(row_group_codes).astype(np.int32, copy=False)
+    observed_labels = np.unique(group_labels)
+    joined_owned = geometry_result.owned
+    if joined_owned is None:
+        joined_series = geometry_result.to_geoseries(
+            index=pd.RangeIndex(geometry_result.row_count),
+            name=geometry_name,
+        )
+        geometry_values = joined_series.values
+        joined_owned = getattr(geometry_values, "_owned", None)
+    else:
+        geometry_values = geoseries_from_owned(
+            joined_owned,
+            name=geometry_name,
+            crs=geometry_result.crs,
+        ).values
+    grouped_union = execute_grouped_union_codes(
+        geometry_values,
+        row_group_codes,
+        group_count=int(group_categories.size),
+        method=DissolveUnionMethod.COVERAGE,
+        owned=joined_owned,
+    )
+    if grouped_union is not None:
+        group_index = pd.CategoricalIndex(pd.Categorical(observed_labels), name="group")
+        if grouped_union.owned is not None:
+            geometry_result = GeometryNativeResult.from_owned(
+                grouped_union.owned.take(observed_codes.astype(np.int64, copy=False)),
+                crs=geometry_result.crs,
+            )
+        else:
+            geometry_result = GeometryNativeResult.from_geoseries(
+                geopandas.GeoSeries(
+                    grouped_union.geometries[observed_codes.astype(np.intp, copy=False)],
+                    name=geometry_name,
+                    crs=geometry_result.crs,
+                )
+            )
+        return GroupedConstructiveResult(
+            geometry=geometry_result,
+            attributes=pd.DataFrame(index=group_index),
+            geometry_name=geometry_name,
+            as_index=True,
+        ), True
+
+    joined_frame = geopandas.GeoDataFrame(
+        {"group": pd.Categorical(group_labels)},
+        geometry=geometry_result.to_geoseries(
+            index=pd.RangeIndex(geometry_result.row_count),
+            name=geometry_name,
+        ),
+        crs=geometry_result.crs,
+    )
+    return evaluate_geopandas_dissolve_native(
+        joined_frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="coverage",
+        grid_size=None,
+        agg_kwargs={},
+    ), False
 
 
 def _profile_join_pipeline(
@@ -560,63 +672,63 @@ def _profile_join_pipeline(
         with profiler.stage(
             "assemble_join_rows",
             category="refine",
-            device=ExecutionMode.CPU,
+            device="auto",
             rows_in=int(right_index.size),
             detail="assemble polygon rows selected by the spatial query before dissolve",
         ) as stage:
             unique_right_index = np.unique(right_index)
             joined_geometry = (
-                geoseries_from_owned(
+                GeometryNativeResult.from_owned(
                     right_owned.take(unique_right_index),
                     crs="EPSG:4326",
                 )
                 if unique_right_index.size
-                else geopandas.GeoSeries([], crs="EPSG:4326")
+                else GeometryNativeResult.from_geoseries(
+                    geopandas.GeoSeries([], name="geometry", crs="EPSG:4326")
+                )
             )
-            stage.rows_out = int(joined_geometry.size)
+            stage.device = _selected_runtime_from_history(joined_geometry) or "cpu"
+            stage.rows_out = int(joined_geometry.row_count)
             stage.metadata["deduped_candidate_rows"] = int(unique_right_index.size)
-            _record_stage_overheads(stage, audit, memory, right_owned)
+            _record_stage_overheads(stage, audit, memory, joined_geometry)
 
         with profiler.stage(
             "dissolve_groups",
             category="refine",
-            device=ExecutionMode.CPU,
-            rows_in=int(joined_geometry.size),
+            device="auto",
+            rows_in=int(joined_geometry.row_count),
             detail="dissolve joined polygons by categorical group after spatial query assembly",
         ) as stage:
-            joined = geopandas.GeoDataFrame(
-                {
-                    "group": pd.Categorical(unique_right_index % max(min(scale, 128), 1)),
-                    "geometry": joined_geometry,
-                },
-                geometry="geometry",
-                crs="EPSG:4326",
+            dissolved, used_direct_grouped_union = _dissolve_join_heavy_groups(
+                joined_geometry,
+                unique_right_index,
+                scale=scale,
             )
-            dissolved = evaluate_geopandas_dissolve(
-                joined,
-                by="group",
-                aggfunc="first",
-                as_index=True,
-                level=None,
-                sort=False,
-                observed=False,
-                dropna=True,
-                method="coverage",
-                grid_size=None,
-                agg_kwargs={},
-            )
-            stage.rows_out = int(len(dissolved))
+            stage.device = _selected_runtime_from_history(dissolved) or "cpu"
+            stage.rows_out = int(len(dissolved.attributes))
+            stage.metadata["group_count"] = int(_join_heavy_group_categories(scale).size)
+            stage.metadata["direct_grouped_union"] = used_direct_grouped_union
+            stage.metadata["method"] = DissolveUnionMethod.COVERAGE.value
+            _record_stage_overheads(stage, audit, memory, dissolved)
 
         output_path = root / "join-output.parquet"
         with profiler.stage(
             "write_output",
             category="emit",
-            device=ExecutionMode.CPU,
-            rows_in=int(len(dissolved)),
+            device="auto",
+            rows_in=int(len(dissolved.attributes)),
             detail="write dissolved join result to GeoParquet",
         ) as stage:
-            write_geoparquet(dissolved, output_path, geometry_encoding="geoarrow")
-            stage.rows_out = int(len(dissolved))
+            write_geoparquet(
+                dissolved,
+                output_path,
+                geometry_encoding="geoarrow",
+                compression=_BENCHMARK_OUTPUT_COMPRESSION,
+            )
+            stage.device = _selected_runtime_from_history(dissolved) or "cpu"
+            stage.rows_out = int(len(dissolved.attributes))
+            stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
+            _record_stage_overheads(stage, audit, memory, dissolved)
 
     trace = profiler.finish(
         metadata={
@@ -646,13 +758,13 @@ def _profile_join_pipeline(
             else "cpu"
         ),
         planner_selected_runtime=planner_runtime.value,
-        output_rows=(trace.metadata["dispatch_events"] and int(len(dissolved))) or int(len(dissolved)),
+        output_rows=(trace.metadata["dispatch_events"] and int(len(dissolved.attributes))) or int(len(dissolved.attributes)),
         transfer_count=audit.transfer_count,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
         stages=(_trace_to_stage_dict(trace),),
-        notes="Current join-heavy pipeline uses owned GeoParquet read plus GPU regular-grid query when available, with CPU dissolve/write surfaces.",
+        notes="Current join-heavy pipeline uses owned GeoParquet read, GPU regular-grid query when available, and a direct grouped coverage dissolve rail before GeoParquet write.",
     )
 
 
@@ -746,21 +858,25 @@ def _profile_constructive_pipeline(
             stage.rows_out = int(buffered.row_count)
             _record_stage_overheads(stage, audit, memory, clipped, buffered)
 
-        output = geopandas.GeoDataFrame(
-            {"geometry": geoseries_from_owned(buffered, crs="EPSG:4326")},
-            geometry="geometry",
-            crs="EPSG:4326",
-        )
+        output = GeometryNativeResult.from_owned(buffered, crs="EPSG:4326")
         output_path = root / "constructive-output.parquet"
         with profiler.stage(
             "write_output",
             category="emit",
-            device=ExecutionMode.CPU,
-            rows_in=int(len(output)),
+            device="auto",
+            rows_in=int(output.row_count),
             detail="write constructive pipeline result to GeoParquet",
         ) as stage:
-            write_geoparquet(output, output_path, geometry_encoding="geoarrow")
-            stage.rows_out = int(len(output))
+            write_geoparquet(
+                output,
+                output_path,
+                geometry_encoding="geoarrow",
+                compression=_BENCHMARK_OUTPUT_COMPRESSION,
+            )
+            stage.device = _selected_runtime_from_history(output) or "cpu"
+            stage.rows_out = int(output.row_count)
+            stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
+            _record_stage_overheads(stage, audit, memory, output)
 
     trace = profiler.finish(
         metadata={
@@ -790,7 +906,7 @@ def _profile_constructive_pipeline(
             else "cpu"
         ),
         planner_selected_runtime=planner_runtime.value,
-        output_rows=int(len(output)),
+        output_rows=int(output.row_count),
         transfer_count=audit.transfer_count,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
@@ -891,18 +1007,24 @@ def _profile_predicate_pipeline(
             survivors = _subset_by_mask(batch.geometry, mask)
             stage.rows_out = survivors.row_count
 
-        output = _owned_to_dga_frame(survivors, crs="EPSG:4326")
+        output = GeometryNativeResult.from_owned(survivors, crs="EPSG:4326")
         output_path = root / "predicate-output.parquet"
         with profiler.stage(
             "write_output",
             category="emit",
             device="auto",
-            rows_in=int(len(output)),
+            rows_in=int(output.row_count),
             detail="write filtered predicate result to GeoParquet",
         ) as stage:
-            write_geoparquet(output, output_path, geometry_encoding="geoarrow")
+            write_geoparquet(
+                output,
+                output_path,
+                geometry_encoding="geoarrow",
+                compression=_BENCHMARK_OUTPUT_COMPRESSION,
+            )
             stage.device = _selected_runtime_from_history(output) or "cpu"
-            stage.rows_out = int(len(output))
+            stage.rows_out = int(output.row_count)
+            stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
             _record_stage_overheads(stage, audit, memory, output)
 
     stage_devices = [stage.device for stage in profiler._stages]
@@ -923,7 +1045,7 @@ def _profile_predicate_pipeline(
         elapsed_seconds=trace.total_elapsed_seconds,
         selected_runtime=actual_selected_runtime,
         planner_selected_runtime=planner_runtime.value,
-        output_rows=int(len(output)),
+        output_rows=int(output.row_count),
         transfer_count=audit.transfer_count,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
@@ -1134,8 +1256,14 @@ def _profile_zero_transfer_pipeline(
             rows_in=int(len(filtered)),
             detail="write the filtered DGA-backed GeoDataFrame through the native GeoParquet path",
         ) as stage:
-            write_geoparquet(filtered, output_path, geometry_encoding="geoarrow")
+            write_geoparquet(
+                filtered,
+                output_path,
+                geometry_encoding="geoarrow",
+                compression=_BENCHMARK_OUTPUT_COMPRESSION,
+            )
             stage.rows_out = int(len(filtered))
+            stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
             _record_stage_overheads(stage, audit, memory, filtered)
 
     transfer_count = audit.transfer_count
@@ -3361,7 +3489,16 @@ def render_gpu_sparkline_report(results: list[PipelineBenchmarkResult]) -> str:
                 vram = metadata.get("gpu_vram_sparkline")
                 if not any((util, mem, vram)):
                     continue
-                lines.append(f"{result.pipeline} scale={result.scale} stage={stage['name']} {stage['elapsed_seconds']:.2f}s")
+                wall_elapsed = float(stage.get("elapsed_seconds", 0.0))
+                wall_display = metadata.get("elapsed_display", _format_elapsed_compact(wall_elapsed))
+                gpu_elapsed = metadata.get("gpu_event_elapsed_seconds")
+                if gpu_elapsed is not None and stage.get("device") == ExecutionMode.GPU.value:
+                    timing_summary = f"gpu={_format_elapsed_compact(float(gpu_elapsed))} wall={wall_display}"
+                else:
+                    timing_summary = str(wall_display)
+                lines.append(
+                    f"{result.pipeline} scale={result.scale} stage={stage['name']} {timing_summary}"
+                )
                 if util:
                     lines.append(f"gpu util  {util}")
                 if mem:
@@ -3378,7 +3515,7 @@ def render_gpu_sparkline_report(results: list[PipelineBenchmarkResult]) -> str:
                     ):
                         val = substages.get(key)
                         if val is not None:
-                            parts.append(f"{key}={val:.4f}")
+                            parts.append(f"{key}={_format_elapsed_compact(float(val))}")
                     for key in ("candidate_count", "total_rows", "strategy"):
                         val = substages.get(key)
                         if val is not None:

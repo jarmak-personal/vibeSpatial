@@ -10,6 +10,7 @@ import vibespatial.api as geopandas
 from vibespatial import (
     benchmark_make_valid,
     fusion_plan_for_make_valid,
+    has_gpu_runtime,
     make_valid_owned,
     plan_make_valid_pipeline,
 )
@@ -17,7 +18,9 @@ from vibespatial.api import GeoSeries
 from vibespatial.api.testing import assert_geoseries_equal
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 from vibespatial.runtime.fusion import IntermediateDisposition
+from vibespatial.runtime.residency import Residency
 
 
 def test_make_valid_plan_compacts_invalid_rows_before_repair() -> None:
@@ -151,3 +154,32 @@ def test_make_valid_gpu_repair_failure_propagates(monkeypatch: pytest.MonkeyPatc
 
     with pytest.raises(RuntimeError, match="gpu-repair-boom"):
         make_valid_owned(owned=owned, dispatch_mode=ExecutionMode.GPU)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime not available")
+def test_make_valid_auto_keeps_inner_is_valid_on_gpu_for_device_resident_owned() -> None:
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+            Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    clear_dispatch_events()
+    result = make_valid_owned(owned=owned, dispatch_mode=ExecutionMode.AUTO)
+    events = get_dispatch_events(clear=True)
+
+    assert result.owned is owned
+    assert all(
+        not (
+            event.surface == "geopandas.array.is_valid"
+            and event.selected is ExecutionMode.CPU
+        )
+        for event in events
+    )
+    assert any(
+        event.surface == "geopandas.array.make_valid"
+        and event.selected is ExecutionMode.GPU
+        for event in events
+    )

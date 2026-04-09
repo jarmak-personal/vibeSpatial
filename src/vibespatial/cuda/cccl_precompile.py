@@ -1310,7 +1310,6 @@ def _warm_overlay_difference_segmented_union_route(timeout: float = 60.0) -> Non
 
         _overlay_difference_warm_done = True
 
-
 # Modules whose import triggers request_nvrtc_warmup() at module scope.
 _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.spatial.indexing",
@@ -1334,6 +1333,7 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.constructive.measurement",
     "vibespatial.constructive.centroid",
     "vibespatial.constructive.clip_rect",
+    "vibespatial.kernels.constructive.polygon_rect_intersection",
     "vibespatial.constructive.validity",
     "vibespatial.io.gpu_parse.structural",
     "vibespatial.io.gpu_parse.numeric",

@@ -57,6 +57,58 @@ __device__ void line_intersect(
     }
 }
 
+__device__ __forceinline__ int approx_same_vertex(
+    double ax, double ay,
+    double bx, double by
+) {
+    return fabs(ax - bx) <= 1e-12 && fabs(ay - by) <= 1e-12;
+}
+
+__device__ __forceinline__ void append_unique_vertex(
+    double* out_x,
+    double* out_y,
+    int* out_count,
+    double x,
+    double y
+) {
+    if (*out_count > 0) {
+        const int prev = *out_count - 1;
+        if (approx_same_vertex(out_x[prev], out_y[prev], x, y)) {
+            return;
+        }
+    }
+    if (*out_count < MAX_CLIP_VERTS) {
+        out_x[*out_count] = x;
+        out_y[*out_count] = y;
+        (*out_count)++;
+    }
+}
+
+__device__ __forceinline__ int collapse_redundant_vertices(
+    double* xs,
+    double* ys,
+    int count
+) {
+    if (count <= 1) {
+        return count;
+    }
+
+    int write = 1;
+    for (int i = 1; i < count; i++) {
+        if (approx_same_vertex(xs[write - 1], ys[write - 1], xs[i], ys[i])) {
+            continue;
+        }
+        xs[write] = xs[i];
+        ys[write] = ys[i];
+        write++;
+    }
+
+    if (write > 1 && approx_same_vertex(xs[0], ys[0], xs[write - 1], ys[write - 1])) {
+        write--;
+    }
+    return write;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Count kernel: compute output vertex count per pair                 */
 /*                                                                     */
@@ -171,20 +223,12 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
 
             if (s_side >= 0.0) {
                 /* S is inside */
-                if (out_count < MAX_CLIP_VERTS) {
-                    out_x[out_count] = sx;
-                    out_y[out_count] = sy;
-                    out_count++;
-                }
+                append_unique_vertex(out_x, out_y, &out_count, sx, sy);
                 if (p_side < 0.0) {
                     /* S inside, P outside -> emit intersection */
                     double ix, iy;
                     line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    if (out_count < MAX_CLIP_VERTS) {
-                        out_x[out_count] = ix;
-                        out_y[out_count] = iy;
-                        out_count++;
-                    }
+                    append_unique_vertex(out_x, out_y, &out_count, ix, iy);
                 }
             } else {
                 /* S is outside */
@@ -192,14 +236,12 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
                     /* S outside, P inside -> emit intersection then P */
                     double ix, iy;
                     line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    if (out_count < MAX_CLIP_VERTS) {
-                        out_x[out_count] = ix;
-                        out_y[out_count] = iy;
-                        out_count++;
-                    }
+                    append_unique_vertex(out_x, out_y, &out_count, ix, iy);
                 }
             }
         }
+
+        out_count = collapse_redundant_vertices(out_x, out_y, out_count);
 
         /* Swap buffers for next edge */
         double* tmp_x = in_x;
@@ -210,6 +252,8 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
         out_y = tmp_y;
         input_count = out_count;
     }
+
+    input_count = collapse_redundant_vertices(in_x, in_y, input_count);
 
     if (input_count < 3) {
         /* Degenerate result (point or line) -> empty */
@@ -312,32 +356,22 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
             double p_side = wsign * cross_sign(px, py, ex0, ey0, ex1, ey1);
 
             if (s_side >= 0.0) {
-                if (out_count < MAX_CLIP_VERTS) {
-                    out_bx[out_count] = sx;
-                    out_by[out_count] = sy;
-                    out_count++;
-                }
+                append_unique_vertex(out_bx, out_by, &out_count, sx, sy);
                 if (p_side < 0.0) {
                     double ix, iy;
                     line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    if (out_count < MAX_CLIP_VERTS) {
-                        out_bx[out_count] = ix;
-                        out_by[out_count] = iy;
-                        out_count++;
-                    }
+                    append_unique_vertex(out_bx, out_by, &out_count, ix, iy);
                 }
             } else {
                 if (p_side >= 0.0) {
                     double ix, iy;
                     line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    if (out_count < MAX_CLIP_VERTS) {
-                        out_bx[out_count] = ix;
-                        out_by[out_count] = iy;
-                        out_count++;
-                    }
+                    append_unique_vertex(out_bx, out_by, &out_count, ix, iy);
                 }
             }
         }
+
+        out_count = collapse_redundant_vertices(out_bx, out_by, out_count);
 
         double* tmp_x = in_x;
         double* tmp_y = in_y;
@@ -347,6 +381,9 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
         out_by = tmp_y;
         input_count = out_count;
     }
+
+    input_count = collapse_redundant_vertices(in_x, in_y, input_count);
+    if (input_count < 3) return;
 
     /* Write clipped vertices at the pre-computed offset. */
     int pos = output_offsets[idx];

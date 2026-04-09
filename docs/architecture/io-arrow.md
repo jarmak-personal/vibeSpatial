@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 161/260 lines
+Body Budget: 205/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-123 | Current Behavior |
-| 124-161 | Measured Local Baseline |
+| 76-167 | Current Behavior |
+| 168-205 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -117,6 +117,50 @@ geometry buffers while keeping GPU-native formats as the design center.
   - `copy`: always normalize into fresh owned buffers
   - `auto`: share aligned buffers, normalize only when required
   - `share`: require a fully aligned layout and fail otherwise
+- Repo-owned GeoParquet export now also accepts grouped native constructive
+  results as an explicit terminal boundary, so grouped dissolve-style outputs
+  can write directly without first materializing an intermediate GeoDataFrame.
+- Geometry-only native results can also write directly to GeoParquet, so
+  geometry-producing pipelines do not need to rebuild a temporary GeoDataFrame
+  just to hit the writer boundary.
+- Row-preserving native clip results can also write directly to GeoParquet, so
+  constructive filter pipelines do not need to materialize a public
+  GeoDataFrame before the terminal write boundary.
+- Point-only row-preserving clip results now also lower directly into the
+  shared native tabular boundary, so simple clip producer paths no longer need
+  to materialize a temporary public spatial object before Arrow-family export.
+- More generally, default `clip(..., keep_geom_type=False)` producer paths now
+  lower row-preserving non-point results directly into the shared native
+  tabular boundary too; only the stricter `keep_geom_type=True` compatibility
+  cases still need the public clip materializer today.
+- Deferred overlay constructive results can also write directly to GeoParquet,
+  so union, identity, and symmetric-difference native paths no longer need to
+  collapse into an intermediate public frame just to hit the writer boundary.
+- Overlay pairwise and left-row constructive fragments now also project
+  attributes directly into the shared native attribute-table boundary, so
+  union/intersection/difference producer paths no longer need to build pandas
+  attribute fragments before native terminal export.
+- Deferred spatial-join export results can also write directly to GeoParquet,
+  so native join pairs and join-context assembly can stay deferred until the
+  terminal write boundary instead of rebuilding a public frame first.
+- Join export now also produces Arrow-backed native attribute payloads before
+  the sink boundary, so `sjoin` and `sjoin_nearest` no longer need to build a
+  joined pandas frame just to cross into Arrow-family writers.
+- Native join, clip, and overlay exports now converge on a shared
+  `NativeTabularResult` boundary of attribute columns plus native geometry
+  before any terminal sink runs.
+- That same shared boundary now lowers directly to Arrow too, so GeoParquet
+  and other Arrow-family sinks do not need to rebuild a temporary
+  GeoDataFrame-shaped export just to cross the terminal format boundary.
+- The shared native boundary now also owns Parquet and Feather terminal
+  emission, so Arrow-family write sinks no longer depend on GeoDataFrame
+  assembly when a native result is already available.
+- `NativeTabularResult` now accepts a shared attribute payload abstraction, so
+  Arrow-family sinks can lower Arrow-backed attribute tables directly instead
+  of requiring pandas frames as the only internal attribute representation.
+- The GeoParquet writer consumes that shared native tabular boundary directly,
+  so writer-local payload assembly is no longer the place where native result
+  semantics live.
 - Repo-owned `read_geoparquet_owned(...)` now provides the scan-engine seam for
   `o17.6.20`:
   - backend selection: `pylibcudf` or `pyarrow`

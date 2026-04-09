@@ -59,6 +59,14 @@ def _is_fsspec_url(url):
     return isinstance(url, str) and "://" in url
 
 
+def _replace_table_schema_metadata(table, *, geo_metadata, attrs=None):
+    metadata = dict(table.schema.metadata or {})
+    metadata[b"geo"] = _encode_metadata(geo_metadata)
+    if attrs:
+        metadata[b"PANDAS_ATTRS"] = json.dumps(attrs).encode()
+    return table.replace_schema_metadata(metadata)
+
+
 def _remove_id_from_member_of_ensembles(json_dict):
     """
     Older PROJ versions will not recognize IDs of datum ensemble members that
@@ -98,25 +106,21 @@ def _get_geometry_types(series):
     arr = series.array
     if isinstance(arr, DeviceGeometryArray):
         # Satisfy from owned tags without Shapely materialization.
-        # Map family tags → shapely type IDs.
         from vibespatial.geometry.buffers import GeometryFamily
-        from vibespatial.geometry.owned import FAMILY_TAGS, NULL_TAG
-
-        _family_to_shapely_type_id = {
-            FAMILY_TAGS[GeometryFamily.POINT]: 0,
-            FAMILY_TAGS[GeometryFamily.LINESTRING]: 1,
-            FAMILY_TAGS[GeometryFamily.POLYGON]: 3,
-            FAMILY_TAGS[GeometryFamily.MULTIPOINT]: 4,
-            FAMILY_TAGS[GeometryFamily.MULTILINESTRING]: 5,
-            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]: 6,
+        family_names = {
+            GeometryFamily.POINT: "Point",
+            GeometryFamily.LINESTRING: "LineString",
+            GeometryFamily.POLYGON: "Polygon",
+            GeometryFamily.MULTIPOINT: "MultiPoint",
+            GeometryFamily.MULTILINESTRING: "MultiLineString",
+            GeometryFamily.MULTIPOLYGON: "MultiPolygon",
         }
-        unique_tags = set(int(t) for t in arr.owned.tags if t != NULL_TAG)
-        geometry_types = []
-        for tag in unique_tags:
-            shapely_id = _family_to_shapely_type_id.get(tag)
-            if shapely_id is not None:
-                geometry_types.append(shapely_id)
-        return sorted([_geometry_type_names[idx] for idx in geometry_types])
+
+        return sorted(
+            family_names[family]
+            for family in arr.owned.families
+            if family in family_names
+        )
 
     arr_geometry_types = shapely.get_type_id(arr._data)
     # ensure to include "... Z" for 3D geometries
@@ -129,6 +133,85 @@ def _get_geometry_types(series):
         geometry_types.remove(-1)
 
     return sorted([_geometry_type_names[idx] for idx in geometry_types])
+
+
+def _create_geometry_metadata(
+    geometry_columns,
+    *,
+    primary_column,
+    schema_version=None,
+    geometry_encoding=None,
+    write_covering_bbox=False,
+):
+    """Create GeoParquet metadata from geometry columns without a GeoDataFrame."""
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+
+    if schema_version is None:
+        if geometry_encoding and any(
+            encoding != "WKB" for encoding in geometry_encoding.values()
+        ):
+            schema_version = "1.1.0"
+        else:
+            schema_version = METADATA_VERSION
+
+    if schema_version not in SUPPORTED_VERSIONS:
+        raise ValueError(
+            f"schema_version must be one of: {', '.join(SUPPORTED_VERSIONS)}"
+        )
+
+    column_metadata = {}
+    for col, series in geometry_columns.items():
+        arr = series.array
+
+        geometry_types = _get_geometry_types(series)
+        if schema_version[0] == "0":
+            geometry_types_name = "geometry_type"
+            if len(geometry_types) == 1:
+                geometry_types = geometry_types[0]
+        else:
+            geometry_types_name = "geometry_types"
+
+        crs = None
+        if series.crs:
+            if schema_version == "0.1.0":
+                crs = series.crs.to_wkt()
+            else:
+                crs = series.crs.to_json_dict()
+                _remove_id_from_member_of_ensembles(crs)
+
+        column_metadata[col] = {
+            "encoding": (
+                geometry_encoding[col]
+                if geometry_encoding and col in geometry_encoding
+                else "WKB"
+            ),
+            "crs": crs,
+            geometry_types_name: geometry_types,
+        }
+
+        if isinstance(arr, DeviceGeometryArray):
+            bbox = np.asarray(arr.total_bounds, dtype=np.float64).tolist()
+        else:
+            bbox = series.total_bounds.tolist()
+        if np.isfinite(bbox).all():
+            column_metadata[col]["bbox"] = bbox
+
+        if write_covering_bbox:
+            column_metadata[col]["covering"] = {
+                "bbox": {
+                    "xmin": ["bbox", "xmin"],
+                    "ymin": ["bbox", "ymin"],
+                    "xmax": ["bbox", "xmax"],
+                    "ymax": ["bbox", "ymax"],
+                },
+            }
+
+    return {
+        "primary_column": primary_column,
+        "columns": column_metadata,
+        "version": schema_version,
+        "creator": {"library": "geopandas", "version": geopandas.__version__},
+    }
 
 
 def _create_metadata(
@@ -154,71 +237,17 @@ def _create_metadata(
     -------
     dict
     """
-    if schema_version is None:
-        if geometry_encoding and any(
-            encoding != "WKB" for encoding in geometry_encoding.values()
-        ):
-            schema_version = "1.1.0"
-        else:
-            schema_version = METADATA_VERSION
-
-    if schema_version not in SUPPORTED_VERSIONS:
-        raise ValueError(
-            f"schema_version must be one of: {', '.join(SUPPORTED_VERSIONS)}"
-        )
-
-    # Construct metadata for each geometry
-    column_metadata = {}
-    for col in df.columns[np.asarray(df.dtypes.map(_is_geometry_like_dtype), dtype=bool)]:
-        series = df[col]
-
-        geometry_types = _get_geometry_types(series)
-        if schema_version[0] == "0":
-            geometry_types_name = "geometry_type"
-            if len(geometry_types) == 1:
-                geometry_types = geometry_types[0]
-        else:
-            geometry_types_name = "geometry_types"
-
-        crs = None
-        if series.crs:
-            if schema_version == "0.1.0":
-                crs = series.crs.to_wkt()
-            else:  # version >= 0.4.0
-                crs = series.crs.to_json_dict()
-                _remove_id_from_member_of_ensembles(crs)
-
-        column_metadata[col] = {
-            "encoding": (
-                geometry_encoding[col]
-                if geometry_encoding and col in geometry_encoding
-                else "WKB"
-            ),
-            "crs": crs,
-            geometry_types_name: geometry_types,
-        }
-
-        bbox = series.total_bounds.tolist()
-        if np.isfinite(bbox).all():
-            # don't add bbox with NaNs for empty / all-NA geometry column
-            column_metadata[col]["bbox"] = bbox
-
-        if write_covering_bbox:
-            column_metadata[col]["covering"] = {
-                "bbox": {
-                    "xmin": ["bbox", "xmin"],
-                    "ymin": ["bbox", "ymin"],
-                    "xmax": ["bbox", "xmax"],
-                    "ymax": ["bbox", "ymax"],
-                },
-            }
-
-    return {
-        "primary_column": df._geometry_column_name,
-        "columns": column_metadata,
-        "version": schema_version,
-        "creator": {"library": "geopandas", "version": geopandas.__version__},
+    geometry_columns = {
+        col: df[col]
+        for col in df.columns[np.asarray(df.dtypes.map(_is_geometry_like_dtype), dtype=bool)]
     }
+    return _create_geometry_metadata(
+        geometry_columns,
+        primary_column=df._geometry_column_name,
+        schema_version=schema_version,
+        geometry_encoding=geometry_encoding,
+        write_covering_bbox=write_covering_bbox,
+    )
 
 
 def _encode_metadata(metadata):
@@ -395,22 +424,109 @@ def _geopandas_to_arrow(
 
     # Store geopandas specific file-level metadata
     # This must be done AFTER creating the table or it is not persisted
-    metadata = table.schema.metadata
-    metadata.update({b"geo": _encode_metadata(geo_metadata)})
+    return _replace_table_schema_metadata(
+        table,
+        geo_metadata=geo_metadata,
+        attrs=df.attrs or None,
+    )
 
-    # Store attributes in metadata if exists
-    if df.attrs:
-        df_metadata = {"PANDAS_ATTRS": json.dumps(df.attrs)}
-        metadata |= df_metadata
 
-    return table.replace_schema_metadata(metadata)
+def _native_tabular_to_arrow(
+    payload,
+    *,
+    index=None,
+    geometry_encoding="WKB",
+    schema_version=None,
+    write_covering_bbox=None,
+):
+    from pyarrow import StructArray
+
+    from vibespatial.api._native_results import NativeTabularResult
+    from vibespatial.io.geoarrow import native_tabular_to_arrow
+
+    if not isinstance(payload, NativeTabularResult):
+        raise TypeError("_native_tabular_to_arrow expects a NativeTabularResult")
+
+    if schema_version is not None:
+        if geometry_encoding != "WKB" and schema_version != "1.1.0":
+            raise ValueError(
+                "'geoarrow' encoding is only supported with schema version >= 1.1.0"
+            )
+
+    if write_covering_bbox and "bbox" in payload.attributes.columns:
+        raise ValueError(
+            "An existing column 'bbox' already exists in the dataframe. "
+            "Please rename to write covering bbox."
+        )
+
+    table, geometry_encoding_dict = native_tabular_to_arrow(
+        payload,
+        index=index,
+        geometry_encoding=geometry_encoding,
+        interleaved=False,
+        include_z=None,
+    )
+    geometry_series = payload.geometry.to_geoseries(
+        index=payload.attributes.index,
+        name=payload.geometry_name,
+    )
+    geo_metadata = _create_geometry_metadata(
+        {payload.geometry_name: geometry_series},
+        primary_column=payload.geometry_name,
+        schema_version=schema_version,
+        geometry_encoding=geometry_encoding_dict,
+        write_covering_bbox=write_covering_bbox,
+    )
+
+    if write_covering_bbox:
+        bounds = geometry_series.bounds
+        bbox_array = StructArray.from_arrays(
+            [bounds["minx"], bounds["miny"], bounds["maxx"], bounds["maxy"]],
+            names=["xmin", "ymin", "xmax", "ymax"],
+        )
+        table = table.append_column("bbox", bbox_array)
+
+    return _replace_table_schema_metadata(
+        table,
+        geo_metadata=geo_metadata,
+        attrs=payload.attrs,
+    )
+
+
+def _spatial_to_arrow(
+    spatial,
+    *,
+    index=None,
+    geometry_encoding="WKB",
+    schema_version=None,
+    write_covering_bbox=None,
+):
+    from vibespatial.api._native_results import to_native_tabular_result
+
+    payload = to_native_tabular_result(spatial)
+    if payload is not None:
+        return _native_tabular_to_arrow(
+            payload,
+            index=index,
+            geometry_encoding=geometry_encoding,
+            schema_version=schema_version,
+            write_covering_bbox=write_covering_bbox,
+        )
+
+    return _geopandas_to_arrow(
+        spatial,
+        index=index,
+        geometry_encoding=geometry_encoding,
+        schema_version=schema_version,
+        write_covering_bbox=write_covering_bbox,
+    )
 
 
 def _to_parquet(
     df,
     path,
     index=None,
-    compression="snappy",
+    compression="lz4",
     geometry_encoding="WKB",
     schema_version=None,
     write_covering_bbox=False,
@@ -440,7 +556,7 @@ def _to_parquet(
         If ``False``, the index(es) will not be written to the file.
         If ``None``, the index(ex) will be included as columns in the file
         output except `RangeIndex` which is stored as metadata only.
-    compression : {'snappy', 'gzip', 'brotli', None}, default 'snappy'
+    compression : {'snappy', 'gzip', 'brotli', 'lz4', 'zstd', None}, default 'lz4'
         Name of the compression to use. Use ``None`` for no compression.
     geometry_encoding : {'WKB', 'geoarrow'}, default 'WKB'
         The encoding to use for the geometry columns. Defaults to "WKB"
@@ -461,7 +577,7 @@ def _to_parquet(
     )
 
     path = _expand_user(path)
-    table = _geopandas_to_arrow(
+    table = _spatial_to_arrow(
         df,
         index=index,
         geometry_encoding=geometry_encoding,
@@ -510,7 +626,7 @@ def _to_feather(df, path, index=None, compression=None, schema_version=None, **k
     )
 
     path = _expand_user(path)
-    table = _geopandas_to_arrow(df, index=index, schema_version=schema_version)
+    table = _spatial_to_arrow(df, index=index, schema_version=schema_version)
     feather.write_feather(table, path, compression=compression, **kwargs)
 
 

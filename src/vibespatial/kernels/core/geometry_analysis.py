@@ -52,6 +52,12 @@ _BOUNDS_KERNEL_SOURCE = _format_bounds_kernel_source("double")
 _BOUNDS_COOPERATIVE_KERNEL_SOURCE = _format_cooperative_bounds_kernel_source("double")
 
 
+def _current_cuda_stream():
+    if cp is None:
+        return None
+    return cp.cuda.get_current_stream()
+
+
 def _compute_geometry_bounds_cpu_scalar(geometry_array: OwnedGeometryArray):
     return _compute_geometry_bounds_cpu_scalar_host(geometry_array)
 
@@ -203,7 +209,13 @@ def _launch_family_bounds_kernel(
             ),
         )
     grid, block = runtime.launch_config(kernel, row_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
 
 
 def _avg_coords_per_geometry(buffer: FamilyGeometryBuffer) -> float:
@@ -278,18 +290,32 @@ def _launch_family_bounds_cooperative(
     # and shared memory sized for 8 warps (256 / 32).
     grid = (row_count, 1, 1)
     block = (256, 1, 1)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
+    runtime.launch(
+        kernel,
+        grid=grid,
+        block=block,
+        params=params,
+        stream=_current_cuda_stream(),
+    )
 
 
 def _compute_geometry_bounds_gpu_impl(
     geometry_array: OwnedGeometryArray,
     compute_type: str = "double",
+    *,
+    materialize_host: bool = True,
 ):
     if cp is None:  # pragma: no cover - exercised on CPU-only installs
         raise RuntimeError("CuPy is not installed; GPU bounds execution is unavailable")
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
     state = geometry_array._ensure_device_state()
+    if state.row_bounds is not None:
+        if materialize_host:
+            bounds = runtime.copy_device_to_host(state.row_bounds)
+            geometry_array.cache_bounds(bounds)
+            return bounds
+        return cp.asarray(state.row_bounds)
     temp_bounds: list[tuple[GeometryFamily, DeviceFamilyGeometryBuffer, object]] = []
     _cooperative_families = frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
     try:
@@ -348,19 +374,28 @@ def _compute_geometry_bounds_gpu_impl(
                 ),
             )
             grid, block = runtime.launch_config(kernel, geometry_array.row_count)
-            runtime.launch(kernel, grid=grid, block=block, params=params)
-            runtime.synchronize()
-            bounds = runtime.copy_device_to_host(out_bounds)
+            runtime.launch(
+                kernel,
+                grid=grid,
+                block=block,
+                params=params,
+                stream=_current_cuda_stream(),
+            )
+            if materialize_host:
+                runtime.synchronize()
+                bounds = runtime.copy_device_to_host(out_bounds)
         except Exception:
             runtime.free(out_bounds)
             raise
         # Cache per-row device bounds instead of freeing — avoids
         # recomputation for subsequent device-side bbox queries (dwithin).
         state.row_bounds = out_bounds
-        geometry_array.cache_bounds(bounds)
         for family, _, device_bounds in temp_bounds:
             geometry_array.cache_device_bounds(family, device_bounds)
-        return bounds
+        if materialize_host:
+            geometry_array.cache_bounds(bounds)
+            return bounds
+        return cp.asarray(out_bounds)
     except Exception:
         for _, device_buffer, device_bounds in temp_bounds:
             device_buffer.bounds = None
@@ -383,6 +418,71 @@ def _compute_geometry_bounds_gpu(
     compute_type: str = "double",
 ):
     return _compute_geometry_bounds_gpu_impl(geometry_array, compute_type=compute_type)
+
+
+def compute_geometry_bounds_device(
+    geometry_array: OwnedGeometryArray,
+    *,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
+):
+    """Return per-row bounds as a device array without forcing a D2H copy."""
+    normalize_precision_mode(precision)
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        raise RuntimeError("CuPy is not installed; GPU bounds execution is unavailable")
+
+    row_count = geometry_array.row_count
+    geometry_families = tuple(sorted(family.value for family in geometry_array.families))
+
+    plan = plan_kernel_dispatch(
+        kernel_name="compute_geometry_bounds",
+        kernel_class=KernelClass.COARSE,
+        row_count=row_count,
+        geometry_families=geometry_families,
+        mixed_geometry=len(geometry_families) > 1,
+        current_residency=geometry_array.residency,
+        requested_mode=ExecutionMode.GPU,
+        requested_precision=precision,
+    )
+    selection = plan.runtime_selection
+    geometry_array.record_runtime_selection(selection)
+    if selection.selected is not ExecutionMode.GPU:
+        raise RuntimeError("device bounds requested but GPU dispatch was not selected")
+
+    precision_plan = select_precision_plan(
+        runtime_selection=selection,
+        kernel_class=KernelClass.COARSE,
+        requested=precision,
+    )
+    try:
+        geometry_array.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="compute_geometry_bounds_device selected GPU execution",
+        )
+        d_bounds = _compute_geometry_bounds_gpu_impl(
+            geometry_array,
+            compute_type="double",
+            materialize_host=False,
+        )
+    except Exception as exc:
+        record_fallback_event(
+            surface="geopandas.array.bounds",
+            reason="GPU device-bounds kernel failed; device-only caller cannot fall back to CPU bounds",
+            detail=f"rows={row_count}",
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+        )
+        raise RuntimeError("device bounds computation failed") from exc
+
+    record_dispatch_event(
+        surface="geopandas.array.bounds",
+        operation="bounds",
+        implementation="gpu_nvrtc_bounds_device",
+        reason="GPU NVRTC bounds kernel kept bounds resident on device",
+        detail=f"rows={row_count}, precision={precision_plan.compute_precision}",
+        selected=ExecutionMode.GPU,
+    )
+    return d_bounds
 
 
 def compute_geometry_bounds(

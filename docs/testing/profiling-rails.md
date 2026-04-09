@@ -18,8 +18,8 @@ Section Map (Body Lines)
 | 28-33 | Verify |
 | 34-41 | Risks |
 | 42-64 | Entry Point |
-| 65-99 | Stage Contracts |
-| 100-109 | Trace Interpretation |
+| 65-98 | Stage Contracts |
+| 99-109 | Trace Interpretation |
 | 110-123 | NVTX |
 DOC_HEADER:END -->
 
@@ -98,10 +98,9 @@ shape obvious:
 Join profiling currently records:
 
 - owned-buffer build
-- bounds computation
-- Morton sort
-- coarse candidate filter
-- predicate refine
+- flat-index build
+- coarse candidate / fast-path selection
+- optional predicate refine
 - output sort
 
 Overlay profiling currently records:
@@ -123,9 +122,10 @@ Each stage reports:
 ## Trace Interpretation
 
 Top-level `selected_runtime` is the device that actually executed the profiled
-stages. If `metadata.planner_selected_runtime` differs, the runtime planner
-would prefer GPU on this machine but the current implementation surface still
-executed on CPU.
+join or overlay hot path. If `metadata.planner_selected_runtime` differs, the
+planner and the realised path diverged; for example, a join may build its flat
+index on CPU but still execute the candidate query path on GPU via a regular-grid
+or owned-query fast path.
 
 This distinction is intentional. The profiling rail is meant to explain real
 execution, not aspirational dispatch.

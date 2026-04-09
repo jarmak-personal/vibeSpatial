@@ -189,6 +189,38 @@ def test_clip_polygon_gpu_coordinates_stay_device_resident() -> None:
 
 
 @pytest.mark.gpu
+def test_clip_polygon_rings_gpu_device_does_not_force_runtime_sync(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.constructive.clip_rect import _clip_polygon_rings_gpu_device
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+
+    def _fail_sync():
+        raise AssertionError("clip polygon device path should not force runtime.synchronize()")
+
+    monkeypatch.setattr(runtime, "synchronize", _fail_sync)
+
+    ring_x = np.asarray([0.0, 4.0, 4.0, 0.0, 0.0], dtype=np.float64)
+    ring_y = np.asarray([0.0, 0.0, 4.0, 4.0, 0.0], dtype=np.float64)
+    ring_offsets = np.asarray([0, 5], dtype=np.int32)
+
+    d_out_x, d_out_y, d_out_offsets = _clip_polygon_rings_gpu_device(
+        ring_x,
+        ring_y,
+        ring_offsets,
+        (1.0, 1.0, 3.0, 3.0),
+    )
+
+    assert d_out_x is not None
+    assert d_out_y is not None
+    assert d_out_offsets is not None
+    assert int(d_out_offsets.size) == 2
+
+
+@pytest.mark.gpu
 def test_clip_lines_gpu_uses_device_family_buffers_when_host_stubs_are_empty() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

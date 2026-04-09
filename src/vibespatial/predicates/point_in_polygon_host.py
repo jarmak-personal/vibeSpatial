@@ -190,4 +190,8 @@ def cpu_return_device_fallback(values: list[bool | None]) -> np.ndarray:
 
 
 def work_cv(work_estimates: np.ndarray) -> float:
-    return float(work_estimates.std() / max(work_estimates.mean(), 1e-9))
+    mean = work_estimates.mean()
+    std = work_estimates.std()
+    mean_value = float(mean.item() if hasattr(mean, "item") else mean)
+    std_value = float(std.item() if hasattr(std, "item") else std)
+    return float(std_value / max(mean_value, 1e-9))

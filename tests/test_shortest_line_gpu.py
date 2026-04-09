@@ -87,6 +87,27 @@ def test_shortest_line_stays_device_resident():
 
 
 @requires_gpu
+def test_shortest_line_gpu_subgroup_writes_do_not_force_runtime_sync(monkeypatch):
+    from vibespatial.constructive.shortest_line import shortest_line_owned
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+
+    def _fail_sync():
+        raise AssertionError("shortest_line subgroup writes should not force runtime.synchronize()")
+
+    monkeypatch.setattr(runtime, "synchronize", _fail_sync)
+
+    left = from_shapely_geometries([Point(0, 0), Point(1, 1)], residency=Residency.DEVICE)
+    right = from_shapely_geometries([Point(3, 4), Point(4, 5)], residency=Residency.DEVICE)
+
+    result = shortest_line_owned(left, right, dispatch_mode="gpu")
+
+    assert result.device_state is not None
+    assert result.row_count == 2
+
+
+@requires_gpu
 def test_shortest_line_all_invalid_rows_stays_device_resident(strict_device_guard):
     """GPU shortest_line keeps the all-empty result branch device-resident."""
     from vibespatial.constructive.shortest_line import shortest_line_owned

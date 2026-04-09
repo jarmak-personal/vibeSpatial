@@ -11,11 +11,16 @@ continues to work.
 """
 from __future__ import annotations
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Re-exports from core geometry modules (backwards compat)
 # ---------------------------------------------------------------------------
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: F401
-from vibespatial.geometry.owned import FAMILY_TAGS  # noqa: F401
+from vibespatial.geometry.owned import (  # noqa: F401
+    FAMILY_TAGS,
+    concatenate_owned_arrays,
+)
 
 # ---------------------------------------------------------------------------
 # io_geoarrow  – GeoArrow bridge, conversion, benchmarks
@@ -54,6 +59,7 @@ from .geoarrow import (  # noqa: F401
     geoseries_from_arrow,
     geoseries_from_owned,
     geoseries_to_arrow,
+    native_tabular_to_arrow,
     plan_geoarrow_codec,
 )
 
@@ -66,8 +72,6 @@ from .geoparquet import (  # noqa: F401
     GeoParquetEnginePlan,
     GeoParquetScanPlan,
     _build_geoparquet_metadata_summary_from_pyarrow,
-    _concat_offsets,
-    _concatenate_owned_arrays,
     _decode_geoparquet_table_to_owned,
     _geoparquet_geometry_column_crs,
     _is_local_geoparquet_file,
@@ -200,3 +204,17 @@ from .wkb import (  # noqa: F401
     plan_wkb_bridge,
     plan_wkb_partition,
 )
+
+
+def _concat_offsets(buffers):
+    if not buffers:
+        return np.asarray([0], dtype=np.int32)
+    parts = [buffers[0]]
+    current = int(buffers[0][-1])
+    for offsets in buffers[1:]:
+        parts.append(offsets[1:] + current)
+        current += int(offsets[-1])
+    return np.concatenate(parts).astype(np.int32, copy=False)
+
+
+_concatenate_owned_arrays = concatenate_owned_arrays

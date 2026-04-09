@@ -60,6 +60,49 @@ request_nvrtc_warmup([
 # GPU implementation
 # ---------------------------------------------------------------------------
 
+
+def _build_device_boxes_from_bounds(
+    device_bounds,
+    *,
+    row_count: int | None = None,
+) -> OwnedGeometryArray:
+    """Build device-resident rectangle polygons from device bounds."""
+    runtime = get_cuda_runtime()
+    if row_count is None:
+        row_count = int(device_bounds.shape[0])
+
+    d_x_out = runtime.allocate((row_count * 5,), np.float64)
+    d_y_out = runtime.allocate((row_count * 5,), np.float64)
+
+    kernels = compile_kernel_group("envelope-fp64", _ENVELOPE_FP64, _ENVELOPE_KERNEL_NAMES)
+    kernel = kernels["envelope_from_bounds"]
+
+    ptr = runtime.pointer
+    params = (
+        (ptr(device_bounds), ptr(d_x_out), ptr(d_y_out), 0.0, 0.0, row_count),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_F64,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    grid, block = runtime.launch_config(kernel, row_count)
+    runtime.launch(kernel, grid=grid, block=block, params=params)
+
+    from vibespatial.constructive.point import _build_device_backed_polygon_output
+
+    return _build_device_backed_polygon_output(
+        d_x_out,
+        d_y_out,
+        row_count=row_count,
+        bounds=None,
+        verts_per_ring=5,
+    )
+
+
 @register_kernel_variant(
     "envelope",
     "gpu-cuda-python",
@@ -71,46 +114,19 @@ request_nvrtc_warmup([
 )
 def _envelope_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     """GPU envelope — returns device-resident Polygon OwnedGeometryArray."""
-    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
-    runtime = get_cuda_runtime()
     row_count = owned.row_count
 
     # Compute bounds on GPU — this populates device_state.row_bounds on device.
-    # Using GPU dispatch avoids a D->H transfer of the entire geometry that
-    # the default CPU dispatch would trigger via move_to(HOST).
-    compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
+    # Keep the per-row bounds on device; this kernel consumes row_bounds
+    # directly and does not need a host-materialized copy.
+    compute_geometry_bounds_device(owned)
 
     # Read the cached device bounds directly — no re-upload needed.
     d_state = owned.device_state
     d_bounds = d_state.row_bounds  # (N, 4) device array, already on device
-
-    d_x_out = runtime.allocate((row_count * 5,), np.float64)
-    d_y_out = runtime.allocate((row_count * 5,), np.float64)
-
-    kernels = compile_kernel_group("envelope-fp64", _ENVELOPE_FP64, _ENVELOPE_KERNEL_NAMES)
-    kernel = kernels["envelope_from_bounds"]
-
-    ptr = runtime.pointer
-    params = (
-        (ptr(d_bounds), ptr(d_x_out), ptr(d_y_out), 0.0, 0.0, row_count),
-        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-         KERNEL_PARAM_F64, KERNEL_PARAM_F64, KERNEL_PARAM_I32),
-    )
-    grid, block = runtime.launch_config(kernel, row_count)
-    runtime.launch(kernel, grid=grid, block=block, params=params)
-
-    # d_bounds is cached in d_state.row_bounds — do NOT free it.
-
-    # Build Polygon OwnedGeometryArray: 1 ring per geometry, 5 verts per ring
-    from vibespatial.constructive.point import _build_device_backed_polygon_output
-
-    return _build_device_backed_polygon_output(
-        d_x_out, d_y_out,
-        row_count=row_count,
-        bounds=None,  # no host bounds needed for device-resident output
-        verts_per_ring=5,
-    )
+    return _build_device_boxes_from_bounds(d_bounds, row_count=row_count)
 
 
 # ---------------------------------------------------------------------------

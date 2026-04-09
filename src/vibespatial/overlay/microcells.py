@@ -570,7 +570,7 @@ def _build_selected_row_microcell_arrays_device(
     y1,
     left_segment_count: int,
     point_x,
-    selection_operation: str,
+    selection_operation: str | None,
 ) -> dict[str, Any] | None:
     if cp is None or int(x0.size) == 0:
         return None
@@ -658,6 +658,8 @@ def _build_selected_row_microcell_arrays_device(
     ) > 1e-12
 
     match selection_operation:
+        case None:
+            band_keep = cp.ones(int(lower_pos.size), dtype=cp.bool_)
         case "intersection":
             band_keep = left_inside & right_inside
         case "union":
@@ -711,7 +713,7 @@ def _build_and_label_selected_overlay_microcells_device(
     right: OwnedGeometryArray,
     *,
     dispatch_mode: ExecutionMode | str,
-    selection_operation: str,
+    selection_operation: str | None,
 ) -> OverlayMicrocellLabels:
     if cp is None:
         return _empty_overlay_microcell_labels_device()
@@ -839,7 +841,7 @@ def build_and_label_overlay_microcells(
         is_gpu = mode is ExecutionMode.GPU
     else:
         is_gpu = str(mode).lower() == "gpu"
-    if cp is not None and is_gpu and selection_operation is not None:
+    if cp is not None and is_gpu:
         return _build_and_label_selected_overlay_microcells_device(
             left,
             right,
