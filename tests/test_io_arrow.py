@@ -1294,6 +1294,111 @@ def test_native_tabular_to_parquet_records_fallback_when_device_writer_declines(
     )
 
 
+def test_native_tabular_to_parquet_compatibility_decline_records_dispatch_not_fallback(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries([Point(0, 0)], residency=Residency.DEVICE),
+            crs="EPSG:4326",
+        )
+    )
+    assert payload is not None
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_write_geoparquet_native_device_payload",
+        lambda *args, **kwargs: io_wkb._NativeDeviceWriteStatus(
+            written=False,
+            compatibility_detail="test-only filesystem-path sink miss",
+        ),
+    )
+
+    path = tmp_path / "native-payload-writer-compatibility.parquet"
+    payload.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert path.exists()
+    assert fallbacks == []
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_payload_arrow_compatibility_export"
+        and "test-only filesystem-path sink miss" in event.detail
+        for event in dispatches
+    )
+
+
+def test_device_geodataframe_to_parquet_compatibility_decline_records_dispatch_not_fallback(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0)])
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_write_geoparquet_native_device",
+        lambda *args, **kwargs: io_wkb._NativeDeviceWriteStatus(
+            written=False,
+            compatibility_detail="test-only public filesystem-path sink miss",
+        ),
+    )
+
+    path = tmp_path / "device-gdf-compatibility.parquet"
+    gdf.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert path.exists()
+    assert fallbacks == []
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_geodataframe_arrow_compatibility_export"
+        and "test-only public filesystem-path sink miss" in event.detail
+        for event in dispatches
+    )
+
+
+def test_device_geodataframe_to_parquet_fallback_decline_raises_in_strict_native(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    from vibespatial.runtime.fallbacks import StrictNativeFallbackError
+    from vibespatial.testing import strict_native_environment
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0)])
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_write_geoparquet_native_device",
+        lambda *args, **kwargs: io_wkb._NativeDeviceWriteStatus(
+            written=False,
+            fallback_detail="test-only missing pylibcudf support",
+        ),
+    )
+
+    path = tmp_path / "device-gdf-strict-fallback.parquet"
+    with pytest.raises(StrictNativeFallbackError):
+        with strict_native_environment():
+            gdf.to_parquet(path)
+
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    assert any("test-only missing pylibcudf support" in event.detail for event in fallbacks)
+
+
 def test_arrow_backed_native_attributes_feather_without_pandas_materialization(
     tmp_path,
     monkeypatch,

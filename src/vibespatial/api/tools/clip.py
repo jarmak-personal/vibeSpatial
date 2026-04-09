@@ -798,6 +798,10 @@ def _clip_polygon_partition_with_polygon_mask(partition, mask):
         from_shapely_geometries,
     )
 
+    partition = _promote_geometry_backing_to_device(
+        partition,
+        reason="clip polygon-mask partition selected GPU-native constructive path",
+    )
     source_values = partition.geometry.values if isinstance(partition, GeoDataFrame) else partition.values
     source_missing = np.asarray(source_values.isna() | source_values.is_empty, dtype=bool)
 

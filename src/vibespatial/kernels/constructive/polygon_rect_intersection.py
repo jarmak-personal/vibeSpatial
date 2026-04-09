@@ -484,6 +484,32 @@ def _host_rectangle_bounds(polygon_buf, row_count: int):
     return xmin, ymin, xmax, ymax
 
 
+def _host_max_input_vertices(polygon_buf, row_count: int) -> int | None:
+    if polygon_buf is None or polygon_buf.ring_offsets is None:
+        return None
+    if int(polygon_buf.ring_offsets.size) != row_count + 1:
+        return None
+    max_input_verts = 0
+    for row in range(row_count):
+        ring_span = int(polygon_buf.ring_offsets[row + 1]) - int(polygon_buf.ring_offsets[row])
+        if ring_span > max_input_verts:
+            max_input_verts = ring_span
+    return max_input_verts
+
+
+def _device_max_input_vertices(polygon_buf, row_count: int) -> int | None:
+    if polygon_buf is None or polygon_buf.ring_offsets is None:
+        return None
+    if int(polygon_buf.ring_offsets.size) != row_count + 1:
+        return None
+    ring_spans = polygon_buf.ring_offsets[1:] - polygon_buf.ring_offsets[:-1]
+    if int(ring_spans.size) != row_count:
+        return None
+    if int(ring_spans.size) == 0:
+        return 0
+    return int(cp.max(ring_spans).item())
+
+
 def polygon_rect_intersection_can_handle(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -501,18 +527,32 @@ def polygon_rect_intersection_can_handle(
 
     left_host = left.families[GeometryFamily.POLYGON]
     right_host = right.families[GeometryFamily.POLYGON]
-    if not _host_is_dense_single_ring_polygons(left_host, left.row_count):
+    left_device = (
+        None
+        if left.device_state is None or GeometryFamily.POLYGON not in left.device_state.families
+        else left.device_state.families[GeometryFamily.POLYGON]
+    )
+    right_device = (
+        None
+        if right.device_state is None or GeometryFamily.POLYGON not in right.device_state.families
+        else right.device_state.families[GeometryFamily.POLYGON]
+    )
+
+    if left_host.host_materialized:
+        if not _host_is_dense_single_ring_polygons(left_host, left.row_count):
+            return False
+        max_input_verts = _host_max_input_vertices(left_host, left.row_count)
+    else:
+        if not _device_is_dense_single_ring_polygons(left_device, left.row_count):
+            return False
+        max_input_verts = _device_max_input_vertices(left_device, left.row_count)
+
+    if max_input_verts is None or max_input_verts > (_MAX_INPUT_VERTS + 1):
         return False
-    if left_host.ring_offsets is None:
-        return False
-    max_input_verts = 0
-    for row in range(left.row_count):
-        ring_span = int(left_host.ring_offsets[row + 1]) - int(left_host.ring_offsets[row])
-        if ring_span > max_input_verts:
-            max_input_verts = ring_span
-    if max_input_verts > (_MAX_INPUT_VERTS + 1):
-        return False
-    return _host_rectangle_bounds(right_host, right.row_count) is not None
+
+    if right_host.host_materialized:
+        return _host_rectangle_bounds(right_host, right.row_count) is not None
+    return _device_rectangle_bounds(right_device, right.row_count) is not None
 
 
 def _polygon_rect_intersection_gpu(

@@ -51,6 +51,20 @@ def _payload_geometry_series(payload: NativeTabularResult):
     )
 
 
+def _record_terminal_geoparquet_compatibility_export(*, detail: str, implementation: str) -> None:
+    record_dispatch_event(
+        surface="geopandas.geodataframe.to_parquet",
+        operation="to_parquet",
+        implementation=implementation,
+        reason=(
+            "terminal GeoParquet export used the explicit Arrow compatibility writer "
+            "after the native device writer declined a sink feature"
+        ),
+        detail=detail,
+        selected=ExecutionMode.CPU,
+    )
+
+
 def _write_geoparquet_native_tabular_result(
     payload: NativeTabularResult,
     path,
@@ -92,6 +106,11 @@ def _write_geoparquet_native_tabular_result(
             selected=ExecutionMode.CPU,
             pipeline="io/to_parquet",
             d2h_transfer=True,
+        )
+    elif device_write.compatibility_detail is not None:
+        _record_terminal_geoparquet_compatibility_export(
+            detail=device_write.compatibility_detail,
+            implementation="native_payload_arrow_compatibility_export",
         )
 
     table, geometry_encoding_dict = native_tabular_to_arrow(
@@ -1174,6 +1193,11 @@ def _write_geoparquet_native(
             selected=ExecutionMode.CPU,
             pipeline="io/to_parquet",
             d2h_transfer=True,
+        )
+    elif device_write.compatibility_detail is not None:
+        _record_terminal_geoparquet_compatibility_export(
+            detail=device_write.compatibility_detail,
+            implementation="native_geodataframe_arrow_compatibility_export",
         )
 
     # Build a table from non-geometry columns

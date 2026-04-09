@@ -81,6 +81,7 @@ class _GpuWkbDecodeAttempt:
 class _NativeDeviceWriteStatus:
     written: bool
     fallback_detail: str | None = None
+    compatibility_detail: str | None = None
 
 
 class _GpuWkbOnInvalidError(ValueError):
@@ -657,7 +658,7 @@ def _write_geoparquet_native_device_payload(
     if unrecognized_kwargs:
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail=(
+            compatibility_detail=(
                 "native device GeoParquet payload writer does not support "
                 f"kwargs={sorted(unrecognized_kwargs)}"
             ),
@@ -665,7 +666,7 @@ def _write_geoparquet_native_device_payload(
     if not _native_parquet_compression_supported(compression):
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail=(
+            compatibility_detail=(
                 "native device GeoParquet payload writer does not support "
                 f"compression={compression!r}"
             ),
@@ -673,12 +674,16 @@ def _write_geoparquet_native_device_payload(
     if not isinstance(path, (str, bytes, os.PathLike)):
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail="native device GeoParquet payload writer requires a filesystem path sink",
+            compatibility_detail=(
+                "native device GeoParquet payload writer requires a filesystem path sink"
+            ),
         )
     if plc is None or not has_pylibcudf_support():
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail="pylibcudf support is unavailable for the native device GeoParquet payload writer",
+            fallback_detail=(
+                "pylibcudf support is unavailable for the native device GeoParquet payload writer"
+            ),
         )
 
     non_geometry_columns = [column for column in column_order if column != geometry_name]
@@ -723,7 +728,9 @@ def _write_geoparquet_native_device_payload(
         if _cp is None:
             return _NativeDeviceWriteStatus(
                 written=False,
-                fallback_detail="covering bbox export requires CuPy for the native device GeoParquet payload writer",
+                fallback_detail=(
+                    "covering bbox export requires CuPy for the native device GeoParquet payload writer"
+                ),
             )
         from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
@@ -935,7 +942,7 @@ def _write_geoparquet_native_device(
     if unrecognized_kwargs:
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail=(
+            compatibility_detail=(
                 "native device GeoParquet writer does not support "
                 f"kwargs={sorted(unrecognized_kwargs)}"
             ),
@@ -943,7 +950,7 @@ def _write_geoparquet_native_device(
     if not _native_parquet_compression_supported(compression):
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail=(
+            compatibility_detail=(
                 "native device GeoParquet writer does not support "
                 f"compression={compression!r}"
             ),
@@ -951,12 +958,16 @@ def _write_geoparquet_native_device(
     if not isinstance(path, (str, bytes, os.PathLike)):
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail="native device GeoParquet writer requires a filesystem path sink",
+            compatibility_detail=(
+                "native device GeoParquet writer requires a filesystem path sink"
+            ),
         )
     if plc is None or not has_pylibcudf_support():
         return _NativeDeviceWriteStatus(
             written=False,
-            fallback_detail="pylibcudf support is unavailable for the native device GeoParquet writer",
+            fallback_detail=(
+                "pylibcudf support is unavailable for the native device GeoParquet writer"
+            ),
         )
 
     geometry_columns_set = set(geometry_columns)
@@ -1013,7 +1024,9 @@ def _write_geoparquet_native_device(
             # and covering metadata stay consistent.
             return _NativeDeviceWriteStatus(
                 written=False,
-                fallback_detail="covering bbox export requires CuPy for the native device GeoParquet writer",
+                fallback_detail=(
+                    "covering bbox export requires CuPy for the native device GeoParquet writer"
+                ),
             )
         from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 

@@ -8,7 +8,7 @@ import shapely
 from shapely.geometry import Point, Polygon, box
 
 from vibespatial.runtime import ExecutionMode
-from vibespatial.runtime.residency import Residency
+from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.testing import build_owned as _make_owned_polygons
 
 try:
@@ -50,6 +50,57 @@ def test_polygon_rect_intersection_can_handle_uses_host_probe_without_move_to(
     monkeypatch.setattr(OwnedGeometryArray, "move_to", _fail_move_to)
 
     assert polygon_rect_intersection_can_handle(left, right) is False
+
+
+@requires_gpu
+def test_polygon_rect_intersection_can_handle_device_take_rows():
+    left = _make_owned_polygons(
+        [
+            Polygon(
+                [
+                    (0.0, 0.0),
+                    (5.0, 12.0),
+                    (10.0, 0.0),
+                    (0.0, 0.0),
+                ]
+            ),
+            Polygon(
+                [
+                    (20.0, 0.0),
+                    (25.0, 12.0),
+                    (30.0, 0.0),
+                    (20.0, 0.0),
+                ]
+            ),
+        ]
+    )
+    right = _make_owned_polygons(
+        [
+            box(0.0, 0.0, 10.0, 10.0),
+            box(20.0, 0.0, 30.0, 10.0),
+        ]
+    )
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test device-take capability probe",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="test device-take capability probe",
+    )
+
+    import cupy as cp
+
+    left_subset = left.device_take(cp.asarray([0, 1], dtype=cp.int64))
+    right_subset = right.device_take(cp.asarray([0, 1], dtype=cp.int64))
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection_can_handle,
+    )
+
+    assert polygon_rect_intersection_can_handle(left_subset, right_subset) is True
 
 
 def _assert_geom_equal(gpu_geom, ref_geom, *, rtol=1e-6, msg=""):

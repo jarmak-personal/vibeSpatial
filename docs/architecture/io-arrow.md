@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 205/260 lines
+Body Budget: 209/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-167 | Current Behavior |
-| 168-205 | Measured Local Baseline |
+| 76-171 | Current Behavior |
+| 172-209 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -161,6 +161,10 @@ geometry buffers while keeping GPU-native formats as the design center.
 - The GeoParquet writer consumes that shared native tabular boundary directly,
   so writer-local payload assembly is no longer the place where native result
   semantics live.
+- Terminal GeoParquet compatibility decisions such as non-filesystem sinks or
+  non-native compression now record an explicit CPU dispatch at the sink
+  boundary instead of a fallback event, so strict-native mode still rejects
+  hidden mid-pipeline fallback without forbidding explicit compatibility export.
 - Repo-owned `read_geoparquet_owned(...)` now provides the scan-engine seam for
   `o17.6.20`:
   - backend selection: `pylibcudf` or `pyarrow`
