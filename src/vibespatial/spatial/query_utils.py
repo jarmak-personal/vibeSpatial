@@ -20,6 +20,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.predicates.binary import evaluate_binary_predicate
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.precision import KernelClass
 from vibespatial.runtime.residency import Residency
 
@@ -274,6 +275,25 @@ def _planned_query_runtime_selection(
     return replace(selection.runtime_selection, reason=reason)
 
 
+def record_shapely_fallback_event(
+    *,
+    surface: str,
+    reason: str,
+    detail: str = "",
+    pipeline: str = "",
+    d2h_transfer: bool = False,
+) -> None:
+    record_fallback_event(
+        surface=surface,
+        requested=ExecutionMode.AUTO,
+        selected=ExecutionMode.CPU,
+        reason=reason,
+        detail=detail,
+        pipeline=pipeline,
+        d2h_transfer=d2h_transfer,
+    )
+
+
 def _filter_predicate_pairs(
     predicate: str | None,
     query_values: np.ndarray,
@@ -441,9 +461,29 @@ def _filter_predicate_pairs_owned(
         # Device-resident non-point tag set for DE-9IM path (avoids H2D
         # upload of host non_point_tags later).
         d_non_point_tags = _cp.concatenate([line_tags_arr, region_tags_arr])
+        d_de9im_pair_mask = (
+            _cp.isin(d_left_tags, d_non_point_tags)
+            & _cp.isin(d_right_tags, d_non_point_tags)
+        )
 
         all_gpu = bool(_cp.all(d_gpu_pair_mask))
         any_gpu = bool(_cp.any(d_gpu_pair_mask))
+        all_non_gpu_have_de9im = bool(_cp.all(d_de9im_pair_mask | d_gpu_pair_mask))
+
+        host_fallback_needed = (
+            not all_gpu
+            and not (all_non_gpu_have_de9im and predicate in _POLYGON_DE9IM_PREDICATES)
+        )
+        fallback_event_recorded = False
+        if host_fallback_needed:
+            record_shapely_fallback_event(
+                surface="vibespatial.spatial.query",
+                reason="GPU candidate refinement requires Shapely fallback for unsupported predicate families",
+                detail=f"predicate={predicate!r}",
+                pipeline="gpu_candidates -> shapely_refine",
+                d2h_transfer=True,
+            )
+            fallback_event_recorded = True
 
         # Materialise host arrays only when needed below.
         # Tag arrays stay on device; host copies are deferred (hitlist #18).
@@ -526,113 +566,114 @@ def _filter_predicate_pairs_owned(
 
     # --- GPU DE-9IM predicate path ---
     # When all non-GPU pairs are line/polygon families, use the DE-9IM kernel.
-    _ensure_host_tags()
-    non_point_tags = np.concatenate([line_tags, region_tags])
-    de9im_pair_mask = (
-        np.isin(left_tags, non_point_tags) & np.isin(right_tags, non_point_tags)
-    )
-    non_gpu_mask = ~gpu_pair_mask
-    all_non_gpu_have_de9im = bool(np.all(de9im_pair_mask | gpu_pair_mask))
-
-    if all_non_gpu_have_de9im and has_gpu_runtime() and predicate in _POLYGON_DE9IM_PREDICATES:
-        keep = np.zeros(left_indices.size, dtype=bool)
-
-        # Handle point-pairs via indexed access (no take copy).
-        if any_gpu:
-            from vibespatial.predicates.point_relations import classify_point_predicates_indexed
-            gpu_idx = np.flatnonzero(gpu_pair_mask)
-            gpu_left = left_indices[gpu_idx]
-            gpu_right = right_indices[gpu_idx]
-            keep[gpu_idx] = classify_point_predicates_indexed(
-                predicate, query_owned, tree_owned, gpu_left, gpu_right,
-            )
-
-        # Handle line/polygon pairs via DE-9IM kernel.
-        de9im_idx = np.flatnonzero(non_gpu_mask & de9im_pair_mask)
-        if de9im_idx.size > 0:
-            de9im_left = left_indices[de9im_idx]
-            de9im_right = right_indices[de9im_idx]
-            de9im_left_tags = left_tags[de9im_idx]
-            de9im_right_tags = right_tags[de9im_idx]
-
-            # When device candidates are available, extract device sub-arrays
-            # via CuPy fancy indexing to avoid re-uploading indices.
-            _dc = device_candidates
-            _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
-
-            # Pre-compute device-side DE-9IM index mask to avoid D->H->D
-            # round-trip (ZCOPY001).  d_left_tags/d_right_tags from line
-            # 374-375 stay on device; we compute per-(lt,rt) sub-indices
-            # directly on GPU instead of uploading host numpy masks.
-            if _use_device_idx:
-                d_non_gpu_mask = ~d_gpu_pair_mask
-                d_de9im_pair_mask = (
-                    _cp.isin(d_left_tags, d_non_point_tags)
-                    & _cp.isin(d_right_tags, d_non_point_tags)
-                )
-                d_de9im_base_mask = d_non_gpu_mask & d_de9im_pair_mask
-                d_de9im_idx = _cp.flatnonzero(d_de9im_base_mask).astype(_cp.int32)
-
-            # Group by (left_family, right_family) to dispatch correct kernel.
-            de9im_masks = np.zeros(de9im_idx.size, dtype=np.uint16)
-            for (lt, rt) in unique_tag_pairs(de9im_left_tags, de9im_right_tags):
-                sub_mask = (de9im_left_tags == lt) & (de9im_right_tags == rt)
-                sub_idx = np.flatnonzero(sub_mask)
-                if sub_idx.size == 0:
-                    continue
-                lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
-                rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
-                if lf is None or rf is None:
-                    continue
-
-                # Build device sub-arrays when candidates are device-resident.
-                # Compute sub-indices on device from device tag arrays to avoid
-                # uploading host-computed indices (eliminates D->H->D ping-pong).
-                d_sub_left = None
-                d_sub_right = None
-                if _use_device_idx:
-                    d_sub_mask = (d_left_tags[d_de9im_idx] == lt) & (d_right_tags[d_de9im_idx] == rt)
-                    d_full_idx = d_de9im_idx[_cp.flatnonzero(d_sub_mask)]
-                    d_sub_left = _dc.d_left[d_full_idx]
-                    d_sub_right = _dc.d_right[d_full_idx]
-
-                from vibespatial.predicates.polygon import (
-                    compute_polygon_de9im_gpu,
-                    evaluate_predicate_from_de9im,
-                )
-                sub_result = compute_polygon_de9im_gpu(
-                    query_owned, tree_owned,
-                    de9im_left[sub_idx], de9im_right[sub_idx],
-                    query_family=lf, tree_family=rf,
-                    d_left=d_sub_left, d_right=d_sub_right,
-                )
-                if sub_result is not None:
-                    de9im_masks[sub_idx] = sub_result
-
-            keep[de9im_idx] = evaluate_predicate_from_de9im(de9im_masks, predicate)
-
-        return (
-            left_indices[keep],
-            right_indices[keep],
-            _planned_query_runtime_selection(
-                kernel_name="predicate_refine",
-                kernel_class=KernelClass.PREDICATE,
-                row_count=left_indices.size,
-                requested_mode=ExecutionMode.GPU,
-                gpu_available=True,
-                reason=f"GPU DE-9IM {predicate} refinement for non-point pairs",
-            ),
+    if _has_device and has_gpu_runtime():
+        _ensure_host_tags()
+        non_point_tags = np.concatenate([line_tags, region_tags])
+        de9im_pair_mask = (
+            np.isin(left_tags, non_point_tags) & np.isin(right_tags, non_point_tags)
         )
+        non_gpu_mask = ~gpu_pair_mask
+        all_non_gpu_have_de9im = bool(np.all(de9im_pair_mask | gpu_pair_mask))
+
+        if all_non_gpu_have_de9im and predicate in _POLYGON_DE9IM_PREDICATES:
+            keep = np.zeros(left_indices.size, dtype=bool)
+
+            # Handle point-pairs via indexed access (no take copy).
+            if any_gpu:
+                from vibespatial.predicates.point_relations import classify_point_predicates_indexed
+                gpu_idx = np.flatnonzero(gpu_pair_mask)
+                gpu_left = left_indices[gpu_idx]
+                gpu_right = right_indices[gpu_idx]
+                keep[gpu_idx] = classify_point_predicates_indexed(
+                    predicate, query_owned, tree_owned, gpu_left, gpu_right,
+                )
+
+            # Handle line/polygon pairs via DE-9IM kernel.
+            de9im_idx = np.flatnonzero(non_gpu_mask & de9im_pair_mask)
+            if de9im_idx.size > 0:
+                de9im_left = left_indices[de9im_idx]
+                de9im_right = right_indices[de9im_idx]
+                de9im_left_tags = left_tags[de9im_idx]
+                de9im_right_tags = right_tags[de9im_idx]
+
+                # When device candidates are available, extract device sub-arrays
+                # via CuPy fancy indexing to avoid re-uploading indices.
+                _dc = device_candidates
+                _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
+
+                # Pre-compute device-side DE-9IM index mask to avoid D->H->D
+                # round-trip (ZCOPY001).  d_left_tags/d_right_tags from line
+                # 374-375 stay on device; we compute per-(lt,rt) sub-indices
+                # directly on GPU instead of uploading host numpy masks.
+                if _use_device_idx:
+                    d_non_gpu_mask = ~d_gpu_pair_mask
+                    d_de9im_pair_mask = (
+                        _cp.isin(d_left_tags, d_non_point_tags)
+                        & _cp.isin(d_right_tags, d_non_point_tags)
+                    )
+                    d_de9im_base_mask = d_non_gpu_mask & d_de9im_pair_mask
+                    d_de9im_idx = _cp.flatnonzero(d_de9im_base_mask).astype(_cp.int32)
+
+                # Group by (left_family, right_family) to dispatch correct kernel.
+                de9im_masks = np.zeros(de9im_idx.size, dtype=np.uint16)
+                for (lt, rt) in unique_tag_pairs(de9im_left_tags, de9im_right_tags):
+                    sub_mask = (de9im_left_tags == lt) & (de9im_right_tags == rt)
+                    sub_idx = np.flatnonzero(sub_mask)
+                    if sub_idx.size == 0:
+                        continue
+                    lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
+                    rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
+                    if lf is None or rf is None:
+                        continue
+
+                    # Build device sub-arrays when candidates are device-resident.
+                    # Compute sub-indices on device from device tag arrays to avoid
+                    # uploading host-computed indices (eliminates D->H->D ping-pong).
+                    d_sub_left = None
+                    d_sub_right = None
+                    if _use_device_idx:
+                        d_sub_mask = (d_left_tags[d_de9im_idx] == lt) & (d_right_tags[d_de9im_idx] == rt)
+                        d_full_idx = d_de9im_idx[_cp.flatnonzero(d_sub_mask)]
+                        d_sub_left = _dc.d_left[d_full_idx]
+                        d_sub_right = _dc.d_right[d_full_idx]
+
+                    from vibespatial.predicates.polygon import (
+                        compute_polygon_de9im_gpu,
+                        evaluate_predicate_from_de9im,
+                    )
+                    sub_result = compute_polygon_de9im_gpu(
+                        query_owned, tree_owned,
+                        de9im_left[sub_idx], de9im_right[sub_idx],
+                        query_family=lf, tree_family=rf,
+                        d_left=d_sub_left, d_right=d_sub_right,
+                    )
+                    if sub_result is not None:
+                        de9im_masks[sub_idx] = sub_result
+
+                keep[de9im_idx] = evaluate_predicate_from_de9im(de9im_masks, predicate)
+
+            return (
+                left_indices[keep],
+                right_indices[keep],
+                _planned_query_runtime_selection(
+                    kernel_name="predicate_refine",
+                    kernel_class=KernelClass.PREDICATE,
+                    row_count=left_indices.size,
+                    requested_mode=ExecutionMode.GPU,
+                    gpu_available=True,
+                    reason=f"GPU DE-9IM {predicate} refinement for non-point pairs",
+                ),
+            )
 
     # Non-GPU path: evaluate via Shapely with direct indexed access.
     # This avoids the expensive .take() buffer copy by indexing into
     # the original Shapely arrays with the candidate pair indices.
-    if query_shapely is None:
-        query_shapely = np.asarray(query_owned.to_shapely(), dtype=object)
-    if tree_shapely is None:
-        tree_shapely = np.asarray(tree_owned.to_shapely(), dtype=object)
-
     if not any_gpu:
+        _ensure_host_indices()
+        if query_shapely is None:
+            query_shapely = np.asarray(query_owned.to_shapely(), dtype=object)
+        if tree_shapely is None:
+            tree_shapely = np.asarray(tree_owned.to_shapely(), dtype=object)
         # All pairs go through Shapely — direct indexed evaluation.
         exact_values = getattr(shapely, predicate)(
             query_shapely[left_indices],
@@ -652,6 +693,18 @@ def _filter_predicate_pairs_owned(
         )
 
     # Mixed path: some pairs support GPU, others need Shapely.
+    if _has_device and not fallback_event_recorded:
+        record_shapely_fallback_event(
+            surface="vibespatial.spatial.query",
+            reason="GPU candidate refinement fell back to a mixed GPU/Shapely path",
+            detail=f"predicate={predicate!r}",
+            pipeline="gpu_candidates -> shapely_refine",
+            d2h_transfer=True,
+        )
+    if query_shapely is None:
+        query_shapely = np.asarray(query_owned.to_shapely(), dtype=object)
+    if tree_shapely is None:
+        tree_shapely = np.asarray(tree_owned.to_shapely(), dtype=object)
     keep = np.zeros(left_indices.size, dtype=bool)
     gpu_idx = np.flatnonzero(gpu_pair_mask)
     cpu_idx = np.flatnonzero(~gpu_pair_mask)
@@ -680,7 +733,7 @@ def _filter_predicate_pairs_owned(
             kernel_name="predicate_refine",
             kernel_class=KernelClass.PREDICATE,
             row_count=left_indices.size,
-            requested_mode=ExecutionMode.GPU,
+            requested_mode=ExecutionMode.CPU,
             gpu_available=True,
             reason=f"mixed GPU/Shapely {predicate} refinement (GPU for point pairs, direct Shapely for remainder)",
         ),

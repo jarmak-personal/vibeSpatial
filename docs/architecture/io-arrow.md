@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 209/260 lines
+Body Budget: 214/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-171 | Current Behavior |
-| 172-209 | Measured Local Baseline |
+| 76-176 | Current Behavior |
+| 177-214 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -175,12 +175,17 @@ geometry buffers while keeping GPU-native formats as the design center.
   families (`point`, `linestring`, `polygon`, `multipoint`,
   `multilinestring`, `multipolygon`) into device-resident owned buffers without
   forcing host family payload materialization first.
-- The `pylibcudf` GeoParquet device path now also decodes WKB point-only,
-  linestring-only, and mixed point/linestring columns into device-resident owned
-  buffers without a Shapely round-trip.
-- Polygon-family WKB device decode is still follow-on work; the current staged
-  WKB bridge remains the contract to port for polygon, multipoint,
-  multilinestring, and multipolygon WKB rows.
+- The `pylibcudf` GeoParquet device path now also decodes canonical WKB point,
+  linestring, polygon, multipoint, multilinestring, and multipolygon columns
+  into device-resident owned buffers without a Shapely round-trip.
+- Mixed canonical WKB columns now keep the same GPU-first contract too:
+  point-only, linestring-only, and point/linestring columns still use the
+  lightweight `pylibcudf` helpers, while heavier or broader family mixes route
+  through the staged GPU WKB decode pipeline after the same header scan.
+- Non-canonical WKB is still explicit compatibility work:
+  big-endian records, Z/M/ZM or other non-2D type ids, and families outside the
+  owned native result model still fall back instead of silently hiding a host
+  decode.
 - Repo-owned native GeoArrow codecs now provide family-specialized encode and
   decode for homogeneous geometry columns:
   - point, linestring, polygon, multilinestring, and multipolygon extension

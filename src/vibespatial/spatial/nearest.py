@@ -66,6 +66,7 @@ from .query_utils import (  # noqa: E402
     _expand_bounds,
     _gpu_bounds_dispatch_mode,
     _to_owned,
+    record_shapely_fallback_event,
 )
 
 # ---------------------------------------------------------------------------
@@ -327,7 +328,7 @@ def _refine_nearest_from_device_distances(
     max_distance: float,
     return_all: bool,
     return_distance: bool,
-) -> tuple[Any, None]:
+) -> tuple[Any, bool]:
     """Shared segment-reduce + keep-mask + compact pipeline.
 
     Takes device arrays of sorted (left, right) pairs and computed distances,
@@ -403,7 +404,7 @@ def _refine_nearest_from_device_distances(
     # Compact kept indices (Tier 3a CCCL).
     compacted = compact_indices(d_keep)
     if compacted.count == 0:
-        return _empty_nearest_result(return_distance), None
+        return _empty_nearest_result(return_distance), False
 
     # Gather results on device, copy to host.
     kept_idx = compacted.values
@@ -413,8 +414,8 @@ def _refine_nearest_from_device_distances(
 
     if return_distance:
         h_dist = runtime.copy_device_to_host(d_distances[kept_idx])
-        return (indices, h_dist), None
-    return indices, None
+        return (indices, h_dist), False
+    return indices, False
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +578,7 @@ def _nearest_refine_gpu_typed(
     return_all: bool = True,
     exclusive: bool = False,
     return_distance: bool = False,
-) -> tuple[np.ndarray, np.ndarray | None] | None:
+) -> tuple[tuple[np.ndarray, np.ndarray | None], bool] | None:
     """GPU nearest refinement for a known geometry family combination.
 
     Uses the provided *strategy* to compute distances, then runs the shared
@@ -1689,7 +1690,9 @@ def _compute_mixed_distances_gpu(
     right_idx: np.ndarray,
     exclusive: bool = False,
     device_candidates: object | None = None,
-) -> np.ndarray | None:
+    *,
+    record_fallback_event: bool = True,
+) -> tuple[np.ndarray, bool] | None:
     """Compute distances for candidate pairs with mixed geometry families.
 
     Groups pairs by (left_tag, right_tag) and dispatches to the appropriate
@@ -1701,18 +1704,19 @@ def _compute_mixed_distances_gpu(
     are extracted on-device via CuPy fancy indexing to avoid redundant
     host->device transfers.
 
-    Returns host float64 array of distances, or None if GPU runtime is
-    unavailable.
+    Returns ``(host_distances, used_shapely_fallback)`` or ``None`` if GPU
+    runtime is unavailable.
     """
     pair_count = left_idx.size
     if pair_count == 0:
-        return np.empty(0, dtype=np.float64)
+        return np.empty(0, dtype=np.float64), False
 
     left_tags = query_owned.tags[left_idx]
     right_tags = tree_owned.tags[right_idx]
 
     runtime = get_cuda_runtime()
     distances = np.full(pair_count, np.inf, dtype=np.float64)
+    used_shapely_fallback = False
 
     _dc = device_candidates
     _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
@@ -1774,6 +1778,27 @@ def _compute_mixed_distances_gpu(
                     runtime.free(d_sub_left)
                     runtime.free(d_sub_right)
                 runtime.free(d_sub_dist)
+        elif (lf == GeometryFamily.MULTIPOINT) != (rf == GeometryFamily.MULTIPOINT):
+            # One side is MP, the other is not -- expand MP coords to points,
+            # compute point distances via existing kernels, segmented min.
+            # Free device sub-arrays first -- MP handler allocates its own.
+            if _own_sub_device:
+                runtime.free(d_sub_left)
+                runtime.free(d_sub_right)
+            _own_sub_device = False  # already freed
+            if lf == GeometryFamily.MULTIPOINT:
+                mp_result = _compute_multipoint_distances_gpu(
+                    query_owned, tree_owned, sub_left, sub_right,
+                    target_family=rf, exclusive=exclusive,
+                )
+            else:
+                mp_result = _compute_multipoint_distances_gpu(
+                    tree_owned, query_owned, sub_right, sub_left,
+                    target_family=lf, exclusive=exclusive,
+                )
+            if mp_result is not None:
+                distances[sub_idx] = mp_result
+                ok = True
         elif lf == point_family or rf == point_family:
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
@@ -1799,27 +1824,6 @@ def _compute_mixed_distances_gpu(
                     runtime.free(d_sub_left)
                     runtime.free(d_sub_right)
                 runtime.free(d_sub_dist)
-        elif (lf == GeometryFamily.MULTIPOINT) != (rf == GeometryFamily.MULTIPOINT):
-            # One side is MP, the other is not -- expand MP coords to points,
-            # compute point distances via existing kernels, segmented min.
-            # Free device sub-arrays first -- MP handler allocates its own.
-            if _own_sub_device:
-                runtime.free(d_sub_left)
-                runtime.free(d_sub_right)
-            _own_sub_device = False  # already freed
-            if lf == GeometryFamily.MULTIPOINT:
-                mp_result = _compute_multipoint_distances_gpu(
-                    query_owned, tree_owned, sub_left, sub_right,
-                    target_family=rf, exclusive=exclusive,
-                )
-            else:
-                mp_result = _compute_multipoint_distances_gpu(
-                    tree_owned, query_owned, sub_right, sub_left,
-                    target_family=lf, exclusive=exclusive,
-                )
-            if mp_result is not None:
-                distances[sub_idx] = mp_result
-                ok = True
         else:
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
@@ -1841,6 +1845,15 @@ def _compute_mixed_distances_gpu(
 
         # For unsupported family pairs, fall back to Shapely distance.
         if not ok:
+            if record_fallback_event and not used_shapely_fallback:
+                record_shapely_fallback_event(
+                    surface="vibespatial.spatial.nearest",
+                    reason="GPU nearest refinement required Shapely fallback for unsupported geometry families",
+                    detail=f"pair={lf.name if lf is not None else 'unknown'}/{rf.name if rf is not None else 'unknown'}",
+                    pipeline="gpu_candidates -> shapely_refine",
+                    d2h_transfer=True,
+                )
+                used_shapely_fallback = True
             query_shapely = np.asarray(query_owned.to_shapely(), dtype=object)
             tree_shapely = np.asarray(tree_owned.to_shapely(), dtype=object)
             sub_dists = shapely.distance(query_shapely[sub_left], tree_shapely[sub_right])
@@ -1849,7 +1862,7 @@ def _compute_mixed_distances_gpu(
                 eq = np.asarray(shapely.equals(query_shapely[sub_left], tree_shapely[sub_right]), dtype=bool)
                 distances[sub_idx[eq]] = np.inf
 
-    return distances
+    return distances, used_shapely_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -1865,7 +1878,7 @@ def _dwithin_refine_gpu(
     device_candidates: _DeviceCandidates | None = None,
     *,
     return_device: bool = False,
-) -> tuple[np.ndarray, np.ndarray] | None:
+) -> tuple[tuple[np.ndarray, np.ndarray], bool] | None:
     """GPU dwithin refinement: distance <= threshold filter.
 
     Device-side pipeline (ADR-0033 Tier 2 CuPy for threshold + compact):
@@ -1897,30 +1910,33 @@ def _dwithin_refine_gpu(
     if pair_count == 0:
         empty = np.empty(0, dtype=np.int32)
         if return_device:
-            return cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)
-        return empty, empty
+            return (cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)), False
+        return (empty, empty), False
 
     # --- Device-side distance computation ---
     # Accumulate distances in a device CuPy array instead of host numpy.
-    d_distances = _compute_mixed_distances_gpu_device(
+    d_distances_result = _compute_mixed_distances_gpu_device(
         query_owned, tree_owned, left_idx, right_idx,
         device_candidates=device_candidates,
     )
-    if d_distances is None:
+    if d_distances_result is None:
         # Fall back to host-side path.
         if left_idx is None or right_idx is None:
             if not _use_device_idx:
                 return None
             left_idx, right_idx = _dc.to_host()
-        distances = _compute_mixed_distances_gpu(
+        distances_result = _compute_mixed_distances_gpu(
             query_owned, tree_owned, left_idx, right_idx, exclusive=False,
             device_candidates=device_candidates,
         )
-        if distances is None:
+        if distances_result is None:
             return None
+        distances, used_shapely_fallback = distances_result
         thresholds = per_row_distance[left_idx]
         keep = distances <= thresholds
-        return left_idx[keep], right_idx[keep]
+        return (left_idx[keep], right_idx[keep]), used_shapely_fallback
+
+    d_distances, used_shapely_fallback = d_distances_result
 
     # --- Device-side threshold filter (Tier 2 CuPy) ---
     d_thresholds_all = cp.asarray(per_row_distance, dtype=cp.float64)
@@ -1939,8 +1955,8 @@ def _dwithin_refine_gpu(
     if d_keep_idx.size == 0:
         empty = np.empty(0, dtype=np.int32 if left_idx is None else left_idx.dtype)
         if return_device:
-            return cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)
-        return empty, empty
+            return (cp.asarray(empty, dtype=cp.int32), cp.asarray(empty, dtype=cp.int32)), used_shapely_fallback
+        return (empty, empty), used_shapely_fallback
 
     # Gather surviving indices on device.
     d_left_result = d_left_all[d_keep_idx]
@@ -1948,10 +1964,13 @@ def _dwithin_refine_gpu(
 
     if return_device:
         # Keep results on device -- caller will consume them directly.
-        return d_left_result.astype(cp.int32, copy=False), d_right_result.astype(cp.int32, copy=False)
+        return (
+            d_left_result.astype(cp.int32, copy=False),
+            d_right_result.astype(cp.int32, copy=False),
+        ), used_shapely_fallback
 
     # --- Single D->H transfer of filtered results ---
-    return cp.asnumpy(d_left_result), cp.asnumpy(d_right_result)
+    return (cp.asnumpy(d_left_result), cp.asnumpy(d_right_result)), used_shapely_fallback
 
 
 def _compute_mixed_distances_gpu_device(
@@ -1976,7 +1995,7 @@ def _compute_mixed_distances_gpu_device(
     _use_device_idx = _dc is not None and hasattr(_dc, "d_left")
     pair_count = left_idx.size if left_idx is not None else (_dc.total_pairs if _use_device_idx else 0)
     if pair_count == 0:
-        return cp.empty(0, dtype=cp.float64)
+        return cp.empty(0, dtype=cp.float64), False
 
     if _use_device_idx:
         _q_ds = query_owned.device_state
@@ -1991,6 +2010,7 @@ def _compute_mixed_distances_gpu_device(
 
     runtime = get_cuda_runtime()
     d_distances = cp.full(pair_count, cp.inf, dtype=cp.float64)
+    used_shapely_fallback = False
 
     point_family = GeometryFamily.POINT
 
@@ -2047,6 +2067,27 @@ def _compute_mixed_distances_gpu_device(
                     runtime.free(d_sub_left)
                     runtime.free(d_sub_right)
                 runtime.free(d_sub_dist)
+        elif (lf == GeometryFamily.MULTIPOINT) != (rf == GeometryFamily.MULTIPOINT):
+            if _own_sub_device:
+                runtime.free(d_sub_left)
+                runtime.free(d_sub_right)
+            _own_sub_device = False
+            if sub_left is None or sub_right is None:
+                sub_left = runtime.copy_device_to_host(d_sub_left).astype(np.int32, copy=False)
+                sub_right = runtime.copy_device_to_host(d_sub_right).astype(np.int32, copy=False)
+            if lf == GeometryFamily.MULTIPOINT:
+                mp_result = _compute_multipoint_distances_gpu(
+                    query_owned, tree_owned, sub_left, sub_right,
+                    target_family=rf,
+                )
+            else:
+                mp_result = _compute_multipoint_distances_gpu(
+                    tree_owned, query_owned, sub_right, sub_left,
+                    target_family=lf,
+                )
+            if mp_result is not None:
+                d_distances[d_sub_idx] = cp.asarray(mp_result)
+                ok = True
         elif lf == point_family or rf == point_family:
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
@@ -2070,27 +2111,6 @@ def _compute_mixed_distances_gpu_device(
                     runtime.free(d_sub_left)
                     runtime.free(d_sub_right)
                 runtime.free(d_sub_dist)
-        elif (lf == GeometryFamily.MULTIPOINT) != (rf == GeometryFamily.MULTIPOINT):
-            if _own_sub_device:
-                runtime.free(d_sub_left)
-                runtime.free(d_sub_right)
-            _own_sub_device = False
-            if sub_left is None or sub_right is None:
-                sub_left = runtime.copy_device_to_host(d_sub_left).astype(np.int32, copy=False)
-                sub_right = runtime.copy_device_to_host(d_sub_right).astype(np.int32, copy=False)
-            if lf == GeometryFamily.MULTIPOINT:
-                mp_result = _compute_multipoint_distances_gpu(
-                    query_owned, tree_owned, sub_left, sub_right,
-                    target_family=rf,
-                )
-            else:
-                mp_result = _compute_multipoint_distances_gpu(
-                    tree_owned, query_owned, sub_right, sub_left,
-                    target_family=lf,
-                )
-            if mp_result is not None:
-                d_distances[d_sub_idx] = cp.asarray(mp_result)
-                ok = True
         else:
             d_sub_dist = runtime.allocate((sub_count,), np.float64)
             try:
@@ -2113,6 +2133,15 @@ def _compute_mixed_distances_gpu_device(
             # then upload the sub-group result to device.
             # to_shapely() is cached on OwnedGeometryArray, so repeated
             # calls for multiple unsupported groups are cheap.
+            if not used_shapely_fallback:
+                record_shapely_fallback_event(
+                    surface="vibespatial.spatial.nearest",
+                    reason="GPU nearest refinement required Shapely fallback for unsupported geometry families",
+                    detail=f"pair={lf.name if lf is not None else 'unknown'}/{rf.name if rf is not None else 'unknown'}",
+                    pipeline="gpu_candidates -> shapely_refine",
+                    d2h_transfer=True,
+                )
+                used_shapely_fallback = True
             if _own_sub_device:
                 runtime.free(d_sub_left)
                 runtime.free(d_sub_right)
@@ -2127,7 +2156,7 @@ def _compute_mixed_distances_gpu_device(
                 np.asarray(sub_dists, dtype=np.float64),
             )
 
-    return d_distances
+    return d_distances, used_shapely_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -2183,7 +2212,7 @@ def _nearest_refine_gpu(
     return_all: bool = True,
     exclusive: bool = False,
     return_distance: bool = False,
-) -> tuple[np.ndarray, np.ndarray | None] | None:
+) -> tuple[tuple[np.ndarray, np.ndarray | None], bool] | None:
     """Full GPU nearest refinement pipeline.
 
     Handles point-point distance, point-to-segment/polygon distance,
@@ -2197,7 +2226,7 @@ def _nearest_refine_gpu(
     if _points_only(query_owned) and _points_only(tree_owned):
         if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
             # All rows are null/empty -- return empty result instead of CPU fallback.
-            return _empty_nearest_result(return_distance), None
+            return _empty_nearest_result(return_distance), False
         # fall through to point-point distance below
     elif _points_only(query_owned):
         tree_family = _tree_distance_family(tree_owned)
@@ -2233,20 +2262,21 @@ def _nearest_refine_gpu(
 
     # --- Mixed-family fallback: per-pair tag dispatch ---
     if use_mixed:
-        mixed_distances = _compute_mixed_distances_gpu(
+        mixed_distances_result = _compute_mixed_distances_gpu(
             query_owned, tree_owned, left_idx, right_idx, exclusive=exclusive,
         )
-        if mixed_distances is not None:
+        if mixed_distances_result is not None:
+            mixed_distances, used_shapely_fallback = mixed_distances_result
             return _nearest_from_distances(
                 left_idx, right_idx, mixed_distances, n_queries,
                 max_distance=max_distance, return_all=return_all,
                 return_distance=return_distance,
-            ), None
+            ), used_shapely_fallback
         return None
 
     if GeometryFamily.POINT not in query_owned.families or GeometryFamily.POINT not in tree_owned.families:
         # Degenerate: both _points_only but POINT not in families -- all null.
-        return _empty_nearest_result(return_distance), None
+        return _empty_nearest_result(return_distance), False
 
     # Point-point path: use PointPointDistanceStrategy via the unified pipeline.
     strategy = PointPointDistanceStrategy()
@@ -2330,8 +2360,8 @@ def _iterative_nearest_gpu(
             return_distance=return_distance,
         )
         if gpu_result is not None:
-            result, _ = gpu_result
-            return result, "owned_gpu_nearest"
+            result, used_shapely_fallback = gpu_result
+            return result, "owned_cpu_nearest" if used_shapely_fallback else "owned_gpu_nearest"
 
         # GPU refinement declined (unsupported family combo) -- fall back.
         return None
@@ -2532,11 +2562,19 @@ def nearest_spatial_index(
         return_distance=return_distance,
     )
     if gpu_result is not None:
-        result, _ = gpu_result
-        # Upgrade impl to GPU when refine ran on device.
-        return result, "owned_gpu_nearest"
+        result, used_shapely_fallback = gpu_result
+        return result, "owned_cpu_nearest" if used_shapely_fallback else "owned_gpu_nearest"
 
     # --- CPU Shapely refinement fallback -------------------------------------
+    if impl == "owned_gpu_nearest":
+        record_shapely_fallback_event(
+            surface="vibespatial.spatial.nearest",
+            reason="GPU nearest candidate refinement fell back to host Shapely distance",
+            detail=f"max_distance={max_distance!r}, return_all={return_all}, exclusive={exclusive}",
+            pipeline="gpu_candidates -> shapely_refine",
+            d2h_transfer=False,
+        )
+    impl = "owned_cpu_nearest"
     left_values = query_values[left_idx]
     right_values = tree_geometries[right_idx]
     distances = shapely.distance(left_values, right_values)

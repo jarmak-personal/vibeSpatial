@@ -3,11 +3,19 @@
 vibeSpatial is a **GPU-first spatial analytics library** for Python.  Change
 one import line and your existing GeoPandas code runs on CUDA — binary
 predicates, buffer, overlay, dissolve, make-valid, spatial joins, and I/O all
-dispatch to GPU kernels automatically, with transparent CPU fallback when no
-GPU is available.
+dispatch to GPU kernels automatically, with **explicit, observable** CPU
+compatibility fallback only when the native GPU path is unavailable or
+unsupported.
 
 > [!WARNING]
 > vibeSpatial is very early in development. Operations may be unoptimized or have multiple Host/Device transfers causing reduced performance. [File an issue](https://github.com/jarmak-personal/vibeSpatial/issues) if you hit a problem!
+>
+> The repository enforces fallback observability: once a workflow is on device,
+> hidden host exits are treated as bugs, and strict-native tests fail if a path
+> materializes to host without first recording an explicit fallback or
+> compatibility boundary. The maintained warmed `10k` shootout suite under
+> [`benchmarks/shootout/`](benchmarks/shootout/) is currently at or above parity
+> on local RTX 4090 runs.
 
 ### Install
 

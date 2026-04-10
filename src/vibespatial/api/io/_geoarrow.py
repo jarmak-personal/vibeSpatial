@@ -3,14 +3,16 @@ import json
 import numpy as np
 import pandas as pd
 import pyarrow as pa
-from numpy.typing import NDArray
-
 import shapely
+from numpy.typing import NDArray
 from shapely import GeometryType
 
 from vibespatial.api import GeoDataFrame
-from vibespatial.api.geometry_array import from_shapely, from_wkb
 from vibespatial.api.geo_base import _is_geometry_like_dtype
+from vibespatial.api.geometry_array import from_shapely, from_wkb
+from vibespatial.geometry.device_array import DeviceGeometryArray
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.fallbacks import record_fallback_event
 
 GEOARROW_ENCODINGS = [
     "point",
@@ -138,8 +140,18 @@ def geopandas_to_arrow(
     if geometry_encoding.lower() == "geoarrow":
         # Encode all geometry columns to GeoArrow
         for i, col in zip(geometry_indices, geometry_columns):
+            array = df[col].array
+            if isinstance(array, DeviceGeometryArray):
+                record_fallback_event(
+                    surface="geopandas.geodataframe.to_parquet",
+                    reason="explicit CPU compatibility export for GeoArrow materialization",
+                    detail=f"column={col}, encoding='geoarrow'",
+                    selected=ExecutionMode.CPU,
+                    pipeline="io/to_parquet",
+                    d2h_transfer=True,
+                )
             field, geom_arr = construct_geometry_array(
-                np.array(df[col].array),
+                np.array(array),
                 include_z=include_z,
                 field_name=col,
                 crs=df[col].crs,

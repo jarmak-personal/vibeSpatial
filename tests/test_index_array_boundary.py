@@ -43,7 +43,9 @@ from vibespatial.overlay.dissolve import (
     evaluate_geopandas_dissolve_native,
 )
 from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.spatial.query import build_owned_spatial_index, query_spatial_index
+from vibespatial.testing import strict_native_environment
 
 clip_module = importlib.import_module("vibespatial.api.tools.clip")
 
@@ -195,6 +197,18 @@ class TestSpatialNearestReturnsIndexArrays:
         assert isinstance(native_result, RelationJoinResult)
         assert materialize_calls == 0
 
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native sjoin GeoDataFrame export should not require relation materialization"
+            )
+
+        monkeypatch.setattr(RelationJoinResult, "materialize", _fail)
+        monkeypatch.setattr(
+            native_results_module,
+            "_materialize_relation_join_parts",
+            _fail,
+        )
+
         materialized = native_result.to_geodataframe(
             left,
             right,
@@ -204,7 +218,6 @@ class TestSpatialNearestReturnsIndexArrays:
         )
         wrapped = geopandas.sjoin(left, right)
 
-        assert materialize_calls == 2
         assert_geodataframe_equal(materialized, wrapped)
 
     def test_sjoin_export_result_defers_frame_materialization(self, monkeypatch):
@@ -246,10 +259,21 @@ class TestSpatialNearestReturnsIndexArrays:
         assert isinstance(export_result, RelationJoinExportResult)
         assert materialize_calls == 0
 
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native sjoin GeoDataFrame export should not require relation materialization"
+            )
+
+        monkeypatch.setattr(RelationJoinResult, "materialize", _fail)
+        monkeypatch.setattr(
+            native_results_module,
+            "_materialize_relation_join_parts",
+            _fail,
+        )
+
         materialized = export_result.to_geodataframe()
         wrapped = geopandas.sjoin(left, right)
 
-        assert materialize_calls == 2
         assert_geodataframe_equal(materialized, wrapped)
 
     def test_sjoin_export_result_writes_without_frame_materialization(
@@ -445,6 +469,7 @@ class TestSpatialNearestReturnsIndexArrays:
             "right",
         )
         native_result = to_native_tabular_result(export_result)
+        expected = pa.table(geopandas.sjoin(left, right).to_arrow(geometry_encoding="WKB"))
 
         assert isinstance(native_result, NativeTabularResult)
 
@@ -453,7 +478,6 @@ class TestSpatialNearestReturnsIndexArrays:
 
         monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
 
-        expected = pa.table(geopandas.sjoin(left, right).to_arrow(geometry_encoding="WKB"))
         result = pa.table(native_result.to_arrow(geometry_encoding="WKB"))
 
         assert result.column_names == expected.column_names
@@ -483,6 +507,7 @@ class TestSpatialNearestReturnsIndexArrays:
             "right",
         )
         native_result = to_native_tabular_result(export_result)
+        expected = geopandas.sjoin(left, right)
 
         assert isinstance(native_result, NativeTabularResult)
 
@@ -495,7 +520,7 @@ class TestSpatialNearestReturnsIndexArrays:
         native_result.to_feather(path)
 
         result = geopandas.read_feather(path)
-        assert_geodataframe_equal(result, geopandas.sjoin(left, right))
+        assert_geodataframe_equal(result, expected)
 
     def test_sjoin_export_result_writes_file_without_frame_materialization(
         self,
@@ -521,6 +546,7 @@ class TestSpatialNearestReturnsIndexArrays:
             "left",
             "right",
         )
+        expected = geopandas.sjoin(left, right)
 
         def _fail(*_args, **_kwargs):
             raise AssertionError("native file export should not require GeoDataFrame export")
@@ -533,7 +559,7 @@ class TestSpatialNearestReturnsIndexArrays:
         result = geopandas.read_file(path, engine="pyogrio")
         assert_geodataframe_equal(
             result,
-            geopandas.sjoin(left, right),
+            expected,
             check_like=True,
             check_dtype=False,
         )
@@ -574,6 +600,18 @@ class TestSpatialNearestReturnsIndexArrays:
         assert isinstance(native_result, RelationJoinResult)
         assert materialize_calls == 0
 
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native nearest GeoDataFrame export should not require relation materialization"
+            )
+
+        monkeypatch.setattr(RelationJoinResult, "materialize", _fail)
+        monkeypatch.setattr(
+            native_results_module,
+            "_materialize_relation_join_parts",
+            _fail,
+        )
+
         materialized = native_result.to_geodataframe(
             left,
             right,
@@ -584,7 +622,6 @@ class TestSpatialNearestReturnsIndexArrays:
         )
         wrapped = geopandas.sjoin_nearest(left, right, how="inner", distance_col="dist")
 
-        assert materialize_calls == 2
         assert_geodataframe_equal(
             materialized.drop(columns=["dist"]),
             wrapped.drop(columns=["dist"]),
@@ -629,10 +666,21 @@ class TestSpatialNearestReturnsIndexArrays:
         assert isinstance(export_result, RelationJoinExportResult)
         assert materialize_calls == 0
 
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "native nearest GeoDataFrame export should not require relation materialization"
+            )
+
+        monkeypatch.setattr(RelationJoinResult, "materialize", _fail)
+        monkeypatch.setattr(
+            native_results_module,
+            "_materialize_relation_join_parts",
+            _fail,
+        )
+
         materialized = export_result.to_geodataframe()
         wrapped = geopandas.sjoin_nearest(left, right, how="inner", distance_col="dist")
 
-        assert materialize_calls == 2
         assert_geodataframe_equal(
             materialized.drop(columns=["dist"]),
             wrapped.drop(columns=["dist"]),
@@ -1013,6 +1061,58 @@ class TestSpatialNearestReturnsIndexArrays:
             geopandas.clip(frame, mask),
         )
 
+    def test_clip_native_tabular_records_fallback_before_shapely_cleanup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
+        from vibespatial.runtime.residency import Residency
+
+        source = GeoDataFrame(
+            {
+                "value": [1],
+                "geometry": GeoSeries([box(0, 0, 2, 2)]),
+            },
+            crs="EPSG:4326",
+        )
+        owned = from_shapely_geometries([box(0.5, 0.5, 1.5, 1.5)], residency=Residency.HOST)
+        native_result = clip_module.ClipNativeResult(
+            source=source,
+            parts=(
+                clip_module._clip_native_part(
+                    source,
+                    np.asarray([0], dtype=np.intp),
+                    clip_module.GeometryArray.from_owned(owned, crs=source.crs),
+                ),
+            ),
+            ordered_index=source.index,
+            ordered_row_positions=np.asarray([0], dtype=np.intp),
+            clipping_by_rectangle=False,
+            has_non_point_candidates=True,
+            keep_geom_type=False,
+        )
+
+        monkeypatch.setattr(
+            native_results_module,
+            "_clip_owned_geometry_native_result",
+            lambda *args, **kwargs: (None, None),
+        )
+
+        real_to_shapely = OwnedGeometryArray.to_shapely
+
+        def _guard_to_shapely(self, *args, **kwargs):
+            raise AssertionError(
+                "fallback should be recorded before clip tabular host cleanup"
+            )
+
+        monkeypatch.setattr(OwnedGeometryArray, "to_shapely", _guard_to_shapely)
+
+        with pytest.raises(StrictNativeFallbackError):
+            with strict_native_environment():
+                to_native_tabular_result(native_result)
+
+        monkeypatch.setattr(OwnedGeometryArray, "to_shapely", real_to_shapely)
+
     def test_point_only_clip_native_tabular_skips_spatial_materialization(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1230,3 +1330,43 @@ class TestGPUBoundary:
             b_cols = [c for c in result.columns if c.startswith("b")]
             assert len(a_cols) > 0
             assert len(b_cols) > 0
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="No GPU runtime available")
+    def test_gpu_overlay_preserves_device_geometry_backing(self):
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+        from vibespatial.geometry.owned import from_shapely_geometries
+        from vibespatial.runtime.residency import Residency
+
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries(
+                DeviceGeometryArray._from_owned(
+                    from_shapely_geometries(
+                        [box(0, 0, 2, 2), box(3, 3, 5, 5)],
+                        residency=Residency.DEVICE,
+                    ),
+                    crs="EPSG:3857",
+                ),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries(
+                DeviceGeometryArray._from_owned(
+                    from_shapely_geometries(
+                        [box(1, 1, 4, 4), box(6, 6, 8, 8)],
+                        residency=Residency.DEVICE,
+                    ),
+                    crs="EPSG:3857",
+                ),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        )
+
+        result = geopandas.overlay(left, right, how="intersection")
+
+        assert isinstance(result.geometry.values, DeviceGeometryArray)
+        assert getattr(result.geometry.values, "_owned", None) is not None

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from functools import lru_cache
 from os import PathLike
 from pathlib import Path
 from time import perf_counter
@@ -8,7 +10,12 @@ from typing import Any
 
 import numpy as np
 
-from vibespatial.api._native_results import NativeTabularResult, to_native_tabular_result
+from vibespatial.api._native_results import (
+    GeometryNativeResult,
+    NativeTabularResult,
+    to_native_tabular_result,
+)
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import (
     OwnedGeometryArray,
@@ -19,6 +26,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 
 from .geoarrow import (
+    _authoritative_geoarrow_host_view,
     _decode_geoarrow_array_to_owned,
     _owned_geoarrow_fast_path_reason,
     encode_owned_geoarrow_array,
@@ -31,7 +39,6 @@ from .geoparquet_planner import (
 )
 from .pylibcudf import (
     _decode_pylibcudf_geoparquet_column_to_owned,
-    _decode_pylibcudf_geoparquet_table_to_owned,
     _is_pylibcudf_table,
 )
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
@@ -43,11 +50,81 @@ from .wkb import (
     has_pylibcudf_support,
 )
 
+_SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS = 2_048
+_SMALL_TERMINAL_ARROW_EXPORT_FAMILIES = frozenset({
+    GeometryFamily.POLYGON,
+    GeometryFamily.MULTIPOLYGON,
+})
+
 
 def _payload_geometry_series(payload: NativeTabularResult):
-    return payload.geometry.to_geoseries(
-        index=payload.attributes.index,
-        name=payload.geometry_name,
+    return _authoritative_geometry_series(
+        payload.geometry.to_geoseries(
+            index=payload.attributes.index,
+            name=payload.geometry_name,
+        )
+    )
+
+
+def _authoritative_owned_geometry_array(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    if owned.device_state is None:
+        return owned
+
+    validity, tags, family_row_offsets, families = _authoritative_geoarrow_host_view(owned)
+    authoritative = OwnedGeometryArray(
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families=families,
+        residency=owned.residency,
+        diagnostics=list(owned.diagnostics),
+        runtime_history=list(owned.runtime_history),
+        geoarrow_backed=owned.geoarrow_backed,
+        shares_geoarrow_memory=owned.shares_geoarrow_memory,
+        device_adopted=owned.device_adopted,
+        device_state=owned.device_state,
+        _row_count=owned.row_count,
+    )
+    if owned._base is not None:
+        authoritative._base = owned._base
+    if owned._index_map is not None:
+        authoritative._index_map = owned._index_map
+    return authoritative
+
+
+def _authoritative_geometry_series(series):
+    arr = series.array
+    if isinstance(arr, DeviceGeometryArray) and arr.owned.device_state is not None:
+        from vibespatial.api.geoseries import GeoSeries
+
+        authoritative_owned = _authoritative_owned_geometry_array(arr.owned)
+        authoritative_array = DeviceGeometryArray._from_owned(
+            authoritative_owned,
+            crs=series.crs,
+        )
+        return GeoSeries(authoritative_array, index=series.index, name=series.name, crs=series.crs)
+    return series
+
+
+def _authoritative_native_tabular_result(
+    payload: NativeTabularResult,
+) -> NativeTabularResult:
+    geometry = payload.geometry
+    owned = geometry.owned
+    if owned is None or owned.device_state is None:
+        return payload
+    authoritative_geometry = GeometryNativeResult.from_owned(
+        _authoritative_owned_geometry_array(owned),
+        crs=geometry.crs,
+    )
+    return NativeTabularResult(
+        attributes=payload.attributes,
+        geometry=authoritative_geometry,
+        geometry_name=payload.geometry_name,
+        column_order=payload.column_order,
+        attrs=payload.attrs,
     )
 
 
@@ -62,6 +139,161 @@ def _record_terminal_geoparquet_compatibility_export(*, detail: str, implementat
         ),
         detail=detail,
         selected=ExecutionMode.CPU,
+    )
+
+
+def _owned_prefers_small_terminal_arrow_export(owned: OwnedGeometryArray | None) -> bool:
+    if owned is None:
+        return False
+    families = frozenset(owned.families)
+    return bool(families) and families.issubset(_SMALL_TERMINAL_ARROW_EXPORT_FAMILIES)
+
+
+def _small_terminal_arrow_export_detail(
+    *,
+    row_count: int,
+    polygonal_terminal_candidate: bool,
+) -> str | None:
+    if not polygonal_terminal_candidate or row_count > _SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS:
+        return None
+    return (
+        "small terminal GeoParquet write prefers the explicit Arrow export at the sink; "
+        "polygonal outputs are faster through the Arrow sink at this size; "
+        f"row_count={row_count} <= {_SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS}"
+    )
+
+
+def _write_native_tabular_result_with_arrow(
+    payload: NativeTabularResult,
+    path,
+    *,
+    index,
+    compression,
+    geometry_encoding,
+    schema_version,
+    write_covering_bbox,
+    **kwargs,
+) -> None:
+    import pyarrow.parquet as pq
+
+    from vibespatial.api.io.arrow import _native_tabular_to_arrow
+
+    table = _native_tabular_to_arrow(
+        payload,
+        index=index,
+        geometry_encoding=geometry_encoding,
+        schema_version=schema_version,
+        write_covering_bbox=write_covering_bbox,
+    )
+    pq.write_table(table, path, compression=compression, **kwargs)
+
+
+def _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
+    table,
+    *,
+    column_name: str,
+    column_index: int,
+    encoding: str | None,
+    schema=None,
+) -> OwnedGeometryArray:
+    import pyarrow as pa
+
+    try:
+        return _decode_pylibcudf_geoparquet_column_to_owned(
+            table.columns()[column_index],
+            encoding,
+        )
+    except NotImplementedError as exc:
+        record_fallback_event(
+            surface="vibespatial.io.geoparquet",
+            reason="explicit CPU fallback after GPU GeoParquet geometry decode could not complete",
+            detail=(
+                f"column={column_name}, encoding={encoding!r}, "
+                f"detail={type(exc).__name__}: {exc}"
+            ),
+            selected=ExecutionMode.CPU,
+            pipeline="io/read_parquet",
+            d2h_transfer=True,
+        )
+        arrow_table = table.to_arrow()
+        arrow_column_index = arrow_table.schema.get_field_index(column_name)
+        if arrow_column_index == -1:
+            arrow_column_index = int(column_index)
+        if schema is not None and column_name in schema.names:
+            field = schema.field(column_name)
+        else:
+            field = arrow_table.schema.field(arrow_column_index)
+        array = arrow_table.column(arrow_column_index).combine_chunks()
+        normalized_encoding = None if encoding is None else str(encoding).lower()
+        if normalized_encoding == "wkb":
+            if pa.types.is_string(array.type):
+                array = pa.Array.from_buffers(
+                    pa.binary(),
+                    len(array),
+                    array.buffers(),
+                    null_count=array.null_count,
+                )
+                field = pa.field(
+                    field.name,
+                    pa.binary(),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+            elif pa.types.is_large_string(array.type):
+                array = pa.Array.from_buffers(
+                    pa.large_binary(),
+                    len(array),
+                    array.buffers(),
+                    null_count=array.null_count,
+                )
+                field = pa.field(
+                    field.name,
+                    pa.large_binary(),
+                    nullable=field.nullable,
+                    metadata=field.metadata,
+                )
+        return _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+
+
+def _decode_arrow_geoparquet_column_to_host_geoseries(
+    table,
+    *,
+    column_name: str,
+    column_index: int,
+    encoding: str | None,
+    crs,
+    index,
+):
+    import pyarrow as pa
+
+    from vibespatial.api.geometry_array import from_wkb
+    from vibespatial.api.geoseries import GeoSeries
+
+    arrow_table = table.to_arrow() if _is_pylibcudf_table(table) else table
+    arrow_column_index = arrow_table.schema.get_field_index(column_name)
+    if arrow_column_index == -1:
+        arrow_column_index = int(column_index)
+    array = arrow_table.column(arrow_column_index).combine_chunks()
+    normalized_encoding = None if encoding is None else str(encoding).lower()
+    if normalized_encoding == "wkb":
+        if pa.types.is_string(array.type):
+            array = pa.Array.from_buffers(
+                pa.binary(),
+                len(array),
+                array.buffers(),
+                null_count=array.null_count,
+            )
+        elif pa.types.is_large_string(array.type):
+            array = pa.Array.from_buffers(
+                pa.large_binary(),
+                len(array),
+                array.buffers(),
+                null_count=array.null_count,
+            )
+        values = np.asarray(array.to_pylist(), dtype=object)
+        return GeoSeries(from_wkb(values, crs=crs), index=index, crs=crs, name=column_name)
+    raise NotImplementedError(
+        "host GeoSeries GeoParquet fallback currently supports WKB-encoded columns only"
     )
 
 
@@ -80,6 +312,31 @@ def _write_geoparquet_native_tabular_result(
     import pyarrow.parquet as pq
 
     from vibespatial.api.io.arrow import _create_geometry_metadata, _replace_table_schema_metadata
+
+    payload = _authoritative_native_tabular_result(payload)
+
+    small_write_detail = _small_terminal_arrow_export_detail(
+        row_count=payload.geometry.row_count,
+        polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(
+            payload.geometry.owned
+        ),
+    )
+    if small_write_detail is not None:
+        _record_terminal_geoparquet_compatibility_export(
+            detail=small_write_detail,
+            implementation="native_payload_arrow_terminal_export",
+        )
+        _write_native_tabular_result_with_arrow(
+            payload,
+            path,
+            index=index,
+            compression=compression,
+            geometry_encoding=geometry_encoding,
+            schema_version=schema_version,
+            write_covering_bbox=write_covering_bbox,
+            **kwargs,
+        )
+        return
 
     geometry_series = _payload_geometry_series(payload)
 
@@ -525,42 +782,76 @@ def _pylibcudf_table_to_geopandas(
         filesystem=filesystem,
     )
 
-    columns_by_index = table.columns()
-    decoded_geometry_owned: dict[str, tuple[OwnedGeometryArray, Any]] = {}
+    decoded_geometry_series: dict[str, pd.Series] = {}
     row_count = None
     for column_name in geometry_columns:
         column_index = table_column_names.index(column_name)
         column_meta = geo_metadata["columns"][column_name]
-        owned = _decode_pylibcudf_geoparquet_column_to_owned(
-            columns_by_index[column_index],
-            column_meta.get("encoding"),
-        )
         crs = _geoparquet_geometry_column_crs(column_meta)
-        if row_count is None:
-            row_count = owned.row_count
-        decoded_geometry_owned[column_name] = (owned, crs)
+        try:
+            owned = _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
+                table,
+                column_name=column_name,
+                column_index=column_index,
+                encoding=column_meta.get("encoding"),
+                schema=schema,
+            )
+            if row_count is None:
+                row_count = owned.row_count
+            decoded_geometry_series[column_name] = pd.Series(
+                DeviceGeometryArray._from_owned(owned, crs=crs),
+                copy=False,
+                name=column_name,
+            )
+        except NotImplementedError as exc:
+            record_fallback_event(
+                surface="vibespatial.io.geoparquet",
+                reason=(
+                    "explicit CPU compatibility fallback after GeoParquet geometry decode "
+                    "produced families outside the owned native result model"
+                ),
+                detail=(
+                    f"column={column_name}, encoding={column_meta.get('encoding')!r}, "
+                    f"detail={type(exc).__name__}: {exc}"
+                ),
+                selected=ExecutionMode.CPU,
+                pipeline="io/read_parquet",
+                d2h_transfer=True,
+            )
+            # ADR-0042 allows an explicit compatibility exit at the terminal
+            # read boundary when the decoded result cannot be represented as an
+            # OwnedGeometryArray (for example GeometryCollection rows).
+            decoded_geometry_series[column_name] = _decode_arrow_geoparquet_column_to_host_geoseries(
+                table,
+                column_name=column_name,
+                column_index=column_index,
+                encoding=column_meta.get("encoding"),
+                crs=crs,
+                index=None,
+            )
+            if row_count is None:
+                row_count = len(decoded_geometry_series[column_name])
 
     # ADR-0042 transitional boundary: host conversion deferred until GeoDataFrame construction.
     if to_pandas_kwargs is None:
         to_pandas_kwargs = {}
     data = attrs_arrow.to_pandas(**to_pandas_kwargs)
-
     if data.empty and not non_geometry_columns and row_count is not None:
         data = pd.DataFrame(index=pd.RangeIndex(row_count))
 
-    decoded_geometry: dict[str, pd.Series] = {}
-    for column_name, (owned, crs) in decoded_geometry_owned.items():
-        decoded_geometry[column_name] = pd.Series(
-            DeviceGeometryArray._from_owned(owned, crs=crs),
-            index=data.index,
-            copy=False,
-            name=column_name,
-        )
+    for column_name, series in list(decoded_geometry_series.items()):
+        if not series.index.equals(data.index):
+            decoded_geometry_series[column_name] = pd.Series(
+                series.array if hasattr(series, "array") else series.to_numpy(copy=False),
+                index=data.index,
+                copy=False,
+                name=column_name,
+            )
 
     data_columns: dict[str, Any] = {}
     for column_name in result_column_names:
-        if column_name in decoded_geometry:
-            data_columns[column_name] = decoded_geometry[column_name]
+        if column_name in decoded_geometry_series:
+            data_columns[column_name] = decoded_geometry_series[column_name]
         elif column_name in data.columns:
             data_columns[column_name] = data[column_name]
         # else: pandas index column, already restored into data.index
@@ -669,26 +960,40 @@ def _read_non_geometry_geoparquet_columns_with_pyarrow(
     )
     return arrow_table.to_pandas(**to_pandas_kwargs)
 
+@lru_cache(maxsize=32)
+def _cached_geoparquet_crs_from_user_input(crs_value: str) -> Any:
+    from pyproj import CRS
+
+    return CRS.from_user_input(crs_value)
+
+
+@lru_cache(maxsize=32)
+def _cached_geoparquet_crs_from_json(crs_json: str) -> Any:
+    from pyproj import CRS
+
+    from vibespatial.api.io.arrow import _remove_id_from_member_of_ensembles
+
+    crs = json.loads(crs_json)
+    _remove_id_from_member_of_ensembles(crs)
+    return CRS.from_user_input(crs)
+
+
 def _geoparquet_geometry_column_crs(column_metadata: dict[str, Any]) -> Any:
     if "crs" in column_metadata:
         crs = column_metadata["crs"]
         if isinstance(crs, dict):
-            from pyproj import CRS
-
-            from vibespatial.api.io.arrow import _remove_id_from_member_of_ensembles
-
-            _remove_id_from_member_of_ensembles(crs)
-            return CRS.from_user_input(crs)
+            try:
+                return _cached_geoparquet_crs_from_json(
+                    json.dumps(crs, sort_keys=True, separators=(",", ":"))
+                )
+            except Exception:
+                return crs
         try:
-            from pyproj import CRS
-
-            return CRS.from_user_input(crs)
+            return _cached_geoparquet_crs_from_user_input(str(crs))
         except Exception:
             return crs
     try:
-        from pyproj import CRS
-
-        return CRS.from_user_input("OGC:CRS84")
+        return _cached_geoparquet_crs_from_user_input("OGC:CRS84")
     except Exception:
         return "OGC:CRS84"
 
@@ -924,6 +1229,30 @@ def _read_geoparquet_table_with_pyarrow(
         df_attrs = None
     return table, geo_metadata, df_attrs
 
+def _decode_arrow_geoparquet_table_to_owned(
+    table,
+    geo_metadata: dict[str, Any],
+    *,
+    column_index: int | None = None,
+) -> OwnedGeometryArray:
+    primary = geo_metadata["primary_column"]
+    field_index = table.schema.get_field_index(primary) if column_index is None else int(column_index)
+    if field_index == -1:
+        field_index = 0
+    field = table.schema.field(field_index)
+    array = table.column(field_index).combine_chunks()
+    column_name = field.name
+    if column_name not in geo_metadata["columns"]:
+        if column_index is None:
+            column_name = primary
+        elif len(geo_metadata["columns"]) == 1:
+            column_name = next(iter(geo_metadata["columns"]))
+        else:
+            raise KeyError(column_name)
+    encoding = geo_metadata["columns"][column_name].get("encoding")
+    return _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+
+
 def _decode_geoparquet_table_to_owned(
     table,
     geo_metadata: dict[str, Any],
@@ -944,20 +1273,20 @@ def _decode_geoparquet_table_to_owned(
             )
             table = table.to_arrow()
         else:
-            return _decode_pylibcudf_geoparquet_table_to_owned(
+            primary = geo_metadata["primary_column"]
+            decode_index = 0 if column_index is None else int(column_index)
+            return _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
                 table,
-                geo_metadata,
-                column_index=column_index,
+                column_name=primary,
+                column_index=decode_index,
+                encoding=geo_metadata["columns"][primary].get("encoding"),
             )
 
-    primary = geo_metadata["primary_column"]
-    field_index = table.schema.get_field_index(primary) if column_index is None else int(column_index)
-    if field_index == -1:
-        field_index = 0
-    field = table.schema.field(field_index)
-    array = table.column(field_index).combine_chunks()
-    encoding = geo_metadata["columns"][primary].get("encoding")
-    return _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+    return _decode_arrow_geoparquet_table_to_owned(
+        table,
+        geo_metadata,
+        column_index=column_index,
+    )
 
 def read_geoparquet_owned(
     path,
@@ -1108,21 +1437,49 @@ def write_geoparquet(
             "Please rename to write covering bbox."
         )
 
-    # Check if any geometry column already has owned backing (either via
-    # DeviceGeometryArray or a GeometryArray with _owned populated).  When
-    # owned is available, use the native owned-buffer encoder which avoids
-    # the D→H→Shapely roundtrip.  We intentionally do NOT trigger owned
-    # construction here — if only Shapely data exists, the standard pyarrow
-    # path with shapely.to_wkb is faster than building owned first.
+    # Check if every geometry column already has owned backing (either via
+    # DeviceGeometryArray or a GeometryArray with _owned populated). When the
+    # full geometry surface is native, use the owned-buffer encoder and avoid
+    # the D→H→Shapely roundtrip. We intentionally do NOT trigger owned
+    # construction here — if any geometry column is still plain Shapely data,
+    # the standard pyarrow path is the compatibility boundary and avoids
+    # partial-native write failures on mixed geometry-column frames.
     geometry_mask = df.dtypes.map(lambda d: d.name in ("geometry", "device_geometry"))
     geometry_columns = df.columns[geometry_mask]
-    has_owned = any(
+    all_geometry_columns_owned = geometry_columns.size > 0 and all(
         isinstance(df[col].array, DeviceGeometryArray)
         or getattr(df[col].array, "_owned", None) is not None
         for col in geometry_columns
     )
 
-    if has_owned and geometry_columns.size > 0:
+    if all_geometry_columns_owned:
+        small_write_detail = None
+        if geometry_columns.size == 1:
+            small_write_detail = _small_terminal_arrow_export_detail(
+                row_count=len(df),
+                polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(
+                    df[geometry_columns[0]].array.to_owned()
+                ),
+            )
+        if small_write_detail is not None:
+            _record_terminal_geoparquet_compatibility_export(
+                detail=small_write_detail,
+                implementation="native_geodataframe_arrow_terminal_export",
+            )
+            from vibespatial.api._native_results import _spatial_to_native_tabular_result
+
+            payload = _spatial_to_native_tabular_result(df)
+            _write_geoparquet_native_tabular_result(
+                payload,
+                path,
+                index=index,
+                compression=compression,
+                geometry_encoding=geometry_encoding,
+                schema_version=schema_version,
+                write_covering_bbox=write_covering_bbox,
+                **kwargs,
+            )
+            return
         _write_geoparquet_native(
             df,
             path,
@@ -1215,7 +1572,7 @@ def _write_geoparquet_native(
     use_geoarrow = geometry_encoding.lower() == "geoarrow"
 
     for col_idx, col_name in zip(geometry_indices, geometry_columns):
-        series = df[col_name]
+        series = _authoritative_geometry_series(df[col_name])
         arr = series.array
         owned = arr.to_owned()
 
@@ -1224,7 +1581,6 @@ def _write_geoparquet_native(
             fast_path_reason = _owned_geoarrow_fast_path_reason(series, include_z=None)
             if fast_path_reason is None:
                 try:
-                    owned._ensure_host_state()  # GeoArrow reads host buffers
                     field, geom_arr = encode_owned_geoarrow_array(
                         owned,
                         field_name=col_name,

@@ -11,6 +11,8 @@ import pandas as pd
 import shapely
 
 from vibespatial.api._compat import PANDAS_GE_30
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.fallbacks import record_fallback_event
 
 if TYPE_CHECKING:
     from vibespatial.api.geodataframe import GeoDataFrame
@@ -656,21 +658,29 @@ def _materialize_attribute_geometry_frame(
     attributes = NativeAttributeTable.from_value(attributes)
     geom = geometry.to_geoseries(index=attributes.index, name=geometry_name)
     frame = attributes.to_pandas(copy=False)
-    geometry_series = pd.Series(
-        geom.values,
+    if column_order is None:
+        ordered_columns = [*frame.columns, geometry_name]
+    else:
+        ordered_columns = list(column_order)
+
+    placeholder_geometry = pd.Series(
+        np.empty(len(attributes.index), dtype=object),
         index=attributes.index,
         copy=False,
         name=geometry_name,
     )
-    if column_order is None:
-        frame[geometry_name] = geometry_series
-    else:
-        insert_at = list(column_order).index(geometry_name)
-        frame.insert(insert_at, geometry_name, geometry_series)
-    frame.__class__ = GeoDataFrame
-    frame._geometry_column_name = geometry_name
+    data_columns = {
+        column_name: (
+            placeholder_geometry if column_name == geometry_name else frame[column_name]
+        )
+        for column_name in ordered_columns
+    }
+    rebuilt = pd.DataFrame(data_columns, index=attributes.index, copy=False)
+    rebuilt.__class__ = GeoDataFrame
+    rebuilt._geometry_column_name = geometry_name
+    rebuilt.attrs = frame.attrs.copy()
     return _replace_geometry_column_preserving_backing(
-        frame,
+        rebuilt,
         geom.values,
         crs=crs,
     )
@@ -690,7 +700,26 @@ def _native_attribute_table_from_projected_frames(
     frames: list[pd.DataFrame],
     *,
     index_override: pd.Index,
+    storage: str = "arrow",
 ) -> NativeAttributeTable:
+    if storage == "pandas":
+        if not frames:
+            return NativeAttributeTable(dataframe=pd.DataFrame(index=index_override))
+        normalized_frames: list[pd.DataFrame] = []
+        for frame in frames:
+            if frame.index.equals(index_override):
+                normalized_frames.append(frame)
+                continue
+            rebased = frame.copy(deep=False)
+            rebased.index = index_override
+            normalized_frames.append(rebased)
+        concat_kwargs = {} if PANDAS_GE_30 else {"copy": False}
+        frame = pd.concat(normalized_frames, axis=1, **concat_kwargs)
+        return NativeAttributeTable(dataframe=frame)
+
+    if storage != "arrow":
+        raise ValueError(f"Unsupported projected-frame storage: {storage!r}")
+
     import pyarrow as pa
 
     tables = []
@@ -746,6 +775,44 @@ def _native_pairwise_attribute_table(
         [left_projected, right_projected],
         index_override=out_index,
     )
+
+
+def _project_pairwise_attribute_frame(
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    left_idx,
+    right_idx,
+    *,
+    lsuffix: str = "1",
+    rsuffix: str = "2",
+) -> pd.DataFrame:
+    """Project pairwise attribute rows directly into a pandas frame.
+
+    This is the public GeoPandas export fast path: keep the projection
+    shape from the native pairwise boundary, but skip the Arrow round-trip
+    when the caller is going to materialize a GeoDataFrame immediately.
+    """
+    h_left_idx = left_idx.get() if hasattr(left_idx, "get") else left_idx
+    h_right_idx = right_idx.get() if hasattr(right_idx, "get") else right_idx
+    row_count = len(h_left_idx)
+    out_index = pd.RangeIndex(row_count)
+
+    left_attrs = left_df.drop(left_df._geometry_column_name, axis=1).copy(deep=False)
+    right_attrs = right_df.drop(right_df._geometry_column_name, axis=1).copy(deep=False)
+    left_columns, right_columns = _process_column_names_with_suffix(
+        left_attrs.columns,
+        right_attrs.columns,
+        (lsuffix, rsuffix),
+        left_attrs,
+        right_attrs,
+    )
+    left_attrs.columns = left_columns
+    right_attrs.columns = right_columns
+
+    left_projected = left_attrs._reindex_with_indexers({0: (out_index, h_left_idx)})
+    right_projected = right_attrs._reindex_with_indexers({0: (out_index, h_right_idx)})
+    concat_kwargs = {} if PANDAS_GE_30 else {"copy": False}
+    return pd.concat([left_projected, right_projected], axis=1, **concat_kwargs)
 
 
 def _relation_join_output_layout(
@@ -827,20 +894,13 @@ def _native_relation_join_parts(
     lsuffix: str,
     rsuffix: str,
     on_attribute=None,
+    attribute_storage: str = "arrow",
 ) -> tuple[NativeAttributeTable, GeometryNativeResult, str, Any, tuple[str, ...], np.ndarray | None]:
     """Build native relation-join export parts without constructing a joined DataFrame."""
     left_geometry_name = left_df.geometry.name
     left_crs = left_df.crs
     right_geometry_name = right_df.geometry.name
     right_crs = right_df.crs
-    geometry_name, crs, column_order = _relation_join_output_layout(
-        left_df,
-        right_df,
-        how=how,
-        lsuffix=lsuffix,
-        rsuffix=rsuffix,
-        on_attribute=on_attribute,
-    )
 
     left_geometry = None
     right_geometry = None
@@ -886,15 +946,34 @@ def _native_relation_join_parts(
         indices, distances, len(left_attr_df), len(right_attr_df), how
     )
     new_index = pd.RangeIndex(len(l_idx))
-    left_projected = left_attr_df._reindex_with_indexers({0: (new_index, l_idx)})
-    right_projected = right_attr_df._reindex_with_indexers({0: (new_index, r_idx)})
+    direct_take = (
+        how == "inner"
+        and len(l_idx) > 0
+        and np.all(np.asarray(l_idx) >= 0)
+        and np.all(np.asarray(r_idx) >= 0)
+    )
+    if direct_take:
+        l_take = np.asarray(l_idx, dtype=np.intp)
+        r_take = np.asarray(r_idx, dtype=np.intp)
+        left_projected = left_attr_df.take(l_take)
+        right_projected = right_attr_df.take(r_take)
+        left_projected.index = new_index
+        right_projected.index = new_index
+    else:
+        left_projected = left_attr_df._reindex_with_indexers({0: (new_index, l_idx)})
+        right_projected = right_attr_df._reindex_with_indexers({0: (new_index, r_idx)})
 
     if how in ("inner", "left"):
         left_projected = _restore_index(left_projected, left_index, left_index_original)
         joined_index = left_projected.index
-        geometry_values = left_df[[left_geometry_name]]._reindex_with_indexers(
-            {0: (new_index, l_idx)}
-        ).iloc[:, 0].values
+        geometry_name = left_geometry_name
+        crs = left_crs
+        if direct_take:
+            geometry_values = left_df.geometry.values.take(np.asarray(l_idx, dtype=np.intp))
+        else:
+            geometry_values = left_df[[left_geometry_name]]._reindex_with_indexers(
+                {0: (new_index, l_idx)}
+            ).iloc[:, 0].values
         geometry_result = GeometryNativeResult.from_values(
             geometry_values,
             crs=left_crs,
@@ -904,9 +983,14 @@ def _native_relation_join_parts(
     elif how == "right":
         right_projected = _restore_index(right_projected, right_index, right_index_original)
         joined_index = right_projected.index
-        geometry_values = right_df[[right_geometry_name]]._reindex_with_indexers(
-            {0: (new_index, r_idx)}
-        ).iloc[:, 0].values
+        geometry_name = right_geometry_name
+        crs = right_crs
+        if direct_take:
+            geometry_values = right_df.geometry.values.take(np.asarray(r_idx, dtype=np.intp))
+        else:
+            geometry_values = right_df[[right_geometry_name]]._reindex_with_indexers(
+                {0: (new_index, r_idx)}
+            ).iloc[:, 0].values
         geometry_result = GeometryNativeResult.from_values(
             geometry_values,
             crs=right_crs,
@@ -915,6 +999,8 @@ def _native_relation_join_parts(
         )
     else:
         joined_index = new_index
+        geometry_name = left_geometry_name
+        crs = left_crs
         geometry_series = _reassemble_outer_geometry(
             left_geometry,
             right_geometry,
@@ -932,7 +1018,9 @@ def _native_relation_join_parts(
     attributes = _native_attribute_table_from_projected_frames(
         [left_projected, right_projected],
         index_override=joined_index,
+        storage=attribute_storage,
     )
+    column_order = tuple([*attributes.columns, geometry_name])
     return attributes, geometry_result, geometry_name, crs, column_order, distances
 
 
@@ -1102,17 +1190,19 @@ class RelationJoinResult:
         on_attribute=None,
         distance_col: str | None = None,
     ) -> GeoDataFrame:
-        joined, distances = self.materialize(
-            left_df,
-            right_df,
-            how=how,
-            lsuffix=lsuffix,
-            rsuffix=rsuffix,
-            on_attribute=on_attribute,
-        )
-        if distance_col is not None:
-            joined[distance_col] = distances
-        return joined
+        return _relation_join_export_result_to_native_tabular_result(
+            RelationJoinExportResult(
+                relation_result=self,
+                left_df=left_df,
+                right_df=right_df,
+                how=how,
+                lsuffix=lsuffix,
+                rsuffix=rsuffix,
+                on_attribute=on_attribute,
+                distance_col=distance_col,
+            ),
+            attribute_storage="pandas",
+        ).to_geodataframe()
 
 
 @dataclass(frozen=True)
@@ -1139,10 +1229,10 @@ class RelationJoinExportResult:
         )
 
     def to_geodataframe(self) -> GeoDataFrame:
-        joined, distances = self.materialize()
-        if self.distance_col is not None:
-            joined[self.distance_col] = distances
-        return joined
+        return _relation_join_export_result_to_native_tabular_result(
+            self,
+            attribute_storage="pandas",
+        ).to_geodataframe()
 
 
 @dataclass(frozen=True)
@@ -1274,19 +1364,57 @@ class PairwiseConstructiveFragment:
     assign_columns: dict[str, Any] | None = None
     geometry_name: str = "geometry"
     frame_type: type | None = None
+    prefer_native_attribute_projection: bool = False
 
     def to_geodataframe(self) -> GeoDataFrame:
-        frame = self.result.to_geodataframe(
-            self.left_df,
-            self.right_df,
-            attribute_assembler=self.attribute_assembler,
-        )
-        if self.rename_columns:
-            frame = frame.rename(columns=self.rename_columns)
-        if self.assign_columns:
-            frame = frame.copy(deep=False)
-            for column, values in self.assign_columns.items():
-                frame[column] = values
+        if self.prefer_native_attribute_projection:
+            left_idx, right_idx = self.result.relation.to_host()
+            attributes = _project_pairwise_attribute_frame(
+                self.left_df,
+                self.right_df,
+                left_idx,
+                right_idx,
+                lsuffix="1",
+                rsuffix="2",
+            )
+            frame_attrs: dict[str, Any] = {}
+            if self.result.keep_geom_type_applied:
+                frame_attrs["_vibespatial_keep_geom_type_applied"] = True
+            if self.rename_columns:
+                attributes = attributes.rename(columns=self.rename_columns, copy=False)
+            trailing_columns: list[str] = []
+            if self.assign_columns:
+                attributes = attributes.copy(deep=False)
+                for column, values in self.assign_columns.items():
+                    attributes[column] = values
+                trailing_columns = list(self.assign_columns)
+            trailing_columns = [
+                column for column in trailing_columns if column in attributes.columns
+            ]
+            base_columns = [
+                column for column in attributes.columns if column not in trailing_columns
+            ]
+            frame = _materialize_attribute_geometry_frame(
+                attributes,
+                self.result.geometry,
+                geometry_name=self.geometry_name,
+                crs=self.result.geometry.crs,
+                column_order=tuple([*base_columns, self.geometry_name, *trailing_columns]),
+            )
+            if frame_attrs:
+                frame.attrs.update(frame_attrs)
+        else:
+            frame = self.result.to_geodataframe(
+                self.left_df,
+                self.right_df,
+                attribute_assembler=self.attribute_assembler,
+            )
+            if self.rename_columns:
+                frame = frame.rename(columns=self.rename_columns)
+            if self.assign_columns:
+                frame = frame.copy(deep=False)
+                for column, values in self.assign_columns.items():
+                    frame[column] = values
         frame = _set_active_geometry_name(frame, self.geometry_name)
         frame_type = self.frame_type or type(frame)
         if not isinstance(frame, frame_type):
@@ -1736,6 +1864,18 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
                 attrs=source.attrs.copy() or None,
             )
 
+        record_fallback_event(
+            surface="geopandas.clip",
+            reason="clip native-tabular export requires host semantic cleanup before materialization",
+            detail=(
+                "owned clip rows could not be preserved in the native boundary, so "
+                "host shapely/object cleanup is the explicit export fallback"
+            ),
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+            pipeline="clip.to_native_tabular_result",
+            d2h_transfer=True,
+        )
         row_parts: list[np.ndarray] = []
         geometry_parts: list[np.ndarray] = []
         for part in result.parts:
@@ -1839,6 +1979,8 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
 
 def _relation_join_export_result_to_native_tabular_result(
     result: RelationJoinExportResult,
+    *,
+    attribute_storage: str = "arrow",
 ) -> NativeTabularResult:
     attributes, geometry, geometry_name, _crs, column_order, distances = _native_relation_join_parts(
         result.left_df,
@@ -1849,6 +1991,7 @@ def _relation_join_export_result_to_native_tabular_result(
         lsuffix=result.lsuffix,
         rsuffix=result.rsuffix,
         on_attribute=result.on_attribute,
+        attribute_storage=attribute_storage,
     )
     if result.distance_col is not None:
         attributes = attributes.with_column(result.distance_col, distances)

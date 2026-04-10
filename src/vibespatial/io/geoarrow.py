@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,15 @@ from .wkb import (
     decode_wkb_owned,
     plan_wkb_partition,
 )
+
+_TAG_TO_GEOM_TYPE_NAME = {
+    FAMILY_TAGS[GeometryFamily.POINT]: "Point",
+    FAMILY_TAGS[GeometryFamily.LINESTRING]: "LineString",
+    FAMILY_TAGS[GeometryFamily.POLYGON]: "Polygon",
+    FAMILY_TAGS[GeometryFamily.MULTIPOINT]: "MultiPoint",
+    FAMILY_TAGS[GeometryFamily.MULTILINESTRING]: "MultiLineString",
+    FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]: "MultiPolygon",
+}
 
 
 @dataclass(frozen=True)
@@ -253,9 +263,16 @@ def encode_owned_geoarrow_array(
     interleaved: bool = True,
 ):
     family = _homogeneous_family(array)
-    buffer = array.families[family]
+    validity, tags, family_row_offsets, families = _authoritative_geoarrow_host_view(array)
+    buffer = families[family]
+    view = SimpleNamespace(
+        row_count=int(validity.size),
+        validity=validity,
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+    )
     if family.value == "point":
-        return _encode_point_family(buffer, array, field_name=field_name, crs=crs, interleaved=interleaved)
+        return _encode_point_family(buffer, view, field_name=field_name, crs=crs, interleaved=interleaved)
     mapping = {
         "linestring": ("geoarrow.linestring", "linestring"),
         "polygon": ("geoarrow.polygon", "polygon"),
@@ -267,7 +284,7 @@ def encode_owned_geoarrow_array(
     return _encode_list_family(
         extension_name=extension_name,
         buffer=buffer,
-        array=array,
+        array=view,
         field_name=field_name,
         crs=crs,
         interleaved=interleaved,
@@ -283,16 +300,7 @@ def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str |
     # DeviceGeometryArray: check eligibility from owned buffers, no Shapely.
     arr = series.array
     if isinstance(arr, DeviceGeometryArray):
-        owned = arr.to_owned()
-        if owned.row_count == 0:
-            return "empty geometry column requires upstream GeoArrow constructor semantics"
-        if not bool(owned.validity.any()):
-            return "all-missing geometry column requires upstream GeoArrow constructor semantics"
-        try:
-            _homogeneous_family(owned)
-        except ValueError as exc:
-            return str(exc)
-        return None
+        return _owned_geoarrow_fast_path_reason_from_owned(arr.to_owned(), include_z=include_z)
 
     values = np.asarray(arr)
     if len(values) == 0:
@@ -308,6 +316,123 @@ def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str |
     except ValueError as exc:
         return str(exc)
     return None
+
+
+def _owned_geoarrow_fast_path_reason_from_owned(
+    owned: OwnedGeometryArray,
+    *,
+    include_z: bool | None,
+) -> str | None:
+    if include_z is True:
+        return "requested z-dimension output requires upstream GeoArrow constructor semantics"
+    if owned.row_count == 0:
+        return "empty geometry column requires upstream GeoArrow constructor semantics"
+    if not bool(owned.validity.any()):
+        return "all-missing geometry column requires upstream GeoArrow constructor semantics"
+    try:
+        _homogeneous_family(owned)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _authoritative_geoarrow_host_view(
+    array: OwnedGeometryArray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[GeometryFamily, FamilyGeometryBuffer]]:
+    if array.device_state is None:
+        return array.validity, array.tags, array.family_row_offsets, array.families
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+
+    runtime = get_cuda_runtime()
+    state = array.device_state
+    validity = np.asarray(runtime.copy_device_to_host(state.validity), dtype=np.bool_)
+    tags = np.asarray(runtime.copy_device_to_host(state.tags), dtype=np.int8)
+    family_row_offsets = np.asarray(
+        runtime.copy_device_to_host(state.family_row_offsets),
+        dtype=np.int32,
+    )
+    families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
+    for family, buffer in array.families.items():
+        device_buffer = state.families.get(family)
+        if device_buffer is None:
+            families[family] = buffer
+            continue
+        families[family] = FamilyGeometryBuffer(
+            family=buffer.family,
+            schema=buffer.schema,
+            row_count=buffer.row_count,
+            x=np.asarray(runtime.copy_device_to_host(device_buffer.x), dtype=np.float64),
+            y=np.asarray(runtime.copy_device_to_host(device_buffer.y), dtype=np.float64),
+            geometry_offsets=np.asarray(
+                runtime.copy_device_to_host(device_buffer.geometry_offsets),
+                dtype=np.int32,
+            ),
+            empty_mask=np.asarray(
+                runtime.copy_device_to_host(device_buffer.empty_mask),
+                dtype=np.bool_,
+            ),
+            part_offsets=(
+                None
+                if device_buffer.part_offsets is None
+                else np.asarray(
+                    runtime.copy_device_to_host(device_buffer.part_offsets),
+                    dtype=np.int32,
+                )
+            ),
+            ring_offsets=(
+                None
+                if device_buffer.ring_offsets is None
+                else np.asarray(
+                    runtime.copy_device_to_host(device_buffer.ring_offsets),
+                    dtype=np.int32,
+                )
+            ),
+            bounds=(
+                None
+                if device_buffer.bounds is None
+                else np.asarray(runtime.copy_device_to_host(device_buffer.bounds), dtype=np.float64)
+            ),
+            host_materialized=False,
+        )
+    return validity, tags, family_row_offsets, families
+
+
+_SUPPORTED_GEOARROW_MIXES = {
+    frozenset({"Point", "MultiPoint"}),
+    frozenset({"LineString", "MultiLineString"}),
+    frozenset({"Polygon", "MultiPolygon"}),
+}
+
+
+def _device_geoarrow_constructor_fallback_reason(owned: OwnedGeometryArray) -> str | None:
+    if owned.device_state is not None:
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+            cp = None
+    else:
+        cp = None
+
+    if cp is not None:
+        state = owned._ensure_device_state()
+        validity = cp.asarray(state.validity)
+        valid_count = int(cp.count_nonzero(validity).item())
+        if valid_count == 0:
+            return None
+        valid_tags = cp.asarray(state.tags)[validity]
+        unique_tags = tuple(int(tag) for tag in cp.unique(valid_tags).get())
+    else:
+        validity = owned.validity
+        valid_tags = owned.tags[validity]
+        if valid_tags.size == 0:
+            return None
+        unique_tags = tuple(int(tag) for tag in np.unique(valid_tags))
+
+    geom_types = frozenset(_TAG_TO_GEOM_TYPE_NAME[tag] for tag in unique_tags)
+    if len(geom_types) <= 1 or geom_types in _SUPPORTED_GEOARROW_MIXES:
+        return None
+    return "Geometry type combination is not supported for native GeoArrow encoding"
 
 
 def _geoarrow_constructor_fallback_reason(series) -> str | None:
@@ -357,19 +482,27 @@ def _construct_geoarrow_array_with_explicit_fallback(
             "GeoArrow export requires at least one non-missing geometry to infer the geometry type"
         )
 
-    fast_path_reason = _owned_geoarrow_fast_path_reason(series, include_z=include_z)
+    arr = series.array
+    owned = arr.to_owned() if isinstance(arr, DeviceGeometryArray) else None
+    fast_path_reason = (
+        _owned_geoarrow_fast_path_reason_from_owned(owned, include_z=include_z)
+        if owned is not None
+        else _owned_geoarrow_fast_path_reason(series, include_z=include_z)
+    )
     if fast_path_reason is None:
         try:
             return encode_owned_geoarrow_array(
-                series.array.to_owned(),
+                owned if owned is not None else series.array.to_owned(),
                 field_name=field_name,
                 crs=series.crs,
                 interleaved=interleaved,
             )
         except Exception as exc:
             fast_path_reason = str(exc)
-    values = np.asarray(series.array)
-    constructor_fallback_reason = _geoarrow_constructor_fallback_reason(series)
+    if owned is not None:
+        constructor_fallback_reason = _device_geoarrow_constructor_fallback_reason(owned)
+    else:
+        constructor_fallback_reason = _geoarrow_constructor_fallback_reason(series)
     if constructor_fallback_reason is not None:
         if not fallback_to_wkb_on_error:
             raise ValueError(constructor_fallback_reason)
@@ -381,11 +514,22 @@ def _construct_geoarrow_array_with_explicit_fallback(
             pipeline="io/geoarrow_encode",
             d2h_transfer=True,
         )
+        values = np.asarray(arr)
         return construct_wkb_array(
             values,
             field_name=field_name,
             crs=series.crs,
         )
+    if owned is not None:
+        record_fallback_event(
+            surface=surface,
+            reason="explicit CPU compatibility export for GeoArrow materialization",
+            detail=fast_path_reason or "native GeoArrow constructor semantics require host materialization",
+            selected=ExecutionMode.CPU,
+            pipeline="io/geoarrow_encode",
+            d2h_transfer=True,
+        )
+    values = np.asarray(arr)
     return construct_geometry_array(
         values,
         include_z=include_z,
@@ -889,7 +1033,9 @@ def geodataframe_to_arrow(
         selected=ExecutionMode.CPU,
     )
     if geometry_encoding.lower() == "geoarrow":
-        geometry_mask = df.dtypes == "geometry"
+        geometry_mask = df.dtypes.map(
+            lambda dtype: getattr(dtype, "name", None) in ("geometry", "device_geometry")
+        )
         geometry_columns = df.columns[geometry_mask]
         geometry_indices = np.asarray(geometry_mask).nonzero()[0]
         df_attr = pd.DataFrame(df.copy(deep=False))

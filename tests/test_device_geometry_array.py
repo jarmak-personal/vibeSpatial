@@ -10,6 +10,7 @@ import pandas as pd
 import pytest
 import shapely
 from shapely.geometry import (
+    GeometryCollection,
     LineString,
     MultiLineString,
     MultiPoint,
@@ -19,6 +20,7 @@ from shapely.geometry import (
     box,
 )
 
+import vibespatial.api as geopandas
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.device_array import DeviceGeometryArray, DeviceGeometryDtype
 from vibespatial.geometry.owned import (
@@ -29,6 +31,7 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
 )
 from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
@@ -637,6 +640,41 @@ class TestGeoDataFrameIntegration:
         taken = df.iloc[[0, 4]]
         assert len(taken) == 2
 
+    def test_active_geometry_setitem_preserves_device_backing(self):
+        gdf = geopandas.GeoDataFrame(
+            {"value": [1, 2]},
+            geometry=DeviceGeometryArray._from_sequence(
+                [Point(0, 0), Point(1, 1)]
+            ),
+            crs="EPSG:4326",
+        )
+
+        gdf["geometry"] = shapely.make_valid(gdf.geometry.values)
+
+        assert gdf.geometry.dtype == DeviceGeometryDtype()
+        assert isinstance(gdf.geometry.values, DeviceGeometryArray)
+
+    def test_set_geometry_preserves_device_backing_for_array_like_replacement(self):
+        gdf = geopandas.GeoDataFrame(
+            {"value": [1, 2]},
+            geometry=DeviceGeometryArray._from_sequence(
+                [Point(0, 0), Point(1, 1)]
+            ),
+            crs="EPSG:4326",
+        )
+
+        result = gdf.set_geometry(shapely.make_valid(gdf.geometry.values))
+
+        assert result.geometry.dtype == DeviceGeometryDtype()
+        assert isinstance(result.geometry.values, DeviceGeometryArray)
+
+    def test_centroid_warning_mentions_operation_name(self):
+        dga = DeviceGeometryArray._from_sequence([Point(0, 0)])
+        dga.crs = "EPSG:4326"
+
+        with pytest.warns(UserWarning, match=r"Results from 'centroid'"):
+            _ = dga.centroid
+
 
 # ---------------------------------------------------------------------------
 # Serialization
@@ -891,6 +929,82 @@ class TestBinaryPredicatesOwned:
         assert len(mat) >= 1
 
 
+class TestFallbackObservability:
+    @pytest.mark.parametrize(
+        ("method_name", "other_factory", "expected_surface"),
+        [
+            (
+                "equals",
+                lambda: DeviceGeometryArray._from_sequence([Point(0, 0), Point(1, 1)]),
+                "DeviceGeometryArray.equals",
+            ),
+            (
+                "distance",
+                lambda: GeometryCollection([Point(0, 0)]),
+                "DeviceGeometryArray.distance",
+            ),
+            (
+                "union",
+                lambda: GeometryCollection([Point(0, 0)]),
+                "DeviceGeometryArray.union",
+            ),
+        ],
+    )
+    def test_fallback_events_precede_shapely_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        method_name: str,
+        other_factory,
+        expected_surface: str,
+    ) -> None:
+        import vibespatial.geometry.device_array as device_array_module
+
+        geopandas.clear_fallback_events()
+        left = DeviceGeometryArray._from_sequence([Point(0, 0), Point(1, 1)])
+        other = other_factory()
+
+        original = device_array_module.owned_to_shapely
+
+        def spy(owned, *args, **kwargs):
+            events = geopandas.get_fallback_events()
+            assert events, "expected a fallback event before Shapely materialization"
+            assert events[-1].surface == expected_surface
+            return original(owned, *args, **kwargs)
+
+        monkeypatch.setattr(device_array_module, "owned_to_shapely", spy)
+
+        result = getattr(left, method_name)(other)
+
+        assert result is not None
+        events = geopandas.get_fallback_events(clear=True)
+        assert events[-1].surface == expected_surface
+
+    def test_distance_strict_native_blocks_host_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import vibespatial.geometry.device_array as device_array_module
+
+        geopandas.clear_fallback_events()
+        monkeypatch.setenv("VIBESPATIAL_STRICT_NATIVE", "1")
+        left = DeviceGeometryArray._from_sequence([Point(0, 0), Point(1, 1)])
+        other = GeometryCollection([Point(0, 0)])
+
+        monkeypatch.setattr(
+            device_array_module,
+            "owned_to_shapely",
+            lambda *args, **kwargs: pytest.fail(
+                "distance fallback should not materialize in strict-native mode"
+            ),
+        )
+
+        with pytest.raises(StrictNativeFallbackError):
+            left.distance(other)
+
+        events = geopandas.get_fallback_events(clear=True)
+        assert events[-1].surface == "DeviceGeometryArray.distance"
+
+
 class TestClipByRectOwned:
     """clip_by_rect on DGA uses owned path and returns DGA."""
 
@@ -1035,6 +1149,63 @@ class TestConstructiveOpsReturnDGA:
         materialized = np.asarray(result, dtype=object)
         assert bool(shapely.is_valid(materialized).all())
 
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="No GPU runtime available")
+    def test_device_resident_small_linestring_buffer_stays_on_gpu(self, monkeypatch):
+        import vibespatial.constructive.linestring as linestring_module
+        import vibespatial.runtime.adaptive as adaptive_module
+        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+        dga = DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [
+                    LineString([(0, 0), (5, 5), (10, 0)]),
+                    LineString([(10, 0), (15, 5), (20, 0)]),
+                ],
+                residency=Residency.DEVICE,
+            )
+        )
+
+        called: dict[str, object] = {}
+
+        def _fake_linestring_buffer_owned_array(owned, *_args, **_kwargs):
+            called["row_count"] = owned.row_count
+            called["residency"] = owned.residency
+            return from_shapely_geometries(
+                [
+                    Polygon([(0, 0), (10, 0), (10, 1), (0, 1), (0, 0)]),
+                    Polygon([(10, 0), (20, 0), (20, 1), (10, 1), (10, 0)]),
+                ],
+                residency=Residency.DEVICE,
+            )
+
+        monkeypatch.setattr(
+            adaptive_module,
+            "plan_dispatch_selection",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                selected=ExecutionMode.CPU,
+                reason="forced cpu for test",
+            ),
+        )
+        monkeypatch.setattr(
+            linestring_module,
+            "linestring_buffer_owned_array",
+            _fake_linestring_buffer_owned_array,
+        )
+
+        clear_dispatch_events()
+        result = dga.buffer(1.0)
+        dispatch_events = get_dispatch_events(clear=True)
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert getattr(result._owned, "residency", None) is Residency.DEVICE
+        assert called["row_count"] == 2
+        assert called["residency"] is Residency.DEVICE
+        buffer_events = [event for event in dispatch_events if event.surface == "DeviceGeometryArray.buffer"]
+        assert buffer_events
+        assert buffer_events[-1].implementation == "linestring_buffer_owned_array"
+        assert buffer_events[-1].selected is ExecutionMode.GPU
+
     def test_large_two_point_linestring_buffer_uses_specialized_gpu_route(self, monkeypatch):
         import vibespatial.constructive.linestring as linestring_module
         import vibespatial.runtime.adaptive as adaptive_module
@@ -1151,6 +1322,38 @@ class TestConstructiveOpsReturnDGA:
         result = poly_dga.intersection(other)
         assert isinstance(result, DeviceGeometryArray)
         assert len(result) == 2
+
+    def test_intersection_falls_back_to_host_geometry_array_for_geometrycollection_output(self):
+        left_owned = from_shapely_geometries(
+            [Polygon([(0, 0), (3, 0), (3, 3), (0, 0)])],
+            residency=Residency.DEVICE if has_gpu_runtime() else Residency.HOST,
+        )
+        left = geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(left_owned, crs="EPSG:3857"),
+            crs="EPSG:3857",
+        )
+        right = geopandas.GeoSeries(
+            GeometryArray(
+                np.asarray(
+                    [
+                        GeometryCollection(
+                            [
+                                Polygon([(1, 0), (3, 0), (3, 2), (1, 0)]),
+                                LineString([(0, 1), (3, 1)]),
+                            ]
+                        )
+                    ],
+                    dtype=object,
+                ),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        )
+
+        result = left.intersection(right)
+
+        assert isinstance(result.values, GeometryArray)
+        assert result.iloc[0].geom_type == "GeometryCollection"
 
     def test_union_returns_dga(self, poly_dga):
         other = DeviceGeometryArray._from_sequence([

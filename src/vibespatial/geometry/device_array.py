@@ -10,7 +10,6 @@ See epic vibeSpatial-o17.9.13 and ADR-0005 for design rationale.
 
 from __future__ import annotations
 
-import inspect
 import warnings
 from collections.abc import Sequence
 from typing import Any
@@ -22,6 +21,7 @@ from shapely.geometry.base import BaseGeometry
 
 from vibespatial.cuda._runtime import get_cuda_runtime
 from vibespatial.runtime.config import LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.residency import Residency, TransferTrigger
 
 from .api_registry import (
@@ -56,6 +56,34 @@ _TAG_TO_GEOM_TYPE_NAME: dict[int, str] = {
     FAMILY_TAGS[GeometryFamily.MULTILINESTRING]: "MultiLineString",
     FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]: "MultiPolygon",
 }
+
+
+def _owned_requires_host_transfer(owned: OwnedGeometryArray | None) -> bool:
+    if owned is None:
+        return False
+    if owned.residency is Residency.DEVICE:
+        return True
+    return any(not buffer.host_materialized for buffer in owned.families.values())
+
+
+def _record_shapely_fallback_event(
+    *,
+    surface: str,
+    reason: str,
+    owned: OwnedGeometryArray | None,
+    detail: str = "",
+    requested: Any = "auto",
+    pipeline: str = "",
+) -> None:
+    record_fallback_event(
+        surface=surface,
+        requested=requested,
+        selected="cpu",
+        reason=reason,
+        detail=detail,
+        pipeline=pipeline,
+        d2h_transfer=_owned_requires_host_transfer(owned),
+    )
 
 
 def _is_host_geometry_array_like(value: Any) -> bool:
@@ -351,12 +379,13 @@ class DeviceGeometryArray(ExtensionArray):
     # Shapely-delegated properties (materialization with diagnostics)
     # ------------------------------------------------------------------
 
-    def check_geographic_crs(self, stacklevel: int) -> None:
+    def check_geographic_crs(self, stacklevel: int, *, operation: str | None = None) -> None:
         """Warn if CRS is geographic."""
         if self._crs and self._crs.is_geographic:
+            op_name = operation or "this operation"
             warnings.warn(
                 "Geometry is in a geographic CRS. Results from "
-                f"'{inspect.stack()[1].function}' are likely incorrect. "
+                f"'{op_name}' are likely incorrect. "
                 "Use 'GeoSeries.to_crs()' to re-project geometries to a "
                 "projected CRS before this operation.\n",
                 UserWarning,
@@ -368,7 +397,7 @@ class DeviceGeometryArray(ExtensionArray):
         """Area — GPU-accelerated from owned coordinate buffers, no Shapely."""
         from vibespatial.constructive.measurement import area_owned
 
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="area")
         return area_owned(self._owned)
 
     @property
@@ -376,7 +405,7 @@ class DeviceGeometryArray(ExtensionArray):
         """Length — GPU-accelerated from owned coordinate buffers, no Shapely."""
         from vibespatial.constructive.measurement import length_owned
 
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="length")
         return length_owned(self._owned)
 
     @property
@@ -416,6 +445,13 @@ class DeviceGeometryArray(ExtensionArray):
     def is_closed(self) -> np.ndarray:
         import shapely
 
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.is_closed",
+            reason="Shapely materialization required",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            pipeline="materialization",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.is_closed: Shapely materialization required",
@@ -436,6 +472,13 @@ class DeviceGeometryArray(ExtensionArray):
     def is_valid_reason(self) -> np.ndarray:
         import shapely
 
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.is_valid_reason",
+            reason="Shapely materialization required",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            pipeline="materialization",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.is_valid_reason: Shapely materialization required",
@@ -456,7 +499,7 @@ class DeviceGeometryArray(ExtensionArray):
     def centroid(self):
         from vibespatial.constructive.centroid import centroid_owned
 
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="centroid")
         result_owned = centroid_owned(self._owned)
         return DeviceGeometryArray._from_owned(result_owned, crs=self._crs)
 
@@ -486,6 +529,13 @@ class DeviceGeometryArray(ExtensionArray):
     def unary_union(self):
         import shapely
 
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.unary_union",
+            reason="Shapely materialization required",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            pipeline="constructive/unary_union",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.unary_union: Shapely materialization required",
@@ -497,6 +547,13 @@ class DeviceGeometryArray(ExtensionArray):
         if method == "coverage":
             # Coverage union has specific topological assumptions; stays CPU
             import shapely
+            _record_shapely_fallback_event(
+                surface="DeviceGeometryArray.union_all",
+                reason="coverage method requires Shapely materialization",
+                owned=self._owned,
+                detail=f"rows={len(self)}, method={method}",
+                pipeline="constructive/union_all",
+            )
             self._owned._record(
                 DiagnosticKind.MATERIALIZATION,
                 "DeviceGeometryArray.union_all: coverage method (CPU-only)",
@@ -508,11 +565,11 @@ class DeviceGeometryArray(ExtensionArray):
 
     def buffer(self, distance, quad_segs=None, **kwargs):
         """Buffer -- routes through owned dispatch with GPU kernel when possible."""
-        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.runtime.dispatch import record_dispatch_event
         from vibespatial.runtime.provenance import make_buffer_tag
 
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="buffer")
         if isinstance(distance, pd.Series):
             distance = np.asarray(distance)
 
@@ -622,6 +679,7 @@ class DeviceGeometryArray(ExtensionArray):
                     kernel_class=KernelClass.CONSTRUCTIVE,
                     row_count=len(self),
                 )
+                preserve_device_native = owned.residency is Residency.DEVICE
                 force_two_point_gpu = (
                     len(self) >= LINESTRING_TWO_POINT_BUFFER_GPU_THRESHOLD
                     and supports_two_point_linestring_buffer_fast_path(
@@ -632,7 +690,11 @@ class DeviceGeometryArray(ExtensionArray):
                         single_sided=single_sided,
                     )
                 )
-                if selection.selected is not ExecutionMode.GPU and not force_two_point_gpu:
+                if (
+                    selection.selected is not ExecutionMode.GPU
+                    and not force_two_point_gpu
+                    and not preserve_device_native
+                ):
                     owned._record(
                         DiagnosticKind.RUNTIME,
                         (
@@ -656,12 +718,20 @@ class DeviceGeometryArray(ExtensionArray):
                             operation="buffer",
                             implementation="linestring_buffer_owned_array",
                             reason=(
+                                "device-resident DGA linestring buffer stayed on GPU"
+                                if preserve_device_native and selection.selected is not ExecutionMode.GPU
+                                else
                                 "DGA direct two-point linestring buffer dispatch"
                                 if force_two_point_gpu and selection.selected is not ExecutionMode.GPU
                                 else "DGA direct linestring buffer dispatch"
                             ),
                             detail=(
                                 f"rows={len(self)}, family=linestring"
+                                + (
+                                    ", residency=device"
+                                    if preserve_device_native
+                                    else ""
+                                )
                                 + (
                                     ", shape=simple_two_point"
                                     if force_two_point_gpu
@@ -715,6 +785,14 @@ class DeviceGeometryArray(ExtensionArray):
         # Shapely fallback for mixed families, nulls, empties, or unsupported params
         import shapely
 
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.buffer",
+            reason="mixed families, nulls, empties, or unsupported params",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            requested=get_requested_mode(),
+            pipeline="constructive/buffer",
+        )
         owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.buffer: Shapely fallback",
@@ -764,7 +842,7 @@ class DeviceGeometryArray(ExtensionArray):
         return DeviceGeometryArray._from_owned(result, crs=self._crs)
 
     def offset_curve(self, distance, quad_segs=8, join_style="round", mitre_limit=5.0):
-        from vibespatial.runtime import ExecutionMode
+        from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.runtime.dispatch import record_dispatch_event
 
         owned = self._owned
@@ -813,6 +891,14 @@ class DeviceGeometryArray(ExtensionArray):
         # Shapely fallback
         import shapely
 
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.offset_curve",
+            reason="ineligible for owned kernel or kernel had fallback rows",
+            owned=owned,
+            detail=f"rows={len(self)}, join_style={join_style}",
+            requested=get_requested_mode(),
+            pipeline="constructive/offset_curve",
+        )
         fallback = shapely.offset_curve(
             shapely_geoms,
             distance,
@@ -1058,6 +1144,14 @@ class DeviceGeometryArray(ExtensionArray):
         # Unsupported predicate — fall back to Shapely
         import shapely as _shapely
 
+        _record_shapely_fallback_event(
+            surface=f"DeviceGeometryArray.{predicate}",
+            reason="predicate is unsupported by the owned predicate engine",
+            owned=self._owned,
+            detail=f"rows={len(self)}, predicate={predicate}",
+            requested=get_requested_mode(),
+            pipeline="predicate",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             f"DeviceGeometryArray.{predicate}: Shapely materialization required (unsupported predicate)",
@@ -1100,6 +1194,16 @@ class DeviceGeometryArray(ExtensionArray):
     def equals(self, other, *args, **kwargs):
         import shapely
 
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.equals",
+            reason="Shapely materialization required",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            requested=get_requested_mode(),
+            pipeline="predicate",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.equals: Shapely materialization required",
@@ -1120,6 +1224,17 @@ class DeviceGeometryArray(ExtensionArray):
             from .equality import geom_equals_exact_owned
             return geom_equals_exact_owned(self._owned, other._owned, tolerance)
         import shapely
+
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.geom_equals_exact",
+            reason="Shapely fallback for non-DGA other",
+            owned=self._owned,
+            detail=f"rows={len(self)}, tolerance={tolerance}",
+            requested=get_requested_mode(),
+            pipeline="predicate",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.geom_equals_exact: Shapely fallback for non-DGA other",
@@ -1132,6 +1247,17 @@ class DeviceGeometryArray(ExtensionArray):
             from .equality import geom_equals_identical_owned
             return geom_equals_identical_owned(self._owned, other._owned)
         import shapely
+
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.geom_equals_identical",
+            reason="Shapely fallback for non-DGA other",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            requested=get_requested_mode(),
+            pipeline="predicate",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.geom_equals_identical: Shapely fallback for non-DGA other",
@@ -1157,20 +1283,29 @@ class DeviceGeometryArray(ExtensionArray):
                 raise ValueError(
                     f"Lengths do not match: {len(self)} vs {len(other)}"
                 )
-            return from_shapely_geometries(other_values._data.tolist())
+            try:
+                return from_shapely_geometries(other_values._data.tolist())
+            except NotImplementedError:
+                return None
         from shapely.geometry.base import BaseGeometry as _BG
         if isinstance(other, _BG):
-            return from_shapely_geometries([other])
+            try:
+                return from_shapely_geometries([other])
+            except NotImplementedError:
+                return None
         if isinstance(other, np.ndarray) and other.dtype == object:
             if len(other) != len(self):
                 raise ValueError(
                     f"Lengths do not match: {len(self)} vs {len(other)}"
                 )
-            return from_shapely_geometries(other.tolist())
+            try:
+                return from_shapely_geometries(other.tolist())
+            except NotImplementedError:
+                return None
         return None
 
     def distance(self, other, *args, **kwargs):
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="distance")
         other_owned = self._coerce_other_to_owned(other)
         if other_owned is not None:
             from vibespatial.spatial.distance_owned import distance_owned
@@ -1178,6 +1313,17 @@ class DeviceGeometryArray(ExtensionArray):
 
         # Shapely fallback for unsupported 'other' types.
         import shapely
+
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.distance",
+            reason="unsupported other type for owned distance path",
+            owned=self._owned,
+            detail=f"rows={len(self)}",
+            requested=get_requested_mode(),
+            pipeline="measurement/distance",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.distance: Shapely fallback (unsupported other type)",
@@ -1188,7 +1334,7 @@ class DeviceGeometryArray(ExtensionArray):
         return shapely.distance(self._ensure_shapely_cache(), other, *args, **kwargs)
 
     def dwithin(self, other, distance):
-        self.check_geographic_crs(stacklevel=6)
+        self.check_geographic_crs(stacklevel=6, operation="dwithin")
         if isinstance(other, BaseGeometry):
             return _dwithin_scalar(self, other, distance)
         other_owned = self._coerce_other_to_owned(other)
@@ -1218,6 +1364,17 @@ class DeviceGeometryArray(ExtensionArray):
 
         import shapely
 
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.hausdorff_distance",
+            reason="unsupported other type for owned distance path",
+            owned=self._owned,
+            detail=f"rows={len(self)}, densify={densify}",
+            requested=get_requested_mode(),
+            pipeline="measurement/distance",
+        )
+
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             "DeviceGeometryArray.hausdorff_distance: Shapely fallback (unsupported other type)",
@@ -1237,6 +1394,17 @@ class DeviceGeometryArray(ExtensionArray):
             return frechet_distance_owned(self._owned, other_owned, densify=densify)
 
         import shapely
+
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface="DeviceGeometryArray.frechet_distance",
+            reason="unsupported other type for owned distance path",
+            owned=self._owned,
+            detail=f"rows={len(self)}, densify={densify}",
+            requested=get_requested_mode(),
+            pipeline="measurement/distance",
+        )
 
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
@@ -1348,6 +1516,16 @@ class DeviceGeometryArray(ExtensionArray):
         # Shapely fallback for unsupported other types
         import shapely
 
+        from vibespatial.runtime import get_requested_mode
+
+        _record_shapely_fallback_event(
+            surface=f"DeviceGeometryArray.{op}",
+            reason="unsupported other type for owned constructive path",
+            owned=self._owned,
+            detail=f"rows={len(self)}, op={op}",
+            requested=get_requested_mode(),
+            pipeline="constructive/binary",
+        )
         self._owned._record(
             DiagnosticKind.MATERIALIZATION,
             f"DeviceGeometryArray.{op}: Shapely fallback (unsupported other type)",
@@ -1358,7 +1536,12 @@ class DeviceGeometryArray(ExtensionArray):
         result = getattr(shapely, op)(
             self._ensure_shapely_cache(), other, *args, **kwargs
         )
-        new_owned = from_shapely_geometries(result.tolist())
+        try:
+            new_owned = from_shapely_geometries(result.tolist())
+        except NotImplementedError:
+            from vibespatial.api.geometry_array import from_shapely
+
+            return from_shapely(result.tolist(), crs=self._crs)
         return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
     def intersection(self, other, *args, **kwargs):

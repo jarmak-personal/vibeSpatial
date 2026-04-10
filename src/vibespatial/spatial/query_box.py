@@ -3,6 +3,11 @@ from __future__ import annotations
 import numpy as np
 from shapely.geometry.base import BaseGeometry
 
+try:
+    import cupy as cp
+except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
+    cp = None
+
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.cuda.cccl_primitives import compact_indices, exclusive_sum
 from vibespatial.runtime import ExecutionMode
@@ -18,7 +23,10 @@ from vibespatial.cuda._runtime import (  # noqa: E402
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import OwnedGeometryArray  # noqa: E402
-from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds  # noqa: E402
+from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
+    compute_geometry_bounds,
+    compute_geometry_bounds_device,
+)
 from vibespatial.kernels.core.spatial_query_kernels import _spatial_query_kernels  # noqa: E402
 from vibespatial.runtime import has_gpu_runtime  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
@@ -449,6 +457,68 @@ def _extract_owned_polygon_box_bounds(query_owned: OwnedGeometryArray) -> np.nda
     coord_counts = ring_offsets[1:] - ring_offsets[:-1]
     if coord_counts.size != n or not np.all(coord_counts == 5):
         return None
+
+    if (
+        cp is not None
+        and query_owned.residency is Residency.DEVICE
+    ):
+        state = query_owned._ensure_device_state()
+        polygon_state = state.families[GeometryFamily.POLYGON]
+        if polygon_state.ring_offsets is None:
+            return None
+
+        d_geom_starts = cp.asarray(polygon_state.geometry_offsets[:-1]).astype(cp.int32, copy=False)
+        d_geom_ends = cp.asarray(polygon_state.geometry_offsets[1:]).astype(cp.int32, copy=False)
+        if not bool(cp.all((d_geom_ends - d_geom_starts) == 1)):
+            return None
+
+        d_ring_offsets = cp.asarray(polygon_state.ring_offsets).astype(cp.int32, copy=False)
+        d_coord_starts = d_ring_offsets[d_geom_starts]
+        d_coord_ends = d_ring_offsets[d_geom_ends]
+        if not bool(cp.all((d_coord_ends - d_coord_starts) == 5)):
+            return None
+
+        compute_geometry_bounds_device(query_owned)
+        d_bounds = cp.asarray(query_owned.device_state.row_bounds).reshape(n, 4)
+        d_offsets = d_coord_starts[:, None] + cp.arange(5, dtype=cp.int32)[None, :]
+        d_x = cp.asarray(polygon_state.x)[d_offsets]
+        d_y = cp.asarray(polygon_state.y)[d_offsets]
+
+        d_minx = d_bounds[:, 0][:, None]
+        d_miny = d_bounds[:, 1][:, None]
+        d_maxx = d_bounds[:, 2][:, None]
+        d_maxy = d_bounds[:, 3][:, None]
+        d_tol = 1e-9 * cp.maximum(
+            cp.maximum(cp.abs(d_bounds[:, 2] - d_bounds[:, 0]), cp.abs(d_bounds[:, 3] - d_bounds[:, 1])),
+            1.0,
+        )
+        d_tol_2d = d_tol[:, None]
+
+        closed = (
+            (cp.abs(d_x[:, 0] - d_x[:, -1]) <= d_tol)
+            & (cp.abs(d_y[:, 0] - d_y[:, -1]) <= d_tol)
+        )
+        x_at_min_or_max = (cp.abs(d_x - d_minx) <= d_tol_2d) | (cp.abs(d_x - d_maxx) <= d_tol_2d)
+        y_at_min_or_max = (cp.abs(d_y - d_miny) <= d_tol_2d) | (cp.abs(d_y - d_maxy) <= d_tol_2d)
+        edge_same_x = cp.abs(d_x[:, 1:] - d_x[:, :-1]) <= d_tol_2d
+        edge_same_y = cp.abs(d_y[:, 1:] - d_y[:, :-1]) <= d_tol_2d
+        if not bool(
+            cp.all(
+                closed
+                & cp.all(x_at_min_or_max, axis=1)
+                & cp.all(y_at_min_or_max, axis=1)
+                & cp.all(cp.logical_xor(edge_same_x, edge_same_y), axis=1)
+            )
+        ):
+            return None
+
+        d_row_offsets = cp.asarray(state.family_row_offsets).astype(cp.int32, copy=False)
+        d_valid = d_row_offsets >= 0
+        d_polygon_rows = cp.clip(d_row_offsets, 0, None)
+        d_empty_mask = cp.asarray(polygon_state.empty_mask).astype(cp.bool_, copy=False)
+        d_valid = d_valid & ~d_empty_mask[d_polygon_rows]
+        d_bounds = cp.where(d_valid[:, None], d_bounds, cp.nan)
+        return cp.asnumpy(d_bounds)
 
     # Structural checks above use only offsets (available on host even for
     # device-resident OGAs).  Coordinate verification needs x/y buffers;

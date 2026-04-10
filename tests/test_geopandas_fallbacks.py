@@ -168,6 +168,34 @@ def test_geopandas_sindex_query_host_fallback_is_observable_for_unsupported_inpu
     assert dispatch_events[-1].selected is geopandas.ExecutionMode.CPU
 
 
+def test_geopandas_geometry_array_sindex_emits_fallback_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial.api.geometry_array as geometry_array_module
+    from vibespatial.api.geometry_array import GeometryArray
+
+    geopandas.clear_fallback_events()
+    series = geopandas.GeoSeries([Point(0, 0), Point(10, 10)])
+    values = GeometryArray.from_owned(series.values.to_owned(), crs=series.crs)
+
+    original = geometry_array_module.owned_to_shapely
+
+    def spy(owned, *args, **kwargs):
+        events = geopandas.get_fallback_events()
+        assert events, "expected an explicit fallback event before host materialization"
+        assert events[-1].surface == "geopandas.array.sindex"
+        return original(owned, *args, **kwargs)
+
+    monkeypatch.setattr(geometry_array_module, "owned_to_shapely", spy)
+
+    sindex = values.sindex
+
+    assert sindex is not None
+    events = geopandas.get_fallback_events(clear=True)
+    assert events[-1].surface == "geopandas.array.sindex"
+    assert events[-1].selected is geopandas.ExecutionMode.CPU
+
+
 def test_geopandas_sindex_query_multipoint_uses_gpu_dispatch() -> None:
     """MULTIPOINT query geometries should dispatch to GPU, not Shapely fallback."""
     from shapely.geometry import MultiPoint

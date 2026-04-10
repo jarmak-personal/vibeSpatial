@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+import shapely
 from shapely.geometry import LineString, Point, box
 
 import vibespatial.spatial.nearest as spatial_nearest_module
 import vibespatial.spatial.query as spatial_query_module
 import vibespatial.spatial.query_utils as spatial_query_utils_module
+from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
@@ -173,13 +175,23 @@ class TestDwithinGPU:
         )
         assert result.shape[1] == 0
 
-    def test_dwithin_multipoint_point(self):
+    def test_dwithin_multipoint_point(self, monkeypatch: pytest.MonkeyPatch):
         import shapely as shp
         from shapely.geometry import MultiPoint
 
         tree = np.asarray([Point(0, 0), Point(5, 0), Point(20, 0)], dtype=object)
         query = np.asarray([MultiPoint([(1, 0), (10, 0)])], dtype=object)
         owned, flat = build_owned_spatial_index(tree)
+
+        def _fail_fallback(*_args, **_kwargs):
+            raise AssertionError("unexpected Shapely fallback for supported MultiPoint/Point dwithin")
+
+        def _fail_to_shapely(self):
+            raise AssertionError("unexpected host materialization for supported MultiPoint/Point dwithin")
+
+        monkeypatch.setattr(spatial_nearest_module, "record_shapely_fallback_event", _fail_fallback)
+        monkeypatch.setattr(spatial_query_utils_module, "record_shapely_fallback_event", _fail_fallback)
+        monkeypatch.setattr(OwnedGeometryArray, "to_shapely", _fail_to_shapely)
 
         result, execution = query_spatial_index(
             owned, flat, query, predicate="dwithin", distance=2.0,
@@ -217,6 +229,30 @@ def test_query_spatial_index_handles_regular_grid_rectangle_boundaries() -> None
 
     assert flat.regular_grid is not None
     assert indices.tolist() == [[0, 0, 0], [0, 1, 2]]
+
+
+def test_geometry_array_full_setitem_preserves_owned_for_noop_full_assignment() -> None:
+    geometry = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                box(0, 0, 1, 1),
+                box(2, 2, 3, 3),
+            ]
+        )
+    )
+    original_owned = geometry._owned
+    original_sindex = object()
+    original_flat = object()
+    geometry._sindex = original_sindex
+    geometry._owned_flat_sindex = original_flat
+    geometry._owned_spatial_input_supported = True
+
+    geometry[:] = shapely.make_valid(np.asarray(geometry, dtype=object))
+
+    assert geometry._owned is original_owned
+    assert geometry._sindex is original_sindex
+    assert geometry._owned_flat_sindex is original_flat
+    assert geometry._owned_spatial_input_supported is True
 
 
 def test_query_spatial_index_reports_execution_metadata() -> None:
@@ -400,6 +436,99 @@ def test_query_spatial_index_point_tree_box_owned_queries_avoid_to_shapely(monke
     assert execution.selected is ExecutionMode.GPU
 
 
+def test_query_spatial_index_point_tree_box_device_owned_queries_avoid_host_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for the device-owned box fast path")
+
+    tree = np.asarray([Point(float(index), 0.0) for index in range(2048)], dtype=object)
+    owned, flat = build_owned_spatial_index(tree)
+    query_owned = from_shapely_geometries(
+        [box(99.5, -1.0, 199.5, 1.0)],
+        residency=Residency.DEVICE,
+    )
+
+    def _fail():
+        raise AssertionError(
+            "device-owned point-tree box fast path should validate rectangle queries "
+            "from device buffers without host-state materialization"
+        )
+
+    monkeypatch.setattr(query_owned, "_ensure_host_state", _fail)
+
+    indices, execution = query_spatial_index(
+        owned,
+        flat,
+        query_owned,
+        predicate="contains",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert indices.tolist() == [[0] * 100, list(range(100, 200))]
+    assert execution.selected is ExecutionMode.GPU
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for candidate-generation fallback")
+def test_query_spatial_index_records_fallback_before_shapely_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cupy as cp
+
+    tree = np.asarray(
+        [
+            LineString([(0.0, 0.0), (1.0, 1.0)]),
+            LineString([(2.0, 0.0), (3.0, 1.0)]),
+        ],
+        dtype=object,
+    )
+    query = np.asarray(
+        [LineString([(0.0, 1.0), (1.0, 0.0)])],
+        dtype=object,
+    )
+    owned, flat = build_owned_spatial_index(tree)
+
+    event_state = {"recorded": False}
+
+    def _record_fallback_event(*args, **kwargs):
+        event_state["recorded"] = True
+
+    class _FakeDeviceCandidates:
+        def __init__(self) -> None:
+            self.d_left = cp.asarray(np.array([0], dtype=np.int32))
+            self.d_right = cp.asarray(np.array([0], dtype=np.int32))
+            self.total_pairs = 1
+
+        def to_host(self):
+            assert event_state["recorded"], "fallback event must be recorded before D2H candidate materialization"
+            return np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)
+
+    original_to_shapely = OwnedGeometryArray.to_shapely
+
+    def _fail_to_shapely(self):
+        assert event_state["recorded"], "fallback event must be recorded before Shapely materialization"
+        return original_to_shapely(self)
+
+    monkeypatch.setattr(spatial_query_utils_module, "record_shapely_fallback_event", _record_fallback_event)
+    monkeypatch.setattr(spatial_query_module, "spatial_index_device_query", lambda *args, **kwargs: (_FakeDeviceCandidates(), None))
+    monkeypatch.setattr(OwnedGeometryArray, "to_shapely", _fail_to_shapely)
+
+    result, execution = query_spatial_index(
+        owned,
+        flat,
+        query,
+        predicate="crosses",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert event_state["recorded"] is True
+    assert result.tolist() == [[0], [0]]
+    assert execution.selected is ExecutionMode.CPU
+    assert execution.implementation == "owned_cpu_spatial_query"
+
+
 def test_nearest_spatial_index_with_max_distance_returns_ties_and_distances() -> None:
     tree = np.asarray([Point(0, 0), Point(2, 0), Point(10, 0)], dtype=object)
     query = np.asarray([Point(1, 0), Point(20, 0)], dtype=object)
@@ -496,6 +625,60 @@ def test_nearest_spatial_index_unbounded_matches_expected_ties_and_distances() -
     assert indices.tolist() == [[0, 0, 1], [0, 1, 2]]
     assert np.allclose(distances, [1.0, 1.0, 10.0])
     assert impl in {"strtree_host", "owned_cpu_nearest", "owned_gpu_nearest"}
+
+
+def test_nearest_spatial_index_records_fallback_before_host_refine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = np.asarray(
+        [
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(5.0, 0.0), (6.0, 0.0)]),
+        ],
+        dtype=object,
+    )
+    query = np.asarray(
+        [LineString([(0.0, 1.0), (1.0, 1.0)])],
+        dtype=object,
+    )
+    event_state = {"recorded": False}
+
+    def _record_fallback_event(*args, **kwargs):
+        event_state["recorded"] = True
+
+    def _fake_candidate_generation(*args, **kwargs):
+        return np.array([0], dtype=np.int32), np.array([0], dtype=np.int32)
+
+    def _fail_refine(*args, **kwargs):
+        return None
+
+    original_distance = spatial_nearest_module.shapely.distance
+
+    def _distance_with_order_check(left_values, right_values):
+        assert event_state["recorded"], "fallback event must be recorded before host Shapely refinement"
+        return original_distance(left_values, right_values)
+
+    monkeypatch.setattr(spatial_nearest_module, "record_shapely_fallback_event", _record_fallback_event)
+    monkeypatch.setattr(spatial_nearest_module, "_generate_candidates_gpu", _fake_candidate_generation)
+    monkeypatch.setattr(spatial_nearest_module, "_generate_distance_pairs", lambda *args, **kwargs: pytest.fail("GPU candidate generation should not fall back to host pair generation"))
+    monkeypatch.setattr(spatial_nearest_module, "_nearest_refine_gpu", _fail_refine)
+    monkeypatch.setattr(spatial_nearest_module.shapely, "distance", _distance_with_order_check)
+    monkeypatch.setattr("vibespatial.spatial.spatial_index_knn_device.spatial_index_knn_device", lambda *args, **kwargs: None)
+
+    (indices, distances), impl = nearest_spatial_index(
+        tree,
+        query,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("host fallback should not call STRtree nearest"),
+        return_all=True,
+        max_distance=10.0,
+        return_distance=True,
+        exclusive=False,
+    )
+
+    assert event_state["recorded"] is True
+    assert impl == "owned_cpu_nearest"
+    assert indices.tolist() == [[0], [0]]
+    assert np.allclose(distances, [1.0])
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for exact GPU nearest fallback")

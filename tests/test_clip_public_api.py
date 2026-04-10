@@ -13,6 +13,7 @@ from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.tools.clip import clip
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency
 from vibespatial.testing import strict_native_environment
 
@@ -103,7 +104,9 @@ def test_clip_polygon_rectangle_mask_routes_multilinestring_rows_through_rect_fa
     assert ("clip_by_rect", "MultiLineString") in seen
 
 
-def test_clip_polygon_rectangle_mask_multilinestring_survives_strict_native_mode() -> None:
+def test_clip_polygon_rectangle_mask_multilinestring_survives_strict_native_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if not vibespatial.has_gpu_runtime():
         return
 
@@ -126,10 +129,68 @@ def test_clip_polygon_rectangle_mask_multilinestring_survives_strict_native_mode
         crs="EPSG:3857",
     )
 
+    monkeypatch.setattr(
+        clip_module.shapely,
+        "length",
+        lambda *_args, **_kwargs: pytest.fail(
+            "multiline rectangle clip should not probe host line degeneracy"
+        ),
+    )
+
     with strict_native_environment():
         result = clip(gdf, mask)
 
     assert set(result.geom_type.tolist()) == {"MultiLineString", "LineString"}
+
+
+def test_clip_records_fallback_before_line_make_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        return
+
+    source = vibespatial.GeoDataFrame(
+        {
+            "geometry": [LineString([(0.0, 0.0), (2.0, 2.0)])],
+        },
+        crs="EPSG:3857",
+    )
+    owned = from_shapely_geometries(
+        [LineString([(0.0, 0.0), (2.0, 2.0)])],
+        residency=Residency.HOST,
+    )
+    native_result = clip_module.ClipNativeResult(
+        source=source,
+        parts=(
+            clip_module._clip_native_part(
+                source,
+                np.asarray([0], dtype=np.intp),
+                GeometryArray.from_owned(owned, crs=source.crs),
+            ),
+        ),
+        ordered_index=source.index,
+        ordered_row_positions=np.asarray([0], dtype=np.intp),
+        clipping_by_rectangle=False,
+        has_non_point_candidates=True,
+        keep_geom_type=False,
+    )
+
+    monkeypatch.setattr(
+        GeometryArray,
+        "length",
+        property(lambda self: np.asarray([0.0], dtype=np.float64)),
+    )
+    monkeypatch.setattr(
+        clip_module.shapely,
+        "make_valid",
+        lambda *_args, **_kwargs: pytest.fail(
+            "line make_valid should not run before fallback is recorded"
+        ),
+    )
+
+    with pytest.raises(StrictNativeFallbackError):
+        with strict_native_environment():
+            native_result.to_spatial()
 
 
 def test_clip_polygon_rectangle_mask_donut_preserves_geometry_collection_slivers() -> None:
@@ -251,6 +312,82 @@ def test_clip_polygon_mask_preserves_device_backing_for_polygon_workloads() -> N
     assert set(result.geometry.to_wkt().tolist()) == set(expected.geometry.to_wkt().tolist())
 
 
+def test_clip_records_fallback_before_host_semantic_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    source = vibespatial.GeoDataFrame(
+        {
+            "value": [1],
+            "geometry": vibespatial.GeoSeries([box(0.0, 0.0, 2.0, 2.0)]),
+        },
+        crs="EPSG:3857",
+    )
+    owned = from_shapely_geometries([box(0.5, 0.5, 1.5, 1.5)], residency=Residency.HOST)
+    part = clip_module._clip_native_part(
+        source,
+        np.asarray([0], dtype=np.intp),
+        GeometryArray.from_owned(owned, crs=source.crs),
+    )
+    native_result = clip_module.ClipNativeResult(
+        source=source,
+        parts=(part,),
+        ordered_index=source.index,
+        ordered_row_positions=np.asarray([0], dtype=np.intp),
+        clipping_by_rectangle=False,
+        has_non_point_candidates=True,
+        keep_geom_type=False,
+    )
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("host clip cleanup should not run before fallback is recorded")
+
+    monkeypatch.setattr(clip_module.shapely, "area", _fail)
+    monkeypatch.setattr(clip_module.shapely, "length", _fail)
+
+    with pytest.raises(StrictNativeFallbackError):
+        with strict_native_environment():
+            native_result.to_spatial()
+
+
+def test_exact_rectangle_clip_boundary_rows_uses_owned_rectangle_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                box(0.0, 0.0, 2.0, 2.0),
+                box(2.0, 2.0, 4.0, 5.0),
+            ],
+            residency=Residency.HOST,
+        )
+    )
+    bounds = np.asarray(
+        [
+            (0.0, 0.0, 2.0, 2.0),
+            (2.0, 2.0, 4.0, 5.0),
+        ],
+        dtype=np.float64,
+    )
+
+    monkeypatch.setattr(
+        clip_module,
+        "_is_axis_aligned_rectangle_polygon",
+        lambda *_args, **_kwargs: pytest.fail(
+            "owned rectangle metadata should avoid per-row Shapely rectangle checks"
+        ),
+    )
+
+    result = clip_module._exact_rectangle_clip_boundary_rows(
+        values,
+        bounds,
+        (1.0, 1.0, 3.0, 4.0),
+    )
+
+    assert result is not None
+    assert [geom.geom_type if geom is not None else None for geom in result] == [
+        "Polygon",
+        "Polygon",
+    ]
+
+
 def test_clip_polygon_mask_boundary_filter_uses_gpu_predicate_for_device_backing() -> None:
     if not vibespatial.has_gpu_runtime():
         return
@@ -302,6 +439,42 @@ def test_clip_polygon_mask_boundary_filter_uses_gpu_predicate_for_device_backing
     )
 
 
+def test_clip_rectangle_filter_avoids_device_array_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        return
+
+    owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            box(3.0, 3.0, 5.0, 5.0),
+            box(10.0, 10.0, 12.0, 12.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    gdf = vibespatial.GeoDataFrame(
+        {
+            "geometry": DeviceGeometryArray._from_owned(
+                owned,
+                crs="EPSG:3857",
+            ),
+            "value": [1, 2, 3],
+        },
+        crs="EPSG:3857",
+    )
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("rectangle clip filter should not materialize DeviceGeometryArray")
+
+    monkeypatch.setattr(DeviceGeometryArray, "__array__", _fail)
+
+    result = clip(gdf, box(0.0, 0.0, 6.0, 6.0))
+
+    assert list(result["value"]) == [1, 2]
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+
+
 def test_clip_polygon_mask_boundary_assembly_skips_bbox_false_positives(
     monkeypatch,
 ) -> None:
@@ -346,7 +519,7 @@ def test_clip_polygon_mask_boundary_assembly_skips_bbox_false_positives(
 
     result = clip(gdf, mask)
 
-    assert seen_rows == [1]
+    assert seen_rows == []
     assert len(result) == 2
 
 
@@ -364,6 +537,38 @@ def test_clip_multipart_result_preserves_duplicate_source_index_order() -> None:
     assert list(result.index) == list(native_result.ordered_index)
     assert result.index.tolist().count("dup") == 2
     assert result.index.tolist().count("uniq") == 1
+
+
+def test_clip_single_polygon_mask_uses_direct_bbox_candidates_before_sindex(
+    monkeypatch,
+) -> None:
+    gdf = vibespatial.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [
+                box(0.0, 0.0, 2.0, 2.0),
+                box(10.0, 10.0, 12.0, 12.0),
+            ],
+        },
+        crs="EPSG:3857",
+    )
+    mask = vibespatial.GeoDataFrame(
+        {"geometry": [Polygon([(1.0, 1.0), (4.0, 1.0), (4.0, 4.0), (1.0, 4.0), (1.0, 1.0)])]},
+        crs="EPSG:3857",
+    )
+
+    monkeypatch.setattr(
+        gdf.sindex.__class__,
+        "query",
+        lambda *args, **kwargs: pytest.fail(
+            "sorted single-row polygon clip should use direct bbox candidates before sindex.query"
+        ),
+    )
+
+    result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True).to_spatial()
+
+    assert result["value"].tolist() == [1]
+    assert result.geometry.iloc[0].normalize().equals(box(1.0, 1.0, 2.0, 2.0))
 
 
 def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_fails(
@@ -431,6 +636,216 @@ def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_
     assert constructive_calls[0]["right"] is mask_owned
     assert constructive_calls[0]["_prefer_exact_polygon_intersection"] is True
     assert constructive_calls[0]["dispatch_mode"].value == "cpu"
+
+
+def test_clip_polygon_partition_polygon_mask_routes_exact_rows_through_owned_helper(
+    monkeypatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        return
+
+    partition_owned = from_shapely_geometries(
+        [
+            Polygon(
+                [
+                    (-0.5, -0.5),
+                    (0.4, -0.5),
+                    (0.5, 0.1),
+                    (0.0, 0.5),
+                    (-0.5, 0.2),
+                    (-0.5, -0.5),
+                ]
+            )
+        ],
+        residency=Residency.DEVICE,
+    )
+    partition = vibespatial.GeoDataFrame(
+        {
+            "value": [1],
+            "geometry": DeviceGeometryArray._from_owned(
+                partition_owned,
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 0.6),
+            (0.6, 0.6),
+            (0.6, 1.0),
+            (0.0, 1.0),
+            (0.0, 0.0),
+        ]
+    )
+    expected_owned = from_shapely_geometries(
+        [Polygon([(0.0, 0.0), (0.5, 0.1), (0.4, 0.4), (0.0, 0.2), (0.0, 0.0)])],
+        residency=Residency.DEVICE,
+    )
+    calls: list[int] = []
+
+    def _owned_helper(
+        left_owned,
+        mask_owned,
+        *,
+        allow_rectangle_kernel=True,
+        prefer_exact_polygon_rect_batch=False,
+    ):
+        calls.append(left_owned.row_count)
+        return expected_owned
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("exact clip rows should not route through the generic rowwise GPU helper")
+
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_polygon_area_intersection_owned",
+        _owned_helper,
+    )
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_polygon_area_intersection_gpu_owned",
+        _fail,
+    )
+    monkeypatch.setattr(
+        shapely,
+        "covered_by",
+        lambda *args, **kwargs: np.zeros(1, dtype=bool),
+    )
+
+    result = clip_module._clip_polygon_partition_with_polygon_mask(partition, mask)
+
+    assert calls == [1]
+    assert len(result) == 1
+    assert np.asarray(result, dtype=object)[0] is not None
+
+
+def test_clip_polygon_partition_polygon_mask_avoids_host_covered_by_for_rectangle_batch(
+    monkeypatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        return
+
+    binary_module = importlib.import_module("vibespatial.constructive.binary_constructive")
+
+    partition_owned = from_shapely_geometries(
+        [box(-0.5, -0.5, 0.5, 0.5)],
+        residency=Residency.DEVICE,
+    )
+    partition = vibespatial.GeoDataFrame(
+        {
+            "value": [1],
+            "geometry": DeviceGeometryArray._from_owned(
+                partition_owned,
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (-1.0, -1.0),
+            (2.0, -1.0),
+            (2.0, 0.5),
+            (0.5, 0.5),
+            (0.5, 2.0),
+            (-1.0, 2.0),
+            (-1.0, -1.0),
+        ]
+    )
+    expected_owned = from_shapely_geometries(
+        [box(-0.5, -0.5, 0.5, 0.5)],
+        residency=Residency.DEVICE,
+    )
+    calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        shapely,
+        "covered_by",
+        lambda *args, **kwargs: pytest.fail(
+            "rectangle polygon-mask clip should avoid host covered_by"
+        ),
+    )
+
+    def _binary_constructive(op, left, right, **kwargs):
+        calls.append({"op": op, "left_rows": left.row_count, **kwargs})
+        return expected_owned
+
+    monkeypatch.setattr(
+        binary_module,
+        "binary_constructive_owned",
+        _binary_constructive,
+    )
+
+    result = clip_module._clip_polygon_partition_with_polygon_mask(partition, mask)
+
+    assert len(calls) == 1
+    assert calls[0]["op"] == "intersection"
+    assert calls[0]["left_rows"] == 1
+    assert calls[0]["dispatch_mode"].value == "gpu"
+    assert calls[0]["_prefer_exact_polygon_intersection"] is True
+    assert calls[0]["_allow_rectangle_intersection_fast_path"] is True
+    assert len(result) == 1
+    assert shapely.equals(np.asarray(result, dtype=object)[0], box(-0.5, -0.5, 0.5, 0.5))
+
+
+def test_clip_polygon_partition_single_row_polygon_mask_skips_predicate_refine(
+    monkeypatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        return
+
+    import vibespatial.predicates.binary as predicate_module
+
+    partition_owned = from_shapely_geometries(
+        [box(-0.5, -0.5, 0.5, 0.5)],
+        residency=Residency.DEVICE,
+    )
+    partition = vibespatial.GeoDataFrame(
+        {
+            "value": [1],
+            "geometry": DeviceGeometryArray._from_owned(
+                partition_owned,
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (-1.0, -1.0),
+            (2.0, -1.0),
+            (2.0, 0.5),
+            (0.5, 0.5),
+            (0.5, 2.0),
+            (-1.0, 2.0),
+            (-1.0, -1.0),
+        ]
+    )
+    expected_owned = from_shapely_geometries(
+        [box(-0.5, -0.5, 0.5, 0.5)],
+        residency=Residency.DEVICE,
+    )
+
+    monkeypatch.setattr(
+        predicate_module,
+        "evaluate_binary_predicate",
+        lambda *args, **kwargs: pytest.fail(
+            "single-row polygon clip should skip GPU predicate refinement before exact intersection"
+        ),
+    )
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_polygon_area_intersection_owned",
+        lambda *args, **kwargs: expected_owned,
+    )
+
+    result = clip_module._clip_polygon_partition_with_polygon_mask(partition, mask)
+
+    assert len(result) == 1
+    assert shapely.equals(np.asarray(result, dtype=object)[0], box(-0.5, -0.5, 0.5, 0.5))
 
 
 def test_clip_polygon_rect_kernel_failure_is_not_silently_swallowed(

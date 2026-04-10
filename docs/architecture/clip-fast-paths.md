@@ -5,7 +5,7 @@ Scope: Rectangle clip fast-path strategy, owned constructive dataflow, and GeoPa
 Read If: You are changing clip_by_rect, rectangle clip performance, or early constructive fast paths.
 STOP IF: You already have the rectangle clip engine open and only need local implementation detail.
 Source Of Truth: Phase-5 rectangle clip fast-path policy before broader overlay assembly.
-Body Budget: 107/220 lines
+Body Budget: 118/220 lines
 Document: docs/architecture/clip-fast-paths.md
 
 Section Map (Body Lines)
@@ -19,9 +19,9 @@ Section Map (Body Lines)
 | 37-41 | Intent |
 | 42-53 | Options Considered |
 | 54-70 | Decision |
-| 71-87 | GeoPandas Adapter Policy |
-| 88-100 | CCCL Mapping |
-| 101-107 | Consequences |
+| 71-98 | GeoPandas Adapter Policy |
+| 99-111 | CCCL Mapping |
+| 112-118 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.2` lands the first owned constructive fast path through axis-aligned
@@ -94,8 +94,9 @@ It uses:
 
 ## GeoPandas Adapter Policy
 
-The repo now has an explicit adapter seam at `GeometryArray.clip_by_rect`, but
-the GeoPandas host path remains on direct Shapely today.
+The repo now has an explicit adapter seam at `GeometryArray.clip_by_rect`, and
+the public `clip(...)` path opportunistically stays inside the owned/native
+boundary when the resulting family mix is representable there.
 
 Current state:
 
@@ -108,6 +109,16 @@ Current state:
 - line families have a device-resident GPU clip path via Liang-Barsky kernel
   with CuPy/CCCL coordinate assembly (``_build_line_clip_device_result``)
 - both polygon and line GPU paths return ``Residency.DEVICE`` OwnedGeometryArrays
+- default public `clip(..., keep_geom_type=False)` now builds a row-preserving
+  native result first and only exits to host for explicit semantic cleanup when
+  the output cannot stay in the native family model
+- host normalization preserves owned backing for representable host-side results,
+  so later `area` / `length` probes stay on the owned measurement path instead
+  of silently dropping to Shapely
+- unsupported public outputs such as `GeometryCollection` slivers stay on the
+  explicit compatibility path instead of being forced into the owned model
+- public ordering now matches GeoPandas again: `sort=False` preserves encounter
+  order, and `sort=True` sorts by index
 
 ## CCCL Mapping
 

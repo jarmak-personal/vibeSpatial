@@ -76,6 +76,7 @@ from .query_utils import (  # noqa: F401
     _reorder_scalar_tree_matches,
     _sort_indices,
     _to_owned,
+    record_shapely_fallback_event,
     supports_owned_spatial_input,
 )
 from .spatial_index_device import (
@@ -517,6 +518,7 @@ def query_spatial_index(
 
     gpu_candidate_gen = False
     device_indices_materialized_from_gpu = False
+    dwithin_used_shapely_fallback = False
     if predicate == "dwithin":
         if distance is None:
             raise ValueError("'distance' parameter is required for 'dwithin' predicate")
@@ -556,27 +558,36 @@ def query_spatial_index(
         # Try GPU dwithin refinement first.
         # When return_device is requested, ask _dwithin_refine_gpu to keep
         # results on device (CuPy arrays) to avoid D->H + H->D round-trip.
-        gpu_dwithin = _dwithin_refine_gpu(
+        gpu_dwithin_result = _dwithin_refine_gpu(
             query_owned, tree_owned, left_idx, right_idx, per_row_distance,
             device_candidates=device_dist_cands if gpu_candidate_gen else None,
             return_device=return_device,
         )
-        if gpu_dwithin is not None:
-            left_idx, right_idx = gpu_dwithin
+        if gpu_dwithin_result is not None:
+            (left_idx, right_idx), used_shapely_fallback = gpu_dwithin_result
+            dwithin_used_shapely_fallback = used_shapely_fallback
             refine_selection = _planned_query_runtime_selection(
                 kernel_name="dwithin_refine",
                 kernel_class=KernelClass.METRIC,
                 row_count=left_idx.size,
-                requested_mode=ExecutionMode.GPU,
+                requested_mode=ExecutionMode.CPU if used_shapely_fallback else ExecutionMode.GPU,
                 gpu_available=True,
-                reason="GPU dwithin refinement via distance kernels",
+                reason=(
+                    "GPU dwithin refinement via distance kernels"
+                    if not used_shapely_fallback
+                    else "GPU candidate generation with Shapely dwithin refinement"
+                ),
             )
             # When return_device is True and results are already device-
             # resident CuPy arrays, return early to avoid the generic
             # return_device block which would D->H->D round-trip via
             # cp.asarray.  The _dwithin_refine_gpu(return_device=True)
             # path keeps indices on device throughout.
-            if return_device and hasattr(left_idx, "__cuda_array_interface__"):
+            if (
+                return_device
+                and not used_shapely_fallback
+                and hasattr(left_idx, "__cuda_array_interface__")
+            ):
                 import cupy as _cp_dw
                 execution = SpatialQueryExecution(
                     requested=ExecutionMode.AUTO,
@@ -593,6 +604,14 @@ def query_spatial_index(
                 device_result = DeviceSpatialJoinResult(d_left_idx=d_left, d_right_idx=d_right)
                 return (device_result, execution) if return_metadata else device_result
         else:
+            if gpu_candidate_gen:
+                record_shapely_fallback_event(
+                    surface="vibespatial.spatial.query",
+                    reason="GPU candidate refinement fell back to Shapely dwithin refinement",
+                    detail="predicate='dwithin'",
+                    pipeline="gpu_candidates -> shapely_refine",
+                    d2h_transfer=True,
+                )
             # CPU Shapely fallback.
             if left_idx is None or right_idx is None:
                 left_idx, right_idx = device_dist_cands.to_host()
@@ -684,17 +703,36 @@ def query_spatial_index(
     # Execution labeling: GPU candidate generation is the dominant stage,
     # so label the full query as GPU when candidate gen ran on GPU.
     if gpu_candidate_gen:
-        reason_parts = ["repo-owned GPU bbox candidate generation"]
-        if predicate is not None:
-            reason_parts.append(
-                f"with {refine_selection.selected.value} exact predicate refinement"
+        if predicate == "dwithin":
+            execution = SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU if dwithin_used_shapely_fallback else ExecutionMode.GPU,
+                implementation="owned_cpu_spatial_query" if dwithin_used_shapely_fallback else "owned_gpu_spatial_query",
+                reason=(
+                    "repo-owned GPU bbox candidate generation with Shapely dwithin refinement"
+                    if dwithin_used_shapely_fallback
+                    else "repo-owned GPU bbox candidate generation with GPU dwithin refinement"
+                ),
             )
-        execution = SpatialQueryExecution(
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.GPU,
-            implementation="owned_gpu_spatial_query",
-            reason=" ".join(reason_parts),
-        )
+        elif predicate is None or refine_selection.selected is ExecutionMode.GPU:
+            reason_parts = ["repo-owned GPU bbox candidate generation"]
+            if predicate is not None:
+                reason_parts.append(
+                    f"with {refine_selection.selected.value} exact predicate refinement"
+                )
+            execution = SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.GPU,
+                implementation="owned_gpu_spatial_query",
+                reason=" ".join(reason_parts),
+            )
+        else:
+            execution = SpatialQueryExecution(
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                implementation="owned_cpu_spatial_query",
+                reason="repo-owned GPU bbox candidate generation with Shapely exact predicate refinement",
+            )
     elif refine_selection.selected is ExecutionMode.GPU:
         execution = SpatialQueryExecution(
             requested=ExecutionMode.AUTO,

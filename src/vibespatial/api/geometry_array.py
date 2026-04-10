@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import logging
 import numbers
 import operator
@@ -50,6 +49,7 @@ from vibespatial.predicates.binary import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.provenance import (
     ProvenanceTag,
     attempt_provenance_rewrite,
@@ -78,6 +78,12 @@ if HAS_PYPROJ:
     from pyproj import Transformer
 
     TransformerFromCRS = lru_cache(Transformer.from_crs)
+
+    @lru_cache(maxsize=32)
+    def _cached_crs_from_user_input(value: str):
+        from pyproj import CRS
+
+        return CRS.from_user_input(value)
 
 
 def _make_transform_func(src_crs, dst_crs):
@@ -263,6 +269,47 @@ def isna(value: None | float | pd.NA) -> bool:
 
 def _is_scalar_geometry(geom) -> bool:
     return isinstance(geom, BaseGeometry)
+
+
+def _is_full_array_indexer(key, length: int) -> bool:
+    """Return True when a setitem indexer targets the full array in-order."""
+    if isinstance(key, slice):
+        start, stop, step = key.indices(length)
+        return start == 0 and stop == length and step == 1
+    if isinstance(key, np.ndarray):
+        if key.dtype == bool:
+            return key.size == length and bool(np.all(key))
+        return (
+            key.ndim == 1
+            and key.size == length
+            and np.array_equal(key.astype(np.intp, copy=False), np.arange(length, dtype=np.intp))
+        )
+    return False
+
+
+def _can_preserve_owned_after_full_array_setitem(
+    current_data: np.ndarray,
+    new_data: np.ndarray,
+) -> bool:
+    """Return True when full-array replacement leaves geometry exactly unchanged."""
+    if len(current_data) != len(new_data):
+        return False
+    try:
+        return bool(
+            np.all(
+                np.asarray(
+                    shapely.equals_exact(
+                        current_data,
+                        new_data,
+                        tolerance=0.0,
+                        normalize=True,
+                    ),
+                    dtype=bool,
+                )
+            )
+        )
+    except Exception:
+        return False
 
 
 _FROM_SHAPELY_OWNED_THRESHOLD = 100
@@ -530,6 +577,18 @@ class GeometryArray(ExtensionArray):
     def sindex(self) -> SpatialIndex:
         """Spatial index for the geometries in this array."""
         if self._sindex is None:
+            if self._owned is not None and self._shapely_data is None:
+                from vibespatial.runtime import get_requested_mode
+
+                record_fallback_event(
+                    surface="geopandas.array.sindex",
+                    requested=get_requested_mode(),
+                    selected=ExecutionMode.CPU,
+                    reason="owned-backed GeometryArray.sindex materializes a host STRtree",
+                    detail=f"rows={len(self)}",
+                    pipeline="spatial_index",
+                    d2h_transfer=True,
+                )
             self._sindex = SpatialIndex(self._data, geometry_array=self)
         return self._sindex
 
@@ -574,7 +633,14 @@ class GeometryArray(ExtensionArray):
         if HAS_PYPROJ:
             from pyproj import CRS
 
-            self._crs = None if not value else CRS.from_user_input(value)
+            if not value:
+                self._crs = None
+            elif isinstance(value, CRS):
+                self._crs = value
+            elif isinstance(value, str):
+                self._crs = _cached_crs_from_user_input(value)
+            else:
+                self._crs = CRS.from_user_input(value)
         else:
             if value is not None:
                 warnings.warn(
@@ -587,12 +653,13 @@ class GeometryArray(ExtensionArray):
                 )
             self._crs = None
 
-    def check_geographic_crs(self, stacklevel: int) -> None:
+    def check_geographic_crs(self, stacklevel: int, *, operation: str | None = None) -> None:
         """Check CRS and warn if the planar operation is done in a geographic CRS."""
         if self.crs and self.crs.is_geographic:
+            op_name = operation or "this operation"
             warnings.warn(
                 "Geometry is in a geographic CRS. Results from "
-                f"'{inspect.stack()[1].function}' are likely incorrect. "
+                f"'{op_name}' are likely incorrect. "
                 "Use 'GeoSeries.to_crs()' to re-project geometries to a "
                 "projected CRS before this operation.\n",
                 UserWarning,
@@ -648,6 +715,11 @@ class GeometryArray(ExtensionArray):
         # validate and convert IntegerArray/BooleanArray
         # keys to numpy array, pass-through non-array-like indexers
         key = pd.api.indexers.check_array_indexer(self, key)
+        preserve_owned = False
+        preserved_sindex = self._sindex
+        preserved_owned = self._owned
+        preserved_owned_flat_sindex = self._owned_flat_sindex
+        preserved_owned_spatial_input_supported = self._owned_spatial_input_supported
         if isinstance(value, pd.Series):
             value = value.values
         if isinstance(value, pd.DataFrame):
@@ -657,6 +729,12 @@ class GeometryArray(ExtensionArray):
         if isinstance(value, GeometryArray):
             if isinstance(key, numbers.Integral):
                 raise ValueError("cannot set a single element with an array")
+            if (
+                self._owned is not None
+                and _is_full_array_indexer(key, len(self))
+                and _can_preserve_owned_after_full_array_setitem(self._data, value._data)
+            ):
+                preserve_owned = True
             self._data[key] = value._data
         elif isinstance(value, BaseGeometry) or isna(value):
             if isna(value):
@@ -678,11 +756,17 @@ class GeometryArray(ExtensionArray):
                 f"Value should be either a BaseGeometry or None, got {value!s}"
             )
 
-        # invalidate spatial index
-        self._sindex = None
-        self._owned = None
-        self._owned_flat_sindex = None
-        self._owned_spatial_input_supported = None
+        if preserve_owned:
+            self._sindex = preserved_sindex
+            self._owned = preserved_owned
+            self._owned_flat_sindex = preserved_owned_flat_sindex
+            self._owned_spatial_input_supported = preserved_owned_spatial_input_supported
+        else:
+            # invalidate spatial index
+            self._sindex = None
+            self._owned = None
+            self._owned_flat_sindex = None
+            self._owned_spatial_input_supported = None
 
         # TODO: use this once pandas-dev/pandas#33457 is fixed
         # if hasattr(value, "crs"):
@@ -883,7 +967,7 @@ class GeometryArray(ExtensionArray):
         np.ndarray of float
             Area of the geometries.
         """
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="area")
         if self._owned is not None:
             from vibespatial.constructive.measurement import area_owned
 
@@ -892,7 +976,7 @@ class GeometryArray(ExtensionArray):
 
     @property
     def length(self):
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="length")
         if self._owned is not None:
             from vibespatial.constructive.measurement import length_owned
 
@@ -946,7 +1030,7 @@ class GeometryArray(ExtensionArray):
 
     @property
     def centroid(self) -> GeometryArray:
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="centroid")
         if self._owned is not None:
             from vibespatial.constructive.centroid import centroid_owned
 
@@ -1331,7 +1415,7 @@ class GeometryArray(ExtensionArray):
         return self._binary_method("within", self, other)
 
     def dwithin(self, other, distance):
-        self.check_geographic_crs(stacklevel=6)
+        self.check_geographic_crs(stacklevel=6, operation="dwithin")
         if isinstance(other, GeometryArray):
             if len(self) != len(other):
                 msg = (
@@ -1519,7 +1603,7 @@ class GeometryArray(ExtensionArray):
     #
 
     def distance(self, other):
-        self.check_geographic_crs(stacklevel=6)
+        self.check_geographic_crs(stacklevel=6, operation="distance")
         if self._owned is not None and isinstance(other, GeometryArray):
             if len(self) != len(other):
                 msg = (
@@ -1536,7 +1620,7 @@ class GeometryArray(ExtensionArray):
         return self._binary_method("distance", self, other)
 
     def hausdorff_distance(self, other, **kwargs):
-        self.check_geographic_crs(stacklevel=6)
+        self.check_geographic_crs(stacklevel=6, operation="hausdorff_distance")
         if (
             self._owned is not None
             and isinstance(other, GeometryArray)
@@ -1550,7 +1634,7 @@ class GeometryArray(ExtensionArray):
         return self._binary_method("hausdorff_distance", self, other, **kwargs)
 
     def frechet_distance(self, other, **kwargs):
-        self.check_geographic_crs(stacklevel=6)
+        self.check_geographic_crs(stacklevel=6, operation="frechet_distance")
         if (
             self._owned is not None
             and isinstance(other, GeometryArray)
@@ -1565,7 +1649,7 @@ class GeometryArray(ExtensionArray):
 
     def buffer(self, distance, quad_segs: int | None = None, **kwargs):
         if not (isinstance(distance, int | float) and distance == 0):
-            self.check_geographic_crs(stacklevel=5)
+            self.check_geographic_crs(stacklevel=5, operation="buffer")
         if "resolution" in kwargs:
             if quad_segs is not None:
                 msg = (
@@ -1691,7 +1775,7 @@ class GeometryArray(ExtensionArray):
         return result
 
     def interpolate(self, distance, normalized: bool = False) -> GeometryArray:
-        self.check_geographic_crs(stacklevel=5)
+        self.check_geographic_crs(stacklevel=5, operation="interpolate")
         if self._owned is not None:
             from vibespatial.constructive.linear_ref import interpolate_owned
 
