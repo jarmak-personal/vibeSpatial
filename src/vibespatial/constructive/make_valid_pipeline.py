@@ -122,6 +122,28 @@ def _compile_validity_kernels(compute_type: str = "double"):
     )
 
 
+def _owned_all_polygon_rectangles(owned) -> bool:
+    """Return True when every valid row is an exact axis-aligned rectangle."""
+    if owned is None or owned.row_count == 0:
+        return False
+    if not bool(np.all(owned.validity)):
+        return False
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        _device_rectangle_bounds,
+    )
+
+    if set(owned.families) != {GeometryFamily.POLYGON}:
+        return False
+
+    owned._ensure_device_state()
+    polygon_buf = owned.device_state.families.get(GeometryFamily.POLYGON)
+    if polygon_buf is None or (int(polygon_buf.geometry_offsets.size) - 1) != owned.row_count:
+        return False
+    return _device_rectangle_bounds(polygon_buf, owned.row_count) is not None
+
+
 def _gpu_polygon_validity_mask(owned) -> np.ndarray | None:
     """Compute per-row validity for polygon families using GPU ring checks.
 
@@ -622,6 +644,28 @@ def make_valid_owned(
     if owned is not None and selection.selected is ExecutionMode.GPU:
         # Compute null_mask from owned validity (no Shapely needed)
         null_mask = ~owned.validity
+        if _owned_all_polygon_rectangles(owned):
+            valid_rows = np.flatnonzero(~null_mask).astype(np.int32)
+            null_rows = np.flatnonzero(null_mask).astype(np.int32)
+            record_dispatch_event(
+                surface="geopandas.array.make_valid",
+                operation="make_valid",
+                implementation="rectangle_valid_fast_path",
+                reason="All valid rows are exact axis-aligned rectangles; repair is a no-op",
+                detail=f"rows={row_count}, method={method}",
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+            )
+            return MakeValidResult(
+                row_count=row_count,
+                valid_rows=valid_rows,
+                repaired_rows=np.asarray([], dtype=np.int32),
+                null_rows=null_rows,
+                method=method,
+                keep_collapsed=keep_collapsed,
+                owned=owned,
+                selected=ExecutionMode.GPU,
+            )
         from vibespatial.constructive.validity import is_valid_owned
 
         # Once the public make_valid boundary has selected GPU, keep the

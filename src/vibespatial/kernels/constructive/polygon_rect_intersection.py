@@ -199,6 +199,7 @@ polygon_rect_intersection_count(
     const int* __restrict__ right_valid,
     int* __restrict__ out_counts,
     int* __restrict__ out_valid,
+    int* __restrict__ out_boundary_overlap,
     const int row_count
 ) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
@@ -207,6 +208,7 @@ polygon_rect_intersection_count(
     if (!left_valid[row] || !right_valid[row]) {
         out_counts[row] = 0;
         out_valid[row] = 0;
+        out_boundary_overlap[row] = 0;
         return;
     }
 
@@ -215,6 +217,7 @@ polygon_rect_intersection_count(
     if (ring_end_idx - ring_start_idx != 1) {
         out_counts[row] = 0;
         out_valid[row] = 0;
+        out_boundary_overlap[row] = 0;
         return;
     }
 
@@ -232,6 +235,7 @@ polygon_rect_intersection_count(
     if (n < 3 || n > 256) {
         out_counts[row] = 0;
         out_valid[row] = 0;
+        out_boundary_overlap[row] = 0;
         return;
     }
 
@@ -242,8 +246,45 @@ polygon_rect_intersection_count(
     if (!(xmin < xmax && ymin < ymax)) {
         out_counts[row] = 0;
         out_valid[row] = 0;
+        out_boundary_overlap[row] = 0;
         return;
     }
+
+    int boundary_overlap = 0;
+    double prev_seg_x = left_x[start + n - 1];
+    double prev_seg_y = left_y[start + n - 1];
+    for (int i = 0; i < n; ++i) {
+        const double cur_seg_x = left_x[start + i];
+        const double cur_seg_y = left_y[start + i];
+
+        if (fabs(prev_seg_x - cur_seg_x) <= EPSILON) {
+            if (fabs(prev_seg_x - xmin) <= EPSILON || fabs(prev_seg_x - xmax) <= EPSILON) {
+                const double seg_min = fmin(prev_seg_y, cur_seg_y);
+                const double seg_max = fmax(prev_seg_y, cur_seg_y);
+                const double overlap_min = fmax(seg_min, ymin);
+                const double overlap_max = fmin(seg_max, ymax);
+                if ((overlap_max - overlap_min) > EPSILON) {
+                    boundary_overlap = 1;
+                    break;
+                }
+            }
+        } else if (fabs(prev_seg_y - cur_seg_y) <= EPSILON) {
+            if (fabs(prev_seg_y - ymin) <= EPSILON || fabs(prev_seg_y - ymax) <= EPSILON) {
+                const double seg_min = fmin(prev_seg_x, cur_seg_x);
+                const double seg_max = fmax(prev_seg_x, cur_seg_x);
+                const double overlap_min = fmax(seg_min, xmin);
+                const double overlap_max = fmin(seg_max, xmax);
+                if ((overlap_max - overlap_min) > EPSILON) {
+                    boundary_overlap = 1;
+                    break;
+                }
+            }
+        }
+
+        prev_seg_x = cur_seg_x;
+        prev_seg_y = cur_seg_y;
+    }
+    out_boundary_overlap[row] = boundary_overlap;
 
     double buf_a_x[256], buf_a_y[256];
     double buf_b_x[256], buf_b_y[256];
@@ -605,6 +646,7 @@ def _polygon_rect_intersection_gpu(
 
     d_counts = runtime.allocate((n,), cp.int32, zero=True)
     d_valid = runtime.allocate((n,), cp.int32, zero=True)
+    d_boundary_overlap = runtime.allocate((n,), cp.int32, zero=True)
 
     kernels = _polygon_rect_intersection_kernels()
     ptr = runtime.pointer
@@ -623,9 +665,11 @@ def _polygon_rect_intersection_gpu(
             ptr(d_right_valid),
             ptr(d_counts),
             ptr(d_valid),
+            ptr(d_boundary_overlap),
             n,
         ),
         (
+            KERNEL_PARAM_PTR,
             KERNEL_PARAM_PTR,
             KERNEL_PARAM_PTR,
             KERNEL_PARAM_PTR,
@@ -711,7 +755,7 @@ def _polygon_rect_intersection_gpu(
     d_ring_offsets[:n] = cp.asarray(d_offsets)
     d_ring_offsets[n] = total_verts
 
-    return build_device_backed_polygon_intersection_output(
+    result = build_device_backed_polygon_intersection_output(
         d_out_x,
         d_out_y,
         row_count=n,
@@ -719,6 +763,8 @@ def _polygon_rect_intersection_gpu(
         ring_offsets=d_ring_offsets,
         runtime_selection=runtime_selection,
     )
+    result._polygon_rect_boundary_overlap = d_boundary_overlap.astype(cp.bool_)
+    return result
 
 
 def _build_empty_result(n: int, runtime_selection: RuntimeSelection) -> OwnedGeometryArray:

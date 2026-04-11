@@ -7,8 +7,10 @@ from vibespatial.api._native_results import (
     RelationJoinResult,
 )
 from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
+from vibespatial.api.tools._pair_cache import cache_intersection_pairs
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import strict_native_mode_enabled
 from vibespatial.runtime.provenance import (
     _r1_preconditions_met,
     provenance_rewrites_enabled,
@@ -19,6 +21,9 @@ from vibespatial.spatial.query import (
     query_spatial_index,
     supports_owned_spatial_input,
 )
+
+_SMALL_HOST_STRTREE_QUERY_MIN_ROWS = 512
+_SMALL_HOST_STRTREE_TREE_MAX_ROWS = 128
 
 
 def sjoin(
@@ -228,6 +233,13 @@ def _sjoin_export_result(
         distance,
         on_attribute=on_attribute,
     )
+    if predicate == "intersects" and distance is None and not on_attribute:
+        cache_intersection_pairs(
+            left_df,
+            right_df,
+            native_result.relation.left_indices,
+            native_result.relation.right_indices,
+        )
     return (
         RelationJoinExportResult(
             relation_result=native_result,
@@ -301,6 +313,16 @@ def _basic_checks(left_df, right_df, how, lsuffix, rsuffix, on_attribute=None, a
 def _query_with_owned_spatial_index(left_df, right_df, predicate, distance):
     tree_geometry = right_df.geometry
     query_geometry = left_df.geometry
+    if (
+        not strict_native_mode_enabled()
+        and predicate == "intersects"
+        and distance is None
+        and len(left_df) >= _SMALL_HOST_STRTREE_QUERY_MIN_ROWS
+        and len(right_df) <= _SMALL_HOST_STRTREE_TREE_MAX_ROWS
+        and getattr(getattr(query_geometry, "values", None), "_owned", None) is not None
+        and getattr(getattr(tree_geometry, "values", None), "_owned", None) is not None
+    ):
+        return None
     if hasattr(tree_geometry, "values") and hasattr(tree_geometry.values, "supports_owned_spatial_input"):
         tree_supported = tree_geometry.values.supports_owned_spatial_input()
     else:
@@ -385,37 +407,51 @@ def _geom_predicate_query(
     """
     original_predicate = predicate
 
+    def _rewrite_buffer_intersects_to_dwithin(df, *, side: str):
+        ga = df.geometry.values
+        tag = getattr(ga, "_provenance", None)
+        if tag is None or tag.operation != "buffer" or not _r1_preconditions_met(tag):
+            return None
+        buf_distance = tag.get_param("distance")
+        source_ga = tag.source_array
+        if source_ga is None or len(source_ga) != len(ga):
+            return None
+
+        from vibespatial.api.geoseries import GeoSeries
+
+        rewritten = df.copy()
+        rewritten[df.geometry.name] = GeoSeries(
+            source_ga,
+            index=df.index,
+            crs=df.crs,
+        )
+        record_rewrite_event(
+            rule_name="R2_sjoin_buffer_intersects_to_dwithin",
+            surface="geopandas.tools.sjoin",
+            original_operation="sjoin(buffer, intersects)",
+            rewritten_operation="sjoin(dwithin)",
+            reason="sjoin(buffer(r, X), Y, intersects) == sjoin(X, Y, dwithin, r)",
+            detail=f"buffer_distance={buf_distance}, side={side}, rows={len(df)}",
+        )
+        return rewritten, buf_distance
+
     # R2: sjoin(buffer(r, X), Y, "intersects") -> sjoin(X, Y, "dwithin", r)
-    # When the left geometry was produced by buffer() on point data, we can
-    # substitute the original (pre-buffer) geometry and use dwithin instead.
+    #
+    # This rewrite is currently limited to the left side. A symmetric
+    # right-buffer rewrite looks valid algebraically, but the existing
+    # polygon-left / point-right dwithin engine under-selects pairs on
+    # real workloads (for example redevelopment_screening at 10k), so we
+    # leave the right-buffer case on the proven intersects path until the
+    # dwithin query orientation is fixed end to end.
     if (
         provenance_rewrites_enabled()
         and predicate == "intersects"
         and distance is None
     ):
-        left_ga = left_df.geometry.values
-        tag = getattr(left_ga, "_provenance", None)
-        if tag is not None and tag.operation == "buffer" and _r1_preconditions_met(tag):
-            buf_distance = tag.get_param("distance")
-            source_ga = tag.source_array
-            if source_ga is not None and len(source_ga) == len(left_ga):
-                from vibespatial.api.geoseries import GeoSeries
-
-                rewritten_left = left_df.copy()
-                rewritten_left[left_df.geometry.name] = GeoSeries(
-                    source_ga, index=left_df.index, crs=left_df.crs
-                )
-                record_rewrite_event(
-                    rule_name="R2_sjoin_buffer_intersects_to_dwithin",
-                    surface="geopandas.tools.sjoin",
-                    original_operation="sjoin(buffer, intersects)",
-                    rewritten_operation="sjoin(dwithin)",
-                    reason="sjoin(buffer(r, X), Y, intersects) == sjoin(X, Y, dwithin, r)",
-                    detail=f"buffer_distance={buf_distance}, rows={len(left_df)}",
-                )
-                left_df = rewritten_left
-                predicate = "dwithin"
-                distance = buf_distance
+        left_rewrite = _rewrite_buffer_intersects_to_dwithin(left_df, side="left")
+        if left_rewrite is not None:
+            left_df, distance = left_rewrite
+            predicate = "dwithin"
 
     # Always try owned spatial query first for all join types, not just
     # outer.  The owned engine handles 'within' directly so we pass the

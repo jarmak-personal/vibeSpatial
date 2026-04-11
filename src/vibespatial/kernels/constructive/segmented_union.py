@@ -315,7 +315,7 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
     consecutive GPU failures (suggesting CUDA context corruption), the
     rest of the reduction proceeds entirely on CPU.
     """
-    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.overlay.gpu import overlay_union_owned
 
     # Split into single-row OwnedGeometryArrays for pairwise reduction.
     current: list[OwnedGeometryArray] = []
@@ -332,12 +332,12 @@ def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 gpu_ok = False
                 if consecutive_gpu_failures < OVERLAY_GPU_FAILURE_THRESHOLD:
                     try:
-                        merged = binary_constructive_owned(
-                            "union",
+                        merged = overlay_union_owned(
                             current[i],
                             current[i + 1],
                             dispatch_mode=ExecutionMode.GPU,
                         )
+                        merged = merged.take(singleton_indices(0))
                         next_round.append(merged)
                         gpu_ok = True
                         consecutive_gpu_failures = 0

@@ -183,3 +183,38 @@ def test_make_valid_auto_keeps_inner_is_valid_on_gpu_for_device_resident_owned()
         and event.selected is ExecutionMode.GPU
         for event in events
     )
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime not available")
+def test_make_valid_gpu_rectangles_skip_generic_validity_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import vibespatial.constructive.validity as validity_module
+
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (4, 0), (4, 2), (0, 2), (0, 0)]),
+            Polygon([(10, 5), (13, 5), (13, 9), (10, 9), (10, 5)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    monkeypatch.setattr(
+        validity_module,
+        "is_valid_owned",
+        lambda *args, **kwargs: pytest.fail(
+            "exact rectangle batches should return from make_valid before the generic validity scan"
+        ),
+    )
+
+    clear_dispatch_events()
+    result = make_valid_owned(owned=owned, dispatch_mode=ExecutionMode.GPU)
+    events = get_dispatch_events(clear=True)
+
+    assert result.owned is owned
+    assert result.repaired_rows.size == 0
+    assert any(
+        event.surface == "geopandas.array.make_valid"
+        and event.implementation == "rectangle_valid_fast_path"
+        for event in events
+    )

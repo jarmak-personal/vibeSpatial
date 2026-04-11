@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import logging
 import statistics
 from dataclasses import dataclass
 from enum import StrEnum
@@ -25,6 +26,7 @@ from vibespatial.runtime.config import (
     SPATIAL_EPSILON,
 )
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.provenance import provenance_rewrites_enabled, record_rewrite_event
 
@@ -42,6 +44,9 @@ if TYPE_CHECKING:
 
 
 _EMPTY = GeometryCollection()
+_BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS = 256
+_BUFFERED_TWO_POINT_SMALL_PARTIAL_UNION_MAX_ROWS = 2
+logger = logging.getLogger(__name__)
 
 
 class DissolveUnionMethod(StrEnum):
@@ -114,10 +119,37 @@ def _grouped_union_geometry_result(
     geometry_name: str,
     crs,
 ) -> GeometryNativeResult:
-    if grouped_union.owned is not None:
-        return GeometryNativeResult.from_owned(grouped_union.owned, crs=crs)
-
     from vibespatial.api.geoseries import GeoSeries
+
+    if grouped_union.owned is not None:
+        return _repair_grouped_union_owned_if_needed(
+            grouped_union.owned,
+            group_count=grouped_union.group_count,
+            geometry_name=geometry_name,
+            crs=crs,
+        )
+
+    invalid_mask = ~np.asarray(shapely.is_valid(grouped_union.geometries), dtype=bool)
+    if invalid_mask.any():
+        repaired = np.asarray(grouped_union.geometries, dtype=object).copy()
+        repaired[invalid_mask] = np.asarray(
+            shapely.make_valid(repaired[invalid_mask]),
+            dtype=object,
+        )
+        record_dispatch_event(
+            surface="geopandas.geodataframe.dissolve",
+            operation="grouped_union_boundary_repair",
+            implementation="shapely.make_valid",
+            reason="grouped union boundary repair for invalid dissolved rows",
+            detail=(
+                f"groups={grouped_union.group_count}, "
+                f"repaired={int(np.count_nonzero(invalid_mask))}"
+            ),
+            selected=ExecutionMode.CPU,
+        )
+        return GeometryNativeResult.from_geoseries(
+            GeoSeries(repaired, name=geometry_name, crs=crs)
+        )
 
     return GeometryNativeResult.from_geoseries(
         GeoSeries(grouped_union.geometries, name=geometry_name, crs=crs)
@@ -644,6 +676,277 @@ def _union_block(values: np.ndarray, method: DissolveUnionMethod, grid_size: flo
     if method is DissolveUnionMethod.DISJOINT_SUBSET:
         return shapely.disjoint_subset_union_all(values)
     return shapely.union_all(values, grid_size=grid_size)
+
+
+def _repair_grouped_union_owned_if_needed(
+    owned: OwnedGeometryArray,
+    *,
+    group_count: int,
+    geometry_name: str,
+    crs,
+) -> GeometryNativeResult:
+    """Repair invalid grouped-union outputs while preserving the native seam."""
+    from vibespatial.api.geoseries import GeoSeries
+    from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+    from vibespatial.constructive.validity import is_valid_owned
+    from vibespatial.geometry.owned import (
+        concat_owned_scatter,
+        from_shapely_geometries,
+        seed_all_validity_cache,
+    )
+
+    invalid_mask = ~np.asarray(is_valid_owned(owned), dtype=bool)
+    if not bool(np.all(owned.validity)):
+        invalid_mask = invalid_mask.copy()
+        invalid_mask[~owned.validity] = False
+    if not invalid_mask.any():
+        seed_all_validity_cache(owned)
+        return GeometryNativeResult.from_owned(owned, crs=crs)
+
+    requested_mode = ExecutionMode.GPU if strict_native_mode_enabled() else ExecutionMode.AUTO
+    mv_result = make_valid_owned(owned=owned, dispatch_mode=requested_mode)
+
+    if strict_native_mode_enabled() and (
+        mv_result.selected is not ExecutionMode.GPU or mv_result.owned is None
+    ):
+        record_fallback_event(
+            surface="geopandas.geodataframe.dissolve",
+            reason="grouped union boundary repair could not stay native",
+            detail=(
+                f"groups={group_count}, repaired={int(np.count_nonzero(invalid_mask))}, "
+                f"selected={mv_result.selected.value}"
+            ),
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+            pipeline="dissolve.grouped_union_boundary_repair",
+            d2h_transfer=True,
+        )
+
+    if mv_result.owned is not None:
+        repaired_owned = mv_result.owned
+        remaining_invalid = ~np.asarray(is_valid_owned(repaired_owned), dtype=bool)
+        if not bool(np.all(repaired_owned.validity)):
+            remaining_invalid = remaining_invalid.copy()
+            remaining_invalid[~repaired_owned.validity] = False
+        if remaining_invalid.any():
+            remaining_rows = np.flatnonzero(remaining_invalid).astype(np.int64, copy=False)
+            if strict_native_mode_enabled():
+                record_fallback_event(
+                    surface="geopandas.geodataframe.dissolve",
+                    reason="grouped union boundary repair requires host compatibility cleanup",
+                    detail=(
+                        f"groups={group_count}, "
+                        f"remaining_invalid={int(np.count_nonzero(remaining_invalid))}"
+                    ),
+                    requested=ExecutionMode.GPU,
+                    selected=ExecutionMode.CPU,
+                    pipeline="dissolve.grouped_union_boundary_repair",
+                    d2h_transfer=True,
+                )
+            repaired_values = np.asarray(
+                repaired_owned.take(remaining_rows).to_shapely(),
+                dtype=object,
+            )
+            repaired_values = np.asarray(
+                shapely.make_valid(repaired_values),
+                dtype=object,
+            )
+            repaired_subset = from_shapely_geometries(
+                repaired_values.tolist(),
+                residency=repaired_owned.residency,
+            )
+            repaired_owned = concat_owned_scatter(
+                repaired_owned,
+                repaired_subset,
+                remaining_rows,
+            )
+            record_dispatch_event(
+                surface="geopandas.geodataframe.dissolve",
+                operation="grouped_union_boundary_repair",
+                implementation="shapely.make_valid_subset",
+                reason="grouped union boundary repair for residual invalid dissolved rows",
+                detail=(
+                    f"groups={group_count}, "
+                    f"repaired={int(np.count_nonzero(remaining_invalid))}"
+                ),
+                selected=ExecutionMode.CPU,
+            )
+        seed_all_validity_cache(repaired_owned)
+        return GeometryNativeResult.from_owned(repaired_owned, crs=crs)
+
+    record_dispatch_event(
+        surface="geopandas.geodataframe.dissolve",
+        operation="grouped_union_boundary_repair",
+        implementation="shapely.make_valid_fallback",
+        reason="grouped union boundary repair fell back to host compatibility cleanup",
+        detail=(
+            f"groups={group_count}, "
+            f"repaired={int(np.count_nonzero(invalid_mask))}"
+        ),
+        selected=ExecutionMode.CPU,
+    )
+    return GeometryNativeResult.from_geoseries(
+        GeoSeries(mv_result.geometries, name=geometry_name, crs=crs)
+    )
+
+
+def _greedy_bbox_disjoint_coloring(bounds: np.ndarray) -> np.ndarray | None:
+    row_count = int(bounds.shape[0])
+    if row_count == 0:
+        return np.empty(0, dtype=np.int32)
+    if bounds.ndim != 2 or bounds.shape[1] != 4:
+        return None
+
+    overlaps = (
+        (bounds[:, 0][:, None] <= bounds[:, 2][None, :])
+        & (bounds[:, 2][:, None] >= bounds[:, 0][None, :])
+        & (bounds[:, 1][:, None] <= bounds[:, 3][None, :])
+        & (bounds[:, 3][:, None] >= bounds[:, 1][None, :])
+    )
+    np.fill_diagonal(overlaps, False)
+
+    degrees = overlaps.sum(axis=1, dtype=np.int32)
+    max_degree = int(degrees.max(initial=0))
+    if max_degree == 0:
+        return np.zeros(row_count, dtype=np.int32)
+
+    order = np.argsort(-degrees, kind="stable")
+    colors = np.full(row_count, -1, dtype=np.int32)
+    for node in order:
+        used = np.unique(colors[overlaps[node] & (colors >= 0)])
+        if used.size == 0:
+            colors[node] = 0
+            continue
+        available = np.ones(int(used[-1]) + 2, dtype=bool)
+        available[used.astype(np.intp, copy=False)] = False
+        colors[node] = int(np.flatnonzero(available)[0])
+    return colors
+
+
+def _reorder_small_partial_union_groups_by_overlap(
+    expanded_bounds: np.ndarray,
+    color_rows: Sequence[np.ndarray],
+) -> list[np.ndarray]:
+    """Order small disjoint color groups to reduce first-round exact union cost.
+
+    The buffered two-point dissolve rewrite ultimately exact-unions one
+    single-row partial polygon per color group. For tiny partial counts, the
+    first pairing order materially affects overlay complexity. Use the already
+    computed expanded source-line bounds as a cheap proxy: groups with fewer
+    inter-group expanded-bbox overlaps are paired first.
+    """
+    if len(color_rows) < 4 or len(color_rows) > 8:
+        return list(color_rows)
+
+    remaining = list(range(len(color_rows)))
+    ordered_indices: list[int] = []
+
+    while len(remaining) > 1:
+        best_pair: tuple[int, int] | None = None
+        best_score: tuple[int, int, int, int] | None = None
+
+        for pos, left_index in enumerate(remaining[:-1]):
+            left_bounds = expanded_bounds[color_rows[left_index]]
+            for right_index in remaining[pos + 1:]:
+                right_bounds = expanded_bounds[color_rows[right_index]]
+                overlap_count = int(
+                    np.count_nonzero(
+                        (left_bounds[:, 0][:, None] <= right_bounds[:, 2][None, :])
+                        & (left_bounds[:, 2][:, None] >= right_bounds[:, 0][None, :])
+                        & (left_bounds[:, 1][:, None] <= right_bounds[:, 3][None, :])
+                        & (left_bounds[:, 3][:, None] >= right_bounds[:, 1][None, :])
+                    )
+                )
+                score = (
+                    overlap_count,
+                    abs(int(color_rows[left_index].size) - int(color_rows[right_index].size)),
+                    left_index,
+                    right_index,
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_pair = (left_index, right_index)
+
+        assert best_pair is not None
+        ordered_indices.extend(best_pair)
+        remaining = [index for index in remaining if index not in best_pair]
+
+    ordered_indices.extend(remaining)
+    return [np.asarray(color_rows[index], dtype=np.int64, copy=False) for index in ordered_indices]
+
+
+def _union_small_partial_rows_gpu(partials: Sequence[OwnedGeometryArray]) -> OwnedGeometryArray | None:
+    """Exact GPU union for a tiny list of single-row partial polygons.
+
+    The generic union_all tree reducer pays unnecessary localization and
+    reduction overhead when the buffered two-point dissolve rewrite has
+    already collapsed the corridor to a few partial rows. Keep this final
+    merge on the exact binary overlay path instead.
+    """
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+    if not partials:
+        return None
+    if len(partials) == 1:
+        return partials[0]
+    if len(partials) > _BUFFERED_TWO_POINT_SMALL_PARTIAL_UNION_MAX_ROWS:
+        return None
+    if any(partial.row_count != 1 for partial in partials):
+        return None
+
+    current = list(partials)
+    try:
+        while len(current) > 1:
+            next_round: list[OwnedGeometryArray] = []
+            limit = len(current) - 1
+            for i in range(0, limit, 2):
+                next_round.append(
+                    binary_constructive_owned(
+                        "union",
+                        current[i],
+                        current[i + 1],
+                        dispatch_mode=ExecutionMode.GPU,
+                    )
+                )
+            if len(current) % 2:
+                next_round.append(current[-1])
+            current = next_round
+    except Exception:
+        logger.debug(
+            "small buffered-line partial union failed; falling back to generic union_all",
+            exc_info=True,
+        )
+        return None
+    return current[0]
+
+
+def _reduce_partial_rows_gpu(partials: Sequence[OwnedGeometryArray]) -> OwnedGeometryArray | None:
+    """Reduce a tiny list of single-row partial polygons on the exact GPU path."""
+    from vibespatial.constructive.union_all import _tree_reduce_global, union_all_gpu_owned
+    from vibespatial.geometry.owned import OwnedGeometryArray
+
+    if not partials:
+        return None
+    if len(partials) == 1:
+        return partials[0]
+
+    reduced = _union_small_partial_rows_gpu(partials)
+    if reduced is not None:
+        return reduced
+
+    merged = OwnedGeometryArray.concat(list(partials))
+    if merged.row_count <= 8:
+        try:
+            return _tree_reduce_global(merged, "union")
+        except Exception:
+            logger.debug(
+                "tiny partial tree reduction failed; falling back to generic union_all",
+                exc_info=True,
+            )
+    return union_all_gpu_owned(
+        merged,
+        dispatch_mode=ExecutionMode.GPU,
+    )
 
 
 def _rectangle_bounds(values: np.ndarray) -> np.ndarray | None:
@@ -1418,7 +1721,14 @@ def execute_grouped_union_codes(
         sorted_codes = observed_codes[order]
         sorted_rows = observed_rows[order]
         offsets, unique_codes = _group_offsets_from_sorted_codes(sorted_codes)
-        reduced = segmented_union_all(owned.take(sorted_rows), offsets)
+        ordered_owned = owned.take(sorted_rows)
+        if group_count == 1:
+            from vibespatial.constructive.union_all import (
+                _spatially_localize_polygon_union_inputs,
+            )
+
+            ordered_owned = _spatially_localize_polygon_union_inputs(ordered_owned)
+        reduced = segmented_union_all(ordered_owned, offsets)
         if unique_codes.size == group_count and np.array_equal(
             unique_codes,
             np.arange(group_count, dtype=unique_codes.dtype),
@@ -1818,7 +2128,11 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         linestring_buffer_owned_array,
         supports_two_point_linestring_buffer_fast_path,
     )
-    from vibespatial.constructive.union_all import union_all_gpu_owned
+    from vibespatial.constructive.union_all import (
+        disjoint_subset_union_all_owned,
+        union_all_gpu_owned,
+    )
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
     quad_segs_param = tag.get_param("quad_segs", 16)
     quad_segs = 16 if quad_segs_param is None else int(quad_segs_param)
@@ -1838,22 +2152,95 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
     unique_rows = _dedupe_two_point_linestring_rows_gpu(source_owned)
     if unique_rows is None or unique_rows.size == 0 or unique_rows.size >= source_owned.row_count:
         return None
-    if unique_rows.size > 8:
+    # Keep the exact rewrite for materially deduped groups while capping the
+    # reduced exact-union size. Corridor-style networks often collapse far
+    # below the original row count but still land just above the generic
+    # grouped-union crossover.
+    if unique_rows.size > _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS:
+        return None
+    # This rewrite only pays off when deduplication is material; otherwise the
+    # exact GPU union can lose to the disjoint-subset host engine on lightly
+    # duplicated groups.
+    if unique_rows.size * 4 > source_owned.row_count:
         return None
 
     unique_owned = source_owned.take(unique_rows.astype(np.int64, copy=False))
-    buffered_unique = linestring_buffer_owned_array(
-        unique_owned,
-        distance_value,
-        quad_segs=quad_segs,
-        cap_style=cap_style,
-        join_style=join_style,
-        dispatch_mode=ExecutionMode.GPU,
+    expanded_bounds = np.asarray(
+        cp.asnumpy(cp.asarray(compute_geometry_bounds_device(unique_owned), dtype=cp.float64)),
+        dtype=np.float64,
     )
-    reduced = union_all_gpu_owned(
-        buffered_unique,
-        dispatch_mode=ExecutionMode.GPU,
-    )
+    if int(expanded_bounds.shape[0]) != unique_owned.row_count:
+        return None
+    expanded_bounds[:, 0] -= distance_value
+    expanded_bounds[:, 1] -= distance_value
+    expanded_bounds[:, 2] += distance_value
+    expanded_bounds[:, 3] += distance_value
+
+    colors = _greedy_bbox_disjoint_coloring(expanded_bounds)
+    color_rows: list[np.ndarray] = []
+    if colors is not None:
+        color_rows = [
+            np.flatnonzero(colors == color).astype(np.int64, copy=False)
+            for color in range(int(colors.max(initial=-1)) + 1)
+        ]
+        color_rows = [rows for rows in color_rows if rows.size]
+        color_rows = _reorder_small_partial_union_groups_by_overlap(
+            expanded_bounds,
+            color_rows,
+        )
+    color_count = len(color_rows)
+    if (
+        color_rows
+        and 1 < color_count < unique_owned.row_count
+        and color_count <= 128
+        and color_count * 4 <= unique_owned.row_count
+    ):
+        partials: list[OwnedGeometryArray] = []
+        for group_rows in color_rows:
+            buffered_color = linestring_buffer_owned_array(
+                unique_owned.take(group_rows),
+                distance_value,
+                quad_segs=quad_segs,
+                cap_style=cap_style,
+                join_style=join_style,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            partial = disjoint_subset_union_all_owned(
+                buffered_color,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            if partial is None:
+                partials = []
+                break
+            partials.append(partial)
+        if partials:
+            reduced = _reduce_partial_rows_gpu(partials)
+        else:
+            buffered_unique = linestring_buffer_owned_array(
+                unique_owned,
+                distance_value,
+                quad_segs=quad_segs,
+                cap_style=cap_style,
+                join_style=join_style,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            reduced = union_all_gpu_owned(
+                buffered_unique,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+    else:
+        buffered_unique = linestring_buffer_owned_array(
+            unique_owned,
+            distance_value,
+            quad_segs=quad_segs,
+            cap_style=cap_style,
+            join_style=join_style,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        reduced = union_all_gpu_owned(
+            buffered_unique,
+            dispatch_mode=ExecutionMode.GPU,
+        )
 
     record_rewrite_event(
         rule_name="R9_dissolve_buffered_two_point_lines_exact_union",
@@ -1863,6 +2250,7 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         reason="single-group buffered two-point lines dissolve rewrites to deduped source-line buffering plus exact GPU union",
         detail=(
             f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"color_subsets={max(color_count, 0)}, "
             f"buffer_distance={distance_value}, quad_segs={quad_segs}"
         ),
     )
@@ -1873,6 +2261,7 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         reason="deduped single-group buffered-line dissolve rewrite",
         detail=(
             f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"color_subsets={max(color_count, 0)}, "
             f"buffer_distance={distance_value}"
         ),
         selected=ExecutionMode.GPU,
@@ -1896,6 +2285,8 @@ def _maybe_execute_buffered_two_point_line_host_disjoint_subset_rewrite(
     group_count: int,
     tag,
 ) -> GroupedUnionResult | None:
+    from vibespatial.runtime.residency import Residency
+
     if (
         normalized_method is not DissolveUnionMethod.DISJOINT_SUBSET
         or row_group_codes is None
@@ -1913,6 +2304,8 @@ def _maybe_execute_buffered_two_point_line_host_disjoint_subset_rewrite(
 
     source_owned = _provenance_source_owned(tag)
     if source_owned is None:
+        return None
+    if source_owned.residency is Residency.DEVICE:
         return None
 
     observed_rows = np.flatnonzero(row_group_codes >= 0).astype(np.int64, copy=False)
@@ -1990,6 +2383,8 @@ def _maybe_rewrite_buffered_line_dissolve_method(
     group_positions: list[np.ndarray],
     group_count: int,
 ) -> DissolveUnionMethod:
+    from vibespatial.runtime.residency import Residency
+
     if (
         normalized_method is not DissolveUnionMethod.UNARY
         or grid_size is not None
@@ -2002,6 +2397,19 @@ def _maybe_rewrite_buffered_line_dissolve_method(
     tag = getattr(geometry_values, "_provenance", None)
     if tag is None or tag.operation != "buffer":
         return normalized_method
+    geometry_owned = getattr(geometry_values, "_owned", None)
+    if (
+        geometry_owned is not None
+        and geometry_owned.residency is Residency.DEVICE
+    ):
+        if strict_native_mode_enabled():
+            return normalized_method
+        source_owned = _provenance_source_owned(tag)
+        if (
+            source_owned is not None
+            and _dedupe_two_point_linestring_rows_gpu(source_owned) is not None
+        ):
+            return normalized_method
 
     source_types = tag.source_geom_types
     if not source_types or not source_types <= frozenset({"linestring", "multilinestring"}):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, Polygon
 
 from vibespatial.constructive.polygon import (
     _polygon_centroids_cpu,
@@ -587,6 +587,50 @@ def test_polygon_centroids_gpu_matches_cpu() -> None:
     gpu_cx, gpu_cy = _polygon_centroids_gpu(owned)
     np.testing.assert_allclose(gpu_cx, cpu_cx, rtol=1e-12)
     np.testing.assert_allclose(gpu_cy, cpu_cy, rtol=1e-12)
+
+
+def test_polygon_centroids_cpu_handles_holes_and_multipolygons() -> None:
+    polys = [
+        Polygon(
+            [(0, 0), (8, 0), (8, 8), (0, 8)],
+            holes=[[(1, 1), (1, 3), (3, 3), (3, 1)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(10, 0), (14, 0), (14, 4), (10, 4)]),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(polys)
+    cx, cy = _polygon_centroids_cpu(owned)
+    expected = np.asarray([geom.centroid.coords[0] for geom in polys], dtype=np.float64)
+    np.testing.assert_allclose(cx, expected[:, 0], atol=1e-10)
+    np.testing.assert_allclose(cy, expected[:, 1], atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_polygon_centroids_gpu_handles_holes_and_multipolygons() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    polys = [
+        Polygon(
+            [(0, 0), (8, 0), (8, 8), (0, 8)],
+            holes=[[(1, 1), (1, 3), (3, 3), (3, 1)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(10, 0), (14, 0), (14, 4), (10, 4)]),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(polys)
+    cx, cy = polygon_centroids_owned(owned, dispatch_mode=ExecutionMode.GPU)
+    expected = np.asarray([geom.centroid.coords[0] for geom in polys], dtype=np.float64)
+    np.testing.assert_allclose(cx, expected[:, 0], atol=1e-10)
+    np.testing.assert_allclose(cy, expected[:, 1], atol=1e-10)
 
 
 def test_polygon_centroids_auto_dispatch() -> None:

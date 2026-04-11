@@ -230,3 +230,32 @@ def test_polygon_rect_intersection_marks_touch_only_rows_empty():
 
     assert len(result_geoms) == 1
     assert result_geoms[0] is None or result_geoms[0].is_empty
+
+
+@requires_gpu
+def test_polygon_rect_intersection_emits_boundary_overlap_flag():
+    left = _make_owned_polygons(
+        [
+            Point(0.0, 0.0).buffer(3.0),
+            box(0.0, 0.0, 2.0, 2.0),
+        ]
+    )
+    right = _make_owned_polygons(
+        [
+            box(-1.0, -1.0, 1.0, 1.0),
+            box(0.0, 0.0, 1.0, 1.0),
+        ]
+    )
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection,
+    )
+
+    result = polygon_rect_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+    overlap = getattr(result, "_polygon_rect_boundary_overlap", None)
+
+    assert overlap is not None
+    if hasattr(overlap, "get"):
+        overlap = overlap.get()
+    overlap = np.asarray(overlap, dtype=bool)
+    assert overlap.tolist() == [False, True]

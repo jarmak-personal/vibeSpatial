@@ -15,7 +15,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import shapely
 from _data import fingerprint, setup_fixtures
 
 import geopandas as gpd
@@ -29,8 +28,9 @@ fixtures = setup_fixtures(tmpdir)
 buildings = gpd.read_parquet(fixtures["buildings"])
 flood_zones = gpd.read_file(fixtures["flood_zones"])
 
-# make_valid on buildings
-buildings["geometry"] = shapely.make_valid(buildings.geometry.values)
+# Repair through the public GeoSeries path so warmed GPU-native make_valid
+# stays on the device-native execution model before terminal export.
+buildings["geometry"] = buildings.geometry.make_valid()
 
 # Spatial join: buildings vs flood zones
 joined = gpd.sjoin(buildings, flood_zones, predicate="intersects")

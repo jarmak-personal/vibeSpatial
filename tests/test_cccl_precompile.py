@@ -11,6 +11,7 @@ from vibespatial.cuda.cccl_precompile import (
     PRECOMPILE_ENV_VAR,
     SPEC_REGISTRY,
     CCCLPrecompiler,
+    _warm_device_linestring_buffer_route,
     _warm_many_vs_one_overlay_remainder_route,
     _warm_overlay_difference_segmented_union_route,
     ensure_pipelines_warm,
@@ -126,6 +127,20 @@ class TestCCCLPrecompilerNoGPU:
             ensure_pipelines_warm()
         probe.assert_called_once_with(timeout=60.0)
 
+    def test_ensure_pipelines_warm_calls_device_linestring_buffer_probe(self):
+        with patch(
+            "vibespatial.cuda.cccl_precompile._warm_device_linestring_buffer_route",
+        ) as probe:
+            ensure_pipelines_warm()
+        probe.assert_called_once_with(timeout=60.0)
+
+    def test_ensure_pipelines_warm_calls_device_centroid_buffer_probe(self):
+        with patch(
+            "vibespatial.cuda.cccl_precompile._warm_device_centroid_buffer_route",
+        ) as probe:
+            ensure_pipelines_warm()
+        probe.assert_called_once_with(timeout=60.0)
+
     def test_ensure_pipelines_warm_drains_second_wave_cccl_requests(self):
         class _FakePrecompiler:
             def __init__(self) -> None:
@@ -151,6 +166,12 @@ class TestCCCLPrecompilerNoGPU:
                 ),
                 patch(
                     "vibespatial.cuda.cccl_precompile._warm_overlay_difference_segmented_union_route",
+                ),
+                patch(
+                    "vibespatial.cuda.cccl_precompile._warm_device_linestring_buffer_route",
+                ),
+                patch(
+                    "vibespatial.cuda.cccl_precompile._warm_device_centroid_buffer_route",
                 ),
             ):
                 result = ensure_pipelines_warm(timeout=7.5)
@@ -193,6 +214,24 @@ def test_warm_overlay_difference_probe_stays_off_cpu_fallback(
         _warm_overlay_difference_segmented_union_route()
 
     assert not any("overlay difference segmented-union" in str(entry.message) for entry in caught)
+
+
+@pytest.mark.gpu
+def test_warm_device_linestring_buffer_probe_stays_off_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    import vibespatial.cuda.cccl_precompile as precompile_module
+
+    monkeypatch.setattr(precompile_module, "_device_linestring_buffer_warm_done", False)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _warm_device_linestring_buffer_route()
+
+    assert not any("linestring-buffer" in str(entry.message) for entry in caught)
 
 class TestCCCLPrecompilerCore:
     def test_deduplication(self):

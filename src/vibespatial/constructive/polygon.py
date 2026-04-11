@@ -161,24 +161,41 @@ def _polygon_centroids_gpu(
             d_y = device_buffer.y
             d_ring_offsets = device_buffer.ring_offsets
             d_geom_offsets = device_buffer.geometry_offsets
+            d_part_offsets = None if family_key is GeometryFamily.POLYGON else device_buffer.part_offsets
         else:
             d_x = runtime.from_host(buf.x)
             d_y = runtime.from_host(buf.y)
             d_ring_offsets = runtime.from_host(buf.ring_offsets.astype(np.int32))
             d_geom_offsets = runtime.from_host(buf.geometry_offsets.astype(np.int32))
+            d_part_offsets = (
+                None
+                if family_key is GeometryFamily.POLYGON
+                else runtime.from_host(buf.part_offsets.astype(np.int32))
+            )
         d_cx = runtime.allocate((family_rows_count,), np.float64)
         d_cy = runtime.allocate((family_rows_count,), np.float64)
 
         cx_cy_owned = False  # tracks whether d_cx/d_cy ownership transferred
         try:
             ptr = runtime.pointer
-            params = (
-                (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_geom_offsets),
-                 ptr(d_cx), ptr(d_cy), center_x, center_y, family_rows_count),
-                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-                 KERNEL_PARAM_I32),
-            )
+            if family_key is GeometryFamily.POLYGON:
+                kernel = kernels["polygon_centroid"]
+                params = (
+                    (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_geom_offsets),
+                     ptr(d_cx), ptr(d_cy), center_x, center_y, family_rows_count),
+                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                     KERNEL_PARAM_I32),
+                )
+            else:
+                kernel = kernels["multipolygon_centroid"]
+                params = (
+                    (ptr(d_x), ptr(d_y), ptr(d_ring_offsets), ptr(d_part_offsets), ptr(d_geom_offsets),
+                     ptr(d_cx), ptr(d_cy), center_x, center_y, family_rows_count),
+                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                     KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                     KERNEL_PARAM_I32),
+                )
             grid, block = runtime.launch_config(kernel, family_rows_count)
             runtime.launch(kernel, grid=grid, block=block, params=params)
 
@@ -198,6 +215,8 @@ def _polygon_centroids_gpu(
                 runtime.free(d_x)
                 runtime.free(d_y)
                 runtime.free(d_ring_offsets)
+                if d_part_offsets is not None:
+                    runtime.free(d_part_offsets)
                 runtime.free(d_geom_offsets)
             if not cx_cy_owned:
                 runtime.free(d_cx)
@@ -641,7 +660,7 @@ def polygon_centroids_owned(
 def _polygon_centroids_cpu(
     owned: OwnedGeometryArray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """CPU fallback: NumPy shoelace per polygon (Python loop)."""
+    """CPU fallback: area-weighted centroid across polygon rings and parts."""
     row_count = owned.row_count
     cx = np.empty(row_count, dtype=np.float64)
     cy = np.empty(row_count, dtype=np.float64)
@@ -651,6 +670,29 @@ def _polygon_centroids_cpu(
 
     tags = owned.tags
     family_row_offsets = owned.family_row_offsets
+
+    def _ring_centroid_terms(
+        xs: np.ndarray,
+        ys: np.ndarray,
+    ) -> tuple[float, float, float, float, float, int]:
+        if len(xs) == 0:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0
+        if len(xs) >= 2 and xs[0] == xs[-1] and ys[0] == ys[-1]:
+            xs = xs[:-1]
+            ys = ys[:-1]
+        if len(xs) < 3:
+            return 0.0, 0.0, 0.0, 0.0, 0.0, 0
+
+        xs_next = np.roll(xs, -1)
+        ys_next = np.roll(ys, -1)
+        cross = xs * ys_next - xs_next * ys
+        signed_area = float(cross.sum() * 0.5)
+        if abs(signed_area) < 1e-30:
+            return 0.0, 0.0, 0.0, float(xs.sum()), float(ys.sum()), len(xs)
+
+        ring_cx = float(((xs + xs_next) * cross).sum() / (6.0 * signed_area))
+        ring_cy = float(((ys + ys_next) * cross).sum() / (6.0 * signed_area))
+        return abs(signed_area), ring_cx, ring_cy, 0.0, 0.0, 0
 
     for tag, family_key in ((poly_tag, GeometryFamily.POLYGON), (mpoly_tag, GeometryFamily.MULTIPOLYGON)):
         row_mask = tags == tag
@@ -665,34 +707,59 @@ def _polygon_centroids_cpu(
         y = buf.y
         ring_offsets = buf.ring_offsets
         geom_offsets = buf.geometry_offsets
+        part_offsets = buf.part_offsets
 
         global_rows = np.flatnonzero(row_mask)
         family_rows = family_row_offsets[global_rows]
 
-        for i, (gr, fr) in enumerate(zip(global_rows, family_rows)):
-            ring_start_idx = int(geom_offsets[fr])
-            coord_start = int(ring_offsets[ring_start_idx])
-            coord_end = int(ring_offsets[ring_start_idx + 1])
+        for gr, fr in zip(global_rows, family_rows, strict=True):
+            total_area = 0.0
+            total_cx = 0.0
+            total_cy = 0.0
+            fallback_x = 0.0
+            fallback_y = 0.0
+            fallback_n = 0
 
-            xs = x[coord_start:coord_end]
-            ys = y[coord_start:coord_end]
+            if family_key is GeometryFamily.POLYGON:
+                ring_start = int(geom_offsets[fr])
+                ring_stop = int(geom_offsets[fr + 1])
+                polygon_ranges = [(ring_start, ring_stop)]
+            else:
+                poly_start = int(geom_offsets[fr])
+                poly_stop = int(geom_offsets[fr + 1])
+                polygon_ranges = [
+                    (int(part_offsets[poly_idx]), int(part_offsets[poly_idx + 1]))
+                    for poly_idx in range(poly_start, poly_stop)
+                ]
 
-            if len(xs) < 3:
+            for ring_start, ring_stop in polygon_ranges:
+                for ring_idx in range(ring_start, ring_stop):
+                    coord_start = int(ring_offsets[ring_idx])
+                    coord_end = int(ring_offsets[ring_idx + 1])
+                    xs = x[coord_start:coord_end]
+                    ys = y[coord_start:coord_end]
+                    ring_area, ring_cx, ring_cy, mean_x, mean_y, mean_n = _ring_centroid_terms(xs, ys)
+                    if mean_n > 0:
+                        fallback_x += mean_x
+                        fallback_y += mean_y
+                        fallback_n += mean_n
+                        continue
+                    if ring_area <= 0.0:
+                        continue
+                    weight = ring_area if ring_idx == ring_start else -ring_area
+                    total_area += weight
+                    total_cx += ring_cx * weight
+                    total_cy += ring_cy * weight
+
+            if abs(total_area) >= 1e-30:
+                cx[gr] = total_cx / total_area
+                cy[gr] = total_cy / total_area
+            elif fallback_n > 0:
+                cx[gr] = fallback_x / fallback_n
+                cy[gr] = fallback_y / fallback_n
+            else:
                 cx[gr] = np.nan
                 cy[gr] = np.nan
-                continue
-
-            xs_next = np.roll(xs, -1)
-            ys_next = np.roll(ys, -1)
-            cross = xs * ys_next - xs_next * ys
-            signed_area = cross.sum() * 0.5
-
-            if abs(signed_area) < 1e-30:
-                cx[gr] = float(xs.mean())
-                cy[gr] = float(ys.mean())
-            else:
-                cx[gr] = float(((xs + xs_next) * cross).sum() / (6.0 * signed_area))
-                cy[gr] = float(((ys + ys_next) * cross).sum() / (6.0 * signed_area))
 
     # Handle any point/line rows that somehow got here (shouldn't happen, but safe)
     remaining = ~np.isin(tags, [poly_tag, mpoly_tag])

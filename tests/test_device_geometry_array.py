@@ -640,33 +640,120 @@ class TestGeoDataFrameIntegration:
         taken = df.iloc[[0, 4]]
         assert len(taken) == 2
 
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
     def test_active_geometry_setitem_preserves_device_backing(self):
         gdf = geopandas.GeoDataFrame(
             {"value": [1, 2]},
-            geometry=DeviceGeometryArray._from_sequence(
-                [Point(0, 0), Point(1, 1)]
+            geometry=DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [Point(0, 0), Point(1, 1)],
+                    residency=Residency.DEVICE,
+                )
             ),
             crs="EPSG:4326",
         )
 
-        gdf["geometry"] = shapely.make_valid(gdf.geometry.values)
+        replacement = pd.Series(
+            np.asarray([Point(2, 2), Point(3, 3)], dtype=object),
+            index=gdf.index,
+            name="geometry",
+        )
+
+        gdf["geometry"] = replacement
 
         assert gdf.geometry.dtype == DeviceGeometryDtype()
         assert isinstance(gdf.geometry.values, DeviceGeometryArray)
+        assert gdf.geometry.values._owned.residency is Residency.DEVICE
 
+    def test_shapely_make_valid_dispatches_device_geometry_array_directly(self):
+        bowtie = Polygon([(0, 0), (2, 2), (0, 2), (2, 0), (0, 0)])
+        dga = DeviceGeometryArray._from_sequence([bowtie])
+
+        result = shapely.make_valid(dga)
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert shapely.is_valid(result[0])
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
     def test_set_geometry_preserves_device_backing_for_array_like_replacement(self):
         gdf = geopandas.GeoDataFrame(
             {"value": [1, 2]},
-            geometry=DeviceGeometryArray._from_sequence(
-                [Point(0, 0), Point(1, 1)]
+            geometry=DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [Point(0, 0), Point(1, 1)],
+                    residency=Residency.DEVICE,
+                )
             ),
             crs="EPSG:4326",
         )
 
-        result = gdf.set_geometry(shapely.make_valid(gdf.geometry.values))
+        result = gdf.set_geometry(np.asarray([Point(2, 2), Point(3, 3)], dtype=object))
 
         assert result.geometry.dtype == DeviceGeometryDtype()
         assert isinstance(result.geometry.values, DeviceGeometryArray)
+        assert result.geometry.values._owned.residency is Residency.DEVICE
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+    def test_set_geometry_records_observable_fallback_when_device_rebuild_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import vibespatial.api.geodataframe as geodataframe_module
+
+        geopandas.clear_fallback_events()
+        gdf = geopandas.GeoDataFrame(
+            {"value": [1, 2]},
+            geometry=DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [Point(0, 0), Point(1, 1)],
+                    residency=Residency.DEVICE,
+                )
+            ),
+            crs="EPSG:4326",
+        )
+        monkeypatch.setattr(
+            geodataframe_module,
+            "_device_geometry_from_shapely",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("device rebuild failed")),
+        )
+
+        result = gdf.set_geometry(np.asarray([Point(2, 2), Point(3, 3)], dtype=object))
+
+        assert not isinstance(result.geometry.values, DeviceGeometryArray)
+        events = geopandas.get_fallback_events(clear=True)
+        assert events[-1].surface == "GeoDataFrame.set_geometry"
+        assert "device rebuild failed" in events[-1].detail
+
+    @pytest.mark.skipif(not has_gpu_runtime(), reason="CUDA runtime not available")
+    def test_set_geometry_strict_native_blocks_host_fallback_when_device_rebuild_fails(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        import vibespatial.api.geodataframe as geodataframe_module
+
+        geopandas.clear_fallback_events()
+        monkeypatch.setenv("VIBESPATIAL_STRICT_NATIVE", "1")
+        gdf = geopandas.GeoDataFrame(
+            {"value": [1, 2]},
+            geometry=DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [Point(0, 0), Point(1, 1)],
+                    residency=Residency.DEVICE,
+                )
+            ),
+            crs="EPSG:4326",
+        )
+        monkeypatch.setattr(
+            geodataframe_module,
+            "_device_geometry_from_shapely",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("device rebuild failed")),
+        )
+
+        with pytest.raises(StrictNativeFallbackError):
+            gdf.set_geometry(np.asarray([Point(2, 2), Point(3, 3)], dtype=object))
+
+        events = geopandas.get_fallback_events(clear=True)
+        assert events[-1].surface == "GeoDataFrame.set_geometry"
 
     def test_centroid_warning_mentions_operation_name(self):
         dga = DeviceGeometryArray._from_sequence([Point(0, 0)])

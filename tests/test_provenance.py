@@ -731,6 +731,42 @@ class TestR2SjoinBufferIntersects:
         dwithin_pairs = set(zip(result_dwithin.index, result_dwithin["index_right"]))
         assert rewrite_pairs == dwithin_pairs
 
+    def test_equivalence_when_buffered_side_is_right_without_rewrite(self):
+        """Right-buffer intersects stays on the proven path until dwithin orientation is fixed."""
+        import vibespatial.api as gpd
+
+        rng = np.random.default_rng(123)
+        n = 200
+        left = gpd.GeoDataFrame(
+            {"val": rng.integers(0, 100, n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+        right = gpd.GeoDataFrame(
+            {"zone": rng.integers(0, 10, n)},
+            geometry=gpd.GeoSeries(shapely.points(rng.uniform(0, 100, (n, 2)))),
+        )
+
+        buffered_right = right.copy()
+        buffered_right["geometry"] = right.geometry.buffer(5.0)
+
+        clear_rewrite_events()
+        result_rewrite = gpd.sjoin(left, buffered_right, predicate="intersects")
+
+        events = get_rewrite_events()
+        r2_events = [e for e in events if e.rule_name == "R2_sjoin_buffer_intersects_to_dwithin"]
+        assert len(r2_events) == 0
+
+        left_points = np.asarray(left.geometry, dtype=object)
+        right_polys = np.asarray(buffered_right.geometry, dtype=object)
+        expected_pairs = {
+            (left_idx, right_idx)
+            for left_idx, point in enumerate(left_points)
+            for right_idx, poly in enumerate(right_polys)
+            if shapely.intersects(point, poly)
+        }
+        rewrite_pairs = set(zip(result_rewrite.index, result_rewrite["index_right"]))
+        assert rewrite_pairs == expected_pairs
+
     def test_logs_rewrite_event(self):
         import vibespatial.api as gpd
 

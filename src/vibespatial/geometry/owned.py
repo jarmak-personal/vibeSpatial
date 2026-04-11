@@ -57,6 +57,19 @@ def unique_tag_pairs(
     return [(int(p // 256), int(p % 256)) for p in unique_packed]
 
 
+def seed_all_validity_cache(owned: OwnedGeometryArray | None) -> None:
+    """Seed the per-row validity cache with an all-valid mask.
+
+    Exact overlay/clip results and successful post-repair outputs are already
+    normalized geometry buffers. Marking them valid avoids re-running full OGC
+    validity scans when those public results feed immediately into another
+    polygon operation.
+    """
+    if owned is None:
+        return
+    owned._cached_is_valid_mask = np.ones(owned.row_count, dtype=bool)
+
+
 class DiagnosticKind(StrEnum):
     CREATED = "created"
     TRANSFER = "transfer"
@@ -267,6 +280,7 @@ class OwnedGeometryArray:
         self.shares_geoarrow_memory = shares_geoarrow_memory
         self.device_adopted = device_adopted
         self.device_state = device_state
+        self._cached_is_valid_mask: np.ndarray | None = None
         # Indexed-view support: when take() detects high index repetition,
         # the result stores a compact base array plus an index map instead
         # of physically copying all coordinate data.  This avoids OOM when
@@ -429,6 +443,39 @@ class OwnedGeometryArray:
     def is_indexed_view(self) -> bool:
         """True when this array is a virtual indexed view over a compact base."""
         return self._base is not None and self._index_map is not None
+
+    def _current_cached_validity_mask(self) -> np.ndarray | None:
+        cached = getattr(self, "_cached_is_valid_mask", None)
+        if cached is not None and int(cached.size) == self.row_count:
+            return np.asarray(cached, dtype=bool)
+
+        if self.is_indexed_view and self._base is not None and self._index_map is not None:
+            base_cached = getattr(self._base, "_cached_is_valid_mask", None)
+            if base_cached is not None and int(base_cached.size) == self._base.row_count:
+                index_map = self._index_map
+                if hasattr(index_map, "get"):
+                    index_map = index_map.get()
+                return np.asarray(
+                    base_cached[np.asarray(index_map, dtype=np.int64)],
+                    dtype=bool,
+                )
+
+        return None
+
+    def _propagate_cached_validity_mask(
+        self,
+        result: OwnedGeometryArray,
+        indices,
+    ) -> OwnedGeometryArray:
+        cached = self._current_cached_validity_mask()
+        if cached is None:
+            return result
+
+        if hasattr(indices, "get"):
+            indices = indices.get()
+        taken_indices = np.asarray(indices, dtype=np.int64)
+        result._cached_is_valid_mask = np.asarray(cached[taken_indices], dtype=bool)
+        return result
 
     @classmethod
     def _indexed_view(
@@ -1203,7 +1250,10 @@ class OwnedGeometryArray:
             approx_unique = len(set(sample.tolist()))
             if approx_unique / sample_size >= self._INDEXED_VIEW_RATIO_THRESHOLD:
                 # Low repetition — skip the full unique computation.
-                return self._physical_take(indices)
+                return self._propagate_cached_validity_mask(
+                    self._physical_take(indices),
+                    indices,
+                )
             unique_indices, inverse = np.unique(indices, return_inverse=True)
             unique_count = unique_indices.size
             if unique_count / max(total, 1) < self._INDEXED_VIEW_RATIO_THRESHOLD:
@@ -1219,14 +1269,23 @@ class OwnedGeometryArray:
                     physical_base = self._base.take(base_unique)
                     # The final inverse: for each output row, which base_unique row?
                     final_inverse = base_inverse[inverse]
-                    return OwnedGeometryArray._indexed_view(physical_base, final_inverse)
+                    return self._propagate_cached_validity_mask(
+                        OwnedGeometryArray._indexed_view(physical_base, final_inverse),
+                        indices,
+                    )
 
                 # Standard case: build physical take of unique rows only.
                 physical_base = self._physical_take(unique_indices)
-                return OwnedGeometryArray._indexed_view(physical_base, inverse)
+                return self._propagate_cached_validity_mask(
+                    OwnedGeometryArray._indexed_view(physical_base, inverse),
+                    indices,
+                )
 
         # --- Physical copy path (original behaviour) ---
-        return self._physical_take(indices)
+        return self._propagate_cached_validity_mask(
+            self._physical_take(indices),
+            indices,
+        )
 
     def _physical_take(self, indices: np.ndarray) -> OwnedGeometryArray:
         """Perform a physical (non-virtual) take, copying coordinate data."""
@@ -1297,7 +1356,10 @@ class OwnedGeometryArray:
             d_sample = d_indices[cp.linspace(0, total - 1, sample_size, dtype=cp.int64)]
             approx_unique = int(cp.unique(d_sample).size)
             if approx_unique / sample_size >= self._INDEXED_VIEW_RATIO_THRESHOLD:
-                return self._physical_device_take(d_indices)
+                return self._propagate_cached_validity_mask(
+                    self._physical_device_take(d_indices),
+                    d_indices,
+                )
             d_unique_indices, d_inverse = cp.unique(d_indices, return_inverse=True)
             unique_count = int(d_unique_indices.size)
             if unique_count / max(total, 1) < self._INDEXED_VIEW_RATIO_THRESHOLD:
@@ -1306,10 +1368,16 @@ class OwnedGeometryArray:
                 # Pass the CuPy inverse map directly -- no D2H transfer.
                 # _indexed_view detects the CuPy array and expands metadata
                 # on device, keeping the entire path GPU-resident.
-                return OwnedGeometryArray._indexed_view(physical_base, d_inverse)
+                return self._propagate_cached_validity_mask(
+                    OwnedGeometryArray._indexed_view(physical_base, d_inverse),
+                    d_indices,
+                )
 
         # --- Physical copy path ---
-        return self._physical_device_take(d_indices)
+        return self._propagate_cached_validity_mask(
+            self._physical_device_take(d_indices),
+            d_indices,
+        )
 
     def _physical_device_take(self, d_indices) -> OwnedGeometryArray:
         """Perform a physical (non-virtual) device-side take."""

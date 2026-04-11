@@ -17,6 +17,7 @@ from vibespatial.api import (
     read_parquet,
 )
 from vibespatial.api._config import options
+from vibespatial.api._shapely_dispatch import install_shapely_make_valid_dispatch
 from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 
 from .constructive.clip_rect import (
@@ -613,3 +614,6 @@ __all__ = [
     "clip",
     "options",
 ]
+
+
+install_shapely_make_valid_dispatch()

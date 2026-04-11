@@ -194,6 +194,63 @@ class TestUnionAllGPU:
         assert called == {"rows": 4}
         assert result.row_count == 1
 
+    def test_union_all_decomposes_disjoint_bbox_components_before_global_tree_reduce(self, monkeypatch):
+        """Disjoint polygon clusters should take the exact component decomposition path."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        polys = [
+            box(0, 0, 1, 1),
+            box(0.5, 0, 1.5, 1),
+            box(10, 0, 11, 1),
+            box(10.5, 0, 11.5, 1),
+        ]
+        owned = from_shapely_geometries(polys)
+        called: dict[str, int] = {}
+        original = union_all_module._try_exact_union_disjoint_bbox_components
+
+        def _wrapped(owned_input, *, precision):
+            called["rows"] = owned_input.row_count
+            return original(owned_input, precision=precision)
+
+        monkeypatch.setattr(
+            union_all_module,
+            "_try_exact_union_disjoint_bbox_components",
+            _wrapped,
+        )
+
+        result = union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+        expected = shapely.union_all(np.asarray(polys, dtype=object))
+
+        assert called == {"rows": 4}
+        assert _geom_equiv(_to_shapely(result), expected)
+
+    def test_union_all_decomposes_bbox_disjoint_color_subsets_before_global_tree_reduce(self, monkeypatch):
+        """Dense overlap workloads should compress bbox-disjoint color classes first."""
+        from vibespatial.constructive import union_all as union_all_module
+
+        polys = [box(float(i), 0.0, float(i) + 10.0, 1.0) for i in range(64)]
+        owned = from_shapely_geometries(polys)
+        partial_calls: list[int] = []
+        original = union_all_module.disjoint_subset_union_all_owned
+
+        def _wrapped(owned_input, **kwargs):
+            partial_calls.append(owned_input.row_count)
+            return original(owned_input, **kwargs)
+
+        monkeypatch.setattr(
+            union_all_module,
+            "disjoint_subset_union_all_owned",
+            _wrapped,
+        )
+
+        result = union_all_module.union_all_gpu_owned(owned, dispatch_mode="gpu")
+        expected = shapely.union_all(np.asarray(polys, dtype=object))
+
+        assert len(partial_calls) > 1
+        assert sum(partial_calls) == len(polys)
+        assert max(partial_calls) < len(polys)
+        assert _geom_equiv(_to_shapely(result), expected)
+
     def test_tree_reduce_batches_rounds(self, monkeypatch):
         """Tree reduction should issue one batched pairwise call per reduction round."""
         from vibespatial.constructive import union_all as union_all_module

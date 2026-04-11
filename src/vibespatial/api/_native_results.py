@@ -1512,26 +1512,12 @@ class GroupedConstructiveResult:
         from vibespatial.api.geodataframe import GeoDataFrame
 
         frame_type = self.frame_type or GeoDataFrame
-        geometry_frame = frame_type(
-            {
-                self.geometry_name: self.geometry.to_geoseries(
-                    index=self.attributes.index,
-                    name=self.geometry_name,
-                )
-            },
-            geometry=self.geometry_name,
-            index=self.attributes.index,
-            crs=self.geometry.crs,
-        )
-        aggregated = geometry_frame.join(self.attributes)
-        if not self.as_index:
-            aggregated = aggregated.reset_index()
+        aggregated = _grouped_constructive_result_to_native_tabular_result(
+            self,
+        ).to_geodataframe()
         if not isinstance(aggregated, frame_type):
-            aggregated = frame_type(
-                aggregated,
-                geometry=self.geometry_name,
-                crs=self.geometry.crs,
-            )
+            aggregated.__class__ = frame_type
+            aggregated._geometry_column_name = self.geometry_name
         return aggregated
 
 

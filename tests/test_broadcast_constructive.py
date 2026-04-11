@@ -16,7 +16,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import MultiPoint, MultiPolygon, Point, box
+from shapely.geometry import MultiPoint, MultiPolygon, Point, Polygon, box
 
 from benchmarks.shootout._data import setup_fixtures
 from vibespatial.api import read_file
@@ -238,6 +238,66 @@ def test_tiling_equivalence(op: str) -> None:
 
 
 @requires_gpu
+def test_expand_right_segments_for_pair_rows_vectorized_matches_legacy() -> None:
+    import cupy as cp
+
+    right = from_shapely_geometries(
+        [
+            Polygon(
+                [(0, 0), (8, 0), (8, 4), (0, 4)],
+                holes=[[(2, 1), (3, 1), (3, 2), (2, 2)]],
+            ),
+            Polygon(
+                [(10, 0), (18, 0), (18, 4), (10, 4)],
+                holes=[[(12, 1), (13, 1), (13, 2), (12, 2)]],
+            ),
+            Polygon(
+                [(20, 0), (28, 0), (28, 4), (20, 4)],
+                holes=[[(22, 1), (23, 1), (23, 2), (22, 2)]],
+            ),
+        ],
+        residency=Residency.DEVICE,
+    )
+    source_rows = np.asarray([2, 0, 2, 1, 0, 2, 1, 1], dtype=np.int32)
+
+    actual = binary_constructive_module._expand_right_segments_for_pair_rows(
+        right,
+        source_rows,
+    )
+    expected = binary_constructive_module._expand_right_segments_for_pair_rows_legacy(
+        right,
+        source_rows,
+    )
+
+    assert actual is not None
+    assert expected is not None
+    assert int(actual.count) == int(expected.count)
+    np.testing.assert_array_equal(cp.asnumpy(actual.row_indices), cp.asnumpy(expected.row_indices))
+    np.testing.assert_array_equal(
+        cp.asnumpy(actual.segment_indices),
+        cp.asnumpy(expected.segment_indices),
+    )
+    np.testing.assert_allclose(cp.asnumpy(actual.x0), cp.asnumpy(expected.x0))
+    np.testing.assert_allclose(cp.asnumpy(actual.y0), cp.asnumpy(expected.y0))
+    np.testing.assert_allclose(cp.asnumpy(actual.x1), cp.asnumpy(expected.x1))
+    np.testing.assert_allclose(cp.asnumpy(actual.y1), cp.asnumpy(expected.y1))
+    if actual.part_indices is None or expected.part_indices is None:
+        assert actual.part_indices is None and expected.part_indices is None
+    else:
+        np.testing.assert_array_equal(
+            cp.asnumpy(actual.part_indices),
+            cp.asnumpy(expected.part_indices),
+        )
+    if actual.ring_indices is None or expected.ring_indices is None:
+        assert actual.ring_indices is None and expected.ring_indices is None
+    else:
+        np.testing.assert_array_equal(
+            cp.asnumpy(actual.ring_indices),
+            cp.asnumpy(expected.ring_indices),
+        )
+
+
+@requires_gpu
 def test_strict_broadcast_polygon_intersection_preserves_row_cardinality_for_complex_polygons() -> None:
     """Strict scalar-right polygon intersection keeps one output slot per input row.
 
@@ -285,18 +345,21 @@ def test_multirow_polygon_constructive_prefers_contraction_path(
     monkeypatch: pytest.MonkeyPatch,
     op: str,
 ) -> None:
+    row_count = 32
     left = [
-        Point(0, 0).buffer(4),
-        Point(10, 10).buffer(4),
+        Point(float(i) * 10.0, float(i) * 10.0).buffer(4.0)
+        for i in range(row_count)
     ]
     right = [
-        Point(1, 1).buffer(2.5),
-        Point(9.5, 9.5).buffer(2.0),
+        Point(float(i) * 10.0 + 1.0, float(i) * 10.0 + 1.0).buffer(2.5)
+        for i in range(row_count)
     ]
-    sentinel = from_shapely_geometries([
-        box(0, 0, 1, 1),
-        box(2, 2, 3, 3),
-    ])
+    sentinel = from_shapely_geometries(
+        [
+            box(float(i) * 10.0, float(i) * 10.0, float(i) * 10.0 + 1.0, float(i) * 10.0 + 1.0)
+            for i in range(row_count)
+        ]
+    )
 
     left_owned = from_shapely_geometries(left)
     right_owned = from_shapely_geometries(right)
@@ -325,9 +388,47 @@ def test_multirow_polygon_constructive_prefers_contraction_path(
         dispatch_mode=ExecutionMode.GPU,
     )
 
-    assert calls == [(op, 2)]
+    assert calls == [(op, row_count)]
     for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
         assert shapely.equals(got, exp)
+
+
+@requires_gpu
+def test_small_multirow_polygon_intersection_skips_contraction_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left_owned = from_shapely_geometries(
+        [Point(0, 0).buffer(4.0), Point(10, 10).buffer(4.0)]
+    )
+    right_owned = from_shapely_geometries(
+        [Point(1, 1).buffer(2.5), Point(9.5, 9.5).buffer(2.0)]
+    )
+    sentinel = from_shapely_geometries([box(0, 0, 1, 1), box(2, 2, 3, 3)])
+
+    contraction_module = importlib.import_module("vibespatial.overlay.contraction")
+
+    monkeypatch.setattr(
+        contraction_module,
+        "overlay_contraction_owned",
+        lambda *args, **kwargs: pytest.fail(
+            "small aligned polygon intersection should skip contraction"
+        ),
+    )
+    monkeypatch.setattr(binary_constructive_module, "_sh_kernel_can_handle", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        lambda *args, **kwargs: sentinel,
+    )
+
+    result = binary_constructive_owned(
+        "intersection",
+        left_owned,
+        right_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result is sentinel
 
 
 def test_polygon_intersection_tries_rowwise_overlay_after_overlay_exception(
@@ -435,6 +536,20 @@ def test_polygon_intersection_prefers_rectangle_kernel_for_high_vertex_left_poly
     assert calls == [2]
     for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
         assert shapely.equals(got, exp)
+
+
+def test_host_rectangle_polygon_mask_rejects_diagonal_bowtie_ring() -> None:
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0.0, 0.0), (2.0, 2.0), (0.0, 2.0), (2.0, 0.0), (0.0, 0.0)]),
+            box(10.0, 10.0, 12.0, 12.0),
+        ]
+    )
+
+    mask = binary_constructive_module._host_rectangle_polygon_mask(owned)
+
+    assert mask is not None
+    assert mask.tolist() == [False, True]
 
 
 @requires_gpu

@@ -77,7 +77,12 @@ def _run_timed_sections(script_path, sections, *, run_name):
     start = time.perf_counter()
     exec(timed_code, globals_dict)
     elapsed = time.perf_counter() - start
-    exec(postamble_code, globals_dict)
+    strict_native = os.environ.pop("VIBESPATIAL_STRICT_NATIVE", None)
+    try:
+        exec(postamble_code, globals_dict)
+    finally:
+        if strict_native is not None:
+            os.environ["VIBESPATIAL_STRICT_NATIVE"] = strict_native
     return elapsed
 
 os.chdir(os.path.dirname(os.path.abspath(script)))
@@ -277,7 +282,12 @@ def _run_timed_script_sections(
         start = time.perf_counter()
         exec(timed_code, globals_dict)
         elapsed = time.perf_counter() - start
-        exec(postamble_code, globals_dict)
+        strict_native = os.environ.pop("VIBESPATIAL_STRICT_NATIVE", None)
+        try:
+            exec(postamble_code, globals_dict)
+        finally:
+            if strict_native is not None:
+                os.environ["VIBESPATIAL_STRICT_NATIVE"] = strict_native
     finally:
         sys.stdout = original_stdout
     return elapsed, capture.getvalue()

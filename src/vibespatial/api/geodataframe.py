@@ -26,6 +26,8 @@ from vibespatial.overlay.dissolve import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.residency import Residency
 
 if PANDAS_GE_30:
     from pandas.core.accessor import Accessor
@@ -47,7 +49,47 @@ if typing.TYPE_CHECKING:
     )
 
 
-def _ensure_geometry(data, crs: Any | None = None) -> GeoSeries | GeometryArray:
+def _device_geometry_from_shapely(data, crs: Any | None = None):
+    """Build a device-backed geometry array from Shapely values when possible."""
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    if isinstance(data, Series):
+        values = np.asarray(data)
+    else:
+        values = np.asarray(data, dtype=object)
+    owned = from_shapely_geometries(values.tolist(), residency=Residency.DEVICE)
+    return DeviceGeometryArray._from_owned(owned, crs=crs)
+
+
+def _ensure_geometry_respecting_device_preference(
+    data,
+    *,
+    crs: Any | None = None,
+    surface: str,
+):
+    try:
+        return _device_geometry_from_shapely(data, crs=crs)
+    except Exception as device_error:
+        host_geometry = from_shapely(np.asarray(data, dtype=object), crs=crs)
+        record_fallback_event(
+            surface=surface,
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.CPU,
+            reason="explicit CPU fallback while rebuilding a device-backed geometry column from Shapely values",
+            detail=f"{type(device_error).__name__}: {device_error}",
+            pipeline="geodataframe",
+        )
+        return host_geometry
+
+
+def _ensure_geometry(
+    data,
+    crs: Any | None = None,
+    *,
+    prefer_device: bool = False,
+    fallback_surface: str = "GeoDataFrame.geometry",
+) -> GeoSeries | GeometryArray:
     """
     Ensure the data is of geometry dtype or converted to it.
 
@@ -64,15 +106,31 @@ def _ensure_geometry(data, crs: Any | None = None) -> GeoSeries | GeometryArray:
             data = data.copy()
             if isinstance(data, GeometryArray):
                 data.crs = crs
-            else:
+            elif hasattr(data, "array"):
                 data.array.crs = crs
+            else:
+                data.crs = crs
         return data
     else:
         if isinstance(data, Series):
-            out = from_shapely(np.asarray(data), crs=crs)
+            if prefer_device:
+                out = _ensure_geometry_respecting_device_preference(
+                    data,
+                    crs=crs,
+                    surface=fallback_surface,
+                )
+            else:
+                out = from_shapely(np.asarray(data), crs=crs)
             return GeoSeries(out, index=data.index, name=data.name)
         else:
-            out = from_shapely(data, crs=crs)
+            if prefer_device:
+                out = _ensure_geometry_respecting_device_preference(
+                    data,
+                    crs=crs,
+                    surface=fallback_surface,
+                )
+            else:
+                out = from_shapely(data, crs=crs)
             return out
 
 
@@ -469,8 +527,18 @@ class GeoDataFrame(GeoPandasBase, DataFrame):
         if not crs:
             crs = getattr(level, "crs", None)
 
+        current_geom_dtype = None
+        if self._geometry_column_name is not None and self._geometry_column_name in self.columns:
+            current_geom_dtype = getattr(self[self._geometry_column_name], "dtype", None)
+        prefer_device = getattr(current_geom_dtype, "name", None) == "device_geometry"
+
         # Check that we are using a listlike of geometries
-        level = _ensure_geometry(level, crs=crs)
+        level = _ensure_geometry(
+            level,
+            crs=crs,
+            prefer_device=prefer_device,
+            fallback_surface="GeoDataFrame.set_geometry",
+        )
         # ensure_geometry only sets crs on level if it has crs==None
         if isinstance(level, GeoSeries):
             level.array.crs = crs
@@ -1994,6 +2062,8 @@ default 'snappy'
             key == self._geometry_column_name
             or (key == "geometry" and self._geometry_column_name is None)
         ):
+            current_geom_dtype = getattr(self.get(key, None), "dtype", None) if key in self.columns else None
+            prefer_device = getattr(current_geom_dtype, "name", None) == "device_geometry"
             if pd.api.types.is_scalar(value) or isinstance(value, BaseGeometry):
                 value = [value] * self.shape[0]
 
@@ -2003,7 +2073,12 @@ default 'snappy'
             if isinstance(crs, pd.Series | pd.DataFrame):
                 crs = None
             try:
-                value = _ensure_geometry(value, crs=crs)
+                value = _ensure_geometry(
+                    value,
+                    crs=crs,
+                    prefer_device=prefer_device,
+                    fallback_surface="GeoDataFrame.__setitem__",
+                )
             except TypeError:
                 warnings.warn(
                     "Geometry column does not contain geometry.",

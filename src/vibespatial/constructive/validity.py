@@ -1725,6 +1725,23 @@ def is_valid_owned(
     if row_count == 0:
         return np.array([], dtype=bool)
 
+    cached_result = getattr(owned, "_cached_is_valid_mask", None)
+    if cached_result is not None and int(cached_result.size) == row_count:
+        return cached_result
+
+    if owned.is_indexed_view and owned._base is not None:
+        base_cached = getattr(owned._base, "_cached_is_valid_mask", None)
+        index_map = owned._index_map
+        if base_cached is not None and index_map is not None:
+            if hasattr(index_map, "get"):
+                index_map = index_map.get()
+            cached_result = np.asarray(
+                base_cached[np.asarray(index_map, dtype=np.int64)],
+                dtype=bool,
+            )
+            owned._cached_is_valid_mask = cached_result
+            return cached_result
+
     selection = plan_dispatch_selection(
         kernel_name="is_valid",
         kernel_class=KernelClass.PREDICATE,
@@ -1803,6 +1820,7 @@ def is_valid_owned(
 
     # Null geometries are valid (Shapely convention)
     # Already True by default; no action needed for nulls.
+    owned._cached_is_valid_mask = result
     return result
 
 

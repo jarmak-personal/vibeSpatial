@@ -9,6 +9,7 @@ from shapely.geometry import (
     LineString,
     MultiLineString,
     MultiPoint,
+    MultiPolygon,
     Point,
     Polygon,
 )
@@ -203,6 +204,50 @@ def test_polygon_centroid_delegation_gpu():
     geoms = [
         Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]),
         Polygon([(0, 0), (6, 0), (3, 6)]),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _extract_cx_cy(_centroid_gpu(owned))
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+def test_polygonal_centroid_cpu_handles_holes_and_multipolygons():
+    geoms = [
+        Polygon(
+            [(0, 0), (8, 0), (8, 8), (0, 8)],
+            holes=[[(1, 1), (1, 3), (3, 3), (3, 1)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(10, 0), (14, 0), (14, 4), (10, 4)]),
+            ]
+        ),
+    ]
+    owned = from_shapely_geometries(geoms)
+    cx, cy = _centroid_cpu(owned)
+    ex, ey = _shapely_centroids(geoms)
+    np.testing.assert_allclose(cx, ex, atol=1e-10)
+    np.testing.assert_allclose(cy, ey, atol=1e-10)
+
+
+@pytest.mark.gpu
+def test_polygonal_centroid_gpu_handles_holes_and_multipolygons():
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    geoms = [
+        Polygon(
+            [(0, 0), (8, 0), (8, 8), (0, 8)],
+            holes=[[(1, 1), (1, 3), (3, 3), (3, 1)]],
+        ),
+        MultiPolygon(
+            [
+                Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]),
+                Polygon([(10, 0), (14, 0), (14, 4), (10, 4)]),
+            ]
+        ),
     ]
     owned = from_shapely_geometries(geoms)
     cx, cy = _extract_cx_cy(_centroid_gpu(owned))

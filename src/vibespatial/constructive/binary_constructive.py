@@ -87,6 +87,16 @@ _LINESTRING_FAMILIES = frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULT
 # Point-Polygon constructive operations supported by the PIP fast path
 _POINT_POLYGON_OPS = frozenset({"intersection", "difference"})
 
+# Contraction has a high fixed setup cost from microcell labeling and
+# reconstruction. Small aligned polygon batches are faster on the existing
+# row-isolated overlay helpers than on the contraction path.
+_POLYGON_CONTRACTION_MIN_ROWS = 32
+
+# Tiny mixed polygonal intersection batches spend more time partitioning by
+# tag pair and exploding multipolygons than they do running one row-isolated
+# exact overlay across the aligned batch.
+_MIXED_POLYGON_INTERSECTION_ROWWISE_MAX = 16
+
 
 def _sync_hotpath() -> None:
     if hotpath_trace_enabled():
@@ -114,6 +124,210 @@ def _is_family_only(owned: OwnedGeometryArray, target_families: frozenset[Geomet
 def _is_polygon_only(owned: OwnedGeometryArray) -> bool:
     """Return True if every family with rows is Polygon or MultiPolygon."""
     return _is_family_only(owned, _POLYGONAL_FAMILIES)
+
+
+def _resolve_indexed_polygon_fast_path_candidate(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray:
+    """Materialize indexed polygon batches before exact GPU fast-path probes.
+
+    Gathered pair batches often arrive as device-side indexed views whose
+    family buffers still carry compact row counts from the source arrays.
+    Rectangle/exact polygon kernels expect physically materialized family
+    rows, so resolve the indexed view on the active residency before probing.
+    """
+    if not owned.is_indexed_view:
+        return owned
+    if owned.residency is Residency.DEVICE or owned.device_state is not None:
+        return owned._device_resolve()
+    return owned._resolve()
+
+
+def _host_single_ring_polygon_mask(
+    owned: OwnedGeometryArray,
+    *,
+    max_input_vertices: int = 256,
+) -> np.ndarray | None:
+    """Classify rows that fit the single-ring polygon kernel contract."""
+    if set(owned.families) != {GeometryFamily.POLYGON}:
+        return None
+
+    owned._ensure_host_state()
+    polygon_buf = owned.families[GeometryFamily.POLYGON]
+    if polygon_buf.row_count != owned.row_count or polygon_buf.ring_offsets is None:
+        return None
+    if len(polygon_buf.geometry_offsets) != owned.row_count + 1:
+        return None
+
+    mask = np.zeros(owned.row_count, dtype=bool)
+    geom_offsets = np.asarray(polygon_buf.geometry_offsets, dtype=np.int64)
+    ring_offsets = np.asarray(polygon_buf.ring_offsets, dtype=np.int64)
+    x = np.asarray(polygon_buf.x, dtype=np.float64)
+    y = np.asarray(polygon_buf.y, dtype=np.float64)
+
+    for row in range(owned.row_count):
+        ring_start = int(geom_offsets[row])
+        ring_end = int(geom_offsets[row + 1])
+        if ring_end - ring_start != 1:
+            continue
+        start = int(ring_offsets[ring_start])
+        end = int(ring_offsets[ring_start + 1])
+        n = end - start
+        if n > 1:
+            dx = float(x[start] - x[end - 1])
+            dy = float(y[start] - y[end - 1])
+            if (dx * dx + dy * dy) <= 1e-24:
+                n -= 1
+        if 3 <= n <= max_input_vertices:
+            mask[row] = True
+    return mask
+
+
+def _host_rectangle_polygon_mask(owned: OwnedGeometryArray) -> np.ndarray | None:
+    """Classify rows that are exact axis-aligned rectangles."""
+    single_ring_mask = _host_single_ring_polygon_mask(owned, max_input_vertices=4)
+    if single_ring_mask is None:
+        return None
+
+    polygon_buf = owned.families[GeometryFamily.POLYGON]
+    geom_offsets = np.asarray(polygon_buf.geometry_offsets, dtype=np.int64)
+    ring_offsets = np.asarray(polygon_buf.ring_offsets, dtype=np.int64)
+    x = np.asarray(polygon_buf.x, dtype=np.float64)
+    y = np.asarray(polygon_buf.y, dtype=np.float64)
+
+    rect_mask = np.zeros(owned.row_count, dtype=bool)
+    for row in np.flatnonzero(single_ring_mask):
+        ring_row = int(geom_offsets[int(row)])
+        start = int(ring_offsets[ring_row])
+        end = int(ring_offsets[ring_row + 1])
+        coords_x = x[start:end]
+        coords_y = y[start:end]
+        if coords_x.size > 1:
+            dx = float(coords_x[0] - coords_x[-1])
+            dy = float(coords_y[0] - coords_y[-1])
+            if (dx * dx + dy * dy) <= 1e-24:
+                coords_x = coords_x[:-1]
+                coords_y = coords_y[:-1]
+        if coords_x.size != 4:
+            continue
+        xmin = float(np.min(coords_x))
+        xmax = float(np.max(coords_x))
+        ymin = float(np.min(coords_y))
+        ymax = float(np.max(coords_y))
+        if not (xmin < xmax and ymin < ymax):
+            continue
+        corners = {
+            (xmin, ymin),
+            (xmin, ymax),
+            (xmax, ymin),
+            (xmax, ymax),
+        }
+        row_points = list(zip(coords_x.tolist(), coords_y.tolist(), strict=True))
+        row_corners = {
+            (float(px), float(py))
+            for px, py in row_points
+        }
+        if row_corners != corners:
+            continue
+        is_axis_aligned = True
+        for index, (x0, y0) in enumerate(row_points):
+            x1, y1 = row_points[(index + 1) % len(row_points)]
+            same_x = abs(float(x0) - float(x1)) <= 1e-12
+            same_y = abs(float(y0) - float(y1)) <= 1e-12
+            if same_x == same_y:
+                is_axis_aligned = False
+                break
+        rect_mask[int(row)] = is_axis_aligned
+    return rect_mask
+
+
+def _dispatch_mixed_polygon_rect_intersection_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Use the rectangle kernel on row subsets within mixed polygon batches."""
+    if cp is None or left.row_count != right.row_count or left.row_count == 0:
+        return None
+    if left.row_count > 4096:
+        return None
+
+    left = _resolve_indexed_polygon_fast_path_candidate(left)
+    right = _resolve_indexed_polygon_fast_path_candidate(right)
+
+    left_simple = _host_single_ring_polygon_mask(left)
+    right_simple = _host_single_ring_polygon_mask(right)
+    left_rect = _host_rectangle_polygon_mask(left)
+    right_rect = _host_rectangle_polygon_mask(right)
+    if (
+        left_simple is None
+        or right_simple is None
+        or left_rect is None
+        or right_rect is None
+    ):
+        return None
+
+    right_rect_rows = left_simple & right_rect
+    left_rect_rows = right_simple & left_rect & ~right_rect_rows
+    handled_rows = right_rect_rows | left_rect_rows
+    if not handled_rows.any():
+        return None
+
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection,
+    )
+
+    result = _empty_device_constructive_output(left.row_count)
+    boundary_overlap = cp.zeros(left.row_count, dtype=cp.bool_)
+    exact_polygon_only = cp.zeros(left.row_count, dtype=cp.bool_)
+    used_rect_kernel = False
+
+    if right_rect_rows.any():
+        right_rect_indices = np.flatnonzero(right_rect_rows)
+        d_rows = cp.asarray(right_rect_indices, dtype=cp.int64)
+        subset = polygon_rect_intersection(
+            left.take(d_rows),
+            right.take(d_rows),
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        result = device_concat_owned_scatter(result, subset, d_rows)
+        subset_overlap = getattr(subset, "_polygon_rect_boundary_overlap", None)
+        if subset_overlap is not None:
+            boundary_overlap[d_rows] = cp.asarray(subset_overlap, dtype=cp.bool_)
+        exact_polygon_only[d_rows] = cp.asarray(left_rect[right_rect_indices], dtype=cp.bool_)
+        used_rect_kernel = True
+
+    if left_rect_rows.any():
+        d_rows = cp.asarray(np.flatnonzero(left_rect_rows), dtype=cp.int64)
+        subset = polygon_rect_intersection(
+            right.take(d_rows),
+            left.take(d_rows),
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        result = device_concat_owned_scatter(result, subset, d_rows)
+        subset_overlap = getattr(subset, "_polygon_rect_boundary_overlap", None)
+        if subset_overlap is not None:
+            boundary_overlap[d_rows] = cp.asarray(subset_overlap, dtype=cp.bool_)
+        used_rect_kernel = True
+
+    remainder_rows = np.flatnonzero(~handled_rows)
+    if remainder_rows.size > 0:
+        d_rows = cp.asarray(remainder_rows, dtype=cp.int64)
+        remainder = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+            left.take(d_rows),
+            right.take(d_rows),
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=None,
+        )
+        if remainder is None or remainder.row_count != remainder_rows.size:
+            return None
+        result = device_concat_owned_scatter(result, remainder, d_rows)
+    if used_rect_kernel:
+        result._polygon_rect_boundary_overlap = boundary_overlap
+        result._polygon_rect_exact_polygon_only = exact_polygon_only
+
+    return result
 
 
 def _is_point_only(owned: OwnedGeometryArray) -> bool:
@@ -434,6 +648,261 @@ def _free_device_segment_table(device_segments: DeviceSegmentTable) -> None:
         runtime.free(device_segments.ring_indices)
 
 
+def _broadcast_right_cached_segments(
+    right: OwnedGeometryArray,
+    row_count: int,
+    *,
+    _cached_right_segments: DeviceSegmentTable | None = None,
+) -> DeviceSegmentTable | None:
+    """Expand a scalar-right segment table to N logical right rows on device."""
+    if cp is None or row_count <= 1 or right.row_count != 1:
+        return _cached_right_segments
+
+    from vibespatial.spatial.segment_primitives import (
+        DeviceSegmentTable,
+        _extract_segments_gpu,
+    )
+
+    source_segments = _cached_right_segments
+    owns_source_segments = False
+    if source_segments is None:
+        source_segments = _extract_segments_gpu(right)
+        owns_source_segments = True
+
+    segment_count = int(source_segments.count)
+    if segment_count == 0:
+        return source_segments
+
+    try:
+        broadcast = DeviceSegmentTable(
+            row_indices=cp.repeat(cp.arange(row_count, dtype=cp.int32), segment_count),
+            segment_indices=cp.tile(
+                cp.asarray(source_segments.segment_indices, dtype=cp.int32),
+                row_count,
+            ),
+            x0=cp.tile(source_segments.x0, row_count),
+            y0=cp.tile(source_segments.y0, row_count),
+            x1=cp.tile(source_segments.x1, row_count),
+            y1=cp.tile(source_segments.y1, row_count),
+            count=segment_count * row_count,
+            part_indices=(
+                None
+                if source_segments.part_indices is None
+                else cp.tile(
+                    cp.asarray(source_segments.part_indices, dtype=cp.int32),
+                    row_count,
+                )
+            ),
+            ring_indices=(
+                None
+                if source_segments.ring_indices is None
+                else cp.tile(
+                    cp.asarray(source_segments.ring_indices, dtype=cp.int32),
+                    row_count,
+                )
+            ),
+        )
+    finally:
+        if owns_source_segments and source_segments is not None:
+            _free_device_segment_table(source_segments)
+
+    return broadcast
+
+
+def _expand_right_segments_for_pair_rows(
+    right: OwnedGeometryArray,
+    source_rows: np.ndarray,
+) -> DeviceSegmentTable | None:
+    """Expand unique right-row segments across pair rows without re-extraction."""
+    if cp is None:
+        return None
+    source_rows = np.asarray(source_rows, dtype=np.int32)
+    if source_rows.size == 0:
+        return None
+
+    from vibespatial.spatial.segment_primitives import (
+        DeviceSegmentTable,
+        _extract_segments_gpu,
+    )
+
+    unique_rows, inverse = np.unique(source_rows, return_inverse=True)
+    right_unique = right.take(unique_rows.astype(np.intp, copy=False))
+    base_segments = _extract_segments_gpu(right_unique)
+    if int(base_segments.count) == 0:
+        return base_segments
+
+    try:
+        d_base_row_indices = cp.asarray(base_segments.row_indices, dtype=cp.int32)
+        if int(d_base_row_indices.size) != int(base_segments.count):
+            raise RuntimeError("segment row-index count mismatch")
+        if int(d_base_row_indices.size) > 1:
+            monotonic = bool(cp.all(d_base_row_indices[1:] >= d_base_row_indices[:-1]).item())
+            if not monotonic:
+                raise RuntimeError("segment rows are not grouped by right row")
+
+        group_count = int(unique_rows.size)
+        pair_counts = np.bincount(inverse, minlength=group_count).astype(np.int64, copy=False)
+        d_pair_counts = cp.asarray(pair_counts, dtype=cp.int64)
+        d_segment_counts = cp.bincount(
+            d_base_row_indices.astype(cp.int32, copy=False),
+            minlength=group_count,
+        ).astype(cp.int64, copy=False)
+        d_expanded_counts = d_pair_counts * d_segment_counts
+        total = int(cp.sum(d_expanded_counts).item())
+        if total == 0:
+            return None
+
+        d_pair_offsets = cp.empty(group_count + 1, dtype=cp.int64)
+        d_pair_offsets[0] = 0
+        cp.cumsum(d_pair_counts, out=d_pair_offsets[1:])
+
+        d_segment_offsets = cp.empty(group_count + 1, dtype=cp.int64)
+        d_segment_offsets[0] = 0
+        cp.cumsum(d_segment_counts, out=d_segment_offsets[1:])
+
+        d_expanded_offsets = cp.empty(group_count + 1, dtype=cp.int64)
+        d_expanded_offsets[0] = 0
+        cp.cumsum(d_expanded_counts, out=d_expanded_offsets[1:])
+
+        pair_order = np.argsort(inverse, kind="stable").astype(np.int32, copy=False)
+        d_pair_row_ids = cp.asarray(pair_order, dtype=cp.int32)
+        d_out_positions = cp.arange(total, dtype=cp.int64)
+        d_group_ids = cp.searchsorted(
+            d_expanded_offsets[1:],
+            d_out_positions,
+            side="right",
+        ).astype(cp.int64, copy=False)
+        d_local = d_out_positions - d_expanded_offsets[d_group_ids]
+        d_group_segment_counts = d_segment_counts[d_group_ids]
+        d_pair_local = d_local // d_group_segment_counts
+        d_segment_local = d_local - (d_pair_local * d_group_segment_counts)
+        d_pair_indices = d_pair_offsets[d_group_ids] + d_pair_local
+        d_segment_indices = d_segment_offsets[d_group_ids] + d_segment_local
+
+        return DeviceSegmentTable(
+            row_indices=d_pair_row_ids[d_pair_indices].astype(cp.int32, copy=False),
+            segment_indices=cp.asarray(
+                base_segments.segment_indices,
+                dtype=cp.int32,
+            )[d_segment_indices],
+            x0=base_segments.x0[d_segment_indices],
+            y0=base_segments.y0[d_segment_indices],
+            x1=base_segments.x1[d_segment_indices],
+            y1=base_segments.y1[d_segment_indices],
+            count=total,
+            part_indices=(
+                None
+                if base_segments.part_indices is None
+                else cp.asarray(base_segments.part_indices, dtype=cp.int32)[d_segment_indices]
+            ),
+            ring_indices=(
+                None
+                if base_segments.ring_indices is None
+                else cp.asarray(base_segments.ring_indices, dtype=cp.int32)[d_segment_indices]
+            ),
+        )
+    except Exception:
+        logger.debug(
+            "vectorized pair-row right-segment expansion failed; falling back to legacy path",
+            exc_info=True,
+        )
+        return _expand_right_segments_for_pair_rows_legacy(right, source_rows)
+    finally:
+        _free_device_segment_table(base_segments)
+
+
+def _expand_right_segments_for_pair_rows_legacy(
+    right: OwnedGeometryArray,
+    source_rows: np.ndarray,
+) -> DeviceSegmentTable | None:
+    """Expand unique right-row segments across pair rows without re-extraction."""
+    if cp is None:
+        return None
+    source_rows = np.asarray(source_rows, dtype=np.int32)
+    if source_rows.size == 0:
+        return None
+
+    from vibespatial.spatial.segment_primitives import (
+        DeviceSegmentTable,
+        _extract_segments_gpu,
+    )
+
+    unique_rows, inverse = np.unique(source_rows, return_inverse=True)
+    right_unique = right.take(unique_rows.astype(np.intp, copy=False))
+    base_segments = _extract_segments_gpu(right_unique)
+    if int(base_segments.count) == 0:
+        return base_segments
+
+    base_row_indices = cp.asarray(base_segments.row_indices, dtype=cp.int32)
+    segment_indices_parts = []
+    x0_parts = []
+    y0_parts = []
+    x1_parts = []
+    y1_parts = []
+    row_index_parts = []
+    part_index_parts = [] if base_segments.part_indices is not None else None
+    ring_index_parts = [] if base_segments.ring_indices is not None else None
+
+    for unique_local_row in range(unique_rows.size):
+        pair_rows = np.flatnonzero(inverse == unique_local_row).astype(np.int32, copy=False)
+        if pair_rows.size == 0:
+            continue
+        d_segment_rows = cp.flatnonzero(base_row_indices == unique_local_row).astype(
+            cp.int64,
+            copy=False,
+        )
+        if int(d_segment_rows.size) == 0:
+            continue
+
+        d_pair_rows = cp.asarray(pair_rows, dtype=cp.int32)
+        row_index_parts.append(cp.repeat(d_pair_rows, int(d_segment_rows.size)))
+        segment_indices_parts.append(
+            cp.tile(
+                cp.asarray(base_segments.segment_indices[d_segment_rows], dtype=cp.int32),
+                pair_rows.size,
+            )
+        )
+        x0_parts.append(cp.tile(base_segments.x0[d_segment_rows], pair_rows.size))
+        y0_parts.append(cp.tile(base_segments.y0[d_segment_rows], pair_rows.size))
+        x1_parts.append(cp.tile(base_segments.x1[d_segment_rows], pair_rows.size))
+        y1_parts.append(cp.tile(base_segments.y1[d_segment_rows], pair_rows.size))
+        if part_index_parts is not None:
+            part_index_parts.append(
+                cp.tile(
+                    cp.asarray(base_segments.part_indices[d_segment_rows], dtype=cp.int32),
+                    pair_rows.size,
+                )
+            )
+        if ring_index_parts is not None:
+            ring_index_parts.append(
+                cp.tile(
+                    cp.asarray(base_segments.ring_indices[d_segment_rows], dtype=cp.int32),
+                    pair_rows.size,
+                )
+            )
+
+    try:
+        if not row_index_parts:
+            return None
+        return DeviceSegmentTable(
+            row_indices=cp.concatenate(row_index_parts),
+            segment_indices=cp.concatenate(segment_indices_parts),
+            x0=cp.concatenate(x0_parts),
+            y0=cp.concatenate(y0_parts),
+            x1=cp.concatenate(x1_parts),
+            y1=cp.concatenate(y1_parts),
+            count=int(sum(int(part.size) for part in row_index_parts)),
+            part_indices=(
+                None if part_index_parts is None else cp.concatenate(part_index_parts)
+            ),
+            ring_indices=(
+                None if ring_index_parts is None else cp.concatenate(ring_index_parts)
+            ),
+        )
+    finally:
+        _free_device_segment_table(base_segments)
+
+
 def _dispatch_polygon_overlay_rowwise_gpu(
     op: str,
     left: OwnedGeometryArray,
@@ -690,6 +1159,8 @@ def _dispatch_polygon_contraction_gpu(
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         return None
     if left.row_count != right.row_count or left.row_count <= 1:
+        return None
+    if left.row_count < _POLYGON_CONTRACTION_MIN_ROWS:
         return None
     try:
         from vibespatial.overlay.contraction import overlay_contraction_owned
@@ -1705,6 +2176,8 @@ def _binary_constructive_gpu(
     _cached_right_segments: DeviceSegmentTable | None = None,
     _prefer_exact_polygon_intersection: bool = False,
     _prefer_rowwise_polygon_difference_overlay: bool = False,
+    _skip_single_row_polygon_difference_exact_correction: bool = False,
+    _allow_rectangle_intersection_fast_path: bool = True,
 ) -> OwnedGeometryArray | None:
     """GPU binary constructive for all family combinations.
 
@@ -1845,6 +2318,24 @@ def _binary_constructive_gpu(
             else 0
         )
         if op == "intersection" and polygon_pair_count > 1:
+            if left.row_count <= _MIXED_POLYGON_INTERSECTION_ROWWISE_MAX:
+                try:
+                    tiny_mixed_rowwise = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+                        left,
+                        right,
+                        dispatch_mode=dispatch_mode,
+                        _cached_right_segments=_cached_right_segments,
+                    )
+                    if (
+                        tiny_mixed_rowwise is not None
+                        and tiny_mixed_rowwise.row_count == left.row_count
+                    ):
+                        return tiny_mixed_rowwise
+                except Exception:
+                    logger.debug(
+                        "tiny mixed polygonal GPU intersection rowwise shortcut failed",
+                        exc_info=True,
+                    )
             try:
                 mixed_polygonal = _dispatch_mixed_binary_constructive_gpu(
                     op,
@@ -1883,17 +2374,42 @@ def _binary_constructive_gpu(
                     polygon_rect_intersection_can_handle,
                 )
 
-                if polygon_rect_intersection_can_handle(left, right):
-                    result = polygon_rect_intersection(left, right, dispatch_mode=ExecutionMode.GPU)
+                rect_left = left
+                rect_right = right
+                if (
+                    (rect_left.is_indexed_view or rect_right.is_indexed_view)
+                    and _is_family_only(rect_left, frozenset({GeometryFamily.POLYGON}))
+                    and _is_family_only(rect_right, frozenset({GeometryFamily.POLYGON}))
+                ):
+                    rect_left = _resolve_indexed_polygon_fast_path_candidate(rect_left)
+                    rect_right = _resolve_indexed_polygon_fast_path_candidate(rect_right)
+
+                if polygon_rect_intersection_can_handle(rect_left, rect_right):
+                    result = polygon_rect_intersection(
+                        rect_left,
+                        rect_right,
+                        dispatch_mode=ExecutionMode.GPU,
+                    )
                     if result.row_count == left.row_count:
                         return result
                 # Intersection is commutative. Allow rectangle-capable batches on
                 # either side so parcel-like rectangle inputs can still use the
                 # specialized GPU clip kernel instead of the generic overlay path.
-                if polygon_rect_intersection_can_handle(right, left):
-                    result = polygon_rect_intersection(right, left, dispatch_mode=ExecutionMode.GPU)
+                if polygon_rect_intersection_can_handle(rect_right, rect_left):
+                    result = polygon_rect_intersection(
+                        rect_right,
+                        rect_left,
+                        dispatch_mode=ExecutionMode.GPU,
+                    )
                     if result.row_count == left.row_count:
                         return result
+                mixed_result = _dispatch_mixed_polygon_rect_intersection_gpu(
+                    rect_left,
+                    rect_right,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                if mixed_result is not None and mixed_result.row_count == left.row_count:
+                    return mixed_result
             except Exception:
                 logger.debug(
                     "polygon-rectangle GPU intersection fast path failed",
@@ -1901,7 +2417,7 @@ def _binary_constructive_gpu(
                 )
             return None
 
-        if op == "intersection":
+        if op == "intersection" and _allow_rectangle_intersection_fast_path:
             rect_result = _try_polygon_rect_intersection()
             if rect_result is not None:
                 return rect_result
@@ -1936,7 +2452,11 @@ def _binary_constructive_gpu(
                     exc_info=True,
                 )
 
-        if op == "difference" and left.row_count == 1:
+        if (
+            op == "difference"
+            and left.row_count == 1
+            and not _skip_single_row_polygon_difference_exact_correction
+        ):
             correction = _single_row_polygon_difference_exact_correction(
                 left,
                 right,
@@ -2259,6 +2779,8 @@ def binary_constructive_owned(
     workload_shape: WorkloadShape | None = None,
     _prefer_exact_polygon_intersection: bool = False,
     _prefer_rowwise_polygon_difference_overlay: bool = False,
+    _skip_single_row_polygon_difference_exact_correction: bool = False,
+    _allow_rectangle_intersection_fast_path: bool = True,
 ) -> OwnedGeometryArray:
     """Element-wise binary constructive operation on owned arrays.
 
@@ -2355,6 +2877,10 @@ def binary_constructive_owned(
             _cached_right_segments=_cached_right_segments,
             _prefer_exact_polygon_intersection=_prefer_exact_polygon_intersection,
             _prefer_rowwise_polygon_difference_overlay=_prefer_rowwise_polygon_difference_overlay,
+            _skip_single_row_polygon_difference_exact_correction=(
+                _skip_single_row_polygon_difference_exact_correction
+            ),
+            _allow_rectangle_intersection_fast_path=_allow_rectangle_intersection_fast_path,
         )
         if result is not None:
             record_dispatch_event(

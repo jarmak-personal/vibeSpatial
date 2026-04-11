@@ -386,15 +386,20 @@ def _launch_polygon_centroid(
     n = buf.row_count
 
     # Choose cooperative vs simple kernel based on avg vertex count.
-    # Cooperative kernel only applies to Polygon family (not MultiPolygon,
-    # which uses the same per-thread polygon_centroid kernel).
-    # Read coordinate count from authoritative side (device stubs have x.size==0).
+    # The cooperative kernel currently supports only simple single-ring
+    # polygons; rows with holes or multipolygon structure use the general
+    # per-thread kernels that aggregate every ring/part correctly.
     if device_state is not None and family in device_state.families:
         coord_count = int(device_state.families[family].x.size)
     else:
         coord_count = buf.x.size
     avg_verts = coord_count / max(n, 1) if n > 0 else 0
-    use_cooperative = avg_verts >= 64 and family is GeometryFamily.POLYGON
+    simple_single_ring = (
+        family is GeometryFamily.POLYGON
+        and buf.geometry_offsets is not None
+        and np.all(np.diff(buf.geometry_offsets.astype(np.int64, copy=False)) == 1)
+    )
+    use_cooperative = avg_verts >= 64 and simple_single_ring
 
     if use_cooperative:
         coop_kernels = _compile_kernel(
@@ -417,24 +422,43 @@ def _launch_polygon_centroid(
         d_x, d_y = ds.x, ds.y
         d_ring = ds.ring_offsets
         d_geom = ds.geometry_offsets
+        d_part = None if family is GeometryFamily.POLYGON else ds.part_offsets
     else:
         d_x = runtime.from_host(buf.x)
         d_y = runtime.from_host(buf.y)
         d_ring = runtime.from_host(buf.ring_offsets.astype(np.int32))
         d_geom = runtime.from_host(buf.geometry_offsets.astype(np.int32))
+        d_part = (
+            None
+            if family is GeometryFamily.POLYGON
+            else runtime.from_host(buf.part_offsets.astype(np.int32))
+        )
         allocated.extend([d_x, d_y, d_ring, d_geom])
+        if d_part is not None:
+            allocated.append(d_part)
 
     d_cx = runtime.allocate((n,), np.float64)
     d_cy = runtime.allocate((n,), np.float64)
     try:
         ptr = runtime.pointer
-        params = (
-            (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_geom),
-             ptr(d_cx), ptr(d_cy), center_x, center_y, n),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
-             KERNEL_PARAM_I32),
-        )
+        if use_cooperative or family is GeometryFamily.POLYGON:
+            kernel = kernel if use_cooperative else kernels["polygon_centroid"]
+            params = (
+                (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_geom),
+                 ptr(d_cx), ptr(d_cy), center_x, center_y, n),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                 KERNEL_PARAM_I32),
+            )
+        else:
+            kernel = kernels["multipolygon_centroid"]
+            params = (
+                (ptr(d_x), ptr(d_y), ptr(d_ring), ptr(d_part), ptr(d_geom),
+                 ptr(d_cx), ptr(d_cy), center_x, center_y, n),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_F64, KERNEL_PARAM_F64,
+                 KERNEL_PARAM_I32),
+            )
         if use_cooperative:
             # 1 block per geometry; fixed at 256 to match __launch_bounds__(256, 4)
             # and shared memory sized for 8 warps (256 / 32).

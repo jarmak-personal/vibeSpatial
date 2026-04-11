@@ -2005,6 +2005,9 @@ def _copy_owned_array(owned: OwnedGeometryArray) -> OwnedGeometryArray:
                 else None
             ),
         )
+    cached_validity = owned._current_cached_validity_mask()
+    if cached_validity is not None:
+        new_owned._cached_is_valid_mask = cached_validity.copy()
     return new_owned
 
 

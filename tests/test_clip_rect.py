@@ -6,6 +6,7 @@ import shapely
 from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
 
 import vibespatial.api as geopandas
+import vibespatial.geometry.owned as owned_mod
 from vibespatial import (
     ExecutionMode,
     Residency,
@@ -121,6 +122,149 @@ def test_clip_by_rect_benchmark_reports_candidate_and_fallback_counts() -> None:
     assert benchmark.candidate_rows == 2
     assert benchmark.fast_rows == 2
     assert benchmark.fallback_rows == 0
+
+
+def test_clip_rectangle_polygon_boundary_rows_bypass_generic_lower_dim_assembler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib
+
+    overlay_mod = importlib.import_module("vibespatial.api.tools.overlay")
+
+    polygons = geopandas.GeoSeries(
+        [
+            box(0.2, 0.2, 0.8, 0.8),
+            box(1.0, 0.2, 1.4, 0.8),
+            box(1.0, 1.0, 1.4, 1.4),
+        ],
+        crs="EPSG:4326",
+    )
+    mask = box(0.0, 0.0, 1.0, 1.0)
+
+    def _fail_lower_dim(*args, **kwargs):
+        raise AssertionError("rectangle-only boundary rows should bypass generic lower-dim assembly")
+
+    monkeypatch.setattr(
+        overlay_mod,
+        "_assemble_polygon_intersection_rows_with_lower_dim",
+        _fail_lower_dim,
+    )
+
+    result = geopandas.clip(polygons, mask)
+    raw_expected = np.asarray(
+        shapely.intersection(
+            np.asarray(polygons.values._data, dtype=object),
+            np.full(len(polygons), mask, dtype=object),
+        ),
+        dtype=object,
+    )
+    keep = ~shapely.is_missing(raw_expected) & ~shapely.is_empty(raw_expected)
+    expected = raw_expected[keep]
+
+    _assert_geometries_match(result.values._data.tolist(), expected.tolist())
+    assert result.geom_type.tolist() == ["Polygon", "LineString", "Point"]
+
+
+@pytest.mark.gpu
+def test_device_rectangle_clip_boundary_rows_bypass_host_rectangle_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import importlib
+
+    clip_mod = importlib.import_module("vibespatial.api.tools.clip")
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            box(0.2, 0.2, 0.8, 0.8),
+            box(1.0, 0.2, 1.4, 0.8),
+            box(1.0, 1.0, 1.4, 1.4),
+        ]
+    )
+    polygons = geopandas.GeoSeries(
+        DeviceGeometryArray._from_owned(owned, crs="EPSG:4326"),
+        crs="EPSG:4326",
+    )
+    mask = box(0.0, 0.0, 1.0, 1.0)
+
+    def _fail_rectangle_probe(*args, **kwargs):
+        raise AssertionError("device rectangle rows should bypass the host rectangle probe")
+
+    monkeypatch.setattr(
+        clip_mod,
+        "_exact_rectangle_clip_boundary_rows",
+        _fail_rectangle_probe,
+    )
+
+    result = geopandas.clip(polygons, mask)
+    raw_expected = np.asarray(
+        shapely.intersection(
+            np.asarray(polygons.values, dtype=object),
+            np.full(len(polygons), mask, dtype=object),
+        ),
+        dtype=object,
+    )
+    keep = ~shapely.is_missing(raw_expected) & ~shapely.is_empty(raw_expected)
+    expected = raw_expected[keep]
+
+    _assert_geometries_match(result.values.tolist(), expected.tolist())
+    assert result.geom_type.tolist() == ["Polygon", "LineString", "Point"]
+
+
+@pytest.mark.gpu
+def test_device_rectangle_clip_boundary_rows_stay_on_device_without_host_bounds_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import importlib
+
+    cp = pytest.importorskip("cupy")
+    clip_mod = importlib.import_module("vibespatial.api.tools.clip")
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            box(0.2, 0.2, 0.8, 0.8),
+            box(1.0, 0.2, 1.4, 0.8),
+            box(1.0, 1.0, 1.4, 1.4),
+        ]
+    )
+    values = DeviceGeometryArray._from_owned(owned, crs="EPSG:4326")
+    bounds = np.asarray(
+        [
+            (0.2, 0.2, 0.8, 0.8),
+            (1.0, 0.2, 1.4, 0.8),
+            (1.0, 1.0, 1.4, 1.4),
+        ],
+        dtype=np.float64,
+    )
+    mask = box(0.0, 0.0, 1.0, 1.0)
+
+    def _fail_asnumpy(*_args, **_kwargs):
+        raise AssertionError("device rectangle boundary rows should not transfer bounds to host")
+
+    original_asnumpy = cp.asnumpy
+    monkeypatch.setattr(cp, "asnumpy", _fail_asnumpy)
+
+    result = clip_mod._exact_rectangle_clip_boundary_owned_rows(
+        values,
+        bounds,
+        (0.0, 0.0, 1.0, 1.0),
+    )
+
+    assert result is not None
+    monkeypatch.setattr(cp, "asnumpy", original_asnumpy)
+    actual = list(result.to_shapely())
+    expected = list(
+        shapely.intersection(
+            np.asarray(values, dtype=object),
+            np.full(len(values), mask, dtype=object),
+        )
+    )
+    _assert_geometries_match(actual, expected)
 
 
 @pytest.mark.gpu
@@ -279,3 +423,40 @@ def test_device_geometry_array_clip_by_rect_preserves_device_residency_for_polyg
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
     expected_list = [None if geom is not None and geom.is_empty else geom for geom in expected.tolist()]
     _assert_geometries_match(list(result.owned.to_shapely()), expected_list)
+
+
+@pytest.mark.gpu
+def test_public_clip_device_rectangle_boundary_rows_stay_native(monkeypatch) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        box(0.2, 0.2, 0.8, 0.8),
+        box(1.0, 0.2, 1.4, 0.8),
+        box(1.0, 1.0, 1.4, 1.4),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+    series = geopandas.GeoSeries(DeviceGeometryArray._from_owned(owned), crs="EPSG:4326")
+    mask = box(0.0, 0.0, 1.0, 1.0)
+
+    original = owned_mod.from_shapely_geometries
+
+    def _fail_rectangle_boundary_rewrap(*args, **kwargs):
+        raise AssertionError("device rectangle boundary rows should not rewrap through from_shapely_geometries")
+
+    monkeypatch.setattr(owned_mod, "from_shapely_geometries", _fail_rectangle_boundary_rewrap)
+    try:
+        result = geopandas.clip(series, mask)
+    finally:
+        monkeypatch.setattr(owned_mod, "from_shapely_geometries", original)
+
+    assert isinstance(result.values, DeviceGeometryArray)
+    expected = np.asarray(
+        shapely.intersection(
+            np.asarray(values, dtype=object),
+            np.full(len(values), mask, dtype=object),
+        ),
+        dtype=object,
+    )
+    keep = ~shapely.is_missing(expected) & ~shapely.is_empty(expected)
+    _assert_geometries_match(list(result.values.owned.to_shapely()), expected[keep].tolist())

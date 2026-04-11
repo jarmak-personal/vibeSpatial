@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
+import pytest
 import shapely
 from shapely.geometry import LineString, Point, box
 
@@ -22,8 +24,12 @@ from vibespatial.bench.pipeline import _dissolve_join_heavy_groups, _regular_pol
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, execute_grouped_union
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.fusion import IntermediateDisposition
 from vibespatial.runtime.provenance import clear_rewrite_events, get_rewrite_events
+from vibespatial.runtime.residency import Residency
+from vibespatial.testing import strict_native_environment
 
 dissolve_module = importlib.import_module("vibespatial.overlay.dissolve")
 
@@ -141,6 +147,55 @@ def test_evaluate_geopandas_dissolve_can_use_dense_group_codes_without_group_pos
 
     assert calls == 1
     assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_preserves_owned_backing_through_reset_index() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(16, dtype=np.int32),
+            "value": np.arange(16, dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(
+                    [Point(float(i), 0.0) for i in range(16)],
+                    residency=Residency.DEVICE,
+                ),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(2.0)
+    assert getattr(buffered.geometry.values, "_owned", None) is not None
+
+    result = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    owned = getattr(result.geometry.values, "_owned", None)
+    assert owned is not None
+    assert owned.residency is Residency.DEVICE
+
+    reset = result.reset_index(drop=True)
+    reset_owned = getattr(reset.geometry.values, "_owned", None)
+    assert reset_owned is not None
+    assert reset_owned.residency is Residency.DEVICE
 
 
 def test_benchmark_dissolve_pipeline_reports_group_count() -> None:
@@ -271,7 +326,7 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
         },
         geometry=geopandas.GeoSeries(
             DeviceGeometryArray._from_owned(
-                from_shapely_geometries(lines),
+                from_shapely_geometries(lines, residency=Residency.DEVICE),
                 crs="EPSG:3857",
             ),
             crs="EPSG:3857",
@@ -359,6 +414,164 @@ def test_dedupe_two_point_linestring_rows_prefers_host_metadata_when_available(
     }
 
 
+def test_buffered_two_point_line_exact_union_rewrite_accepts_large_deduped_sets(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    unique_lines = [
+        LineString([(0.0, float(i) * 4.0), (20.0, float(i) * 4.0)])
+        for i in range(66)
+    ]
+    lines = unique_lines * 16
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(len(lines), dtype=np.int32),
+            "value": np.arange(len(lines), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(lines, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("large deduped buffered-line dissolve should bypass the generic grouped union path")
+
+    monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
+
+    clear_rewrite_events()
+    actual = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    assert any(
+        event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
+        for event in rewrite_events
+    )
+    assert getattr(actual.geometry.array, "_owned", None) is not None
+    actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
+    expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+
+def test_union_small_partial_rows_gpu_matches_union_all_for_two_partials() -> None:
+    if not has_gpu_runtime():
+        return
+
+    partials = [
+        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
+    ]
+
+    actual = dissolve_module._union_small_partial_rows_gpu(partials)
+
+    assert actual is not None
+    assert actual.row_count == 1
+    actual_geom = np.asarray(actual.to_shapely(), dtype=object)[0]
+    expected_geom = shapely.union_all(
+        np.asarray(
+            [partial.to_shapely()[0] for partial in partials],
+            dtype=object,
+        )
+    )
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+
+def test_union_small_partial_rows_gpu_defers_four_partials_to_union_all() -> None:
+    if not has_gpu_runtime():
+        return
+
+    partials = [
+        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(2.0, 0.0, 4.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(3.0, 0.0, 5.0, 2.0)], residency=Residency.DEVICE),
+    ]
+
+    assert dissolve_module._union_small_partial_rows_gpu(partials) is None
+
+
+def test_reorder_small_partial_union_groups_by_overlap_pairs_low_overlap_groups() -> None:
+    expanded_bounds = np.asarray(
+        [
+            [0.0, 0.0, 4.0, 10.0],
+            [2.0, 3.0, 12.0, 5.0],
+            [10.0, 0.0, 14.0, 10.0],
+            [2.0, 6.0, 12.0, 8.0],
+        ],
+        dtype=np.float64,
+    )
+    color_rows = [
+        np.asarray([0], dtype=np.int64),
+        np.asarray([1], dtype=np.int64),
+        np.asarray([2], dtype=np.int64),
+        np.asarray([3], dtype=np.int64),
+    ]
+
+    reordered = dissolve_module._reorder_small_partial_union_groups_by_overlap(
+        expanded_bounds,
+        color_rows,
+    )
+
+    assert [rows.tolist() for rows in reordered] == [[0], [2], [1], [3]]
+
+
+def test_reduce_partial_rows_gpu_uses_direct_tree_reduce_for_four_partials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    union_all_module = importlib.import_module("vibespatial.constructive.union_all")
+
+    partials = [
+        from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(1.0, 0.0, 3.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(2.0, 0.0, 4.0, 2.0)], residency=Residency.DEVICE),
+        from_shapely_geometries([box(3.0, 0.0, 5.0, 2.0)], residency=Residency.DEVICE),
+    ]
+
+    monkeypatch.setattr(
+        union_all_module,
+        "union_all_gpu_owned",
+        lambda *_args, **_kwargs: pytest.fail(
+            "four partial rows should use direct tree reduction before generic union_all"
+        ),
+    )
+
+    actual = dissolve_module._reduce_partial_rows_gpu(partials)
+
+    assert actual is not None
+    assert actual.row_count == 1
+    actual_geom = np.asarray(actual.to_shapely(), dtype=object)[0]
+    expected_geom = shapely.union_all(
+        np.asarray(
+            [partial.to_shapely()[0] for partial in partials],
+            dtype=object,
+        )
+    )
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+
 def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> None:
     frame = geopandas.GeoDataFrame(
         {
@@ -396,7 +609,7 @@ def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> 
     )
 
 
-def test_device_backed_buffered_line_dissolve_preserves_provenance_for_rewrite() -> None:
+def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
     lines = [
         LineString([(float(i), 0.0), (float(i), 10.0)])
         for i in range(64)
@@ -408,7 +621,7 @@ def test_device_backed_buffered_line_dissolve_preserves_provenance_for_rewrite()
         },
         geometry=geopandas.GeoSeries(
             DeviceGeometryArray._from_owned(
-                from_shapely_geometries(lines),
+                from_shapely_geometries(lines, residency=Residency.DEVICE),
                 crs="EPSG:3857",
             ),
             crs="EPSG:3857",
@@ -437,10 +650,199 @@ def test_device_backed_buffered_line_dissolve_preserves_provenance_for_rewrite()
     rewrite_events = get_rewrite_events(clear=True)
 
     assert len(result) == 1
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert getattr(result.geometry.values, "_owned", None) is not None
+    assert not any(
+        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+        for event in rewrite_events
+    )
+
+
+def test_device_backed_buffered_line_dissolve_strict_native_skips_host_rewrite() -> None:
+    lines = [
+        LineString([(float(i), 0.0), (float(i), 10.0)])
+        for i in range(64)
+    ]
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(64, dtype=np.int32),
+            "value": np.arange(64, dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(lines, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+    assert getattr(buffered.geometry.values, "_provenance", None) is not None
+
+    clear_rewrite_events()
+    with strict_native_environment():
+        result = evaluate_geopandas_dissolve(
+            buffered,
+            by="group",
+            aggfunc="first",
+            as_index=True,
+            level=None,
+            sort=True,
+            observed=False,
+            dropna=True,
+            method="unary",
+            grid_size=None,
+            agg_kwargs={},
+        )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    assert len(result) == 1
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert getattr(result.geometry.values, "_owned", None) is not None
+    assert not any(
+        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+        for event in rewrite_events
+    )
+
+
+def test_device_backed_multivertex_buffered_line_dissolve_rewrites_to_disjoint_subset() -> None:
+    lines = [
+        LineString(
+            [
+                (0.0, float(i)),
+                (5.0, float(i) + 0.25),
+                (10.0, float(i)),
+                (15.0, float(i) + 0.25),
+            ]
+        )
+        for i in range(64)
+    ]
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(64, dtype=np.int32),
+            "value": np.arange(64, dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(lines, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+
+    clear_rewrite_events()
+    result = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
     assert any(
         event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
         for event in rewrite_events
     )
+    actual_geom = np.asarray(result.geometry.array, dtype=object)[0]
+    expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+
+def test_grouped_union_geometry_result_prefers_owned_make_valid_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+    make_valid_module = importlib.import_module("vibespatial.constructive.make_valid_pipeline")
+
+    original_owned = from_shapely_geometries([box(0.0, 0.0, 1.0, 1.0)])
+    repaired_owned = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
+
+    def _fake_is_valid_owned(arg, *args, **kwargs):
+        return np.asarray([arg is repaired_owned], dtype=bool)
+
+    def _fake_make_valid_owned(*, owned, dispatch_mode, **kwargs):
+        assert owned is original_owned
+        return SimpleNamespace(
+            owned=repaired_owned,
+            geometries=np.asarray([box(0.0, 0.0, 2.0, 2.0)], dtype=object),
+            repaired_rows=np.asarray([0], dtype=np.int32),
+            selected=ExecutionMode.GPU,
+        )
+
+    monkeypatch.setattr(validity_module, "is_valid_owned", _fake_is_valid_owned)
+    monkeypatch.setattr(make_valid_module, "make_valid_owned", _fake_make_valid_owned)
+
+    grouped = dissolve_module.GroupedUnionResult(
+        geometries=None,
+        group_count=1,
+        non_empty_groups=1,
+        empty_groups=0,
+        method=DissolveUnionMethod.UNARY,
+        owned=original_owned,
+    )
+
+    result = dissolve_module._grouped_union_geometry_result(
+        grouped,
+        geometry_name="geometry",
+        crs="EPSG:3857",
+    )
+
+    assert result.owned is repaired_owned
+    assert result.series is None
+
+
+def test_grouped_union_geometry_result_strict_native_raises_on_host_repair_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+    make_valid_module = importlib.import_module("vibespatial.constructive.make_valid_pipeline")
+
+    owned = from_shapely_geometries([box(0.0, 0.0, 1.0, 1.0)])
+
+    def _fake_is_valid_owned(*args, **kwargs):
+        return np.asarray([False], dtype=bool)
+
+    def _fake_make_valid_owned(*, owned, dispatch_mode, **kwargs):
+        return SimpleNamespace(
+            owned=None,
+            geometries=np.asarray([box(0.0, 0.0, 1.0, 1.0)], dtype=object),
+            repaired_rows=np.asarray([0], dtype=np.int32),
+            selected=ExecutionMode.CPU,
+        )
+
+    monkeypatch.setattr(validity_module, "is_valid_owned", _fake_is_valid_owned)
+    monkeypatch.setattr(make_valid_module, "make_valid_owned", _fake_make_valid_owned)
+
+    grouped = dissolve_module.GroupedUnionResult(
+        geometries=None,
+        group_count=1,
+        non_empty_groups=1,
+        empty_groups=0,
+        method=DissolveUnionMethod.UNARY,
+        owned=owned,
+    )
+
+    with strict_native_environment(), pytest.raises(StrictNativeFallbackError):
+        dissolve_module._grouped_union_geometry_result(
+            grouped,
+            geometry_name="geometry",
+            crs="EPSG:3857",
+        )
 
 
 def test_execute_grouped_box_union_gpu_owned_codes_builds_device_backed_coverage_rectangles() -> None:

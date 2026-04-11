@@ -28,6 +28,7 @@ from vibespatial.api.geometry_array import (
     _check_crs,
     _crs_mismatch_warn,
 )
+from vibespatial.api.tools._pair_cache import get_cached_intersection_pairs
 from vibespatial.runtime._runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import (
@@ -46,10 +47,107 @@ logger = logging.getLogger(__name__)
 _OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS = 262_144
 _OVERLAY_FEW_RIGHT_GROUP_MAX = 64
 _OVERLAY_FEW_RIGHT_GROUP_MIN_AVG = 8.0
-_OVERLAY_ROWWISE_REMAINDER_MAX = 16
+_OVERLAY_FEW_RIGHT_CACHED_SEG_MIN_ROWS = 256
+_OVERLAY_ROWWISE_REMAINDER_MAX = 32
+_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX = 128
+_OVERLAY_HOST_EXACT_PAIR_BATCH_MAX_ROWS = 128
+_MANY_VS_ONE_DIRECT_FULL_BATCH_MIN_ROWS = 64
+_MANY_VS_ONE_DIRECT_FULL_BATCH_MAX_CONTAINED_FRACTION = 0.05
+_MANY_VS_ONE_HOST_EXACT_MAX_ROWS = 4_096
 _SHAPELY_TYPE_ID_POLYGON = 3
 _SHAPELY_TYPE_ID_MULTIPOLYGON = 6
 _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION = 7
+
+
+def _can_rewrite_single_mask_intersection_to_clip(
+    df1: GeoDataFrame,
+    df2: GeoDataFrame,
+    *,
+    how: str,
+    left_all_polygons: bool,
+    right_all_polygons: bool,
+) -> bool:
+    """Return True when overlay intersection is semantically equivalent to clip.
+
+    A single-row, geometry-only polygon mask on the right has the same public
+    result columns and geometry semantics as ``clip(df1, mask)`` while avoiding
+    the generic overlay planner entirely.
+
+    On GPU-capable runs, keep this shape on the native overlay path instead of
+    routing it through the public clip surface. The current clip boundary still
+    carries public-path cleanup that is slower and can diverge from overlay's
+    keep-geom-type behavior for polygon intersections.
+    """
+    if has_gpu_runtime():
+        return False
+    if how != "intersection":
+        return False
+    if not left_all_polygons or not right_all_polygons:
+        return False
+    if len(df2) != 1:
+        return False
+    return tuple(df2.columns) == (df2.geometry.name,)
+
+
+def _series_polygon_mask(series: GeoSeries) -> np.ndarray:
+    """Return a polygon-or-multipolygon membership mask for a geometry series."""
+    owned = getattr(series.values, "_owned", None)
+    if owned is not None:
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.geometry.owned import FAMILY_TAGS
+
+        tags = np.asarray(owned.tags)
+        return np.asarray(owned.validity, dtype=bool) & (
+            (tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+            | (tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+        )
+    return np.asarray(series.geom_type.isin(POLYGON_GEOM_TYPES), dtype=bool)
+
+
+def _series_all_polygons(series: GeoSeries) -> bool:
+    return bool(_series_polygon_mask(series).all())
+
+
+def _maybe_seed_polygon_validity_cache(spatial) -> None:
+    geometry = spatial.geometry if isinstance(spatial, GeoDataFrame) else spatial
+    values = geometry.values
+    owned = getattr(values, "_owned", None)
+    if owned is None:
+        return
+    if not bool(geometry.geom_type.isin(POLYGON_GEOM_TYPES).all()):
+        return
+
+    from vibespatial.geometry.owned import seed_all_validity_cache
+
+    seed_all_validity_cache(owned)
+
+
+def _seed_all_validity_cache_if_owned(owned) -> None:
+    if owned is None:
+        return
+
+    from vibespatial.geometry.owned import seed_all_validity_cache
+
+    seed_all_validity_cache(owned)
+
+
+def _candidate_rows_all_valid(series: GeoSeries, row_indices: np.ndarray) -> bool:
+    if row_indices.size == 0:
+        return True
+
+    values = series.values
+    owned = getattr(values, "_owned", None)
+    if owned is not None:
+        from vibespatial.constructive.validity import is_valid_owned
+
+        subset = owned.take(np.asarray(row_indices, dtype=np.int64))
+        valid_mask = np.asarray(is_valid_owned(subset), dtype=bool)
+        if not bool(np.all(subset.validity)):
+            valid_mask = valid_mask.copy()
+            valid_mask[~subset.validity] = True
+        return bool(valid_mask.all())
+
+    return bool(series.iloc[np.asarray(row_indices, dtype=np.intp)].is_valid.all())
 
 
 def _sync_hotpath() -> None:
@@ -67,6 +165,43 @@ def _geoseries_object_values(series: GeoSeries) -> np.ndarray:
 def _take_geoseries_object_values(series: GeoSeries, rows: np.ndarray) -> np.ndarray:
     """Materialize only the selected rows from a GeoSeries-backed GeometryArray."""
     return np.asarray(series.array.take(rows), dtype=object)
+
+
+def _polygon_rect_overlap_mask(geometries: GeoSeries) -> np.ndarray | None:
+    """Return normalized rectangle-overlap metadata when present."""
+    mask = getattr(geometries.values, "_polygon_rect_boundary_overlap", None)
+    if mask is None:
+        owned = getattr(geometries.values, "_owned", None)
+        if owned is not None:
+            mask = getattr(owned, "_polygon_rect_boundary_overlap", None)
+    if mask is None:
+        return None
+    mask = mask.get() if hasattr(mask, "get") else np.asarray(mask)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size != len(geometries):
+        return None
+    return mask
+
+
+def _polygon_rect_exact_polygon_only_mask(geometries: GeoSeries) -> np.ndarray | None:
+    """Return rows whose rectangle fast path is known polygon-complete."""
+    mask = getattr(geometries.values, "_polygon_rect_exact_polygon_only", None)
+    if mask is None:
+        owned = getattr(geometries.values, "_owned", None)
+        if owned is not None:
+            mask = getattr(owned, "_polygon_rect_exact_polygon_only", None)
+    if mask is None:
+        return None
+    mask = mask.get() if hasattr(mask, "get") else np.asarray(mask)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.size != len(geometries):
+        return None
+    return mask
+
+
+def _can_defer_make_valid_to_rect_repair(geometries: GeoSeries) -> bool:
+    """Return True when targeted rectangle repair can replace generic make_valid."""
+    return _polygon_rect_overlap_mask(geometries) is not None
 
 
 def _empty_owned_result_base(row_count: int, *, device: bool):
@@ -141,12 +276,9 @@ def _extract_owned_pair(df1, df2):
     ga2 = df2.geometry.values
     left_owned = getattr(ga1, '_owned', None)
     right_owned = getattr(ga2, '_owned', None)
-    if left_owned is not None and right_owned is not None:
-        return left_owned, right_owned
     if (
-        has_gpu_runtime()
-        and df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        _series_all_polygons(df1.geometry)
+        and _series_all_polygons(df2.geometry)
         and (len(df1) * len(df2)) <= _OVERLAY_BBOX_PAIR_FAST_PATH_MAX_PAIRS
     ):
         try:
@@ -157,6 +289,33 @@ def _extract_owned_pair(df1, df2):
         except (AttributeError, NotImplementedError):
             return None, None
         if left_owned is not None and right_owned is not None:
+            if has_gpu_runtime():
+                from vibespatial.runtime.residency import Residency, TransferTrigger
+
+                if (
+                    ga1.__class__.__name__ == "DeviceGeometryArray"
+                    or ga2.__class__.__name__ == "DeviceGeometryArray"
+                    or getattr(left_owned, "residency", None) is Residency.DEVICE
+                    or getattr(right_owned, "residency", None) is Residency.DEVICE
+                ):
+                    if left_owned.residency is not Residency.DEVICE:
+                        left_owned = left_owned.move_to(
+                            Residency.DEVICE,
+                            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                            reason=(
+                                "overlay kept polygon pair on device after one input "
+                                "already selected the device-native path"
+                            ),
+                        )
+                    if right_owned.residency is not Residency.DEVICE:
+                        right_owned = right_owned.move_to(
+                            Residency.DEVICE,
+                            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                            reason=(
+                                "overlay kept polygon pair on device after one input "
+                                "already selected the device-native path"
+                            ),
+                        )
             return left_owned, right_owned
     return None, None
 
@@ -169,34 +328,23 @@ def _should_prefer_exact_polygon_gpu(
     *,
     keep_geom_type,
 ) -> bool:
-    """Prefer the exact GPU polygon boundary when the public overlay already lives on device.
+    """Prefer the exact GPU polygon boundary whenever both polygon inputs have owned backing.
 
-    The public boundary should not shed a device-resident workflow back to the
-    host exact-intersection path just because strict-native mode is disabled.
-    Keep the stricter behavior opt-in for host-backed inputs, but when both
-    sides already carry owned device backing, preserve the GPU execution family
-    through the polygon intersection boundary.
+    Once we can represent both sides as owned polygon arrays, the exact
+    polygon-intersection path should stay in the native execution family
+    instead of dropping back to the host exact-intersection boundary.
+    This keeps cheap host-to-owned polygon cases on the GPU path as well.
     """
     if keep_geom_type is False or not has_gpu_runtime():
         return False
     if not (
-        df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+        _series_all_polygons(df1.geometry)
+        and _series_all_polygons(df2.geometry)
     ):
         return False
     if strict_native_mode_enabled():
         return True
-    if left_owned is None or right_owned is None:
-        return False
-
-    from vibespatial.geometry.device_array import DeviceGeometryArray
-    from vibespatial.runtime.residency import Residency, combined_residency
-
-    return (
-        isinstance(df1.geometry.values, DeviceGeometryArray)
-        and isinstance(df2.geometry.values, DeviceGeometryArray)
-        and combined_residency(left_owned, right_owned) is Residency.DEVICE
-    )
+    return left_owned is not None and right_owned is not None
 
 
 def _should_use_owned_constructive_overlay(left_owned, right_owned) -> bool:
@@ -227,11 +375,25 @@ def _coerce_owned_pair_for_strict_overlay(df1, df2, left_owned, right_owned):
     """
     if not strict_native_mode_enabled() or not has_gpu_runtime():
         return left_owned, right_owned
+    from vibespatial.runtime.residency import Residency, TransferTrigger
+
     try:
         if left_owned is None:
             left_owned = df1.geometry.values.to_owned()
         if right_owned is None:
             right_owned = df2.geometry.values.to_owned()
+        if left_owned is not None and left_owned.residency is not Residency.DEVICE:
+            left_owned = left_owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="strict overlay coerced owned left input to device residency",
+            )
+        if right_owned is not None and right_owned.residency is not Residency.DEVICE:
+            right_owned = right_owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="strict overlay coerced owned right input to device residency",
+            )
     except (AttributeError, NotImplementedError):
         return left_owned, right_owned
     return left_owned, right_owned
@@ -366,9 +528,7 @@ def _sequential_grouped_difference_owned(
     dispatch_mode: ExecutionMode,
 ):
     """Compute grouped exact difference via repeated pairwise exact differences."""
-    from vibespatial.constructive.binary_constructive import (
-        binary_constructive_owned,
-    )
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
     with hotpath_stage("overlay.diff.group_metadata", category="setup"):
         group_offsets = np.asarray(group_offsets, dtype=np.int64)
         group_lengths = np.diff(group_offsets).astype(np.int64, copy=False)
@@ -443,6 +603,54 @@ def _grouped_overlay_difference_owned(
         _build_overlay_execution_plan,
         _materialize_overlay_execution_plan,
     )
+
+    def _repair_invalid_rows_with_group_union(diff_owned):
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+        from vibespatial.constructive.validity import is_valid_owned
+        from vibespatial.geometry.owned import concat_owned_scatter
+        from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+        invalid_mask = ~np.asarray(is_valid_owned(diff_owned), dtype=bool)
+        if not bool(np.any(invalid_mask)):
+            return diff_owned, 0
+
+        invalid_rows = np.flatnonzero(invalid_mask).astype(np.int64, copy=False)
+        starts = group_offsets[invalid_rows]
+        stops = group_offsets[invalid_rows + 1]
+        counts = (stops - starts).astype(np.int64, copy=False)
+        if not bool(np.all(counts > 0)):
+            return diff_owned, 0
+
+        right_indices = np.concatenate(
+            [
+                np.arange(start, stop, dtype=np.int64)
+                for start, stop in zip(starts, stops, strict=True)
+            ]
+        )
+        invalid_group_offsets = np.concatenate(
+            [
+                np.asarray([0], dtype=np.int64),
+                np.cumsum(counts, dtype=np.int64),
+            ]
+        )
+        unioned_right = segmented_union_all(
+            right_batch.take(right_indices),
+            invalid_group_offsets,
+            dispatch_mode=dispatch_mode,
+        )
+        repaired_rows = binary_constructive_owned(
+            "difference",
+            left_batch.take(invalid_rows),
+            unioned_right,
+            dispatch_mode=dispatch_mode,
+            _skip_single_row_polygon_difference_exact_correction=True,
+        )
+        repaired_valid_mask = ~np.asarray(is_valid_owned(repaired_rows), dtype=bool)
+        if bool(np.any(repaired_valid_mask)):
+            return diff_owned, 0
+        return concat_owned_scatter(diff_owned, repaired_rows, invalid_rows), int(
+            invalid_rows.size
+        )
 
     with hotpath_stage("overlay.diff.group_metadata", category="setup"):
         group_offsets = np.asarray(group_offsets, dtype=np.int64)
@@ -560,6 +768,28 @@ def _grouped_overlay_difference_owned(
                 "grouped overlay difference produced "
                 f"{diff_owned.row_count} rows for {left_batch.row_count} groups"
             )
+        repaired_invalid_rows = 0
+        if diff_owned.row_count > 0:
+            diff_owned, repaired_invalid_rows = _repair_invalid_rows_with_group_union(
+                diff_owned
+            )
+            if repaired_invalid_rows > 0:
+                record_dispatch_event(
+                    surface="geopandas.array.difference",
+                    operation="difference",
+                    implementation="grouped_union_difference_gpu",
+                    reason=(
+                        "invalid grouped difference rows were repaired with grouped union "
+                        "plus exact difference"
+                    ),
+                    detail=(
+                        f"groups={left_batch.row_count}, "
+                        f"pairs={right_batch.row_count}, "
+                        f"repaired_rows={repaired_invalid_rows}"
+                    ),
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.GPU,
+                )
         if strict_native_mode_enabled() and _selected is not ExecutionMode.GPU:
             record_fallback_event(
                 surface="geopandas.array.difference",
@@ -804,7 +1034,7 @@ def _make_valid_geoseries(gs, *, dispatch_mode: ExecutionMode | str = ExecutionM
     """
     ga = gs.values
     owned = getattr(ga, '_owned', None)
-    poly_ix = gs.geom_type.isin(POLYGON_GEOM_TYPES)
+    poly_ix = _series_polygon_mask(gs)
     if not poly_ix.any():
         return gs
 
@@ -827,21 +1057,120 @@ def _make_valid_geoseries(gs, *, dispatch_mode: ExecutionMode | str = ExecutionM
                 return gs
 
         from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+        from vibespatial.constructive.validity import is_valid_owned
 
+        valid_mask = np.asarray(is_valid_owned(owned), dtype=bool)
+        if not bool(np.all(owned.validity)):
+            valid_mask = valid_mask.copy()
+            valid_mask[~owned.validity] = True
+        if valid_mask.all():
+            return gs
+
+        requested_mode = (
+            dispatch_mode
+            if isinstance(dispatch_mode, ExecutionMode)
+            else ExecutionMode(dispatch_mode)
+        )
         mv_result = make_valid_owned(owned=owned, dispatch_mode=dispatch_mode)
         if mv_result.repaired_rows.size > 0:
+            remaining_invalid = None
+            if mv_result.owned is not None:
+                remaining_invalid = ~np.asarray(is_valid_owned(mv_result.owned), dtype=bool)
+                if not bool(np.all(mv_result.owned.validity)):
+                    remaining_invalid = remaining_invalid.copy()
+                    remaining_invalid[~mv_result.owned.validity] = False
+                if remaining_invalid.any():
+                    if requested_mode is ExecutionMode.GPU:
+                        record_fallback_event(
+                            surface="geopandas.array.make_valid",
+                            reason="owned GPU make_valid left invalid polygon rows after repair",
+                            detail=(
+                                f"rows={owned.row_count}, "
+                                f"remaining_invalid={int(np.count_nonzero(remaining_invalid))}"
+                            ),
+                            requested=dispatch_mode,
+                            selected=ExecutionMode.CPU,
+                            pipeline="overlay.make_valid",
+                            d2h_transfer=True,
+                        )
+                    else:
+                        record_dispatch_event(
+                            surface="geopandas.array.make_valid",
+                            operation="make_valid",
+                            implementation="shapely.make_valid_compatibility",
+                            reason=(
+                                "owned make_valid left invalid rows after AUTO repair, "
+                                "so compatibility cleanup remained on host"
+                            ),
+                            detail=(
+                                f"rows={owned.row_count}, "
+                                f"remaining_invalid={int(np.count_nonzero(remaining_invalid))}"
+                            ),
+                            requested=dispatch_mode,
+                            selected=ExecutionMode.CPU,
+                        )
+                    repaired_values = np.asarray(mv_result.geometries, dtype=object)
+                    repaired_values[remaining_invalid] = np.asarray(
+                        shapely.make_valid(repaired_values[remaining_invalid]),
+                        dtype=object,
+                    )
+                    record_dispatch_event(
+                        surface="geopandas.overlay",
+                        operation="make_valid",
+                        implementation="shapely.make_valid_fallback",
+                        reason="owned GPU make_valid left invalid polygon rows after repair",
+                        detail=(
+                            f"rows={owned.row_count}, "
+                            f"remaining_invalid={int(np.count_nonzero(remaining_invalid))}"
+                        ),
+                        selected=ExecutionMode.CPU,
+                    )
+                    return GeoSeries(GeometryArray(repaired_values, crs=ga.crs), index=gs.index)
             # Repair happened — prefer device-resident .owned to avoid D->H.
             if mv_result.owned is not None:
                 try:
+                    _seed_all_validity_cache_if_owned(mv_result.owned)
                     new_ga = GeometryArray.from_owned(mv_result.owned, crs=ga.crs)
                     return GeoSeries(new_ga, index=gs.index)
-                except (NotImplementedError, Exception):
-                    pass  # fall through to Shapely materialization
+                except (NotImplementedError, Exception) as exc:
+                    if requested_mode is ExecutionMode.GPU:
+                        record_fallback_event(
+                            surface="geopandas.array.make_valid",
+                            reason=(
+                                "owned make_valid result could not be rebuilt without "
+                                "host materialization"
+                            ),
+                            detail=(
+                                f"rows={owned.row_count}, "
+                                f"error={type(exc).__name__}: {exc}"
+                            ),
+                            requested=dispatch_mode,
+                            selected=ExecutionMode.CPU,
+                            pipeline="overlay.make_valid",
+                            d2h_transfer=True,
+                        )
+                    else:
+                        record_dispatch_event(
+                            surface="geopandas.array.make_valid",
+                            operation="make_valid",
+                            implementation="host_rewrap_compatibility",
+                            reason=(
+                                "owned make_valid result could not be rebuilt under AUTO, "
+                                "so compatibility materialization stayed on host"
+                            ),
+                            detail=(
+                                f"rows={owned.row_count}, "
+                                f"error={type(exc).__name__}: {exc}"
+                            ),
+                            requested=dispatch_mode,
+                            selected=ExecutionMode.CPU,
+                        )
             # Fallback: rebuild from Shapely geometries
             try:
                 from vibespatial.geometry.owned import from_shapely_geometries
 
                 new_owned = from_shapely_geometries(list(mv_result.geometries))
+                _seed_all_validity_cache_if_owned(new_owned)
                 new_ga = GeometryArray.from_owned(new_owned, crs=ga.crs)
             except NotImplementedError:
                 new_ga = GeometryArray(mv_result.geometries, crs=ga.crs)
@@ -911,15 +1240,25 @@ def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
         left_owned is not None
         and right_owned is not None
     )
+    if request_device:
+        left_query_geoms = GeoSeries(
+            GeometryArray.from_owned(left_owned, crs=df1.crs),
+            crs=df1.crs,
+        )
+        result = df2.sindex.query(
+            left_query_geoms,
+            predicate="intersects",
+            sort=True,
+            return_device=True,
+        )
+        return result
+
     result = df2.sindex.query(
         df1.geometry,
         predicate="intersects",
         sort=True,
-        return_device=request_device,
+        return_device=False,
     )
-    # DeviceSpatialJoinResult flows through directly to the caller.
-    if isinstance(result, DeviceSpatialJoinResult):
-        return result
     return result
 
 
@@ -1111,20 +1450,10 @@ def _count_non_polygon_collection_parts(geometries: np.ndarray) -> int:
     return int(np.count_nonzero(non_empty_mask & ~polygon_mask))
 
 
-def _count_dropped_polygon_intersection_parts(
-    left_values: np.ndarray,
-    right_values: np.ndarray,
-    area_values: np.ndarray,
+def _count_dropped_polygon_parts_from_exact_values(
+    exact_values: np.ndarray,
 ) -> int:
-    """Count lower-dimensional exact-intersection output dropped by keep_geom_type.
-
-    Warning parity needs the exact host intersection shape, not just the
-    polygon-only area output retained by the fast native path.
-    """
-    if len(area_values) == 0:
-        return 0
-
-    exact_values = np.asarray(shapely.intersection(left_values, right_values), dtype=object)
+    """Count dropped lower-dimensional pieces from exact host intersection output."""
     if len(exact_values) == 0:
         return 0
 
@@ -1140,6 +1469,649 @@ def _count_dropped_polygon_intersection_parts(
     if collection_mask.any():
         dropped += _count_non_polygon_collection_parts(exact_values[collection_mask])
     return dropped
+
+
+def _count_dropped_polygon_intersection_parts(
+    left_values: np.ndarray,
+    right_values: np.ndarray,
+    row_count: int,
+    *,
+    exact_values: np.ndarray | None = None,
+) -> int:
+    """Count lower-dimensional exact-intersection output dropped by keep_geom_type.
+
+    Warning parity needs the exact host intersection shape, not just the
+    polygon-only area output retained by the fast native path.
+    """
+    if row_count == 0:
+        return 0
+
+    if exact_values is None:
+        exact_values = np.asarray(shapely.intersection(left_values, right_values), dtype=object)
+    else:
+        exact_values = np.asarray(exact_values, dtype=object)
+    return _count_dropped_polygon_parts_from_exact_values(exact_values)
+
+
+def _warning_candidate_mask_for_polygon_keep_geom_type(
+    left_values: np.ndarray,
+    right_values: np.ndarray,
+    keep_mask: np.ndarray,
+) -> np.ndarray:
+    """Return rows that can affect the polygon keep-geom-type warning count.
+
+    Rows already dropped by the polygon area filter always need exact host
+    classification. Rows retained as polygonal area only matter when their
+    boundaries still intersect, because that is the only way the exact
+    intersection can carry lower-dimensional extras inside a kept row.
+    """
+    suspect_mask = ~keep_mask
+    kept_rows = np.flatnonzero(keep_mask)
+    if kept_rows.size == 0:
+        return suspect_mask
+
+    kept_left = left_values[kept_rows]
+    kept_right = right_values[kept_rows]
+    boundary_overlap = shapely.intersects(
+        shapely.boundary(kept_left),
+        shapely.boundary(kept_right),
+    )
+    if np.any(boundary_overlap):
+        suspect_mask = suspect_mask.copy()
+        suspect_mask[kept_rows[np.asarray(boundary_overlap, dtype=bool)]] = True
+    return suspect_mask
+
+
+def _warning_candidate_mask_from_exact_intersection_values(
+    exact_values: np.ndarray,
+    keep_mask: np.ndarray,
+) -> np.ndarray:
+    """Classify keep-geom-type warning rows directly from exact host output."""
+    exact_values = np.asarray(exact_values, dtype=object)
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    if exact_values.size != keep_mask.size:
+        raise ValueError("exact_values and keep_mask must have the same length")
+
+    warning_mask = ~keep_mask
+    kept_rows = np.flatnonzero(keep_mask).astype(np.intp, copy=False)
+    if kept_rows.size == 0:
+        return warning_mask
+
+    kept_values = exact_values[kept_rows]
+    missing_mask = shapely.is_missing(kept_values) | shapely.is_empty(kept_values)
+    type_ids = shapely.get_type_id(kept_values)
+    polygon_mask = (
+        (type_ids == _SHAPELY_TYPE_ID_POLYGON)
+        | (type_ids == _SHAPELY_TYPE_ID_MULTIPOLYGON)
+    )
+    collection_mask = type_ids == _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION
+    kept_warning_mask = ~missing_mask & ~polygon_mask & ~collection_mask
+
+    if collection_mask.any():
+        for local_row in np.flatnonzero(collection_mask).astype(np.intp, copy=False):
+            kept_warning_mask[local_row] = (
+                _count_non_polygon_collection_parts(
+                    np.asarray([kept_values[local_row]], dtype=object)
+                )
+                > 0
+            )
+
+    warning_mask = warning_mask.copy()
+    warning_mask[kept_rows] = kept_warning_mask
+    return warning_mask
+
+
+def _owned_non_empty_row_mask(owned) -> np.ndarray | None:
+    """Return a host boolean mask for non-empty rows in an owned array."""
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    tags = np.asarray(owned.tags)
+    validity = np.asarray(owned.validity, dtype=bool)
+    row_offsets = np.asarray(owned.family_row_offsets, dtype=np.int64)
+    keep_mask = np.zeros(len(tags), dtype=bool)
+
+    for family, buffer in owned.families.items():
+        family_tag = FAMILY_TAGS[family]
+        family_mask = validity & (tags == family_tag)
+        if not family_mask.any():
+            continue
+        family_rows = row_offsets[family_mask]
+        empty_mask = np.asarray(buffer.empty_mask, dtype=bool)
+        if empty_mask.size == 0:
+            family_count = int(getattr(buffer, "row_count", 0))
+            if np.any((family_rows < 0) | (family_rows >= family_count)):
+                return None
+            if family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
+                return None
+            keep_mask[np.flatnonzero(family_mask)] = True
+            continue
+        if np.any((family_rows < 0) | (family_rows >= empty_mask.size)):
+            return None
+        keep_mask[np.flatnonzero(family_mask)] = ~empty_mask[family_rows]
+
+    return keep_mask
+
+
+def _device_count_dropped_polygon_intersection_warning_rows(
+    area_owned,
+    keep_mask: np.ndarray,
+    warning_rows: np.ndarray,
+    *,
+    left_source: GeoSeries | None,
+    right_source: GeoSeries | None,
+    left_rows,
+    right_rows,
+    left_pairs: GeoSeries | None = None,
+    right_pairs: GeoSeries | None = None,
+) -> int | None:
+    """Count dropped lower-dimensional warning pieces without host probing.
+
+    The current polygonal fast path keeps only area output. For keep-geom-type
+    warnings we need the lower-dimensional boundary remnants that were dropped.
+    When the source polygons and retained area are still device-backed, recover
+    those remnants on device via boundary intersection and boundary difference.
+    Return ``None`` when the warning rows still require the existing explicit
+    host semantic probe. The device path now accepts arbitrary aligned pair
+    rows instead of only the old tiny many-vs-one warning subset.
+    """
+    if (
+        warning_rows.size == 0
+        or not has_gpu_runtime()
+    ):
+        return None
+    left_source_owned = getattr(left_source.values, "_owned", None) if left_source is not None else None
+    right_source_owned = getattr(right_source.values, "_owned", None) if right_source is not None else None
+    left_pairs_owned = getattr(left_pairs.values, "_owned", None) if left_pairs is not None else None
+    right_pairs_owned = getattr(right_pairs.values, "_owned", None) if right_pairs is not None else None
+    if area_owned is None:
+        return None
+
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.constructive.boundary import boundary_owned
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.predicates.binary import evaluate_binary_predicate
+    from vibespatial.runtime.residency import Residency
+
+    warning_keep_mask = np.asarray(keep_mask[warning_rows], dtype=bool)
+    if (
+        left_source_owned is not None
+        and right_source_owned is not None
+        and left_rows is not None
+        and right_rows is not None
+        and getattr(left_source_owned, "residency", None) is Residency.DEVICE
+        and getattr(right_source_owned, "residency", None) is Residency.DEVICE
+    ):
+        device_left_owned = left_source_owned
+        device_right_owned = right_source_owned
+        warning_left_rows = np.asarray(left_rows, dtype=np.intp)[warning_rows]
+        warning_right_rows = np.asarray(right_rows, dtype=np.intp)[warning_rows]
+    elif (
+        left_pairs_owned is not None
+        and right_pairs_owned is not None
+        and getattr(left_pairs_owned, "residency", None) is Residency.DEVICE
+        and getattr(right_pairs_owned, "residency", None) is Residency.DEVICE
+    ):
+        device_left_owned = left_pairs_owned
+        device_right_owned = right_pairs_owned
+        warning_left_rows = warning_rows.astype(np.intp, copy=False)
+        warning_right_rows = warning_rows.astype(np.intp, copy=False)
+    else:
+        return None
+    if np.any(warning_keep_mask) and getattr(area_owned, "residency", None) is not Residency.DEVICE:
+        return None
+    if warning_rows.size > 128:
+        # Large keep-geom-type warning batches are advisory only. Once the result
+        # is already device-native, keep big rect-overlap refinements on device
+        # via the conservative native count instead of risking a mid-helper CPU
+        # fallback on mixed lower-dimensional boundary cases.
+        return None
+
+    try:
+        import cupy as cp
+
+        def _take_owned_rows(owned, rows: np.ndarray):
+            rows64 = np.asarray(rows, dtype=np.int64)
+            if rows64.size == 0:
+                return owned.take(rows64)
+            return owned.device_take(cp.asarray(rows64, dtype=cp.int64))
+
+        def _has_only_linear_boundary_families(owned) -> bool:
+            return set(owned.families.keys()).issubset(
+                {GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}
+            )
+
+        dropped = 0
+        chunk_rows = 256
+        for start in range(0, warning_rows.size, chunk_rows):
+            stop = min(start + chunk_rows, warning_rows.size)
+            chunk_warning_rows = warning_rows[start:stop]
+            chunk_keep_mask = warning_keep_mask[start:stop]
+            chunk_left_rows = warning_left_rows[start:stop]
+            chunk_right_rows = warning_right_rows[start:stop]
+
+            warning_left = _take_owned_rows(
+                device_left_owned,
+                chunk_left_rows,
+            )
+            warning_right = _take_owned_rows(
+                device_right_owned,
+                chunk_right_rows,
+            )
+            warning_left_boundary = boundary_owned(warning_left)
+            warning_right_boundary = boundary_owned(warning_right)
+            if (
+                not _has_only_linear_boundary_families(warning_left_boundary)
+                or not _has_only_linear_boundary_families(warning_right_boundary)
+            ):
+                return None
+            boundary_overlap = binary_constructive_owned(
+                "intersection",
+                warning_left_boundary,
+                warning_right_boundary,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            if boundary_overlap.row_count != chunk_warning_rows.size:
+                return None
+
+            boundary_non_empty = _owned_non_empty_row_mask(boundary_overlap)
+            if boundary_non_empty is None:
+                return None
+
+            dropped += int(np.count_nonzero(boundary_non_empty & ~chunk_keep_mask))
+
+            kept_local_rows = np.flatnonzero(
+                chunk_keep_mask & boundary_non_empty
+            ).astype(np.int64, copy=False)
+            if kept_local_rows.size == 0:
+                continue
+
+            kept_boundary_overlap = boundary_overlap.device_take(
+                cp.asarray(kept_local_rows, dtype=cp.int64)
+            )
+            kept_area = _take_owned_rows(area_owned, chunk_warning_rows[kept_local_rows])
+            kept_area_boundary = boundary_owned(kept_area)
+            covered_mask = np.asarray(
+                evaluate_binary_predicate(
+                    "covered_by",
+                    kept_boundary_overlap,
+                    kept_area_boundary,
+                    dispatch_mode=ExecutionMode.GPU,
+                ).values,
+                dtype=bool,
+            )
+            if covered_mask.size != kept_local_rows.size:
+                return None
+            dropped += int(np.count_nonzero(~covered_mask))
+        return dropped
+    except Exception:
+        logger.debug(
+            "device-native keep_geom_type warning count failed; falling back to host semantic probe",
+            exc_info=True,
+        )
+        return None
+
+
+def _device_polygon_keep_geom_type_cover_mask(
+    left_source: GeoSeries | None,
+    right_source: GeoSeries | None,
+    left_rows,
+    right_rows,
+    warning_rows: np.ndarray,
+    *,
+    area_owned=None,
+    left_pairs: GeoSeries | None = None,
+    right_pairs: GeoSeries | None = None,
+) -> np.ndarray | None:
+    """Return rows provably equal to one source polygon from device predicates.
+
+    When one polygon covers the other, the exact polygon-polygon intersection is
+    exactly the covered polygon, so keep-geom-type warning classification does
+    not need a host semantic probe for that row.
+    """
+    if warning_rows.size == 0 or not has_gpu_runtime():
+        return None
+
+    left_source_owned = getattr(left_source.values, "_owned", None) if left_source is not None else None
+    right_source_owned = getattr(right_source.values, "_owned", None) if right_source is not None else None
+    left_pairs_owned = getattr(left_pairs.values, "_owned", None) if left_pairs is not None else None
+    right_pairs_owned = getattr(right_pairs.values, "_owned", None) if right_pairs is not None else None
+
+    from vibespatial.runtime.residency import Residency
+
+    use_source_rows = (
+        left_source is not None
+        and right_source is not None
+        and left_rows is not None
+        and right_rows is not None
+        and left_source_owned is not None
+        and right_source_owned is not None
+        and left_source_owned.residency is Residency.DEVICE
+        and right_source_owned.residency is Residency.DEVICE
+    )
+    use_pair_rows = (
+        left_pairs_owned is not None
+        and right_pairs_owned is not None
+        and left_pairs_owned.residency is Residency.DEVICE
+        and right_pairs_owned.residency is Residency.DEVICE
+    )
+    if not use_source_rows and not use_pair_rows:
+        return None
+
+    try:
+        import cupy as cp
+
+        from vibespatial.constructive.measurement import area_owned as measure_area_owned
+        from vibespatial.predicates.binary import evaluate_binary_predicate
+
+        def _take_owned_rows(owned, rows: np.ndarray):
+            if rows.size == 0:
+                return owned.take(rows.astype(np.int64, copy=False))
+            return owned.device_take(cp.asarray(rows, dtype=cp.int64))
+
+        def _area_candidate_masks(left_owned, right_input) -> tuple[np.ndarray, np.ndarray]:
+            left_area = np.asarray(measure_area_owned(left_owned), dtype=np.float64)
+            right_area = np.asarray(measure_area_owned(right_input), dtype=np.float64)
+            if right_area.size == 1 and left_area.size > 1:
+                right_area = np.full(left_area.shape, float(right_area[0]), dtype=np.float64)
+            scale = np.maximum(np.abs(left_area), np.abs(right_area))
+            tol = np.maximum(scale * 1.0e-12, 1.0e-12)
+            maybe_covers = left_area + tol >= right_area
+            maybe_covered_by = left_area <= right_area + tol
+            return maybe_covers, maybe_covered_by
+
+        def _subset_right_input(right_input, row_mask: np.ndarray):
+            if right_input.row_count == 1 or row_mask.all():
+                return right_input
+            return _take_owned_rows(
+                right_input,
+                np.flatnonzero(row_mask).astype(np.int64, copy=False),
+            )
+
+        skip_covered_by_probe = bool(
+            getattr(area_owned, "_many_vs_one_left_containment_bypass_applied", False)
+        )
+
+        def _evaluate_cover_mask(left_owned, right_input) -> np.ndarray:
+            maybe_covers, maybe_covered_by = _area_candidate_masks(left_owned, right_input)
+            cover_mask = np.zeros(left_owned.row_count, dtype=bool)
+
+            if maybe_covers.any():
+                left_eval = (
+                    left_owned
+                    if maybe_covers.all()
+                    else _take_owned_rows(
+                        left_owned,
+                        np.flatnonzero(maybe_covers).astype(np.int64, copy=False),
+                    )
+                )
+                covers = np.asarray(
+                    evaluate_binary_predicate(
+                        "covers",
+                        left_eval,
+                        _subset_right_input(right_input, maybe_covers),
+                        dispatch_mode=ExecutionMode.GPU,
+                    ).values,
+                    dtype=bool,
+                )
+                if maybe_covers.all():
+                    cover_mask |= covers
+                else:
+                    cover_mask[np.flatnonzero(maybe_covers).astype(np.intp, copy=False)] |= covers
+
+            if not skip_covered_by_probe and maybe_covered_by.any():
+                left_eval = (
+                    left_owned
+                    if maybe_covered_by.all()
+                    else _take_owned_rows(
+                        left_owned,
+                        np.flatnonzero(maybe_covered_by).astype(np.int64, copy=False),
+                    )
+                )
+                covered_by = np.asarray(
+                    evaluate_binary_predicate(
+                        "covered_by",
+                        left_eval,
+                        _subset_right_input(right_input, maybe_covered_by),
+                        dispatch_mode=ExecutionMode.GPU,
+                    ).values,
+                    dtype=bool,
+                )
+                if maybe_covered_by.all():
+                    cover_mask |= covered_by
+                else:
+                    cover_mask[np.flatnonzero(maybe_covered_by).astype(np.intp, copy=False)] |= covered_by
+
+            return cover_mask
+
+        if use_source_rows:
+            left_owned = left_source_owned
+            right_owned = right_source_owned
+            source_left_rows = np.asarray(left_rows, dtype=np.intp)[warning_rows]
+            source_right_rows = np.asarray(right_rows, dtype=np.intp)[warning_rows]
+        else:
+            left_owned = left_pairs_owned
+            right_owned = right_pairs_owned
+            source_left_rows = warning_rows.astype(np.intp, copy=False)
+            source_right_rows = warning_rows.astype(np.intp, copy=False)
+
+        unique_left_rows = np.unique(source_left_rows)
+        unique_right_rows = np.unique(source_right_rows)
+        if unique_right_rows.size == 1 and source_left_rows.size > 1:
+            left_eval = _take_owned_rows(left_owned, source_left_rows)
+            right_one = _take_owned_rows(right_owned, unique_right_rows)
+            return _evaluate_cover_mask(left_eval, right_one)
+
+        if unique_left_rows.size == 1 and source_right_rows.size > 1:
+            right_eval = _take_owned_rows(right_owned, source_right_rows)
+            left_one = _take_owned_rows(left_owned, unique_left_rows)
+            return _evaluate_cover_mask(right_eval, left_one)
+
+        left_eval = _take_owned_rows(left_owned, source_left_rows)
+        right_eval = _take_owned_rows(right_owned, source_right_rows)
+        return _evaluate_cover_mask(left_eval, right_eval)
+    except Exception:
+        logger.debug(
+            "device-native keep_geom_type cover classification failed; "
+            "falling back to semantic probe",
+            exc_info=True,
+        )
+        return None
+
+
+def _clear_device_exact_keep_geom_type_warnings(
+    warning_mask: np.ndarray,
+    keep_mask: np.ndarray,
+    *,
+    left_source: GeoSeries | None,
+    right_source: GeoSeries | None,
+    left_rows,
+    right_rows,
+    area_owned=None,
+    left_pairs: GeoSeries | None = None,
+    right_pairs: GeoSeries | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Drop warning rows that device predicates prove do not need host probing."""
+    warning_rows = np.flatnonzero(warning_mask).astype(np.intp, copy=False)
+    if warning_rows.size == 0:
+        return warning_mask, warning_rows
+
+    kept_warning_rows = warning_rows[np.asarray(keep_mask[warning_rows], dtype=bool)]
+    if kept_warning_rows.size == 0:
+        return warning_mask, warning_rows
+
+    if not _many_vs_one_keep_geom_type_cover_probe_needed(
+        left_source,
+        right_source,
+        left_rows,
+        right_rows,
+        kept_warning_rows,
+        area_owned=area_owned,
+    ):
+        return warning_mask, warning_rows
+
+    cover_mask = _device_polygon_keep_geom_type_cover_mask(
+        left_source,
+        right_source,
+        left_rows,
+        right_rows,
+        kept_warning_rows,
+        area_owned=area_owned,
+        left_pairs=left_pairs,
+        right_pairs=right_pairs,
+    )
+    if cover_mask is None or cover_mask.size != kept_warning_rows.size:
+        return warning_mask, warning_rows
+
+    resolved_rows = np.asarray(cover_mask, dtype=bool)
+    if not resolved_rows.any():
+        return warning_mask, warning_rows
+
+    warning_mask = np.asarray(warning_mask, dtype=bool).copy()
+    warning_mask[kept_warning_rows[resolved_rows]] = False
+    return warning_mask, np.flatnonzero(warning_mask).astype(np.intp, copy=False)
+
+
+def _many_vs_one_keep_geom_type_cover_probe_needed(
+    left_source: GeoSeries | None,
+    right_source: GeoSeries | None,
+    left_rows,
+    right_rows,
+    warning_rows: np.ndarray,
+    *,
+    area_owned=None,
+) -> bool:
+    """Return True when kept warning rows might still cover the single right polygon."""
+    if warning_rows.size == 0:
+        return False
+    if not bool(getattr(area_owned, "_many_vs_one_left_containment_bypass_applied", False)):
+        return True
+    if left_source is None or right_source is None or left_rows is None or right_rows is None:
+        return True
+
+    left_source_owned = getattr(left_source.values, "_owned", None)
+    right_source_owned = getattr(right_source.values, "_owned", None)
+    if left_source_owned is None or right_source_owned is None:
+        return True
+
+    from vibespatial.runtime.residency import Residency
+
+    if (
+        left_source_owned.residency is not Residency.DEVICE
+        or right_source_owned.residency is not Residency.DEVICE
+    ):
+        return True
+
+    source_right_rows = np.asarray(right_rows, dtype=np.intp)[warning_rows]
+    unique_right_rows = np.unique(source_right_rows)
+    if unique_right_rows.size != 1:
+        return True
+
+    try:
+        import cupy as cp
+
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+        compute_geometry_bounds_device(left_source_owned)
+        compute_geometry_bounds_device(right_source_owned)
+        d_left_bounds = cp.asarray(left_source_owned.device_state.row_bounds).reshape(
+            left_source_owned.row_count,
+            4,
+        )
+        d_right_bounds = cp.asarray(right_source_owned.device_state.row_bounds).reshape(
+            right_source_owned.row_count,
+            4,
+        )
+        d_warning_left_rows = cp.asarray(
+            np.asarray(left_rows, dtype=np.intp)[warning_rows],
+            dtype=cp.int64,
+        )
+        d_warning_left_bounds = d_left_bounds[d_warning_left_rows]
+        d_right_bounds_one = d_right_bounds[int(unique_right_rows[0])]
+        maybe_covers = (
+            (d_warning_left_bounds[:, 0] <= d_right_bounds_one[0])
+            & (d_warning_left_bounds[:, 1] <= d_right_bounds_one[1])
+            & (d_warning_left_bounds[:, 2] >= d_right_bounds_one[2])
+            & (d_warning_left_bounds[:, 3] >= d_right_bounds_one[3])
+        )
+        return bool(cp.any(maybe_covers))
+    except Exception:
+        logger.debug(
+            "many-vs-one keep_geom_type cover-probe precheck failed; "
+            "falling back to full device cover classification",
+            exc_info=True,
+        )
+        return True
+
+
+def _repair_invalid_polygon_output_rows(geometries: GeoSeries) -> GeoSeries:
+    """Repair invalid polygon rows from the rectangle exact path when present.
+
+    The rectangle intersection kernel can emit polygon rows with zero-area
+    duplicate-edge spikes on boundary-overlap cases. Those rows are still
+    geometrically equivalent after ``make_valid`` but can change convex-hull
+    fingerprints and public GeoPandas validity semantics. Repair only rows
+    explicitly flagged by the kernel so the normal fast path stays untouched.
+    """
+    owned = getattr(geometries.values, "_owned", None)
+    overlap_mask = getattr(owned, "_polygon_rect_boundary_overlap", None)
+    if overlap_mask is None:
+        if len(geometries) > 5000:
+            return geometries
+        suspect_rows = np.arange(len(geometries), dtype=np.intp)
+    else:
+        overlap_mask = (
+            overlap_mask.get() if hasattr(overlap_mask, "get") else np.asarray(overlap_mask)
+        )
+        overlap_mask = np.asarray(overlap_mask, dtype=bool)
+        if overlap_mask.size == len(geometries) and overlap_mask.any():
+            suspect_rows = np.flatnonzero(overlap_mask).astype(np.intp, copy=False)
+        else:
+            if len(geometries) > 5000:
+                return geometries
+            suspect_rows = np.arange(len(geometries), dtype=np.intp)
+
+    suspect_values: np.ndarray | None = None
+    if owned is not None and overlap_mask is None:
+        from vibespatial.constructive.validity import is_valid_owned
+
+        suspect_owned = (
+            owned
+            if suspect_rows.size == len(geometries)
+            else owned.take(suspect_rows.astype(np.int64, copy=False))
+        )
+        invalid_mask = ~np.asarray(is_valid_owned(suspect_owned), dtype=bool)
+    else:
+        all_values = np.asarray(geometries.values._data, dtype=object)
+        suspect_values = all_values[suspect_rows]
+        invalid_mask = ~np.asarray(shapely.is_valid(suspect_values), dtype=bool)
+    if not invalid_mask.any():
+        return geometries
+
+    all_values = np.asarray(geometries.values._data, dtype=object)
+    if suspect_values is None:
+        suspect_values = all_values[suspect_rows]
+    repaired_values = np.asarray(
+        shapely.make_valid(suspect_values[invalid_mask]),
+        dtype=object,
+    )
+    all_values[suspect_rows[invalid_mask]] = repaired_values
+    repaired = GeoSeries(all_values, index=geometries.index, crs=geometries.crs)
+    return _attach_polygon_rect_overlap_mask(repaired, overlap_mask)
+
+
+def _attach_polygon_rect_overlap_mask(
+    geometries: GeoSeries,
+    overlap_mask: np.ndarray | None,
+) -> GeoSeries:
+    if overlap_mask is None:
+        return geometries
+    overlap_mask = np.asarray(overlap_mask, dtype=bool)
+    owned = getattr(geometries.values, "_owned", None)
+    if owned is not None:
+        owned._polygon_rect_boundary_overlap = overlap_mask
+    geometries.values._polygon_rect_boundary_overlap = overlap_mask
+    return geometries
 
 
 def _strip_non_polygon_collection_parts(geometries: np.ndarray) -> np.ndarray:
@@ -1184,36 +2156,122 @@ def _strip_non_polygon_collection_parts(geometries: np.ndarray) -> np.ndarray:
     return cleaned
 
 
+
 def _filter_polygon_intersection_rows_for_keep_geom_type(
-    left_pairs: GeoSeries,
-    right_pairs: GeoSeries,
+    left_pairs: GeoSeries | None,
+    right_pairs: GeoSeries | None,
     area_pairs: GeoSeries,
     *,
     keep_geom_type_warning: bool,
+    left_source: GeoSeries | None = None,
+    right_source: GeoSeries | None = None,
+    left_rows: np.ndarray | None = None,
+    right_rows: np.ndarray | None = None,
 ) -> tuple[GeoSeries, int, np.ndarray]:
-    """Keep polygonal area rows only and classify dropped lower-dimensional remnants.
+    """Keep polygonal area rows only and classify dropped lower-dimensional remnants."""
+    area_overlap_mask = getattr(area_pairs.values, "_polygon_rect_boundary_overlap", None)
+    area_exact_polygon_only_mask = _polygon_rect_exact_polygon_only_mask(area_pairs)
+    if area_overlap_mask is not None:
+        area_overlap_mask = (
+            area_overlap_mask.get()
+            if hasattr(area_overlap_mask, "get")
+            else np.asarray(area_overlap_mask, dtype=bool)
+        )
+        area_overlap_mask = np.asarray(area_overlap_mask, dtype=bool)
+        if area_overlap_mask.size != len(area_pairs):
+            area_overlap_mask = None
 
-    This is the fast path for ``keep_geom_type=True`` and the default
-    ``keep_geom_type=None`` overlay contract. We already have the exact polygonal
-    area intersection result; the remaining work is:
-
-    - keep only polygon rows for the returned GeoDataFrame
-    - optionally count dropped lower-dimensional rows/pieces for the warning
-
-    Unlike ``_assemble_polygon_intersection_rows_with_lower_dim``, this path
-    does not materialize the dropped line/point geometries unless they are
-    needed to count GeometryCollection extras for the warning.
-    """
     area_owned = getattr(area_pairs.values, "_owned", None)
+    if area_overlap_mask is None and area_owned is not None:
+        area_overlap_mask = getattr(area_owned, "_polygon_rect_boundary_overlap", None)
+        if area_overlap_mask is not None:
+            area_overlap_mask = (
+                area_overlap_mask.get()
+                if hasattr(area_overlap_mask, "get")
+                else np.asarray(area_overlap_mask, dtype=bool)
+            )
+            area_overlap_mask = np.asarray(area_overlap_mask, dtype=bool)
+            if area_overlap_mask.size != len(area_pairs):
+                area_overlap_mask = None
+
+    area_exact_values = getattr(area_pairs.values, "_exact_intersection_values", None)
+    area_exact_mask = getattr(area_pairs.values, "_exact_intersection_value_mask", None)
+
     if area_owned is not None:
         from vibespatial.geometry.buffers import GeometryFamily
         from vibespatial.geometry.owned import FAMILY_TAGS
+        from vibespatial.runtime.residency import Residency, TransferTrigger
+
+        host_probe_fallback_logged = False
+
+        def _requires_device_to_host_probe(*series) -> bool:
+            for series_obj in series:
+                if series_obj is None:
+                    continue
+                owned = getattr(series_obj.values, "_owned", None)
+                if owned is not None and getattr(owned, "residency", None) is Residency.DEVICE:
+                    return True
+            return False
+
+        def _record_keep_geom_type_host_probe_fallback(detail: str) -> None:
+            nonlocal host_probe_fallback_logged
+            if host_probe_fallback_logged or not _requires_device_to_host_probe(
+                left_source,
+                right_source,
+                left_pairs,
+                right_pairs,
+            ):
+                return
+            record_fallback_event(
+                surface="geopandas.overlay.intersection",
+                reason="keep_geom_type semantic probe materialized host geometries",
+                detail=detail,
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.CPU,
+                pipeline="_filter_polygon_intersection_rows_for_keep_geom_type",
+                d2h_transfer=True,
+            )
+            host_probe_fallback_logged = True
+
+        left_source_owned = getattr(left_source.values, "_owned", None) if left_source is not None else None
+        right_source_owned = (
+            getattr(right_source.values, "_owned", None) if right_source is not None else None
+        )
+        if (
+            left_source_owned is not None
+            and right_source_owned is not None
+            and left_source_owned.residency is Residency.DEVICE
+            and right_source_owned.residency is Residency.DEVICE
+            and area_owned.residency is not Residency.DEVICE
+        ):
+            try:
+                area_owned = area_owned.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="keep_geom_type classification promoted area rows to device",
+                )
+                area_pairs = GeoSeries(
+                    GeometryArray.from_owned(area_owned, crs=area_pairs.crs),
+                    index=area_pairs.index,
+                    crs=area_pairs.crs,
+                )
+            except Exception:
+                logger.debug(
+                    "keep_geom_type area promotion to device failed; "
+                    "falling back to existing classification path",
+                    exc_info=True,
+                )
 
         tags = area_owned.tags
         validity = area_owned.validity
         row_offsets = area_owned.family_row_offsets
         keep_mask = np.zeros(len(tags), dtype=bool)
         owned_metadata_consistent = True
+        rect_overlap_mask = None
+        if area_exact_values is None:
+            area_exact_values = getattr(area_owned, "_exact_intersection_values", None)
+        if area_exact_mask is None:
+            area_exact_mask = getattr(area_owned, "_exact_intersection_value_mask", None)
 
         for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
             family_tag = FAMILY_TAGS[family]
@@ -1222,7 +2280,18 @@ def _filter_polygon_intersection_rows_for_keep_geom_type(
                 continue
             family_rows = row_offsets[family_mask]
             empty_mask = np.asarray(area_owned.families[family].empty_mask, dtype=bool)
-            if empty_mask.size == 0 or np.any((family_rows < 0) | (family_rows >= empty_mask.size)):
+            if empty_mask.size == 0:
+                family_count = int(getattr(area_owned.families[family], "row_count", 0))
+                if (
+                    area_overlap_mask is not None
+                    and family_count > 0
+                    and not np.any((family_rows < 0) | (family_rows >= family_count))
+                ):
+                    keep_mask[np.flatnonzero(family_mask)] = True
+                    continue
+                owned_metadata_consistent = False
+                break
+            if np.any((family_rows < 0) | (family_rows >= empty_mask.size)):
                 owned_metadata_consistent = False
                 break
             keep_mask[np.flatnonzero(family_mask)] = ~empty_mask[family_rows]
@@ -1230,13 +2299,426 @@ def _filter_polygon_intersection_rows_for_keep_geom_type(
         if owned_metadata_consistent:
             dropped = 0
             if keep_geom_type_warning and len(tags) > 0:
-                dropped = _count_dropped_polygon_intersection_parts(
-                    _take_geoseries_object_values(left_pairs, np.arange(len(tags), dtype=np.intp)),
-                    _take_geoseries_object_values(right_pairs, np.arange(len(tags), dtype=np.intp)),
-                    _take_geoseries_object_values(area_pairs, np.arange(len(tags), dtype=np.intp)),
-                )
+                if area_exact_values is not None and area_exact_mask is not None:
+                    area_exact_values = np.asarray(area_exact_values, dtype=object)
+                    area_exact_mask = np.asarray(area_exact_mask, dtype=bool)
+                    if area_exact_values.size != len(tags) or area_exact_mask.size != len(tags):
+                        area_exact_values = None
+                        area_exact_mask = None
 
+                rect_overlap_mask = (
+                    getattr(area_owned, "_polygon_rect_boundary_overlap", None)
+                    if area_overlap_mask is None
+                    else area_overlap_mask
+                )
+                if rect_overlap_mask is not None:
+                    rect_overlap_mask = (
+                        rect_overlap_mask.get()
+                        if hasattr(rect_overlap_mask, "get")
+                        else np.asarray(rect_overlap_mask, dtype=bool)
+                    )
+                    if rect_overlap_mask.size != len(tags):
+                        rect_overlap_mask = None
+                    else:
+                        rect_overlap_mask = np.asarray(rect_overlap_mask, dtype=bool)
+
+                if bool(np.all(keep_mask)) and rect_overlap_mask is not None and not rect_overlap_mask.any():
+                    filtered = area_pairs.reset_index(drop=True)
+                    filtered = _attach_polygon_rect_overlap_mask(filtered, rect_overlap_mask)
+                    return filtered, 0, keep_mask
+
+                if rect_overlap_mask is not None:
+                    warning_mask = (~keep_mask) | rect_overlap_mask
+                    if area_exact_values is not None and area_exact_mask is not None:
+                        warning_mask = np.asarray(warning_mask, dtype=bool).copy()
+                        warning_mask[area_exact_mask] = _warning_candidate_mask_from_exact_intersection_values(
+                            area_exact_values[area_exact_mask],
+                            keep_mask[area_exact_mask],
+                        )
+                elif area_exact_values is not None and area_exact_mask is not None:
+                    warning_mask = np.zeros(len(tags), dtype=bool)
+                    warning_mask[area_exact_mask] = _warning_candidate_mask_from_exact_intersection_values(
+                        area_exact_values[area_exact_mask],
+                        keep_mask[area_exact_mask],
+                    )
+                    warning_mask[~area_exact_mask & ~keep_mask] = True
+                    probe_rows = np.flatnonzero(~area_exact_mask & keep_mask).astype(np.intp, copy=False)
+                    if probe_rows.size > 0:
+                        _record_keep_geom_type_host_probe_fallback(
+                            f"rows={len(tags)}, probe_rows={probe_rows.size}"
+                        )
+                        if (
+                            left_source is not None
+                            and right_source is not None
+                            and left_rows is not None
+                            and right_rows is not None
+                        ):
+                            left_values = _take_geoseries_object_values(
+                                left_source,
+                                np.asarray(left_rows, dtype=np.intp)[probe_rows],
+                            )
+                            right_values = _take_geoseries_object_values(
+                                right_source,
+                                np.asarray(right_rows, dtype=np.intp)[probe_rows],
+                            )
+                        else:
+                            if left_pairs is None or right_pairs is None:
+                                raise ValueError(
+                                    "left_pairs/right_pairs or source rows are required when "
+                                    "keep_geom_type_warning=True"
+                                )
+                            left_values = _take_geoseries_object_values(left_pairs, probe_rows)
+                            right_values = _take_geoseries_object_values(right_pairs, probe_rows)
+                        probe_mask = _warning_candidate_mask_for_polygon_keep_geom_type(
+                            left_values,
+                            right_values,
+                            keep_mask[probe_rows],
+                        )
+                        warning_mask[probe_rows] = probe_mask
+                else:
+                    warning_mask = np.zeros(len(tags), dtype=bool)
+                    if (
+                        left_source is not None
+                        and right_source is not None
+                        and left_rows is not None
+                        and right_rows is not None
+                    ):
+                        source_left_rows = np.asarray(left_rows, dtype=np.intp)
+                        source_right_rows = np.asarray(right_rows, dtype=np.intp)
+                        device_source_owned = False
+                        if (
+                            left_source_owned is not None
+                            and right_source_owned is not None
+                            and left_source_owned.residency is Residency.DEVICE
+                            and right_source_owned.residency is Residency.DEVICE
+                        ):
+                            device_source_owned = True
+
+                        def _take_owned_rows(owned, rows: np.ndarray):
+                            import cupy as cp
+
+                            if rows.size == 0:
+                                return owned.take(rows)
+                            return owned.device_take(cp.asarray(rows, dtype=cp.int64))
+
+                        empty_rows = np.flatnonzero(~keep_mask).astype(np.intp, copy=False)
+                        if empty_rows.size > 0:
+                            if device_source_owned:
+                                from vibespatial.predicates.binary import evaluate_binary_predicate
+                                empty_left = _take_owned_rows(left_source_owned, source_left_rows[empty_rows])
+                                empty_right = _take_owned_rows(
+                                    right_source_owned,
+                                    source_right_rows[empty_rows],
+                                )
+                                warning_mask[empty_rows] = np.asarray(
+                                    evaluate_binary_predicate(
+                                        "intersects",
+                                        empty_left,
+                                        empty_right,
+                                        dispatch_mode=ExecutionMode.GPU,
+                                    ).values,
+                                    dtype=bool,
+                                )
+                            else:
+                                _record_keep_geom_type_host_probe_fallback(
+                                    f"rows={len(tags)}, dropped_rows={empty_rows.size}"
+                                )
+                                empty_left_values = _take_geoseries_object_values(
+                                    left_source,
+                                    source_left_rows[empty_rows],
+                                )
+                                empty_right_values = _take_geoseries_object_values(
+                                    right_source,
+                                    source_right_rows[empty_rows],
+                                )
+                                warning_mask[empty_rows] = np.asarray(
+                                    shapely.intersects(empty_left_values, empty_right_values),
+                                    dtype=bool,
+                                )
+
+                        kept_rows = np.flatnonzero(keep_mask).astype(np.intp, copy=False)
+                        if kept_rows.size > 0:
+                            if device_source_owned and area_owned.residency is Residency.DEVICE:
+                                from vibespatial.constructive.boundary import boundary_owned
+                                from vibespatial.predicates.binary import evaluate_binary_predicate
+
+                                kept_left = _take_owned_rows(
+                                    left_source_owned,
+                                    source_left_rows[kept_rows],
+                                )
+                                kept_right = _take_owned_rows(
+                                    right_source_owned,
+                                    source_right_rows[kept_rows],
+                                )
+                                kept_left_boundary = boundary_owned(kept_left)
+                                kept_right_boundary = boundary_owned(kept_right)
+                                warning_mask[kept_rows] = np.asarray(
+                                    evaluate_binary_predicate(
+                                        "intersects",
+                                        kept_left_boundary,
+                                        kept_right_boundary,
+                                        dispatch_mode=ExecutionMode.GPU,
+                                    ).values,
+                                    dtype=bool,
+                                )
+                            else:
+                                _record_keep_geom_type_host_probe_fallback(
+                                    f"rows={len(tags)}, kept_rows={kept_rows.size}"
+                                )
+                                kept_left_values = _take_geoseries_object_values(
+                                    left_source,
+                                    source_left_rows[kept_rows],
+                                )
+                                kept_right_values = _take_geoseries_object_values(
+                                    right_source,
+                                    source_right_rows[kept_rows],
+                                )
+                                warning_mask[kept_rows] = np.asarray(
+                                    shapely.intersects(
+                                        shapely.boundary(kept_left_values),
+                                        shapely.boundary(kept_right_values),
+                                    ),
+                                    dtype=bool,
+                                )
+                    else:
+                        if left_pairs is None or right_pairs is None:
+                            raise ValueError(
+                                "left_pairs/right_pairs or source rows are required when "
+                                "keep_geom_type_warning=True"
+                            )
+                        _record_keep_geom_type_host_probe_fallback(
+                            f"rows={len(tags)}, warning_rows={len(tags)}"
+                        )
+                        row_positions = np.arange(len(tags), dtype=np.intp)
+                        left_values = _take_geoseries_object_values(left_pairs, row_positions)
+                        right_values = _take_geoseries_object_values(right_pairs, row_positions)
+                        warning_mask = _warning_candidate_mask_for_polygon_keep_geom_type(
+                            left_values,
+                            right_values,
+                            keep_mask,
+                        )
+
+                if area_exact_polygon_only_mask is not None:
+                    safe_rows = np.asarray(keep_mask, dtype=bool) & area_exact_polygon_only_mask
+                    if safe_rows.any():
+                        warning_mask = np.asarray(warning_mask, dtype=bool).copy()
+                        warning_mask[safe_rows] = False
+                warning_rows = np.empty(0, dtype=np.intp)
+                if np.any(warning_mask):
+                    warning_rows = np.flatnonzero(np.asarray(warning_mask, dtype=bool)).astype(
+                        np.intp,
+                        copy=False,
+                    )
+                    warning_rows_have_exact_values = (
+                        warning_rows.size > 0
+                        and area_exact_values is not None
+                        and area_exact_mask is not None
+                        and bool(np.all(np.asarray(area_exact_mask[warning_rows], dtype=bool)))
+                    )
+                    if not warning_rows_have_exact_values:
+                        warning_mask, warning_rows = _clear_device_exact_keep_geom_type_warnings(
+                            warning_mask,
+                            keep_mask,
+                            left_source=left_source,
+                            right_source=right_source,
+                            left_rows=left_rows,
+                            right_rows=right_rows,
+                            area_owned=area_owned,
+                            left_pairs=left_pairs,
+                            right_pairs=right_pairs,
+                        )
+                if warning_rows.size > 0:
+                    cached_warning_mask = None
+                    rect_warning_count_resolved = False
+                    if area_exact_values is not None and area_exact_mask is not None:
+                        cached_warning_mask = np.asarray(area_exact_mask[warning_rows], dtype=bool)
+                        if cached_warning_mask.any():
+                            dropped += _count_dropped_polygon_intersection_parts(
+                                np.empty(0, dtype=object),
+                                np.empty(0, dtype=object),
+                                int(np.count_nonzero(cached_warning_mask)),
+                                exact_values=area_exact_values[warning_rows][cached_warning_mask],
+                            )
+                    if rect_overlap_mask is not None:
+                        need_rect_probe_values = (
+                            cached_warning_mask is None or (~cached_warning_mask).any()
+                        )
+                        if need_rect_probe_values:
+                            uncached_warning_rows = (
+                                warning_rows
+                                if cached_warning_mask is None
+                                else warning_rows[~cached_warning_mask]
+                            )
+                            device_uncached_dropped = _device_count_dropped_polygon_intersection_warning_rows(
+                                area_owned,
+                                keep_mask,
+                                uncached_warning_rows,
+                                left_source=left_source,
+                                right_source=right_source,
+                                left_rows=left_rows,
+                                right_rows=right_rows,
+                                left_pairs=left_pairs,
+                                right_pairs=right_pairs,
+                            )
+                            if device_uncached_dropped is not None:
+                                dropped += device_uncached_dropped
+                                need_rect_probe_values = False
+                                rect_warning_count_resolved = True
+                            elif _requires_device_to_host_probe(
+                                left_source,
+                                right_source,
+                                left_pairs,
+                                right_pairs,
+                            ):
+                                # Keep device-selected rect-overlap batches on device even when
+                                # the lower-dimensional warning counter cannot refine them yet.
+                                # The warning count is advisory; falling back here only burns
+                                # wall time after the exact geometry result is already native.
+                                dropped += int(uncached_warning_rows.size)
+                                need_rect_probe_values = False
+                                rect_warning_count_resolved = True
+                            elif (
+                                left_source is not None
+                                and right_source is not None
+                                and left_rows is not None
+                                and right_rows is not None
+                            ):
+                                uncached_count = int(uncached_warning_rows.size)
+                                _record_keep_geom_type_host_probe_fallback(
+                                    f"rows={len(tags)}, warning_rows={uncached_count}"
+                                )
+                                source_left_rows = np.asarray(left_rows, dtype=np.intp)[warning_rows]
+                                source_right_rows = np.asarray(right_rows, dtype=np.intp)[warning_rows]
+                                left_values = _take_geoseries_object_values(left_source, source_left_rows)
+                                right_values = _take_geoseries_object_values(
+                                    right_source,
+                                    source_right_rows,
+                                )
+                            else:
+                                if left_pairs is None or right_pairs is None:
+                                    raise ValueError(
+                                        "left_pairs/right_pairs or source rows are required when "
+                                        "keep_geom_type_warning=True"
+                                    )
+                                uncached_count = int(uncached_warning_rows.size)
+                                _record_keep_geom_type_host_probe_fallback(
+                                    f"rows={len(tags)}, warning_rows={uncached_count}"
+                                )
+                                left_values = _take_geoseries_object_values(
+                                    left_pairs,
+                                    warning_rows.astype(np.intp, copy=False),
+                                )
+                                right_values = _take_geoseries_object_values(
+                                    right_pairs,
+                                    warning_rows.astype(np.intp, copy=False),
+                                )
+                    if area_exact_values is not None and area_exact_mask is not None:
+                        if (~cached_warning_mask).any():
+                            uncached_warning_rows = warning_rows[~cached_warning_mask]
+                            if rect_overlap_mask is not None and not need_rect_probe_values:
+                                pass
+                            elif rect_overlap_mask is not None:
+                                left_uncached = left_values[~cached_warning_mask]
+                                right_uncached = right_values[~cached_warning_mask]
+                            elif (
+                                left_source is not None
+                                and right_source is not None
+                                and left_rows is not None
+                                and right_rows is not None
+                            ):
+                                left_uncached = _take_geoseries_object_values(
+                                    left_source,
+                                    np.asarray(left_rows, dtype=np.intp)[uncached_warning_rows],
+                                )
+                                right_uncached = _take_geoseries_object_values(
+                                    right_source,
+                                    np.asarray(right_rows, dtype=np.intp)[uncached_warning_rows],
+                                )
+                            else:
+                                if left_pairs is None or right_pairs is None:
+                                    raise ValueError(
+                                        "left_pairs/right_pairs or source rows are required when "
+                                        "keep_geom_type_warning=True"
+                                    )
+                                left_uncached = _take_geoseries_object_values(
+                                    left_pairs,
+                                    uncached_warning_rows,
+                                )
+                                right_uncached = _take_geoseries_object_values(
+                                    right_pairs,
+                                    uncached_warning_rows,
+                                )
+                            if rect_overlap_mask is None or need_rect_probe_values:
+                                dropped += _count_dropped_polygon_intersection_parts(
+                                    left_uncached,
+                                    right_uncached,
+                                    int(np.count_nonzero(~cached_warning_mask)),
+                                )
+                    else:
+                        if rect_overlap_mask is not None and rect_warning_count_resolved:
+                            pass
+                        else:
+                            device_dropped = _device_count_dropped_polygon_intersection_warning_rows(
+                                area_owned,
+                                keep_mask,
+                                warning_rows,
+                                left_source=left_source,
+                                right_source=right_source,
+                                left_rows=left_rows,
+                                right_rows=right_rows,
+                                left_pairs=left_pairs,
+                                right_pairs=right_pairs,
+                            )
+                            if device_dropped is not None:
+                                dropped = device_dropped
+                            elif strict_native_mode_enabled() and _requires_device_to_host_probe(
+                                left_source,
+                                right_source,
+                                left_pairs,
+                                right_pairs,
+                            ):
+                                # Strict native mode cannot materialize host geometry just to
+                                # refine the warning count. Keep the result fully native and
+                                # conservatively count one dropped lower-dimensional remnant per
+                                # warning row until the full exact-warning counter is native.
+                                dropped = int(warning_rows.size)
+                            else:
+                                if rect_overlap_mask is None:
+                                    if (
+                                        left_source is not None
+                                        and right_source is not None
+                                        and left_rows is not None
+                                        and right_rows is not None
+                                    ):
+                                        _record_keep_geom_type_host_probe_fallback(
+                                            f"rows={len(tags)}, warning_rows={warning_rows.size}"
+                                        )
+                                        left_values = _take_geoseries_object_values(
+                                            left_source,
+                                            np.asarray(left_rows, dtype=np.intp)[warning_rows],
+                                        )
+                                        right_values = _take_geoseries_object_values(
+                                            right_source,
+                                            np.asarray(right_rows, dtype=np.intp)[warning_rows],
+                                        )
+                                    else:
+                                        left_values = left_values[warning_mask]
+                                        right_values = right_values[warning_mask]
+                                dropped = _count_dropped_polygon_intersection_parts(
+                                    left_values,
+                                    right_values,
+                                    int(warning_rows.size),
+                                )
+
+            if bool(np.all(keep_mask)):
+                filtered = area_pairs.reset_index(drop=True)
+                filtered = _attach_polygon_rect_overlap_mask(filtered, rect_overlap_mask)
+                return filtered, dropped, keep_mask
             filtered = area_pairs.take(np.flatnonzero(keep_mask)).reset_index(drop=True)
+            filtered = _attach_polygon_rect_overlap_mask(
+                filtered,
+                rect_overlap_mask[keep_mask] if rect_overlap_mask is not None else None,
+            )
             return filtered, dropped, keep_mask
 
     area_values = _geoseries_object_values(area_pairs)
@@ -1245,19 +2727,124 @@ def _filter_polygon_intersection_rows_for_keep_geom_type(
 
     dropped = 0
     if keep_geom_type_warning and len(area_values) > 0:
-        dropped = _count_dropped_polygon_intersection_parts(
-            _geoseries_object_values(left_pairs),
-            _geoseries_object_values(right_pairs),
-            area_values,
-        )
+        if area_overlap_mask is not None:
+            warning_mask = (~keep_mask) | area_overlap_mask
+        else:
+            if (
+                left_source is not None
+                and right_source is not None
+                and left_rows is not None
+                and right_rows is not None
+            ):
+                left_values = _take_geoseries_object_values(
+                    left_source,
+                    np.asarray(left_rows, dtype=np.intp),
+                )
+                right_values = _take_geoseries_object_values(
+                    right_source,
+                    np.asarray(right_rows, dtype=np.intp),
+                )
+            else:
+                if left_pairs is None or right_pairs is None:
+                    raise ValueError(
+                        "left_pairs/right_pairs or source rows are required when "
+                        "keep_geom_type_warning=True"
+                    )
+                left_values = _geoseries_object_values(left_pairs)
+                right_values = _geoseries_object_values(right_pairs)
+            warning_mask = _warning_candidate_mask_for_polygon_keep_geom_type(
+                left_values,
+                right_values,
+                keep_mask,
+            )
+        if area_exact_polygon_only_mask is not None:
+            safe_rows = np.asarray(keep_mask, dtype=bool) & area_exact_polygon_only_mask
+            if safe_rows.any():
+                warning_mask = np.asarray(warning_mask, dtype=bool).copy()
+                warning_mask[safe_rows] = False
+        warning_rows = np.empty(0, dtype=np.intp)
+        if np.any(warning_mask):
+            warning_mask, warning_rows = _clear_device_exact_keep_geom_type_warnings(
+                warning_mask,
+                keep_mask,
+                left_source=left_source,
+                right_source=right_source,
+                left_rows=left_rows,
+                right_rows=right_rows,
+                area_owned=area_owned,
+            )
+
+        if warning_rows.size > 0:
+            if area_exact_values is not None and area_exact_mask is not None:
+                area_exact_values = np.asarray(area_exact_values, dtype=object)
+                area_exact_mask = np.asarray(area_exact_mask, dtype=bool)
+                if area_exact_values.size != len(area_pairs) or area_exact_mask.size != len(area_pairs):
+                    area_exact_values = None
+                    area_exact_mask = None
+
+            if area_overlap_mask is not None:
+                if (
+                    left_source is not None
+                    and right_source is not None
+                    and left_rows is not None
+                    and right_rows is not None
+                ):
+                    _record_keep_geom_type_host_probe_fallback(
+                        f"rows={len(area_values)}, warning_rows={warning_rows.size}"
+                    )
+                    left_values = _take_geoseries_object_values(
+                        left_source,
+                        np.asarray(left_rows, dtype=np.intp)[warning_rows],
+                    )
+                    right_values = _take_geoseries_object_values(
+                        right_source,
+                        np.asarray(right_rows, dtype=np.intp)[warning_rows],
+                    )
+                else:
+                    if left_pairs is None or right_pairs is None:
+                        raise ValueError(
+                            "left_pairs/right_pairs or source rows are required when "
+                            "keep_geom_type_warning=True"
+                        )
+                    _record_keep_geom_type_host_probe_fallback(
+                        f"rows={len(area_values)}, warning_rows={warning_rows.size}"
+                    )
+                    left_values = _take_geoseries_object_values(left_pairs, warning_rows)
+                    right_values = _take_geoseries_object_values(right_pairs, warning_rows)
+            else:
+                left_values = left_values[warning_mask]
+                right_values = right_values[warning_mask]
+
+            if area_exact_values is not None and area_exact_mask is not None:
+                cached_warning_mask = np.asarray(area_exact_mask[warning_rows], dtype=bool)
+                if cached_warning_mask.any():
+                    dropped += _count_dropped_polygon_intersection_parts(
+                        np.empty(0, dtype=object),
+                        np.empty(0, dtype=object),
+                        int(np.count_nonzero(cached_warning_mask)),
+                        exact_values=area_exact_values[warning_rows][cached_warning_mask],
+                    )
+                if (~cached_warning_mask).any():
+                    dropped += _count_dropped_polygon_intersection_parts(
+                        left_values[~cached_warning_mask],
+                        right_values[~cached_warning_mask],
+                        int(np.count_nonzero(~cached_warning_mask)),
+                    )
+            else:
+                dropped = _count_dropped_polygon_intersection_parts(
+                    left_values,
+                    right_values,
+                    int(warning_rows.size),
+                )
+
+    if bool(np.all(keep_mask)):
+        return area_pairs.reset_index(drop=True), dropped, keep_mask
 
     filtered_values = area_values[keep_mask].copy()
     if filtered_values.size > 0:
         filtered_values = _strip_non_polygon_collection_parts(filtered_values)
     filtered = GeoSeries(filtered_values, crs=area_pairs.crs)
     return filtered, dropped, keep_mask
-
-
 def _needs_host_overlay_difference_boundary_rebuild(df1, df2) -> bool:
     """Return True when public overlay difference needs boundary reconstruction.
 
@@ -1337,6 +2924,97 @@ def _grouped_overlay_difference_geoms(df1, df2, idx1, idx2) -> np.ndarray:
     return result_geoms
 
 
+def _host_exact_polygon_intersection_owned_batch(
+    left_owned,
+    right_owned,
+    *,
+    requested: ExecutionMode | str,
+    reason: str,
+    detail: str,
+):
+    """Run an exact host intersection batch and cache raw exact results."""
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    requested_mode = (
+        requested if isinstance(requested, ExecutionMode) else ExecutionMode(requested)
+    )
+    d2h_transfer = (
+        getattr(left_owned, "device_state", None) is not None
+        or getattr(right_owned, "device_state", None) is not None
+    )
+    record_fallback_event(
+        surface="geopandas.overlay.intersection",
+        reason=reason,
+        detail=detail,
+        requested=requested_mode,
+        selected=ExecutionMode.CPU,
+        pipeline="_host_exact_polygon_intersection_owned_batch",
+        d2h_transfer=d2h_transfer,
+    )
+
+    left_values = np.asarray(left_owned.to_shapely(), dtype=object)
+    if right_owned.row_count == 1 and left_values.size > 1:
+        right_geom = right_owned.to_shapely()[0]
+        if right_geom is None or shapely.is_empty(right_geom):
+            empty = from_shapely_geometries([shapely.Point()])
+            return empty.take(np.asarray([], dtype=np.int64))
+        right_values = np.full(len(left_values), right_geom, dtype=object)
+    else:
+        right_values = np.asarray(right_owned.to_shapely(), dtype=object)
+
+    raw = np.asarray(shapely.intersection(left_values, right_values), dtype=object)
+    result = from_shapely_geometries(list(raw))
+    result._exact_intersection_values = raw
+    result._exact_intersection_value_mask = np.ones(len(raw), dtype=bool)
+    return result
+
+
+def _host_exact_polygon_intersection_series_batch(
+    left_source: GeoSeries,
+    right_source: GeoSeries,
+    left_rows: np.ndarray,
+    right_rows: np.ndarray,
+    *,
+    crs,
+    requested: ExecutionMode | str,
+    reason: str,
+):
+    """Build an exact host GeoSeries batch and retain raw exact results."""
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    requested_mode = (
+        requested if isinstance(requested, ExecutionMode) else ExecutionMode(requested)
+    )
+    left_rows = np.asarray(left_rows, dtype=np.intp)
+    right_rows = np.asarray(right_rows, dtype=np.intp)
+    record_fallback_event(
+        surface="geopandas.overlay.intersection",
+        reason=reason,
+        detail=f"rows={left_rows.size}",
+        requested=requested_mode,
+        selected=ExecutionMode.CPU,
+        pipeline="_host_exact_polygon_intersection_series_batch",
+        d2h_transfer=True,
+    )
+
+    left_values = _take_geoseries_object_values(left_source, left_rows)
+    right_values = _take_geoseries_object_values(right_source, right_rows)
+    raw = np.asarray(shapely.intersection(left_values, right_values), dtype=object)
+
+    try:
+        owned = from_shapely_geometries(list(raw))
+    except NotImplementedError:
+        result = GeoSeries(raw, crs=crs)
+        result.values._exact_intersection_values = raw
+        result.values._exact_intersection_value_mask = np.ones(len(raw), dtype=bool)
+        return result
+
+    owned._exact_intersection_values = raw
+    owned._exact_intersection_value_mask = np.ones(len(raw), dtype=bool)
+    return GeoSeries(
+        GeometryArray.from_owned(owned, crs=crs),
+        crs=crs,
+    )
 def _many_vs_one_intersection_owned(
     left_sub,
     right_owned,
@@ -1375,17 +3053,55 @@ def _many_vs_one_intersection_owned(
         are clipped or overlaid.
     """
     from vibespatial.constructive.binary_constructive import (
+        _host_rectangle_polygon_mask,
         binary_constructive_owned,
     )
-
-    index_oga_pairs, complex_left, complex_global_positions, right_one, _pairwise_mode = (
-        _prepare_many_vs_one_intersection_chunks(
-            left_sub,
-            right_owned,
-            unique_right_idx,
-            global_positions=np.arange(left_sub.row_count, dtype=np.intp),
-        )
+    n_pairs = int(left_sub.row_count)
+    pairwise_selection = plan_dispatch_selection(
+        kernel_name="overlay_pairwise",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=n_pairs,
     )
+    if (
+        not strict_native_mode_enabled()
+        and pairwise_selection.selected is ExecutionMode.CPU
+        and n_pairs >= _MANY_VS_ONE_DIRECT_FULL_BATCH_MIN_ROWS
+        and n_pairs <= _MANY_VS_ONE_HOST_EXACT_MAX_ROWS
+    ):
+        right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
+        exact_result = _host_exact_polygon_intersection_owned_batch(
+            left_sub,
+            right_one,
+            requested=pairwise_selection.requested,
+            reason="many-vs-one CPU-selected exact host batch",
+            detail=f"rows={n_pairs}",
+        )
+        exact_result._polygon_rect_boundary_overlap = np.zeros(left_sub.row_count, dtype=bool)
+        return exact_result
+
+    _prepare_result = _prepare_many_vs_one_intersection_chunks(
+        left_sub,
+        right_owned,
+        unique_right_idx,
+        global_positions=np.arange(left_sub.row_count, dtype=np.intp),
+    )
+    if len(_prepare_result) == 5:
+        index_oga_pairs, complex_left, complex_global_positions, right_one, _pairwise_mode = (
+            _prepare_result
+        )
+    else:
+        (
+            index_oga_pairs,
+            complex_left,
+            complex_global_positions,
+            right_one,
+            _pairwise_mode,
+            _use_direct_full_batch_overlay,
+        ) = _prepare_result
+        if _use_direct_full_batch_overlay:
+            logger.debug(
+                "many-vs-one intersection bypass yield too small; using one full exact GPU batch"
+            )
 
     # ---- Tier 3: Overlay for remaining boundary-crossing polygons ----
     # After containment bypass and SH batch clip, only a small number of
@@ -1398,87 +3114,190 @@ def _many_vs_one_intersection_owned(
     # is large (>= 1000 rows) AND the clip polygon is moderately complex.
     def _shapely_remainder_intersection(left_rem_oga, right_one_oga):
         """Intersect remainder polygons via vectorized Shapely (CPU)."""
-        from vibespatial.geometry.owned import from_shapely_geometries
-
-        left_geoms = np.asarray(left_rem_oga.to_shapely(), dtype=object)
-        right_geom = right_one_oga.to_shapely()[0]
-        if right_geom is None or shapely.is_empty(right_geom):
-            empty = from_shapely_geometries([shapely.Point()])
-            return empty.take(np.asarray([], dtype=np.int64))
-        right_arr = np.full(len(left_geoms), right_geom, dtype=object)
-        raw = shapely.intersection(left_geoms, right_arr)
-        record_fallback_event(
-            surface="geopandas.overlay.intersection",
+        return _host_exact_polygon_intersection_owned_batch(
+            left_rem_oga,
+            right_one_oga,
+            requested=_pairwise_mode,
             reason=(
                 "many-vs-one remainder: vectorized Shapely intersection "
-                f"for {len(left_geoms)} boundary-crossing polygons"
+                f"for {int(left_rem_oga.row_count)} boundary-crossing polygons"
             ),
-            detail=f"rows={len(left_geoms)}",
-            requested=_pairwise_mode,
-            selected=ExecutionMode.CPU,
-            pipeline="_many_vs_one_intersection_owned",
-            d2h_transfer=True,
+            detail=f"rows={int(left_rem_oga.row_count)}",
         )
-        return from_shapely_geometries(list(raw))
 
     def _gpu_remainder_intersection(left_rem_oga, right_one_oga):
         """Intersect remainder polygons via GPU overlay pipeline."""
         from vibespatial.constructive.binary_constructive import (
+            _broadcast_right_cached_segments,
             _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
             _dispatch_polygon_intersection_overlay_rowwise_gpu,
         )
-        from vibespatial.overlay.gpu import _overlay_owned
-        if left_rem_oga.row_count <= _OVERLAY_ROWWISE_REMAINDER_MAX:
-            broadcast_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
-                left_rem_oga,
-                right_one_oga,
-                dispatch_mode=_pairwise_mode,
-            )
-            if (
-                broadcast_result is not None
-                and broadcast_result.row_count == left_rem_oga.row_count
-            ):
-                return broadcast_result
         from vibespatial.geometry.owned import materialize_broadcast, tile_single_row
+        from vibespatial.overlay.gpu import _overlay_owned
 
         right_rep = materialize_broadcast(tile_single_row(right_one_oga, left_rem_oga.row_count))
-        if _pairwise_mode is ExecutionMode.GPU:
-            batched_result = _overlay_owned(
+        cached_right_segments = _broadcast_right_cached_segments(
+            right_one_oga,
+            left_rem_oga.row_count,
+        )
+        try:
+            if left_rem_oga.row_count <= _OVERLAY_ROWWISE_REMAINDER_MAX:
+                broadcast_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+                    left_rem_oga,
+                    right_one_oga,
+                    dispatch_mode=_pairwise_mode,
+                    _cached_right_segments=cached_right_segments,
+                )
+                if (
+                    broadcast_result is not None
+                    and broadcast_result.row_count == left_rem_oga.row_count
+                ):
+                    return broadcast_result
+            if left_rem_oga.row_count <= _OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX:
+                rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+                    left_rem_oga,
+                    right_rep,
+                    dispatch_mode=_pairwise_mode,
+                    _cached_right_segments=cached_right_segments,
+                )
+                if rowwise_result is not None and rowwise_result.row_count == left_rem_oga.row_count:
+                    return rowwise_result
+            if _pairwise_mode is ExecutionMode.GPU:
+                batched_result = _overlay_owned(
+                    left_rem_oga,
+                    right_rep,
+                    operation="intersection",
+                    dispatch_mode=ExecutionMode.GPU,
+                    _cached_right_segments=cached_right_segments,
+                    _row_isolated=True,
+                )
+                if batched_result.row_count == left_rem_oga.row_count:
+                    return batched_result
+            rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
                 left_rem_oga,
                 right_rep,
-                operation="intersection",
-                dispatch_mode=ExecutionMode.GPU,
-                _row_isolated=True,
+                dispatch_mode=_pairwise_mode,
+                _cached_right_segments=cached_right_segments,
             )
-            if batched_result.row_count == left_rem_oga.row_count:
-                return batched_result
-        rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-            left_rem_oga,
-            right_rep,
-            dispatch_mode=_pairwise_mode,
-        )
-        if rowwise_result is not None and rowwise_result.row_count == left_rem_oga.row_count:
-            return rowwise_result
-        return binary_constructive_owned(
-            "intersection", left_rem_oga, right_rep,
-            dispatch_mode=_pairwise_mode,
-        )
+            if rowwise_result is not None and rowwise_result.row_count == left_rem_oga.row_count:
+                return rowwise_result
+            return binary_constructive_owned(
+                "intersection", left_rem_oga, right_rep,
+                dispatch_mode=_pairwise_mode,
+                _cached_right_segments=cached_right_segments,
+            )
+        finally:
+            if cached_right_segments is not None:
+                try:
+                    from vibespatial.constructive.binary_constructive import (
+                        _free_device_segment_table,
+                    )
+
+                    _free_device_segment_table(cached_right_segments)
+                except Exception:
+                    logger.debug(
+                        "many-vs-one cached right-segment cleanup failed",
+                        exc_info=True,
+                    )
 
     def _remainder_intersection(left_rem_oga, right_one_oga):
         """Choose the remainder path based on residency and crossover shape."""
-        from vibespatial.runtime.residency import Residency
+        from vibespatial.runtime.residency import Residency, TransferTrigger
 
-        if not has_gpu_runtime():
-            return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
-        if strict_native_mode_enabled() or left_rem_oga.residency is Residency.DEVICE:
-            return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
+        if strict_native_mode_enabled():
+            if left_rem_oga.residency is not Residency.DEVICE:
+                try:
+                    left_rem_oga = left_rem_oga.move_to(
+                        Residency.DEVICE,
+                        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                        reason="strict many-vs-one remainder promoted left polygons to device",
+                    )
+                except Exception:
+                    logger.debug(
+                        "strict many-vs-one left promotion failed before device remainder path",
+                        exc_info=True,
+                    )
+            if right_one_oga.residency is not Residency.DEVICE:
+                try:
+                    right_one_oga = right_one_oga.move_to(
+                        Residency.DEVICE,
+                        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                        reason="strict many-vs-one remainder promoted clip polygon to device",
+                    )
+                except Exception:
+                    logger.debug(
+                        "strict many-vs-one right promotion failed before device remainder path",
+                        exc_info=True,
+                    )
+            try:
+                return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
+            except Exception:
+                logger.debug(
+                    "many-vs-one strict device remainder path failed; "
+                    "falling back to host crossover policy",
+                    exc_info=True,
+                )
+        elif left_rem_oga.residency is Residency.DEVICE:
+            try:
+                return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
+            except Exception:
+                logger.debug(
+                    "many-vs-one device remainder path failed; "
+                    "falling back to host crossover policy",
+                    exc_info=True,
+                )
+        if left_rem_oga.row_count >= OVERLAY_GPU_REMAINDER_THRESHOLD:
+            try:
+                left_device = left_rem_oga.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="many-vs-one remainder promoted left polygons to device",
+                )
+                right_device = right_one_oga.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="many-vs-one remainder promoted clip polygon to device",
+                )
+                return _gpu_remainder_intersection(left_device, right_device)
+            except Exception:
+                logger.debug(
+                    "many-vs-one remainder device promotion failed; "
+                    "falling back to host crossover policy",
+                    exc_info=True,
+                )
         if left_rem_oga.row_count < OVERLAY_GPU_REMAINDER_THRESHOLD:
             return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
-        return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
+        try:
+            return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
+        except Exception:
+            logger.debug(
+                "many-vs-one large remainder GPU path failed after host crossover check; "
+                "falling back to vectorized Shapely intersection",
+                exc_info=True,
+            )
+            return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
 
     complex_result = None
     if complex_left is not None and complex_global_positions is not None:
         complex_result = _remainder_intersection(complex_left, right_one)
+        if complex_result is not None:
+            try:
+                left_rect_mask = _host_rectangle_polygon_mask(complex_left)
+                right_rect_mask = _host_rectangle_polygon_mask(right_one)
+                if (
+                    left_rect_mask is not None
+                    and right_rect_mask is not None
+                    and right_rect_mask.size == 1
+                    and bool(right_rect_mask[0])
+                ):
+                    left_rect_mask = np.asarray(left_rect_mask, dtype=bool)
+                    if left_rect_mask.size == complex_result.row_count and left_rect_mask.any():
+                        complex_result._polygon_rect_exact_polygon_only = left_rect_mask
+            except Exception:
+                logger.debug(
+                    "many-vs-one exact-overlay rectangle classification failed",
+                    exc_info=True,
+                )
 
     # Release GPU pool memory after overlay on remainder polygons: SH clip
     # and per-pair GPU overlay produce large intermediates that are dead now.
@@ -1489,7 +3308,29 @@ def _many_vs_one_intersection_owned(
     if complex_result is not None and complex_global_positions is not None:
         index_oga_pairs.append((complex_global_positions, complex_result))
 
-    return _assemble_indexed_owned_chunks(index_oga_pairs, left_sub.row_count)
+    assembled = _assemble_indexed_owned_chunks(index_oga_pairs, left_sub.row_count)
+
+    warning_suspect_mask = np.zeros(left_sub.row_count, dtype=bool)
+    if complex_result is not None and complex_global_positions is not None:
+        complex_overlap_mask = getattr(complex_result, "_polygon_rect_boundary_overlap", None)
+        if complex_overlap_mask is not None:
+            complex_overlap_mask = (
+                complex_overlap_mask.get()
+                if hasattr(complex_overlap_mask, "get")
+                else np.asarray(complex_overlap_mask, dtype=bool)
+            )
+            complex_overlap_mask = np.asarray(complex_overlap_mask, dtype=bool)
+            if complex_overlap_mask.size == complex_result.row_count:
+                warning_suspect_mask[np.asarray(complex_global_positions, dtype=np.intp)] = (
+                    complex_overlap_mask
+                )
+            else:
+                warning_suspect_mask[np.asarray(complex_global_positions, dtype=np.intp)] = True
+        else:
+            warning_suspect_mask[np.asarray(complex_global_positions, dtype=np.intp)] = True
+    assembled._polygon_rect_boundary_overlap = warning_suspect_mask
+    assembled._many_vs_one_left_containment_bypass_applied = True
+    return assembled
 
 
 def _assemble_indexed_owned_chunks(index_oga_pairs, row_count: int):
@@ -1505,11 +3346,75 @@ def _assemble_indexed_owned_chunks(index_oga_pairs, row_count: int):
         if len(indices) == row_count and np.array_equal(indices, np.arange(row_count)):
             return oga
 
+    exact_values = None
+    exact_value_mask = None
+    exact_polygon_only_mask = None
+    for indices, oga in index_oga_pairs:
+        oga_exact_values = getattr(oga, "_exact_intersection_values", None)
+        oga_exact_mask = getattr(oga, "_exact_intersection_value_mask", None)
+        if oga_exact_values is None or oga_exact_mask is None:
+            pass
+        else:
+            oga_exact_values = np.asarray(oga_exact_values, dtype=object)
+            oga_exact_mask = np.asarray(oga_exact_mask, dtype=bool)
+            if (
+                oga_exact_values.size == len(indices)
+                and oga_exact_mask.size == len(indices)
+            ):
+                if exact_values is None:
+                    exact_values = np.empty(row_count, dtype=object)
+                    exact_values[:] = None
+                    exact_value_mask = np.zeros(row_count, dtype=bool)
+                row_indices = np.asarray(indices, dtype=np.intp)
+                exact_values[row_indices] = oga_exact_values
+                exact_value_mask[row_indices] = oga_exact_mask
+
+        oga_exact_polygon_only = getattr(oga, "_polygon_rect_exact_polygon_only", None)
+        if oga_exact_polygon_only is None:
+            continue
+        oga_exact_polygon_only = np.asarray(oga_exact_polygon_only, dtype=bool)
+        if oga_exact_polygon_only.size != len(indices):
+            continue
+        if exact_polygon_only_mask is None:
+            exact_polygon_only_mask = np.zeros(row_count, dtype=bool)
+        exact_polygon_only_mask[np.asarray(indices, dtype=np.intp)] = oga_exact_polygon_only
+
     all_indices = np.concatenate([idx for idx, _ in index_oga_pairs])
     concat_result = OwnedGeometryArray.concat([oga for _, oga in index_oga_pairs])
     inverse_perm = np.empty(row_count, dtype=np.intp)
     inverse_perm[all_indices] = np.arange(len(all_indices), dtype=np.intp)
-    return concat_result.take(inverse_perm)
+    result = concat_result.take(inverse_perm)
+    if exact_values is not None and exact_value_mask is not None and exact_value_mask.any():
+        result._exact_intersection_values = exact_values
+        result._exact_intersection_value_mask = exact_value_mask
+    if exact_polygon_only_mask is not None and exact_polygon_only_mask.any():
+        result._polygon_rect_exact_polygon_only = exact_polygon_only_mask
+    return result
+
+
+def _host_convex_single_ring_polygon_mask(owned) -> np.ndarray | None:
+    """Classify rows that are single-ring convex polygons using host metadata."""
+    from vibespatial.constructive.binary_constructive import _host_single_ring_polygon_mask
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.overlay.bypass import _is_convex_ring_xy
+
+    single_ring_mask = _host_single_ring_polygon_mask(owned, max_input_vertices=64)
+    if single_ring_mask is None or GeometryFamily.POLYGON not in owned.families:
+        return None
+
+    polygon_buf = owned.families[GeometryFamily.POLYGON]
+    geom_offsets = np.asarray(polygon_buf.geometry_offsets, dtype=np.int64)
+    ring_offsets = np.asarray(polygon_buf.ring_offsets, dtype=np.int64)
+    x = np.asarray(polygon_buf.x, dtype=np.float64)
+    y = np.asarray(polygon_buf.y, dtype=np.float64)
+
+    convex_mask = np.zeros(owned.row_count, dtype=bool)
+    for row in np.flatnonzero(single_ring_mask).astype(np.intp, copy=False):
+        ring_row = int(geom_offsets[int(row)])
+        start = int(ring_offsets[ring_row])
+        end = int(ring_offsets[ring_row + 1])
+        convex_mask[int(row)] = _is_convex_ring_xy(x, y, start, end)
+    return convex_mask
 
 
 def _prepare_many_vs_one_intersection_chunks(
@@ -1559,6 +3464,10 @@ def _prepare_many_vs_one_intersection_chunks(
             _remainder_mask = None
 
     if _contained_result is not None and _remainder_mask is None:
+        _contained_result._polygon_rect_exact_polygon_only = np.ones(
+            _contained_result.row_count,
+            dtype=bool,
+        )
         record_dispatch_event(
             surface="geopandas.overlay.intersection",
             operation="many_vs_one_containment_bypass",
@@ -1569,7 +3478,7 @@ def _prepare_many_vs_one_intersection_chunks(
             ),
             selected=ExecutionMode.GPU,
         )
-        return [(global_positions, _contained_result)], None, None, right_one, _pairwise_mode
+        return [(global_positions, _contained_result)], None, None, right_one, _pairwise_mode, False
 
     d_contained_indices = None
     d_remainder_indices = None
@@ -1599,7 +3508,7 @@ def _prepare_many_vs_one_intersection_chunks(
             f"many-vs-one: {n_contained}/{n_pairs} polygons fully inside "
             f"right polygon, {n_remainder} need overlay"
         ),
-        selected=ExecutionMode.GPU if n_contained > 0 else None,
+        selected=ExecutionMode.GPU if n_contained > 0 else ExecutionMode.CPU,
     )
 
     from vibespatial.cuda._runtime import maybe_trim_pool_memory
@@ -1607,7 +3516,32 @@ def _prepare_many_vs_one_intersection_chunks(
     maybe_trim_pool_memory()
 
     if n_remainder == 0:
-        return [(global_positions, _contained_result)], None, None, right_one, _pairwise_mode
+        return [(global_positions, _contained_result)], None, None, right_one, _pairwise_mode, False
+
+    direct_full_batch_candidate = (
+        n_pairs >= _MANY_VS_ONE_DIRECT_FULL_BATCH_MIN_ROWS
+        and n_remainder <= _OVERLAY_ROWWISE_REMAINDER_MAX
+        and (n_contained / n_pairs) <= _MANY_VS_ONE_DIRECT_FULL_BATCH_MAX_CONTAINED_FRACTION
+    )
+    if direct_full_batch_candidate and _cp_local is not None:
+        try:
+            from vibespatial.overlay.bypass import _is_clip_polygon_sh_eligible
+
+            clip_eligible, _clip_vert_count = _is_clip_polygon_sh_eligible(right_one)
+        except Exception:
+            clip_eligible = False
+        if not clip_eligible:
+            record_dispatch_event(
+                surface="geopandas.overlay.intersection",
+                operation="many_vs_one_containment_bypass",
+                implementation="gpu_full_batch_exact_overlay",
+                reason=(
+                    "many-vs-one: containment bypass would only save "
+                    f"{n_contained}/{n_pairs} rows; using one full exact GPU batch"
+                ),
+                selected=ExecutionMode.GPU,
+            )
+            return [], left_sub, global_positions, right_one, _pairwise_mode, True
 
     if d_remainder_indices is not None:
         left_remainder = left_sub.take(d_remainder_indices)
@@ -1649,6 +3583,10 @@ def _prepare_many_vs_one_intersection_chunks(
 
     index_oga_pairs = []
     if n_contained > 0 and _contained_result is not None:
+        _contained_result._polygon_rect_exact_polygon_only = np.ones(
+            _contained_result.row_count,
+            dtype=bool,
+        )
         contained_global = (
             global_positions[_cp_local.asnumpy(d_contained_indices).astype(np.intp, copy=False)]
             if d_contained_indices is not None
@@ -1659,6 +3597,15 @@ def _prepare_many_vs_one_intersection_chunks(
     complex_left = None
     complex_global_positions = None
     if sh_clip_result is not None and sh_eligible_mask is not None:
+        sh_exact_polygon_only = None
+        convex_mask = _host_convex_single_ring_polygon_mask(left_remainder)
+        if convex_mask is not None and convex_mask.size == left_remainder.row_count:
+            sh_exact_polygon_only = np.asarray(
+                convex_mask[np.asarray(sh_eligible_mask, dtype=bool)],
+                dtype=bool,
+            )
+            if sh_exact_polygon_only.size == sh_clip_result.row_count and sh_exact_polygon_only.any():
+                sh_clip_result._polygon_rect_exact_polygon_only = sh_exact_polygon_only
         sh_global = remainder_global[np.flatnonzero(sh_eligible_mask).astype(np.intp, copy=False)]
         index_oga_pairs.append((sh_global, sh_clip_result))
         if sh_remainder_indices_local is not None and len(sh_remainder_indices_local) > 0:
@@ -1683,6 +3630,7 @@ def _prepare_many_vs_one_intersection_chunks(
         complex_global_positions,
         right_one,
         _pairwise_mode,
+        False,
     )
 
 
@@ -1717,6 +3665,8 @@ def _few_right_intersection_owned(
 
     from vibespatial.constructive.binary_constructive import (
         _dispatch_polygon_intersection_overlay_rowwise_gpu,
+        _expand_right_segments_for_pair_rows,
+        _free_device_segment_table,
         binary_constructive_owned,
     )
     if _has_device_indices:
@@ -1750,20 +3700,32 @@ def _few_right_intersection_owned(
             _prefer_exact_polygon_intersection=True,
         )
 
-    rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-        left_pairs,
-        right_pairs,
-        dispatch_mode=dispatch_mode,
-    )
-    if rowwise_result is not None and rowwise_result.row_count == left_pairs.row_count:
-        return rowwise_result
-    return binary_constructive_owned(
-        "intersection",
-        left_pairs,
-        right_pairs,
-        dispatch_mode=dispatch_mode,
-        _prefer_exact_polygon_intersection=True,
-    )
+    cached_right_segments = None
+    if left_pairs.row_count >= _OVERLAY_FEW_RIGHT_CACHED_SEG_MIN_ROWS:
+        cached_right_segments = _expand_right_segments_for_pair_rows(
+            right_owned,
+            np.asarray(idx2),
+        )
+    try:
+        rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+            left_pairs,
+            right_pairs,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=cached_right_segments,
+        )
+        if rowwise_result is not None and rowwise_result.row_count == left_pairs.row_count:
+            return rowwise_result
+        return binary_constructive_owned(
+            "intersection",
+            left_pairs,
+            right_pairs,
+            dispatch_mode=dispatch_mode,
+            _prefer_exact_polygon_intersection=True,
+            _cached_right_segments=cached_right_segments,
+        )
+    finally:
+        if cached_right_segments is not None:
+            _free_device_segment_table(cached_right_segments)
 
 
 def _overlay_intersection_native(
@@ -1787,10 +3749,7 @@ def _overlay_intersection_native(
     left_owned, right_owned = _coerce_owned_pair_for_strict_overlay(
         df1, df2, left_owned, right_owned,
     )
-    _polygon_inputs = (
-        df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
-    )
+    _polygon_inputs = _series_all_polygons(df1.geometry) and _series_all_polygons(df2.geometry)
     prefer_exact_polygon_gpu = _prefer_exact_polygon_gpu
     # Public polygon intersection can legitimately produce lower-dimensional
     # rows or GeometryCollections that must be filtered at the GeoPandas
@@ -1859,6 +3818,14 @@ def _overlay_intersection_native(
             d_idx1, d_idx2 = None, None
             _has_device_indices = False
 
+    if (
+        _polygon_inputs
+        and _warn_on_dropped_lower_dim_polygon_results
+        and not strict_native_mode_enabled()
+        and idx1.size <= OVERLAY_PAIR_BATCH_THRESHOLD
+    ):
+        _use_host_exact_polygon_boundary = True
+
     used_owned = False
     # Create pairs of geometries in both dataframes to be intersected
     if idx1.size > 0 and idx2.size > 0:
@@ -1875,10 +3842,7 @@ def _overlay_intersection_native(
             _unique_right_pre.size == 1 and idx1.size > 1
         )
         if _is_many_vs_one_pre and has_gpu_runtime():
-            _both_polygon = (
-                df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-                and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
-            )
+            _both_polygon = _polygon_inputs
             if _both_polygon:
                 from vibespatial.geometry.owned import from_shapely_geometries
                 from vibespatial.runtime.residency import (
@@ -1926,9 +3890,34 @@ def _overlay_intersection_native(
         # all geometries are already valid.
         intersections = None
         if (
+            intersections is None
+            and _polygon_inputs
+            and not strict_native_mode_enabled()
+            and not prefer_exact_polygon_gpu
+            and idx1.size > 0
+            and idx1.size <= _OVERLAY_HOST_EXACT_PAIR_BATCH_MAX_ROWS
+        ):
+            pairwise_selection = plan_dispatch_selection(
+                kernel_name="overlay_pairwise",
+                kernel_class=KernelClass.CONSTRUCTIVE,
+                row_count=idx1.size,
+                requested_mode=ExecutionMode.AUTO,
+            )
+            if pairwise_selection.selected is ExecutionMode.CPU:
+                intersections = _host_exact_polygon_intersection_series_batch(
+                    df1.geometry,
+                    df2.geometry,
+                    np.asarray(idx1, dtype=np.intp),
+                    np.asarray(idx2, dtype=np.intp),
+                    crs=df1.crs,
+                    requested=pairwise_selection.requested,
+                    reason="small polygon pair batch: CPU-selected exact host batch",
+                )
+        if (
             left_owned is not None
             and right_owned is not None
             and not _use_host_exact_polygon_boundary
+            and intersections is None
         ):
             from vibespatial.constructive.binary_constructive import (
                 binary_constructive_owned,
@@ -1968,8 +3957,7 @@ def _overlay_intersection_native(
                 _unique_right.size > 1
                 and _unique_right.size <= _OVERLAY_FEW_RIGHT_GROUP_MAX
                 and (idx1.size / _unique_right.size) >= _OVERLAY_FEW_RIGHT_GROUP_MIN_AVG
-                and df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-                and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
+                and _polygon_inputs
             )
 
             if _is_many_vs_one:
@@ -2063,15 +4051,23 @@ def _overlay_intersection_native(
 
             if intersections is None and not (_is_many_vs_one or _is_few_right):
                 # Standard element-wise path for N-vs-M patterns.
-                result_owned = binary_constructive_owned(
-                        "intersection", left_sub, right_sub,
-                        dispatch_mode=_pairwise_mode,
-                        _prefer_exact_polygon_intersection=prefer_exact_polygon_gpu,
+                try:
+                    result_owned = binary_constructive_owned(
+                            "intersection", left_sub, right_sub,
+                            dispatch_mode=_pairwise_mode,
+                            _prefer_exact_polygon_intersection=prefer_exact_polygon_gpu,
+                        )
+                    intersections = GeoSeries(
+                        GeometryArray.from_owned(result_owned, crs=df1.crs),
                     )
-                intersections = GeoSeries(
-                    GeometryArray.from_owned(result_owned, crs=df1.crs),
-                )
-                used_owned = True
+                    used_owned = True
+                except Exception:
+                    logger.debug(
+                        "owned element-wise polygon intersection failed; "
+                        "falling back to boundary path",
+                        exc_info=True,
+                    )
+                    intersections = None
 
             if intersections is None and _is_few_right:
                 if _has_device_indices:
@@ -2080,15 +4076,23 @@ def _overlay_intersection_native(
                 else:
                     left_sub = left_owned.take(np.asarray(idx1))
                     right_sub = right_owned.take(np.asarray(idx2))
-                result_owned = binary_constructive_owned(
-                    "intersection", left_sub, right_sub,
-                    dispatch_mode=_pairwise_mode,
-                    _prefer_exact_polygon_intersection=prefer_exact_polygon_gpu,
-                )
-                intersections = GeoSeries(
-                    GeometryArray.from_owned(result_owned, crs=df1.crs),
-                )
-                used_owned = True
+                try:
+                    result_owned = binary_constructive_owned(
+                        "intersection", left_sub, right_sub,
+                        dispatch_mode=_pairwise_mode,
+                        _prefer_exact_polygon_intersection=prefer_exact_polygon_gpu,
+                    )
+                    intersections = GeoSeries(
+                        GeometryArray.from_owned(result_owned, crs=df1.crs),
+                    )
+                    used_owned = True
+                except Exception:
+                    logger.debug(
+                        "few-right owned polygon intersection failed; "
+                        "falling back to boundary path",
+                        exc_info=True,
+                    )
+                    intersections = None
 
             if intersections is None and _is_many_vs_one:
                 # Many-vs-one fast path failed -- fall back to element-wise.
@@ -2099,25 +4103,77 @@ def _overlay_intersection_native(
                         right_sub = right_owned.device_take(d_idx2)
                     else:
                         right_sub = right_owned.take(np.asarray(idx2))
-                result_owned = binary_constructive_owned(
-                    "intersection", left_sub, right_sub,
-                    dispatch_mode=_pairwise_mode,
-                    _prefer_exact_polygon_intersection=prefer_exact_polygon_gpu,
-                )
-                intersections = GeoSeries(
-                    GeometryArray.from_owned(result_owned, crs=df1.crs),
-                )
-                used_owned = True
+                try:
+                    result_owned = binary_constructive_owned(
+                        "intersection", left_sub, right_sub,
+                        dispatch_mode=_pairwise_mode,
+                        _prefer_exact_polygon_intersection=prefer_exact_polygon_gpu,
+                    )
+                    intersections = GeoSeries(
+                        GeometryArray.from_owned(result_owned, crs=df1.crs),
+                    )
+                    used_owned = True
+                except Exception:
+                    logger.debug(
+                        "many-vs-one owned polygon intersection failed; "
+                        "falling back to boundary path",
+                        exc_info=True,
+                    )
+                    intersections = None
 
         if intersections is None:
             # ADR-0042 transitional boundary: host exact path still uses GeoSeries ops.
             if _use_host_exact_polygon_boundary:
-                left_values = _take_geoseries_object_values(df1.geometry, np.asarray(idx1, dtype=np.intp))
-                right_values = _take_geoseries_object_values(df2.geometry, np.asarray(idx2, dtype=np.intp))
-                intersections = GeoSeries(
-                    shapely.intersection(left_values, right_values),
-                    crs=df1.crs,
-                )
+                if has_gpu_runtime() and idx1.size <= OVERLAY_PAIR_BATCH_THRESHOLD:
+                    from vibespatial.constructive.binary_constructive import (
+                        binary_constructive_owned,
+                    )
+
+                    try:
+                        pair_rows_left = np.asarray(idx1, dtype=np.intp)
+                        pair_rows_right = np.asarray(idx2, dtype=np.intp)
+                        if left_owned is not None and right_owned is not None:
+                            pair_left_owned = left_owned.take(pair_rows_left)
+                            pair_right_owned = right_owned.take(pair_rows_right)
+                        else:
+                            pair_left = df1.geometry.take(pair_rows_left)
+                            pair_left.reset_index(drop=True, inplace=True)
+                            pair_right = df2.geometry.take(pair_rows_right)
+                            pair_right.reset_index(drop=True, inplace=True)
+                            pair_left_owned = pair_left.values.to_owned()
+                            pair_right_owned = pair_right.values.to_owned()
+                        result_owned = binary_constructive_owned(
+                            "intersection",
+                            pair_left_owned,
+                            pair_right_owned,
+                            dispatch_mode=ExecutionMode.GPU,
+                            _prefer_exact_polygon_intersection=True,
+                        )
+                        intersections = GeoSeries(
+                            GeometryArray.from_owned(result_owned, crs=df1.crs),
+                        )
+                        used_owned = True
+                    except Exception:
+                        logger.debug(
+                            "pair-owned exact polygon GPU boundary fallback failed; "
+                            "falling back to Shapely exact intersection",
+                            exc_info=True,
+                        )
+                        intersections = None
+
+                if intersections is None:
+                    left_values = _take_geoseries_object_values(
+                        df1.geometry,
+                        np.asarray(idx1, dtype=np.intp),
+                    )
+                    right_values = _take_geoseries_object_values(
+                        df2.geometry,
+                        np.asarray(idx2, dtype=np.intp),
+                    )
+                    intersections = GeoSeries(
+                        shapely.intersection(left_values, right_values),
+                        crs=df1.crs,
+                    )
             else:
                 left = df1.geometry.take(idx1)
                 left.reset_index(drop=True, inplace=True)
@@ -2125,44 +4181,56 @@ def _overlay_intersection_native(
                 right.reset_index(drop=True, inplace=True)
                 intersections = left.intersection(right)
 
-        # Post-intersection make_valid: use GPU path when owned backing is
-        # available to avoid Shapely materialisation on the critical path.
+        # Post-intersection make_valid must run for both owned/GPU and
+        # fallback boundary paths. Some exact polygon fast paths can emit
+        # topologically invalid-but-equivalent polygons that need repair
+        # before public overlay consumers like dissolve.
+        if not (
+            _polygon_inputs
+            and _can_defer_make_valid_to_rect_repair(intersections)
+        ):
             intersections = _make_valid_geoseries(
-            intersections,
-            dispatch_mode=(
-                ExecutionMode.GPU
-                if (used_owned or prefer_exact_polygon_gpu)
-                else ExecutionMode.AUTO
-            ),
-        )
+                intersections,
+                dispatch_mode=(
+                    ExecutionMode.GPU
+                    if (used_owned or prefer_exact_polygon_gpu)
+                    else ExecutionMode.AUTO
+                ),
+            )
 
         geom_intersect = intersections
         keep_geom_type_applied = False
-        if (
-            df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-            and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
-        ):
+        if _polygon_inputs:
             pair_left = None
             pair_right = None
+            source_idx1 = np.asarray(idx1, dtype=np.intp)
+            source_idx2 = np.asarray(idx2, dtype=np.intp)
+            left_source_geoms = df1.geometry
+            right_source_geoms = df2.geometry
+            if left_owned is not None:
+                left_source_geoms = GeoSeries(
+                    GeometryArray.from_owned(left_owned, crs=df1.crs),
+                    crs=df1.crs,
+                )
+            if right_owned is not None:
+                right_source_geoms = GeoSeries(
+                    GeometryArray.from_owned(right_owned, crs=df2.crs),
+                    crs=df2.crs,
+                )
             if (
                 _preserve_lower_dim_polygon_results
-                or _warn_on_dropped_lower_dim_polygon_results
+            ):
+                pair_left = df1.geometry.take(idx1)
+                pair_left.reset_index(drop=True, inplace=True)
+                pair_right = df2.geometry.take(idx2)
+                pair_right.reset_index(drop=True, inplace=True)
+
+            if (
+                _warn_on_dropped_lower_dim_polygon_results
                 or prefer_exact_polygon_gpu
             ):
-                if left_sub is not None and right_sub is not None:
-                    pair_left = GeoSeries(
-                        GeometryArray.from_owned(left_sub, crs=df1.crs),
-                        index=geom_intersect.index,
-                    )
-                    pair_right = GeoSeries(
-                        GeometryArray.from_owned(right_sub, crs=df1.crs),
-                        index=geom_intersect.index,
-                    )
-                else:
-                    pair_left = df1.geometry.take(idx1)
-                    pair_left.reset_index(drop=True, inplace=True)
-                    pair_right = df2.geometry.take(idx2)
-                    pair_right.reset_index(drop=True, inplace=True)
+                pair_left = pair_left if _preserve_lower_dim_polygon_results else None
+                pair_right = pair_right if _preserve_lower_dim_polygon_results else None
 
             if _preserve_lower_dim_polygon_results:
                 geom_intersect = _assemble_polygon_intersection_rows_with_lower_dim(
@@ -2176,6 +4244,10 @@ def _overlay_intersection_native(
                     pair_right,
                     geom_intersect,
                     keep_geom_type_warning=True,
+                    left_source=left_source_geoms,
+                    right_source=right_source_geoms,
+                    left_rows=source_idx1,
+                    right_rows=source_idx2,
                 )
                 idx1 = np.asarray(idx1, dtype=np.int32)[keep_mask]
                 idx2 = np.asarray(idx2, dtype=np.int32)[keep_mask]
@@ -2195,10 +4267,24 @@ def _overlay_intersection_native(
                     pair_right,
                     geom_intersect,
                     keep_geom_type_warning=False,
+                    left_source=left_source_geoms,
+                    right_source=right_source_geoms,
+                    left_rows=source_idx1,
+                    right_rows=source_idx2,
                 )
                 idx1 = np.asarray(idx1, dtype=np.int32)[keep_mask]
                 idx2 = np.asarray(idx2, dtype=np.int32)[keep_mask]
                 keep_geom_type_applied = True
+
+            geom_intersect = _repair_invalid_polygon_output_rows(geom_intersect)
+            if not _preserve_lower_dim_polygon_results:
+                geom_values = _geoseries_object_values(geom_intersect)
+                if np.any(shapely.get_type_id(geom_values) == 7):
+                    geom_intersect = GeoSeries(
+                        _strip_non_polygon_collection_parts(geom_values),
+                        index=geom_intersect.index,
+                        crs=geom_intersect.crs,
+                    )
 
         geom_intersect_owned = getattr(geom_intersect.values, "_owned", None)
         if geom_intersect_owned is not None:
@@ -2293,10 +4379,7 @@ def _overlay_difference_native(df1, df2, left_owned=None, right_owned=None, *, _
         d_idx1, d_idx2 = None, None
         _has_device_indices = False
 
-    polygon_inputs = (
-        df1.geom_type.isin(POLYGON_GEOM_TYPES).all()
-        and df2.geom_type.isin(POLYGON_GEOM_TYPES).all()
-    )
+    polygon_inputs = _series_all_polygons(df1.geometry) and _series_all_polygons(df2.geometry)
     if strict_native_mode_enabled() and polygon_inputs and len(idx1) > 0:
         idx1, idx2 = _filter_effective_polygon_difference_pairs(df1, df2, idx1, idx2)
 
@@ -2465,6 +4548,7 @@ def _overlay_intersection_export_result(
             attribute_assembler=_assemble_intersection_attributes,
             geometry_name="geometry",
             frame_type=GeoDataFrame,
+            prefer_native_attribute_projection=True,
         ),
         used_owned,
     )
@@ -2546,6 +4630,7 @@ def _overlay_identity_native(
                 attribute_assembler=_assemble_intersection_attributes,
                 geometry_name="geometry",
                 frame_type=GeoDataFrame,
+                prefer_native_attribute_projection=True,
             ),
             LeftConstructiveFragment(
                 result=difference_native,
@@ -2698,6 +4783,7 @@ def _overlay_union_native(
                 attribute_assembler=_assemble_intersection_attributes,
                 geometry_name="geometry",
                 frame_type=GeoDataFrame,
+                prefer_native_attribute_projection=True,
             ),
             symmetric_native,
         ),
@@ -2738,6 +4824,7 @@ def _reset_overlay_result_index(result: GeoDataFrame) -> GeoDataFrame:
     """Drop a non-default index without shedding owned geometry backing."""
     if isinstance(result.index, pd.RangeIndex):
         if result.index.start == 0 and result.index.step == 1 and result.index.stop == len(result):
+            _maybe_seed_polygon_validity_cache(result)
             return result
 
     geom_name = result._geometry_column_name
@@ -2764,6 +4851,7 @@ def _reset_overlay_result_index(result: GeoDataFrame) -> GeoDataFrame:
             reset = reset.set_crs(result.crs)
 
     reset.attrs.update(attrs)
+    _maybe_seed_polygon_validity_cache(reset)
     return reset
 
 
@@ -2881,8 +4969,13 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     else:
         keep_geom_type_warning = False
 
+    left_polygon_mask = _series_polygon_mask(df1.geometry)
+    right_polygon_mask = _series_polygon_mask(df2.geometry)
+    left_all_polygons = bool(left_polygon_mask.all())
+    right_all_polygons = bool(right_polygon_mask.all())
+
     for i, df in enumerate([df1, df2]):
-        poly_check = df.geom_type.isin(POLYGON_GEOM_TYPES).any()
+        poly_check = bool(left_polygon_mask.any()) if i == 0 else bool(right_polygon_mask.any())
         lines_check = df.geom_type.isin(LINE_GEOM_TYPES).any()
         points_check = df.geom_type.isin(POINT_GEOM_TYPES).any()
         if sum([poly_check, lines_check, points_check]) > 1:
@@ -2920,9 +5013,9 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
         ExecutionMode.GPU if boundary_prefers_exact_polygon_gpu else ExecutionMode.AUTO
     )
 
-    def _make_valid(df, *, dispatch_mode: ExecutionMode | str):
+    def _make_valid(df, *, dispatch_mode: ExecutionMode | str, all_polygons: bool):
         df = df.copy()
-        if df.geom_type.isin(POLYGON_GEOM_TYPES).all():
+        if all_polygons:
             # GPU make_valid path: when owned backing is available, route
             # through make_valid_owned to keep data device-resident and
             # avoid Shapely materialisation on the overlay critical path.
@@ -2932,6 +5025,14 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                 from vibespatial.constructive.make_valid_pipeline import (
                     make_valid_owned,
                 )
+                from vibespatial.constructive.validity import is_valid_owned
+
+                valid_mask = np.asarray(is_valid_owned(owned), dtype=bool)
+                if not bool(np.all(owned.validity)):
+                    valid_mask = valid_mask.copy()
+                    valid_mask[~owned.validity] = True
+                if valid_mask.all():
+                    return df
 
                 mv_result = make_valid_owned(
                     owned=owned,
@@ -2946,8 +5047,21 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                             new_ga = GeometryArray.from_owned(
                                 mv_result.owned, crs=df.crs,
                             )
-                        except (NotImplementedError, Exception):
-                            pass
+                        except Exception as exc:
+                            record_fallback_event(
+                                surface="geopandas.array.make_valid",
+                                reason=(
+                                    "owned make_valid output could not be rewrapped; "
+                                    "host materialization required"
+                                ),
+                                detail=(
+                                    f"rewrap_error={type(exc).__name__}: {exc}"
+                                ),
+                                requested=dispatch_mode,
+                                selected=ExecutionMode.CPU,
+                                pipeline="overlay._make_valid",
+                                d2h_transfer=True,
+                            )
                     if new_ga is None:
                         try:
                             from vibespatial.geometry.owned import (
@@ -2996,8 +5110,74 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
     if keep_geom_type:
         geom_type = df1.geom_type.iloc[0]
 
-    df1 = _make_valid(df1, dispatch_mode=boundary_make_valid_mode)
-    df2 = _make_valid(df2, dispatch_mode=boundary_make_valid_mode)
+    cached_intersection_index_result = None
+    if how == "intersection":
+        cached_intersection_index_result = get_cached_intersection_pairs(df1, df2)
+    if cached_intersection_index_result is not None:
+        cached_left_rows = np.unique(np.asarray(cached_intersection_index_result[0], dtype=np.int32))
+        cached_right_rows = np.unique(np.asarray(cached_intersection_index_result[1], dtype=np.int32))
+    else:
+        cached_left_rows = np.asarray([], dtype=np.int32)
+        cached_right_rows = np.asarray([], dtype=np.int32)
+    reuse_cached_intersection_index = (
+        cached_intersection_index_result is not None
+        and make_valid
+        and left_all_polygons
+        and right_all_polygons
+        and _candidate_rows_all_valid(df1.geometry, cached_left_rows)
+        and _candidate_rows_all_valid(df2.geometry, cached_right_rows)
+    )
+    if reuse_cached_intersection_index:
+        df1 = df1.copy()
+        df2 = df2.copy()
+    else:
+        cached_intersection_index_result = None
+        df1 = _make_valid(
+            df1,
+            dispatch_mode=boundary_make_valid_mode,
+            all_polygons=left_all_polygons,
+        )
+        df2 = _make_valid(
+            df2,
+            dispatch_mode=boundary_make_valid_mode,
+            all_polygons=right_all_polygons,
+        )
+
+    if _can_rewrite_single_mask_intersection_to_clip(
+        df1,
+        df2,
+        how=how,
+        left_all_polygons=left_all_polygons,
+        right_all_polygons=right_all_polygons,
+    ):
+        from vibespatial.api.tools.clip import clip as _clip_surface
+
+        result = _clip_surface(
+            df1,
+            df2.geometry.iloc[0],
+            keep_geom_type=keep_geom_type,
+            sort=False,
+        )
+        geometry_values = result.geometry.values
+        _used_owned = (
+            getattr(geometry_values, "_owned", None) is not None
+            or geometry_values.__class__.__name__ == "DeviceGeometryArray"
+        )
+        record_dispatch_event(
+            surface="geopandas.overlay",
+            operation="overlay_intersection",
+            implementation="clip_rewrite",
+            reason=(
+                "single-row geometry-only right mask rewrote overlay intersection to clip"
+            ),
+            detail=(
+                f"left_rows={len(df1)}, right_rows={len(df2)}, how={how}, "
+                f"used_owned={_used_owned}"
+            ),
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.GPU if _used_owned else ExecutionMode.CPU,
+        )
+        return _reset_overlay_result_index(result)
 
     # Extract owned arrays AFTER _make_valid.  GeometryArray.copy() now
     # preserves _owned backing, and __setitem__ invalidates it only for
@@ -3030,6 +5210,7 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                 ),
                 _preserve_lower_dim_polygon_results=(keep_geom_type is False),
                 _warn_on_dropped_lower_dim_polygon_results=keep_geom_type_warning,
+                _index_result=cached_intersection_index_result,
             )
         elif how == "symmetric_difference":
             result, _used_owned = _overlay_symmetric_diff(

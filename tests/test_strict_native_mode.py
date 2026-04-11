@@ -327,6 +327,11 @@ def test_strict_clip_concave_polygon_mask_matches_shapely_fixture(
     assert int(result.geometry.isna().sum()) == 0
     assert result.index.to_numpy().tolist() == expected_index.tolist()
     assert len(result) == len(expected_norm)
+    actual = shapely.normalize(np.asarray(result.geometry.values, dtype=object))
+    assert np.asarray(
+        shapely.equals(actual, expected_norm),
+        dtype=bool,
+    ).tolist() == [True] * len(expected_norm)
 
 
 @pytest.mark.gpu
@@ -447,6 +452,11 @@ def test_strict_clip_concave_polygon_mask_keeps_exact_subset_on_gpu() -> None:
         and event.selected.value == "gpu"
         for event in events
     )
+    assert not any(
+        event.surface == "vibespatial.kernels.constructive.polygon_rect_intersection"
+        and event.selected.value == "gpu"
+        for event in events
+    )
     assert all(
         getattr(getattr(event, "selected", None), "value", None) != "cpu"
         for event in events
@@ -488,6 +498,36 @@ def test_strict_clip_polygon_mask_preserves_geometry_array_after_concat(
 
     assert not called
     assert isinstance(result.geometry.values, GeometryArray | DeviceGeometryArray)
+
+
+@pytest.mark.gpu
+def test_strict_clip_concave_polygon_mask_preserves_multipart_results() -> None:
+    _require_gpu_runtime()
+    source = vibespatial.GeoDataFrame(
+        {"geometry": [box(4.0, 0.5, 7.0, 5.5)]},
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 5.0),
+            (6.0, 5.0),
+            (6.0, 6.0),
+            (0.0, 6.0),
+            (0.0, 0.0),
+        ]
+    )
+
+    with strict_native_environment():
+        result = vibespatial.clip(source, mask)
+
+    expected = shapely.intersection(source.geometry.iloc[0], mask)
+    assert len(result) == 1
+    assert result.geometry.iloc[0].geom_type == "MultiPolygon"
+    assert result.geometry.iloc[0].equals(expected)
 
 
 @pytest.mark.gpu

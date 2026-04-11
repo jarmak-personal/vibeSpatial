@@ -165,6 +165,35 @@ def test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss() -> None
     assert payload["launch"] in {"subprocess", "in_process_retry"}
 
 
+def test_shootout_postamble_runs_without_strict_native_env(tmp_path: Path) -> None:
+    script = tmp_path / "postamble_env_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import os",
+                "# --- timed work starts here ---",
+                "timed_flag = os.environ.get('VIBESPATIAL_STRICT_NATIVE')",
+                "# --- timed work ends here ---",
+                "print(f'TIMED={timed_flag};POST={os.environ.get(\"VIBESPATIAL_STRICT_NATIVE\")}')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run = _run_harness(
+        label="probe",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        env={**os.environ, "VIBESPATIAL_STRICT_NATIVE": "1"},
+        quiet=True,
+    )
+
+    assert run.error is None
+    assert "TIMED=1;POST=None" in run.stdout
+
+
 @pytest.mark.gpu
 def test_vibespatial_harness_pipeline_warm_drains_deferred_cache(
     tmp_path: Path,

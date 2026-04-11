@@ -327,14 +327,85 @@ _RING_WINDING_KERNEL_NAMES = ("compute_ring_winding",)
 # ---------------------------------------------------------------------------
 # GPU Polygon Centroid Kernel (NVRTC Tier 1)
 # ---------------------------------------------------------------------------
-# One thread per polygon.  Each thread traverses the exterior ring and
-# computes the centroid via the shoelace formula:
-#   cross_i = x_i * y_{i+1} - x_{i+1} * y_i
-#   signed_area = sum(cross_i) / 2
-#   cx = sum((x_i + x_{i+1}) * cross_i) / (6 * signed_area)
-#   cy = sum((y_i + y_{i+1}) * cross_i) / (6 * signed_area)
+# One thread per polygonal row.  The row centroid must incorporate every
+# polygon part and subtract hole contributions, not just the first ring.
+# Ring centroid coordinates are orientation-invariant; we therefore weight the
+# first ring of each polygon part by +abs(area) and later rings by -abs(area).
 
 _POLYGON_CENTROID_KERNEL_SOURCE = PRECISION_PREAMBLE + STRIP_CLOSURE_DEVICE + r"""
+__device__ int polygon_centroid_ring_terms(
+    const double* x,
+    const double* y,
+    int coord_start,
+    int coord_end,
+    double center_x,
+    double center_y,
+    compute_t* out_abs_area,
+    compute_t* out_cx,
+    compute_t* out_cy,
+    compute_t* out_mean_x,
+    compute_t* out_mean_y,
+    int* out_mean_n
+) {{
+    int n = coord_end - coord_start;
+    n = vs_strip_closure(x, y, coord_start, coord_end, n, 1e-24);
+    if (n < 3) {{
+        *out_abs_area = (compute_t)0.0;
+        *out_cx = (compute_t)0.0;
+        *out_cy = (compute_t)0.0;
+        *out_mean_x = (compute_t)0.0;
+        *out_mean_y = (compute_t)0.0;
+        *out_mean_n = 0;
+        return 0;
+    }}
+
+    compute_t sum_area = (compute_t)0.0;
+    compute_t sum_cx = (compute_t)0.0;
+    compute_t sum_cy = (compute_t)0.0;
+    compute_t c_area = (compute_t)0.0;
+    compute_t c_cx = (compute_t)0.0;
+    compute_t c_cy = (compute_t)0.0;
+
+    for (int i = 0; i < n; i++) {{
+        const int cur = coord_start + i;
+        const int nxt = coord_start + ((i + 1) % n);
+        const compute_t xi  = (compute_t)(x[cur] - center_x);
+        const compute_t yi  = (compute_t)(y[cur] - center_y);
+        const compute_t xi1 = (compute_t)(x[nxt] - center_x);
+        const compute_t yi1 = (compute_t)(y[nxt] - center_y);
+
+        const compute_t cross = xi * yi1 - xi1 * yi;
+        KAHAN_ADD(sum_area, cross, c_area);
+        KAHAN_ADD(sum_cx, (xi + xi1) * cross, c_cx);
+        KAHAN_ADD(sum_cy, (yi + yi1) * cross, c_cy);
+    }}
+
+    const compute_t signed_area = sum_area * (compute_t)0.5;
+    if (fabs(signed_area) < (compute_t)1e-30) {{
+        compute_t mx = (compute_t)0.0;
+        compute_t my = (compute_t)0.0;
+        for (int i = 0; i < n; i++) {{
+            mx += (compute_t)(x[coord_start + i] - center_x);
+            my += (compute_t)(y[coord_start + i] - center_y);
+        }}
+        *out_abs_area = (compute_t)0.0;
+        *out_cx = (compute_t)0.0;
+        *out_cy = (compute_t)0.0;
+        *out_mean_x = mx;
+        *out_mean_y = my;
+        *out_mean_n = n;
+        return 1;
+    }}
+
+    *out_abs_area = fabs(signed_area);
+    *out_cx = sum_cx / ((compute_t)6.0 * signed_area);
+    *out_cy = sum_cy / ((compute_t)6.0 * signed_area);
+    *out_mean_x = (compute_t)0.0;
+    *out_mean_y = (compute_t)0.0;
+    *out_mean_n = 0;
+    return 1;
+}}
+
 extern "C" __global__ void polygon_centroid(
     const double* x,
     const double* y,
@@ -349,62 +420,147 @@ extern "C" __global__ void polygon_centroid(
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= row_count) return;
 
-    /* Exterior ring is the first ring of the polygon. */
     const int first_ring = geometry_offsets[row];
-    const int coord_start = ring_offsets[first_ring];
-    const int coord_end = ring_offsets[first_ring + 1];
-    int n = coord_end - coord_start;
-
-    /* Strip closure vertex if present. */
-    n = vs_strip_closure(x, y, coord_start, coord_end, n, 1e-24);
-
-    if (n < 3) {{
-        cx[row] = 0.0 / 0.0;  /* NaN */
+    const int last_ring = geometry_offsets[row + 1];
+    if (first_ring == last_ring) {{
+        cx[row] = 0.0 / 0.0;
         cy[row] = 0.0 / 0.0;
         return;
     }}
 
-    compute_t sum_area = (compute_t)0.0;
-    compute_t sum_cx = (compute_t)0.0;
-    compute_t sum_cy = (compute_t)0.0;
-    /* Kahan compensation terms */
+    compute_t total_area = (compute_t)0.0;
+    compute_t total_cx = (compute_t)0.0;
+    compute_t total_cy = (compute_t)0.0;
     compute_t c_area = (compute_t)0.0;
     compute_t c_cx = (compute_t)0.0;
     compute_t c_cy = (compute_t)0.0;
+    compute_t mean_x = (compute_t)0.0;
+    compute_t mean_y = (compute_t)0.0;
+    int mean_n = 0;
 
-    for (int i = 0; i < n; i++) {{
-        const int cur = coord_start + i;
-        const int nxt = coord_start + ((i + 1) % n);
-        const compute_t xi  = CX(x[cur]);
-        const compute_t yi  = CY(y[cur]);
-        const compute_t xi1 = CX(x[nxt]);
-        const compute_t yi1 = CY(y[nxt]);
-
-        const compute_t cross = xi * yi1 - xi1 * yi;
-        KAHAN_ADD(sum_area, cross, c_area);
-        KAHAN_ADD(sum_cx, (xi + xi1) * cross, c_cx);
-        KAHAN_ADD(sum_cy, (yi + yi1) * cross, c_cy);
+    for (int ring = first_ring; ring < last_ring; ++ring) {{
+        compute_t ring_abs_area;
+        compute_t ring_cx;
+        compute_t ring_cy;
+        compute_t ring_mean_x;
+        compute_t ring_mean_y;
+        int ring_mean_n;
+        const int coord_start = ring_offsets[ring];
+        const int coord_end = ring_offsets[ring + 1];
+        if (!polygon_centroid_ring_terms(
+            x, y, coord_start, coord_end,
+            center_x, center_y,
+            &ring_abs_area, &ring_cx, &ring_cy,
+            &ring_mean_x, &ring_mean_y, &ring_mean_n
+        )) {{
+            continue;
+        }}
+        if (ring_mean_n > 0) {{
+            mean_x += ring_mean_x;
+            mean_y += ring_mean_y;
+            mean_n += ring_mean_n;
+            continue;
+        }}
+        const compute_t weight = (ring == first_ring) ? ring_abs_area : -ring_abs_area;
+        KAHAN_ADD(total_area, weight, c_area);
+        KAHAN_ADD(total_cx, ring_cx * weight, c_cx);
+        KAHAN_ADD(total_cy, ring_cy * weight, c_cy);
     }}
 
-    const compute_t signed_area = sum_area * (compute_t)0.5;
-
-    if (fabs(signed_area) < (compute_t)1e-30) {{
-        /* Degenerate polygon -- fall back to coordinate mean. */
-        compute_t mx = (compute_t)0.0, my = (compute_t)0.0;
-        for (int i = 0; i < n; i++) {{
-            mx += CX(x[coord_start + i]);
-            my += CY(y[coord_start + i]);
+    if (fabs(total_area) < (compute_t)1e-30) {{
+        if (mean_n == 0) {{
+            cx[row] = 0.0 / 0.0;
+            cy[row] = 0.0 / 0.0;
+            return;
         }}
-        /* Un-center: add back center to get absolute coordinates. */
-        cx[row] = (double)(mx / (compute_t)n) + center_x;
-        cy[row] = (double)(my / (compute_t)n) + center_y;
+        cx[row] = (double)(mean_x / (compute_t)mean_n) + center_x;
+        cy[row] = (double)(mean_y / (compute_t)mean_n) + center_y;
     }} else {{
-        /* Un-center: centroid of centered coords + center offset. */
-        cx[row] = (double)(sum_cx / ((compute_t)6.0 * signed_area)) + center_x;
-        cy[row] = (double)(sum_cy / ((compute_t)6.0 * signed_area)) + center_y;
+        cx[row] = (double)(total_cx / total_area) + center_x;
+        cy[row] = (double)(total_cy / total_area) + center_y;
+    }}
+}}
+
+extern "C" __global__ void multipolygon_centroid(
+    const double* x,
+    const double* y,
+    const int* ring_offsets,
+    const int* part_offsets,
+    const int* geometry_offsets,
+    double* cx,
+    double* cy,
+    double center_x,
+    double center_y,
+    int row_count
+) {{
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= row_count) return;
+
+    const int first_polygon = geometry_offsets[row];
+    const int last_polygon = geometry_offsets[row + 1];
+    if (first_polygon == last_polygon) {{
+        cx[row] = 0.0 / 0.0;
+        cy[row] = 0.0 / 0.0;
+        return;
+    }}
+
+    compute_t total_area = (compute_t)0.0;
+    compute_t total_cx = (compute_t)0.0;
+    compute_t total_cy = (compute_t)0.0;
+    compute_t c_area = (compute_t)0.0;
+    compute_t c_cx = (compute_t)0.0;
+    compute_t c_cy = (compute_t)0.0;
+    compute_t mean_x = (compute_t)0.0;
+    compute_t mean_y = (compute_t)0.0;
+    int mean_n = 0;
+
+    for (int polygon = first_polygon; polygon < last_polygon; ++polygon) {{
+        const int first_ring = part_offsets[polygon];
+        const int last_ring = part_offsets[polygon + 1];
+        for (int ring = first_ring; ring < last_ring; ++ring) {{
+            compute_t ring_abs_area;
+            compute_t ring_cx;
+            compute_t ring_cy;
+            compute_t ring_mean_x;
+            compute_t ring_mean_y;
+            int ring_mean_n;
+            const int coord_start = ring_offsets[ring];
+            const int coord_end = ring_offsets[ring + 1];
+            if (!polygon_centroid_ring_terms(
+                x, y, coord_start, coord_end,
+                center_x, center_y,
+                &ring_abs_area, &ring_cx, &ring_cy,
+                &ring_mean_x, &ring_mean_y, &ring_mean_n
+            )) {{
+                continue;
+            }}
+            if (ring_mean_n > 0) {{
+                mean_x += ring_mean_x;
+                mean_y += ring_mean_y;
+                mean_n += ring_mean_n;
+                continue;
+            }}
+            const compute_t weight = (ring == first_ring) ? ring_abs_area : -ring_abs_area;
+            KAHAN_ADD(total_area, weight, c_area);
+            KAHAN_ADD(total_cx, ring_cx * weight, c_cx);
+            KAHAN_ADD(total_cy, ring_cy * weight, c_cy);
+        }}
+    }}
+
+    if (fabs(total_area) < (compute_t)1e-30) {{
+        if (mean_n == 0) {{
+            cx[row] = 0.0 / 0.0;
+            cy[row] = 0.0 / 0.0;
+            return;
+        }}
+        cx[row] = (double)(mean_x / (compute_t)mean_n) + center_x;
+        cy[row] = (double)(mean_y / (compute_t)mean_n) + center_y;
+    }} else {{
+        cx[row] = (double)(total_cx / total_area) + center_x;
+        cy[row] = (double)(total_cy / total_area) + center_y;
     }}
 }}
 """
-_POLYGON_CENTROID_KERNEL_NAMES = ("polygon_centroid",)
+_POLYGON_CENTROID_KERNEL_NAMES = ("polygon_centroid", "multipolygon_centroid")
 _POLYGON_CENTROID_FP64_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="double")
 _POLYGON_CENTROID_FP32_SOURCE = _POLYGON_CENTROID_KERNEL_SOURCE.format(compute_type="float")

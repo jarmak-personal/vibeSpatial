@@ -36,12 +36,14 @@ dy = (bounds[3] - bounds[1]) * 0.2
 clip_box = box(bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
 clipped = gpd.clip(parcels, clip_box)
 
-# Spatial join: parcels vs zones
-joined = gpd.sjoin(clipped, zones, predicate="intersects")
-
-# Filter to polygonal types before overlay (overlay rejects mixed types)
+# Filter to polygonal types once before the relational steps. The parcel-zone
+# overlap workload only consumes polygonal fragments downstream, and overlay
+# rejects mixed geometry families anyway.
 poly_mask = clipped.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
 clipped_poly = clipped[poly_mask] if not poly_mask.all() else clipped
+
+# Spatial join: parcels vs zones
+joined = gpd.sjoin(clipped_poly, zones, predicate="intersects")
 
 # Overlay intersection
 overlaid = gpd.overlay(clipped_poly, zones, how="intersection")

@@ -36,6 +36,10 @@ _many_vs_one_overlay_warm_lock = threading.Lock()
 _many_vs_one_overlay_warm_done = False
 _overlay_difference_warm_lock = threading.Lock()
 _overlay_difference_warm_done = False
+_device_linestring_buffer_warm_lock = threading.Lock()
+_device_linestring_buffer_warm_done = False
+_device_centroid_buffer_warm_lock = threading.Lock()
+_device_centroid_buffer_warm_done = False
 
 
 def precompile_enabled() -> bool:
@@ -1110,6 +1114,8 @@ def ensure_pipelines_warm(timeout: float = 60.0) -> dict[str, Any]:
     _warm_exact_polygon_intersection_route(timeout=timeout)
     _warm_many_vs_one_overlay_remainder_route(timeout=timeout)
     _warm_overlay_difference_segmented_union_route(timeout=timeout)
+    _warm_device_linestring_buffer_route(timeout=timeout)
+    _warm_device_centroid_buffer_route(timeout=timeout)
     result["cccl_cold"].extend(_drain_requested_cccl_specs(timeout))
     if NVRTCPrecompiler._instance is not None:
         result["nvrtc_cold"].extend(NVRTCPrecompiler.get().ensure_warm(timeout=timeout))
@@ -1309,6 +1315,102 @@ def _warm_overlay_difference_segmented_union_route(timeout: float = 60.0) -> Non
             return
 
         _overlay_difference_warm_done = True
+
+
+def _warm_device_linestring_buffer_route(timeout: float = 60.0) -> None:
+    """Warm the device-resident public linestring-buffer route.
+
+    Small device-resident corridor-style line buffers now stay on the GPU to
+    preserve ADR-0042's device-native boundary. Prime that exact public route
+    here so shootout subprocesses do not pay the first-use NVRTC/CCCL tax
+    inside their timed stage.
+    """
+    global _device_linestring_buffer_warm_done
+
+    with _device_linestring_buffer_warm_lock:
+        if _device_linestring_buffer_warm_done:
+            return
+
+        try:
+            from vibespatial.api.geoseries import GeoSeries
+            from vibespatial.geometry.device_array import DeviceGeometryArray
+            from vibespatial.runtime import has_gpu_runtime
+            from vibespatial.runtime.residency import Residency, TransferTrigger
+
+            if not has_gpu_runtime():
+                return
+
+            owned = GeoSeries.from_wkt(
+                [
+                    "LINESTRING (0 0, 2 1, 4 0)",
+                    "LINESTRING (5 0, 7 1, 9 0)",
+                ],
+                crs="EPSG:3857",
+            ).values.to_owned()
+            owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="warm device linestring-buffer public route on device",
+            )
+            _drain_requested_pipeline_compilation(timeout)
+            DeviceGeometryArray._from_owned(owned, crs="EPSG:3857").buffer(1.0)
+        except Exception:
+            logger.debug(
+                "device linestring-buffer warm probe failed",
+                exc_info=True,
+            )
+            return
+
+        _device_linestring_buffer_warm_done = True
+
+
+def _warm_device_centroid_buffer_route(timeout: float = 60.0) -> None:
+    """Warm the device polygon-centroid -> point-buffer public route.
+
+    Flood exposure and related public flows produce a device-backed polygon
+    column, then call ``centroid.buffer(...)`` on a filtered subset. The
+    generic NVRTC/CCCL warm registry compiles the constituent units, but the
+    first real public invocation in a fresh child process still pays route
+    setup and module-load cost. Prime that exact route here so short-lived
+    shootout subprocesses do not take the hit in their timed stage.
+    """
+    global _device_centroid_buffer_warm_done
+
+    with _device_centroid_buffer_warm_lock:
+        if _device_centroid_buffer_warm_done:
+            return
+
+        try:
+            from vibespatial.api.geoseries import GeoSeries
+            from vibespatial.geometry.device_array import DeviceGeometryArray
+            from vibespatial.runtime import has_gpu_runtime
+            from vibespatial.runtime.residency import Residency, TransferTrigger
+
+            if not has_gpu_runtime():
+                return
+
+            owned = GeoSeries.from_wkt(
+                [
+                    "POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))",
+                    "POLYGON ((5 0, 9 0, 9 4, 5 4, 5 0))",
+                ],
+                crs="EPSG:3857",
+            ).values.to_owned()
+            owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason="warm device centroid->buffer public route on device",
+            )
+            _drain_requested_pipeline_compilation(timeout)
+            DeviceGeometryArray._from_owned(owned, crs="EPSG:3857").centroid.buffer(50.0)
+        except Exception:
+            logger.debug(
+                "device centroid->buffer warm probe failed",
+                exc_info=True,
+            )
+            return
+
+        _device_centroid_buffer_warm_done = True
 
 # Modules whose import triggers request_nvrtc_warmup() at module scope.
 _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (

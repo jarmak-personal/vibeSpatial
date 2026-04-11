@@ -34,6 +34,7 @@ from vibespatial.cuda._runtime import (  # noqa: E402
     compile_kernel_group,
     count_scatter_total,
     get_cuda_runtime,
+    maybe_trim_pool_memory,
 )
 from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
@@ -1041,8 +1042,9 @@ def _main_sweep_scatter_and_filter(
         if b_raw_count == 0:
             continue
 
-        # Release pool fragmentation between batches.
-        runtime.free_pool_memory()
+        # Only trim the pool when explicitly enabled. Forced GC between
+        # normal batches dominates warmed overlay/clip workloads.
+        maybe_trim_pool_memory(runtime)
 
         b_left, b_right = _scatter_and_filter_single(
             runtime=runtime,

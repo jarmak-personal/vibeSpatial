@@ -4,6 +4,7 @@ import shapely
 from shapely.geometry import Point, box
 
 import vibespatial.api as geopandas
+from vibespatial.geometry.device_array import DeviceGeometryArray
 
 
 def test_outer_sjoin_uses_owned_query_dispatch_for_supported_inputs() -> None:
@@ -51,3 +52,26 @@ def test_geometry_array_owned_spatial_index_is_cached_for_outer_sjoin() -> None:
 
     assert owned1 is owned2
     assert flat1 is flat2
+
+
+def test_large_left_tiny_right_intersects_prefers_host_strtree_dispatch() -> None:
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    left = geopandas.GeoDataFrame(
+        {"left": list(range(512))},
+        geometry=DeviceGeometryArray._from_sequence([Point(float(i), 0.0) for i in range(512)]),
+    )
+    right = geopandas.GeoDataFrame(
+        {"right": [1, 2]},
+        geometry=DeviceGeometryArray._from_sequence(
+            [box(-0.5, -0.5, 0.5, 0.5), box(1000.0, -0.5, 1001.0, 0.5)]
+        ),
+    )
+
+    result = geopandas.sjoin(left, right, how="inner", predicate="intersects")
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+
+    assert len(result) == 1
+    assert result["left"].tolist() == [0]
+    assert dispatch_events
+    assert dispatch_events[-1].implementation == "strtree_host"
