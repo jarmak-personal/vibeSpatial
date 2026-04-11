@@ -335,11 +335,12 @@ def test_hybrid_properties_materialize_host_state_lazily(monkeypatch, tmp_path):
 
 
 @needs_gpu
-def test_track_properties_false_skips_boundary_host_copy_and_keeps_lazy_properties(
+def test_track_properties_false_drops_property_retention_and_stays_explicit(
     monkeypatch,
     tmp_path,
 ):
     import vibespatial.io.geojson_gpu as io_geojson_gpu
+    import vibespatial.io.kvikio_reader as io_kvikio
 
     features = [
         _make_polygon_feature(_simple_square(0, 0), {"id": 1, "name": "alpha"}),
@@ -348,11 +349,25 @@ def test_track_properties_false_skips_boundary_host_copy_and_keeps_lazy_properti
     fc = _make_feature_collection(features)
     path = tmp_path / "test_props_geometry_only.geojson"
     _write_geojson(path, fc)
+    raw = path.read_bytes()
 
     def fail_asnumpy(*_args, **_kwargs):
         raise AssertionError("geometry-only GPU GeoJSON read should not copy feature boundaries to host")
 
+    def fail_fromfile(*_args, **_kwargs):
+        raise AssertionError("geometry-only GPU GeoJSON read should not re-read host bytes")
+
+    def fake_read_file_to_device(path_arg: Path, file_size: int):
+        assert path_arg == path
+        assert file_size == len(raw)
+        return io_kvikio.FileReadResult(
+            device_bytes=cp.asarray(np.frombuffer(raw, dtype=np.uint8)),
+            host_bytes=None,
+        )
+
     monkeypatch.setattr(io_geojson_gpu.cp, "asnumpy", fail_asnumpy)
+    monkeypatch.setattr(io_kvikio, "read_file_to_device", fake_read_file_to_device)
+    monkeypatch.setattr(io_geojson_gpu.np, "fromfile", fail_fromfile)
 
     batch = read_geojson_owned(
         path,
@@ -360,12 +375,12 @@ def test_track_properties_false_skips_boundary_host_copy_and_keeps_lazy_properti
         track_properties=False,
     )
 
-    props = batch.properties
+    assert batch._properties is None
+    assert batch._properties_json is None
+    assert batch._properties_loader is None
 
-    assert props[0]["id"] == 1
-    assert props[0]["name"] == "alpha"
-    assert props[1]["id"] == 2
-    assert props[1]["name"] == "beta"
+    with pytest.raises(RuntimeError, match="track_properties=True"):
+        _ = batch.properties
 
 
 # ---------------------------------------------------------------------------

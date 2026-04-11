@@ -73,9 +73,19 @@ class GeoJSONOwnedBatch:
     _properties: list[dict[str, object]] | None = None
     _properties_json: list[str | None] | None = None
     _properties_loader: Callable[[], list[dict[str, object]]] | None = None
+    _tracks_properties: bool = True
 
     @property
     def properties(self) -> list[dict[str, object]]:
+        if (
+            not self._tracks_properties
+            and self._properties is None
+            and self._properties_json is None
+            and self._properties_loader is None
+        ):
+            raise RuntimeError(
+                "GeoJSON properties were not retained; re-read with track_properties=True"
+            )
         if self._properties is None:
             if self._properties_loader is not None:
                 self._properties = self._properties_loader()
@@ -84,6 +94,12 @@ class GeoJSONOwnedBatch:
                 self._properties = _decode_geojson_property_json_values(self._properties_json or [])
             self._properties_json = None
         return self._properties
+
+    def without_properties(self) -> GeoJSONOwnedBatch:
+        return GeoJSONOwnedBatch(
+            geometry=self.geometry,
+            _tracks_properties=False,
+        )
 
 
 @dataclass(frozen=True)
@@ -1333,6 +1349,11 @@ def read_geojson_owned(
                 resolved,
                 capture_feature_boundaries=track_properties,
             )
+            if not track_properties:
+                return GeoJSONOwnedBatch(
+                    geometry=result.owned,
+                    _tracks_properties=False,
+                )
             return GeoJSONOwnedBatch(
                 geometry=result.owned,
                 _properties_loader=result.properties_loader(),
@@ -1377,34 +1398,38 @@ def read_geojson_owned(
         reason=plan.reason,
         selected=ExecutionMode.CPU,
     )
+    batch: GeoJSONOwnedBatch
     if plan.selected_strategy == "simdjson":
-        return _read_geojson_owned_simdjson(data)
+        batch = _read_geojson_owned_simdjson(data)
+        return batch if track_properties else batch.without_properties()
     text = data if isinstance(data, str) else data.decode("utf-8")
     if plan.selected_strategy == "fast-json":
-        return _read_geojson_owned_fast_json(text)
-    if plan.selected_strategy == "chunked":
-        return _read_geojson_owned_chunked(text)
-    if plan.selected_strategy == "full-json":
-        return _read_geojson_owned_full_json(text)
-    if plan.selected_strategy == "pylibcudf":
-        return _read_geojson_owned_pylibcudf(text)
-    if plan.selected_strategy == "pylibcudf-arrays":
+        batch = _read_geojson_owned_fast_json(text)
+    elif plan.selected_strategy == "chunked":
+        batch = _read_geojson_owned_chunked(text)
+    elif plan.selected_strategy == "full-json":
+        batch = _read_geojson_owned_full_json(text)
+    elif plan.selected_strategy == "pylibcudf":
+        batch = _read_geojson_owned_pylibcudf(text)
+    elif plan.selected_strategy == "pylibcudf-arrays":
         array_batch = _read_geojson_owned_pylibcudf_arrays(text)
         if array_batch is None:
             raise ValueError(
                 "experimental GeoJSON wildcard-array GPU path requires a homogeneous geometry family"
             )
-        return array_batch
-    if plan.selected_strategy == "pylibcudf-rowized":
+        batch = array_batch
+    elif plan.selected_strategy == "pylibcudf-rowized":
         rowized = _read_geojson_owned_pylibcudf_rowized(text)
         if rowized is None:
             raise ValueError(
                 "experimental GeoJSON rowized GPU path requires a homogeneous feature schema"
             )
-        return rowized
-    if plan.selected_strategy == "tokenizer":
-        return _read_geojson_owned_tokenizer(text)
-    return _read_geojson_owned_stream(text)
+        batch = rowized
+    elif plan.selected_strategy == "tokenizer":
+        batch = _read_geojson_owned_tokenizer(text)
+    else:
+        batch = _read_geojson_owned_stream(text)
+    return batch if track_properties else batch.without_properties()
 
 
 def benchmark_geojson_ingest(

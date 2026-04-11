@@ -649,6 +649,26 @@ def test_read_geojson_native_returns_shared_native_boundary(
     assert payload.attributes["value"].tolist() == [10, 20]
 
 
+def test_read_geojson_native_without_properties_returns_geometry_only_payload(tmp_path) -> None:
+    path = tmp_path / "native-geometry-only.geojson"
+    frame = geopandas.GeoDataFrame(
+        {
+            "id": [1, 2],
+            "value": [10, 20],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        }
+    )
+    path.write_text(frame.to_json())
+
+    payload = read_geojson_native(path, prefer="fast-json", track_properties=False)
+    materialized = payload.to_geodataframe()
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.row_count == 2
+    assert tuple(payload.attributes.columns) == ()
+    assert list(materialized.columns) == ["geometry"]
+
+
 def test_geojson_gpu_native_boundary_keeps_properties_lazy_until_materialization() -> None:
     load_calls = 0
     owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])

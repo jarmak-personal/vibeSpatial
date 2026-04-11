@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 261/280 lines
+Body Budget: 264/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-54 | Decision |
 | 55-64 | Performance Notes |
-| 65-171 | Current Behavior |
-| 172-261 | Measured Local Baseline |
+| 65-174 | Current Behavior |
+| 175-264 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -126,6 +126,9 @@ keeping GPU-native formats primary and legacy formats explicit.
   The shared native read boundary now preserves GeoJSON properties lazily
   until explicit attribute access or terminal public export, so geometry-only
   native consumers do not pay the property parse cost up front.
+  Explicit `track_properties=False` reads now drop property retention
+  completely; accessing properties after a geometry-only read is an explicit
+  contract error and requires a re-read with `track_properties=True`.
 - Shapefile remains an explicit hybrid compatibility boundary because the
   container and DBF attribute story are still legacy-oriented even when
   geometry decode is native.
