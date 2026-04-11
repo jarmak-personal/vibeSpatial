@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from time import perf_counter
 from typing import Any
@@ -129,6 +129,12 @@ class MixedGeoArrowView:
     family_row_offsets: np.ndarray
     families: dict[GeometryFamily, GeoArrowBufferView]
     shares_memory: bool = False
+    _cached_shared_family_buffers: tuple[tuple[GeometryFamily, FamilyGeometryBuffer], ...] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass
@@ -2174,21 +2180,28 @@ def _build_shared_geoarrow_owned(
     *,
     residency: Residency,
 ) -> OwnedGeometryArray:
-    families = {
-        family: FamilyGeometryBuffer(
-            family=family,
-            schema=get_geometry_buffer_schema(family),
-            row_count=int(buffer.empty_mask.size),
-            x=buffer.x,
-            y=buffer.y,
-            geometry_offsets=buffer.geometry_offsets,
-            empty_mask=buffer.empty_mask,
-            part_offsets=buffer.part_offsets,
-            ring_offsets=buffer.ring_offsets,
-            bounds=buffer.bounds,
+    cached_family_buffers = view._cached_shared_family_buffers
+    if cached_family_buffers is None:
+        cached_family_buffers = tuple(
+            (
+                family,
+                FamilyGeometryBuffer(
+                    family=family,
+                    schema=get_geometry_buffer_schema(family),
+                    row_count=int(buffer.empty_mask.size),
+                    x=buffer.x,
+                    y=buffer.y,
+                    geometry_offsets=buffer.geometry_offsets,
+                    empty_mask=buffer.empty_mask,
+                    part_offsets=buffer.part_offsets,
+                    ring_offsets=buffer.ring_offsets,
+                    bounds=buffer.bounds,
+                ),
+            )
+            for family, buffer in view.families.items()
         )
-        for family, buffer in view.families.items()
-    }
+        object.__setattr__(view, "_cached_shared_family_buffers", cached_family_buffers)
+    families = dict(cached_family_buffers)
     array = OwnedGeometryArray(
         validity=view.validity,
         tags=view.tags,

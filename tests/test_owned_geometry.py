@@ -118,6 +118,20 @@ def test_geoarrow_share_mode_reuses_cached_view_object() -> None:
     assert first is second
 
 
+def test_geoarrow_share_mode_reuses_cached_family_wrappers_on_import() -> None:
+    owned = from_shapely_geometries(_sample_geometries())
+    shared_view = owned.to_geoarrow(sharing=BufferSharingMode.SHARE)
+
+    first = from_geoarrow(shared_view, sharing=BufferSharingMode.AUTO)
+    second = from_geoarrow(shared_view, sharing=BufferSharingMode.AUTO)
+
+    point_family = next(iter(first.families))
+    assert first is not second
+    assert first.families is not second.families
+    assert first.families[point_family] is second.families[point_family]
+    assert np.shares_memory(first.validity, second.validity)
+
+
 def test_bounds_and_total_bounds_ignore_nulls_and_empty() -> None:
     owned = from_shapely_geometries(_sample_geometries())
 

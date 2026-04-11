@@ -47606,6 +47606,7 @@
         "test_geoarrow_style_round_trip_preserves_family_buffers",
         "test_geoarrow_share_mode_reuses_buffers_and_delays_host_geometry_materialization",
         "test_geoarrow_share_mode_reuses_cached_view_object",
+        "test_geoarrow_share_mode_reuses_cached_family_wrappers_on_import",
         "test_bounds_and_total_bounds_ignore_nulls_and_empty",
         "test_offset_spans_expose_payload_hierarchy",
         "test_morton_keys_place_null_and_empty_at_end",
@@ -47655,6 +47656,7 @@
         "holes",
         "host",
         "ignore",
+        "import",
         "indices",
         "keys",
         "make",
@@ -47700,7 +47702,8 @@
         "trip",
         "view",
         "when",
-        "wkb"
+        "wkb",
+        "wrappers"
       ]
     },
     {
