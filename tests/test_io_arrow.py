@@ -1581,6 +1581,49 @@ def test_geoseries_to_arrow_mixed_family_records_explicit_fallback() -> None:
     assert any("geometry mix" in event.reason or "geometry mix" in event.detail for event in fallbacks)
 
 
+@pytest.mark.parametrize(
+    ("values", "extension_name"),
+    [
+        ([Point(0, 0), MultiPoint([(1, 1), (2, 2)])], b"geoarrow.multipoint"),
+        (
+            [
+                LineString([(0, 0), (1, 1)]),
+                MultiLineString([[(2, 2), (3, 3)], [(4, 4), (5, 5)]]),
+            ],
+            b"geoarrow.multilinestring",
+        ),
+        (
+            [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+                MultiPolygon([Polygon([(2, 0), (3, 0), (3, 1), (2, 0)])]),
+            ],
+            b"geoarrow.multipolygon",
+        ),
+    ],
+)
+def test_geoseries_to_arrow_supported_single_multi_mix_uses_native_geoarrow_promotion(
+    values,
+    extension_name,
+) -> None:
+    geopandas.clear_fallback_events()
+    series = geopandas.GeoSeries(values, crs="EPSG:4326")
+
+    arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
+    schema_capsule, array_capsule = arrow_array.__arrow_c_array__()
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+    pa_array = pa.Array._import_from_c_capsule(field.__arrow_c_schema__(), array_capsule)
+    expected_field, expected_array = api_geoarrow.construct_geometry_array(
+        np.asarray(values, dtype=object),
+        field_name="",
+        crs=series.crs,
+    )
+
+    assert field.metadata[b"ARROW:extension:name"] == extension_name
+    assert field.equals(expected_field, check_metadata=True)
+    assert pa_array.to_pylist() == expected_array.to_pylist()
+    assert geopandas.get_fallback_events(clear=True) == []
+
+
 def test_geoseries_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     geopandas.clear_fallback_events()
     series = geopandas.GeoSeries([Point(0, 0), Point(1, 1), Point(2, 2)])
@@ -1692,6 +1735,39 @@ def test_geodataframe_to_arrow_device_geoarrow_raises_strict_native_before_host_
         and "compatibility export" in event.reason
         for event in fallbacks
     )
+
+
+def test_geodataframe_to_arrow_device_supported_single_multi_mix_avoids_fallback_and_materialization() -> None:
+    geopandas.clear_fallback_events()
+    gdf, owned = _make_device_dga_gdf([Point(0, 0), MultiPoint([(1, 1), (2, 2)])])
+    owned.diagnostics.clear()
+
+    arrow_table = io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow")
+    table = pa.table(arrow_table)
+    field = table.schema.field("geometry")
+    mat_events = [event for event in owned.diagnostics if event.kind == DiagnosticKind.MATERIALIZATION]
+
+    assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.multipoint"
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert mat_events == []
+
+
+def test_geodataframe_to_arrow_device_supported_single_multi_mix_succeeds_in_strict_native() -> None:
+    from vibespatial.testing import strict_native_environment
+
+    geopandas.clear_fallback_events()
+    gdf, owned = _make_device_dga_gdf([Point(0, 0), MultiPoint([(1, 1), (2, 2)])])
+    owned.diagnostics.clear()
+
+    with strict_native_environment():
+        arrow_table = io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow")
+
+    table = pa.table(arrow_table)
+    mat_events = [event for event in owned.diagnostics if event.kind == DiagnosticKind.MATERIALIZATION]
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.multipoint"
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert mat_events == []
 
 
 def _interleaved_leaf_name(data_type) -> str | None:

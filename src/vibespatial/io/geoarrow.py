@@ -11,6 +11,7 @@ from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_sch
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import (
     FAMILY_TAGS,
+    TAG_FAMILIES,
     BufferSharingMode,
     DiagnosticKind,
     FamilyGeometryBuffer,
@@ -29,7 +30,6 @@ from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb import (
     _encode_native_wkb,
     _encode_owned_wkb_array,
-    _homogeneous_family,
     decode_wkb_arrow_array_owned,
     decode_wkb_owned,
     plan_wkb_partition,
@@ -252,15 +252,24 @@ def encode_owned_geoarrow_array(
     crs: Any | None = None,
     interleaved: bool = True,
 ):
-    family = _homogeneous_family(array)
     validity, tags, family_row_offsets, families = _authoritative_geoarrow_host_view(array)
-    buffer = families[family]
-    view = SimpleNamespace(
-        row_count=int(validity.size),
-        validity=validity,
-        tags=tags,
-        family_row_offsets=family_row_offsets,
-    )
+    family, requires_promotion = _geoarrow_export_family_from_tags(validity, tags)
+    if requires_promotion:
+        buffer, view = _promote_supported_geoarrow_mix(
+            export_family=family,
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=families,
+        )
+    else:
+        buffer = families[family]
+        view = SimpleNamespace(
+            row_count=int(validity.size),
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+        )
     if family.value == "point":
         return _encode_point_family(buffer, view, field_name=field_name, crs=crs, interleaved=interleaved)
     mapping = {
@@ -302,7 +311,7 @@ def _owned_geoarrow_fast_path_reason(series, *, include_z: bool | None) -> str |
     if bool(shapely.has_z(present).any()):
         return "3D geometry rows require upstream GeoArrow constructor semantics"
     try:
-        _homogeneous_family(arr.to_owned())
+        _geoarrow_export_family_from_family_set(_owned_geoarrow_family_set(arr.to_owned()))
     except ValueError as exc:
         return str(exc)
     return None
@@ -320,7 +329,7 @@ def _owned_geoarrow_fast_path_reason_from_owned(
     if not bool(owned.validity.any()):
         return "all-missing geometry column requires upstream GeoArrow constructor semantics"
     try:
-        _homogeneous_family(owned)
+        _geoarrow_export_family_from_family_set(_owned_geoarrow_family_set(owned))
     except ValueError as exc:
         return str(exc)
     return None
@@ -393,6 +402,320 @@ _SUPPORTED_GEOARROW_MIXES = {
     frozenset({"LineString", "MultiLineString"}),
     frozenset({"Polygon", "MultiPolygon"}),
 }
+
+_SUPPORTED_GEOARROW_PROMOTIONS = {
+    frozenset({GeometryFamily.POINT, GeometryFamily.MULTIPOINT}): GeometryFamily.MULTIPOINT,
+    frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING}): GeometryFamily.MULTILINESTRING,
+    frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}): GeometryFamily.MULTIPOLYGON,
+}
+
+
+def _geoarrow_export_family_from_family_set(
+    family_set: frozenset[GeometryFamily],
+) -> tuple[GeometryFamily, bool]:
+    if len(family_set) == 1:
+        return next(iter(family_set)), False
+    promoted_family = _SUPPORTED_GEOARROW_PROMOTIONS.get(family_set)
+    if promoted_family is not None:
+        return promoted_family, True
+    raise ValueError("Geometry type combination is not supported for native GeoArrow encoding")
+
+
+def _owned_geoarrow_family_set(owned: OwnedGeometryArray) -> frozenset[GeometryFamily]:
+    if owned.device_state is not None:
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - exercised on CPU-only installs
+            cp = None
+    else:
+        cp = None
+
+    if cp is not None:
+        state = owned._ensure_device_state()
+        validity = cp.asarray(state.validity)
+        valid_count = int(cp.count_nonzero(validity).item())
+        if valid_count == 0:
+            return frozenset()
+        valid_tags = cp.asarray(state.tags)[validity]
+        unique_tags = tuple(int(tag) for tag in cp.unique(valid_tags).get())
+    else:
+        valid_tags = owned.tags[owned.validity]
+        if valid_tags.size == 0:
+            return frozenset()
+        unique_tags = tuple(int(tag) for tag in np.unique(valid_tags))
+    return frozenset(TAG_FAMILIES[tag] for tag in unique_tags)
+
+
+def _geoarrow_export_family_from_tags(
+    validity: np.ndarray,
+    tags: np.ndarray,
+) -> tuple[GeometryFamily, bool]:
+    valid_tags = np.asarray(tags[validity], dtype=np.int8)
+    if valid_tags.size == 0:
+        raise ValueError("GeoArrow export requires at least one valid geometry row")
+    family_set = frozenset(TAG_FAMILIES[int(tag)] for tag in np.unique(valid_tags))
+    return _geoarrow_export_family_from_family_set(family_set)
+
+
+def _promoted_geoarrow_row_view(validity: np.ndarray):
+    family_row_offsets = np.full(validity.size, -1, dtype=np.int32)
+    if bool(validity.any()):
+        family_row_offsets[validity] = np.arange(int(validity.sum()), dtype=np.int32)
+    return SimpleNamespace(
+        row_count=int(validity.size),
+        validity=validity,
+        family_row_offsets=family_row_offsets,
+    )
+
+
+def _promote_point_multipoint_mix(
+    *,
+    validity: np.ndarray,
+    tags: np.ndarray,
+    family_row_offsets: np.ndarray,
+    families: dict[GeometryFamily, FamilyGeometryBuffer],
+):
+    point_buffer = families.get(GeometryFamily.POINT)
+    multipoint_buffer = families.get(GeometryFamily.MULTIPOINT)
+    x_chunks: list[np.ndarray] = []
+    y_chunks: list[np.ndarray] = []
+    geometry_offsets = [0]
+    empty_mask: list[bool] = []
+    point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+    multipoint_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+    for row_index in range(validity.size):
+        if not bool(validity[row_index]):
+            continue
+        local_row = int(family_row_offsets[row_index])
+        tag = int(tags[row_index])
+        if tag == point_tag:
+            assert point_buffer is not None
+            if bool(point_buffer.empty_mask[local_row]):
+                empty_mask.append(True)
+                geometry_offsets.append(geometry_offsets[-1])
+                continue
+            coord_index = int(point_buffer.geometry_offsets[local_row])
+            x_chunks.append(point_buffer.x[coord_index : coord_index + 1])
+            y_chunks.append(point_buffer.y[coord_index : coord_index + 1])
+            empty_mask.append(False)
+            geometry_offsets.append(geometry_offsets[-1] + 1)
+            continue
+        if tag == multipoint_tag:
+            assert multipoint_buffer is not None
+            start = int(multipoint_buffer.geometry_offsets[local_row])
+            end = int(multipoint_buffer.geometry_offsets[local_row + 1])
+            count = end - start
+            if count:
+                x_chunks.append(multipoint_buffer.x[start:end])
+                y_chunks.append(multipoint_buffer.y[start:end])
+            empty_mask.append(count == 0)
+            geometry_offsets.append(geometry_offsets[-1] + count)
+            continue
+        raise ValueError(f"Unsupported GeoArrow promotion tag: {tag}")
+
+    return (
+        SimpleNamespace(
+            family=GeometryFamily.MULTIPOINT,
+            x=np.concatenate(x_chunks) if x_chunks else np.empty(0, dtype=np.float64),
+            y=np.concatenate(y_chunks) if y_chunks else np.empty(0, dtype=np.float64),
+            geometry_offsets=np.asarray(geometry_offsets, dtype=np.int32),
+            empty_mask=np.asarray(empty_mask, dtype=np.bool_),
+            part_offsets=None,
+            ring_offsets=None,
+        ),
+        _promoted_geoarrow_row_view(validity),
+    )
+
+
+def _promote_linestring_multilinestring_mix(
+    *,
+    validity: np.ndarray,
+    tags: np.ndarray,
+    family_row_offsets: np.ndarray,
+    families: dict[GeometryFamily, FamilyGeometryBuffer],
+):
+    linestring_buffer = families.get(GeometryFamily.LINESTRING)
+    multilinestring_buffer = families.get(GeometryFamily.MULTILINESTRING)
+    x_chunks: list[np.ndarray] = []
+    y_chunks: list[np.ndarray] = []
+    geometry_offsets = [0]
+    part_offsets = [0]
+    empty_mask: list[bool] = []
+    linestring_tag = FAMILY_TAGS[GeometryFamily.LINESTRING]
+    multilinestring_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
+    for row_index in range(validity.size):
+        if not bool(validity[row_index]):
+            continue
+        local_row = int(family_row_offsets[row_index])
+        tag = int(tags[row_index])
+        if tag == linestring_tag:
+            assert linestring_buffer is not None
+            start = int(linestring_buffer.geometry_offsets[local_row])
+            end = int(linestring_buffer.geometry_offsets[local_row + 1])
+            count = end - start
+            if count:
+                x_chunks.append(linestring_buffer.x[start:end])
+                y_chunks.append(linestring_buffer.y[start:end])
+                part_offsets.append(part_offsets[-1] + count)
+                geometry_offsets.append(geometry_offsets[-1] + 1)
+                empty_mask.append(False)
+            else:
+                geometry_offsets.append(geometry_offsets[-1])
+                empty_mask.append(True)
+            continue
+        if tag == multilinestring_tag:
+            assert multilinestring_buffer is not None
+            start_part = int(multilinestring_buffer.geometry_offsets[local_row])
+            end_part = int(multilinestring_buffer.geometry_offsets[local_row + 1])
+            part_count = end_part - start_part
+            if part_count:
+                coord_start = int(multilinestring_buffer.part_offsets[start_part])
+                coord_end = int(multilinestring_buffer.part_offsets[end_part])
+                x_chunks.append(multilinestring_buffer.x[coord_start:coord_end])
+                y_chunks.append(multilinestring_buffer.y[coord_start:coord_end])
+                promoted_part_offsets = (
+                    multilinestring_buffer.part_offsets[start_part : end_part + 1]
+                    - coord_start
+                    + part_offsets[-1]
+                )
+                part_offsets.extend(promoted_part_offsets[1:])
+            geometry_offsets.append(geometry_offsets[-1] + part_count)
+            empty_mask.append(part_count == 0)
+            continue
+        raise ValueError(f"Unsupported GeoArrow promotion tag: {tag}")
+
+    return (
+        SimpleNamespace(
+            family=GeometryFamily.MULTILINESTRING,
+            x=np.concatenate(x_chunks) if x_chunks else np.empty(0, dtype=np.float64),
+            y=np.concatenate(y_chunks) if y_chunks else np.empty(0, dtype=np.float64),
+            geometry_offsets=np.asarray(geometry_offsets, dtype=np.int32),
+            empty_mask=np.asarray(empty_mask, dtype=np.bool_),
+            part_offsets=np.asarray(part_offsets, dtype=np.int32),
+            ring_offsets=None,
+        ),
+        _promoted_geoarrow_row_view(validity),
+    )
+
+
+def _promote_polygon_multipolygon_mix(
+    *,
+    validity: np.ndarray,
+    tags: np.ndarray,
+    family_row_offsets: np.ndarray,
+    families: dict[GeometryFamily, FamilyGeometryBuffer],
+):
+    polygon_buffer = families.get(GeometryFamily.POLYGON)
+    multipolygon_buffer = families.get(GeometryFamily.MULTIPOLYGON)
+    x_chunks: list[np.ndarray] = []
+    y_chunks: list[np.ndarray] = []
+    geometry_offsets = [0]
+    part_offsets = [0]
+    ring_offsets = [0]
+    empty_mask: list[bool] = []
+    polygon_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    multipolygon_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+    for row_index in range(validity.size):
+        if not bool(validity[row_index]):
+            continue
+        local_row = int(family_row_offsets[row_index])
+        tag = int(tags[row_index])
+        if tag == polygon_tag:
+            assert polygon_buffer is not None
+            start_ring = int(polygon_buffer.geometry_offsets[local_row])
+            end_ring = int(polygon_buffer.geometry_offsets[local_row + 1])
+            ring_count = end_ring - start_ring
+            if ring_count:
+                coord_start = int(polygon_buffer.ring_offsets[start_ring])
+                coord_end = int(polygon_buffer.ring_offsets[end_ring])
+                x_chunks.append(polygon_buffer.x[coord_start:coord_end])
+                y_chunks.append(polygon_buffer.y[coord_start:coord_end])
+                promoted_ring_offsets = (
+                    polygon_buffer.ring_offsets[start_ring : end_ring + 1]
+                    - coord_start
+                    + ring_offsets[-1]
+                )
+                ring_offsets.extend(promoted_ring_offsets[1:])
+                part_offsets.append(part_offsets[-1] + ring_count)
+                geometry_offsets.append(geometry_offsets[-1] + 1)
+                empty_mask.append(False)
+            else:
+                geometry_offsets.append(geometry_offsets[-1])
+                empty_mask.append(True)
+            continue
+        if tag == multipolygon_tag:
+            assert multipolygon_buffer is not None
+            start_polygon = int(multipolygon_buffer.geometry_offsets[local_row])
+            end_polygon = int(multipolygon_buffer.geometry_offsets[local_row + 1])
+            polygon_count = end_polygon - start_polygon
+            if polygon_count:
+                start_ring = int(multipolygon_buffer.part_offsets[start_polygon])
+                end_ring = int(multipolygon_buffer.part_offsets[end_polygon])
+                coord_start = int(multipolygon_buffer.ring_offsets[start_ring])
+                coord_end = int(multipolygon_buffer.ring_offsets[end_ring])
+                x_chunks.append(multipolygon_buffer.x[coord_start:coord_end])
+                y_chunks.append(multipolygon_buffer.y[coord_start:coord_end])
+                promoted_ring_offsets = (
+                    multipolygon_buffer.ring_offsets[start_ring : end_ring + 1]
+                    - coord_start
+                    + ring_offsets[-1]
+                )
+                ring_offsets.extend(promoted_ring_offsets[1:])
+                promoted_part_offsets = (
+                    multipolygon_buffer.part_offsets[start_polygon : end_polygon + 1]
+                    - start_ring
+                    + part_offsets[-1]
+                )
+                part_offsets.extend(promoted_part_offsets[1:])
+            geometry_offsets.append(geometry_offsets[-1] + polygon_count)
+            empty_mask.append(polygon_count == 0)
+            continue
+        raise ValueError(f"Unsupported GeoArrow promotion tag: {tag}")
+
+    return (
+        SimpleNamespace(
+            family=GeometryFamily.MULTIPOLYGON,
+            x=np.concatenate(x_chunks) if x_chunks else np.empty(0, dtype=np.float64),
+            y=np.concatenate(y_chunks) if y_chunks else np.empty(0, dtype=np.float64),
+            geometry_offsets=np.asarray(geometry_offsets, dtype=np.int32),
+            empty_mask=np.asarray(empty_mask, dtype=np.bool_),
+            part_offsets=np.asarray(part_offsets, dtype=np.int32),
+            ring_offsets=np.asarray(ring_offsets, dtype=np.int32),
+        ),
+        _promoted_geoarrow_row_view(validity),
+    )
+
+
+def _promote_supported_geoarrow_mix(
+    *,
+    export_family: GeometryFamily,
+    validity: np.ndarray,
+    tags: np.ndarray,
+    family_row_offsets: np.ndarray,
+    families: dict[GeometryFamily, FamilyGeometryBuffer],
+):
+    if export_family is GeometryFamily.MULTIPOINT:
+        return _promote_point_multipoint_mix(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=families,
+        )
+    if export_family is GeometryFamily.MULTILINESTRING:
+        return _promote_linestring_multilinestring_mix(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=families,
+        )
+    if export_family is GeometryFamily.MULTIPOLYGON:
+        return _promote_polygon_multipolygon_mix(
+            validity=validity,
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families=families,
+        )
+    raise ValueError(f"Unsupported GeoArrow promotion target: {export_family.value}")
 
 
 def _device_geoarrow_constructor_fallback_reason(owned: OwnedGeometryArray) -> str | None:

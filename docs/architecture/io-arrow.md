@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 218/260 lines
+Body Budget: 222/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-180 | Current Behavior |
-| 181-218 | Measured Local Baseline |
+| 76-184 | Current Behavior |
+| 185-222 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -156,6 +156,10 @@ geometry buffers while keeping GPU-native formats as the design center.
   now also delegates to that shared native tabular boundary, so GeoArrow
   export no longer keeps a separate helper-local DeviceGeometryArray
   materialization branch alongside the repo-owned adapter.
+- Repo-owned GeoArrow export now also keeps the promotable single/multi mixes
+  (`Point`/`MultiPoint`, `LineString`/`MultiLineString`,
+  `Polygon`/`MultiPolygon`) on the native adapter instead of dropping those
+  columns into the host `construct_geometry_array(...)` bridge.
 - The shared native boundary now also owns Parquet and Feather terminal
   emission, so Arrow-family write sinks no longer depend on GeoDataFrame
   assembly when a native result is already available.
