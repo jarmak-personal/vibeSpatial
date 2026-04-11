@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
+from packaging.version import InvalidVersion, Version
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -212,6 +214,26 @@ class CcclScanBuild(ctypes.Structure):
     ]
 
 
+class CcclScanBuild060(ctypes.Structure):
+    _fields_ = [
+        ("cc", ctypes.c_int),
+        ("cubin", ctypes.c_void_p),
+        ("cubin_size", ctypes.c_size_t),
+        ("library", ctypes.c_void_p),
+        ("input_type", CcclTypeInfo),
+        ("output_type", CcclTypeInfo),
+        ("accumulator_type", CcclTypeInfo),
+        ("init_kernel", ctypes.c_void_p),
+        ("scan_kernel", ctypes.c_void_p),
+        ("force_inclusive", ctypes.c_bool),
+        ("init_kind", ctypes.c_int),
+        ("use_warpspeed", ctypes.c_bool),
+        ("description_bytes_per_tile", ctypes.c_size_t),
+        ("payload_bytes_per_tile", ctypes.c_size_t),
+        ("runtime_policy", ctypes.c_void_p),
+    ]
+
+
 class CcclReduceBuild(ctypes.Structure):
     _fields_ = [
         ("cc", ctypes.c_int),
@@ -302,8 +324,7 @@ class CcclBinarySearchBuild(ctypes.Structure):
 
 
 # Map of family name → (struct_type, kernel_field_names)
-_FAMILY_STRUCTS: dict[str, tuple[type, list[str]]] = {
-    "exclusive_scan": (CcclScanBuild, ["init_kernel", "scan_kernel"]),
+_BASE_FAMILY_STRUCTS: dict[str, tuple[type, list[str]]] = {
     "reduce_into": (CcclReduceBuild, [
         "single_tile_kernel", "single_tile_second_kernel",
         "reduction_kernel", "nondeterministic_atomic_kernel",
@@ -323,6 +344,25 @@ _FAMILY_STRUCTS: dict[str, tuple[type, list[str]]] = {
     "lower_bound": (CcclBinarySearchBuild, ["kernel"]),
     "upper_bound": (CcclBinarySearchBuild, ["kernel"]),
 }
+
+
+def _scan_struct_type_for_version(version: str) -> type:
+    """Return the scan build-result struct matching the installed CCCL version."""
+    try:
+        return CcclScanBuild060 if Version(version) >= Version("0.6.0") else CcclScanBuild
+    except InvalidVersion:
+        return CcclScanBuild
+
+
+def _family_struct_spec(family: str) -> tuple[type, list[str]] | None:
+    """Return the ctypes struct + kernel fields for a CCCL family."""
+    if family == "exclusive_scan":
+        return (_scan_struct_type_for_version(_cccl_version()), ["init_kernel", "scan_kernel"])
+    return _BASE_FAMILY_STRUCTS.get(family)
+
+
+def _known_families() -> frozenset[str]:
+    return frozenset({"exclusive_scan", *_BASE_FAMILY_STRUCTS.keys()})
 
 
 # ---------------------------------------------------------------------------
@@ -535,10 +575,11 @@ def extract_cache_entry(
 
     callable_obj is e.g. a _Scan, _Reduce, etc. from cuda.compute.algorithms.
     """
-    if family not in _FAMILY_STRUCTS:
+    family_spec = _family_struct_spec(family)
+    if family_spec is None:
         return None
 
-    struct_type, kernel_fields = _FAMILY_STRUCTS[family]
+    struct_type, kernel_fields = family_spec
 
     try:
         build_result = callable_obj.build_result
@@ -615,7 +656,10 @@ class ReconstructedBuild:
 
 def reconstruct_build(entry: CacheEntry) -> ReconstructedBuild:
     """Reconstruct a build result struct from a CacheEntry."""
-    struct_type, kernel_fields = _FAMILY_STRUCTS[entry.family]
+    family_spec = _family_struct_spec(entry.family)
+    if family_spec is None:
+        raise KeyError(f"unsupported CCCL family: {entry.family}")
+    struct_type, kernel_fields = family_spec
     refs: list[Any] = []
 
     # 1. Load CUBIN → CUlibrary
@@ -712,6 +756,20 @@ def _setup_cfunc(
     func.restype = ctypes.c_int
     _cfuncs[func_name] = func
     return func
+
+
+def _refresh_cached_op_state(op_adapter: Any, cccl_op: Any) -> None:
+    """Refresh a cached CCCL op state across 0.5.x and 0.6.x adapters."""
+    update_state = getattr(op_adapter, "update_op_state", None)
+    if callable(update_state):
+        update_state(cccl_op)
+        return
+
+    get_state = getattr(op_adapter, "get_state", None)
+    if callable(get_state) and hasattr(cccl_op, "state"):
+        state = get_state()
+        if state is not None:
+            cccl_op.state = state
 
 
 # ---------------------------------------------------------------------------
@@ -960,7 +1018,7 @@ class _CachedScanReduce(_CachedAlgorithm):
             set_cccl_iterator_state(self._d_out_cccl, d_out)
 
             op_adapter = make_op_adapter(op)
-            op_adapter.update_op_state(self._op_cccl)
+            _refresh_cached_op_state(op_adapter, self._op_cccl)
 
             if hasattr(self._init_cccl, 'state') and init_value is not None:
                 if _is_host_array_like(init_value):
@@ -1063,7 +1121,7 @@ class _CachedSegmentedReduce(_CachedAlgorithm):
             set_cccl_iterator_state(self._d_starts_cccl, d_starts)
             set_cccl_iterator_state(self._d_ends_cccl, d_ends)
             op_adapter = make_op_adapter(op)
-            op_adapter.update_op_state(self._op_cccl)
+            _refresh_cached_op_state(op_adapter, self._op_cccl)
             if _is_host_array_like(init_value):
                 self._init_cccl.state = to_cccl_value_state(init_value)
             stream_handle = validate_and_get_stream(stream)
@@ -1338,7 +1396,7 @@ class _CachedMergeSort(_CachedAlgorithm):
             set_cccl_iterator_state(self._d_keys_out_cccl, d_keys_out)
             set_cccl_iterator_state(self._d_vals_out_cccl, d_vals_out)
             op_adapter = make_op_adapter(op)
-            op_adapter.update_op_state(self._op_cccl)
+            _refresh_cached_op_state(op_adapter, self._op_cccl)
             stream_handle = validate_and_get_stream(stream)
 
             if temp_storage is None:
@@ -1435,7 +1493,7 @@ class _CachedUniqueByKey(_CachedAlgorithm):
             set_cccl_iterator_state(self._d_vals_out_cccl, d_vals_out)
             set_cccl_iterator_state(self._d_count_cccl, d_count)
             op_adapter = make_op_adapter(op)
-            op_adapter.update_op_state(self._op_cccl)
+            _refresh_cached_op_state(op_adapter, self._op_cccl)
             stream_handle = validate_and_get_stream(stream)
 
             if temp_storage is None:
@@ -1481,7 +1539,7 @@ def try_load_cached(spec_name: str, family: str) -> CacheEntry | None:
     """Try to load a cached entry for the given spec.  Returns None on miss."""
     if not _cccl_cache_enabled():
         return None
-    if family not in _FAMILY_STRUCTS:
+    if _family_struct_spec(family) is None:
         return None
     return _read_cache_entry(spec_name)
 
@@ -1494,7 +1552,7 @@ def save_after_build(
     """Extract and save a cache entry after a successful CCCL build."""
     if not _cccl_cache_enabled():
         return
-    if family not in _FAMILY_STRUCTS:
+    if _family_struct_spec(family) is None:
         return
     entry = extract_cache_entry(spec_name, family, callable_obj)
     if entry is not None:

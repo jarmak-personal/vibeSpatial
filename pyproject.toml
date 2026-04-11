@@ -55,7 +55,7 @@ Issues = "https://github.com/jarmak-personal/vibeSpatial/issues"
 [project.optional-dependencies]
 cu12 = [
   "cuda-python>=12,<13",
-  "cuda-cccl[cu12]",
+  "cuda-cccl[cu12]>=0.6,<0.7",
   "cuda-bench[cu12]",
   "cupy-cuda12x>=13",
   "kvikio-cu12>=26.2",
@@ -65,7 +65,7 @@ cu12 = [
 ]
 cu13 = [
   "cuda-python>=13",
-  "cuda-cccl[cu13]",
+  "cuda-cccl[cu13]>=0.6,<0.7",
   "cuda-bench[cu13]",
   "cupy-cuda13x>=14",
   "kvikio-cu13>=26.2",

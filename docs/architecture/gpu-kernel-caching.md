@@ -188,11 +188,15 @@ format self-describing and trivially auditable.
 
 ctypes `Structure` subclasses mirror the CCCL C headers exactly. Sizes
 are validated at extraction time by locating the `cubin_size` field in
-the Cython object's memory.
+the Cython object's memory.  Scan is versioned because CCCL 0.6.0 added
+`input_type`, `output_type`, and `use_warpspeed` to
+`cccl_device_scan_build_result_t`; the cache shim selects the correct
+scan mirror from the installed `cuda-cccl` version at runtime.
 
 | Family | C struct | sizeof | Kernels |
 |--------|----------|--------|---------|
-| Scan | `cccl_device_scan_build_result_t` | 104 | 2 |
+| Scan (CCCL 0.5.x) | `cccl_device_scan_build_result_t` | 104 | 2 |
+| Scan (CCCL 0.6.x+) | `cccl_device_scan_build_result_t` | 160 | 2 |
 | Reduce | `cccl_device_reduce_build_result_t` | 88 | 4 |
 | SegmentedReduce | `cccl_device_segmented_reduce_build_result_t` | 56 | 1 |
 | RadixSort | `cccl_device_radix_sort_build_result_t` | 168 | 9 |

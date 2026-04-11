@@ -341,33 +341,34 @@ wheels = [
 
 [[package]]
 name = "cuda-cccl"
-version = "0.5.1"
+version = "0.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cuda-core" },
     { name = "cuda-pathfinder" },
-    { name = "numba" },
     { name = "numpy" },
     { name = "typing-extensions" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/0a/0d/62a1acd795c4597dd8dce61e4e46fa9f680699a198e5352dc618a27d81e0/cuda_cccl-0.5.1-cp312-cp312-manylinux_2_24_aarch64.whl", hash = "sha256:2407563d7859107e765c219a2f0bde2e8fb1c035366767d2b1cd84b31dfb377f", size = 5379984, upload-time = "2026-02-06T23:24:00.414Z" },
-    { url = "https://files.pythonhosted.org/packages/e4/10/bd552c20e85d4f72d52d8abe7b7688be3fa21c14bb2e2048ad270449a86a/cuda_cccl-0.5.1-cp312-cp312-manylinux_2_26_x86_64.whl", hash = "sha256:3748229ed04553f56d39d0b39b640b45ee94f75d0f4d381e65c8158aa0aa7426", size = 5534083, upload-time = "2026-02-06T23:24:02.166Z" },
-    { url = "https://files.pythonhosted.org/packages/7c/c9/a3a8a26bb6936503fb71bbfc3608977d8e72d4d6eafd0ed066c302922dcc/cuda_cccl-0.5.1-cp312-cp312-win_amd64.whl", hash = "sha256:b788e4ffaa8965fc540bcff9f6650ee689804754b016f13b362bb0fafb98d04b", size = 4775488, upload-time = "2026-02-06T23:24:03.851Z" },
-    { url = "https://files.pythonhosted.org/packages/88/9d/236e3571440c7f34c3e7f4229e7589830d65d5c3c4dcb764e21a723f6a82/cuda_cccl-0.5.1-cp313-cp313-manylinux_2_24_aarch64.whl", hash = "sha256:0eb851fa2ee33ee39bc1d417e40b2ed78c538c6452b9f29390504ce749f07ccc", size = 5373722, upload-time = "2026-02-06T23:24:05.601Z" },
-    { url = "https://files.pythonhosted.org/packages/18/2a/9228845daee61fb99c7662eac07202cd9df046a3ce28f710cd2494da4095/cuda_cccl-0.5.1-cp313-cp313-manylinux_2_26_x86_64.whl", hash = "sha256:423c95c0abc7b2cb37294e77ba801734e7174d4f5e5e6be4c117803df78d3bcf", size = 5535805, upload-time = "2026-02-06T23:24:07.348Z" },
-    { url = "https://files.pythonhosted.org/packages/b1/50/0cfc6d76e5329c6b814e3de4c5d57402bbe48fa8dde4446f8d2edd835ab6/cuda_cccl-0.5.1-cp313-cp313-win_amd64.whl", hash = "sha256:fcbb5e9c6faf8f75eda8e1ac2dce6e162ef9f899c63370e35c33f22a1ef3b4d7", size = 4790201, upload-time = "2026-02-06T23:24:09.694Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/4c/edea50a8e134458015fa30157ec58fb296e05f6089906fcdc1226f4068cb/cuda_cccl-0.6.0-cp312-cp312-manylinux_2_24_aarch64.whl", hash = "sha256:925f231fe557474e261dccc117d2b6d4ff9f39e158e6624951b9353460f8165e", size = 5590953, upload-time = "2026-04-09T13:27:58.34Z" },
+    { url = "https://files.pythonhosted.org/packages/f4/e4/85d305db3ece55ec30f55fa1bbc2e796b4b0b4babff360335f27e3da893d/cuda_cccl-0.6.0-cp312-cp312-manylinux_2_26_x86_64.whl", hash = "sha256:b414d0905bdde37527dd5ba47f9dc0023dc0cadc00b265fdb163c73704c474ef", size = 5761590, upload-time = "2026-04-09T13:27:59.933Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/4d/1c6afc2c9b833937821adbd1c1c29532134806f9906a3a54bbb597c87c0a/cuda_cccl-0.6.0-cp312-cp312-win_amd64.whl", hash = "sha256:a648745a8f5f7fe52596f310cfc27b3b8f03577a69a7b7733affad7e77559c60", size = 5042460, upload-time = "2026-04-09T13:28:02.317Z" },
+    { url = "https://files.pythonhosted.org/packages/43/aa/5cf0d1c1a18bf464d6a4c7e9c365b035e449f05579803fdb3d94174f2f64/cuda_cccl-0.6.0-cp313-cp313-manylinux_2_24_aarch64.whl", hash = "sha256:4ab63f658a40c533f34b349a9870021e4fa9a090acfcee11eb93be36704ce0ac", size = 5588554, upload-time = "2026-04-09T13:28:04.158Z" },
+    { url = "https://files.pythonhosted.org/packages/51/68/25d49c3c80cb488e15b1eaebd9674293b3eeea6467caaf84995a95d64683/cuda_cccl-0.6.0-cp313-cp313-manylinux_2_26_x86_64.whl", hash = "sha256:fff5fee026a1d89ecd8922f0355a84a59f23afa74c3af4a0add5c274d879a3ea", size = 5758063, upload-time = "2026-04-09T13:28:06.094Z" },
+    { url = "https://files.pythonhosted.org/packages/23/71/b48c66bf679ad1b71226b0eccc45262492cac176592a1593a12a596fcb33/cuda_cccl-0.6.0-cp313-cp313-win_amd64.whl", hash = "sha256:ff683aa2775ba36d37f17852b6991a23a174a61718535b0f1f398a9a4ed2048f", size = 5054340, upload-time = "2026-04-09T13:28:08.277Z" },
 ]
 
 [package.optional-dependencies]
 cu12 = [
     { name = "cuda-bindings", version = "12.9.6", source = { registry = "https://pypi.org/simple" } },
     { name = "cuda-toolkit", version = "12.9.1", source = { registry = "https://pypi.org/simple" }, extra = ["cudart", "nvcc", "nvjitlink", "nvrtc"], marker = "extra == 'extra-11-vibespatial-cu12'" },
+    { name = "numba" },
     { name = "numba-cuda", extra = ["cu12"], marker = "extra == 'extra-11-vibespatial-cu12'" },
 ]
 cu13 = [
     { name = "cuda-bindings", version = "13.2.0", source = { registry = "https://pypi.org/simple" } },
     { name = "cuda-toolkit", version = "13.2.0", source = { registry = "https://pypi.org/simple" }, extra = ["cudart", "nvcc", "nvjitlink", "nvrtc", "nvvm"], marker = "extra == 'extra-11-vibespatial-cu13'" },
+    { name = "numba" },
     { name = "numba-cuda", extra = ["cu13"], marker = "extra == 'extra-11-vibespatial-cu13'" },
 ]
 
@@ -2383,8 +2384,8 @@ upstream-optional = [
 requires-dist = [
     { name = "cuda-bench", extras = ["cu12"], marker = "extra == 'cu12'" },
     { name = "cuda-bench", extras = ["cu13"], marker = "extra == 'cu13'" },
-    { name = "cuda-cccl", extras = ["cu12"], marker = "extra == 'cu12'" },
-    { name = "cuda-cccl", extras = ["cu13"], marker = "extra == 'cu13'" },
+    { name = "cuda-cccl", extras = ["cu12"], marker = "extra == 'cu12'", specifier = ">=0.6,<0.7" },
+    { name = "cuda-cccl", extras = ["cu13"], marker = "extra == 'cu13'", specifier = ">=0.6,<0.7" },
     { name = "cuda-python", marker = "extra == 'cu12'", specifier = ">=12,<13" },
     { name = "cuda-python", marker = "extra == 'cu13'", specifier = ">=13" },
     { name = "cupy-cuda12x", marker = "extra == 'cu12'", specifier = ">=13" },

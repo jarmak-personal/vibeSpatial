@@ -18,19 +18,26 @@ from vibespatial.cuda.cccl_cubin_cache import (
     CcclBinarySearchBuild,
     CcclReduceBuild,
     CcclScanBuild,
+    CcclScanBuild060,
     CcclTypeInfo,
     _cache_key,
     _cached_spec_name_set,
     _cccl_cache_enabled,
     _deserialize_cache_entry,
     _extract_kernel_names,
+    _family_struct_spec,
+    _known_families,
     _normalize_cubin,
     _read_cache_entry,
+    _refresh_cached_op_state,
+    _scan_struct_type_for_version,
     _serialize_cache_entry,
     _write_cache_entry,
     cache_stats,
     clear_cache,
     is_cached,
+    save_after_build,
+    try_load_cached,
 )
 
 # ---------------------------------------------------------------------------
@@ -80,6 +87,16 @@ class TestStructSizes:
         assert "init_kernel" in fields
         assert "scan_kernel" in fields
         assert "runtime_policy" in fields
+
+    def test_scan_build_060_has_expected_fields(self):
+        import ctypes
+
+        fields = {f[0] for f in CcclScanBuild060._fields_}
+        assert "input_type" in fields
+        assert "output_type" in fields
+        assert "use_warpspeed" in fields
+        assert "runtime_policy" in fields
+        assert ctypes.sizeof(CcclScanBuild060) == 160
 
     def test_reduce_build_has_expected_fields(self):
         fields = {f[0] for f in CcclReduceBuild._fields_}
@@ -271,18 +288,76 @@ class TestCacheKey:
 
 class TestFamilyRegistry:
     def test_all_expected_families_present(self):
-        from vibespatial.cuda.cccl_cubin_cache import _FAMILY_STRUCTS
         expected = {
             "exclusive_scan", "reduce_into", "segmented_reduce",
             "radix_sort", "merge_sort", "unique_by_key",
             "lower_bound", "upper_bound",
         }
-        assert expected.issubset(set(_FAMILY_STRUCTS.keys()))
+        assert expected.issubset(_known_families())
 
     def test_each_family_has_kernel_fields(self):
-        from vibespatial.cuda.cccl_cubin_cache import _FAMILY_STRUCTS
-        for name, (struct_type, kernel_fields) in _FAMILY_STRUCTS.items():
+        for name in _known_families():
+            struct_type, kernel_fields = _family_struct_spec(name)
             assert len(kernel_fields) >= 1, f"{name} has no kernel fields"
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("0.5.1", CcclScanBuild),
+            ("0.6.0", CcclScanBuild060),
+            ("0.6.2", CcclScanBuild060),
+            ("unknown", CcclScanBuild),
+        ],
+    )
+    def test_scan_struct_switches_with_version(self, version: str, expected: type):
+        assert _scan_struct_type_for_version(version) is expected
+
+    def test_exclusive_scan_family_uses_runtime_version(self):
+        with patch("vibespatial.cuda.cccl_cubin_cache._cccl_version", return_value="0.6.0"):
+            struct_type, kernel_fields = _family_struct_spec("exclusive_scan")
+        assert struct_type is CcclScanBuild060
+        assert kernel_fields == ["init_kernel", "scan_kernel"]
+
+
+class TestOpStateCompatibility:
+    def test_refresh_prefers_update_op_state(self):
+        calls: list[str] = []
+
+        class _Adapter:
+            def update_op_state(self, cccl_op) -> None:
+                calls.append("update")
+                cccl_op.state = b"patched"
+
+        class _Op:
+            state = b""
+
+        op = _Op()
+        _refresh_cached_op_state(_Adapter(), op)
+        assert calls == ["update"]
+        assert op.state == b"patched"
+
+    def test_refresh_uses_get_state_when_update_missing(self):
+        class _Adapter:
+            def get_state(self) -> bytes:
+                return b"stateful"
+
+        class _Op:
+            state = b""
+
+        op = _Op()
+        _refresh_cached_op_state(_Adapter(), op)
+        assert op.state == b"stateful"
+
+    def test_refresh_noops_for_stateless_adapter(self):
+        class _Adapter:
+            pass
+
+        class _Op:
+            state = b"original"
+
+        op = _Op()
+        _refresh_cached_op_state(_Adapter(), op)
+        assert op.state == b"original"
 
 
 # ---------------------------------------------------------------------------
@@ -338,3 +413,60 @@ class TestIsCached:
             names = _cached_spec_name_set()
             assert "scan_i32" in names
             assert len(names) == 1
+
+
+@pytest.mark.gpu
+def test_exclusive_scan_disk_cache_roundtrip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """A saved exclusive-scan cache entry reloads and replays correctly."""
+    import cupy as cp
+    import numpy as np
+    from cuda.compute import algorithms
+
+    from vibespatial.cuda import cccl_cubin_cache as cache_mod
+    from vibespatial.cuda.cccl_precompile import (
+        SPEC_REGISTRY,
+        _build_cached_callable,
+        _query_cached_temp,
+    )
+    from vibespatial.cuda.cccl_primitives import _sum_op
+    from vibespatial.runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    monkeypatch.setenv("VIBESPATIAL_CCCL_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("VIBESPATIAL_CCCL_CACHE", "1")
+    cache_mod._cccl_cache_enabled.cache_clear()
+    cache_mod._get_cache_dir.cache_clear()
+    try:
+        d_in = cp.arange(16, dtype=cp.int32)
+        d_out = cp.empty_like(d_in)
+        init = np.asarray(0, dtype=np.int32)
+        raw_callable = algorithms.make_exclusive_scan(d_in, d_out, _sum_op, init)
+        raw_callable(None, d_in, d_out, _sum_op, int(d_in.size), init)
+
+        save_after_build("exclusive_scan_i32", "exclusive_scan", raw_callable)
+        matching = [path for path in tmp_path.glob("*.cache") if "exclusive_scan_i32" in path.name]
+        assert len(matching) >= 1
+
+        entry = try_load_cached("exclusive_scan_i32", "exclusive_scan")
+        assert entry is not None
+
+        spec = SPEC_REGISTRY["exclusive_scan_i32"]
+        cached_callable = _build_cached_callable(entry, spec, cp, algorithms)
+        assert cached_callable is not None
+
+        temp_bytes = int(_query_cached_temp(cached_callable, spec, cp) or 0)
+        d_temp = cp.empty(max(temp_bytes, 1), dtype=cp.uint8)
+        d_cached_out = cp.empty_like(d_in)
+        cached_callable(d_temp, d_in, d_cached_out, _sum_op, int(d_in.size), init)
+
+        got = cp.asnumpy(d_cached_out)
+        expected = np.array(
+            [0, 0, 1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66, 78, 91, 105],
+            dtype=np.int32,
+        )
+        assert np.array_equal(got, expected)
+    finally:
+        cache_mod._cccl_cache_enabled.cache_clear()
+        cache_mod._get_cache_dir.cache_clear()
