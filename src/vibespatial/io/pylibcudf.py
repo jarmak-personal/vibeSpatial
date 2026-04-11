@@ -255,15 +255,21 @@ def _build_device_single_family_owned(
     part_offsets_device=None,
     ring_offsets_device=None,
     detail: str,
+    all_valid: bool = False,
 ) -> OwnedGeometryArray:
     import cupy as cp
 
     row_count = int(validity_device.size)
-    valid_count = int(cp.count_nonzero(validity_device).item())
-    tags_device = cp.where(validity_device, np.int8(FAMILY_TAGS[family]), np.int8(-1)).astype(cp.int8)
-    family_row_offsets_device = cp.full(row_count, -1, dtype=cp.int32)
-    if valid_count:
-        family_row_offsets_device[validity_device] = cp.arange(valid_count, dtype=cp.int32)
+    if all_valid:
+        valid_count = row_count
+        tags_device = cp.full(row_count, np.int8(FAMILY_TAGS[family]), dtype=cp.int8)
+        family_row_offsets_device = cp.arange(row_count, dtype=cp.int32)
+    else:
+        valid_count = int(cp.count_nonzero(validity_device).item())
+        tags_device = cp.where(validity_device, np.int8(FAMILY_TAGS[family]), np.int8(-1)).astype(cp.int8)
+        family_row_offsets_device = cp.full(row_count, -1, dtype=cp.int32)
+        if valid_count:
+            family_row_offsets_device[validity_device] = cp.arange(valid_count, dtype=cp.int32)
     buffer = _build_lazy_host_family_stub(family, row_count=valid_count)
     owned = OwnedGeometryArray(
         validity=None,
@@ -884,16 +890,25 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
         y_device = y_device[:row_count]
         validity_device = cp.ones(row_count, dtype=cp.bool_)
         empty_mask_device = cp.isnan(x_device) | cp.isnan(y_device)
-        nonempty = ~empty_mask_device
-        geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
+        has_empty = bool(empty_mask_device.any().item())
+        if has_empty:
+            nonempty = ~empty_mask_device
+            geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
+            x_payload = x_device[nonempty]
+            y_payload = y_device[nonempty]
+        else:
+            geometry_offsets_device = cp.arange(row_count + 1, dtype=cp.int32)
+            x_payload = x_device
+            y_payload = y_device
         owned = _build_device_single_family_owned(
             family=GeometryFamily.POINT,
             validity_device=validity_device,
-            x_device=x_device[nonempty],
-            y_device=y_device[nonempty],
+            x_device=x_payload,
+            y_device=y_payload,
             geometry_offsets_device=geometry_offsets_device,
             empty_mask_device=empty_mask_device,
             detail="zero-copy adopted device-resident point buffers from pylibcudf GeoArrow column",
+            all_valid=True,
         )
         owned.device_adopted = True
         if owned.device_state is not None:
@@ -1057,6 +1072,7 @@ def _decode_pylibcudf_linestring_like_geoarrow_column_to_owned(column, family: G
             geometry_offsets_device=geometry_offsets_device,
             empty_mask_device=empty_mask_device,
             detail=f"zero-copy adopted device-resident {family.value} buffers from pylibcudf GeoArrow column",
+            all_valid=True,
         )
         owned.device_adopted = True
         if owned.device_state is not None:
@@ -1108,6 +1124,7 @@ def _decode_pylibcudf_polygon_geoarrow_column_to_owned(column) -> OwnedGeometryA
             empty_mask_device=empty_mask_device,
             ring_offsets_device=ring_offsets_device,
             detail="zero-copy adopted device-resident polygon buffers from pylibcudf GeoArrow column",
+            all_valid=True,
         )
         owned.device_adopted = True
         if owned.device_state is not None:
@@ -1165,6 +1182,7 @@ def _decode_pylibcudf_multilinestring_geoarrow_column_to_owned(column) -> OwnedG
             empty_mask_device=empty_mask_device,
             part_offsets_device=part_offsets_device,
             detail="zero-copy adopted device-resident multilinestring buffers from pylibcudf GeoArrow column",
+            all_valid=True,
         )
         owned.device_adopted = True
         if owned.device_state is not None:
@@ -1227,6 +1245,7 @@ def _decode_pylibcudf_multipolygon_geoarrow_column_to_owned(column) -> OwnedGeom
             part_offsets_device=part_offsets_device,
             ring_offsets_device=ring_offsets_device,
             detail="zero-copy adopted device-resident multipolygon buffers from pylibcudf GeoArrow column",
+            all_valid=True,
         )
         owned.device_adopted = True
         if owned.device_state is not None:

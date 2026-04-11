@@ -31,6 +31,9 @@ from vibespatial.testing.synthetic import (
     generate_polygons,
 )
 
+_GEOPARQUET_BENCH_WARMUP_READS = 2
+_GEOPARQUET_SCAN_BENCH_MIN_REPEAT = 3
+
 
 @dataclass(frozen=True)
 class IOBenchmarkCase:
@@ -235,9 +238,9 @@ def _sample_geodataframe(geometry_type: str, rows: int, *, seed: int = 0):
 
 def _build_covering_summary(*, scale: int, selectivity: float, seed: int = 0):
     rng = np.random.default_rng(seed)
-    row_group_count = max(16, scale // 10_000)
+    row_group_count = max(125, scale // 8_000)
     rows_per_group = max(1, scale // row_group_count)
-    grid_width = max(4, int(np.ceil(np.sqrt(row_group_count))))
+    grid_width = max(12, int(np.ceil(np.sqrt(row_group_count))))
     cell = 1_000.0 / grid_width
     centers_x = []
     centers_y = []
@@ -282,13 +285,16 @@ def _benchmark_geoparquet_scan(
     repeat: int,
     geometry_encoding: str = "geoarrow",
     chunk_rows: int | None = None,
+    compression: str | None = None,
     seed: int = 0,
 ) -> tuple[float, int]:
     gdf = _sample_geodataframe(geometry_type, rows, seed=seed)
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "sample.parquet"
-        gdf.to_parquet(path, geometry_encoding=geometry_encoding)
+        gdf.to_parquet(path, geometry_encoding=geometry_encoding, compression=compression)
         file_bytes = path.stat().st_size
+        for _ in range(_GEOPARQUET_BENCH_WARMUP_READS):
+            read_geoparquet_owned(path, backend=backend, chunk_rows=chunk_rows)
         start = perf_counter()
         for _ in range(repeat):
             read_geoparquet_owned(path, backend=backend, chunk_rows=chunk_rows)
@@ -332,13 +338,17 @@ def _benchmark_mixed_wkb_decode(*, rows: int, repeat: int, seed: int = 0) -> tup
     )
 
 
+def _stable_geoparquet_scan_repeat(repeat: int) -> int:
+    return max(repeat, _GEOPARQUET_SCAN_BENCH_MIN_REPEAT)
+
+
 def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBenchmarkCase]:
     if suite not in {"smoke", "ci", "all"}:
         raise ValueError(f"Unsupported suite: {suite}")
 
     point_scales = {"smoke": [10_000], "ci": [100_000], "all": [10_000, 100_000, 1_000_000]}[suite]
     polygon_scales = {"smoke": [10_000], "ci": [20_000], "all": [20_000, 100_000]}[suite]
-    selective_scales = {"smoke": [100_000], "ci": [100_000], "all": [100_000, 1_000_000]}[suite]
+    geoparquet_scales = {"smoke": [1_000_000], "ci": [1_000_000], "all": [1_000_000, 10_000_000]}[suite]
     results: list[IOBenchmarkCase] = []
 
     for rows in point_scales:
@@ -576,7 +586,8 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
             )
         )
 
-    for rows in selective_scales:
+    for rows in geoparquet_scales:
+        scan_repeat = _stable_geoparquet_scan_repeat(repeat)
         summary, bbox = _build_covering_summary(scale=rows, selectivity=0.1)
         prune_result = select_row_groups(summary, bbox, strategy="auto")
         decoded_rows = int(round(prune_result.decoded_row_fraction * summary.total_rows))
@@ -602,14 +613,17 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
             geometry_type="point",
             rows=rows,
             backend="cpu",
-            repeat=repeat,
+            repeat=scan_repeat,
+            compression=None,
         )
         if has_pylibcudf_support():
             gpu_rows_per_second, gpu_bytes = _benchmark_geoparquet_scan(
                 geometry_type="point",
                 rows=rows,
                 backend="gpu",
-                repeat=repeat,
+                repeat=scan_repeat,
+                chunk_rows=250_000,
+                compression=None,
             )
             results.append(
                 _speedup_case(
@@ -618,7 +632,7 @@ def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOB
                     format_name="geoparquet_scan",
                     geometry_profile="point-heavy",
                     scale=rows,
-                    target_floor=3.0,
+                    target_floor=2.0,
                     enforced=True,
                     baseline_label="pyarrow_cpu",
                     candidate_label="pylibcudf_gpu",

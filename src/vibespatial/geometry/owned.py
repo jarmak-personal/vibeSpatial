@@ -281,6 +281,7 @@ class OwnedGeometryArray:
         self.device_adopted = device_adopted
         self.device_state = device_state
         self._cached_is_valid_mask: np.ndarray | None = None
+        self._cached_shared_geoarrow_view: MixedGeoArrowView | None = None
         # Indexed-view support: when take() detects high index repetition,
         # the result stores a compact base array plus an index map instead
         # of physically copying all coordinate data.  This avoids OOM when
@@ -600,6 +601,7 @@ class OwnedGeometryArray:
         self._tags = resolved._tags
         self._family_row_offsets = resolved._family_row_offsets
         self.families = resolved.families
+        self._cached_shared_geoarrow_view = None
         self.residency = resolved.residency
         self.device_state = resolved.device_state
         self._base = None
@@ -633,6 +635,7 @@ class OwnedGeometryArray:
         self._tags = resolved._tags
         self._family_row_offsets = resolved._family_row_offsets
         self.families = resolved.families
+        self._cached_shared_geoarrow_view = None
         self.residency = resolved.residency
         self.device_state = resolved.device_state
         self._base = None
@@ -740,6 +743,7 @@ class OwnedGeometryArray:
 
     def cache_bounds(self, bounds: np.ndarray) -> None:
         self._record(DiagnosticKind.CACHE, "cached per-geometry bounds", visible=False)
+        self._cached_shared_geoarrow_view = None
         runtime = get_cuda_runtime() if self.device_state is not None else None
         if self.device_state is not None:
             validity = runtime.copy_device_to_host(self.device_state.validity)
@@ -1455,6 +1459,8 @@ class OwnedGeometryArray:
         self._ensure_host_state()
         sharing_mode = normalize_buffer_sharing_mode(sharing)
         share = sharing_mode is not BufferSharingMode.COPY
+        if share and self._cached_shared_geoarrow_view is not None:
+            return self._cached_shared_geoarrow_view
         views = {
             family: GeoArrowBufferView(
                 family=buffer.family,
@@ -1475,13 +1481,16 @@ class OwnedGeometryArray:
             else "materialized GeoArrow-style buffer view"
         )
         self._record(DiagnosticKind.MATERIALIZATION, detail, visible=True)
-        return MixedGeoArrowView(
+        view = MixedGeoArrowView(
             validity=self.validity if share else self.validity.copy(),
             tags=self.tags if share else self.tags.copy(),
             family_row_offsets=self.family_row_offsets if share else self.family_row_offsets.copy(),
             families=views,
             shares_memory=share,
         )
+        if share:
+            self._cached_shared_geoarrow_view = view
+        return view
 
 
 def _gather_offset_slices(
@@ -2115,6 +2124,94 @@ def _adopt_bounds(
     return normalized, False
 
 
+def _shareable_geoarrow_buffer_view(buffer: GeoArrowBufferView) -> bool:
+    return all(
+        [
+            isinstance(buffer.x, np.ndarray)
+            and _is_shareable_vector(buffer.x, dtype=np.float64),
+            isinstance(buffer.y, np.ndarray)
+            and _is_shareable_vector(buffer.y, dtype=np.float64),
+            isinstance(buffer.geometry_offsets, np.ndarray)
+            and _is_shareable_vector(buffer.geometry_offsets, dtype=np.int32),
+            isinstance(buffer.empty_mask, np.ndarray)
+            and _is_shareable_vector(buffer.empty_mask, dtype=np.bool_),
+            buffer.part_offsets is None
+            or (
+                isinstance(buffer.part_offsets, np.ndarray)
+                and _is_shareable_vector(buffer.part_offsets, dtype=np.int32)
+            ),
+            buffer.ring_offsets is None
+            or (
+                isinstance(buffer.ring_offsets, np.ndarray)
+                and _is_shareable_vector(buffer.ring_offsets, dtype=np.int32)
+            ),
+            buffer.bounds is None
+            or (
+                isinstance(buffer.bounds, np.ndarray)
+                and _is_shareable_bounds(buffer.bounds)
+            ),
+        ]
+    )
+
+
+def _shareable_geoarrow_view(view: MixedGeoArrowView) -> bool:
+    if not all(
+        [
+            isinstance(view.validity, np.ndarray)
+            and _is_shareable_vector(view.validity, dtype=np.bool_),
+            isinstance(view.tags, np.ndarray)
+            and _is_shareable_vector(view.tags, dtype=np.int8),
+            isinstance(view.family_row_offsets, np.ndarray)
+            and _is_shareable_vector(view.family_row_offsets, dtype=np.int32),
+        ]
+    ):
+        return False
+    return all(_shareable_geoarrow_buffer_view(buffer) for buffer in view.families.values())
+
+
+def _build_shared_geoarrow_owned(
+    view: MixedGeoArrowView,
+    *,
+    residency: Residency,
+) -> OwnedGeometryArray:
+    families = {
+        family: FamilyGeometryBuffer(
+            family=family,
+            schema=get_geometry_buffer_schema(family),
+            row_count=int(buffer.empty_mask.size),
+            x=buffer.x,
+            y=buffer.y,
+            geometry_offsets=buffer.geometry_offsets,
+            empty_mask=buffer.empty_mask,
+            part_offsets=buffer.part_offsets,
+            ring_offsets=buffer.ring_offsets,
+            bounds=buffer.bounds,
+        )
+        for family, buffer in view.families.items()
+    }
+    array = OwnedGeometryArray(
+        validity=view.validity,
+        tags=view.tags,
+        family_row_offsets=view.family_row_offsets,
+        families=families,
+        residency=Residency.HOST,
+        geoarrow_backed=True,
+        shares_geoarrow_memory=True,
+    )
+    array._record(
+        DiagnosticKind.CREATED,
+        "created owned geometry array from shared GeoArrow-style buffers",
+        visible=True,
+    )
+    if residency is Residency.DEVICE:
+        array.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="created owned geometry array with device residency requested",
+        )
+    return array
+
+
 def _iter_coords(linear: Any) -> list[tuple[float, float]]:
     return [(float(coord[0]), float(coord[1])) for coord in linear.coords]
 
@@ -2547,6 +2644,17 @@ def from_geoarrow(
     sharing: BufferSharingMode | str = BufferSharingMode.COPY,
 ) -> OwnedGeometryArray:
     sharing_mode = normalize_buffer_sharing_mode(sharing)
+    if sharing_mode is BufferSharingMode.SHARE and view.shares_memory:
+        return _build_shared_geoarrow_owned(view, residency=residency)
+    if sharing_mode is BufferSharingMode.AUTO and view.shares_memory:
+        return _build_shared_geoarrow_owned(view, residency=residency)
+    shareable_view = _shareable_geoarrow_view(view)
+    if sharing_mode is BufferSharingMode.SHARE:
+        if not shareable_view:
+            raise ValueError("GeoArrow view is not shareable in the owned-buffer schema")
+        return _build_shared_geoarrow_owned(view, residency=residency)
+    if sharing_mode is BufferSharingMode.AUTO and shareable_view:
+        return _build_shared_geoarrow_owned(view, residency=residency)
     families: dict[GeometryFamily, FamilyGeometryBuffer] = {}
     share_results: list[bool] = []
     for family, buffer in view.families.items():

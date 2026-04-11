@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 227/280 lines
+Body Budget: 258/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -17,10 +17,10 @@ Section Map (Body Lines)
 | 18-23 | Open First |
 | 24-29 | Verify |
 | 30-35 | Risks |
-| 36-50 | Decision |
-| 51-60 | Performance Notes |
-| 61-137 | Current Behavior |
-| 138-227 | Measured Local Baseline |
+| 36-54 | Decision |
+| 55-64 | Performance Notes |
+| 65-168 | Current Behavior |
+| 169-258 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -61,7 +61,11 @@ keeping GPU-native formats primary and legacy formats explicit.
 - GeoJSON is a first-class hybrid path. Files >10 MB auto-route to GPU
   byte-classification (ADR-0038); smaller files and filtered reads use pyogrio.
 - Shapefile is a first-class hybrid path with pyogrio-first routing.
-- Other GDAL vector formats stay behind an explicit legacy fallback adapter.
+- Promoted pyogrio-backed vector containers such as GeoPackage, FileGDB, GML,
+  GPX, TopoJSON, GeoJSON-Seq, and FlatGeobuf stay hybrid rather than being
+  treated as canonical GPU-native formats.
+- Untargeted legacy GDAL vector formats stay behind an explicit fallback
+  adapter.
 - Public `geopandas.read_file` and `GeoDataFrame.to_file` should dispatch
   through repo-owned wrappers so the chosen path is observable.
 - On the `pyogrio` write path, terminal export should prefer the shared
@@ -85,6 +89,15 @@ keeping GPU-native formats primary and legacy formats explicit.
 
 - `geopandas.read_file` now classifies GeoJSON, Shapefile, and legacy GDAL
   paths through one repo-owned router.
+- `read_vector_file_native(...)` is now the shared native file-read surface for
+  promoted vector formats. It returns a `NativeTabularResult` at the read
+  boundary and lets public `read_file(...)` materialize a `GeoDataFrame` only
+  at the explicit compatibility/export step.
+- The repo-owned file router already makes the promoted read-boundary
+  classification explicit through `plan_vector_file_io(...).selected_path`:
+  - `hybrid`: GeoJSON, Shapefile, WKT, CSV, KML, OSM PBF, GeoPackage,
+    FileGDB, FlatGeobuf, GML, GPX, TopoJSON, GeoJSON-Seq
+  - `fallback`: untargeted legacy GDAL formats
 - `GeoDataFrame.to_file` uses the same routing policy.
 - Repo-owned `to_file(..., engine="pyogrio")` now writes through
   `pyogrio.write_arrow(...)` from the shared native tabular boundary whenever
@@ -95,8 +108,26 @@ keeping GPU-native formats primary and legacy formats explicit.
   append mode, timezone-preserving datetime fields, unsupported metadata
   combinations, and other legacy driver semantics that the native Arrow sink
   does not yet match exactly.
-- GeoJSON and Shapefile record dispatch events without fallback events.
-- Legacy formats such as GPKG emit explicit fallback events.
+- Repo-owned `read_file` GPU branches that can already produce owned geometry
+  plus columnar attributes now lower through the shared `NativeTabularResult`
+  boundary before the terminal `GeoDataFrame` materialization point instead of
+  each branch rebuilding a public frame independently. That now includes:
+  - the pyogrio Arrow + GPU WKB compatibility path
+  - direct WKT, CSV, KML, and FlatGeobuf GPU readers
+  - the direct SHP binary + DBF and pyogrio geometry + GPU DBF Shapefile paths
+  - the GeoJSON byte-classify path after property extraction
+  - the OSM PBF hybrid path after protobuf/tag extraction
+- Direct format-native helpers now exist for the promoted compatibility readers
+  that already have a credible shared boundary:
+  - `read_geojson_native(...)`
+  - `read_shapefile_native(...)`
+- GeoJSON remains an explicit hybrid compatibility boundary because property
+  extraction is still CPU-side even though geometry decode is GPU-native.
+- Shapefile remains an explicit hybrid compatibility boundary because the
+  container and DBF attribute story are still legacy-oriented even when
+  geometry decode is native.
+- Untargeted legacy GDAL formats stay outside the GPU-native promise and route
+  through explicit fallback compatibility adapters.
 - Repo-owned GeoJSON ingest now also has an internal staged owned path:
   - `auto` prefers `gpu-byte-classify` when a GPU runtime is available,
     producing device-resident geometry via NVRTC kernels. On CPU-only hosts,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from vibespatial.bench.io_benchmark_rails import (
+    _stable_geoparquet_scan_repeat,
     benchmark_io_arrow_suite,
     benchmark_io_file_suite,
     io_suite_to_json,
@@ -15,13 +16,20 @@ def test_io_arrow_smoke_suite_reports_enforced_and_informational_cases() -> None
 
     assert "geoarrow-bridge-encode-point-10000" in by_id
     assert "wkb-decode-point-10000" in by_id
-    assert "geoparquet-selective-point-100000" in by_id
+    assert "geoparquet-selective-point-1000000" in by_id
     assert all(result.metric in {"speedup", "decoded_row_fraction"} for result in results)
 
     payload = json.loads(io_suite_to_json(results, suite="smoke", repeat=1, scope="io-arrow"))
     assert payload["metadata"]["suite"] == "smoke"
     assert payload["metadata"]["scope"] == "io-arrow"
     assert "results" in payload
+
+
+def test_stable_geoparquet_scan_repeat_enforces_minimum_samples() -> None:
+    assert _stable_geoparquet_scan_repeat(1) == 3
+    assert _stable_geoparquet_scan_repeat(2) == 3
+    assert _stable_geoparquet_scan_repeat(3) == 3
+    assert _stable_geoparquet_scan_repeat(5) == 5
 
 
 def test_io_file_smoke_suite_keeps_geojson_informational() -> None:

@@ -93,6 +93,7 @@ from .geoparquet import (  # noqa: F401
     plan_geoparquet_engine,
     plan_geoparquet_scan,
     read_geoparquet,
+    read_geoparquet_native,
     read_geoparquet_owned,
     write_geoparquet,
 )

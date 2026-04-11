@@ -109,6 +109,15 @@ def test_geoarrow_share_mode_reuses_buffers_and_delays_host_geometry_materializa
     assert any(event.kind is DiagnosticKind.MATERIALIZATION for event in adopted.diagnostics)
 
 
+def test_geoarrow_share_mode_reuses_cached_view_object() -> None:
+    owned = from_shapely_geometries(_sample_geometries())
+
+    first = owned.to_geoarrow(sharing=BufferSharingMode.SHARE)
+    second = owned.to_geoarrow(sharing=BufferSharingMode.SHARE)
+
+    assert first is second
+
+
 def test_bounds_and_total_bounds_ignore_nulls_and_empty() -> None:
     owned = from_shapely_geometries(_sample_geometries())
 

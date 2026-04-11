@@ -16,6 +16,9 @@ class GeoParquetMetadataSummary:
     ymin: np.ndarray
     xmax: np.ndarray
     ymax: np.ndarray
+    source_paths: tuple[str, ...] | None = None
+    row_group_source_indices: np.ndarray | None = None
+    row_group_source_row_groups: np.ndarray | None = None
 
     @property
     def row_group_count(self) -> int:
@@ -55,6 +58,9 @@ def build_geoparquet_metadata_summary(
     ymin: list[float] | tuple[float, ...] | np.ndarray,
     xmax: list[float] | tuple[float, ...] | np.ndarray,
     ymax: list[float] | tuple[float, ...] | np.ndarray,
+    source_paths: list[str] | tuple[str, ...] | None = None,
+    row_group_source_indices: list[int] | tuple[int, ...] | np.ndarray | None = None,
+    row_group_source_row_groups: list[int] | tuple[int, ...] | np.ndarray | None = None,
 ) -> GeoParquetMetadataSummary:
     rows = np.asarray(row_group_rows, dtype=np.int64)
     xmin_arr = np.asarray(xmin, dtype=np.float64)
@@ -66,6 +72,25 @@ def build_geoparquet_metadata_summary(
         raise ValueError("GeoParquet metadata summary requires at least one row group")
     if not all(array.size == size for array in (xmin_arr, ymin_arr, xmax_arr, ymax_arr)):
         raise ValueError("row_group_rows and bbox arrays must have matching sizes")
+    source_indices_arr = None
+    source_row_groups_arr = None
+    source_paths_tuple = None if source_paths is None else tuple(str(path) for path in source_paths)
+    if row_group_source_indices is not None:
+        source_indices_arr = np.asarray(row_group_source_indices, dtype=np.int64)
+        if source_indices_arr.size != size:
+            raise ValueError("row_group_source_indices must match row_group_rows size")
+    if row_group_source_row_groups is not None:
+        source_row_groups_arr = np.asarray(row_group_source_row_groups, dtype=np.int64)
+        if source_row_groups_arr.size != size:
+            raise ValueError("row_group_source_row_groups must match row_group_rows size")
+    if (source_indices_arr is None) != (source_row_groups_arr is None):
+        raise ValueError(
+            "row_group_source_indices and row_group_source_row_groups must be provided together"
+        )
+    if source_paths_tuple is not None and source_indices_arr is not None:
+        max_index = -1 if source_indices_arr.size == 0 else int(source_indices_arr.max())
+        if max_index >= len(source_paths_tuple):
+            raise ValueError("row_group_source_indices refer to a missing source path")
     return GeoParquetMetadataSummary(
         source=source,
         row_group_rows=rows,
@@ -73,6 +98,9 @@ def build_geoparquet_metadata_summary(
         ymin=ymin_arr,
         xmax=xmax_arr,
         ymax=ymax_arr,
+        source_paths=source_paths_tuple,
+        row_group_source_indices=source_indices_arr,
+        row_group_source_row_groups=source_row_groups_arr,
     )
 
 

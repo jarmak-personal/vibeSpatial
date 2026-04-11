@@ -1192,6 +1192,12 @@ class DeviceGeometryArray(ExtensionArray):
         return self._binary_predicate("contains_properly", other, **kwargs)
 
     def equals(self, other, *args, **kwargs):
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None and other_owned.row_count == len(self):
+            from .equality import geom_equals_owned
+
+            return geom_equals_owned(self._owned, other_owned)
+
         import shapely
 
         from vibespatial.runtime import get_requested_mode
@@ -1214,15 +1220,19 @@ class DeviceGeometryArray(ExtensionArray):
         return shapely.equals(self._ensure_shapely_cache(), other, *args, **kwargs)
 
     def geom_equals(self, other):
-        if isinstance(other, DeviceGeometryArray):
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_owned
-            return geom_equals_owned(self._owned, other._owned)
+
+            return geom_equals_owned(self._owned, other_owned)
         return self.equals(other)
 
     def geom_equals_exact(self, other, tolerance):
-        if isinstance(other, DeviceGeometryArray):
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_exact_owned
-            return geom_equals_exact_owned(self._owned, other._owned, tolerance)
+
+            return geom_equals_exact_owned(self._owned, other_owned, tolerance)
         import shapely
 
         from vibespatial.runtime import get_requested_mode
@@ -1243,9 +1253,11 @@ class DeviceGeometryArray(ExtensionArray):
         return shapely.equals_exact(self._ensure_shapely_cache(), other, tolerance=tolerance)
 
     def geom_equals_identical(self, other):
-        if isinstance(other, DeviceGeometryArray):
+        other_owned = self._coerce_other_to_owned(other)
+        if other_owned is not None and other_owned.row_count == len(self):
             from .equality import geom_equals_identical_owned
-            return geom_equals_identical_owned(self._owned, other._owned)
+
+            return geom_equals_identical_owned(self._owned, other_owned)
         import shapely
 
         from vibespatial.runtime import get_requested_mode

@@ -7,6 +7,7 @@ import shapely
 import shapely.wkb
 
 from vibespatial.api import GeoDataFrame
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 
 
 @contextmanager
@@ -475,14 +476,21 @@ def _try_gpu_read_postgis(sql, con, *, geom_col="geom", crs=None, chunksize=None
     """Attempt GPU-accelerated PostGIS read via ADBC.
 
     Returns a GeoDataFrame on success, or ``None`` if the GPU path cannot
-    be used (missing ADBC, connection type unsupported, or any failure).
+    be used. Only PostgreSQL URI-backed connectables are eligible for the
+    GPU PostGIS path; other SQL backends should remain on the generic host
+    reader without recording a GPU fallback.
     """
     try:
-        from vibespatial.io.postgis_gpu import read_postgis_gpu
+        from vibespatial.io.postgis_gpu import _get_connection_uri, read_postgis_gpu
+
+        if _get_connection_uri(con) is None:
+            return None
 
         return read_postgis_gpu(
             sql, con, geom_col=geom_col, crs=crs, chunksize=chunksize,
         )
+    except StrictNativeFallbackError:
+        raise
     except Exception:
         return None
 
@@ -512,6 +520,8 @@ def _try_gpu_write_postgis(gdf, name, con, *, if_exists="fail", schema=None,
             schema=schema,
             index=index,
         )
+    except StrictNativeFallbackError:
+        raise
     except Exception:
         return False
 

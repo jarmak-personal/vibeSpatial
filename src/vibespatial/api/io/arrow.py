@@ -1,3 +1,4 @@
+import io
 import json
 import warnings
 from typing import Literal, get_args
@@ -12,6 +13,7 @@ from vibespatial.api._compat import import_optional_dependency
 from vibespatial.api.geo_base import _is_geometry_like_dtype
 from vibespatial.api.geometry_array import GeometryArray, from_shapely, from_wkb
 from vibespatial.api.io.file import _expand_user
+from vibespatial.runtime.fallbacks import record_fallback_event
 
 METADATA_VERSION = "1.0.0"
 SUPPORTED_VERSIONS_LITERAL = Literal["0.1.0", "0.4.0", "1.0.0-beta.1", "1.0.0", "1.1.0"]
@@ -466,12 +468,15 @@ def _native_tabular_to_arrow(
         interleaved=False,
         include_z=None,
     )
-    geometry_series = payload.geometry.to_geoseries(
-        index=payload.attributes.index,
-        name=payload.geometry_name,
-    )
+    geometry_series_by_name = {
+        geometry_column.name: geometry_column.geometry.to_geoseries(
+            index=payload.attributes.index,
+            name=geometry_column.name,
+        )
+        for geometry_column in payload.geometry_columns
+    }
     geo_metadata = _create_geometry_metadata(
-        {payload.geometry_name: geometry_series},
+        geometry_series_by_name,
         primary_column=payload.geometry_name,
         schema_version=schema_version,
         geometry_encoding=geometry_encoding_dict,
@@ -479,6 +484,11 @@ def _native_tabular_to_arrow(
     )
 
     if write_covering_bbox:
+        if len(payload.geometry_columns) != 1:
+            raise ValueError(
+                "write_covering_bbox with multiple geometry columns requires reader-side disambiguation support"
+            )
+        geometry_series = geometry_series_by_name[payload.geometry_name]
         bounds = geometry_series.bounds
         bbox_array = StructArray.from_arrays(
             [bounds["minx"], bounds["miny"], bounds["maxx"], bounds["maxy"]],
@@ -630,7 +640,35 @@ def _to_feather(df, path, index=None, compression=None, schema_version=None, **k
     feather.write_feather(table, path, compression=compression, **kwargs)
 
 
-def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attrs=None):
+def _record_arrow_geometry_decode_fallback(
+    *,
+    surface: str,
+    pipeline: str,
+    column_name: str,
+    encoding: str,
+    exc: Exception,
+) -> None:
+    record_fallback_event(
+        surface=surface,
+        reason="explicit CPU compatibility fallback after Arrow geometry decode could not complete",
+        detail=(
+            f"column={column_name}, encoding={encoding!r}, "
+            f"detail={type(exc).__name__}: {exc}"
+        ),
+        pipeline=pipeline,
+        d2h_transfer=False,
+    )
+
+
+def _arrow_to_geopandas(
+    table,
+    geo_metadata=None,
+    to_pandas_kwargs=None,
+    df_attrs=None,
+    *,
+    fallback_surface: str = "vibespatial.api.io.arrow",
+    fallback_pipeline: str = "io/read_arrow",
+):
     """Convert a pyarrow Table to a GeoDataFrame.
 
     Helper function with main, shared logic for read_parquet/read_feather.
@@ -693,7 +731,14 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attr
             try:
                 owned = decode_wkb_arrow_array_owned(arrow_col)
                 geom_arr = GeometryArray.from_owned(owned, crs=crs)
-            except (ValueError, NotImplementedError):
+            except (ValueError, NotImplementedError) as exc:
+                _record_arrow_geometry_decode_fallback(
+                    surface=fallback_surface,
+                    pipeline=fallback_pipeline,
+                    column_name=col,
+                    encoding="WKB",
+                    exc=exc,
+                )
                 geom_arr = from_wkb(np.array(table[col]), crs=crs)
         else:
             import pyarrow as pa
@@ -707,7 +752,14 @@ def _arrow_to_geopandas(table, geo_metadata=None, to_pandas_kwargs=None, df_attr
                     field, arrow_col, encoding=col_metadata["encoding"],
                 )
                 geom_arr = GeometryArray.from_owned(owned, crs=crs)
-            except (ValueError, NotImplementedError):
+            except (ValueError, NotImplementedError) as exc:
+                _record_arrow_geometry_decode_fallback(
+                    surface=fallback_surface,
+                    pipeline=fallback_pipeline,
+                    column_name=col,
+                    encoding=col_metadata["encoding"],
+                    exc=exc,
+                )
                 from vibespatial.api.io._geoarrow import construct_shapely_array
 
                 geom_arr = from_shapely(
@@ -781,6 +833,18 @@ def _ensure_arrow_fs(filesystem):
     return filesystem
 
 
+def _coerce_pyarrow_parquet_source(path):
+    if isinstance(path, bytes):
+        import pyarrow as pa
+
+        return pa.BufferReader(path)
+    if isinstance(path, io.BytesIO):
+        import pyarrow as pa
+
+        return pa.BufferReader(path.getvalue())
+    return path
+
+
 def _validate_and_decode_metadata(metadata):
     if metadata is None or b"geo" not in metadata:
         raise ValueError(
@@ -808,6 +872,7 @@ def _read_parquet_schema_and_metadata(path, filesystem):
     """
     from pyarrow import parquet
 
+    path = _coerce_pyarrow_parquet_source(path)
     dataset = None
     try:
         dataset = parquet.ParquetDataset(path, filesystem=filesystem)
@@ -975,7 +1040,14 @@ def _read_parquet(
     else:
         df_attrs = None
 
-    return _arrow_to_geopandas(table, geo_metadata, to_pandas_kwargs, df_attrs)
+    return _arrow_to_geopandas(
+        table,
+        geo_metadata,
+        to_pandas_kwargs,
+        df_attrs,
+        fallback_surface="geopandas.read_parquet",
+        fallback_pipeline="io/read_parquet",
+    )
 
 
 def _read_feather(path, columns=None, to_pandas_kwargs=None, **kwargs):
@@ -1047,7 +1119,12 @@ def _read_feather(path, columns=None, to_pandas_kwargs=None, **kwargs):
     path = _expand_user(path)
 
     table = feather.read_table(path, columns=columns, **kwargs)
-    return _arrow_to_geopandas(table, to_pandas_kwargs=to_pandas_kwargs)
+    return _arrow_to_geopandas(
+        table,
+        to_pandas_kwargs=to_pandas_kwargs,
+        fallback_surface="geopandas.read_feather",
+        fallback_pipeline="io/read_feather",
+    )
 
 
 def _get_parquet_bbox_filter(geo_metadata, bbox):

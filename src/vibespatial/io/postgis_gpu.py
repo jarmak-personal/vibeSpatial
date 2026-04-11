@@ -1,7 +1,8 @@
 """GPU-accelerated PostGIS read/write via ADBC (Arrow Database Connectivity).
 
 Pipeline:
-  read:  ADBC → Arrow table → split WKB column → GPU decode → GeoDataFrame
+  read:  ADBC → Arrow table → split WKB column → GPU decode → NativeTabularResult
+         → GeoDataFrame
   write: OwnedGeometryArray → GPU WKB encode → Arrow table → ADBC bulk ingest
 
 ADBC is an OPTIONAL dependency. All public functions return ``None`` when
@@ -59,16 +60,34 @@ def _get_connection_uri(con: object) -> str | None:
     caller to fall back to the Shapely path.
     """
     if isinstance(con, str):
-        return con
+        return con if _is_postgresql_uri(con) else None
     # SQLAlchemy Engine
     if hasattr(con, "url"):
         url = str(con.url)
-        # SQLAlchemy uses ``postgresql://`` which ADBC also accepts.
-        return url
+        return url if _is_postgresql_uri(url) else None
     # SQLAlchemy Connection (has .engine.url)
     if hasattr(con, "engine") and hasattr(con.engine, "url"):
-        return str(con.engine.url)
+        url = str(con.engine.url)
+        return url if _is_postgresql_uri(url) else None
     return None
+
+
+def _is_postgresql_uri(uri: str) -> bool:
+    normalized = uri.lower()
+    return normalized.startswith(
+        (
+            "postgresql://",
+            "postgresql+",
+            "postgres://",
+            "postgres+",
+        )
+    )
+
+
+def _is_sqlalchemy_like_connectable(con: object) -> bool:
+    return isinstance(con, str) or hasattr(con, "url") or (
+        hasattr(con, "engine") and hasattr(con.engine, "url")
+    )
 
 
 def _coerce_native_write_payload(spatial) -> NativeTabularResult | None:
@@ -137,13 +156,34 @@ def _arrow_table_to_geodataframe(
 ) -> GeoDataFrame:
     """Convert a PyArrow table with a WKB binary geometry column into a GeoDataFrame.
 
+    The table is first lowered into the shared native read boundary and only
+    then materialized at the explicit public boundary.
+    """
+    return _arrow_table_to_native_tabular_result(
+        table,
+        geom_col=geom_col,
+        crs=crs,
+    ).to_geodataframe()
+
+
+def _arrow_table_to_native_tabular_result(
+    table: pa.Table,
+    geom_col: str,
+    crs: str | int | None,
+) -> NativeTabularResult:
+    """Convert a PyArrow table with a WKB geometry column into a native read result.
+
     The WKB column is GPU-decoded via ``decode_wkb_arrow_array_owned``,
-    then wrapped into a device-backed GeoSeries. Attribute columns stay
-    on host as a pandas DataFrame.
+    while non-geometry columns stay columnar in the shared native attribute
+    payload until an explicit public materialization point.
     """
     import pyarrow as pa
 
-    from vibespatial.io.geoarrow import geoseries_from_owned
+    from vibespatial.api._native_results import (
+        GeometryNativeResult,
+        NativeTabularResult,
+        native_attribute_table_from_arrow_table,
+    )
     from vibespatial.io.wkb import decode_wkb_arrow_array_owned
 
     # --- extract WKB column -------------------------------------------------
@@ -168,18 +208,14 @@ def _arrow_table_to_geodataframe(
     # --- GPU decode ----------------------------------------------------------
     owned: OwnedGeometryArray = decode_wkb_arrow_array_owned(wkb_column)
 
-    # --- build GeoSeries from OGA -------------------------------------------
-    geom_series = geoseries_from_owned(owned, name=geom_col, crs=crs)
-
-    # --- build attribute DataFrame (host-side) ------------------------------
     attr_table = table.drop(geom_col)
-
-    import vibespatial.api as geopandas
-
-    attrs_df = attr_table.to_pandas()
-    gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
-
-    return gdf
+    attributes = native_attribute_table_from_arrow_table(attr_table)
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=GeometryNativeResult.from_owned(owned, crs=crs),
+        geometry_name=geom_col,
+        column_order=tuple([*attributes.columns, geom_col]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,14 +223,14 @@ def _arrow_table_to_geodataframe(
 # ---------------------------------------------------------------------------
 
 
-def read_postgis_gpu(
+def read_postgis_native(
     sql: str,
     con: str | object,
     geom_col: str = "geom",
     crs: str | int | None = None,
     chunksize: int | None = None,
-) -> GeoDataFrame | None:
-    """Read a PostGIS query into a GeoDataFrame using ADBC + GPU WKB decode.
+) -> NativeTabularResult | None:
+    """Read a PostGIS query into a native tabular result using ADBC + GPU WKB decode.
 
     Parameters
     ----------
@@ -214,23 +250,45 @@ def read_postgis_gpu(
 
     Returns
     -------
-    GeoDataFrame or None
+    NativeTabularResult or None
         ``None`` when ADBC is unavailable or any error occurs (caller
         should fall through to the Shapely-based path).
     """
     # Chunked reading is not yet supported in the GPU path.
     if chunksize is not None:
+        record_fallback_event(
+            surface="vibespatial.io.postgis_gpu",
+            reason="Chunked PostGIS GPU read is not implemented",
+            selected=ExecutionMode.CPU,
+            pipeline="io/postgis_read",
+            d2h_transfer=False,
+        )
         return None
 
     # --- resolve connection URI ----------------------------------------------
     con_uri = _get_connection_uri(con)
     if con_uri is None:
+        if not _is_sqlalchemy_like_connectable(con):
+            record_fallback_event(
+                surface="vibespatial.io.postgis_gpu",
+                reason="PostGIS GPU read requires a PostgreSQL URI or SQLAlchemy connectable",
+                selected=ExecutionMode.CPU,
+                pipeline="io/postgis_read",
+                d2h_transfer=False,
+            )
         return None
 
     # --- ensure ADBC is installed --------------------------------------------
     try:
         import adbc_driver_postgresql.dbapi as pg_dbapi
     except ImportError:
+        record_fallback_event(
+            surface="vibespatial.io.postgis_gpu",
+            reason="ADBC PostgreSQL driver is not installed",
+            selected=ExecutionMode.CPU,
+            pipeline="io/postgis_read",
+            d2h_transfer=False,
+        )
         return None
 
     # --- CRS auto-detection --------------------------------------------------
@@ -271,13 +329,13 @@ def read_postgis_gpu(
             ]
         )
 
-    # --- assemble GeoDataFrame -----------------------------------------------
+    # --- assemble native result ----------------------------------------------
     try:
-        gdf = _arrow_table_to_geodataframe(table, geom_col=geom_col, crs=crs)
+        payload = _arrow_table_to_native_tabular_result(table, geom_col=geom_col, crs=crs)
     except Exception as exc:
         record_fallback_event(
             surface="vibespatial.io.postgis_gpu",
-            reason=f"GPU WKB decode or assembly failed: {exc}",
+            reason=f"GPU WKB decode or native read assembly failed: {exc}",
             detail=str(exc),
             selected=ExecutionMode.CPU,
             pipeline="io/postgis_read",
@@ -292,7 +350,38 @@ def read_postgis_gpu(
         reason="ADBC Arrow fetch + GPU WKB decode pipeline",
         selected=ExecutionMode.GPU,
     )
-    return gdf
+    return payload
+
+
+def read_postgis_gpu(
+    sql: str,
+    con: str | object,
+    geom_col: str = "geom",
+    crs: str | int | None = None,
+    chunksize: int | None = None,
+) -> GeoDataFrame | None:
+    """Read a PostGIS query into a GeoDataFrame using ADBC + GPU WKB decode."""
+    payload = read_postgis_native(
+        sql,
+        con,
+        geom_col=geom_col,
+        crs=crs,
+        chunksize=chunksize,
+    )
+    if payload is None:
+        return None
+    try:
+        return payload.to_geodataframe()
+    except Exception as exc:
+        record_fallback_event(
+            surface="vibespatial.io.postgis_gpu",
+            reason=f"Native PostGIS read export failed: {exc}",
+            detail=str(exc),
+            selected=ExecutionMode.CPU,
+            pipeline="io/postgis_read",
+            d2h_transfer=False,
+        )
+        return None
 
 
 # ---------------------------------------------------------------------------

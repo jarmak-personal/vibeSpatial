@@ -117,6 +117,7 @@ from .io.arrow import (
     plan_wkb_bridge,
     plan_wkb_partition,
     read_geoparquet,
+    read_geoparquet_native,
     read_geoparquet_owned,
     write_geoparquet,
 )
@@ -128,8 +129,11 @@ from .io.file import (
     benchmark_shapefile_ingest,
     plan_shapefile_ingest,
     plan_vector_file_io,
+    read_geojson_native,
+    read_shapefile_native,
     read_shapefile_owned,
     read_vector_file,
+    read_vector_file_native,
     write_vector_file,
 )
 from .io.geojson import (
@@ -569,9 +573,13 @@ __all__ = [
     "record_dispatch_event",
     "record_fallback_event",
     "read_geoparquet",
+    "read_geoparquet_native",
     "read_geoparquet_owned",
+    "read_geojson_native",
     "read_geojson_owned",
+    "read_shapefile_native",
     "read_shapefile_owned",
+    "read_vector_file_native",
     "read_vector_file",
     "select_precision_plan",
     "select_residency_plan",

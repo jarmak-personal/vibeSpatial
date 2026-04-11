@@ -9,6 +9,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 
 # Re-exported from io_geojson for backward compatibility
 from .geojson import (  # noqa: F401
@@ -123,6 +124,72 @@ def _prepare_native_payload_for_file(payload, *, index: bool | None):
     )
 
 
+def _native_attribute_table_from_file_attributes(attributes, *, row_count: int):
+    import pandas as pd
+
+    from vibespatial.api._native_results import NativeAttributeTable
+
+    if isinstance(attributes, NativeAttributeTable):
+        return attributes
+    if attributes is None:
+        return NativeAttributeTable(dataframe=pd.DataFrame(index=pd.RangeIndex(row_count)))
+    if isinstance(attributes, dict):
+        frame = pd.DataFrame(attributes)
+        if not attributes:
+            frame = pd.DataFrame(index=pd.RangeIndex(row_count))
+        return NativeAttributeTable(dataframe=frame)
+    if isinstance(attributes, pd.DataFrame):
+        return NativeAttributeTable(dataframe=attributes)
+    return NativeAttributeTable.from_value(attributes)
+
+
+def _native_file_result_from_owned(
+    owned: OwnedGeometryArray,
+    *,
+    geometry_name: str = "geometry",
+    crs=None,
+    attributes=None,
+    row_count: int | None = None,
+):
+    from vibespatial.api._native_results import GeometryNativeResult, NativeTabularResult
+
+    if row_count is None:
+        row_count = int(owned.row_count)
+    attribute_table = _native_attribute_table_from_file_attributes(
+        attributes,
+        row_count=row_count,
+    )
+    return NativeTabularResult(
+        attributes=attribute_table,
+        geometry=GeometryNativeResult.from_owned(owned, crs=crs),
+        geometry_name=geometry_name,
+        column_order=tuple([*attribute_table.columns, geometry_name]),
+    )
+
+
+def _native_geojson_result_from_gpu_result(
+    gpu_result,
+    *,
+    target_crs: str | None = None,
+):
+    import pandas as pd
+
+    effective_crs = _resolve_target_crs_for_owned(
+        gpu_result.owned,
+        source_crs="EPSG:4326",
+        target_crs=target_crs,
+    )
+    props_df = gpu_result.extract_properties_dataframe()
+    if props_df.empty:
+        props_df = pd.DataFrame(index=pd.RangeIndex(gpu_result.n_features))
+    return _native_file_result_from_owned(
+        gpu_result.owned,
+        crs=effective_crs,
+        attributes=props_df,
+        row_count=gpu_result.n_features,
+    )
+
+
 def _write_vector_file_native_pyogrio(
     payload,
     filename,
@@ -225,6 +292,93 @@ def _select_arrow_geometry_column(table, metadata: dict[str, object]) -> tuple[i
     raise ValueError("Shapefile Arrow table did not expose a GeoArrow WKB geometry column")
 
 
+def _pyogrio_arrow_wkb_to_native_tabular_result(
+    table,
+    metadata: dict[str, object],
+    *,
+    target_crs: str | None = None,
+):
+    from vibespatial.api._native_results import (
+        GeometryNativeResult,
+        NativeTabularResult,
+        native_attribute_table_from_arrow_table,
+    )
+
+    from .arrow import decode_wkb_arrow_array_owned
+
+    geom_idx, _geom_field = _select_arrow_geometry_column(table, metadata)
+    geom_column = table.column(geom_idx).combine_chunks()
+    owned = decode_wkb_arrow_array_owned(geom_column)
+    geometry_name = metadata.get("geometry_name") or "geometry"
+
+    source_crs = metadata.get("crs")
+    effective_crs = _resolve_target_crs_for_owned(
+        owned,
+        source_crs=source_crs,
+        target_crs=target_crs,
+    )
+
+    attrs_table = table.remove_column(geom_idx)
+    attributes = native_attribute_table_from_arrow_table(attrs_table)
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=GeometryNativeResult.from_owned(owned, crs=effective_crs),
+        geometry_name=geometry_name,
+        column_order=tuple([*attributes.columns, geometry_name]),
+    )
+
+
+def _materialize_native_file_read_result(payload):
+    import datetime
+
+    frame = payload.to_geodataframe()
+    for col in frame.columns:
+        if col == frame.geometry.name:
+            continue
+        series = frame[col]
+        if hasattr(series, "dt") and series.dt.tz is not None:
+            try:
+                frame[col] = series.dt.tz_convert(datetime.UTC)
+            except Exception:
+                pass
+    return frame
+
+
+def read_geojson_native(
+    source: str | Path,
+    *,
+    prefer: str = "auto",
+    track_properties: bool = True,
+    target_crs: str | None = None,
+):
+    import pandas as pd
+
+    batch = read_geojson_owned(
+        source,
+        prefer=prefer,
+        track_properties=track_properties,
+    )
+    effective_crs = _resolve_target_crs_for_owned(
+        batch.geometry,
+        source_crs="EPSG:4326",
+        target_crs=target_crs,
+    )
+    attributes = None
+    if track_properties:
+        properties = batch.properties
+        attributes = (
+            pd.DataFrame(properties)
+            if properties
+            else pd.DataFrame(index=pd.RangeIndex(batch.geometry.row_count))
+        )
+    return _native_file_result_from_owned(
+        batch.geometry,
+        crs=effective_crs,
+        attributes=attributes,
+        row_count=int(batch.geometry.row_count),
+    )
+
+
 def read_shapefile_owned(
     source: str | Path,
     *,
@@ -262,6 +416,43 @@ def read_shapefile_owned(
         geometry=geometry,
         attributes_table=attributes_table,
         metadata=metadata,
+    )
+
+
+def read_shapefile_native(
+    source: str | Path,
+    *,
+    bbox=None,
+    columns=None,
+    rows=None,
+    target_crs: str | None = None,
+    **kwargs,
+):
+    from vibespatial.api._native_results import (
+        GeometryNativeResult,
+        NativeTabularResult,
+        native_attribute_table_from_arrow_table,
+    )
+
+    batch = read_shapefile_owned(
+        source,
+        bbox=bbox,
+        columns=columns,
+        rows=rows,
+        **kwargs,
+    )
+    effective_crs = _resolve_target_crs_for_owned(
+        batch.geometry,
+        source_crs=batch.metadata.get("crs"),
+        target_crs=target_crs,
+    )
+    geometry_name = batch.metadata.get("geometry_name") or "geometry"
+    attributes = native_attribute_table_from_arrow_table(batch.attributes_table)
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=GeometryNativeResult.from_owned(batch.geometry, crs=effective_crs),
+        geometry_name=geometry_name,
+        column_order=tuple([*attributes.columns, geometry_name]),
     )
 
 
@@ -412,6 +603,20 @@ def _reproject_owned_inplace(
         dbuf.bounds = None
 
 
+def _resolve_target_crs_for_owned(
+    owned: OwnedGeometryArray,
+    *,
+    source_crs: str | None,
+    target_crs: str | None,
+) -> str | None:
+    if target_crs is None:
+        return source_crs
+    if source_crs is None:
+        return target_crs
+    _reproject_owned_inplace(owned, src_crs=source_crs, dst_crs=target_crs)
+    return target_crs
+
+
 def _reproject_gdf_gpu(gdf, target_crs: str) -> None:
     """Reproject a GPU-backed GeoDataFrame in-place via to_crs.
 
@@ -506,27 +711,8 @@ def _try_wkt_gpu_read(filename, *, target_crs: str | None = None) -> object | No
     Returns a GeoDataFrame with a geometry column only, or None on failure.
     """
     try:
-        from .arrow import geoseries_from_owned
-        from .kvikio_reader import read_file_to_device
-
-        file_path = Path(filename)
-        file_size = file_path.stat().st_size
-        result = read_file_to_device(file_path, file_size)
-        d_bytes = result.device_bytes
-
-        from .wkt_gpu import read_wkt_gpu
-
-        owned = read_wkt_gpu(d_bytes)
-
-        # WKT has no embedded CRS.  When target_crs is requested, set it
-        # as the CRS label on the output (no reprojection possible without
-        # a known source CRS).
-        crs = target_crs if target_crs is not None else None
-        geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
-
-        import vibespatial.api as geopandas
-
-        gdf = geopandas.GeoDataFrame(geometry=geom_series)
+        payload = _try_wkt_gpu_read_native(filename, target_crs=target_crs)
+        gdf = _materialize_native_file_read_result(payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -542,6 +728,20 @@ def _try_wkt_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
+def _try_wkt_gpu_read_native(filename, *, target_crs: str | None = None):
+    from .kvikio_reader import read_file_to_device
+    from .wkt_gpu import read_wkt_gpu
+
+    file_path = Path(filename)
+    file_size = file_path.stat().st_size
+    result = read_file_to_device(file_path, file_size)
+    d_bytes = result.device_bytes
+    owned = read_wkt_gpu(d_bytes)
+
+    crs = target_crs if target_crs is not None else None
+    return _native_file_result_from_owned(owned, crs=crs)
+
+
 def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read a CSV file using the GPU byte-classification pipeline.
 
@@ -550,33 +750,8 @@ def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | No
     Returns None on failure to fall through to CPU.
     """
     try:
-        from .arrow import geoseries_from_owned
-        from .kvikio_reader import read_file_to_device
-
-        file_path = Path(filename)
-        file_size = file_path.stat().st_size
-        result = read_file_to_device(file_path, file_size)
-        d_bytes = result.device_bytes
-
-        from .csv_gpu import read_csv_gpu
-
-        csv_result = read_csv_gpu(d_bytes)
-
-        # CSV has no embedded CRS.  When target_crs is requested, set it
-        # as the CRS label on the output.
-        crs = target_crs if target_crs is not None else None
-        geom_series = geoseries_from_owned(csv_result.geometry, name="geometry", crs=crs)
-
-        import pandas as pd
-
-        import vibespatial.api as geopandas
-
-        # Merge non-spatial attribute columns into the GeoDataFrame.
-        if csv_result.attributes:
-            attrs_df = pd.DataFrame(csv_result.attributes)
-        else:
-            attrs_df = pd.DataFrame(index=range(csv_result.n_rows))
-        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+        payload = _try_csv_gpu_read_native(filename, target_crs=target_crs)
+        gdf = _materialize_native_file_read_result(payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -592,7 +767,30 @@ def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
-def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
+def _try_csv_gpu_read_native(filename, *, target_crs: str | None = None):
+    from .csv_gpu import read_csv_gpu
+    from .kvikio_reader import read_file_to_device
+
+    file_path = Path(filename)
+    file_size = file_path.stat().st_size
+    result = read_file_to_device(file_path, file_size)
+    d_bytes = result.device_bytes
+
+    csv_result = read_csv_gpu(d_bytes)
+    crs = target_crs if target_crs is not None else None
+    return _native_file_result_from_owned(
+        csv_result.geometry,
+        crs=crs,
+        attributes=csv_result.attributes,
+        row_count=csv_result.n_rows,
+    )
+
+
+def _try_shapefile_shp_direct_gpu_read(
+    filename,
+    *,
+    target_crs: str | None = None,
+) -> object | None:
     """Try to read a Shapefile using direct GPU SHP binary decode.
 
     When both .shp and .shx files exist, bypasses the pyogrio -> WKB ->
@@ -604,88 +802,13 @@ def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
     etc.), allowing the caller to try the pyogrio + GPU WKB path.
     """
     try:
-        from .arrow import geoseries_from_owned
-
-        file_path = Path(filename)
-        is_zip = (
-            file_path.suffix.lower() == ".zip"
-            or str(file_path).lower().endswith(".shp.zip")
+        payload = _try_shapefile_shp_direct_gpu_read_native(
+            filename,
+            target_crs=target_crs,
         )
-
-        crs = None
-        attrs_df = None
-
-        if is_zip:
-            # Single-pass zip extraction: read SHP, SHX, PRJ, DBF all at
-            # once to avoid opening the archive multiple times.
-            import zipfile
-
-            from .shp_gpu import _assemble_from_shp_bytes
-
-            with zipfile.ZipFile(file_path) as zf:
-                names = zf.namelist()
-                shp_name = next((n for n in names if n.lower().endswith(".shp")), None)
-                shx_name = next((n for n in names if n.lower().endswith(".shx")), None)
-                if shp_name is None or shx_name is None:
-                    return None
-
-                shp_bytes = zf.read(shp_name)
-                shx_bytes = zf.read(shx_name)
-
-                prj_name = next((n for n in names if n.lower().endswith(".prj")), None)
-                if prj_name:
-                    try:
-                        crs = zf.read(prj_name).decode("utf-8", errors="replace").strip()
-                    except Exception:
-                        pass
-
-                dbf_name = next((n for n in names if n.lower().endswith(".dbf")), None)
-                dbf_bytes = zf.read(dbf_name) if dbf_name else None
-
-            # GPU decode SHP geometry from in-memory bytes
-            owned = _assemble_from_shp_bytes(shp_bytes, shx_bytes)
-            del shp_bytes, shx_bytes
-
-            # GPU decode DBF attributes from in-memory bytes (no temp file)
-            if dbf_bytes is not None:
-                from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu_from_bytes
-
-                dbf_result = read_dbf_gpu_from_bytes(dbf_bytes)
-                del dbf_bytes
-                attrs_df = dbf_result_to_dataframe(dbf_result)
-        else:
-            from .shp_gpu import read_shp_gpu
-
-            shx_path = file_path.with_suffix(".shx")
-            if not shx_path.exists():
-                return None
-
-            owned = read_shp_gpu(file_path)
-
-            prj_path = file_path.with_suffix(".prj")
-            if prj_path.exists():
-                try:
-                    crs = prj_path.read_text().strip()
-                except Exception:
-                    pass
-
-            dbf_path = file_path.with_suffix(".dbf")
-            if dbf_path.exists():
-                from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
-
-                dbf_result = read_dbf_gpu(dbf_path)
-                attrs_df = dbf_result_to_dataframe(dbf_result)
-
-        geom_series = geoseries_from_owned(owned, name="geometry", crs=crs)
-
-        if attrs_df is None:
-            import pandas as pd
-
-            attrs_df = pd.DataFrame(index=range(len(geom_series)))
-
-        import vibespatial.api as geopandas
-
-        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+        if payload is None:
+            return None
+        gdf = _materialize_native_file_read_result(payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -701,7 +824,94 @@ def _try_shapefile_shp_direct_gpu_read(filename) -> object | None:
         return None
 
 
-def _try_shapefile_dbf_gpu_read(filename) -> object | None:
+def _try_shapefile_shp_direct_gpu_read_native(
+    filename,
+    *,
+    target_crs: str | None = None,
+):
+    file_path = Path(filename)
+    is_zip = (
+        file_path.suffix.lower() == ".zip"
+        or str(file_path).lower().endswith(".shp.zip")
+    )
+
+    crs = None
+    attrs_df = None
+
+    if is_zip:
+        import zipfile
+
+        from .shp_gpu import _assemble_from_shp_bytes
+
+        with zipfile.ZipFile(file_path) as zf:
+            names = zf.namelist()
+            shp_name = next((n for n in names if n.lower().endswith(".shp")), None)
+            shx_name = next((n for n in names if n.lower().endswith(".shx")), None)
+            if shp_name is None or shx_name is None:
+                return None
+
+            shp_bytes = zf.read(shp_name)
+            shx_bytes = zf.read(shx_name)
+
+            prj_name = next((n for n in names if n.lower().endswith(".prj")), None)
+            if prj_name:
+                try:
+                    crs = zf.read(prj_name).decode("utf-8", errors="replace").strip()
+                except Exception:
+                    pass
+
+            dbf_name = next((n for n in names if n.lower().endswith(".dbf")), None)
+            dbf_bytes = zf.read(dbf_name) if dbf_name else None
+
+        owned = _assemble_from_shp_bytes(shp_bytes, shx_bytes)
+        del shp_bytes, shx_bytes
+
+        if dbf_bytes is not None:
+            from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu_from_bytes
+
+            dbf_result = read_dbf_gpu_from_bytes(dbf_bytes)
+            del dbf_bytes
+            attrs_df = dbf_result_to_dataframe(dbf_result)
+    else:
+        from .shp_gpu import read_shp_gpu
+
+        shx_path = file_path.with_suffix(".shx")
+        if not shx_path.exists():
+            return None
+
+        owned = read_shp_gpu(file_path)
+
+        prj_path = file_path.with_suffix(".prj")
+        if prj_path.exists():
+            try:
+                crs = prj_path.read_text().strip()
+            except Exception:
+                pass
+
+        dbf_path = file_path.with_suffix(".dbf")
+        if dbf_path.exists():
+            from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+
+            dbf_result = read_dbf_gpu(dbf_path)
+            attrs_df = dbf_result_to_dataframe(dbf_result)
+
+    effective_crs = _resolve_target_crs_for_owned(
+        owned,
+        source_crs=crs,
+        target_crs=target_crs,
+    )
+    return _native_file_result_from_owned(
+        owned,
+        crs=effective_crs,
+        attributes=attrs_df,
+    )
+
+
+def _try_shapefile_dbf_gpu_read(
+    filename,
+    *,
+    target_crs: str | None = None,
+) -> object | None:
     """Try to read a Shapefile with GPU DBF attribute parsing.
 
     Uses pyogrio.read_arrow() for geometry (via GPU WKB decode) and
@@ -710,35 +920,13 @@ def _try_shapefile_dbf_gpu_read(filename) -> object | None:
     failure.
     """
     try:
-        import pyogrio
-
-        from .arrow import decode_wkb_arrow_array_owned, geoseries_from_owned
-        from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
-
-        file_path = Path(filename)
-        dbf_path = file_path.with_suffix(".dbf")
-        if not dbf_path.exists():
-            return None
-
-        # Read geometry via pyogrio Arrow + GPU WKB decode
-        metadata, table = pyogrio.read_arrow(filename)
-        geom_idx, _ = _select_arrow_geometry_column(table, metadata)
-        geom_column = table.column(geom_idx).combine_chunks()
-        owned = decode_wkb_arrow_array_owned(geom_column)
-        crs = metadata.get("crs")
-        geom_series = geoseries_from_owned(
-            owned,
-            name=table.schema.field(geom_idx).name,
-            crs=crs,
+        payload = _try_shapefile_dbf_gpu_read_native(
+            filename,
+            target_crs=target_crs,
         )
-
-        # Read attributes via GPU DBF parser
-        dbf_result = read_dbf_gpu(dbf_path)
-        attrs_df = dbf_result_to_dataframe(dbf_result)
-
-        import vibespatial.api as geopandas
-
-        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+        if payload is None:
+            return None
+        gdf = _materialize_native_file_read_result(payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -754,6 +942,43 @@ def _try_shapefile_dbf_gpu_read(filename) -> object | None:
         return None
 
 
+def _try_shapefile_dbf_gpu_read_native(
+    filename,
+    *,
+    target_crs: str | None = None,
+):
+    import pyogrio
+
+    from .arrow import decode_wkb_arrow_array_owned
+    from .dbf_gpu import dbf_result_to_dataframe, read_dbf_gpu
+
+    file_path = Path(filename)
+    dbf_path = file_path.with_suffix(".dbf")
+    if not dbf_path.exists():
+        return None
+
+    metadata, table = pyogrio.read_arrow(filename)
+    geom_idx, _ = _select_arrow_geometry_column(table, metadata)
+    geom_column = table.column(geom_idx).combine_chunks()
+    owned = decode_wkb_arrow_array_owned(geom_column)
+    crs = _resolve_target_crs_for_owned(
+        owned,
+        source_crs=metadata.get("crs"),
+        target_crs=target_crs,
+    )
+
+    dbf_result = read_dbf_gpu(dbf_path)
+    attrs_df = dbf_result_to_dataframe(dbf_result)
+
+    geometry_name = metadata.get("geometry_name") or "geometry"
+    return _native_file_result_from_owned(
+        owned,
+        geometry_name=geometry_name,
+        crs=crs,
+        attributes=attrs_df,
+    )
+
+
 def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read a KML file using the GPU byte-classification pipeline.
 
@@ -761,33 +986,8 @@ def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | No
     Returns a GeoDataFrame with a geometry column only, or None on failure.
     """
     try:
-        from .arrow import geoseries_from_owned
-        from .kvikio_reader import read_file_to_device
-
-        file_path = Path(filename)
-        file_size = file_path.stat().st_size
-        result = read_file_to_device(file_path, file_size)
-        d_bytes = result.device_bytes
-
-        from .kml_gpu import read_kml_gpu
-
-        kml_result = read_kml_gpu(d_bytes)
-
-        # KML has no embedded CRS.  When target_crs is requested, set it
-        # as the CRS label on the output.
-        crs = target_crs if target_crs is not None else None
-        geom_series = geoseries_from_owned(kml_result.geometry, name="geometry", crs=crs)
-
-        import pandas as pd
-
-        import vibespatial.api as geopandas
-
-        # Merge Placemark attributes (name, description) into the GeoDataFrame.
-        if kml_result.attributes:
-            attrs_df = pd.DataFrame(kml_result.attributes)
-        else:
-            attrs_df = pd.DataFrame(index=range(kml_result.n_placemarks))
-        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
+        payload = _try_kml_gpu_read_native(filename, target_crs=target_crs)
+        gdf = _materialize_native_file_read_result(payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -803,6 +1003,25 @@ def _try_kml_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
+def _try_kml_gpu_read_native(filename, *, target_crs: str | None = None):
+    from .kml_gpu import read_kml_gpu
+    from .kvikio_reader import read_file_to_device
+
+    file_path = Path(filename)
+    file_size = file_path.stat().st_size
+    result = read_file_to_device(file_path, file_size)
+    d_bytes = result.device_bytes
+
+    kml_result = read_kml_gpu(d_bytes)
+    crs = target_crs if target_crs is not None else None
+    return _native_file_result_from_owned(
+        kml_result.geometry,
+        crs=crs,
+        attributes=kml_result.attributes,
+        row_count=kml_result.n_placemarks,
+    )
+
+
 def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read an OSM PBF file using the GPU hybrid pipeline.
 
@@ -816,106 +1035,10 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
     attributes (tags) are host-resident in a pandas DataFrame.
     """
     try:
-        import pandas as pd
-
-        from .arrow import geoseries_from_owned
-        from .osm_gpu import _tags_to_dataframe, read_osm_pbf
-
-        osm_result = read_osm_pbf(filename)
-        has_nodes = osm_result.nodes is not None and osm_result.n_nodes > 0
-        has_ways = osm_result.ways is not None and osm_result.n_ways > 0
-        has_relations = osm_result.relations is not None and osm_result.n_relations > 0
-
-        if not has_nodes and not has_ways and not has_relations:
+        payload = _try_osm_pbf_gpu_read_native(filename, target_crs=target_crs)
+        if payload is None:
             return None
-
-        # OSM PBF has no embedded CRS; coordinates are WGS84 by definition.
-        crs = target_crs if target_crs is not None else "EPSG:4326"
-
-        import cupy as _cp
-
-        import vibespatial.api as geopandas
-
-        # Count how many element types we have -- if only one, return a
-        # simple single-type GeoDataFrame; if multiple, concatenate with
-        # osm_element / osm_id columns.
-        n_types = int(has_nodes) + int(has_ways) + int(has_relations)
-
-        if n_types == 1:
-            if has_nodes:
-                geom_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
-                tags_df = (
-                    _tags_to_dataframe(osm_result.node_tags)
-                    if osm_result.node_tags
-                    else pd.DataFrame(index=range(osm_result.n_nodes))
-                )
-                gdf = geopandas.GeoDataFrame(tags_df, geometry=geom_series)
-                if osm_result.node_ids is not None:
-                    gdf["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
-            elif has_ways:
-                geom_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
-                tags_df = (
-                    _tags_to_dataframe(osm_result.way_tags)
-                    if osm_result.way_tags
-                    else pd.DataFrame(index=range(osm_result.n_ways))
-                )
-                gdf = geopandas.GeoDataFrame(tags_df, geometry=geom_series)
-                if osm_result.way_ids is not None:
-                    gdf["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
-            else:
-                geom_series = geoseries_from_owned(osm_result.relations, name="geometry", crs=crs)
-                tags_df = (
-                    _tags_to_dataframe(osm_result.relation_tags)
-                    if osm_result.relation_tags
-                    else pd.DataFrame(index=range(osm_result.n_relations))
-                )
-                gdf = geopandas.GeoDataFrame(tags_df, geometry=geom_series)
-                if osm_result.relation_ids is not None:
-                    gdf["osm_relation_id"] = _cp.asnumpy(osm_result.relation_ids)
-        else:
-            # Multiple element types -- build per-type GeoDataFrames and concatenate.
-            frames = []
-
-            if has_nodes:
-                node_series = geoseries_from_owned(osm_result.nodes, name="geometry", crs=crs)
-                node_tags_df = (
-                    _tags_to_dataframe(osm_result.node_tags)
-                    if osm_result.node_tags
-                    else pd.DataFrame(index=range(osm_result.n_nodes))
-                )
-                node_tags_df["osm_element"] = "node"
-                if osm_result.node_ids is not None:
-                    node_tags_df["osm_id"] = _cp.asnumpy(osm_result.node_ids)
-                frames.append(geopandas.GeoDataFrame(node_tags_df, geometry=node_series))
-
-            if has_ways:
-                way_series = geoseries_from_owned(osm_result.ways, name="geometry", crs=crs)
-                way_tags_df = (
-                    _tags_to_dataframe(osm_result.way_tags)
-                    if osm_result.way_tags
-                    else pd.DataFrame(index=range(osm_result.n_ways))
-                )
-                way_tags_df["osm_element"] = "way"
-                if osm_result.way_ids is not None:
-                    way_tags_df["osm_id"] = _cp.asnumpy(osm_result.way_ids)
-                frames.append(geopandas.GeoDataFrame(way_tags_df, geometry=way_series))
-
-            if has_relations:
-                rel_series = geoseries_from_owned(osm_result.relations, name="geometry", crs=crs)
-                rel_tags_df = (
-                    _tags_to_dataframe(osm_result.relation_tags)
-                    if osm_result.relation_tags
-                    else pd.DataFrame(index=range(osm_result.n_relations))
-                )
-                rel_tags_df["osm_element"] = "relation"
-                if osm_result.relation_ids is not None:
-                    rel_tags_df["osm_id"] = _cp.asnumpy(osm_result.relation_ids)
-                frames.append(geopandas.GeoDataFrame(rel_tags_df, geometry=rel_series))
-
-            gdf = geopandas.GeoDataFrame(
-                pd.concat(frames, ignore_index=True),
-            )
-
+        gdf = _materialize_native_file_read_result(payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
@@ -934,6 +1057,102 @@ def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object 
         return None
 
 
+def _try_osm_pbf_gpu_read_native(filename, *, target_crs: str | None = None):
+    import cupy as _cp
+    import pandas as pd
+
+    from vibespatial.api._native_results import _concat_native_tabular_results
+
+    from .osm_gpu import _tags_to_dataframe, read_osm_pbf
+
+    osm_result = read_osm_pbf(filename)
+    has_nodes = osm_result.nodes is not None and osm_result.n_nodes > 0
+    has_ways = osm_result.ways is not None and osm_result.n_ways > 0
+    has_relations = osm_result.relations is not None and osm_result.n_relations > 0
+
+    if not has_nodes and not has_ways and not has_relations:
+        return None
+
+    crs = target_crs if target_crs is not None else "EPSG:4326"
+
+    n_types = int(has_nodes) + int(has_ways) + int(has_relations)
+    results = []
+
+    if has_nodes:
+        node_tags_df = (
+            _tags_to_dataframe(osm_result.node_tags)
+            if osm_result.node_tags
+            else pd.DataFrame(index=range(osm_result.n_nodes))
+        )
+        if n_types == 1:
+            if osm_result.node_ids is not None:
+                node_tags_df["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
+        else:
+            node_tags_df["osm_element"] = "node"
+            if osm_result.node_ids is not None:
+                node_tags_df["osm_id"] = _cp.asnumpy(osm_result.node_ids)
+        results.append(
+            _native_file_result_from_owned(
+                osm_result.nodes,
+                crs=crs,
+                attributes=node_tags_df,
+                row_count=osm_result.n_nodes,
+            )
+        )
+
+    if has_ways:
+        way_tags_df = (
+            _tags_to_dataframe(osm_result.way_tags)
+            if osm_result.way_tags
+            else pd.DataFrame(index=range(osm_result.n_ways))
+        )
+        if n_types == 1:
+            if osm_result.way_ids is not None:
+                way_tags_df["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
+        else:
+            way_tags_df["osm_element"] = "way"
+            if osm_result.way_ids is not None:
+                way_tags_df["osm_id"] = _cp.asnumpy(osm_result.way_ids)
+        results.append(
+            _native_file_result_from_owned(
+                osm_result.ways,
+                crs=crs,
+                attributes=way_tags_df,
+                row_count=osm_result.n_ways,
+            )
+        )
+
+    if has_relations:
+        rel_tags_df = (
+            _tags_to_dataframe(osm_result.relation_tags)
+            if osm_result.relation_tags
+            else pd.DataFrame(index=range(osm_result.n_relations))
+        )
+        if n_types == 1:
+            if osm_result.relation_ids is not None:
+                rel_tags_df["osm_relation_id"] = _cp.asnumpy(osm_result.relation_ids)
+        else:
+            rel_tags_df["osm_element"] = "relation"
+            if osm_result.relation_ids is not None:
+                rel_tags_df["osm_id"] = _cp.asnumpy(osm_result.relation_ids)
+        results.append(
+            _native_file_result_from_owned(
+                osm_result.relations,
+                crs=crs,
+                attributes=rel_tags_df,
+                row_count=osm_result.n_relations,
+            )
+        )
+
+    if len(results) == 1:
+        return results[0]
+    return _concat_native_tabular_results(
+        results,
+        geometry_name="geometry",
+        crs=crs,
+    )
+
+
 def _try_fgb_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
     """Try to read a FlatGeobuf file using the GPU direct binary decoder.
 
@@ -944,28 +1163,8 @@ def _try_fgb_gpu_read(filename, *, target_crs: str | None = None) -> object | No
     Returns a GeoDataFrame with geometry + attributes, or None on failure.
     """
     try:
-        from .arrow import geoseries_from_owned
-        from .fgb_gpu import read_fgb_gpu
-
-        fgb_result = read_fgb_gpu(filename)
-
-        # Determine CRS: prefer target_crs, then embedded CRS
-        crs = target_crs if target_crs is not None else fgb_result.crs
-        geom_series = geoseries_from_owned(fgb_result.geometry, name="geometry", crs=crs)
-
-        import pandas as pd
-
-        import vibespatial.api as geopandas
-
-        if fgb_result.attributes:
-            attrs_df = pd.DataFrame(fgb_result.attributes)
-        else:
-            attrs_df = pd.DataFrame(index=range(fgb_result.n_features))
-        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
-
-        # Fused reproject: if target_crs differs from embedded CRS, reproject.
-        if target_crs is not None and fgb_result.crs is not None and target_crs != fgb_result.crs:
-            _reproject_gdf_gpu(gdf, target_crs)
+        payload = _try_fgb_gpu_read_native(filename, target_crs=target_crs)
+        gdf = _materialize_native_file_read_result(payload)
 
         record_dispatch_event(
             surface="geopandas.read_file",
@@ -982,10 +1181,226 @@ def _try_fgb_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
+def _try_fgb_gpu_read_native(filename, *, target_crs: str | None = None):
+    from .fgb_gpu import read_fgb_gpu
+
+    fgb_result = read_fgb_gpu(filename)
+    crs = _resolve_target_crs_for_owned(
+        fgb_result.geometry,
+        source_crs=fgb_result.crs,
+        target_crs=target_crs,
+    )
+    return _native_file_result_from_owned(
+        fgb_result.geometry,
+        crs=crs,
+        attributes=fgb_result.attributes,
+        row_count=fgb_result.n_features,
+    )
+
+
 # Minimum file size (in bytes) for GPU fast-path routing.
 # Below this threshold, let the CPU handle it -- kernel launch overhead
 # dominates for small files.
 _GPU_MIN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+def _try_gpu_read_file_native(
+    filename,
+    *,
+    plan,
+    bbox,
+    columns,
+    rows,
+    target_crs: str | None = None,
+    **kwargs,
+):
+    """Try to read a vector file into the shared native tabular boundary."""
+    import pyogrio
+
+    from vibespatial.cuda._runtime import get_cuda_runtime
+    from vibespatial.runtime import get_requested_mode
+
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
+
+    runtime = get_cuda_runtime()
+    if not runtime.available():
+        return None
+
+    if bbox is None and columns is None and rows is None:
+        file_path = Path(filename)
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            file_size = 0
+
+        if plan.format is IOFormat.WKT:
+            payload = _try_wkt_gpu_read_native(filename, target_crs=target_crs)
+            record_dispatch_event(
+                surface="geopandas.read_file",
+                operation="read_file",
+                implementation="wkt_gpu_byte_classify_adapter",
+                reason=(
+                    "GPU byte-classification: direct GPU parsing of WKT with "
+                    "NVRTC kernels, one geometry per line."
+                ),
+                selected=ExecutionMode.GPU,
+            )
+            return payload
+
+        if plan.format is IOFormat.OSM_PBF:
+            payload = _try_osm_pbf_gpu_read_native(filename, target_crs=target_crs)
+            if payload is not None:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="osm_pbf_gpu_hybrid_adapter",
+                    reason=(
+                        "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
+                        "decoding, coordinate assembly, Way/Relation coordinate "
+                        "resolution via binary-search kernel, MultiPolygon "
+                        "assembly from Relation Way members, and host-resident "
+                        "tag/attribute extraction."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+            return payload
+
+        if plan.format is IOFormat.CSV and file_size > _GPU_MIN_FILE_SIZE:
+            payload = _try_csv_gpu_read_native(filename, target_crs=target_crs)
+            if payload is not None:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="csv_gpu_byte_classify_adapter",
+                    reason=(
+                        "GPU byte-classification: GPU structural analysis and "
+                        "coordinate extraction for CSV spatial data."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
+
+        if plan.format is IOFormat.KML and file_size > _GPU_MIN_FILE_SIZE:
+            payload = _try_kml_gpu_read_native(filename, target_crs=target_crs)
+            if payload is not None:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="kml_gpu_byte_classify_adapter",
+                    reason=(
+                        "GPU byte-classification: direct GPU parsing of KML with "
+                        "NVRTC kernels, XML structural analysis and coordinate extraction."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
+
+        if plan.format is IOFormat.SHAPEFILE and file_size > _GPU_MIN_FILE_SIZE:
+            payload = _try_shapefile_shp_direct_gpu_read_native(
+                filename,
+                target_crs=target_crs,
+            )
+            if payload is not None:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="shapefile_shp_direct_gpu_adapter",
+                    reason=(
+                        "GPU-native Shapefile read: direct SHP binary decode on GPU "
+                        "(no WKB intermediate), GPU DBF parser for attributes."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
+            payload = _try_shapefile_dbf_gpu_read_native(
+                filename,
+                target_crs=target_crs,
+            )
+            if payload is not None:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="shapefile_gpu_dbf_adapter",
+                    reason=(
+                        "GPU-dominant Shapefile read: pyogrio Arrow for geometry with "
+                        "GPU WKB decode, GPU DBF parser for numeric attributes."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
+
+        if plan.format is IOFormat.GEOJSON and file_size > _GPU_MIN_FILE_SIZE:
+            from .geojson_gpu import read_geojson_gpu
+
+            payload = _native_geojson_result_from_gpu_result(
+                read_geojson_gpu(file_path, target_crs=target_crs),
+                target_crs=target_crs,
+            )
+            record_dispatch_event(
+                surface="geopandas.read_file",
+                operation="read_file",
+                implementation="geojson_gpu_byte_classify_adapter",
+                reason=(
+                    "GPU byte-classification: direct GPU parsing of GeoJSON with "
+                    "NVRTC kernels, bypassing pyogrio for geometry."
+                ),
+                selected=ExecutionMode.GPU,
+            )
+            return payload
+
+        if plan.format is IOFormat.FLATGEOBUF and file_size > _GPU_MIN_FILE_SIZE:
+            payload = _try_fgb_gpu_read_native(filename, target_crs=target_crs)
+            if payload is not None:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="flatgeobuf_gpu_direct_decode_adapter",
+                    reason=(
+                        "GPU direct FGB decode: binary FlatBuffer navigation on GPU via "
+                        "NVRTC kernels, bypassing pyogrio/WKB roundtrip."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
+
+    skip_features, max_features = _normalize_feature_window(rows)
+    arrow_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
+    if bbox is not None:
+        if hasattr(bbox, "total_bounds"):
+            meta = pyogrio.read_info(filename, layer=arrow_kwargs.get("layer"))
+            crs = meta.get("crs")
+            if crs is not None and bbox.crs is not None:
+                bbox = tuple(bbox.to_crs(crs).total_bounds)
+            else:
+                bbox = tuple(bbox.total_bounds)
+        elif hasattr(bbox, "bounds"):
+            bbox = bbox.bounds
+        arrow_kwargs["bbox"] = bbox
+
+    metadata, table = pyogrio.read_arrow(
+        filename,
+        columns=columns,
+        skip_features=skip_features,
+        max_features=max_features,
+        **arrow_kwargs,
+    )
+    payload = _pyogrio_arrow_wkb_to_native_tabular_result(
+        table,
+        metadata,
+        target_crs=target_crs,
+    )
+    record_dispatch_event(
+        surface="geopandas.read_file",
+        operation="read_file",
+        implementation=f"{plan.format.value}_pyogrio_arrow_gpu_wkb",
+        reason=(
+            "GPU-dominant read: pyogrio Arrow container parse, device-side WKB geometry "
+            "decode via pylibcudf, native tabular read boundary, explicit public export."
+        ),
+        selected=ExecutionMode.GPU,
+    )
+    return payload
 
 
 def _try_gpu_read_file(
@@ -1002,210 +1417,146 @@ def _try_gpu_read_file(
     """Try to read a vector file using the GPU-dominant owned path.
 
     Uses pyogrio.read_arrow() for container parsing, then GPU WKB decode
-    for geometry, and assembles a GeoDataFrame from the owned geometry and
-    Arrow attribute columns. Falls back to None if anything fails,
-    triggering the vendored CPU path.
+    for geometry and lowers the result through the shared native tabular
+    boundary before the explicit public GeoDataFrame materialization point.
+    Falls back to None if anything fails, triggering the vendored CPU path.
     """
-    import pyogrio
-
-    from vibespatial.cuda._runtime import get_cuda_runtime
-    from vibespatial.runtime import get_requested_mode
-
-    from .arrow import decode_wkb_arrow_array_owned, geoseries_from_owned
-
-    if get_requested_mode() is ExecutionMode.CPU:
-        return None
-
-    runtime = get_cuda_runtime()
-    if not runtime.available():
-        return None
-
-    # Format-specific GPU fast paths: direct GPU parsing of the entire file,
-    # bypassing pyogrio entirely.  Only for unfiltered reads.
-    if bbox is None and columns is None and rows is None:
-        file_path = Path(filename)
-        try:
-            file_size = file_path.stat().st_size
-        except OSError:
-            file_size = 0
-
-        # WKT: always route to GPU (pyogrio/GDAL does not support raw WKT)
-        if plan.format is IOFormat.WKT:
-            gdf = _try_wkt_gpu_read(filename, target_crs=target_crs)
-            if gdf is not None and build_index:
-                _attach_gpu_spatial_index(gdf)
-            return gdf
-
-        # OSM PBF: always route to GPU (pyogrio/GDAL does not support PBF)
-        if plan.format is IOFormat.OSM_PBF:
-            gdf = _try_osm_pbf_gpu_read(filename, target_crs=target_crs)
-            if gdf is not None and build_index:
-                _attach_gpu_spatial_index(gdf)
-            return gdf
-
-        # CSV: route to GPU for files above size threshold
-        if plan.format is IOFormat.CSV and file_size > _GPU_MIN_FILE_SIZE:
-            gpu_result = _try_csv_gpu_read(filename, target_crs=target_crs)
-            if gpu_result is not None:
-                if build_index:
-                    _attach_gpu_spatial_index(gpu_result)
-                return gpu_result
-            # fall through to pyogrio CPU path
-
-        # KML: route to GPU for files above size threshold
-        if plan.format is IOFormat.KML and file_size > _GPU_MIN_FILE_SIZE:
-            gpu_result = _try_kml_gpu_read(filename, target_crs=target_crs)
-            if gpu_result is not None:
-                if build_index:
-                    _attach_gpu_spatial_index(gpu_result)
-                return gpu_result
-            # fall through to pyogrio CPU path
-
-        # Shapefile: try direct GPU SHP binary decode first (fastest path),
-        # then fall back to pyogrio Arrow + GPU WKB + GPU DBF path.
-        if plan.format is IOFormat.SHAPEFILE and file_size > _GPU_MIN_FILE_SIZE:
-            # Direct SHP binary decode (no WKB intermediate)
-            gpu_result = _try_shapefile_shp_direct_gpu_read(filename)
-            if gpu_result is not None:
-                if target_crs is not None:
-                    _reproject_gdf_gpu(gpu_result, target_crs)
-                if build_index:
-                    _attach_gpu_spatial_index(gpu_result)
-                return gpu_result
-            # Fallback: pyogrio Arrow geometry + GPU DBF attributes
-            gpu_result = _try_shapefile_dbf_gpu_read(filename)
-            if gpu_result is not None:
-                if target_crs is not None:
-                    _reproject_gdf_gpu(gpu_result, target_crs)
-                if build_index:
-                    _attach_gpu_spatial_index(gpu_result)
-                return gpu_result
-            # fall through to pyogrio CPU path
-
-        # GeoJSON GPU byte-classify fast path: direct GPU parsing of the
-        # entire file for files > 10 MB.
-        if plan.format is IOFormat.GEOJSON and file_size > _GPU_MIN_FILE_SIZE:
-            from .geojson_gpu import read_geojson_gpu
-
-            gpu_result = read_geojson_gpu(file_path, target_crs=target_crs)
-            # GeoJSON is EPSG:4326 by spec (RFC 7946).  If target_crs
-            # was set, coordinates are already reprojected.
-            effective_crs = target_crs if target_crs is not None else "EPSG:4326"
-            geom_series = geoseries_from_owned(
-                gpu_result.owned, name="geometry", crs=effective_crs,
-            )
-            props_df = gpu_result.extract_properties_dataframe()
-            import vibespatial.api as geopandas
-
-            gdf = geopandas.GeoDataFrame(props_df, geometry=geom_series)
-            record_dispatch_event(
-                surface="geopandas.read_file",
-                operation="read_file",
-                implementation="geojson_gpu_byte_classify_adapter",
-                reason=(
-                    "GPU byte-classification: direct GPU parsing of GeoJSON with "
-                    "NVRTC kernels, bypassing pyogrio for geometry."
-                ),
-                selected=ExecutionMode.GPU,
-            )
-            if build_index:
-                _attach_gpu_spatial_index(gdf)
-            return gdf
-
-        # FlatGeobuf: direct GPU binary decode for files > 10 MB.
-        # FGB stores coordinates as flat arrays -- almost our OGA format.
-        if plan.format is IOFormat.FLATGEOBUF and file_size > _GPU_MIN_FILE_SIZE:
-            gpu_result = _try_fgb_gpu_read(filename, target_crs=target_crs)
-            if gpu_result is not None:
-                if build_index:
-                    _attach_gpu_spatial_index(gpu_result)
-                return gpu_result
-            # fall through to pyogrio GPU WKB path
-
     try:
-        skip_features, max_features = _normalize_feature_window(rows)
-        arrow_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
-        if bbox is not None:
-            if hasattr(bbox, "total_bounds"):
-                # GeoDataFrame/GeoSeries bbox
-                meta = pyogrio.read_info(filename, layer=arrow_kwargs.get("layer"))
-                crs = meta.get("crs")
-                if crs is not None and bbox.crs is not None:
-                    bbox = tuple(bbox.to_crs(crs).total_bounds)
-                else:
-                    bbox = tuple(bbox.total_bounds)
-            elif hasattr(bbox, "bounds"):
-                # Shapely geometry
-                bbox = bbox.bounds
-            arrow_kwargs["bbox"] = bbox
-        metadata, table = pyogrio.read_arrow(
+        payload = _try_gpu_read_file_native(
             filename,
+            plan=plan,
+            bbox=bbox,
             columns=columns,
-            skip_features=skip_features,
-            max_features=max_features,
-            **arrow_kwargs,
+            rows=rows,
+            target_crs=target_crs,
+            **kwargs,
         )
-        # Find the geometry column.
-        geom_idx, _ = _select_arrow_geometry_column(table, metadata)
-        geom_column = table.column(geom_idx).combine_chunks()
+        if payload is None:
+            return None
+        gdf = _materialize_native_file_read_result(payload)
 
-        # Try GPU WKB decode.
-        owned = decode_wkb_arrow_array_owned(geom_column)
-
-        # Fused reproject: transform on device before GeoSeries assembly.
-        source_crs = metadata.get("crs")
-        if target_crs is not None and source_crs is not None:
-            _reproject_owned_inplace(owned, src_crs=source_crs, dst_crs=target_crs)
-            effective_crs = target_crs
-        else:
-            effective_crs = source_crs
-
-        # Build GeoSeries from owned geometry.
-        geom_series = geoseries_from_owned(
-            owned,
-            name=table.schema.field(geom_idx).name,
-            crs=effective_crs,
-        )
-
-        # ADR-0042: keep Arrow tables through intermediate processing and defer
-        # host conversion to the explicit GeoDataFrame construction point.
-        import datetime
-
-        attrs_table = table.remove_column(geom_idx)
-        attrs_df = attrs_table.to_pandas()
-
-        # Normalise timezone representation for columns that PyArrow annotated
-        # with zoneinfo.ZoneInfo('UTC'): upstream GeoPandas and pyogrio expose
-        # datetime.timezone.utc which is what the contract tests expect.
-        for col in attrs_df.columns:
-            s = attrs_df[col]
-            if hasattr(s, "dt") and s.dt.tz is not None:
-                try:
-                    attrs_df[col] = s.dt.tz_convert(datetime.UTC)
-                except Exception:
-                    pass
-
-        import vibespatial.api as geopandas
-
-        gdf = geopandas.GeoDataFrame(attrs_df, geometry=geom_series)
-
-        # Record GPU dispatch event.
-        gpu_impl = f"{plan.format.value}_pyogrio_arrow_gpu_wkb"
-        record_dispatch_event(
-            surface="geopandas.read_file",
-            operation="read_file",
-            implementation=gpu_impl,
-            reason=(
-                "GPU-dominant read: pyogrio Arrow container parse, device-side WKB geometry "
-                "decode via pylibcudf, owned-buffer GeoDataFrame assembly."
-            ),
-            selected=ExecutionMode.GPU,
-        )
         if build_index:
             _attach_gpu_spatial_index(gdf)
         return gdf
-    except Exception:
+    except Exception as exc:
+        record_fallback_event(
+            surface="geopandas.read_file",
+            reason=f"GPU Arrow/WKB file read failed: {exc}",
+            detail=str(exc),
+            selected=ExecutionMode.CPU,
+            pipeline="io/read_file",
+            d2h_transfer=False,
+        )
         return None
+
+
+def read_vector_file_native(
+    filename,
+    bbox=None,
+    mask=None,
+    columns=None,
+    rows=None,
+    engine=None,
+    *,
+    target_crs: str | None = None,
+    **kwargs,
+):
+    """Read a spatial file into the shared native tabular boundary."""
+    from vibespatial.api._native_results import _spatial_to_native_tabular_result
+
+    plan = plan_vector_file_io(filename, operation=IOOperation.READ)
+    normalized = _normalize_driver(filename)
+
+    if normalized == "GeoParquet":
+        from .arrow import read_geoparquet_native
+
+        parquet_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
+        if columns is not None:
+            parquet_kwargs["columns"] = columns
+        if bbox is not None:
+            parquet_kwargs["bbox"] = bbox
+        return read_geoparquet_native(filename, **parquet_kwargs)
+
+    if normalized in ("Feather", "Arrow"):
+        from vibespatial.api.io.arrow import _read_feather
+
+        feather_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
+        if columns is not None:
+            feather_kwargs["columns"] = columns
+        return _spatial_to_native_tabular_result(_read_feather(filename, **feather_kwargs))
+
+    _GPU_DISPATCH_FORMATS = {
+        IOFormat.GEOJSON,
+        IOFormat.SHAPEFILE,
+        IOFormat.WKT,
+        IOFormat.CSV,
+        IOFormat.KML,
+        IOFormat.OSM_PBF,
+        IOFormat.GEOPACKAGE,
+        IOFormat.FILE_GEODATABASE,
+        IOFormat.FLATGEOBUF,
+        IOFormat.GML,
+        IOFormat.GPX,
+        IOFormat.TOPOJSON,
+        IOFormat.GEOJSONSEQ,
+    }
+    if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
+        payload = _try_gpu_read_file_native(
+            filename,
+            plan=plan,
+            bbox=bbox,
+            columns=columns,
+            rows=rows,
+            target_crs=target_crs,
+            **kwargs,
+        )
+        if payload is not None:
+            return payload
+
+    if plan.format is IOFormat.WKT:
+        raise RuntimeError(
+            f"Cannot read WKT file '{filename}': GPU runtime is required for raw "
+            "WKT files (pyogrio/GDAL does not support this format). Ensure a CUDA "
+            "GPU is available and CuPy is installed."
+        )
+
+    if plan.format is IOFormat.OSM_PBF:
+        raise RuntimeError(
+            f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
+            "OSM PBF files (pyogrio/GDAL does not support PBF). Ensure a CUDA "
+            "GPU is available and CuPy is installed."
+        )
+
+    record_dispatch_event(
+        surface="geopandas.read_file",
+        operation="read_file",
+        implementation=plan.implementation,
+        reason=plan.reason,
+        selected=ExecutionMode.CPU,
+    )
+    chosen_engine = engine
+    if plan.format in {IOFormat.GEOJSON, IOFormat.SHAPEFILE} and engine is None:
+        chosen_engine = "pyogrio"
+    if chosen_engine is not None:
+        from vibespatial.api.io import file as api_file
+
+        chosen_engine = api_file._check_engine(chosen_engine, "'read_file' function")
+    from vibespatial.api.io.file import _read_file
+
+    gdf = _read_file(
+        filename,
+        bbox=bbox,
+        mask=mask,
+        columns=columns,
+        rows=rows,
+        engine=chosen_engine,
+        **kwargs,
+    )
+    if target_crs is not None and gdf.crs is not None:
+        gdf = gdf.to_crs(target_crs)
+    elif target_crs is not None and gdf.crs is None:
+        gdf = gdf.set_crs(target_crs)
+    return _spatial_to_native_tabular_result(gdf)
 
 
 def read_vector_file(

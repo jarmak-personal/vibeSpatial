@@ -20,9 +20,9 @@ from vibespatial.bench.io_benchmark_rails import benchmark_io_arrow_suite, io_su
 
 def build_covering_summary(*, scale: int, selectivity: float, seed: int = 0):
     rng = np.random.default_rng(seed)
-    row_group_count = max(16, scale // 10_000)
+    row_group_count = max(125, scale // 8_000)
     rows_per_group = max(1, scale // row_group_count)
-    grid_width = max(4, int(np.ceil(np.sqrt(row_group_count))))
+    grid_width = max(12, int(np.ceil(np.sqrt(row_group_count))))
     cell = 1_000.0 / grid_width
     centers_x = []
     centers_y = []

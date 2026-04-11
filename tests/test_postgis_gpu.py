@@ -20,26 +20,32 @@ import types
 from unittest.mock import MagicMock
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pytest
 from shapely import to_wkb
 from shapely.geometry import LineString, Point, Polygon
 
+import vibespatial.api as geopandas
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     NativeAttributeTable,
     NativeTabularResult,
 )
 from vibespatial.api.io.sql import _try_gpu_write_postgis
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.postgis_gpu import (
     _arrow_table_to_geodataframe,
+    _arrow_table_to_native_tabular_result,
     _get_connection_uri,
     _is_simple_table_name,
     _wrap_sql_for_wkb,
     read_postgis_gpu,
+    read_postgis_native,
     to_postgis_gpu,
 )
 from vibespatial.runtime._runtime import has_gpu_runtime
+from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 
 needs_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime not available")
 
@@ -132,6 +138,14 @@ class TestConnectionUriExtraction:
         conn.engine = MagicMock()
         conn.engine.url = "postgresql://user:pass@host/db"
         assert _get_connection_uri(conn) == "postgresql://user:pass@host/db"
+
+    def test_non_postgresql_string_returns_none(self) -> None:
+        assert _get_connection_uri("sqlite:///tmp/test.db") is None
+
+    def test_sqlalchemy_sqlite_engine_mock_returns_none(self) -> None:
+        engine = MagicMock()
+        engine.url = "sqlite:///tmp/test.db"
+        assert _get_connection_uri(engine) is None
 
     def test_unsupported_object(self) -> None:
         assert _get_connection_uri(42) is None
@@ -273,9 +287,53 @@ class TestArrowWkbToGeoDataFrame:
 
         gdf = _arrow_table_to_geodataframe(table, geom_col="geom", crs=None)
 
-        assert list(gdf.columns) == ["a", "b", "c", "geometry"]
+        assert list(gdf.columns) == ["a", "b", "c", "geom"]
+        assert gdf.geometry.name == "geom"
         np.testing.assert_array_equal(gdf["a"].values, [1, 2, 3])
         np.testing.assert_array_equal(gdf["b"].values, ["x", "y", "z"])
+
+
+class TestArrowWkbToNativeTabularResult:
+    """Verify the PostGIS Arrow bridge lowers into the shared native boundary."""
+
+    def test_native_result_preserves_arrow_attributes_without_frame_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        table = pa.Table.from_pandas(
+            pd.DataFrame(
+                {
+                    "value": [10, 20],
+                    "geom": [to_wkb(Point(0, 0)), to_wkb(Point(1, 1))],
+                },
+                index=pd.Index(["a", "b"], name="row_id"),
+            ),
+            preserve_index=True,
+        )
+        owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+
+        monkeypatch.setattr(
+            "vibespatial.io.wkb.decode_wkb_arrow_array_owned",
+            lambda _column: owned,
+        )
+        monkeypatch.setattr(
+            NativeTabularResult,
+            "to_geodataframe",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("native PostGIS bridge should not materialize a GeoDataFrame")
+            ),
+        )
+
+        payload = _arrow_table_to_native_tabular_result(
+            table,
+            geom_col="geom",
+            crs="EPSG:4326",
+        )
+
+        assert isinstance(payload, NativeTabularResult)
+        assert payload.geometry.owned is owned
+        assert list(payload.attributes.columns) == ["value"]
+        assert payload.attributes.index.tolist() == ["a", "b"]
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +346,12 @@ class TestGracefulFallback:
 
     def test_read_returns_none_for_bad_connection(self) -> None:
         """read_postgis_gpu returns None when connection object is unsupported."""
+        geopandas.clear_fallback_events()
         result = read_postgis_gpu("SELECT 1", 42, geom_col="geom")
+        fallbacks = geopandas.get_fallback_events(clear=True)
         assert result is None
+        assert fallbacks
+        assert "requires a PostgreSQL URI" in fallbacks[-1].reason
 
     def test_write_returns_false_for_bad_connection(self) -> None:
         """to_postgis_gpu returns False when connection object is unsupported."""
@@ -328,6 +390,39 @@ class TestGracefulFallback:
 
         assert result is True
         assert isinstance(captured["payload"], NativeTabularResult)
+
+    def test_try_gpu_read_postgis_propagates_strict_native_errors(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vibespatial.api.io.sql import _try_gpu_read_postgis
+
+        monkeypatch.setattr(
+            "vibespatial.io.postgis_gpu.read_postgis_gpu",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                StrictNativeFallbackError("strict native test")
+            ),
+        )
+
+        with pytest.raises(StrictNativeFallbackError, match="strict native test"):
+            _try_gpu_read_postgis("SELECT 1", "postgresql://user:pass@host/db")
+
+    def test_try_gpu_read_postgis_skips_ineligible_connectables_before_gpu_probe(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from vibespatial.api.io.sql import _try_gpu_read_postgis
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError("ineligible SQL connectables should skip the GPU probe")
+
+        monkeypatch.setattr("vibespatial.io.postgis_gpu.read_postgis_gpu", _fail)
+
+        sqlite_result = _try_gpu_read_postgis("SELECT 1", "sqlite:///tmp/test.db")
+        opaque_result = _try_gpu_read_postgis("SELECT 1", object())
+
+        assert sqlite_result is None
+        assert opaque_result is None
 
     def test_write_accepts_native_payload_without_frame_materialization(
         self,
@@ -416,14 +511,118 @@ class TestGracefulFallback:
         assert captured["mode"] == "create"
         assert captured["table"].column_names == ["id", "geometry"]
 
+    def test_try_gpu_write_postgis_propagates_strict_native_errors(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "vibespatial.io.postgis_gpu.to_postgis_gpu",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                StrictNativeFallbackError("strict native write test")
+            ),
+        )
+
+        with pytest.raises(StrictNativeFallbackError, match="strict native write test"):
+            _try_gpu_write_postgis(
+                geopandas.GeoDataFrame(
+                    {"id": [1]},
+                    geometry=geopandas.GeoSeries.from_wkt(["POINT (0 0)"]),
+                ),
+                "test_table",
+                "postgresql://user:pass@host/db",
+            )
+
     def test_read_returns_none_for_chunked(self) -> None:
         """Chunked reading is not supported; should return None."""
+        geopandas.clear_fallback_events()
         result = read_postgis_gpu(
             "my_table",
             "postgresql://user:pass@host/db",
             chunksize=100,
         )
+        fallbacks = geopandas.get_fallback_events(clear=True)
         assert result is None
+        assert fallbacks
+        assert "Chunked PostGIS GPU read is not implemented" in fallbacks[-1].reason
+
+    def test_read_postgis_native_ignores_non_postgresql_connectables_without_fallback_event(
+        self,
+    ) -> None:
+        geopandas.clear_fallback_events()
+
+        result = read_postgis_native(
+            "SELECT 1",
+            "sqlite:///tmp/test.db",
+            geom_col="geom",
+        )
+
+        fallbacks = geopandas.get_fallback_events(clear=True)
+        assert result is None
+        assert not fallbacks
+
+    def test_read_postgis_native_returns_native_payload_without_frame_materialization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+        table = pa.table(
+            {
+                "id": [1, 2],
+                "__vibes_wkb": [to_wkb(Point(0, 0)), to_wkb(Point(1, 1))],
+            }
+        )
+
+        class _FakeCursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def execute(self, _sql):
+                return None
+
+            def fetch_arrow_table(self):
+                return table
+
+        class _FakeConnection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def cursor(self):
+                return _FakeCursor()
+
+        dbapi_module = types.ModuleType("adbc_driver_postgresql.dbapi")
+        dbapi_module.connect = lambda _uri: _FakeConnection()
+        package_module = types.ModuleType("adbc_driver_postgresql")
+        package_module.dbapi = dbapi_module
+        monkeypatch.setitem(sys.modules, "adbc_driver_postgresql", package_module)
+        monkeypatch.setitem(sys.modules, "adbc_driver_postgresql.dbapi", dbapi_module)
+        monkeypatch.setattr(
+            "vibespatial.io.wkb.decode_wkb_arrow_array_owned",
+            lambda _column: owned,
+        )
+        monkeypatch.setattr(
+            NativeTabularResult,
+            "to_geodataframe",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("native PostGIS read should not materialize a GeoDataFrame")
+            ),
+        )
+
+        payload = read_postgis_native(
+            "SELECT id, geom FROM test_table",
+            "postgresql://user:pass@host/db",
+            geom_col="geom",
+            crs="EPSG:4326",
+        )
+
+        assert isinstance(payload, NativeTabularResult)
+        assert payload.geometry.owned is owned
+        assert list(payload.attributes.columns) == ["id"]
 
 
 # ---------------------------------------------------------------------------

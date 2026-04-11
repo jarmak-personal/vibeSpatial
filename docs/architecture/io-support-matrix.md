@@ -65,8 +65,8 @@ and which remain explicit fallback adapters.
 | GeoArrow | GPU-native | GPU-native | GPU-native | yes |
 | GeoParquet | GPU-native | GPU-native | hybrid | yes |
 | WKB | hybrid | hybrid | hybrid | no |
-| GeoJSON | hybrid | GPU geometry + CPU properties | hybrid | no (geometry GPU-accelerated) |
-| Shapefile | hybrid | hybrid | hybrid | no |
+| GeoJSON | hybrid | hybrid with native read boundary | hybrid | no (geometry GPU-accelerated) |
+| Shapefile | hybrid | hybrid with native read boundary | hybrid | no |
 | GDAL legacy | fallback | fallback | fallback | no |
 
 ## Performance Notes

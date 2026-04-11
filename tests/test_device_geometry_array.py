@@ -1008,12 +1008,23 @@ class TestBinaryPredicatesOwned:
         result = left_dga.intersects(right)
         assert list(result) == [True, False, True]
 
-    def test_equals_falls_back_to_shapely(self, left_dga):
-        """equals is not in PREDICATE_SPECS — must materialize."""
-        left_dga._owned.diagnostics.clear()
-        _ = left_dga.equals(left_dga)
-        mat = [e for e in left_dga._owned.diagnostics if e.kind == DiagnosticKind.MATERIALIZATION]
-        assert len(mat) >= 1
+    def test_equals_uses_owned_path_for_device_peers(self, left_dga):
+        geopandas.clear_fallback_events()
+        result = left_dga.equals(left_dga)
+
+        assert result.all()
+        assert not geopandas.get_fallback_events(clear=True)
+
+    def test_geom_equals_strict_native_accepts_host_geometry_array(self, monkeypatch):
+        geopandas.clear_fallback_events()
+        monkeypatch.setenv("VIBESPATIAL_STRICT_NATIVE", "1")
+        left = DeviceGeometryArray._from_sequence([Point(0, 0), Point(1, 1)])
+        right = GeometryArray(np.asarray([Point(0, 0), Point(1, 1)], dtype=object))
+
+        result = left.geom_equals(right)
+
+        assert result.all()
+        assert not geopandas.get_fallback_events(clear=True)
 
 
 class TestFallbackObservability:
@@ -1022,7 +1033,7 @@ class TestFallbackObservability:
         [
             (
                 "equals",
-                lambda: DeviceGeometryArray._from_sequence([Point(0, 0), Point(1, 1)]),
+                lambda: GeometryCollection([Point(0, 0)]),
                 "DeviceGeometryArray.equals",
             ),
             (

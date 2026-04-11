@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 
+import pandas as pd
+import pyarrow as pa
 import pytest
 from shapely.geometry import LineString, Point, Polygon
 
@@ -12,13 +14,23 @@ from vibespatial import (
     benchmark_shapefile_ingest,
     plan_geojson_ingest,
     plan_shapefile_ingest,
+    read_geojson_native,
     read_geojson_owned,
+    read_shapefile_native,
     read_shapefile_owned,
 )
-from vibespatial.api._native_results import _spatial_to_native_tabular_result
+from vibespatial.api._native_results import NativeTabularResult, _spatial_to_native_tabular_result
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.io.file import write_vector_file
+from vibespatial.io.file import (
+    _native_file_result_from_owned,
+    _pyogrio_arrow_wkb_to_native_tabular_result,
+    plan_vector_file_io,
+    read_vector_file,
+    read_vector_file_native,
+    write_vector_file,
+)
+from vibespatial.io.support import IOOperation, IOPathKind
 
 
 def _sample_frame() -> geopandas.GeoDataFrame:
@@ -51,7 +63,7 @@ def test_geojson_roundtrip_uses_gpu_adapter(tmp_path) -> None:
 
 
 @pytest.mark.gpu
-def test_geojson_gpu_adapter_failure_propagates(monkeypatch, tmp_path) -> None:
+def test_geojson_gpu_adapter_failure_records_explicit_fallback(monkeypatch, tmp_path) -> None:
     path = tmp_path / "sample.geojson"
     frame = _sample_frame()
     frame.to_file(path, driver="GeoJSON")
@@ -63,8 +75,15 @@ def test_geojson_gpu_adapter_failure_propagates(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr("vibespatial.io.geojson_gpu.read_geojson_gpu", _boom)
 
-    with pytest.raises(RuntimeError, match="geojson-gpu-boom"):
-        geopandas.read_file(path)
+    geopandas.clear_fallback_events()
+    result = geopandas.read_file(path)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert len(result) == len(frame)
+    assert result.geometry.iloc[0].equals(frame.geometry.iloc[0])
+    assert fallbacks
+    assert fallbacks[-1].surface == "geopandas.read_file"
+    assert "geojson-gpu-boom" in fallbacks[-1].reason
 
 
 @pytest.mark.gpu
@@ -340,6 +359,124 @@ def test_read_shapefile_owned_polygons_use_raw_arrow_fast_path(monkeypatch, tmp_
     assert batch.geometry.to_shapely()[1].equals(frame.geometry.iloc[1])
 
 
+def test_pyogrio_arrow_wkb_native_result_preserves_index_and_defers_public_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.Table.from_pandas(
+        pd.DataFrame(
+            {
+                "value": [10, 20],
+                "geometry": [Point(0, 0).wkb, Point(1, 1).wkb],
+            },
+            index=pd.Index(["left", "right"], name="row_id"),
+        ),
+        preserve_index=True,
+    )
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        NativeTabularResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native file read bridge should not materialize a GeoDataFrame")
+        ),
+    )
+
+    payload = _pyogrio_arrow_wkb_to_native_tabular_result(
+        table,
+        {"geometry_name": "geometry", "crs": "EPSG:4326"},
+    )
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.owned is owned
+    assert payload.geometry_name == "geometry"
+    assert list(payload.attributes.columns) == ["value"]
+    assert payload.attributes.index.tolist() == ["left", "right"]
+
+
+def test_pyogrio_arrow_wkb_native_result_labels_target_crs_when_source_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.table({"geometry": [Point(0, 0).wkb]})
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    payload = _pyogrio_arrow_wkb_to_native_tabular_result(
+        table,
+        {"geometry_name": "geometry"},
+        target_crs="EPSG:3857",
+    )
+
+    assert payload.geometry.crs == "EPSG:3857"
+
+
+def test_pyogrio_arrow_wkb_native_result_normalizes_empty_geometry_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    field = pa.field(
+        "wkb_geometry",
+        pa.binary(),
+        metadata={b"ARROW:extension:name": b"geoarrow.wkb"},
+    )
+    table = pa.Table.from_arrays(
+        [pa.array([Point(0, 0).wkb], type=pa.binary())],
+        schema=pa.schema([field]),
+    )
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    payload = _pyogrio_arrow_wkb_to_native_tabular_result(
+        table,
+        {"geometry_name": "", "crs": "EPSG:4326"},
+    )
+
+    assert payload.geometry_name == "geometry"
+
+
+def test_native_file_result_from_owned_accepts_dict_attributes_without_frame_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+
+    monkeypatch.setattr(
+        NativeTabularResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("internal native file helper should not materialize a GeoDataFrame")
+        ),
+    )
+
+    payload = _native_file_result_from_owned(
+        owned,
+        crs="EPSG:4326",
+        attributes={"value": [10, 20]},
+    )
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.owned is owned
+    assert list(payload.attributes.columns) == ["value"]
+    assert payload.attributes["value"].tolist() == [10, 20]
+
+
+def test_plan_vector_file_io_exposes_promoted_read_boundary_classification() -> None:
+    assert plan_vector_file_io("data.geojson", operation=IOOperation.READ).selected_path is IOPathKind.HYBRID
+    assert plan_vector_file_io("data.shp", operation=IOOperation.READ).selected_path is IOPathKind.HYBRID
+    assert plan_vector_file_io("data.gpkg", operation=IOOperation.READ).selected_path is IOPathKind.HYBRID
+    assert plan_vector_file_io("data.unknown", operation=IOOperation.READ).selected_path is IOPathKind.FALLBACK
+
+
 def test_gpkg_routes_through_legacy_host_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
@@ -355,6 +492,111 @@ def test_gpkg_routes_through_legacy_host_adapter(tmp_path) -> None:
     # GPKG now routes through pyogrio Arrow + GPU WKB decode
     assert any("gpu" in e.implementation.lower() for e in events)
     assert not fallbacks
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_read_vector_file_native_returns_native_payload_for_pyogrio_arrow_gpu_wkb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.table({"geometry": [Point(0, 0).wkb], "value": [10]})
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        NativeTabularResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native vector read should not materialize a GeoDataFrame")
+        ),
+    )
+
+    payload = read_vector_file_native("example.gpkg")
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.owned is owned
+    assert payload.attributes["value"].tolist() == [10]
+
+
+def test_read_vector_file_native_lowers_cpu_path_to_shared_native_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_frame = geopandas.GeoDataFrame(
+        {"value": [10]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+
+    monkeypatch.setattr("vibespatial.api.io.file._read_file", lambda *_args, **_kwargs: fallback_frame)
+    monkeypatch.setattr(
+        NativeTabularResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("CPU fallback lowering should still stop at the native boundary")
+        ),
+    )
+
+    payload = read_vector_file_native("example.gpkg", engine="pyogrio")
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.row_count == 1
+    assert payload.geometry_name == "geometry"
+    assert payload.attributes["value"].tolist() == [10]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_gpu_arrow_wkb_read_records_explicit_fallback_before_cpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    fallback_frame = geopandas.GeoDataFrame(
+        {"value": [10]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+    table = pa.table({"geometry": [Point(0, 0).wkb]})
+
+    geopandas.clear_fallback_events()
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr("vibespatial.api.io.file._read_file", lambda *_args, **_kwargs: fallback_frame)
+
+    result = read_vector_file("example.gpkg")
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert result.equals(fallback_frame)
+    assert fallbacks
+    assert fallbacks[-1].surface == "geopandas.read_file"
+    assert "GPU Arrow/WKB file read failed" in fallbacks[-1].reason
 
 
 def test_read_geojson_owned_streams_feature_collection_to_owned_buffers(tmp_path) -> None:
@@ -374,6 +616,36 @@ def test_read_geojson_owned_streams_feature_collection_to_owned_buffers(tmp_path
     assert batch.geometry.row_count == 2
     assert batch.geometry.to_shapely()[0].equals(Point(0, 0))
     assert batch.geometry.to_shapely()[1].equals(frame.geometry.iloc[1])
+
+
+def test_read_geojson_native_returns_shared_native_boundary(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "native.geojson"
+    frame = geopandas.GeoDataFrame(
+        {
+            "id": [1, 2],
+            "value": [10, 20],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        }
+    )
+    path.write_text(frame.to_json())
+
+    monkeypatch.setattr(
+        NativeTabularResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native GeoJSON read should not materialize a GeoDataFrame")
+        ),
+    )
+
+    payload = read_geojson_native(path, prefer="fast-json")
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.row_count == 2
+    assert payload.geometry.crs == "EPSG:4326"
+    assert payload.attributes["value"].tolist() == [10, 20]
 
 
 def test_plan_geojson_ingest_auto_selects_best_available() -> None:
@@ -433,6 +705,37 @@ def test_read_geojson_owned_supports_stream_strategy(tmp_path) -> None:
     batch = read_geojson_owned(path, prefer="stream")
 
     assert batch.geometry.to_shapely()[1].equals(Point(1, 1))
+
+
+def test_read_shapefile_native_returns_shared_native_boundary(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "native-shapefile.shp"
+    frame = geopandas.GeoDataFrame(
+        {
+            "value": [10, 20],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    frame.to_file(path, driver="ESRI Shapefile")
+
+    monkeypatch.setattr(
+        NativeTabularResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native Shapefile read should not materialize a GeoDataFrame")
+        ),
+    )
+
+    payload = read_shapefile_native(path)
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.row_count == 2
+    assert payload.geometry_name == "geometry"
+    assert payload.geometry.crs is not None
+    assert payload.attributes["value"].tolist() == [10, 20]
 
 
 def test_read_geojson_owned_supports_pylibcudf_strategy(tmp_path) -> None:

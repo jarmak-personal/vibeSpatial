@@ -10,9 +10,6 @@ from shapely import GeometryType
 from vibespatial.api import GeoDataFrame
 from vibespatial.api.geo_base import _is_geometry_like_dtype
 from vibespatial.api.geometry_array import from_shapely, from_wkb
-from vibespatial.geometry.device_array import DeviceGeometryArray
-from vibespatial.runtime import ExecutionMode
-from vibespatial.runtime.fallbacks import record_fallback_event
 
 GEOARROW_ENCODINGS = [
     "point",
@@ -124,6 +121,17 @@ def geopandas_to_arrow(
     mask = df.dtypes.map(_is_geometry_like_dtype)
     geometry_columns = df.columns[mask]
     geometry_indices = np.asarray(mask).nonzero()[0]
+    if geometry_encoding.lower() == "geoarrow":
+        from vibespatial.api._native_results import _spatial_to_native_tabular_result
+        from vibespatial.io.geoarrow import native_tabular_to_arrow
+
+        return native_tabular_to_arrow(
+            _spatial_to_native_tabular_result(df),
+            index=index,
+            geometry_encoding=geometry_encoding,
+            interleaved=interleaved,
+            include_z=include_z,
+        )
 
     df_attr = pd.DataFrame(df.copy(deep=False))
 
@@ -137,34 +145,7 @@ def geopandas_to_arrow(
 
     geometry_encoding_dict = {}
 
-    if geometry_encoding.lower() == "geoarrow":
-        # Encode all geometry columns to GeoArrow
-        for i, col in zip(geometry_indices, geometry_columns):
-            array = df[col].array
-            if isinstance(array, DeviceGeometryArray):
-                record_fallback_event(
-                    surface="geopandas.geodataframe.to_parquet",
-                    reason="explicit CPU compatibility export for GeoArrow materialization",
-                    detail=f"column={col}, encoding='geoarrow'",
-                    selected=ExecutionMode.CPU,
-                    pipeline="io/to_parquet",
-                    d2h_transfer=True,
-                )
-            field, geom_arr = construct_geometry_array(
-                np.array(array),
-                include_z=include_z,
-                field_name=col,
-                crs=df[col].crs,
-                interleaved=interleaved,
-            )
-            table = table.set_column(i, field, geom_arr)
-            geometry_encoding_dict[col] = (
-                field.metadata[b"ARROW:extension:name"]
-                .decode()
-                .removeprefix("geoarrow.")
-            )
-
-    elif geometry_encoding.lower() == "wkb":
+    if geometry_encoding.lower() == "wkb":
         # Encode all geometry columns to WKB
         for i, col in zip(geometry_indices, geometry_columns):
             field, wkb_arr = construct_wkb_array(

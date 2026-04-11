@@ -2560,11 +2560,26 @@ def _try_gpu_wkb_list_decode(
     if len(values) < DEVICE_WKB_LIST_DECODE_MIN_ROWS:
         return _GpuWkbDecodeAttempt(result=None)
 
-    staged_records = _prepare_native_wkb_list_for_device(values)
-    if staged_records is None:
-        return _GpuWkbDecodeAttempt(result=None)
+    normalized: list[bytes | None] = [_normalize_wkb_value(v) for v in values]
+    non_null_mask = _non_null_wkb_input_mask(normalized)
+    arrow_error: str | None = None
+    try:
+        import pyarrow as pa
 
-    non_null_mask = _non_null_wkb_input_mask(values)
+        arrow_array = pa.array(normalized, type=pa.binary())
+        arrow_attempt = _try_gpu_wkb_arrow_decode(arrow_array, on_invalid=on_invalid)
+        if arrow_attempt.result is not None:
+            return arrow_attempt
+        arrow_error = arrow_attempt.fallback_detail
+    except _GpuWkbOnInvalidError:
+        raise
+    except Exception as exc:
+        arrow_error = f"Arrow WKB list bridge failed: {type(exc).__name__}: {exc}"
+
+    staged_records = _prepare_native_wkb_list_for_device(normalized)
+    if staged_records is None:
+        return _GpuWkbDecodeAttempt(result=None, fallback_detail=arrow_error)
+
     staged_error: str | None = None
 
     try:
@@ -2588,8 +2603,6 @@ def _try_gpu_wkb_list_decode(
 
         from .pylibcudf import _decode_pylibcudf_wkb_general_column_to_owned
 
-        normalized: list[bytes | None] = [_normalize_wkb_value(v) for v in values]
-
         # Single bulk allocation: list[bytes|None] -> pa.BinaryArray.
         arrow_array = pa.array(normalized, type=pa.binary())
 
@@ -2609,7 +2622,14 @@ def _try_gpu_wkb_list_decode(
     except _GpuWkbOnInvalidError:
         raise
     except (ImportError, NotImplementedError) as exc:
-        detail = staged_error or "staged device decode did not produce a result"
+        detail = "; ".join(
+            message
+            for message in (
+                arrow_error,
+                staged_error or "staged device decode did not produce a result",
+            )
+            if message
+        )
         return _GpuWkbDecodeAttempt(
             result=None,
             fallback_detail=(
@@ -2618,7 +2638,14 @@ def _try_gpu_wkb_list_decode(
             ),
         )
     except Exception as exc:
-        detail = staged_error or "staged device decode did not produce a result"
+        detail = "; ".join(
+            message
+            for message in (
+                arrow_error,
+                staged_error or "staged device decode did not produce a result",
+            )
+            if message
+        )
         return _GpuWkbDecodeAttempt(
             result=None,
             fallback_detail=(
