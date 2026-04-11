@@ -1328,7 +1328,7 @@ def _read_geojson_owned_tokenizer(text: str) -> GeoJSONOwnedBatch:
 
 
 def read_geojson_owned(
-    source: str | Path,
+    source: str | bytes | bytearray | memoryview | Path,
     *,
     prefer: str = "auto",
     track_properties: bool = True,
@@ -1343,10 +1343,9 @@ def read_geojson_owned(
             reason=plan.reason,
             selected=ExecutionMode.GPU,
         )
-        resolved = Path(source) if not isinstance(source, Path) else source
         try:
             result = read_geojson_gpu(
-                resolved,
+                source,
                 capture_feature_boundaries=track_properties,
             )
             if not track_properties:
@@ -1375,6 +1374,8 @@ def read_geojson_owned(
     if plan.selected_strategy == "simdjson":
         if isinstance(source, Path):
             data: str | bytes = source.read_bytes()
+        elif isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source)
         elif isinstance(source, str) and (
             source.lstrip().startswith("{") or source.lstrip().startswith("[")
         ):
@@ -1384,6 +1385,8 @@ def read_geojson_owned(
     else:
         if isinstance(source, Path):
             data = source.read_text(encoding="utf-8")
+        elif isinstance(source, (bytes, bytearray, memoryview)):
+            data = bytes(source).decode("utf-8")
         elif isinstance(source, str) and (
             source.lstrip().startswith("{") or source.lstrip().startswith("[")
         ):

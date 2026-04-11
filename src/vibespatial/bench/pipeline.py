@@ -432,17 +432,21 @@ def _read_geoparquet_owned_preferred(path: Path, *, preferred_backend: str) -> t
         return read_geoparquet_owned(path, backend="cpu"), "cpu", f"gpu read fallback: {exc.__class__.__name__}"
 
 
-def _read_geojson_owned_preferred(path: Path, *, preferred_mode: str):
+def _read_geojson_owned_preferred(
+    source: Path | str | bytes | bytearray | memoryview,
+    *,
+    preferred_mode: str,
+):
     if preferred_mode == "pylibcudf":
         try:
             return read_geojson_owned(
-                path,
+                source,
                 prefer="pylibcudf",
                 track_properties=False,
             ), "gpu", ""
         except Exception as exc:
             return read_geojson_owned(
-                path,
+                source,
                 prefer="fast-json",
                 track_properties=False,
             ), "cpu", f"gpu read fallback: {exc.__class__.__name__}"
@@ -451,7 +455,7 @@ def _read_geojson_owned_preferred(path: Path, *, preferred_mode: str):
     # which will select the strategy (auto now prefers GPU when available).
     try:
         batch = read_geojson_owned(
-            path,
+            source,
             prefer=preferred_mode,
             track_properties=False,
         )
@@ -459,7 +463,7 @@ def _read_geojson_owned_preferred(path: Path, *, preferred_mode: str):
         return batch, device, ""
     except Exception as exc:
         batch = read_geojson_owned(
-            path,
+            source,
             prefer="fast-json",
             track_properties=False,
         )
@@ -936,9 +940,10 @@ def _profile_predicate_pipeline(
 
         source_path = root / "predicate.geojson"
         frame = _regular_points_frame(scale)
+        source_bytes = frame.to_json().encode("utf-8")
         # Write RFC 7946 GeoJSON (no GDAL CRS block) so the GPU
         # byte-classify parser can consume it directly.
-        source_path.write_text(frame.to_json())
+        source_path.write_bytes(source_bytes)
 
         profiler = StageProfiler(
             operation="pipeline.predicate-heavy",
@@ -952,13 +957,14 @@ def _profile_predicate_pipeline(
 
         with profiler.stage("read_geojson", category="setup", device="auto", rows_in=scale) as stage:
             batch, actual_read_mode, read_note = _read_geojson_owned_preferred(
-                source_path,
+                source_bytes,
                 preferred_mode=read_mode,
             )
             stage.device = actual_read_mode
             stage.rows_out = batch.geometry.row_count
             stage.metadata["requested_mode"] = read_mode
             stage.metadata["actual_mode"] = actual_read_mode
+            stage.metadata["source_kind"] = "bytes"
             if read_note:
                 stage.metadata["fallback_note"] = read_note
             _record_stage_overheads(stage, audit, memory, batch)
@@ -1051,7 +1057,7 @@ def _profile_predicate_pipeline(
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
         stages=(_trace_to_stage_dict(trace),),
-        notes="Current predicate-heavy pipeline measures read_geojson -> point_in_polygon -> filter -> GeoParquet write.",
+        notes="Current predicate-heavy pipeline measures GeoJSON bytes ingest -> point_in_polygon -> filter -> GeoParquet write.",
     )
 
 

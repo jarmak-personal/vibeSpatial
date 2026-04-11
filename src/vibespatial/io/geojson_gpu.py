@@ -145,9 +145,9 @@ def _classify_type_kernels():
 class GeoJSONGpuResult:
     owned: OwnedGeometryArray
     n_features: int
-    path: Path
+    path: Path | None
     source_nbytes: int
-    source_mtime_ns: int
+    source_mtime_ns: int | None
     host_bytes: np.ndarray | None
     feature_starts: np.ndarray | None = None
     feature_ends: np.ndarray | None = None
@@ -156,6 +156,8 @@ class GeoJSONGpuResult:
 
     def _ensure_host_bytes(self) -> np.ndarray:
         if self.host_bytes is None:
+            if self.path is None or self.source_mtime_ns is None:
+                raise OSError("GeoJSON source bytes are unavailable for lazy property extraction")
             stat = self.path.stat()
             if stat.st_size != self.source_nbytes or stat.st_mtime_ns != self.source_mtime_ns:
                 raise OSError(
@@ -250,8 +252,45 @@ def _launch_kernel(runtime, kernel, n, params):
     runtime.launch(kernel, grid=grid, block=block, params=params)
 
 
+def _is_geojson_text_source(source: str) -> bool:
+    stripped = source.lstrip()
+    return stripped.startswith("{") or stripped.startswith("[")
+
+
+def _resolve_geojson_gpu_source(
+    source: str | bytes | bytearray | memoryview | Path,
+) -> tuple[cp.ndarray, np.ndarray | None, Path | None, int | None]:
+    from .kvikio_reader import read_file_to_device
+
+    if isinstance(source, Path):
+        stat = source.stat()
+        result = read_file_to_device(source, stat.st_size)
+        d_bytes = result.device_bytes
+        n = len(d_bytes)
+        if result.host_bytes is not None and len(result.host_bytes) != n:
+            raise OSError(
+                f"File size changed between reads: device has {n} bytes, "
+                f"host has {len(result.host_bytes)} bytes"
+            )
+        return d_bytes, result.host_bytes, source, stat.st_mtime_ns
+    if isinstance(source, str) and not _is_geojson_text_source(source):
+        return _resolve_geojson_gpu_source(Path(source))
+    if isinstance(source, str):
+        host_data = source.encode("utf-8")
+    elif isinstance(source, bytes):
+        host_data = source
+    elif isinstance(source, bytearray):
+        host_data = bytes(source)
+    elif isinstance(source, memoryview):
+        host_data = source.tobytes()
+    else:
+        raise TypeError(f"unsupported GeoJSON GPU source type: {type(source)!r}")
+    host_bytes = np.frombuffer(host_data, dtype=np.uint8)
+    return cp.asarray(host_bytes), host_bytes, None, None
+
+
 def read_geojson_gpu(
-    path: Path,
+    source: str | bytes | bytearray | memoryview | Path,
     *,
     target_crs: str | None = None,
     capture_feature_boundaries: bool = True,
@@ -260,8 +299,10 @@ def read_geojson_gpu(
 
     Parameters
     ----------
-    path : Path
-        Path to the GeoJSON file.
+    source : Path | str | bytes | bytearray | memoryview
+        GeoJSON FeatureCollection source. Path-like inputs read from the
+        filesystem; string or bytes inputs parse directly from in-memory
+        RFC 7946 payload bytes.
     target_crs : str, optional
         Target CRS to reproject coordinates into (e.g. ``"EPSG:3857"``).
         GeoJSON is EPSG:4326 by spec (RFC 7946).  When provided, a fused
@@ -272,21 +313,8 @@ def read_geojson_gpu(
     and host data for lazy CPU property extraction.
     """
     runtime = get_cuda_runtime()
-    source_stat = path.stat()
-
-    # S0: Read file to device via kvikio (parallel POSIX with pinned
-    # bounce buffers) or cp.asarray fallback.
-    from .kvikio_reader import read_file_to_device
-
-    file_size = source_stat.st_size
-    result = read_file_to_device(path, file_size)
-    d_bytes = result.device_bytes
+    d_bytes, host_bytes, source_path, source_mtime_ns = _resolve_geojson_gpu_source(source)
     n = len(d_bytes)
-    if result.host_bytes is not None and len(result.host_bytes) != n:
-        raise OSError(
-            f"File size changed between reads: device has {n} bytes, "
-            f"host has {len(result.host_bytes)} bytes"
-        )
     n_i64 = np.int64(n)
     ptr = runtime.pointer
 
@@ -321,10 +349,10 @@ def read_geojson_gpu(
         return GeoJSONGpuResult(
             owned=owned,
             n_features=0,
-            path=path,
+            path=source_path,
             source_nbytes=n,
-            source_mtime_ns=source_stat.st_mtime_ns,
-            host_bytes=result.host_bytes,
+            source_mtime_ns=source_mtime_ns,
+            host_bytes=host_bytes,
             feature_starts=np.empty(0, dtype=np.int64),
             feature_ends=np.empty(0, dtype=np.int64),
         )
@@ -659,10 +687,10 @@ def read_geojson_gpu(
     return GeoJSONGpuResult(
         owned=owned,
         n_features=n_features,
-        path=path,
+        path=source_path,
         source_nbytes=n,
-        source_mtime_ns=source_stat.st_mtime_ns,
-        host_bytes=result.host_bytes,
+        source_mtime_ns=source_mtime_ns,
+        host_bytes=host_bytes,
         device_feature_starts=d_feat_start_pos,
         device_feature_ends=d_feat_end_pos,
     )

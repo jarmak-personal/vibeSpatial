@@ -104,6 +104,38 @@ def test_correctness_against_fast_json(tmp_path):
     np.testing.assert_allclose(gpu_y, cpu_buf.y, atol=1e-10)
 
 
+@needs_gpu
+def test_gpu_byte_classify_supports_in_memory_text_source() -> None:
+    fc = _make_feature_collection([
+        _make_point_feature([0.5, 1.5], {"id": 1}),
+        _make_point_feature([2.5, 3.5], {"id": 2}),
+    ])
+    text = json.dumps(fc)
+
+    batch = read_geojson_owned(text, prefer="gpu-byte-classify")
+
+    assert batch.geometry.device_state is not None
+    assert batch.geometry.row_count == 2
+    assert batch.properties[0]["id"] == 1
+    assert batch.properties[1]["id"] == 2
+
+
+@needs_gpu
+def test_gpu_byte_classify_supports_in_memory_bytes_source() -> None:
+    fc = _make_feature_collection([
+        _make_linestring_feature([[0, 0], [1, 1]], {"id": 1}),
+        _make_linestring_feature([[2, 2], [3, 3]], {"id": 2}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify")
+
+    assert batch.geometry.device_state is not None
+    assert batch.geometry.row_count == 2
+    assert batch.properties[0]["id"] == 1
+    assert batch.properties[1]["id"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Test 2: Quote-state — property containing "coordinates": as text
 # ---------------------------------------------------------------------------

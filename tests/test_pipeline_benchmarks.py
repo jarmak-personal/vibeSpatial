@@ -112,6 +112,17 @@ def test_predicate_pipeline_reports_cpu_planner_when_runtime_unavailable(
     assert trace["metadata"]["planner_selected_runtime"] == "cpu"
 
 
+def test_predicate_pipeline_reads_precomputed_geojson_bytes() -> None:
+    result = _profile_predicate_pipeline(scale=8)
+
+    trace = result.stages[0]
+    read_stage = trace["stages"][0]
+
+    assert read_stage["name"] == "read_geojson"
+    assert read_stage["metadata"]["source_kind"] == "bytes"
+    assert "GeoJSON bytes ingest" in result.notes
+
+
 def test_extract_gpu_util_ignores_nvml_only_cpu_traces() -> None:
     stages = (
         {
