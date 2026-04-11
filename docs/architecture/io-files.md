@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 267/280 lines
+Body Budget: 266/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-54 | Decision |
 | 55-64 | Performance Notes |
-| 65-177 | Current Behavior |
-| 178-267 | Measured Local Baseline |
+| 65-176 | Current Behavior |
+| 177-266 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -186,17 +186,16 @@ keeping GPU-native formats primary and legacy formats explicit.
     as explicit strategies
   - assemble geometry directly into owned buffers without Shapely objects
   - keep property rows separate from geometry assembly
-- Repo-owned Shapefile ingest now also has an internal batch-first owned path:
-  - `read_shapefile_owned(...)` uses `pyogrio.read_arrow(...)` for host container
-    parsing of `.shp/.shx/.dbf`
-  - geometry lands through Arrow `geoarrow.wkb` batches into owned buffers via
-    the repo-owned native WKB decoder
-  - homogeneous point Shapefiles now use a raw Arrow-binary point fast path
-    before any `to_pylist()` materialization
-  - attributes stay in a columnar Arrow table instead of materializing a
-    GeoDataFrame during ingest
-  - the public `read_file(..., driver=\"ESRI Shapefile\")` route stays on
-    `pyogrio` until the owned batch path is measurably faster end-to-end
+- Repo-owned Shapefile ingest now also has an internal native-first owned path:
+  - `read_shapefile_owned(...)` now prefers direct SHP binary decode on GPU plus
+    the GPU DBF parser for plain local-file reads with no bbox, column
+    projection, row window, or pyogrio-specific kwargs
+  - when the request needs those pyogrio container features, it falls back to
+    `pyogrio.read_arrow(...)` plus the repo-owned native WKB decoder
+  - attributes stay columnar through the read boundary instead of materializing
+    a GeoDataFrame during ingest
+  - the direct SHP path and the Arrow-WKB fallback now share the same public
+    owned/native read boundary instead of reader-local frame assembly
 
 ## Measured Local Baseline
 

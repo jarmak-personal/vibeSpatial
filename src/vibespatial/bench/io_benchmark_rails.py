@@ -33,6 +33,7 @@ from vibespatial.testing.synthetic import (
 
 _GEOPARQUET_BENCH_WARMUP_READS = 2
 _GEOPARQUET_SCAN_BENCH_MIN_REPEAT = 3
+_SHAPEFILE_BENCH_MIN_REPEAT = 3
 
 
 @dataclass(frozen=True)
@@ -340,6 +341,10 @@ def _benchmark_mixed_wkb_decode(*, rows: int, repeat: int, seed: int = 0) -> tup
 
 def _stable_geoparquet_scan_repeat(repeat: int) -> int:
     return max(repeat, _GEOPARQUET_SCAN_BENCH_MIN_REPEAT)
+
+
+def _stable_shapefile_repeat(repeat: int) -> int:
+    return max(repeat, _SHAPEFILE_BENCH_MIN_REPEAT)
 
 
 def benchmark_io_arrow_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBenchmarkCase]:
@@ -697,9 +702,13 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
     results: list[IOBenchmarkCase] = []
 
     for rows in point_scales:
-        benchmarks = benchmark_shapefile_ingest(geometry_type="point", rows=rows, repeat=repeat)
+        benchmarks = benchmark_shapefile_ingest(
+            geometry_type="point",
+            rows=rows,
+            repeat=_stable_shapefile_repeat(repeat),
+        )
         host = _benchmark_lookup(benchmarks, "pyogrio_host")
-        owned = _benchmark_lookup(benchmarks, "shapefile_owned_batch")
+        owned = _benchmark_lookup(benchmarks, "shapefile_owned_native")
         results.append(
             _speedup_case(
                 case_id=f"shapefile-point-{rows}",
@@ -710,20 +719,24 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
                 target_floor=1.5,
                 enforced=True,
                 baseline_label="pyogrio_host",
-                candidate_label="shapefile_owned_batch",
+                candidate_label="shapefile_owned_native",
                 baseline_rows_per_second=host.rows_per_second,
                 candidate_rows_per_second=owned.rows_per_second,
                 rows_decoded=rows,
                 bytes_scanned=None,
                 copies_made=1,
-                notes="Point Shapefile ingest should beat the host baseline through batch Arrow-WKB decode.",
+                notes="Point Shapefile ingest should beat the host baseline through direct SHP GPU decode.",
             )
         )
 
     for rows in line_scales:
-        benchmarks = benchmark_shapefile_ingest(geometry_type="line", rows=rows, repeat=repeat)
+        benchmarks = benchmark_shapefile_ingest(
+            geometry_type="line",
+            rows=rows,
+            repeat=_stable_shapefile_repeat(repeat),
+        )
         host = _benchmark_lookup(benchmarks, "pyogrio_host")
-        owned = _benchmark_lookup(benchmarks, "shapefile_owned_batch")
+        owned = _benchmark_lookup(benchmarks, "shapefile_owned_native")
         results.append(
             _speedup_case(
                 case_id=f"shapefile-line-{rows}",
@@ -734,20 +747,24 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
                 target_floor=1.5,
                 enforced=True,
                 baseline_label="pyogrio_host",
-                candidate_label="shapefile_owned_batch",
+                candidate_label="shapefile_owned_native",
                 baseline_rows_per_second=host.rows_per_second,
                 candidate_rows_per_second=owned.rows_per_second,
                 rows_decoded=rows,
                 bytes_scanned=None,
                 copies_made=1,
-                notes="Line-heavy Shapefile ingest should stay on the raw Arrow-binary fast path.",
+                notes="Line-heavy Shapefile ingest should stay on the direct SHP GPU path.",
             )
         )
 
     for rows in polygon_scales:
-        benchmarks = benchmark_shapefile_ingest(geometry_type="polygon", rows=rows, repeat=repeat)
+        benchmarks = benchmark_shapefile_ingest(
+            geometry_type="polygon",
+            rows=rows,
+            repeat=_stable_shapefile_repeat(repeat),
+        )
         host = _benchmark_lookup(benchmarks, "pyogrio_host")
-        owned = _benchmark_lookup(benchmarks, "shapefile_owned_batch")
+        owned = _benchmark_lookup(benchmarks, "shapefile_owned_native")
         results.append(
             _speedup_case(
                 case_id=f"shapefile-polygon-{rows}",
@@ -758,13 +775,13 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
                 target_floor=1.1,
                 enforced=True,
                 baseline_label="pyogrio_host",
-                candidate_label="shapefile_owned_batch",
+                candidate_label="shapefile_owned_native",
                 baseline_rows_per_second=host.rows_per_second,
                 candidate_rows_per_second=owned.rows_per_second,
                 rows_decoded=rows,
                 bytes_scanned=None,
                 copies_made=1,
-                notes="Polygon Shapefile ingest should clear the modest floor while avoiding per-feature Python decode.",
+                notes="Polygon Shapefile ingest should clear the modest floor through direct SHP GPU decode.",
             )
         )
 

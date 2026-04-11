@@ -241,8 +241,17 @@ def test_pyogrio_write_preserves_geometry_alignment_for_sparse_indexes(tmp_path)
         assert right.equals(left)
 
 
-def test_plan_shapefile_ingest_uses_arrow_wkb_owned_path() -> None:
+def test_plan_shapefile_ingest_prefers_direct_gpu_owned_path() -> None:
     plan = plan_shapefile_ingest()
+
+    assert plan.implementation == "shapefile_shp_direct_owned"
+    assert plan.selected_strategy == "shp-direct-gpu"
+    assert plan.uses_pyogrio_container is False
+    assert plan.uses_native_wkb_decode is False
+
+
+def test_plan_shapefile_ingest_supports_arrow_wkb_fallback() -> None:
+    plan = plan_shapefile_ingest(prefer="arrow-wkb")
 
     assert plan.implementation == "shapefile_arrow_wkb_owned"
     assert plan.selected_strategy == "arrow-wkb"
@@ -358,6 +367,60 @@ def test_read_shapefile_owned_polygons_use_raw_arrow_fast_path(monkeypatch, tmp_
     batch = read_shapefile_owned(path)
 
     assert batch.geometry.to_shapely()[1].equals(frame.geometry.iloc[1])
+
+
+def test_read_shapefile_owned_prefers_direct_gpu_native_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    payload = _native_file_result_from_owned(
+        owned,
+        crs="EPSG:4326",
+        attributes=pd.DataFrame({"value": [10, 20]}),
+        row_count=2,
+    )
+
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_shapefile_shp_direct_gpu_read_native",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("direct Shapefile owned read should not call pyogrio.read_arrow")
+        ),
+    )
+
+    batch = read_shapefile_owned("sample.shp")
+
+    assert batch.geometry.row_count == 2
+    assert batch.attributes_table.column("value").to_pylist() == [10, 20]
+
+
+def test_read_shapefile_owned_uses_arrow_wkb_fallback_for_bbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    table = pa.table({"value": [10], "geometry": [Point(0, 0).wkb]})
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_shapefile_shp_direct_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("bbox reads should bypass the direct Shapefile GPU path")
+        ),
+    )
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    batch = read_shapefile_owned("sample.shp", bbox=(0.0, 0.0, 1.0, 1.0))
+
+    assert batch.geometry.row_count == 1
+    assert batch.attributes_table.column("value").to_pylist() == [10]
 
 
 def test_pyogrio_arrow_wkb_native_result_preserves_index_and_defers_public_materialization(
@@ -964,6 +1027,6 @@ def test_benchmark_shapefile_ingest_reports_all_candidate_paths() -> None:
     assert {result.implementation for result in results} == {
         "pyogrio_host",
         "pyogrio_arrow_container",
-        "shapefile_owned_batch",
+        "shapefile_owned_native",
         "native_wkb_decode",
     }

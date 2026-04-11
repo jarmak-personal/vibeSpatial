@@ -270,21 +270,36 @@ def _write_vector_file_native_pyogrio(
     )
 
 
-def plan_shapefile_ingest(*, prefer: str = "arrow-wkb") -> ShapefileIngestPlan:
-    selected_strategy = "arrow-wkb" if prefer == "auto" else prefer
+def plan_shapefile_ingest(*, prefer: str = "auto") -> ShapefileIngestPlan:
+    selected_strategy = "shp-direct-gpu" if prefer == "auto" else prefer
     implementation = {
+        "shp-direct-gpu": "shapefile_shp_direct_owned",
         "arrow-wkb": "shapefile_arrow_wkb_owned",
-    }.get(selected_strategy, "shapefile_arrow_wkb_owned")
+    }.get(selected_strategy, "shapefile_shp_direct_owned")
+    if selected_strategy == "arrow-wkb":
+        return ShapefileIngestPlan(
+            implementation=implementation,
+            selected_strategy=selected_strategy,
+            uses_pyogrio_container=True,
+            uses_arrow_batch=True,
+            uses_native_wkb_decode=True,
+            reason=(
+                "Use host-side pyogrio container parsing for bbox, column projection, "
+                "row-windowed reads, and other compatibility-sensitive Shapefile cases, "
+                "then land geometry through Arrow WKB batches into owned buffers without "
+                "per-row Shapely construction."
+            ),
+        )
     return ShapefileIngestPlan(
         implementation=implementation,
         selected_strategy=selected_strategy,
-        uses_pyogrio_container=True,
-        uses_arrow_batch=True,
-        uses_native_wkb_decode=True,
+        uses_pyogrio_container=False,
+        uses_arrow_batch=False,
+        uses_native_wkb_decode=False,
         reason=(
-            "Use host-side pyogrio container parsing for the Shapefile sidecar ecosystem, "
-            "then land geometry through Arrow WKB batches into owned buffers without per-row "
-            "Shapely construction. Keep attributes in a columnar table."
+            "Prefer direct SHP binary decode on GPU with the GPU DBF parser for plain "
+            "local-file Shapefile reads. Fall back to the Arrow WKB compatibility path "
+            "only when the request needs pyogrio container features."
         ),
     )
 
@@ -419,17 +434,70 @@ def read_shapefile_owned(
     rows=None,
     **kwargs,
 ) -> ShapefileOwnedBatch:
+    plan = plan_shapefile_ingest()
+    direct_supported = (
+        bbox is None
+        and columns is None
+        and rows is None
+        and not kwargs
+        and isinstance(source, str | Path)
+        and "://" not in str(source)
+    )
+    if direct_supported:
+        payload = _try_shapefile_shp_direct_gpu_read_native(source)
+        if payload is not None:
+            geometry = payload.geometry.owned
+            if geometry is None:
+                raise ValueError("direct Shapefile native read did not produce owned geometry")
+            attributes_table = payload.attributes.to_arrow(index=False)
+            metadata = {
+                "geometry_name": payload.geometry_name,
+                "crs": payload.geometry.crs,
+            }
+            record_dispatch_event(
+                surface="vibespatial.io.shapefile",
+                operation="read_owned",
+                implementation=plan.implementation,
+                reason=plan.reason,
+                selected=ExecutionMode.GPU,
+            )
+            return ShapefileOwnedBatch(
+                geometry=geometry,
+                attributes_table=attributes_table,
+                metadata=metadata,
+            )
+
+        record_fallback_event(
+            surface="vibespatial.io.shapefile",
+            reason=(
+                "direct SHP GPU decode unavailable for this source; falling back to the "
+                "Arrow WKB compatibility path"
+            ),
+            detail=str(source),
+            pipeline="io/read_shapefile_owned",
+        )
+    elif plan.selected_strategy == "shp-direct-gpu":
+        record_fallback_event(
+            surface="vibespatial.io.shapefile",
+            reason=(
+                "direct SHP GPU decode requires an unfiltered local-file read with no "
+                "bbox, column projection, row window, or pyogrio-specific kwargs"
+            ),
+            detail=str(source),
+            pipeline="io/read_shapefile_owned",
+        )
+
+    fallback_plan = plan_shapefile_ingest(prefer="arrow-wkb")
     import pyogrio
 
     from .arrow import decode_wkb_arrow_array_owned
 
-    plan = plan_shapefile_ingest()
     skip_features, max_features = _normalize_feature_window(rows)
     record_dispatch_event(
         surface="vibespatial.io.shapefile",
         operation="read_owned",
-        implementation=plan.implementation,
-        reason=plan.reason,
+        implementation=fallback_plan.implementation,
+        reason=fallback_plan.reason,
         selected=ExecutionMode.CPU,
     )
     metadata, table = pyogrio.read_arrow(
@@ -1850,6 +1918,8 @@ def benchmark_shapefile_ingest(
 ) -> list[ShapefileIngestBenchmark]:
     import pyogrio
 
+    from .arrow import decode_wkb_owned
+
     if geometry_type == "point":
         from vibespatial.testing.synthetic import SyntheticSpec, generate_points
 
@@ -1908,6 +1978,10 @@ def benchmark_shapefile_ingest(
         assert last_meta is not None and last_table is not None
         geometry_index, _ = _select_arrow_geometry_column(last_table, last_meta)
         geometry_column = last_table.column(geometry_index).combine_chunks()
+        wkb_values = list(geometry_column.to_pylist())
+
+        # Benchmark the steady-state owned path, not one-time WKB kernel setup.
+        read_shapefile_owned(path)
 
         start = perf_counter()
         for _ in range(repeat):
@@ -1915,7 +1989,7 @@ def benchmark_shapefile_ingest(
         elapsed = (perf_counter() - start) / repeat
         results.append(
             ShapefileIngestBenchmark(
-                implementation="shapefile_owned_batch",
+                implementation="shapefile_owned_native",
                 geometry_type=geometry_type,
                 rows=rows,
                 elapsed_seconds=elapsed,
@@ -1923,9 +1997,8 @@ def benchmark_shapefile_ingest(
             )
         )
 
-        from .arrow import decode_wkb_owned
-
-        wkb_values = list(geometry_column.to_pylist())
+        # Native WKB decode shares the same kernel stack; exclude cold-start cost.
+        decode_wkb_owned(wkb_values)
         start = perf_counter()
         for _ in range(repeat):
             decode_wkb_owned(wkb_values)
