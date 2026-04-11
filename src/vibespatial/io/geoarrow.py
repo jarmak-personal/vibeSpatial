@@ -1651,12 +1651,13 @@ def native_tabular_to_arrow(
         selected=ExecutionMode.CPU,
     )
 
+    resolved_column_order = list(payload.resolved_column_order)
     geometry_columns = sorted(
         payload.geometry_columns,
-        key=lambda column: list(payload.column_order).index(column.name),
+        key=lambda column: resolved_column_order.index(column.name),
     )
     geometry_names = {column.name for column in geometry_columns}
-    attr_columns = [column for column in payload.column_order if column not in geometry_names]
+    attr_columns = [column for column in resolved_column_order if column not in geometry_names]
     if attr_columns:
         table = payload.attributes.to_arrow(
             index=index,
@@ -1674,7 +1675,7 @@ def native_tabular_to_arrow(
             index=payload.attributes.index,
             name=geometry_column.name,
         )
-        geometry_column_index = list(payload.column_order).index(geometry_column.name)
+        geometry_column_index = resolved_column_order.index(geometry_column.name)
         if geometry_encoding.lower() == "geoarrow":
             field, geom_arr = _construct_geoarrow_array_with_explicit_fallback(
                 geometry_series,

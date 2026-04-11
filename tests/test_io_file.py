@@ -24,6 +24,7 @@ from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.file import (
     _native_file_result_from_owned,
+    _native_geojson_result_from_gpu_result,
     _pyogrio_arrow_wkb_to_native_tabular_result,
     plan_vector_file_io,
     read_vector_file,
@@ -646,6 +647,38 @@ def test_read_geojson_native_returns_shared_native_boundary(
     assert payload.geometry.row_count == 2
     assert payload.geometry.crs == "EPSG:4326"
     assert payload.attributes["value"].tolist() == [10, 20]
+
+
+def test_geojson_gpu_native_boundary_keeps_properties_lazy_until_materialization() -> None:
+    load_calls = 0
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+
+    class _FakeGpuResult:
+        def __init__(self) -> None:
+            self.owned = owned
+            self.n_features = 2
+
+        def properties_loader(self):
+            def _load():
+                nonlocal load_calls
+                load_calls += 1
+                return [{"value": 10}, {"value": 20}]
+
+            return _load
+
+    payload = _native_geojson_result_from_gpu_result(_FakeGpuResult())
+
+    assert isinstance(payload, NativeTabularResult)
+    assert load_calls == 0
+    assert payload.geometry.row_count == 2
+    assert payload.take([0]).geometry.row_count == 1
+    assert load_calls == 0
+
+    frame = payload.to_geodataframe()
+
+    assert load_calls == 1
+    assert list(frame.columns) == ["value", "geometry"]
+    assert frame["value"].tolist() == [10, 20]
 
 
 def test_plan_geojson_ingest_auto_selects_best_available() -> None:

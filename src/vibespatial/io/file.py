@@ -143,6 +143,36 @@ def _native_attribute_table_from_file_attributes(attributes, *, row_count: int):
     return NativeAttributeTable.from_value(attributes)
 
 
+def _geojson_properties_to_frame(properties, *, row_count: int):
+    import pandas as pd
+
+    if properties:
+        return pd.DataFrame(properties)
+    return pd.DataFrame(index=pd.RangeIndex(row_count))
+
+
+def _native_attribute_table_from_geojson_properties_loader(
+    properties_loader,
+    *,
+    row_count: int,
+):
+    import pandas as pd
+
+    from vibespatial.api._native_results import NativeAttributeTable
+
+    def _load_frame():
+        return _geojson_properties_to_frame(
+            properties_loader(),
+            row_count=row_count,
+        )
+
+    return NativeAttributeTable.from_loader(
+        _load_frame,
+        index_override=pd.RangeIndex(row_count),
+        columns=(),
+    )
+
+
 def _native_file_result_from_owned(
     owned: OwnedGeometryArray,
     *,
@@ -172,21 +202,20 @@ def _native_geojson_result_from_gpu_result(
     *,
     target_crs: str | None = None,
 ):
-    import pandas as pd
-
     effective_crs = _resolve_target_crs_for_owned(
         gpu_result.owned,
         source_crs="EPSG:4326",
         target_crs=target_crs,
     )
-    props_df = gpu_result.extract_properties_dataframe()
-    if props_df.empty:
-        props_df = pd.DataFrame(index=pd.RangeIndex(gpu_result.n_features))
+    row_count = int(gpu_result.n_features)
     return _native_file_result_from_owned(
         gpu_result.owned,
         crs=effective_crs,
-        attributes=props_df,
-        row_count=gpu_result.n_features,
+        attributes=_native_attribute_table_from_geojson_properties_loader(
+            gpu_result.properties_loader(),
+            row_count=row_count,
+        ),
+        row_count=row_count,
     )
 
 
@@ -351,8 +380,6 @@ def read_geojson_native(
     track_properties: bool = True,
     target_crs: str | None = None,
 ):
-    import pandas as pd
-
     batch = read_geojson_owned(
         source,
         prefer=prefer,
@@ -365,12 +392,17 @@ def read_geojson_native(
     )
     attributes = None
     if track_properties:
-        properties = batch.properties
-        attributes = (
-            pd.DataFrame(properties)
-            if properties
-            else pd.DataFrame(index=pd.RangeIndex(batch.geometry.row_count))
-        )
+        row_count = int(batch.geometry.row_count)
+        if batch._properties is None:
+            attributes = _native_attribute_table_from_geojson_properties_loader(
+                lambda: batch.properties,
+                row_count=row_count,
+            )
+        else:
+            attributes = _geojson_properties_to_frame(
+                batch.properties,
+                row_count=row_count,
+            )
     return _native_file_result_from_owned(
         batch.geometry,
         crs=effective_crs,

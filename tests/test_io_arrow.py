@@ -2625,6 +2625,63 @@ def test_arrow_backed_native_attributes_device_parquet_without_pandas_materializ
     assert b"geo" in table.schema.metadata
 
 
+def test_lazy_native_attribute_table_take_preserves_loader() -> None:
+    load_calls = 0
+
+    def _load() -> pd.DataFrame:
+        nonlocal load_calls
+        load_calls += 1
+        return pd.DataFrame({"value": [1, 2, 3]}, index=pd.RangeIndex(3))
+
+    attr_table = NativeAttributeTable.from_loader(
+        _load,
+        index_override=pd.RangeIndex(3),
+        columns=("value",),
+    )
+
+    taken = attr_table.take([0, 2])
+
+    assert load_calls == 0
+    assert list(taken.index) == [0, 2]
+    assert taken.columns.tolist() == ["value"]
+    assert taken.to_pandas()["value"].tolist() == [1, 3]
+    assert load_calls == 1
+
+
+def test_lazy_native_tabular_export_resolves_late_attribute_columns() -> None:
+    load_calls = 0
+
+    def _load() -> pd.DataFrame:
+        nonlocal load_calls
+        load_calls += 1
+        return pd.DataFrame({"value": [1, 2]}, index=pd.RangeIndex(2))
+
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable.from_loader(
+            _load,
+            index_override=pd.RangeIndex(2),
+            columns=(),
+        ),
+        geometry=GeometryNativeResult.from_geoseries(
+            geopandas.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326")
+        ),
+        geometry_name="geometry",
+        column_order=("geometry",),
+    )
+
+    assert load_calls == 0
+    frame = payload.to_geodataframe()
+
+    assert load_calls == 1
+    assert list(frame.columns) == ["value", "geometry"]
+    assert frame["value"].tolist() == [1, 2]
+
+    table = payload.to_arrow(index=False)._pa_table
+
+    assert load_calls == 1
+    assert table.column_names == ["value", "geometry"]
+
+
 def test_create_metadata_uses_device_geometry_fast_path(monkeypatch) -> None:
     if not has_gpu_runtime():
         return

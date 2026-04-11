@@ -369,7 +369,7 @@ def _write_geoparquet_native_tabular_result(
         geometry_encoding=geometry_encoding,
         schema_version=schema_version,
         write_covering_bbox=write_covering_bbox,
-        column_order=payload.column_order,
+        column_order=payload.resolved_column_order,
         frame_attrs=payload.attrs,
         **kwargs,
     )

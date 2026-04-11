@@ -55,13 +55,18 @@ class NativeAttributeTable:
 
     dataframe: pd.DataFrame | None = None
     arrow_table: Any | None = None
+    loader: Callable[[], pd.DataFrame] | None = None
     index_override: pd.Index | None = None
+    column_override: tuple[str, ...] | None = None
     to_pandas_kwargs: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
-        if (self.dataframe is None) == (self.arrow_table is None):
+        provided = sum(
+            value is not None for value in (self.dataframe, self.arrow_table, self.loader)
+        )
+        if provided != 1:
             raise ValueError(
-                "NativeAttributeTable requires exactly one of dataframe or arrow_table"
+                "NativeAttributeTable requires exactly one of dataframe, arrow_table, or loader"
             )
         if self.to_pandas_kwargs is None:
             object.__setattr__(self, "to_pandas_kwargs", {})
@@ -71,6 +76,11 @@ class NativeAttributeTable:
                 "index_override",
                 pd.RangeIndex(int(self.arrow_table.num_rows)),
             )
+        if self.loader is not None:
+            if self.index_override is None:
+                raise ValueError("NativeAttributeTable loader requires index_override")
+            if self.column_override is None:
+                object.__setattr__(self, "column_override", tuple())
 
     @classmethod
     def from_value(cls, value) -> NativeAttributeTable:
@@ -88,6 +98,22 @@ class NativeAttributeTable:
 
         raise TypeError("NativeAttributeTable expects pandas DataFrame or pyarrow.Table")
 
+    @classmethod
+    def from_loader(
+        cls,
+        loader: Callable[[], pd.DataFrame],
+        *,
+        index_override: pd.Index,
+        columns: tuple[str, ...] | list[str] | None = None,
+        to_pandas_kwargs: dict[str, Any] | None = None,
+    ) -> NativeAttributeTable:
+        return cls(
+            loader=loader,
+            index_override=index_override,
+            column_override=None if columns is None else tuple(columns),
+            to_pandas_kwargs=to_pandas_kwargs,
+        )
+
     @property
     def index(self) -> pd.Index:
         if self.dataframe is not None:
@@ -98,11 +124,46 @@ class NativeAttributeTable:
     def columns(self) -> pd.Index:
         if self.dataframe is not None:
             return self.dataframe.columns
+        if self.loader is not None:
+            return pd.Index(self.column_override)
         return pd.Index(self.arrow_table.column_names)
+
+    def _materialize_loaded_frame(self) -> pd.DataFrame:
+        if self.loader is None:
+            if self.dataframe is None:
+                raise ValueError("loader materialization requires a loader-backed table")
+            return self.dataframe
+
+        frame = self.loader()
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(
+                "NativeAttributeTable loader must return a pandas DataFrame"
+            )
+        if not frame.index.equals(self.index):
+            if len(frame) != len(self.index):
+                raise ValueError(
+                    "NativeAttributeTable loader returned a DataFrame with the wrong row count"
+                )
+            frame = frame.copy(deep=False)
+            frame.index = self.index
+        if self.column_override:
+            expected = tuple(self.column_override)
+            actual = tuple(frame.columns)
+            if actual != expected:
+                raise ValueError(
+                    "NativeAttributeTable loader returned columns that do not match the declared schema"
+                )
+        object.__setattr__(self, "dataframe", frame)
+        object.__setattr__(self, "loader", None)
+        object.__setattr__(self, "column_override", tuple(frame.columns))
+        return frame
 
     def to_pandas(self, *, copy: bool = False, **kwargs) -> pd.DataFrame:
         if self.dataframe is not None:
             return self.dataframe.copy(deep=copy) if copy else self.dataframe
+        if self.loader is not None:
+            frame = self._materialize_loaded_frame()
+            return frame.copy(deep=copy) if copy else frame
 
         to_pandas_kwargs = dict(self.to_pandas_kwargs or {})
         to_pandas_kwargs.update(kwargs)
@@ -112,6 +173,13 @@ class NativeAttributeTable:
 
     def to_arrow(self, *, index: bool | None = None, columns=None):
         import pyarrow as pa
+
+        if self.loader is not None:
+            frame = self.to_pandas(copy=False)
+            requested_columns = None if columns is None else list(columns)
+            if requested_columns is not None:
+                frame = frame.loc[:, requested_columns]
+            return pa.Table.from_pandas(frame, preserve_index=index)
 
         requested_columns = None if columns is None else list(columns)
         can_skip_index = (
@@ -136,6 +204,21 @@ class NativeAttributeTable:
         return pa.Table.from_pandas(frame, preserve_index=index)
 
     def with_column(self, name: str, values) -> NativeAttributeTable:
+        if self.loader is not None:
+            declared_columns = tuple(self.column_override or ())
+            parent = self
+
+            def _load() -> pd.DataFrame:
+                frame = parent.to_pandas(copy=False).copy(deep=False)
+                frame[name] = values
+                return frame
+
+            return type(self).from_loader(
+                _load,
+                index_override=self.index,
+                columns=tuple([*declared_columns, name]),
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
         if self.arrow_table is not None:
             import pyarrow as pa
 
@@ -153,6 +236,21 @@ class NativeAttributeTable:
     def rename_columns(self, mapping: dict[str, str]) -> NativeAttributeTable:
         if not mapping:
             return self
+        if self.loader is not None:
+            declared_columns = tuple(
+                mapping.get(name, name) for name in (self.column_override or ())
+            )
+            parent = self
+
+            def _load() -> pd.DataFrame:
+                return parent.to_pandas(copy=False).rename(columns=mapping, copy=False)
+
+            return type(self).from_loader(
+                _load,
+                index_override=self.index,
+                columns=declared_columns,
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
         if self.arrow_table is not None:
             renamed = [mapping.get(name, name) for name in self.arrow_table.column_names]
             return type(self)(
@@ -164,6 +262,18 @@ class NativeAttributeTable:
 
     def take(self, row_positions) -> NativeAttributeTable:
         host_positions = _host_row_positions(row_positions)
+        if self.loader is not None:
+            parent = self
+
+            def _load() -> pd.DataFrame:
+                return parent.to_pandas(copy=False).take(host_positions)
+
+            return type(self).from_loader(
+                _load,
+                index_override=self.index.take(host_positions),
+                columns=self.column_override,
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
         if self.arrow_table is not None:
             import pyarrow as pa
 
@@ -514,12 +624,31 @@ class NativeTabularResult:
             *self.secondary_geometry,
         )
 
+    @property
+    def resolved_column_order(self) -> tuple[str, ...]:
+        ordered = list(self.column_order)
+        geometry_names = {column.name for column in self.geometry_columns}
+        attr_columns = list(self.attributes.columns)
+        if not attr_columns and self.attributes.loader is not None:
+            attr_columns = list(self.attributes.to_pandas(copy=False).columns)
+        missing_attr_columns = [
+            column for column in attr_columns if column not in ordered and column not in geometry_names
+        ]
+        if not missing_attr_columns:
+            return self.column_order
+        insert_at = next(
+            (index for index, name in enumerate(ordered) if name in geometry_names),
+            len(ordered),
+        )
+        ordered[insert_at:insert_at] = missing_attr_columns
+        return tuple(ordered)
+
     def to_geodataframe(self) -> GeoDataFrame:
         frame = _materialize_attribute_geometry_frame(
             self.attributes,
             self.geometry_columns,
             geometry_name=self.geometry_name,
-            column_order=self.column_order,
+            column_order=self.resolved_column_order,
         )
         if self.attrs:
             frame.attrs.update(self.attrs)
@@ -2314,7 +2443,7 @@ def _concat_native_tabular_results(
     )
     column_order: list[str] = []
     for result in results:
-        for column_name in result.column_order:
+        for column_name in result.resolved_column_order:
             if column_name not in column_order:
                 column_order.append(column_name)
     return NativeTabularResult(
