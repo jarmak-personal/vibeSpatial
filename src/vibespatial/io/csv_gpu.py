@@ -885,6 +885,18 @@ def _extract_wkb_and_parse(
     return _decode_pylibcudf_wkb_general_column_to_owned(column)
 
 
+def _decode_hex_string_column_to_owned(string_column) -> OwnedGeometryArray:
+    """Decode a pylibcudf strings column of hex-encoded WKB to owned geometry."""
+    if string_column.offset() != 0:
+        raise NotImplementedError("offset string columns are not supported for CSV WKB decode")
+
+    d_offsets = cp.asarray(string_column.child(0).data()).view(cp.int32)
+    d_payload = cp.asarray(string_column.data()).view(cp.uint8)
+    d_starts = d_offsets[:-1].astype(cp.int64, copy=False)
+    d_ends = d_offsets[1:].astype(cp.int64, copy=False)
+    return _extract_wkb_and_parse(d_payload, d_starts, d_ends)
+
+
 def _assemble_point_geometry(
     d_lon: cp.ndarray,
     d_lat: cp.ndarray,

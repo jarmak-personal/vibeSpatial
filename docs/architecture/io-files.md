@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 271/280 lines
+Body Budget: 277/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-54 | Decision |
 | 55-64 | Performance Notes |
-| 65-181 | Current Behavior |
-| 182-271 | Measured Local Baseline |
+| 65-187 | Current Behavior |
+| 188-277 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -117,6 +117,12 @@ keeping GPU-native formats primary and legacy formats explicit.
   - the direct SHP binary + DBF and pyogrio geometry + GPU DBF Shapefile paths
   - the GeoJSON byte-classify path after property extraction
   - the OSM PBF hybrid path after protobuf/tag extraction
+- Large geometry-column CSV now prefers a `pylibcudf` / `libcudf` table parse
+  instead of the older whole-file byte-classify path. That keeps the CSV
+  container parse on device, avoids the previous WKT concatenation memory blowup
+  on Florida-scale files, and then routes the geometry column into the native
+  GPU WKT/WKB decode path. The byte-classify CSV reader still owns small files
+  and non-geometry-column layouts such as lat/lon pairs.
 - FlatGeobuf now defaults to the pyogrio Arrow + GPU WKB path on public
   `read_file(...)` / `read_vector_file_native(...)`. The repo still has a
   direct GPU FlatBuffer decoder in `fgb_gpu.py`, but the Florida real-dataset

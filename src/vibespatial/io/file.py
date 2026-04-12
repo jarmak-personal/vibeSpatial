@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -57,6 +58,20 @@ class ShapefileIngestBenchmark:
     rows: int
     elapsed_seconds: float
     rows_per_second: float
+
+
+@dataclass(frozen=True)
+class _CsvSpatialLayout:
+    column_names: tuple[str, ...]
+    spatial_columns: dict[str, int]
+    geometry_format: str | None = None
+
+
+@dataclass(frozen=True)
+class _CsvGpuSelection:
+    payload: object
+    implementation: str
+    reason: str
 
 
 def _native_payload_geometry_type(payload) -> str:
@@ -217,6 +232,55 @@ def _native_geojson_result_from_gpu_result(
         ),
         row_count=row_count,
     )
+
+
+def _csv_detect_geometry_value_format(value: str) -> str:
+    stripped = value.lstrip()
+    if (
+        len(stripped) >= 10
+        and stripped[:2] in ("00", "01")
+        and len(stripped) % 2 == 0
+        and all(ch in "0123456789abcdefABCDEF" for ch in stripped)
+    ):
+        return "wkb"
+    return "wkt"
+
+
+def _sniff_csv_spatial_layout(path: Path) -> _CsvSpatialLayout | None:
+    from .csv_gpu import _detect_spatial_columns
+
+    try:
+        current_limit = csv.field_size_limit()
+        if current_limit < (2**31 - 1):
+            csv.field_size_limit(2**31 - 1)
+    except OverflowError:
+        csv.field_size_limit(2**31 - 1)
+
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if header is None:
+            return None
+        column_names = tuple(str(name) for name in header)
+        spatial_columns = _detect_spatial_columns(list(column_names))
+        geometry_format: str | None = None
+        if "geom" in spatial_columns:
+            geom_idx = spatial_columns["geom"]
+            for row in reader:
+                if geom_idx >= len(row):
+                    continue
+                value = row[geom_idx].strip()
+                if not value:
+                    continue
+                geometry_format = _csv_detect_geometry_value_format(value)
+                break
+            if geometry_format is None:
+                geometry_format = "wkt"
+        return _CsvSpatialLayout(
+            column_names=column_names,
+            spatial_columns=spatial_columns,
+            geometry_format=geometry_format,
+        )
 
 
 def _write_vector_file_native_pyogrio(
@@ -621,7 +685,11 @@ def plan_vector_file_io(
     elif normalized_driver == "CSV":
         io_format = IOFormat.CSV
         implementation = "csv_gpu_hybrid_adapter"
-        reason = "CSV uses GPU byte-classification for structural analysis and coordinate extraction with host fallback."
+        reason = (
+            "CSV uses libcudf table parse for large geometry-column files and "
+            "GPU byte-classification for the remaining spatial layouts, with "
+            "explicit host fallback when neither path applies."
+        )
     elif normalized_driver == "KML":
         io_format = IOFormat.KML
         implementation = "kml_gpu_hybrid_adapter"
@@ -853,23 +921,15 @@ def _try_wkt_gpu_read_native(filename, *, target_crs: str | None = None):
 
 
 def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
-    """Try to read a CSV file using the GPU byte-classification pipeline.
-
-    Performs GPU structural analysis to find lat/lon or WKT geometry
-    columns, then extracts spatial data and assembles a GeoDataFrame.
-    Returns None on failure to fall through to CPU.
-    """
+    """Try to read a CSV file using the best available GPU path."""
     try:
-        payload = _try_csv_gpu_read_native(filename, target_crs=target_crs)
-        gdf = _materialize_native_file_read_result(payload)
+        selection = _select_csv_gpu_read_native(filename, target_crs=target_crs)
+        gdf = _materialize_native_file_read_result(selection.payload)
         record_dispatch_event(
             surface="geopandas.read_file",
             operation="read_file",
-            implementation="csv_gpu_byte_classify_adapter",
-            reason=(
-                "GPU byte-classification: GPU structural analysis and "
-                "coordinate extraction for CSV spatial data."
-            ),
+            implementation=selection.implementation,
+            reason=selection.reason,
             selected=ExecutionMode.GPU,
         )
         return gdf
@@ -877,7 +937,7 @@ def _try_csv_gpu_read(filename, *, target_crs: str | None = None) -> object | No
         return None
 
 
-def _try_csv_gpu_read_native(filename, *, target_crs: str | None = None):
+def _try_csv_byte_classify_read_native(filename, *, target_crs: str | None = None):
     from .csv_gpu import read_csv_gpu
     from .kvikio_reader import read_file_to_device
 
@@ -894,6 +954,102 @@ def _try_csv_gpu_read_native(filename, *, target_crs: str | None = None):
         attributes=csv_result.attributes,
         row_count=csv_result.n_rows,
     )
+
+
+def _try_csv_pylibcudf_read_native(filename, *, target_crs: str | None = None):
+    import cupy as cp
+    import pyarrow as pa
+    import pylibcudf as plc
+    from pylibcudf.scalar import Scalar
+
+    from .csv_gpu import _decode_hex_string_column_to_owned
+    from .wkt_gpu import read_wkt_gpu
+
+    file_path = Path(filename)
+    layout = _sniff_csv_spatial_layout(file_path)
+    if layout is None or "geom" not in layout.spatial_columns:
+        return None
+
+    geom_idx = layout.spatial_columns["geom"]
+    if layout.geometry_format not in {"wkt", "wkb"}:
+        return None
+
+    options = plc.io.csv.CsvReaderOptions.builder(
+        plc.io.types.SourceInfo([str(file_path)])
+    ).build()
+    options.set_header(0)
+    csv_table = plc.io.csv.read_csv(options)
+    column_names = csv_table.column_names()
+    if geom_idx >= len(column_names):
+        return None
+
+    geom_column = csv_table.columns[geom_idx]
+    if geom_column.null_count() != 0:
+        return None
+
+    if layout.geometry_format == "wkt":
+        newline = Scalar.from_arrow(pa.scalar("\n"))
+        empty = Scalar.from_arrow(pa.scalar(""))
+        joined = plc.strings.combine.join_strings(geom_column, newline, empty)
+        offsets = cp.asarray(joined.child(0).data()).view(cp.int32)
+        total_bytes = int(offsets[1]) if int(joined.size()) else 0
+        payload = cp.asarray(joined.data()).view(cp.uint8)[:total_bytes]
+        owned = read_wkt_gpu(payload)
+    else:
+        owned = _decode_hex_string_column_to_owned(geom_column)
+
+    attribute_names = [
+        name for idx, name in enumerate(column_names) if idx != geom_idx
+    ]
+    attributes = None
+    if attribute_names:
+        attributes = csv_table.tbl.to_arrow(metadata=column_names).select(attribute_names)
+
+    crs = target_crs if target_crs is not None else None
+    return _native_file_result_from_owned(
+        owned,
+        crs=crs,
+        attributes=attributes,
+        row_count=int(csv_table.tbl.num_rows()),
+    )
+
+
+def _select_csv_gpu_read_native(
+    filename,
+    *,
+    target_crs: str | None = None,
+) -> _CsvGpuSelection:
+    file_path = Path(filename)
+    file_size = file_path.stat().st_size
+
+    if file_size > _GPU_MIN_FILE_SIZE:
+        payload = _try_csv_pylibcudf_read_native(filename, target_crs=target_crs)
+        if payload is not None:
+            return _CsvGpuSelection(
+                payload=payload,
+                implementation="csv_pylibcudf_table_adapter",
+                reason=(
+                    "GPU CSV table parse via pylibcudf/libcudf for large geometry-column "
+                    "CSV, followed by native GPU WKT/WKB geometry decode."
+                ),
+            )
+
+    payload = _try_csv_byte_classify_read_native(filename, target_crs=target_crs)
+    return _CsvGpuSelection(
+        payload=payload,
+        implementation="csv_gpu_byte_classify_adapter",
+        reason=(
+            "GPU byte-classification: GPU structural analysis and coordinate "
+            "extraction for CSV spatial data."
+        ),
+    )
+
+
+def _try_csv_gpu_read_native(filename, *, target_crs: str | None = None):
+    return _select_csv_gpu_read_native(
+        filename,
+        target_crs=target_crs,
+    ).payload
 
 
 def _try_shapefile_shp_direct_gpu_read(
@@ -1377,19 +1533,16 @@ def _try_gpu_read_file_native(
             return payload
 
         if plan.format is IOFormat.CSV and file_size > _GPU_MIN_FILE_SIZE:
-            payload = _try_csv_gpu_read_native(filename, target_crs=target_crs)
-            if payload is not None:
+            selection = _select_csv_gpu_read_native(filename, target_crs=target_crs)
+            if selection.payload is not None:
                 record_dispatch_event(
                     surface="geopandas.read_file",
                     operation="read_file",
-                    implementation="csv_gpu_byte_classify_adapter",
-                    reason=(
-                        "GPU byte-classification: GPU structural analysis and "
-                        "coordinate extraction for CSV spatial data."
-                    ),
+                    implementation=selection.implementation,
+                    reason=selection.reason,
                     selected=ExecutionMode.GPU,
                 )
-                return payload
+                return selection.payload
 
         if plan.format is IOFormat.KML and file_size > _GPU_MIN_FILE_SIZE:
             payload = _try_kml_gpu_read_native(filename, target_crs=target_crs)

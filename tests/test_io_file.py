@@ -152,6 +152,37 @@ def test_large_flatgeobuf_read_prefers_pyogrio_arrow_gpu_wkb(
 
 
 @pytest.mark.gpu
+def test_large_csv_wkt_read_prefers_pylibcudf_table_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.csv"
+    path.write_text(
+        'id,name,geometry\n'
+        '1,a,"POINT (0 0)"\n'
+        '2,b,"POINT (1 1)"\n'
+    )
+
+    monkeypatch.setattr("vibespatial.io.file._GPU_MIN_FILE_SIZE", 0)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("byte-classify CSV path should not be used for large WKT CSV")
+
+    monkeypatch.setattr("vibespatial.io.file._try_csv_byte_classify_read_native", _boom)
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert result["name"].tolist() == ["a", "b"]
+    assert result.geometry.iloc[0].equals(Point(0, 0))
+    assert result.geometry.iloc[1].equals(Point(1, 1))
+    assert events
+    assert events[-1].implementation == "csv_pylibcudf_table_adapter"
+
+
+@pytest.mark.gpu
 def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()

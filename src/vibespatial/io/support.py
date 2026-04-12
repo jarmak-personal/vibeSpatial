@@ -96,7 +96,7 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         read_path=IOPathKind.HYBRID,
         write_path=IOPathKind.FALLBACK,
         canonical_gpu=False,
-        reason="CSV read uses GPU byte-classification for structural analysis and coordinate extraction; write stays fallback (no GPU CSV serializer).",
+        reason="CSV read uses libcudf table parse for large geometry-column files and GPU byte-classification for the remaining spatial layouts; write stays fallback (no GPU CSV serializer).",
     ),
     IOFormat.GEOJSON: IOSupportEntry(
         format=IOFormat.GEOJSON,
