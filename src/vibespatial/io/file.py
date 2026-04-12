@@ -353,7 +353,12 @@ def _pyogrio_arrow_wkb_to_native_tabular_result(
     geom_idx, _geom_field = _select_arrow_geometry_column(table, metadata)
     geom_column = table.column(geom_idx).combine_chunks()
     owned = decode_wkb_arrow_array_owned(geom_column)
-    geometry_name = metadata.get("geometry_name") or "geometry"
+    geometry_name = str(metadata.get("geometry_name") or "geometry")
+    # Match GeoPandas read_file semantics for container-backed file reads:
+    # expose the active geometry column as "geometry" even when the on-disk
+    # container uses an internal name like "geom".
+    if geometry_name != "geometry" and "geometry" not in table.column_names:
+        geometry_name = "geometry"
 
     source_crs = metadata.get("crs")
     effective_crs = _resolve_target_crs_for_owned(
@@ -635,8 +640,13 @@ def plan_vector_file_io(
         reason = "File Geodatabase uses pyogrio Arrow container parse with GPU WKB geometry decode."
     elif normalized_driver == "FlatGeobuf":
         io_format = IOFormat.FLATGEOBUF
-        implementation = "flatgeobuf_gpu_direct_decode"
-        reason = "FlatGeobuf uses direct GPU binary decode via NVRTC FlatBuffer navigation, bypassing pyogrio/WKB roundtrip. Falls back to pyogrio Arrow + GPU WKB for filtered reads or small files."
+        implementation = "flatgeobuf_pyogrio_arrow_gpu_wkb"
+        reason = (
+            "FlatGeobuf defaults to pyogrio Arrow container parse with GPU WKB "
+            "geometry decode. The direct GPU FlatBuffer decoder remains "
+            "available for targeted experimentation, but the Arrow path is the "
+            "faster default on real datasets."
+        )
     elif normalized_driver == "GML":
         io_format = IOFormat.GML
         implementation = "gml_pyogrio_arrow_gpu_wkb"
@@ -1448,21 +1458,6 @@ def _try_gpu_read_file_native(
                 selected=ExecutionMode.GPU,
             )
             return payload
-
-        if plan.format is IOFormat.FLATGEOBUF and file_size > _GPU_MIN_FILE_SIZE:
-            payload = _try_fgb_gpu_read_native(filename, target_crs=target_crs)
-            if payload is not None:
-                record_dispatch_event(
-                    surface="geopandas.read_file",
-                    operation="read_file",
-                    implementation="flatgeobuf_gpu_direct_decode_adapter",
-                    reason=(
-                        "GPU direct FGB decode: binary FlatBuffer navigation on GPU via "
-                        "NVRTC kernels, bypassing pyogrio/WKB roundtrip."
-                    ),
-                    selected=ExecutionMode.GPU,
-                )
-                return payload
 
     skip_features, max_features = _normalize_feature_window(rows)
     arrow_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}

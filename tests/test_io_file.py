@@ -125,6 +125,33 @@ def test_large_public_geojson_read_uses_default_feature_boundary_capture(
 
 
 @pytest.mark.gpu
+def test_large_flatgeobuf_read_prefers_pyogrio_arrow_gpu_wkb(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.fgb"
+    frame = _sample_frame()
+    frame.to_file(path, driver="FlatGeobuf")
+
+    monkeypatch.setattr("vibespatial.io.file._GPU_MIN_FILE_SIZE", 0)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("direct FlatGeobuf decoder should not be used by default")
+
+    monkeypatch.setattr("vibespatial.io.file._try_fgb_gpu_read_native", _boom)
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert len(result) == len(frame)
+    assert set(result["id"]) == set(frame["id"])
+    assert tuple(result.total_bounds) == tuple(frame.total_bounds)
+    assert events
+    assert events[-1].implementation == "flatgeobuf_pyogrio_arrow_gpu_wkb"
+
+
+@pytest.mark.gpu
 def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
@@ -541,6 +568,33 @@ def test_pyogrio_arrow_wkb_native_result_normalizes_empty_geometry_name(
     payload = _pyogrio_arrow_wkb_to_native_tabular_result(
         table,
         {"geometry_name": "", "crs": "EPSG:4326"},
+    )
+
+    assert payload.geometry_name == "geometry"
+
+
+def test_pyogrio_arrow_wkb_native_result_normalizes_nonstandard_geometry_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    field = pa.field(
+        "geom",
+        pa.binary(),
+        metadata={b"ARROW:extension:name": b"geoarrow.wkb"},
+    )
+    table = pa.Table.from_arrays(
+        [pa.array([Point(0, 0).wkb], type=pa.binary())],
+        schema=pa.schema([field]),
+    )
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    payload = _pyogrio_arrow_wkb_to_native_tabular_result(
+        table,
+        {"geometry_name": "geom", "crs": "EPSG:4326"},
     )
 
     assert payload.geometry_name == "geometry"

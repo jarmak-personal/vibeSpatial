@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 266/280 lines
+Body Budget: 271/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-54 | Decision |
 | 55-64 | Performance Notes |
-| 65-176 | Current Behavior |
-| 177-266 | Measured Local Baseline |
+| 65-181 | Current Behavior |
+| 182-271 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -113,10 +113,15 @@ keeping GPU-native formats primary and legacy formats explicit.
   boundary before the terminal `GeoDataFrame` materialization point instead of
   each branch rebuilding a public frame independently. That now includes:
   - the pyogrio Arrow + GPU WKB compatibility path
-  - direct WKT, CSV, KML, and FlatGeobuf GPU readers
+  - direct WKT, CSV, and KML GPU readers
   - the direct SHP binary + DBF and pyogrio geometry + GPU DBF Shapefile paths
   - the GeoJSON byte-classify path after property extraction
   - the OSM PBF hybrid path after protobuf/tag extraction
+- FlatGeobuf now defaults to the pyogrio Arrow + GPU WKB path on public
+  `read_file(...)` / `read_vector_file_native(...)`. The repo still has a
+  direct GPU FlatBuffer decoder in `fgb_gpu.py`, but the Florida real-dataset
+  shootout shows the Arrow path is materially faster today than the direct
+  decoder, so the direct route is not the default execution shape.
 - Direct format-native helpers now exist for the promoted compatibility readers
   that already have a credible shared boundary:
   - `read_geojson_native(...)`
