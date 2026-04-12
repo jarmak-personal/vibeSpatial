@@ -1210,6 +1210,7 @@ class WKBPartitionPlan:
     fallback_rows: int
     family_counts: dict[str, int]
     fallback_indexes: tuple[int, ...]
+    fallback_reason_counts: dict[str, int]
     reason: str
 
 
@@ -1351,49 +1352,108 @@ def _scan_wkb_value(value: bytes) -> tuple[GeometryFamily | None, str | None]:
     if len(value) < 5:
         return None, "buffer shorter than WKB header"
     byteorder = value[0]
+    if byteorder not in {0, 1}:
+        return None, f"unsupported WKB byte-order flag {byteorder}"
+    byteorder_name = "little" if byteorder == 1 else "big"
+    type_id = int.from_bytes(value[1:5], byteorder_name)
+    ewkb_z = bool(type_id & 0x80000000)
+    ewkb_m = bool(type_id & 0x40000000)
+    ewkb_srid = bool(type_id & 0x20000000)
+    ewkb_base_type = type_id & 0x1FFFFFFF
+    iso_dimension_variant = type_id // 1000 if 1000 <= type_id < 4000 else 0
+    iso_base_type = type_id % 1000 if iso_dimension_variant else type_id
+    if ewkb_z or ewkb_m or iso_dimension_variant:
+        return None, "Z/M/ZM WKB rows fall outside the 2D owned native result model"
+    candidate_type_id = ewkb_base_type if ewkb_srid else iso_base_type
+    if candidate_type_id == 7:
+        return None, "GeometryCollection rows fall outside the 2D owned native result model"
+    if ewkb_srid and candidate_type_id in WKB_ID_FAMILIES:
+        return None, "EWKB SRID-annotated 2D input routes through the explicit compatibility bridge"
     if byteorder != 1:
-        return None, "native WKB fast path currently supports only little-endian input"
-    type_id = int.from_bytes(value[1:5], "little")
-    family = WKB_ID_FAMILIES.get(type_id)
+        return None, "big-endian 2D WKB input routes through the explicit compatibility bridge"
+    family = WKB_ID_FAMILIES.get(candidate_type_id)
     if family is None:
         return None, f"unsupported WKB geometry type id {type_id}"
     return family, None
 
 
-def plan_wkb_partition(
-    values: list[bytes | str | None] | tuple[bytes | str | None, ...],
-) -> WKBPartitionPlan:
+def _scan_wkb_partition_normalized(
+    values: list[bytes | None] | tuple[bytes | None, ...],
+) -> tuple[tuple[tuple[GeometryFamily | None, str | None], ...], WKBPartitionPlan]:
     family_counts = {family.value: 0 for family in GeometryFamily}
     fallback_indexes: list[int] = []
+    fallback_reason_counts: dict[str, int] = {}
+    scan_results: list[tuple[GeometryFamily | None, str | None]] = []
     null_rows = 0
     valid_rows = 0
     native_rows = 0
     for index, value in enumerate(values):
-        normalized = _normalize_wkb_value(value)
-        if normalized is None:
+        if value is None:
             null_rows += 1
+            scan_results.append((None, None))
             continue
         valid_rows += 1
-        family, reason = _scan_wkb_value(normalized)
-        if reason is not None:
+        family, reason = _scan_wkb_value(value)
+        scan_results.append((family, reason))
+        if reason is not None or family is None:
             fallback_indexes.append(index)
+            fallback_reason_counts[reason or "unknown WKB fallback reason"] = (
+                fallback_reason_counts.get(reason or "unknown WKB fallback reason", 0) + 1
+            )
             continue
-        assert family is not None
         family_counts[family.value] += 1
         native_rows += 1
-    return WKBPartitionPlan(
-        total_rows=len(values),
-        valid_rows=valid_rows,
-        null_rows=null_rows,
-        native_rows=native_rows,
-        fallback_rows=len(fallback_indexes),
-        family_counts=family_counts,
-        fallback_indexes=tuple(fallback_indexes),
-        reason=(
-            "Use one WKB header scan to separate native little-endian 2D families from the "
-            "explicit fallback pool before decode or encode work begins."
+    return (
+        tuple(scan_results),
+        WKBPartitionPlan(
+            total_rows=len(values),
+            valid_rows=valid_rows,
+            null_rows=null_rows,
+            native_rows=native_rows,
+            fallback_rows=len(fallback_indexes),
+            family_counts=family_counts,
+            fallback_indexes=tuple(fallback_indexes),
+            fallback_reason_counts=fallback_reason_counts,
+            reason=(
+                "Use one WKB header scan to separate native little-endian 2D families from the "
+                "explicit fallback pool before decode or encode work begins."
+            ),
         ),
     )
+
+
+def plan_wkb_partition(
+    values: list[bytes | str | None] | tuple[bytes | str | None, ...],
+) -> WKBPartitionPlan:
+    normalized_values = tuple(_normalize_wkb_value(value) for value in values)
+    _scan_results, partition_plan = _scan_wkb_partition_normalized(normalized_values)
+    return partition_plan
+
+
+def _format_wkb_fallback_reason_counts(partition_plan: WKBPartitionPlan) -> str:
+    if not partition_plan.fallback_reason_counts:
+        return ""
+    ordered_reasons = sorted(
+        partition_plan.fallback_reason_counts.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return "; ".join(f"{count}x {reason}" for reason, count in ordered_reasons)
+
+
+def _geometry_family_from_shapely_type(geom_type: str) -> GeometryFamily:
+    family = {
+        "Point": GeometryFamily.POINT,
+        "LineString": GeometryFamily.LINESTRING,
+        "Polygon": GeometryFamily.POLYGON,
+        "MultiPoint": GeometryFamily.MULTIPOINT,
+        "MultiLineString": GeometryFamily.MULTILINESTRING,
+        "MultiPolygon": GeometryFamily.MULTIPOLYGON,
+    }.get(geom_type)
+    if family is None:
+        raise NotImplementedError(
+            f"{geom_type} rows fall outside the 2D owned native result model"
+        )
+    return family
 
 
 def _append_point_row(state: dict[str, Any], x: float, y: float, *, empty: bool) -> int:
@@ -1633,7 +1693,7 @@ def _decode_native_wkb(
     on_invalid: str = "raise",
 ) -> tuple[OwnedGeometryArray, WKBPartitionPlan]:
     normalized_values = [_normalize_wkb_value(value) for value in values]
-    partition_plan = plan_wkb_partition(normalized_values)
+    scan_results, partition_plan = _scan_wkb_partition_normalized(normalized_values)
     validity = np.asarray([value is not None for value in normalized_values], dtype=bool)
     tags = np.full(len(normalized_values), -1, dtype=np.int8)
     family_row_offsets = np.full(len(normalized_values), -1, dtype=np.int32)
@@ -1646,7 +1706,7 @@ def _decode_native_wkb(
     for row_index, value in enumerate(normalized_values):
         if value is None:
             continue
-        family, scan_reason = _scan_wkb_value(value)
+        family, scan_reason = scan_results[row_index]
         if scan_reason is not None or family is None:
             fallback_rows.append(row_index)
             fallback_values.append(value)
@@ -1688,14 +1748,7 @@ def _decode_native_wkb(
             if geometry is None:
                 validity[row_index] = False
                 continue
-            family = {
-                "Point": GeometryFamily.POINT,
-                "LineString": GeometryFamily.LINESTRING,
-                "Polygon": GeometryFamily.POLYGON,
-                "MultiPoint": GeometryFamily.MULTIPOINT,
-                "MultiLineString": GeometryFamily.MULTILINESTRING,
-                "MultiPolygon": GeometryFamily.MULTIPOLYGON,
-            }[geometry.geom_type]
+            family = _geometry_family_from_shapely_type(geometry.geom_type)
             local_row = _append_shapely_geometry_state(family, geometry, states[family])
             tags[row_index] = FAMILY_TAGS[family]
             family_row_offsets[row_index] = local_row
@@ -2448,6 +2501,7 @@ def _encode_native_wkb(
         fallback_rows=0,
         family_counts={family.value: int((array.tags == FAMILY_TAGS[family]).sum()) for family in GeometryFamily},
         fallback_indexes=tuple(),
+        fallback_reason_counts={},
         reason="Owned buffers already provide family tags and offsets, so encode can go straight to family-local WKB assembly.",
     )
     outputs: list[bytes | None] = [None] * array.row_count
@@ -2523,10 +2577,16 @@ def decode_wkb_owned(
     )
     array, partition_plan = _decode_native_wkb(values, on_invalid=on_invalid)
     if partition_plan.fallback_rows:
+        fallback_detail = (
+            f"{partition_plan.fallback_rows} rows entered the fallback pool during staged decode"
+        )
+        fallback_reasons = _format_wkb_fallback_reason_counts(partition_plan)
+        if fallback_reasons:
+            fallback_detail = f"{fallback_detail} ({fallback_reasons})"
         record_fallback_event(
             surface="vibespatial.io.wkb",
             reason="explicit CPU fallback for unsupported or malformed WKB rows",
-            detail=f"{partition_plan.fallback_rows} rows entered the fallback pool during staged decode",
+            detail=fallback_detail,
             selected=ExecutionMode.CPU,
             pipeline="io/wkb_decode",
         )

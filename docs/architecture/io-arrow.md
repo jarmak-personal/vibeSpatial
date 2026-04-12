@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 222/260 lines
+Body Budget: 232/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-184 | Current Behavior |
-| 185-222 | Measured Local Baseline |
+| 76-194 | Current Behavior |
+| 195-232 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -191,19 +191,29 @@ geometry buffers while keeping GPU-native formats as the design center.
   lightweight `pylibcudf` helpers, while heavier or broader family mixes route
   through the staged GPU WKB decode pipeline after the same header scan.
 - Non-canonical WKB is still explicit compatibility work:
-  big-endian records, Z/M/ZM or other non-2D type ids, and families outside the
-  owned native result model still fall back instead of silently hiding a host
-  decode.
+  big-endian 2D records, EWKB SRID-annotated 2D rows, Z/M/ZM or other non-2D
+  type ids, and families outside the owned native result model now classify
+  into explicit compatibility buckets instead of silently hiding a host decode.
 - Repo-owned native GeoArrow codecs now provide family-specialized encode and
   decode for homogeneous geometry columns:
   - point, linestring, polygon, multilinestring, and multipolygon extension
     arrays decode through dedicated family builders
-  - homogeneous exports encode directly from owned buffers to native GeoArrow
-    arrays instead of routing through the generic host bridge
-  - mixed-family exports stay on explicit WKB fallback until partition-and-restore
-    mixed codecs land
+  - device-backed homogeneous exports now rebuild public Arrow arrays directly
+    from the repo-owned device codec instead of routing through the generic host
+    bridge first
+  - unsupported device-backed geometry mixes now drop to the repo-owned WKB
+    compatibility bridge instead of forcing a host `construct_wkb_array(...)`
+    materialization step
+  - mixed-family GeoArrow export still ends in WKB for truly unsupported mixes
+    until partition-and-restore mixed codecs land
   - successful homogeneous native export no longer records a fallback event on
     the public GeoPandas Arrow surface
+- The verified `pylibcudf` transport matrix is now checked in explicitly:
+  local paths, `bytes`, `BytesIO`, `DeviceBuffer`, multi-source scans,
+  row-group selection, filters, and `ChunkedParquetReader` are confirmed in
+  [`pylibcudf-capabilities.md`](/home/picard/repos/vibeSpatial/docs/architecture/pylibcudf-capabilities.md).
+- Local partitioned-directory GeoParquet reads and normalized `file://` public
+  reads are now explicitly verified to stay on the `pylibcudf` scan backend.
 
 ## Measured Local Baseline
 

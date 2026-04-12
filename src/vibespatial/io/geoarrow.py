@@ -29,6 +29,7 @@ from vibespatial.runtime.residency import Residency, TransferTrigger
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb import (
     _encode_native_wkb,
+    _encode_owned_geoarrow_column_device,
     _encode_owned_wkb_array,
     decode_wkb_arrow_array_owned,
     decode_wkb_owned,
@@ -804,6 +805,18 @@ def _construct_geoarrow_array_with_explicit_fallback(
     )
     if fast_path_reason is None:
         try:
+            if owned is not None:
+                family, requires_promotion = _geoarrow_export_family_from_family_set(
+                    _owned_geoarrow_family_set(owned)
+                )
+                if not requires_promotion:
+                    return _encode_owned_geoarrow_array_device(
+                        owned,
+                        family=family,
+                        field_name=field_name,
+                        crs=series.crs,
+                        interleaved=interleaved,
+                    )
             return encode_owned_geoarrow_array(
                 owned if owned is not None else series.array.to_owned(),
                 field_name=field_name,
@@ -819,6 +832,22 @@ def _construct_geoarrow_array_with_explicit_fallback(
     if constructor_fallback_reason is not None:
         if not fallback_to_wkb_on_error:
             raise ValueError(constructor_fallback_reason)
+        if owned is not None:
+            record_dispatch_event(
+                surface=surface,
+                operation="to_arrow",
+                implementation="native_wkb_compatibility_bridge",
+                reason=(
+                    "unsupported GeoArrow geometry mix exported through the repo-owned "
+                    "WKB compatibility bridge instead of the host constructor"
+                ),
+                selected=ExecutionMode.GPU,
+            )
+            return _encode_owned_wkb_array(
+                owned,
+                field_name=field_name,
+                crs=series.crs,
+            )
         record_fallback_event(
             surface=surface,
             reason="explicit CPU fallback to WKB until native GeoArrow encoder covers this geometry mix",
@@ -850,6 +879,166 @@ def _construct_geoarrow_array_with_explicit_fallback(
         crs=series.crs,
         interleaved=interleaved,
     )
+
+
+def _geoarrow_point_type(*, interleaved: bool):
+    import pyarrow as pa
+
+    if interleaved:
+        return pa.list_(pa.field("xy", pa.float64(), nullable=False), 2)
+    return pa.struct(
+        [
+            pa.field("x", pa.float64(), nullable=False),
+            pa.field("y", pa.float64(), nullable=False),
+        ]
+    )
+
+
+def _geoarrow_target_type(
+    family: GeometryFamily,
+    *,
+    interleaved: bool,
+):
+    from vibespatial.api.io._geoarrow import (
+        _linestring_type,
+        _multilinestring_type,
+        _multipoint_type,
+        _multipolygon_type,
+        _polygon_type,
+    )
+
+    point_type = _geoarrow_point_type(interleaved=interleaved)
+    if family is GeometryFamily.POINT:
+        return point_type
+    if family is GeometryFamily.LINESTRING:
+        return _linestring_type(point_type)
+    if family is GeometryFamily.POLYGON:
+        return _polygon_type(point_type)
+    if family is GeometryFamily.MULTIPOINT:
+        return _multipoint_type(point_type)
+    if family is GeometryFamily.MULTILINESTRING:
+        return _multilinestring_type(point_type)
+    if family is GeometryFamily.MULTIPOLYGON:
+        return _multipolygon_type(point_type)
+    raise ValueError(f"Unsupported geometry family for device GeoArrow encode: {family}")
+
+
+def _rebuild_arrow_array_with_type(
+    source_array,
+    target_type,
+    *,
+    interleaved_point_child=None,
+):
+    import pyarrow as pa
+
+    if pa.types.is_fixed_size_list(target_type):
+        if interleaved_point_child is None:
+            raise ValueError("interleaved GeoArrow export requires a prepared point child array")
+        return pa.Array.from_buffers(
+            target_type,
+            len(source_array),
+            source_array.buffers()[: target_type.num_buffers],
+            null_count=source_array.null_count,
+            offset=source_array.offset,
+            children=[interleaved_point_child],
+        )
+    if source_array.type == target_type:
+        return source_array
+
+    children = None
+    if pa.types.is_struct(target_type):
+        children = [
+            _rebuild_arrow_array_with_type(
+                source_array.field(index),
+                target_type[index].type,
+                interleaved_point_child=interleaved_point_child,
+            )
+            for index in range(target_type.num_fields)
+        ]
+    elif pa.types.is_list(target_type) or pa.types.is_large_list(target_type):
+        children = [
+            _rebuild_arrow_array_with_type(
+                source_array.values,
+                target_type.value_type,
+                interleaved_point_child=interleaved_point_child,
+            )
+        ]
+    return pa.Array.from_buffers(
+        target_type,
+        len(source_array),
+        source_array.buffers()[: target_type.num_buffers],
+        null_count=source_array.null_count,
+        offset=source_array.offset,
+        children=children,
+    )
+
+
+def _device_interleaved_point_child(plc_column, *, family: GeometryFamily):
+    import pyarrow as pa
+    import pylibcudf as plc
+
+    if family is GeometryFamily.POINT:
+        x_column = plc_column.child(0)
+        y_column = plc_column.child(1)
+    else:
+        raise RuntimeError("device interleaved GeoArrow child must be built from owned buffers")
+
+    values = plc.reshape.interleave_columns(plc.Table([x_column, y_column])).to_arrow()
+    return pa.Array.from_buffers(
+        pa.float64(),
+        len(values),
+        values.buffers(),
+        null_count=values.null_count,
+        offset=values.offset,
+    )
+
+
+def _encode_owned_geoarrow_array_device(
+    owned: OwnedGeometryArray,
+    *,
+    family: GeometryFamily,
+    field_name: str,
+    crs: Any | None,
+    interleaved: bool,
+):
+    import pyarrow as pa
+    import pylibcudf as plc
+
+    plc_column, encoding_name = _encode_owned_geoarrow_column_device(owned)
+    source_array = plc_column.to_arrow()
+    target_type = _geoarrow_target_type(family, interleaved=interleaved)
+    interleaved_point_child = None
+    if interleaved:
+        if family is GeometryFamily.POINT:
+            interleaved_point_child = _device_interleaved_point_child(plc_column, family=family)
+        else:
+            state = owned._ensure_device_state()
+            device_buffer = state.families[family]
+            x_column = plc.Column.from_cuda_array_interface(device_buffer.x)
+            y_column = plc.Column.from_cuda_array_interface(device_buffer.y)
+            values = plc.reshape.interleave_columns(plc.Table([x_column, y_column])).to_arrow()
+            interleaved_point_child = pa.Array.from_buffers(
+                pa.float64(),
+                len(values),
+                values.buffers(),
+                null_count=values.null_count,
+                offset=values.offset,
+            )
+    geom_arr = _rebuild_arrow_array_with_type(
+        source_array,
+        target_type,
+        interleaved_point_child=interleaved_point_child,
+    )
+    field = pa.field(
+        field_name,
+        geom_arr.type,
+        nullable=True,
+        metadata=_geoarrow_field_metadata(
+            extension_name=f"geoarrow.{encoding_name}",
+            crs=crs,
+        ),
+    )
+    return field, geom_arr
 
 def _arrow_validity_mask(array) -> np.ndarray:
     if array.null_count == 0:

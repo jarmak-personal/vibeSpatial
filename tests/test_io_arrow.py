@@ -203,6 +203,29 @@ def test_wkb_partition_reports_fallback_pool_for_big_endian_rows() -> None:
     assert plan.native_rows == 1
     assert plan.fallback_rows == 1
     assert plan.fallback_indexes == (1,)
+    assert plan.fallback_reason_counts == {
+        "big-endian 2D WKB input routes through the explicit compatibility bridge": 1
+    }
+
+
+def test_wkb_partition_classifies_noncanonical_and_out_of_model_rows() -> None:
+    srid_point = bytes.fromhex(
+        "0101000020e6100000000000000000f03f0000000000000040"
+    )
+    point_z = bytes.fromhex(
+        "01e9030000000000000000f03f00000000000000400000000000000840"
+    )
+    geometrycollection = bytes.fromhex("010700000000000000")
+
+    plan = plan_wkb_partition([srid_point, point_z, geometrycollection])
+
+    assert plan.native_rows == 0
+    assert plan.fallback_rows == 3
+    assert plan.fallback_reason_counts == {
+        "EWKB SRID-annotated 2D input routes through the explicit compatibility bridge": 1,
+        "GeometryCollection rows fall outside the 2D owned native result model": 1,
+        "Z/M/ZM WKB rows fall outside the 2D owned native result model": 1,
+    }
 
 
 def test_wkb_bridge_falls_back_explicitly_for_big_endian_point() -> None:
@@ -215,6 +238,13 @@ def test_wkb_bridge_falls_back_explicitly_for_big_endian_point() -> None:
     assert decoded.to_shapely()[0].equals(Point(1, 2))
     assert len(fallbacks) == 1
     assert "fallback pool" in fallbacks[0].detail
+
+
+def test_decode_wkb_owned_raises_explicitly_for_geometrycollection_rows() -> None:
+    values = [bytes.fromhex("010700000000000000")]
+
+    with pytest.raises(NotImplementedError, match="GeometryCollection"):
+        decode_wkb_owned(values)
 
 
 def test_wkb_bridge_roundtrips_polygon_fast_path_without_fallback() -> None:
@@ -1581,6 +1611,37 @@ def test_geoseries_to_arrow_mixed_family_records_explicit_fallback() -> None:
     assert any("geometry mix" in event.reason or "geometry mix" in event.detail for event in fallbacks)
 
 
+def test_geoseries_to_arrow_device_mixed_family_uses_native_wkb_bridge_without_host_materialization(
+    monkeypatch,
+) -> None:
+    geopandas.clear_fallback_events()
+    gdf, owned = _make_device_dga_gdf(
+        [Point(0, 0), Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])]
+    )
+    owned.diagnostics.clear()
+
+    original_asarray = io_geoarrow.np.asarray
+
+    def _spy_asarray(value, *args, **kwargs):
+        if isinstance(value, DeviceGeometryArray):
+            raise AssertionError(
+                "device-backed unsupported GeoArrow mixes should not materialize through numpy"
+            )
+        return original_asarray(value, *args, **kwargs)
+
+    monkeypatch.setattr(io_geoarrow.np, "asarray", _spy_asarray)
+
+    arrow_array = io_arrow.geoseries_to_arrow(gdf.geometry, geometry_encoding="geoarrow")
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    schema_capsule, _ = arrow_array.__arrow_c_array__()
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+    mat_events = [event for event in owned.diagnostics if event.kind == DiagnosticKind.MATERIALIZATION]
+
+    assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.wkb"
+    assert fallbacks == []
+    assert mat_events == []
+
+
 @pytest.mark.parametrize(
     ("values", "extension_name"),
     [
@@ -2251,6 +2312,62 @@ def test_read_parquet_partitioned_directory_recovers_fragment_geo_metadata(tmp_p
     assert result.crs == gdf.crs
     for left, right in zip(gdf.geometry, result.geometry, strict=True):
         assert left.equals(right)
+
+
+@pytest.mark.skipif(
+    not (has_gpu_runtime() and has_pylibcudf_support()),
+    reason="GPU GeoParquet scan backend unavailable",
+)
+def test_read_parquet_partitioned_directory_uses_gpu_scan_backend(tmp_path) -> None:
+    geopandas.clear_dispatch_events()
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2, 3, 4],
+            "geometry": [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)],
+        },
+        crs="EPSG:4326",
+    )
+    basedir = tmp_path / "partitioned_gpu_dataset"
+    basedir.mkdir()
+
+    gdf.iloc[:2].to_parquet(basedir / "part1.parquet")
+    gdf.iloc[2:].to_parquet(basedir / "part2.parquet")
+    result = geopandas.read_parquet(basedir)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert list(result["value"]) == [1, 2, 3, 4]
+    assert any(
+        event.surface == "geopandas.read_parquet"
+        and "GPU GeoParquet scan backend" in event.reason
+        for event in events
+    )
+
+
+@pytest.mark.skipif(
+    not (has_gpu_runtime() and has_pylibcudf_support()),
+    reason="GPU GeoParquet scan backend unavailable",
+)
+def test_read_parquet_file_uri_uses_gpu_scan_backend(tmp_path) -> None:
+    geopandas.clear_dispatch_events()
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "gpu_file_uri.parquet"
+    gdf.to_parquet(path)
+
+    result = geopandas.read_parquet(path.as_uri())
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert list(result["value"]) == [1, 2]
+    assert any(
+        event.surface == "geopandas.read_parquet"
+        and "GPU GeoParquet scan backend" in event.reason
+        for event in events
+    )
 
 
 @pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")

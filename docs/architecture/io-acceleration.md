@@ -5,7 +5,7 @@ Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and fo
 Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
 STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
 Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-Body Budget: 146/260 lines
+Body Budget: 152/260 lines
 Document: docs/architecture/io-acceleration.md
 
 Section Map (Body Lines)
@@ -20,10 +20,10 @@ Section Map (Body Lines)
 | 37-43 | Risks |
 | 44-62 | Decision |
 | 63-76 | Execution Model |
-| 77-104 | Format Strategy |
-| 105-117 | CCCL Preference Order |
-| 118-136 | Performance Targets |
-| 137-146 | Non-Negotiable Constraints |
+| 77-107 | Format Strategy |
+| 108-120 | CCCL Preference Order |
+| 121-139 | Performance Targets |
+| 140-152 | Non-Negotiable Constraints |
 DOC_HEADER:END -->
 
 ## Purpose
@@ -114,6 +114,9 @@ The critical rule is that decode happens after pruning, not before it.
 - Treat WKB as a byte-stream compatibility bridge.
 - Use GPU header scans, size scans, and family partitions before decode.
 - Compact unsupported or ambiguous rows into an explicit fallback pool.
+- Classify big-endian 2D, EWKB SRID-annotated 2D, Z/M/ZM, and
+  `GeometryCollection` rows explicitly instead of letting those cases blur into
+  one generic fallback reason.
 
 ### GeoJSON
 
@@ -150,7 +153,7 @@ host baseline for the same format, whichever is faster.
 | Format / Path | Floor Target | Aspirational Target | Reference Scale |
 |---|---:|---:|---|
 | GeoArrow aligned import or export | `5x` faster | `10x` faster | `10M` points / `1M` polygons |
-| GeoParquet unfiltered native scan | `3x` faster | `5x` faster | `10M` points / `1M` polygons |
+| GeoParquet unfiltered native scan | `2x` faster | `5x` faster | `10M` points / `1M` polygons |
 | GeoParquet selective scan with bbox pushdown | decode `<= 15%` of rows at `< 10%` selectivity | decode `<= 5%` | row-group dataset with covering metadata |
 | GeoArrow native decode or encode | `4x` faster | `8x` faster | `10M` points / `1M` polygons |
 | WKB decode | `4x` faster | `8x` faster | `10M` points / `1M` polygons |
@@ -170,3 +173,6 @@ host baseline for the same format, whichever is faster.
   decoder.
 - Out-of-core and chunked execution must compose with `o17.2.9` and
   `o17.6.10`, not bypass them.
+- The current enforced local GeoParquet scan rail is `2x` on consumer GPUs.
+  Higher datacenter and HBM-class targets remain aspirational, but the local
+  floor should not assume 4090-class scan throughput matches those cards.
