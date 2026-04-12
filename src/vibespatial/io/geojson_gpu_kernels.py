@@ -298,6 +298,23 @@ extern "C" __global__ void scatter_ring_offsets(
 """
 
 _FEATURE_BOUNDARY_SOURCE = r"""
+extern "C" __global__ void find_feature_starts(
+    const unsigned char* __restrict__ input,
+    const int* __restrict__ depth,
+    unsigned char* __restrict__ is_feature_start,
+    long long n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    unsigned char c = input[idx];
+    int d = depth[idx];
+
+    // Features are objects at depth 3: FeatureCollection { depth=1,
+    // "features": [ depth=2, Feature { depth=3.
+    is_feature_start[idx] = (c == '{' && d == 3) ? 1 : 0;
+}
+
 extern "C" __global__ void find_feature_boundaries(
     const unsigned char* __restrict__ input,
     const int* __restrict__ depth,
@@ -444,6 +461,6 @@ _RING_COUNT_NAMES = ("count_rings_and_coords",)
 _MPOLY_COUNT_NAMES = ("count_mpoly_levels",)
 _MPOLY_SCATTER_NAMES = ("scatter_mpoly_offsets",)
 _SCATTER_COORDS_NAMES = ("scatter_ring_offsets",)
-_FEATURE_BOUNDARY_NAMES = ("find_feature_boundaries",)
+_FEATURE_BOUNDARY_NAMES = ("find_feature_starts", "find_feature_boundaries")
 _TYPE_KEY_NAMES = ("find_type_key",)
 _CLASSIFY_TYPE_NAMES = ("classify_type_value",)

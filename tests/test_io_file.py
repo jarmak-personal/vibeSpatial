@@ -88,6 +88,43 @@ def test_geojson_gpu_adapter_failure_records_explicit_fallback(monkeypatch, tmp_
 
 
 @pytest.mark.gpu
+def test_large_public_geojson_read_uses_default_feature_boundary_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.geojson"
+    frame = _sample_frame()
+    frame.to_file(path, driver="GeoJSON")
+
+    monkeypatch.setattr("vibespatial.io.file._GPU_MIN_FILE_SIZE", 0)
+
+    calls: list[dict[str, object]] = []
+
+    class _FakeGpuResult:
+        def __init__(self) -> None:
+            self.owned = from_shapely_geometries(frame.geometry.tolist())
+            self.n_features = len(frame)
+
+        def properties_loader(self):
+            def _load():
+                return frame.drop(columns="geometry").to_dict("records")
+
+            return _load
+
+    def _fake_read_geojson_gpu(*args, **kwargs):
+        calls.append(kwargs)
+        return _FakeGpuResult()
+
+    monkeypatch.setattr("vibespatial.io.geojson_gpu.read_geojson_gpu", _fake_read_geojson_gpu)
+
+    result = geopandas.read_file(path)
+
+    assert result["id"].tolist() == frame["id"].tolist()
+    assert calls
+    assert "capture_feature_boundaries" not in calls[-1]
+
+
+@pytest.mark.gpu
 def test_shapefile_roundtrip_uses_gpu_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
@@ -660,7 +697,7 @@ def test_gpu_arrow_wkb_read_records_explicit_fallback_before_cpu_path(
     assert result.equals(fallback_frame)
     assert fallbacks
     assert fallbacks[-1].surface == "geopandas.read_file"
-    assert "GPU Arrow/WKB file read failed" in fallbacks[-1].reason
+    assert "GPU-dominant file read failed" in fallbacks[-1].reason
 
 
 def test_read_geojson_owned_streams_feature_collection_to_owned_buffers(tmp_path) -> None:

@@ -442,12 +442,8 @@ def _replace_geometry_column_preserving_backing(frame, values, *, crs):
         geometry_series = pd.Series(values, index=frame.index, copy=False, name=geom_name)
     else:
         geometry_series = GeoSeries(values, index=frame.index, crs=crs, name=geom_name)
-
-    data_columns = {
-        column_name: (geometry_series if column_name == geom_name else frame[column_name])
-        for column_name in frame.columns
-    }
-    rebuilt = pd.DataFrame(data_columns, index=frame.index, copy=False)
+    rebuilt = frame.copy(deep=False)
+    pd.DataFrame.__setitem__(rebuilt, geom_name, geometry_series)
     rebuilt.__class__ = type(frame)
     rebuilt._geometry_column_name = geom_name
     rebuilt.attrs = frame.attrs.copy()
@@ -977,22 +973,22 @@ def _materialize_attribute_geometry_frame(
         column.name: column.geometry.to_geoseries(index=attributes.index, name=column.name)
         for column in geometry_columns
     }
-    if column_order is None:
-        ordered_columns = [*frame.columns, *geometry_series]
-    else:
-        ordered_columns = list(column_order)
-
-    data_columns: dict[str, Any] = {}
-    for column_name in ordered_columns:
-        if column_name in geometry_series:
-            data_columns[column_name] = geometry_series[column_name]
-        else:
-            data_columns[column_name] = frame[column_name]
-    rebuilt = pd.DataFrame(data_columns, index=attributes.index, copy=False)
-    rebuilt.__class__ = GeoDataFrame
-    rebuilt._geometry_column_name = geometry_name
-    rebuilt.attrs = frame.attrs.copy()
     active_geometry = geometry_series[geometry_name]
+    rebuilt = GeoDataFrame(
+        frame.copy(deep=False),
+        geometry=active_geometry,
+        crs=active_geometry.crs,
+        copy=False,
+    )
+    for name, series in geometry_series.items():
+        if name == geometry_name:
+            continue
+        pd.DataFrame.__setitem__(rebuilt, name, series)
+    if column_order is not None:
+        rebuilt = rebuilt.reindex(columns=list(column_order), copy=False)
+        rebuilt.__class__ = GeoDataFrame
+        rebuilt._geometry_column_name = geometry_name
+    rebuilt.attrs = frame.attrs.copy()
     return _replace_geometry_column_preserving_backing(
         rebuilt,
         active_geometry.values,

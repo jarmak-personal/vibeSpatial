@@ -1541,7 +1541,7 @@ def _try_gpu_read_file(
     except Exception as exc:
         record_fallback_event(
             surface="geopandas.read_file",
-            reason=f"GPU Arrow/WKB file read failed: {exc}",
+            reason=f"GPU-dominant file read failed: {exc}",
             detail=str(exc),
             selected=ExecutionMode.CPU,
             pipeline="io/read_file",

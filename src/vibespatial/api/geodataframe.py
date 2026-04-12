@@ -1954,7 +1954,16 @@ default 'snappy'
         else:
             df = self.copy(deep=not PANDAS_GE_30)
         geom = df.geometry.to_crs(crs=crs, epsg=epsg)
-        df.geometry = geom
+        if inplace:
+            df.geometry = geom
+        else:
+            from vibespatial.api._native_results import _replace_geometry_column_preserving_backing
+
+            df = _replace_geometry_column_preserving_backing(
+                df,
+                geom.values,
+                crs=geom.crs,
+            )
         if not inplace:
             return df
 

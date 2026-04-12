@@ -75,6 +75,8 @@ except ModuleNotFoundError:  # pragma: no cover
 # ctypes for kernel params not in cuda_runtime.py
 KERNEL_PARAM_I64 = ctypes.c_longlong
 KERNEL_PARAM_I8 = ctypes.c_int8
+_FEATURE_SEPARATOR_BYTES = np.frombuffer(b" \t\r\n,", dtype=np.uint8)
+_FEATURE_SEPARATOR_BYTES_PY = frozenset(int(v) for v in _FEATURE_SEPARATOR_BYTES.tolist())
 
 # ---------------------------------------------------------------------------
 # NVRTC warmup (ADR-0034 Level 2)
@@ -174,15 +176,18 @@ class GeoJSONGpuResult:
     def _ensure_host_property_state(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         host_bytes = self._ensure_host_bytes()
 
-        if self.feature_starts is None or self.feature_ends is None:
-            if self.device_feature_starts is None or self.device_feature_ends is None:
+        if self.feature_starts is None:
+            if self.device_feature_starts is None:
                 self.feature_starts = np.empty(0, dtype=np.int64)
-                self.feature_ends = np.empty(0, dtype=np.int64)
             else:
                 self.feature_starts = cp.asnumpy(self.device_feature_starts)
-                self.feature_ends = cp.asnumpy(self.device_feature_ends)
                 self.device_feature_starts = None
+        if self.feature_ends is None:
+            if self.device_feature_ends is not None:
+                self.feature_ends = cp.asnumpy(self.device_feature_ends)
                 self.device_feature_ends = None
+            else:
+                self.feature_ends = _derive_feature_ends_from_starts(host_bytes, self.feature_starts)
 
         return host_bytes, self.feature_starts, self.feature_ends
 
@@ -241,6 +246,63 @@ def _extract_properties_stream_cpu(host_bytes: np.ndarray) -> list[dict[str, obj
         dict(feature.get("properties") or {}) if isinstance(feature, dict) else {}
         for feature in _iter_feature_collection(text)
     ]
+
+
+def _derive_feature_ends_from_starts(
+    host_bytes: np.ndarray,
+    feature_starts: np.ndarray,
+) -> np.ndarray:
+    starts = np.asarray(feature_starts, dtype=np.int64)
+    if len(starts) == 0:
+        return np.empty(0, dtype=np.int64)
+
+    ends = np.empty(len(starts), dtype=np.int64)
+    if len(starts) > 1:
+        probe = starts[1:].copy() - 1
+        lower = starts[:-1]
+        for _ in range(16):
+            trim_mask = np.isin(host_bytes[probe], _FEATURE_SEPARATOR_BYTES) & (probe > lower)
+            if not trim_mask.any():
+                break
+            probe[trim_mask] -= 1
+        slow_mask = np.isin(host_bytes[probe], _FEATURE_SEPARATOR_BYTES) & (probe > lower)
+        if slow_mask.any():
+            for idx in np.flatnonzero(slow_mask):
+                end = int(probe[idx])
+                lower_bound = int(lower[idx])
+                while end > lower_bound and int(host_bytes[end]) in _FEATURE_SEPARATOR_BYTES_PY:
+                    end -= 1
+                probe[idx] = end
+        ends[:-1] = probe + 1
+    ends[-1] = _find_feature_end(host_bytes, int(starts[-1]))
+    return ends
+
+
+def _find_feature_end(raw: np.ndarray | bytes, start: int) -> int:
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(raw)):
+        byte = raw[i]
+        if not isinstance(byte, int):
+            byte = int(byte)
+        if in_string:
+            if escape:
+                escape = False
+            elif byte == 0x5C:  # '\'
+                escape = True
+            elif byte == 0x22:  # '"'
+                in_string = False
+            continue
+        if byte == 0x22:  # '"'
+            in_string = True
+        elif byte == 0x7B:  # '{'
+            depth += 1
+        elif byte == 0x7D:  # '}'
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    raise ValueError("GeoJSON feature boundary recovery failed: unterminated feature object")
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +418,27 @@ def read_geojson_gpu(
             feature_starts=np.empty(0, dtype=np.int64),
             feature_ends=np.empty(0, dtype=np.int64),
         )
+
+    d_feat_start_pos = None
+    d_feat_end_pos = None
+    if capture_feature_boundaries:
+        # S3a: Find feature boundaries for property extraction while the
+        # live set is still minimal. The kernel only needs d_bytes + d_depth,
+        # so running it here avoids stacking its full-file scratch buffers on
+        # top of later type/ring-count state for large GeoJSON inputs.
+        # Capture only feature starts on-device; the corresponding ends are
+        # derived cheaply on host from the next start so we do not pay for a
+        # second full-file marker buffer.
+        fb_kernels = _feature_boundary_kernels()
+        d_feat_start = cp.zeros(n, dtype=cp.uint8)
+        _launch_kernel(runtime, fb_kernels["find_feature_starts"], n, (
+            (ptr(d_bytes), ptr(d_depth), ptr(d_feat_start), n_i64),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+        ))
+        d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
+        if int(d_feat_start_pos.size) > n_features:
+            d_feat_start_pos = d_feat_start_pos[-n_features:]
+        del d_feat_start
 
     # S3.5: Type detection — find "type": at geometry depth and classify
     tk_kernels = _type_key_kernels()
@@ -578,26 +661,6 @@ def read_geojson_gpu(
         ))
         del d_mp_part_psum, d_mp_ring_psum
         del d_mp_part_offset_starts, d_mp_ring_offset_starts, d_mp_pair_offset_starts
-
-    d_feat_start_pos = None
-    d_feat_end_pos = None
-    if capture_feature_boundaries:
-        # S8: Find feature boundaries for property extraction.
-        # Moved before S4 so that d_depth (n*4 bytes = 8.6 GB for a 2 GB file)
-        # can be freed before the memory-intensive number extraction stage.
-        fb_kernels = _feature_boundary_kernels()
-        d_feat_start = cp.zeros(n, dtype=cp.uint8)
-        d_feat_end = cp.zeros(n, dtype=cp.uint8)
-        _launch_kernel(runtime, fb_kernels["find_feature_boundaries"], n, (
-            (ptr(d_bytes), ptr(d_depth), ptr(d_feat_start), ptr(d_feat_end), n_i64),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
-        ))
-        d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
-        d_feat_end_pos = cp.flatnonzero(d_feat_end).astype(cp.int64) + 1
-        if int(d_feat_start_pos.size) > n_features:
-            d_feat_start_pos = d_feat_start_pos[-n_features:]
-            d_feat_end_pos = d_feat_end_pos[-n_features:]
-        del d_feat_start, d_feat_end
 
     # Free d_depth early: it is the single largest allocation (n*4 bytes,
     # ~8.6 GB for a 2 GB input file).  All consumers (type detection, span

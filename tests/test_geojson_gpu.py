@@ -12,6 +12,7 @@ from vibespatial.io.geojson import (
     plan_geojson_ingest,
     read_geojson_owned,
 )
+from vibespatial.io.geojson_gpu import _derive_feature_ends_from_starts
 from vibespatial.runtime.residency import Residency
 
 try:
@@ -56,6 +57,28 @@ def _simple_square(x0: float, y0: float, size: float = 0.01) -> list[list[list[f
             [x0, y0],
         ]
     ]
+
+
+def test_derive_feature_ends_from_starts_handles_commas_whitespace_and_last_row() -> None:
+    text = (
+        '{"type":"FeatureCollection","features":[\n'
+        '  {"type":"Feature","properties":{"id":1},"geometry":null},\n'
+        '  {"type":"Feature","properties":{"id":2},"geometry":null} \n'
+        ']}'
+    )
+    host_bytes = np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+    starts = np.asarray(
+        [
+            text.index('{"type":"Feature","properties":{"id":1},"geometry":null}'),
+            text.index('{"type":"Feature","properties":{"id":2},"geometry":null}'),
+        ],
+        dtype=np.int64,
+    )
+
+    ends = _derive_feature_ends_from_starts(host_bytes, starts)
+
+    assert text[starts[0]:ends[0]] == '{"type":"Feature","properties":{"id":1},"geometry":null}'
+    assert text[starts[1]:ends[1]] == '{"type":"Feature","properties":{"id":2},"geometry":null}'
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +386,7 @@ def test_hybrid_properties_materialize_host_state_lazily(monkeypatch, tmp_path):
     assert props[1]["id"] == 2
     assert props[1]["name"] == "beta"
     assert fromfile_calls == 1
-    assert asnumpy_calls == 2
+    assert asnumpy_calls == 1
 
 
 @needs_gpu
