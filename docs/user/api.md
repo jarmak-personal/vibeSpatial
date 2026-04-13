@@ -295,7 +295,7 @@ available. No code changes are required — GPU acceleration is transparent.
 | TopoJSON | `.topojson` | Always | pyogrio |
 | GeoJSON-Seq | `.geojsonl`, `.geojsonseq` | Always | pyogrio |
 | WKT | `.wkt` | Always | None (GPU-only) |
-| OSM PBF | `.pbf`, `.osm.pbf` | Always | None (GPU-only) |
+| OSM PBF | `.pbf`, `.osm.pbf` | Native GPU for `layer="all"` and full-data reads; supported public layers use pyogrio plus the shared native boundary | Default public reads combine `points`, `lines`, `multilinestrings`, `multipolygons`, and `other_relations` through parallel supported-layer scans; `GeometryCollection` relation leftovers use an explicit compatibility bridge |
 | PostGIS | `read_postgis()` | When ADBC installed | Shapely WKB |
 
 ### CSV Spatial Column Auto-Detection

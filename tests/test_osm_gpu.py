@@ -1387,6 +1387,98 @@ class TestReadOsmPbf:
             path.unlink()
 
     @needs_gpu
+    def test_points_layer_reports_only_significant_tagged_nodes(self):
+        """Points layer skips untagged and unsignificant-tag-only nodes."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        dense = _build_dense_nodes(
+            id_deltas=[1, 1, 1],
+            lat_deltas=[0, 10000, 10000],
+            lon_deltas=[0, 10000, 10000],
+            keys_vals=[
+                1, 2, 0,  # node 1: created_by=bot (unsignificant)
+                3, 4, 0,  # node 2: name=Cafe
+                0,        # node 3: no tags
+            ],
+        )
+        group = _build_primitive_group(dense)
+        pblock = _build_primitive_block_with_stringtable(
+            [group],
+            stringtable_entries=[b"", b"created_by", b"bot", b"name", b"Cafe"],
+        )
+        pbf = _build_osm_header() + _build_pbf_block("OSMData", pblock)
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path, layer="points")
+            assert result.n_nodes == 1
+            assert result.node_ids is not None
+            np.testing.assert_array_equal(cp.asnumpy(result.node_ids), [2])
+            assert result.node_tags == [{"name": "Cafe"}]
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_closed_non_area_way_stays_in_lines_layer(self):
+        """Closed non-area ways remain linework instead of being promoted to areas."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        dense = _build_dense_nodes(
+            id_deltas=[1, 1, 1],
+            lat_deltas=[0, 0, 10000000],
+            lon_deltas=[0, 10000000, 0],
+        )
+        dense_group = _build_primitive_group(dense)
+        way = _build_way(100, [1, 1, 1, -2], keys=[1], vals=[2])
+        ways_group = _build_primitive_group_with_ways([way])
+        pblock = _build_primitive_block_with_stringtable(
+            [dense_group, ways_group],
+            stringtable_entries=[b"", b"highway", b"residential"],
+        )
+        pbf = _build_osm_header() + _build_pbf_block("OSMData", pblock)
+        path = _write_temp_pbf(pbf)
+
+        try:
+            lines = read_osm_pbf(path, layer="lines")
+            assert lines.n_ways == 1
+            assert lines.ways is not None
+            assert GeometryFamily.LINESTRING in lines.ways.families
+
+            areas = read_osm_pbf(path, layer="multipolygons")
+            assert areas.n_ways == 0
+            assert areas.ways is None
+        finally:
+            path.unlink()
+
+    @needs_gpu
+    def test_closed_building_way_surfaces_in_multipolygons_layer(self):
+        """Closed area ways still surface in the multipolygons layer."""
+        from vibespatial.io.osm_gpu import read_osm_pbf
+
+        dense = _build_dense_nodes(
+            id_deltas=[1, 1, 1],
+            lat_deltas=[0, 0, 10000000],
+            lon_deltas=[0, 10000000, 0],
+        )
+        dense_group = _build_primitive_group(dense)
+        way = _build_way(100, [1, 1, 1, -2], keys=[1], vals=[2])
+        ways_group = _build_primitive_group_with_ways([way])
+        pblock = _build_primitive_block_with_stringtable(
+            [dense_group, ways_group],
+            stringtable_entries=[b"", b"building", b"yes"],
+        )
+        pbf = _build_osm_header() + _build_pbf_block("OSMData", pblock)
+        path = _write_temp_pbf(pbf)
+
+        try:
+            result = read_osm_pbf(path, layer="multipolygons")
+            assert result.n_ways == 1
+            assert result.ways is not None
+            assert GeometryFamily.POLYGON in result.ways.families
+        finally:
+            path.unlink()
+
+    @needs_gpu
     def test_file_not_found_read_osm_pbf(self):
         """read_osm_pbf raises FileNotFoundError for missing files."""
         from vibespatial.io.osm_gpu import read_osm_pbf

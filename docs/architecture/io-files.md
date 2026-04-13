@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 277/280 lines
+Body Budget: 275/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 30-35 | Risks |
 | 36-54 | Decision |
 | 55-64 | Performance Notes |
-| 65-187 | Current Behavior |
-| 188-277 | Measured Local Baseline |
+| 65-185 | Current Behavior |
+| 186-275 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -110,44 +110,42 @@ keeping GPU-native formats primary and legacy formats explicit.
   does not yet match exactly.
 - Repo-owned `read_file` GPU branches that can already produce owned geometry
   plus columnar attributes now lower through the shared `NativeTabularResult`
-  boundary before the terminal `GeoDataFrame` materialization point instead of
-  each branch rebuilding a public frame independently. That now includes:
-  - the pyogrio Arrow + GPU WKB compatibility path
-  - direct WKT, CSV, and KML GPU readers
-  - the direct SHP binary + DBF and pyogrio geometry + GPU DBF Shapefile paths
-  - the GeoJSON byte-classify path after property extraction
-  - the OSM PBF hybrid path after protobuf/tag extraction
+  boundary before terminal `GeoDataFrame` materialization. That now includes
+  the pyogrio Arrow + GPU WKB compatibility path, direct WKT/CSV/KML readers,
+  both Shapefile GPU paths, the GeoJSON byte-classify path after property
+  extraction, and the OSM PBF hybrid path after protobuf/tag extraction.
+- The OSM PBF public boundary now uses a bounded, lossless tag projection instead of widening every observed tag key into its own eager object column. Common OSM keys stay first-class and the remainder stay in `other_tags`, avoiding the previous Florida-scale `2843`-column host explosion.
+- Public OSM standard layers (`points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`) now prefer `pyogrio` container reads through the shared native boundary. Those supported-layer scans run in parallel for the default public `read_file("*.osm.pbf")` path, so the user-facing wall time is no longer dominated by five serial OSM driver passes. Layers with native-supported geometry stay on Arrow + GPU WKB; `other_relations` uses an explicit compatibility bridge because real PBF data still carries `GeometryCollection`. The repo-owned hybrid OSM parser remains the path for `layer="all"` and the full-data native contract.
+- Default public `read_file("*.osm.pbf")` now combines those supported public layers by default instead of forcing the full mixed all-data parser into one eager frame. Small node-only fixtures and other empty supported-layer cases explicitly fall back to the full native parser so data is not lost.
+- OSM PBF native reads now keep tag projection lazy until explicit export. The low-level reader still returns host-resident tag dicts today, but the shared native file boundary no longer eagerly rebuilds a giant pandas object table.
+- Full-data OSM native reads now normalize through an internal partitioned bundle before any public layer projection or `GeoDataFrame` assembly. That keeps parser-shaped node/way/relation output out of the public boundary while preserving a reusable full-data seam for future views.
 - Large geometry-column CSV now prefers a `pylibcudf` / `libcudf` table parse
   instead of the older whole-file byte-classify path. That keeps the CSV
-  container parse on device, avoids the previous WKT concatenation memory blowup
-  on Florida-scale files, and then routes the geometry column into the native
-  GPU WKT/WKB decode path. The byte-classify CSV reader still owns small files
-  and non-geometry-column layouts such as lat/lon pairs.
+  container parse on device, avoids the Florida-scale WKT concatenation memory
+  blowup, and then routes the geometry column into the native GPU WKT/WKB
+  decode path. The byte-classify reader still owns small files and lat/lon
+  layouts.
 - FlatGeobuf now defaults to the pyogrio Arrow + GPU WKB path on public
   `read_file(...)` / `read_vector_file_native(...)`. The repo still has a
-  direct GPU FlatBuffer decoder in `fgb_gpu.py`, but the Florida real-dataset
-  shootout shows the Arrow path is materially faster today than the direct
-  decoder, so the direct route is not the default execution shape.
-- Direct format-native helpers now exist for the promoted compatibility readers
-  that already have a credible shared boundary:
-  - `read_geojson_native(...)`
-  - `read_shapefile_native(...)`
+  direct GPU FlatBuffer decoder in `fgb_gpu.py`, but the Florida shootout
+  shows the Arrow path is materially faster today, so the direct route is not
+  the default execution shape.
+- Direct format-native helpers now exist for the promoted compatibility readers that already have a credible shared boundary: `read_geojson_native(...)` and `read_shapefile_native(...)`.
 - GeoJSON remains an explicit hybrid compatibility boundary because property
   extraction is still CPU-side even though geometry decode is GPU-native.
   The shared native read boundary now preserves GeoJSON properties lazily
   until explicit attribute access or terminal public export, so geometry-only
   native consumers do not pay the property parse cost up front.
   The GPU byte-classify path now accepts both filesystem paths and in-memory
-  RFC 7946 text/bytes sources, so repo-owned pipelines can avoid synthetic
-  write-then-read loops when the GeoJSON payload is already resident on host.
+  RFC 7946 text/bytes sources, avoiding synthetic write-then-read loops when
+  the payload is already resident on host.
   Explicit `track_properties=False` reads now drop property retention
   completely; accessing properties after a geometry-only read is an explicit
   contract error and requires a re-read with `track_properties=True`.
 - Shapefile remains an explicit hybrid compatibility boundary because the
   container and DBF attribute story are still legacy-oriented even when
-  geometry decode is native.
-- Untargeted legacy GDAL formats stay outside the GPU-native promise and route
-  through explicit fallback compatibility adapters.
+  geometry decode is native; untargeted legacy GDAL formats stay outside the
+  GPU-native promise and route through explicit fallback compatibility adapters.
 - Repo-owned GeoJSON ingest now also has an internal staged owned path:
   - `auto` prefers `gpu-byte-classify` when a GPU runtime is available,
     producing device-resident geometry via NVRTC kernels. On CPU-only hosts,

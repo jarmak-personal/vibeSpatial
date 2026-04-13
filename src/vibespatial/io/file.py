@@ -10,7 +10,7 @@ from vibespatial.geometry.owned import (
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.fallbacks import get_fallback_events, record_fallback_event
 
 # Re-exported from io_geojson for backward compatibility
 from .geojson import (  # noqa: F401
@@ -186,6 +186,371 @@ def _native_attribute_table_from_geojson_properties_loader(
         index_override=pd.RangeIndex(row_count),
         columns=(),
     )
+
+
+_OSM_PYOGRIO_ARROW_LAYERS = frozenset(
+    {"points", "lines", "multilinestrings", "multipolygons", "other_relations"}
+)
+_OSM_PYOGRIO_DEFAULT_LAYERS = (
+    "points",
+    "lines",
+    "multilinestrings",
+    "multipolygons",
+    "other_relations",
+)
+
+
+def _normalize_osm_layer(layer) -> str:
+    if layer is None:
+        return "all"
+    normalized = str(layer).strip().lower()
+    aliases = {
+        "all": "all",
+        "points": "points",
+        "nodes": "points",
+        "lines": "lines",
+        "ways": "ways",
+        "multipolygons": "multipolygons",
+        "polygons": "multipolygons",
+        "relations": "relations",
+        "multilinestrings": "multilinestrings",
+        "other_relations": "other_relations",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            "Unsupported OSM PBF layer. Expected one of "
+            "'points', 'lines', 'ways', 'multipolygons', 'relations', "
+            "'multilinestrings', 'other_relations', or 'all'."
+        )
+    return aliases[normalized]
+
+
+def _osm_uses_pyogrio_compat_layer(*, layer, tags) -> bool:
+    normalized_layer = _normalize_osm_layer(layer)
+    return normalized_layer in _OSM_PYOGRIO_ARROW_LAYERS
+
+
+def _osm_uses_pyogrio_compat_default(*, layer, tags, geometry_only: bool) -> bool:
+    return layer is None and (geometry_only or tags in ("ways", True, False))
+
+
+def _prepare_osm_pyogrio_kwargs(
+    *,
+    layer,
+    tags,
+    columns,
+    kwargs,
+) -> tuple[object, dict[str, object]]:
+    pyogrio_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in ("engine", "tags", "geometry_only")
+    }
+    layer_columns = _osm_pyogrio_columns(
+        layer=layer,
+        geometry_only=bool(kwargs.get("geometry_only", False)),
+        tags=tags,
+    )
+    if layer_columns is not None:
+        columns = layer_columns
+    return columns, pyogrio_kwargs
+
+
+def _osm_pyogrio_columns(
+    *,
+    layer: str,
+    geometry_only: bool,
+    tags,
+) -> list[str] | None:
+    if geometry_only:
+        return []
+    if tags is not False:
+        return None
+
+    normalized_layer = _normalize_osm_layer(layer)
+    if normalized_layer == "multipolygons":
+        return ["osm_id", "osm_way_id"]
+    return ["osm_id"]
+
+
+def _native_tabular_result_with_attribute_column(payload, name: str, values):
+    from vibespatial.api._native_results import NativeTabularResult
+
+    attributes = payload.attributes.with_column(name, values)
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=payload.geometry,
+        geometry_name=payload.geometry_name,
+        column_order=tuple([*attributes.columns, payload.geometry_name]),
+        attrs=payload.attrs,
+        secondary_geometry=payload.secondary_geometry,
+        provenance=payload.provenance,
+    )
+
+
+def _add_osm_element_column(payload, *, osm_element: str):
+    import numpy as np
+
+    row_count = int(payload.geometry.row_count)
+    values = np.empty(row_count, dtype=object)
+    values[:] = osm_element
+    return _native_tabular_result_with_attribute_column(payload, "osm_element", values)
+
+
+def _add_osm_element_column_for_multipolygons(payload):
+    import numpy as np
+    import pyarrow.compute as pc
+
+    row_count = int(payload.geometry.row_count)
+    values = np.empty(row_count, dtype=object)
+    values[:] = "relation"
+    if "osm_way_id" not in payload.attributes.columns:
+        return _native_tabular_result_with_attribute_column(payload, "osm_element", values)
+    attrs_arrow = payload.attributes.to_arrow(index=False, columns=["osm_way_id"])
+    way_mask = pc.is_valid(attrs_arrow["osm_way_id"]).to_numpy(zero_copy_only=False)
+    values[way_mask] = "way"
+    return _native_tabular_result_with_attribute_column(payload, "osm_element", values)
+
+
+def _read_osm_pbf_pyogrio_layer_public(
+    filename,
+    *,
+    layer: str,
+    target_crs: str | None = None,
+    geometry_only: bool = False,
+    tags: bool | str = "ways",
+    include_element_column: bool = False,
+):
+    import pyogrio
+
+    import geopandas as gpd
+
+    kwargs = {"layer": layer}
+    layer_columns = _osm_pyogrio_columns(
+        layer=layer,
+        geometry_only=geometry_only,
+        tags=tags,
+    )
+    if layer_columns is not None:
+        kwargs["columns"] = layer_columns
+    frame = pyogrio.read_dataframe(filename, **kwargs)
+    if geometry_only:
+        frame = gpd.GeoDataFrame(geometry=frame.geometry, crs=frame.crs)
+    elif not include_element_column:
+        pass
+    elif layer == "points":
+        frame["osm_element"] = "node"
+    elif layer == "lines":
+        frame["osm_element"] = "way"
+    elif layer in {"multilinestrings", "other_relations"}:
+        frame["osm_element"] = "relation"
+    else:
+        frame["osm_element"] = "relation"
+        if "osm_way_id" in frame.columns:
+            way_mask = frame["osm_way_id"].notna()
+            frame.loc[way_mask, "osm_element"] = "way"
+
+    if target_crs is not None and frame.crs is not None:
+        frame = frame.to_crs(target_crs)
+    elif target_crs is not None and frame.crs is None:
+        frame = frame.set_crs(target_crs)
+    return frame
+
+
+def _read_osm_pbf_pyogrio_layer_native(
+    filename,
+    *,
+    layer: str,
+    target_crs: str | None = None,
+    geometry_only: bool = False,
+    tags: bool | str = "ways",
+    include_element_column: bool = False,
+):
+    import pyogrio
+
+    from vibespatial.api._native_results import (
+        NativeTabularResult,
+        _empty_geometry_native_result,
+        _spatial_to_native_tabular_result,
+        native_attribute_table_from_arrow_table,
+    )
+
+    layer_columns = _osm_pyogrio_columns(
+        layer=layer,
+        geometry_only=geometry_only,
+        tags=tags,
+    )
+    metadata, table = pyogrio.read_arrow(
+        filename,
+        layer=layer,
+        columns=layer_columns,
+    )
+    geometry_name = str(metadata.get("geometry_name") or "geometry")
+    if geometry_name != "geometry" and "geometry" not in table.column_names:
+        geometry_name = "geometry"
+    if table.num_rows == 0:
+        geom_idx, _geom_field = _select_arrow_geometry_column(table, metadata)
+        attrs_table = table.remove_column(geom_idx)
+        attributes = native_attribute_table_from_arrow_table(attrs_table)
+        effective_crs = target_crs or metadata.get("crs") or "EPSG:4326"
+        return NativeTabularResult(
+            attributes=attributes,
+            geometry=_empty_geometry_native_result(
+                geometry_name=geometry_name,
+                crs=effective_crs,
+            ),
+            geometry_name=geometry_name,
+            column_order=tuple([*attributes.columns, geometry_name]),
+        )
+    try:
+        payload = _pyogrio_arrow_wkb_to_native_tabular_result(
+            table,
+            metadata,
+            target_crs=target_crs,
+        )
+    except NotImplementedError as exc:
+        if "unsupported geometry family" not in str(exc):
+            raise
+        record_fallback_event(
+            surface="vibespatial.io.osm_pbf",
+            reason=(
+                "explicit CPU compatibility fallback for an OSM pyogrio layer after "
+                "GPU WKB decode could not handle the layer geometry family"
+            ),
+            detail=f"layer={layer!r}, detail={type(exc).__name__}: {exc}",
+            pipeline="io/read_osm_pbf_pyogrio_layer",
+            d2h_transfer=False,
+        )
+        return _spatial_to_native_tabular_result(
+            _read_osm_pbf_pyogrio_layer_public(
+                filename,
+                layer=layer,
+                target_crs=target_crs,
+                geometry_only=geometry_only,
+                tags=tags,
+                include_element_column=include_element_column,
+            )
+        )
+    if geometry_only:
+        return payload
+    if not include_element_column:
+        return payload
+    if layer == "points":
+        return _add_osm_element_column(payload, osm_element="node")
+    if layer == "lines":
+        return _add_osm_element_column(payload, osm_element="way")
+    if layer == "multipolygons":
+        return _add_osm_element_column_for_multipolygons(payload)
+    if layer in {"multilinestrings", "other_relations"}:
+        return _add_osm_element_column(payload, osm_element="relation")
+    return payload
+
+
+def _read_osm_pbf_supported_layers_native(
+    filename,
+    *,
+    target_crs: str | None = None,
+    geometry_only: bool = False,
+    tags: bool | str = "ways",
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from vibespatial.api._native_results import _concat_native_tabular_results
+
+    worker_count = min(4, len(_OSM_PYOGRIO_DEFAULT_LAYERS))
+    if worker_count <= 1:
+        results = [
+            _read_osm_pbf_pyogrio_layer_native(
+                filename,
+                layer=layer_name,
+                target_crs=target_crs,
+                geometry_only=geometry_only,
+                tags=tags,
+                include_element_column=True,
+            )
+            for layer_name in _OSM_PYOGRIO_DEFAULT_LAYERS
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="osm-pbf-layer") as executor:
+            futures = [
+                executor.submit(
+                    _read_osm_pbf_pyogrio_layer_native,
+                    filename,
+                    layer=layer_name,
+                    target_crs=target_crs,
+                    geometry_only=geometry_only,
+                    tags=tags,
+                    include_element_column=True,
+                )
+                for layer_name in _OSM_PYOGRIO_DEFAULT_LAYERS
+            ]
+            results = [future.result() for future in futures]
+    return _concat_native_tabular_results(
+        results,
+        geometry_name="geometry",
+        crs=target_crs or "EPSG:4326",
+    )
+
+
+def _read_osm_pbf_supported_layers_public(
+    filename,
+    *,
+    target_crs: str | None = None,
+    geometry_only: bool = False,
+    tags: bool | str = "ways",
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pandas as pd
+
+    import geopandas as gpd
+
+    parts: list[gpd.GeoDataFrame] = []
+    worker_count = min(4, len(_OSM_PYOGRIO_DEFAULT_LAYERS))
+    if worker_count <= 1:
+        frames = [
+            _read_osm_pbf_pyogrio_layer_public(
+                filename,
+                layer=layer_name,
+                target_crs=None,
+                geometry_only=geometry_only,
+                tags=tags,
+                include_element_column=True,
+            )
+            for layer_name in _OSM_PYOGRIO_DEFAULT_LAYERS
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="osm-pbf-layer") as executor:
+            futures = [
+                executor.submit(
+                    _read_osm_pbf_pyogrio_layer_public,
+                    filename,
+                    layer=layer_name,
+                    target_crs=None,
+                    geometry_only=geometry_only,
+                    tags=tags,
+                    include_element_column=True,
+                )
+                for layer_name in _OSM_PYOGRIO_DEFAULT_LAYERS
+            ]
+            frames = [future.result() for future in futures]
+
+    for frame in frames:
+        if len(frame) > 0:
+            parts.append(frame)
+
+    if parts:
+        combined = pd.concat(parts, ignore_index=True, sort=False)
+        crs = next((part.crs for part in parts if part.crs is not None), "EPSG:4326")
+        gdf = gpd.GeoDataFrame(combined, geometry="geometry", crs=crs)
+    else:
+        gdf = gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs="EPSG:4326"))
+
+    if target_crs is not None and gdf.crs is not None:
+        gdf = gdf.to_crs(target_crs)
+    elif target_crs is not None and gdf.crs is None:
+        gdf = gdf.set_crs(target_crs)
+    return gdf
 
 
 def _native_file_result_from_owned(
@@ -697,7 +1062,11 @@ def plan_vector_file_io(
     elif normalized_driver == "OSM-PBF":
         io_format = IOFormat.OSM_PBF
         implementation = "osm_pbf_gpu_hybrid_adapter"
-        reason = "OSM PBF uses CPU protobuf parsing with GPU varint decoding and coordinate assembly."
+        reason = (
+            "OSM PBF uses CPU protobuf parsing with GPU varint decoding and "
+            "coordinate assembly, then projects tags through promoted columns "
+            "plus lossless other_tags at the public boundary."
+        )
     elif normalized_driver == "GPKG":
         io_format = IOFormat.GEOPACKAGE
         implementation = "gpkg_pyogrio_arrow_gpu_wkb"
@@ -1288,135 +1657,39 @@ def _try_kml_gpu_read_native(filename, *, target_crs: str | None = None):
     )
 
 
-def _try_osm_pbf_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
-    """Try to read an OSM PBF file using the GPU hybrid pipeline.
+def _try_osm_pbf_gpu_read_native(
+    filename,
+    *,
+    target_crs: str | None = None,
+    tags: bool | str = "ways",
+    geometry_only: bool = False,
+    layer=None,
+    compatibility: bool = False,
+):
+    from .osm_bundle import build_osm_native_bundle
+    from .osm_gpu import read_osm_pbf
 
-    OSM PBF files contain DenseNodes (Points), Ways (LineStrings, Polygons),
-    and Relations (MultiPolygons) extracted via CPU protobuf parsing with
-    GPU varint decoding, coordinate assembly, and binary-search-based
-    coordinate resolution.  Returns a GeoDataFrame with mixed geometry
-    types, OSM ID columns, and tag/attribute columns, or None on failure.
-
-    Follows the GeoJSON hybrid pattern: geometry is device-resident,
-    attributes (tags) are host-resident in a pandas DataFrame.
-    """
-    try:
-        payload = _try_osm_pbf_gpu_read_native(filename, target_crs=target_crs)
-        if payload is None:
-            return None
-        gdf = _materialize_native_file_read_result(payload)
-        record_dispatch_event(
-            surface="geopandas.read_file",
-            operation="read_file",
-            implementation="osm_pbf_gpu_hybrid_adapter",
-            reason=(
-                "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
-                "decoding, coordinate assembly, Way/Relation coordinate "
-                "resolution via binary-search kernel, MultiPolygon "
-                "assembly from Relation Way members, and host-resident "
-                "tag/attribute extraction."
-            ),
-            selected=ExecutionMode.GPU,
-        )
-        return gdf
-    except Exception:
-        return None
-
-
-def _try_osm_pbf_gpu_read_native(filename, *, target_crs: str | None = None):
-    import cupy as _cp
-    import pandas as pd
-
-    from vibespatial.api._native_results import _concat_native_tabular_results
-
-    from .osm_gpu import _tags_to_dataframe, read_osm_pbf
-
-    osm_result = read_osm_pbf(filename)
-    has_nodes = osm_result.nodes is not None and osm_result.n_nodes > 0
-    has_ways = osm_result.ways is not None and osm_result.n_ways > 0
-    has_relations = osm_result.relations is not None and osm_result.n_relations > 0
-
-    if not has_nodes and not has_ways and not has_relations:
-        return None
+    normalized_layer = _normalize_osm_layer(layer)
+    osm_result = read_osm_pbf(
+        filename,
+        tags=tags,
+        geometry_only=geometry_only,
+        layer=layer,
+    )
 
     crs = target_crs if target_crs is not None else "EPSG:4326"
-
-    n_types = int(has_nodes) + int(has_ways) + int(has_relations)
-    results = []
-
-    if has_nodes:
-        node_tags_df = (
-            _tags_to_dataframe(osm_result.node_tags)
-            if osm_result.node_tags
-            else pd.DataFrame(index=range(osm_result.n_nodes))
-        )
-        if n_types == 1:
-            if osm_result.node_ids is not None:
-                node_tags_df["osm_node_id"] = _cp.asnumpy(osm_result.node_ids)
-        else:
-            node_tags_df["osm_element"] = "node"
-            if osm_result.node_ids is not None:
-                node_tags_df["osm_id"] = _cp.asnumpy(osm_result.node_ids)
-        results.append(
-            _native_file_result_from_owned(
-                osm_result.nodes,
-                crs=crs,
-                attributes=node_tags_df,
-                row_count=osm_result.n_nodes,
-            )
-        )
-
-    if has_ways:
-        way_tags_df = (
-            _tags_to_dataframe(osm_result.way_tags)
-            if osm_result.way_tags
-            else pd.DataFrame(index=range(osm_result.n_ways))
-        )
-        if n_types == 1:
-            if osm_result.way_ids is not None:
-                way_tags_df["osm_way_id"] = _cp.asnumpy(osm_result.way_ids)
-        else:
-            way_tags_df["osm_element"] = "way"
-            if osm_result.way_ids is not None:
-                way_tags_df["osm_id"] = _cp.asnumpy(osm_result.way_ids)
-        results.append(
-            _native_file_result_from_owned(
-                osm_result.ways,
-                crs=crs,
-                attributes=way_tags_df,
-                row_count=osm_result.n_ways,
-            )
-        )
-
-    if has_relations:
-        rel_tags_df = (
-            _tags_to_dataframe(osm_result.relation_tags)
-            if osm_result.relation_tags
-            else pd.DataFrame(index=range(osm_result.n_relations))
-        )
-        if n_types == 1:
-            if osm_result.relation_ids is not None:
-                rel_tags_df["osm_relation_id"] = _cp.asnumpy(osm_result.relation_ids)
-        else:
-            rel_tags_df["osm_element"] = "relation"
-            if osm_result.relation_ids is not None:
-                rel_tags_df["osm_id"] = _cp.asnumpy(osm_result.relation_ids)
-        results.append(
-            _native_file_result_from_owned(
-                osm_result.relations,
-                crs=crs,
-                attributes=rel_tags_df,
-                row_count=osm_result.n_relations,
-            )
-        )
-
-    if len(results) == 1:
-        return results[0]
-    return _concat_native_tabular_results(
-        results,
-        geometry_name="geometry",
+    bundle = build_osm_native_bundle(
+        osm_result,
         crs=crs,
+        source=str(filename),
     )
+    payload = bundle.to_native_tabular_result(
+        layer=normalized_layer,
+        compatibility=compatibility,
+    )
+    if payload is None or payload.geometry.row_count == 0:
+        return None
+    return payload
 
 
 def _try_fgb_gpu_read(filename, *, target_crs: str | None = None) -> object | None:
@@ -1478,6 +1751,7 @@ def _try_gpu_read_file_native(
     columns,
     rows,
     target_crs: str | None = None,
+    compatibility: bool = False,
     **kwargs,
 ):
     """Try to read a vector file into the shared native tabular boundary."""
@@ -1493,7 +1767,100 @@ def _try_gpu_read_file_native(
     if not runtime.available():
         return None
 
-    if bbox is None and columns is None and rows is None:
+    osm_layer = kwargs.get("layer")
+    osm_tags = kwargs.get("tags", "ways")
+    osm_geometry_only = bool(kwargs.get("geometry_only", False))
+    osm_pyogrio_default = (
+        plan.format is IOFormat.OSM_PBF
+        and bbox is None
+        and columns is None
+        and rows is None
+        and _osm_uses_pyogrio_compat_default(
+            layer=osm_layer,
+            tags=osm_tags,
+            geometry_only=osm_geometry_only,
+        )
+    )
+    use_pyogrio_osm_layer = (
+        plan.format is IOFormat.OSM_PBF
+        and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
+    )
+
+    if osm_pyogrio_default:
+        payload = _read_osm_pbf_supported_layers_native(
+            filename,
+            target_crs=target_crs,
+            geometry_only=osm_geometry_only,
+            tags=osm_tags,
+        )
+        if payload.geometry.row_count > 0:
+            record_dispatch_event(
+                surface="geopandas.read_file",
+                operation="read_file",
+                implementation="osm_pbf_pyogrio_supported_layers_gpu_wkb",
+                reason=(
+                    "Public OSM PBF default read combines the supported pyogrio layers "
+                    "(points, lines, multilinestrings, multipolygons, other_relations) "
+                    "through Arrow container parsing, GPU WKB decode, native concat, "
+                    "and explicit public export."
+                ),
+                selected=ExecutionMode.GPU,
+            )
+            return payload
+
+        payload = _try_osm_pbf_gpu_read_native(
+            filename,
+            target_crs=target_crs,
+            tags=osm_tags,
+            geometry_only=osm_geometry_only,
+            layer=osm_layer,
+            compatibility=compatibility,
+        )
+        if payload is not None:
+            record_dispatch_event(
+                surface="geopandas.read_file",
+                operation="read_file",
+                implementation="osm_pbf_gpu_hybrid_adapter",
+                reason=(
+                    "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
+                    "decoding, coordinate assembly, Way/Relation coordinate "
+                    "resolution via binary-search kernel, MultiPolygon "
+                    "assembly from Relation Way members, and bounded public "
+                    "tag export through promoted columns plus lossless "
+                    "other_tags payloads."
+                ),
+                selected=ExecutionMode.GPU,
+            )
+        return payload
+
+    if (
+        use_pyogrio_osm_layer
+        and bbox is None
+        and columns is None
+        and rows is None
+    ):
+        payload = _read_osm_pbf_pyogrio_layer_native(
+            filename,
+            layer=_normalize_osm_layer(osm_layer),
+            target_crs=target_crs,
+            geometry_only=osm_geometry_only,
+            tags=osm_tags,
+        )
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation=f"{plan.format.value}_pyogrio_arrow_gpu_wkb",
+            reason=(
+                "GPU-dominant read for a standard OSM public layer through pyogrio "
+                "Arrow container parsing, GPU WKB decode when supported, and "
+                "explicit compatibility bridging for unsupported layer geometry "
+                "families."
+            ),
+            selected=ExecutionMode.GPU,
+        )
+        return payload
+
+    if bbox is None and columns is None and rows is None and not use_pyogrio_osm_layer:
         file_path = Path(filename)
         try:
             file_size = file_path.stat().st_size
@@ -1515,7 +1882,14 @@ def _try_gpu_read_file_native(
             return payload
 
         if plan.format is IOFormat.OSM_PBF:
-            payload = _try_osm_pbf_gpu_read_native(filename, target_crs=target_crs)
+            payload = _try_osm_pbf_gpu_read_native(
+                filename,
+                target_crs=target_crs,
+                tags=osm_tags,
+                geometry_only=bool(kwargs.get("geometry_only", False)),
+                layer=osm_layer,
+                compatibility=compatibility,
+            )
             if payload is not None:
                 record_dispatch_event(
                     surface="geopandas.read_file",
@@ -1525,8 +1899,9 @@ def _try_gpu_read_file_native(
                         "GPU hybrid OSM PBF: CPU protobuf parsing with GPU varint "
                         "decoding, coordinate assembly, Way/Relation coordinate "
                         "resolution via binary-search kernel, MultiPolygon "
-                        "assembly from Relation Way members, and host-resident "
-                        "tag/attribute extraction."
+                        "assembly from Relation Way members, and bounded public "
+                        "tag export through promoted columns plus lossless "
+                        "other_tags payloads."
                     ),
                     selected=ExecutionMode.GPU,
                 )
@@ -1613,7 +1988,16 @@ def _try_gpu_read_file_native(
             return payload
 
     skip_features, max_features = _normalize_feature_window(rows)
-    arrow_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
+    arrow_columns = columns
+    if use_pyogrio_osm_layer:
+        arrow_columns, arrow_kwargs = _prepare_osm_pyogrio_kwargs(
+            layer=osm_layer,
+            tags=osm_tags,
+            columns=columns,
+            kwargs=kwargs,
+        )
+    else:
+        arrow_kwargs = {k: v for k, v in kwargs.items() if k not in ("engine",)}
     if bbox is not None:
         if hasattr(bbox, "total_bounds"):
             meta = pyogrio.read_info(filename, layer=arrow_kwargs.get("layer"))
@@ -1628,7 +2012,7 @@ def _try_gpu_read_file_native(
 
     metadata, table = pyogrio.read_arrow(
         filename,
-        columns=columns,
+        columns=arrow_columns,
         skip_features=skip_features,
         max_features=max_features,
         **arrow_kwargs,
@@ -1677,6 +2061,7 @@ def _try_gpu_read_file(
             columns=columns,
             rows=rows,
             target_crs=target_crs,
+            compatibility=True,
             **kwargs,
         )
         if payload is None:
@@ -1696,6 +2081,16 @@ def _try_gpu_read_file(
             d2h_transfer=False,
         )
         return None
+
+
+def _latest_read_file_gpu_failure(start_index: int):
+    events = get_fallback_events()
+    if start_index < 0:
+        start_index = 0
+    for event in reversed(events[start_index:]):
+        if event.surface == "geopandas.read_file" and event.pipeline == "io/read_file":
+            return event
+    return None
 
 
 def read_vector_file_native(
@@ -1748,6 +2143,26 @@ def read_vector_file_native(
         IOFormat.TOPOJSON,
         IOFormat.GEOJSONSEQ,
     }
+    osm_layer = kwargs.get("layer")
+    osm_tags = kwargs.get("tags", "ways")
+    osm_geometry_only = bool(kwargs.get("geometry_only", False))
+    osm_pyogrio_default = (
+        plan.format is IOFormat.OSM_PBF
+        and bbox is None
+        and columns is None
+        and rows is None
+        and mask is None
+        and _osm_uses_pyogrio_compat_default(
+            layer=osm_layer,
+            tags=osm_tags,
+            geometry_only=osm_geometry_only,
+        )
+    )
+    osm_pyogrio_compat = (
+        plan.format is IOFormat.OSM_PBF
+        and mask is None
+        and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
+    )
     if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         payload = _try_gpu_read_file_native(
             filename,
@@ -1769,11 +2184,14 @@ def read_vector_file_native(
         )
 
     if plan.format is IOFormat.OSM_PBF:
-        raise RuntimeError(
-            f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
-            "OSM PBF files (pyogrio/GDAL does not support PBF). Ensure a CUDA "
-            "GPU is available and CuPy is installed."
-        )
+        if not osm_pyogrio_compat and not osm_pyogrio_default:
+            raise RuntimeError(
+                f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
+                "full-data OSM PBF reads. Standard layered reads "
+                "(`points`, `lines`, `multipolygons`) can use the pyogrio "
+                "compatibility path; `layer=\"all\"` and native-only tag modes "
+                "require the GPU OSM reader."
+            )
 
     record_dispatch_event(
         surface="geopandas.read_file",
@@ -1791,14 +2209,34 @@ def read_vector_file_native(
         chosen_engine = api_file._check_engine(chosen_engine, "'read_file' function")
     from vibespatial.api.io.file import _read_file
 
+    if osm_pyogrio_default:
+        return _spatial_to_native_tabular_result(
+            _read_osm_pbf_supported_layers_public(
+                filename,
+                target_crs=target_crs,
+                geometry_only=osm_geometry_only,
+                tags=osm_tags,
+            )
+        )
+
+    read_kwargs = dict(kwargs)
+    read_columns = columns
+    if osm_pyogrio_compat:
+        read_columns, read_kwargs = _prepare_osm_pyogrio_kwargs(
+            layer=osm_layer,
+            tags=osm_tags,
+            columns=columns,
+            kwargs=kwargs,
+        )
+
     gdf = _read_file(
         filename,
         bbox=bbox,
         mask=mask,
-        columns=columns,
+        columns=read_columns,
         rows=rows,
         engine=chosen_engine,
-        **kwargs,
+        **read_kwargs,
     )
     if target_crs is not None and gdf.crs is not None:
         gdf = gdf.to_crs(target_crs)
@@ -1829,13 +2267,15 @@ def read_vector_file(
     and OSM PBF formats.  For CSV, KML, GeoJSON, and Shapefile, GPU
     acceleration activates only for files larger than 10 MB (below this
     threshold, CPU is faster due to kernel launch overhead).  WKT and
-    OSM PBF always use the GPU path -- there is no CPU fallback for
-    these formats (pyogrio/GDAL does not support them).
+    full-data OSM PBF reads use the native GPU path. Standard OSM layers
+    (``points``, ``lines``, ``multipolygons``) may use the pyogrio
+    compatibility path when the native all-data parser is not required.
 
     The GPU fast path is disabled when any of ``bbox``, ``columns``,
     ``rows``, or ``mask`` parameters are specified, or when ``engine``
     is explicitly set.  In those cases the reader falls through to the
-    CPU pyogrio/fiona path.
+    CPU pyogrio/fiona path, except for pyogrio-backed GPU WKB routes that
+    still operate through the shared native read boundary.
 
     Aliased as ``vibespatial.read_file()``.
 
@@ -1867,7 +2307,14 @@ def read_vector_file(
         Hilbert R-tree spatial index fused with ingest.  The index is
         accessible via the ``GeoDataFrame.gpu_spatial_index`` property.
     **kwargs
-        Passed through to the underlying engine.
+        Passed through to the underlying engine. For OSM PBF GPU reads, the
+        repo-owned path also accepts:
+
+        - ``tags``: ``True``, ``False``, or ``"ways"`` to control tag decode
+        - ``geometry_only``: skip tag and ID export for geometry-only reads
+        - ``layer``: ``"points"``, ``"lines"``, ``"multipolygons"``,
+          ``"ways"``, ``"relations"``, ``"multilinestrings"``,
+          ``"other_relations"``, or ``"all"``
 
     Returns
     -------
@@ -1913,6 +2360,27 @@ def read_vector_file(
         IOFormat.TOPOJSON,
         IOFormat.GEOJSONSEQ,
     }
+    fallback_start = len(get_fallback_events())
+    osm_layer = kwargs.get("layer")
+    osm_tags = kwargs.get("tags", "ways")
+    osm_geometry_only = bool(kwargs.get("geometry_only", False))
+    osm_pyogrio_default = (
+        plan.format is IOFormat.OSM_PBF
+        and bbox is None
+        and columns is None
+        and rows is None
+        and mask is None
+        and _osm_uses_pyogrio_compat_default(
+            layer=osm_layer,
+            tags=osm_tags,
+            geometry_only=osm_geometry_only,
+        )
+    )
+    osm_pyogrio_compat = (
+        plan.format is IOFormat.OSM_PBF
+        and mask is None
+        and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
+    )
     if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
         gpu_result = _try_gpu_read_file(
             filename,
@@ -1930,6 +2398,12 @@ def read_vector_file(
     # WKT files have no CPU fallback (pyogrio/GDAL does not support raw WKT).
     # If the GPU path returned None, raise an informative error.
     if plan.format is IOFormat.WKT:
+        gpu_failure = _latest_read_file_gpu_failure(fallback_start)
+        if gpu_failure is not None:
+            detail = gpu_failure.detail or gpu_failure.reason
+            raise RuntimeError(
+                f"Cannot read WKT file '{filename}': GPU WKT read failed: {detail}"
+            )
         raise RuntimeError(
             f"Cannot read WKT file '{filename}': GPU runtime is required for raw "
             "WKT files (pyogrio/GDAL does not support this format). Ensure a CUDA "
@@ -1938,11 +2412,25 @@ def read_vector_file(
 
     # OSM PBF files have no CPU fallback (pyogrio/GDAL does not support PBF).
     if plan.format is IOFormat.OSM_PBF:
-        raise RuntimeError(
-            f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
-            "OSM PBF files (pyogrio/GDAL does not support this format). Ensure a "
-            "CUDA GPU is available and CuPy is installed."
-        )
+        gpu_failure = _latest_read_file_gpu_failure(fallback_start)
+        if osm_pyogrio_default and gpu_failure is not None:
+            detail = gpu_failure.detail or gpu_failure.reason
+            raise RuntimeError(
+                f"Cannot read OSM PBF file '{filename}': GPU OSM PBF read failed: {detail}"
+            )
+        if not osm_pyogrio_compat and not osm_pyogrio_default:
+            if gpu_failure is not None:
+                detail = gpu_failure.detail or gpu_failure.reason
+                raise RuntimeError(
+                    f"Cannot read OSM PBF file '{filename}': GPU OSM PBF read failed: {detail}"
+                )
+            raise RuntimeError(
+                f"Cannot read OSM PBF file '{filename}': GPU runtime is required for "
+                "full-data OSM PBF reads. Standard layered reads "
+                "(`points`, `lines`, `multipolygons`) can use the pyogrio "
+                "compatibility path; `layer=\"all\"` and native-only tag modes "
+                "require the GPU OSM reader."
+            )
 
     record_dispatch_event(
         surface="geopandas.read_file",
@@ -1960,14 +2448,32 @@ def read_vector_file(
         chosen_engine = api_file._check_engine(chosen_engine, "'read_file' function")
     from vibespatial.api.io.file import _read_file
 
+    if osm_pyogrio_default:
+        return _read_osm_pbf_supported_layers_public(
+            filename,
+            target_crs=target_crs,
+            geometry_only=osm_geometry_only,
+            tags=osm_tags,
+        )
+
+    read_kwargs = dict(kwargs)
+    read_columns = columns
+    if osm_pyogrio_compat:
+        read_columns, read_kwargs = _prepare_osm_pyogrio_kwargs(
+            layer=osm_layer,
+            tags=osm_tags,
+            columns=columns,
+            kwargs=kwargs,
+        )
+
     gdf = _read_file(
         filename,
         bbox=bbox,
         mask=mask,
-        columns=columns,
+        columns=read_columns,
         rows=rows,
         engine=chosen_engine,
-        **kwargs,
+        **read_kwargs,
     )
 
     # CPU post-read: reproject if target_crs was requested.

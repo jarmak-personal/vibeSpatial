@@ -5,7 +5,7 @@ import importlib.util
 import pandas as pd
 import pyarrow as pa
 import pytest
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import GeometryCollection, LineString, Point, Polygon
 
 import vibespatial.api as geopandas
 import vibespatial.io.geojson as io_geojson
@@ -19,13 +19,18 @@ from vibespatial import (
     read_shapefile_native,
     read_shapefile_owned,
 )
-from vibespatial.api._native_results import NativeTabularResult, _spatial_to_native_tabular_result
+from vibespatial.api._native_results import (
+    NativeAttributeTable,
+    NativeTabularResult,
+    _spatial_to_native_tabular_result,
+)
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.file import (
     _native_file_result_from_owned,
     _native_geojson_result_from_gpu_result,
     _pyogrio_arrow_wkb_to_native_tabular_result,
+    _read_osm_pbf_pyogrio_layer_public,
     plan_vector_file_io,
     read_vector_file,
     read_vector_file_native,
@@ -43,6 +48,19 @@ def _sample_frame() -> geopandas.GeoDataFrame:
         },
         crs="EPSG:4326",
     )
+
+
+def test_native_attribute_table_concat_harmonizes_string_widths() -> None:
+    left = NativeAttributeTable.from_value(
+        pa.table({"name": pa.array(["a"], type=pa.string())})
+    )
+    right = NativeAttributeTable.from_value(
+        pa.table({"name": pa.array(["b"], type=pa.large_string())})
+    )
+
+    concatenated = NativeAttributeTable.concat([left, right])
+
+    assert concatenated.to_pandas(copy=False)["name"].tolist() == ["a", "b"]
 
 
 @pytest.mark.gpu
@@ -180,6 +198,809 @@ def test_large_csv_wkt_read_prefers_pylibcudf_table_adapter(
     assert result.geometry.iloc[1].equals(Point(1, 1))
     assert events
     assert events[-1].implementation == "csv_pylibcudf_table_adapter"
+
+
+def test_osm_public_read_surfaces_gpu_failure_detail(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("osm-public-boom")
+
+    monkeypatch.setattr("vibespatial.io.file._try_gpu_read_file_native", _boom)
+
+    geopandas.clear_fallback_events()
+    with pytest.raises(RuntimeError, match="osm-public-boom"):
+        geopandas.read_file(path)
+
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    assert fallbacks
+    assert fallbacks[-1].surface == "geopandas.read_file"
+    assert fallbacks[-1].pipeline == "io/read_file"
+    assert "osm-public-boom" in fallbacks[-1].detail
+
+
+@pytest.mark.gpu
+def test_osm_native_read_uses_loader_backed_lossless_tag_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import cupy as cp
+
+    import vibespatial.io.osm_gpu as io_osm_gpu
+    from vibespatial.io import file as io_file
+
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+
+    class _FakeOsmResult:
+        nodes = None
+        node_ids = None
+        n_nodes = 0
+        node_tags = None
+        ways = from_shapely_geometries([LineString([(0, 0), (1, 1)])])
+        way_ids = cp.asarray([42], dtype=cp.int64)
+        way_tags = [{"name": "Main", "highway": "residential", "custom": "x"}]
+        n_ways = 1
+        relations = None
+        relation_ids = None
+        relation_tags = None
+        n_relations = 0
+
+    monkeypatch.setattr(io_osm_gpu, "read_osm_pbf", lambda *args, **kwargs: _FakeOsmResult())
+
+    payload = io_file._try_osm_pbf_gpu_read_native(path)
+
+    assert payload.attributes.loader is not None
+    assert "osm_element" in payload.attributes.columns
+    assert "osm_id" in payload.attributes.columns
+    assert "other_tags" in payload.attributes.columns
+
+    frame = payload.to_geodataframe()
+
+    assert frame["osm_element"].tolist() == ["way"]
+    assert frame["osm_id"].tolist() == [42]
+    assert frame["name"].tolist() == ["Main"]
+    assert frame["highway"].tolist() == ["residential"]
+    assert frame["other_tags"].tolist() == ['"custom"=>"x"']
+
+
+@pytest.mark.gpu
+def test_osm_public_read_projects_compatibility_schema_from_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import cupy as cp
+
+    import vibespatial.io.osm_gpu as io_osm_gpu
+
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+
+    class _FakeRuntime:
+        compute_capability = (8, 9)
+
+        def available(self) -> bool:
+            return True
+
+    class _FakeOsmResult:
+        nodes = None
+        node_ids = None
+        n_nodes = 0
+        node_tags = None
+        ways = from_shapely_geometries([LineString([(0, 0), (1, 1)])])
+        way_ids = cp.asarray([42], dtype=cp.int64)
+        way_tags = [{"name": "Main", "highway": "residential", "custom": "x"}]
+        n_ways = 1
+        relations = None
+        relation_ids = None
+        relation_tags = None
+        n_relations = 0
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(io_osm_gpu, "read_osm_pbf", lambda *args, **kwargs: _FakeOsmResult())
+
+    result = geopandas.read_file(path, layer="all")
+
+    assert "osm_way_id" in result.columns
+    assert "osm_element" not in result.columns
+    assert result["osm_way_id"].tolist() == [42]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_other_relations_tags_false_stays_on_pyogrio_layer_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.table({"geometry": [Point(0, 0).wkb]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    captured: dict[str, object] = {}
+
+    class _FakeRuntime:
+        compute_capability = (8, 9)
+
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **kwargs: (
+            captured.update(kwargs)
+            or ({"geometry_name": "geometry", "crs": "EPSG:4326"}, table)
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("supported relation layers should stay on the pyogrio layer path")
+        ),
+    )
+
+    payload = read_vector_file_native(
+        "example.osm.pbf",
+        layer="other_relations",
+        tags=False,
+        geometry_only=True,
+    )
+
+    assert captured["layer"] == "other_relations"
+    assert captured["columns"] == []
+    assert list(payload.attributes.columns) == []
+    assert payload.geometry.row_count == 1
+
+
+@pytest.mark.gpu
+def test_osm_public_read_projects_promoted_columns_and_other_tags(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries(
+            [
+                Point(0, 0),
+                LineString([(0, 0), (1, 1)]),
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            ]
+        ),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame(
+            {
+                "osm_element": ["node", "way", "relation"],
+                "osm_id": [100, 200, 300],
+                "name": ["Cafe", None, None],
+                "highway": [None, "primary", None],
+                "landuse": [None, None, "residential"],
+                "other_tags": ['"railway"=>"halt"', '"custom_way"=>"y"', '"custom_rel"=>"z"'],
+            }
+        ),
+    )
+
+    class _FakeRuntime:
+        compute_capability = (8, 9)
+
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_osm_pbf_supported_layers_native",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default public OSM read should use supported layers helper")
+        ),
+    )
+
+    result = geopandas.read_file(path)
+
+    assert result["osm_element"].tolist() == ["node", "way", "relation"]
+    assert result["osm_id"].tolist() == [100, 200, 300]
+    assert result["name"].iloc[0] == "Cafe"
+    assert pd.isna(result["name"].iloc[1])
+    assert pd.isna(result["name"].iloc[2])
+    assert pd.isna(result["highway"].iloc[0])
+    assert result["highway"].iloc[1] == "primary"
+    assert pd.isna(result["highway"].iloc[2])
+    assert pd.isna(result["landuse"].iloc[0])
+    assert pd.isna(result["landuse"].iloc[1])
+    assert result["landuse"].iloc[2] == "residential"
+    assert result["other_tags"].tolist() == [
+        '"railway"=>"halt"',
+        '"custom_way"=>"y"',
+        '"custom_rel"=>"z"',
+    ]
+    assert "custom_way" not in result.columns
+    assert "custom_rel" not in result.columns
+
+
+@pytest.mark.gpu
+def test_osm_read_forwards_tags_and_geometry_only_kwargs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+
+    captured: dict[str, object] = {}
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0)]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame(index=pd.RangeIndex(1)),
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    def _fake_supported_layers(*args, **kwargs):
+        captured.update(kwargs)
+        return payload
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("vibespatial.io.file._read_osm_pbf_supported_layers_native", _fake_supported_layers)
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default geometry-only OSM read should use supported layers helper")
+        ),
+    )
+
+    result = geopandas.read_file(path, tags=False, geometry_only=True)
+
+    assert list(result.columns) == ["geometry"]
+    assert captured == {"target_crs": None, "geometry_only": True, "tags": False}
+
+
+@pytest.mark.gpu
+def test_osm_public_read_supports_points_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+    table = pa.table(
+        {
+            "geometry": [Point(0, 0).wkb],
+            "osm_id": [100],
+            "name": ["Cafe"],
+            "other_tags": [None],
+        }
+    )
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    result = geopandas.read_file(path, layer="points")
+
+    assert len(result) == 1
+    assert result.geometry.iloc[0].equals(Point(0, 0))
+    assert result["osm_id"].tolist() == [100]
+    assert "osm_way_id" not in result.columns
+    assert "osm_element" not in result.columns
+
+
+@pytest.mark.gpu
+def test_osm_public_read_supports_multipolygons_layer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.osm.pbf"
+    path.write_bytes(b"")
+    table = pa.table(
+        {
+            "geometry": [
+                Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]).wkb,
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]).wkb,
+            ],
+            "osm_id": [None, 300],
+            "osm_way_id": [201, None],
+            "landuse": ["forest", "residential"],
+            "other_tags": ['"custom_way"=>"y"', None],
+        }
+    )
+    owned = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+            Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+        ]
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    result = geopandas.read_file(path, layer="multipolygons")
+
+    assert len(result) == 2
+    assert sorted(result["osm_way_id"].dropna().astype(int).tolist()) == [201]
+    assert sorted(result["osm_id"].dropna().astype(int).tolist()) == [300]
+    assert sorted(result["landuse"].dropna().tolist()) == ["forest", "residential"]
+    assert sorted(result["other_tags"].dropna().tolist()) == ['"custom_way"=>"y"']
+
+
+@pytest.mark.gpu
+def test_osm_native_bundle_builds_stable_partition_results() -> None:
+    import cupy as cp
+
+    from vibespatial.io.osm_bundle import build_osm_native_bundle
+
+    class _FakeOsmResult:
+        nodes = from_shapely_geometries([Point(0, 0)])
+        node_ids = cp.asarray([100], dtype=cp.int64)
+        n_nodes = 1
+        node_tags = [{"name": "Cafe", "railway": "halt"}]
+        ways = from_shapely_geometries([LineString([(0, 0), (1, 1)])])
+        way_ids = cp.asarray([200], dtype=cp.int64)
+        n_ways = 1
+        way_tags = [{"name": "Main", "highway": "primary", "custom_way": "y"}]
+        relations = from_shapely_geometries([Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])])
+        relation_ids = cp.asarray([300], dtype=cp.int64)
+        n_relations = 1
+        relation_tags = [{"type": "multipolygon", "landuse": "residential", "custom_rel": "z"}]
+
+    bundle = build_osm_native_bundle(_FakeOsmResult(), crs="EPSG:4326", source="sample.osm.pbf")
+
+    assert bundle.full_counts() == (1, 1, 1)
+
+    points = bundle.points.result.to_geodataframe()
+    ways = bundle.ways.result.to_geodataframe()
+    relations = bundle.relations.result.to_geodataframe()
+
+    assert points["osm_element"].tolist() == ["node"]
+    assert points["osm_id"].tolist() == [100]
+    assert points["name"].tolist() == ["Cafe"]
+    assert points["other_tags"].tolist() == ['"railway"=>"halt"']
+
+    assert ways["osm_element"].tolist() == ["way"]
+    assert ways["osm_id"].tolist() == [200]
+    assert ways["highway"].tolist() == ["primary"]
+    assert ways["other_tags"].tolist() == ['"custom_way"=>"y"']
+
+    assert relations["osm_element"].tolist() == ["relation"]
+    assert relations["osm_id"].tolist() == [300]
+    assert relations["landuse"].tolist() == ["residential"]
+    assert relations["other_tags"].tolist() == ['"custom_rel"=>"z"']
+
+
+@pytest.mark.gpu
+def test_osm_native_bundle_projects_public_compatibility_views() -> None:
+    import cupy as cp
+
+    from vibespatial.io.osm_bundle import build_osm_native_bundle
+
+    class _FakeOsmResult:
+        nodes = None
+        node_ids = None
+        n_nodes = 0
+        node_tags = None
+        ways = from_shapely_geometries(
+            [
+                LineString([(0, 0), (1, 1)]),
+                Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]),
+            ]
+        )
+        way_ids = cp.asarray([200, 201], dtype=cp.int64)
+        n_ways = 2
+        way_tags = [
+            {"highway": "primary"},
+            {"landuse": "forest", "custom_way": "y"},
+        ]
+        relations = from_shapely_geometries([Polygon([(4, 4), (5, 4), (5, 5), (4, 4)])])
+        relation_ids = cp.asarray([300], dtype=cp.int64)
+        n_relations = 1
+        relation_tags = [{"type": "multipolygon", "landuse": "residential"}]
+
+    bundle = build_osm_native_bundle(_FakeOsmResult(), crs="EPSG:4326", source="sample.osm.pbf")
+
+    multipolygons = bundle.to_native_tabular_result(layer="multipolygons").to_geodataframe()
+    assert sorted(multipolygons["osm_way_id"].dropna().astype(int).tolist()) == [201]
+    assert sorted(multipolygons["osm_id"].dropna().astype(int).tolist()) == [300]
+    assert sorted(multipolygons["landuse"].dropna().tolist()) == ["forest", "residential"]
+    assert sorted(multipolygons["other_tags"].dropna().tolist()) == ['"custom_way"=>"y"']
+
+    ways_only_bundle = build_osm_native_bundle(
+        type(
+            "_WaysOnlyResult",
+            (),
+            {
+                "nodes": None,
+                "node_ids": None,
+                "n_nodes": 0,
+                "node_tags": None,
+                "ways": _FakeOsmResult.ways,
+                "way_ids": _FakeOsmResult.way_ids,
+                "n_ways": _FakeOsmResult.n_ways,
+                "way_tags": _FakeOsmResult.way_tags,
+                "relations": None,
+                "relation_ids": None,
+                "n_relations": 0,
+                "relation_tags": None,
+            },
+        )(),
+        crs="EPSG:4326",
+        source="sample.osm.pbf",
+    )
+    all_view = ways_only_bundle.to_native_tabular_result(layer="all").to_geodataframe()
+    assert "osm_element" not in all_view.columns
+    assert "osm_way_id" in all_view.columns
+    assert "osm_id" not in all_view.columns
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_points_layer_prefers_pyogrio_arrow_gpu_wkb_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.table(
+        {
+            "geometry": [Point(0, 0).wkb],
+            "osm_id": [100],
+            "name": ["Cafe"],
+            "other_tags": [None],
+        }
+    )
+    owned = from_shapely_geometries([Point(0, 0)])
+    captured: dict[str, object] = {}
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **kwargs: (
+            captured.update(kwargs)
+            or ({"geometry_name": "geometry", "crs": "EPSG:4326"}, table)
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("standard OSM layers should not use the native parser")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file("example.osm.pbf", layer="points")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["osm_id"].tolist() == [100]
+    assert captured["layer"] == "points"
+    assert any(event.implementation.endswith("_pyogrio_arrow_gpu_wkb") for event in events)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_points_layer_geometry_only_maps_to_pyogrio_geometry_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.table({"geometry": [Point(0, 0).wkb]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    captured: dict[str, object] = {}
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **kwargs: (
+            captured.update(kwargs)
+            or ({"geometry_name": "geometry", "crs": "EPSG:4326"}, table)
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("standard OSM layers should not use the native parser")
+        ),
+    )
+
+    payload = read_vector_file_native("example.osm.pbf", layer="points", geometry_only=True)
+
+    assert captured["layer"] == "points"
+    assert captured["columns"] == []
+    assert list(payload.attributes.columns) == []
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_points_layer_tags_false_projects_only_osm_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    table = pa.table({"geometry": [Point(0, 0).wkb], "osm_id": [100]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    captured: dict[str, object] = {}
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **kwargs: (
+            captured.update(kwargs)
+            or ({"geometry_name": "geometry", "crs": "EPSG:4326"}, table)
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("supported OSM point layer with tags=False should stay on the pyogrio layer path")
+        ),
+    )
+
+    result = geopandas.read_file("example.osm.pbf", layer="points", tags=False)
+
+    assert captured["layer"] == "points"
+    assert captured["columns"] == ["osm_id"]
+    assert list(result.columns) == ["osm_id", "geometry"]
+    assert result["osm_id"].tolist() == [100]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_public_multipolygons_without_osm_way_id_stays_relation_shaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import geopandas as gpd
+
+    frame = gpd.GeoDataFrame(
+        {"osm_id": [300]},
+        geometry=[Polygon([(0, 0), (1, 0), (1, 1), (0, 0)])],
+        crs="EPSG:4326",
+    )
+
+    monkeypatch.setattr("pyogrio.read_dataframe", lambda *_args, **_kwargs: frame.copy())
+
+    result = _read_osm_pbf_pyogrio_layer_public(
+        "example.osm.pbf",
+        layer="multipolygons",
+        include_element_column=True,
+    )
+
+    assert result["osm_element"].tolist() == ["relation"]
+    assert result["osm_id"].tolist() == [300]
+
+
+def test_osm_points_layer_cpu_fallback_uses_pyogrio_compatibility_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_frame = geopandas.GeoDataFrame(
+        {"osm_id": [100]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+
+    class _NoGpuRuntime:
+        def available(self) -> bool:
+            return False
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _NoGpuRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("vibespatial.api.io.file._read_file", lambda *_args, **_kwargs: fallback_frame)
+
+    result = read_vector_file("example.osm.pbf", layer="points")
+
+    assert result.equals(fallback_frame)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_osm_other_relations_layer_uses_explicit_compatibility_bridge_for_geometrycollection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pyarrow as pa
+
+    from vibespatial.io.file import _read_osm_pbf_pyogrio_layer_native
+
+    metadata = {"geometry_name": "geometry", "crs": "EPSG:4326"}
+    table = pa.table({"geometry": pa.array([b"010100000000000000000000000000000000000000"], type=pa.binary())})
+    fallback_frame = geopandas.GeoDataFrame(
+        {"osm_id": [300], "osm_element": ["relation"]},
+        geometry=[GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])])],
+        crs="EPSG:4326",
+    )
+
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *args, **kwargs: (metadata, table),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._pyogrio_arrow_wkb_to_native_tabular_result",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            NotImplementedError("unsupported geometry family: GeometryCollection")
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_osm_pbf_pyogrio_layer_public",
+        lambda *args, **kwargs: fallback_frame,
+    )
+
+    geopandas.clear_fallback_events()
+    payload = _read_osm_pbf_pyogrio_layer_native("example.osm.pbf", layer="other_relations")
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.row_count == 1
+    assert payload.to_geodataframe()["osm_element"].tolist() == ["relation"]
+    assert fallbacks
+    assert fallbacks[-1].surface == "vibespatial.io.osm_pbf"
+    assert "GeometryCollection" in (fallbacks[-1].detail or "")
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_default_public_read_prefers_supported_layers_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0), LineString([(0, 0), (1, 1)])]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame(
+            {
+                "osm_element": ["node", "way"],
+                "osm_id": [100, 200],
+            }
+        ),
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_osm_pbf_supported_layers_native",
+        lambda *_args, **_kwargs: payload,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default OSM read should not hit the full native parser")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file("example.osm.pbf")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["osm_element"].tolist() == ["node", "way"]
+    assert any(event.implementation == "osm_pbf_pyogrio_supported_layers_gpu_wkb" for event in events)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
+def test_osm_default_public_read_tags_false_prefers_supported_layers_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0), LineString([(0, 0), (1, 1)])]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame(
+            {
+                "osm_element": ["node", "way"],
+                "osm_id": [100, 200],
+            }
+        ),
+    )
+    captured: dict[str, object] = {}
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    def _fake_supported_layers(*_args, **kwargs):
+        captured.update(kwargs)
+        return payload
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_osm_pbf_supported_layers_native",
+        _fake_supported_layers,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_osm_pbf_gpu_read_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default tags=False OSM read should not hit the full native parser")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file("example.osm.pbf", tags=False)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert captured == {"target_crs": None, "geometry_only": False, "tags": False}
+    assert result["osm_element"].tolist() == ["node", "way"]
+    assert any(event.implementation == "osm_pbf_pyogrio_supported_layers_gpu_wkb" for event in events)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_osm_default_read_without_gpu_uses_supported_layers_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_frame = geopandas.GeoDataFrame(
+        {"osm_element": ["node"], "osm_id": [100]},
+        geometry=[Point(0, 0)],
+        crs="EPSG:4326",
+    )
+
+    class _NoGpuRuntime:
+        def available(self) -> bool:
+            return False
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _NoGpuRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_osm_pbf_supported_layers_public",
+        lambda *_args, **_kwargs: fallback_frame,
+    )
+
+    result = read_vector_file("example.osm.pbf")
+
+    assert result.equals(fallback_frame)
 
 
 @pytest.mark.gpu

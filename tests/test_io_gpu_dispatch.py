@@ -591,7 +591,7 @@ def _build_test_pbf(
 
 
 class TestOsmPbfGpuDispatch:
-    """OSM PBF files must always route through GPU (no pyogrio fallback)."""
+    """Default OSM PBF reads stay native; standard layers may use pyogrio compatibility."""
 
     @needs_gpu
     def test_read_pbf_point_file(self, tmp_path) -> None:
@@ -658,7 +658,7 @@ class TestOsmPbfGpuDispatch:
         assert plan.format is IOFormat.OSM_PBF
 
     def test_read_pbf_without_gpu_raises(self, tmp_path, monkeypatch) -> None:
-        """PBF files must raise a clear error when GPU is not available."""
+        """Full-data PBF reads still require the native GPU path."""
         pbf_path = tmp_path / "nogpu.pbf"
         pbf_path.write_bytes(_build_test_pbf(
             id_deltas=[1], lat_deltas=[0], lon_deltas=[0],
@@ -666,11 +666,10 @@ class TestOsmPbfGpuDispatch:
 
         from vibespatial.io import file as io_file
 
-        monkeypatch.setattr(io_file, "_try_osm_pbf_gpu_read", lambda *a, **kw: None)
         monkeypatch.setattr(io_file, "_try_gpu_read_file", lambda *a, **kw: None)
 
         with pytest.raises(RuntimeError, match="GPU runtime is required"):
-            geopandas.read_file(pbf_path)
+            geopandas.read_file(pbf_path, layer="all")
 
 
 # ---------------------------------------------------------------------------

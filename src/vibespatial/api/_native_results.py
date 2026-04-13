@@ -307,11 +307,36 @@ class NativeAttributeTable:
         arrow_tables = [table.to_arrow(index=False) for table in tables]
         ordered_columns: list[str] = []
         column_types: dict[str, Any] = {}
+
+        def _promote_arrow_types(left, right):
+            if left == right:
+                return left
+            if pa.types.is_null(left):
+                return right
+            if pa.types.is_null(right):
+                return left
+            if (
+                (pa.types.is_string(left) and pa.types.is_large_string(right))
+                or (pa.types.is_large_string(left) and pa.types.is_string(right))
+            ):
+                return pa.large_string()
+            if (
+                (pa.types.is_binary(left) and pa.types.is_large_binary(right))
+                or (pa.types.is_large_binary(left) and pa.types.is_binary(right))
+            ):
+                return pa.large_binary()
+            return left
+
         for table in arrow_tables:
             for field in table.schema:
                 if field.name not in column_types:
                     column_types[field.name] = field.type
                     ordered_columns.append(field.name)
+                else:
+                    column_types[field.name] = _promote_arrow_types(
+                        column_types[field.name],
+                        field.type,
+                    )
 
         aligned_tables = []
         for table in arrow_tables:
@@ -319,7 +344,11 @@ class NativeAttributeTable:
             arrays = []
             for name in ordered_columns:
                 if name in table_columns:
-                    arrays.append(table[name])
+                    column = table[name]
+                    target_type = column_types[name]
+                    if column.type != target_type:
+                        column = column.cast(target_type)
+                    arrays.append(column)
                 else:
                     arrays.append(pa.nulls(table.num_rows, type=column_types[name]))
             aligned_tables.append(pa.table(arrays, names=ordered_columns))
