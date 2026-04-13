@@ -10,7 +10,6 @@ from vibespatial.constructive.clip_rect_cpu import (
     EMPTY,
     benchmark_clip_by_rect_baseline,
     clip_by_rect_array,
-    clip_rect_gpu_available,
     reconstruct_polygon_result_from_rings,
 )
 from vibespatial.constructive.clip_rect_cpu import (
@@ -48,6 +47,8 @@ from vibespatial.geometry.owned import (
     FamilyGeometryBuffer,
     OwnedGeometryArray,
     build_device_resident_owned,
+    build_null_owned_array,
+    concat_owned_scatter,
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
@@ -58,7 +59,7 @@ from vibespatial.runtime.precision import (
     PrecisionMode,
     PrecisionPlan,
 )
-from vibespatial.runtime.residency import combined_residency
+from vibespatial.runtime.residency import Residency, combined_residency
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
 
 from .point import (
@@ -1158,6 +1159,128 @@ def _build_line_clip_device_result(
         d_global_row_map = d_global_row_map[d_valid_geom_idx]
         line_count = valid_geom_count
 
+    def _compact_selected_runs(d_selected_run_indices):
+        selected_count = int(d_selected_run_indices.shape[0])
+        if selected_count == 0:
+            return None
+        d_selected_starts = d_geom_offsets[d_selected_run_indices].astype(cp.int64)
+        d_selected_ends = d_geom_offsets[d_selected_run_indices + 1].astype(cp.int64)
+        d_selected_lengths = (d_selected_ends - d_selected_starts).astype(cp.int32)
+        d_new_offsets = cp.empty(selected_count + 1, dtype=cp.int32)
+        d_new_offsets[0] = 0
+        d_new_offsets[1:] = cp.cumsum(d_selected_lengths).astype(cp.int32)
+        total_selected_coords = int(d_new_offsets[selected_count])
+        d_intra = cp.arange(total_selected_coords, dtype=cp.int64)
+        d_run_ids = cp.searchsorted(
+            d_new_offsets[1:].astype(cp.int64),
+            d_intra,
+            side="right",
+        )
+        d_gather = d_selected_starts[d_run_ids] + (
+            d_intra - d_new_offsets[d_run_ids].astype(cp.int64)
+        )
+        return (
+            d_flat_x[d_gather],
+            d_flat_y[d_gather],
+            d_new_offsets,
+        )
+
+    d_row_breaks = cp.empty(line_count, dtype=cp.bool_)
+    d_row_breaks[0] = True
+    if line_count > 1:
+        d_row_breaks[1:] = d_global_row_map[1:] != d_global_row_map[:-1]
+    d_row_starts = cp.flatnonzero(d_row_breaks).astype(cp.int64, copy=False)
+    compact_row_count = int(d_row_starts.shape[0])
+    d_unique_rows = d_global_row_map[d_row_starts]
+
+    if compact_row_count < line_count:
+        d_row_offsets = cp.empty(compact_row_count + 1, dtype=cp.int64)
+        d_row_offsets[:compact_row_count] = d_row_starts
+        d_row_offsets[compact_row_count] = line_count
+        d_row_run_counts = cp.diff(d_row_offsets).astype(cp.int32)
+        d_single_row_mask = d_row_run_counts == 1
+        d_multi_row_mask = d_row_run_counts > 1
+
+        output_validity = cp.ones(compact_row_count, dtype=cp.bool_)
+        d_single_prefix = (
+            cp.cumsum(d_single_row_mask.astype(cp.int32)).astype(cp.int32)
+            - d_single_row_mask.astype(cp.int32)
+        )
+        d_multi_prefix = (
+            cp.cumsum(d_multi_row_mask.astype(cp.int32)).astype(cp.int32)
+            - d_multi_row_mask.astype(cp.int32)
+        )
+        output_family_row_offsets = cp.where(
+            d_single_row_mask,
+            d_single_prefix,
+            d_multi_prefix,
+        ).astype(cp.int32)
+        output_tags = cp.where(
+            d_single_row_mask,
+            FAMILY_TAGS[GeometryFamily.LINESTRING],
+            FAMILY_TAGS[GeometryFamily.MULTILINESTRING],
+        ).astype(cp.int8)
+
+        device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+
+        if int(cp.sum(d_single_row_mask)) > 0:
+            d_single_run_indices = d_row_starts[d_single_row_mask]
+            single_compacted = _compact_selected_runs(d_single_run_indices)
+            if single_compacted is not None:
+                d_single_x, d_single_y, d_single_geom_offsets = single_compacted
+                device_families[GeometryFamily.LINESTRING] = DeviceFamilyGeometryBuffer(
+                    family=GeometryFamily.LINESTRING,
+                    x=d_single_x,
+                    y=d_single_y,
+                    geometry_offsets=d_single_geom_offsets,
+                    empty_mask=cp.zeros(d_single_run_indices.shape[0], dtype=cp.bool_),
+                    bounds=None,
+                )
+
+        if int(cp.sum(d_multi_row_mask)) > 0:
+            d_multi_row_starts = d_row_starts[d_multi_row_mask]
+            d_multi_part_counts = d_row_run_counts[d_multi_row_mask].astype(cp.int32)
+            multi_row_count = int(d_multi_row_starts.shape[0])
+            total_multi_parts = int(cp.sum(d_multi_part_counts))
+            d_multi_row_part_offsets = cp.empty(multi_row_count + 1, dtype=cp.int64)
+            d_multi_row_part_offsets[0] = 0
+            d_multi_row_part_offsets[1:] = cp.cumsum(d_multi_part_counts).astype(cp.int64)
+            d_multi_intra = cp.arange(total_multi_parts, dtype=cp.int64)
+            d_multi_row_ids = cp.searchsorted(
+                d_multi_row_part_offsets[1:],
+                d_multi_intra,
+                side="right",
+            )
+            d_multi_run_indices = d_multi_row_starts[d_multi_row_ids] + (
+                d_multi_intra - d_multi_row_part_offsets[d_multi_row_ids]
+            )
+            multi_compacted = _compact_selected_runs(d_multi_run_indices)
+            if multi_compacted is not None:
+                d_multi_x, d_multi_y, d_multi_part_offsets = multi_compacted
+                d_multi_geom_offsets = cp.empty(multi_row_count + 1, dtype=cp.int32)
+                d_multi_geom_offsets[0] = 0
+                d_multi_geom_offsets[1:] = cp.cumsum(d_multi_part_counts).astype(cp.int32)
+                device_families[GeometryFamily.MULTILINESTRING] = DeviceFamilyGeometryBuffer(
+                    family=GeometryFamily.MULTILINESTRING,
+                    x=d_multi_x,
+                    y=d_multi_y,
+                    geometry_offsets=d_multi_geom_offsets,
+                    empty_mask=cp.zeros(multi_row_count, dtype=cp.bool_),
+                    part_offsets=d_multi_part_offsets,
+                    bounds=None,
+                )
+
+        global_row_map = cp.asnumpy(d_unique_rows).astype(np.int32, copy=False)
+        oga = build_device_resident_owned(
+            device_families=device_families,
+            row_count=compact_row_count,
+            tags=output_tags,
+            validity=output_validity,
+            family_row_offsets=output_family_row_offsets,
+            execution_mode="gpu",
+        )
+        return oga, global_row_map
+
     # Transfer global_row_map to host (small metadata -- single D2H).
     # Caller needs host numpy for scatter into host result array.
     global_row_map = cp.asnumpy(d_global_row_map).astype(np.int32)
@@ -2188,32 +2311,50 @@ def evaluate_geopandas_clip_by_rect(
     ymax: float,
     *,
     prebuilt_owned: OwnedGeometryArray | None = None,
-) -> tuple[np.ndarray | None, ExecutionMode]:
+) -> tuple[OwnedGeometryArray | np.ndarray | None, ExecutionMode]:
     from vibespatial.runtime.execution_trace import execution_trace
 
     with execution_trace("clip_by_rect"):
-        geometries = np.asarray(values, dtype=object)
-        gpu_available = clip_rect_gpu_available(geometries, _POINT_TYPE_ID)
-
-        selection = plan_dispatch_selection(
-            kernel_name="clip_by_rect",
-            kernel_class=KernelClass.CONSTRUCTIVE,
-            row_count=len(geometries),
-            gpu_available=gpu_available,
+        geometries = None if prebuilt_owned is not None else np.asarray(values, dtype=object)
+        clip_input = prebuilt_owned if prebuilt_owned is not None else geometries
+        dispatch_mode = (
+            ExecutionMode.GPU
+            if (
+                prebuilt_owned is not None
+                and prebuilt_owned.residency is Residency.DEVICE
+            )
+            else ExecutionMode.AUTO
         )
         try:
-            clip_input = prebuilt_owned if prebuilt_owned is not None else geometries
             result = clip_by_rect_owned(
                 clip_input,
                 xmin,
                 ymin,
                 xmax,
                 ymax,
-                dispatch_mode=selection.selected,
+                dispatch_mode=dispatch_mode,
             )
         except NotImplementedError:
             return None, ExecutionMode.CPU
-        return np.asarray(result.geometries, dtype=object), selection.selected
+        if result.owned_result is not None and result.owned_result_rows is not None:
+            owned_result = result.owned_result
+            row_map = np.asarray(result.owned_result_rows, dtype=np.int64)
+            if (
+                owned_result.row_count != result.row_count
+                or row_map.size != result.row_count
+                or not np.array_equal(row_map, np.arange(result.row_count, dtype=np.int64))
+            ):
+                base = build_null_owned_array(
+                    result.row_count,
+                    residency=owned_result.residency,
+                )
+                owned_result = concat_owned_scatter(
+                    base,
+                    owned_result,
+                    row_map,
+                )
+            return owned_result, result.runtime_selection.selected
+        return np.asarray(result.geometries, dtype=object), result.runtime_selection.selected
 
 
 def benchmark_clip_by_rect(

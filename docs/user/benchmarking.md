@@ -145,6 +145,8 @@ vibeSpatial.  The script should `import geopandas as gpd` -- vsbench
 handles the import swap transparently.
 
 ```bash
+uv run vsbench shootout benchmarks/shootout/nearby_buildings.py --scale 10k --repeat 3
+uv run vsbench shootout benchmarks/shootout/accessibility_redevelopment.py --scale 10k --repeat 3
 uv run vsbench shootout examples/nearby_buildings.py --repeat 5
 uv run vsbench shootout my_etl.py --with pyogrio --json
 ```

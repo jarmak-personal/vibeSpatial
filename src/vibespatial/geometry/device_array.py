@@ -1435,6 +1435,7 @@ class DeviceGeometryArray(ExtensionArray):
         from vibespatial.constructive.clip_rect import clip_by_rect_owned
         from vibespatial.runtime import ExecutionMode, get_requested_mode
         from vibespatial.runtime.dispatch import record_dispatch_event
+        from vibespatial.runtime.residency import Residency
 
         requested_mode = get_requested_mode()
         families = set(self._owned.families)
@@ -1446,9 +1447,17 @@ class DeviceGeometryArray(ExtensionArray):
             or GeometryFamily.MULTIPOLYGON in families
         )
         dispatch_mode = (
+            ExecutionMode.GPU
+            if (
+                requested_mode is ExecutionMode.AUTO
+                and gpu_family_supported
+                and self._owned.residency is Residency.DEVICE
+            )
+            else (
             ExecutionMode.CPU
             if requested_mode is not ExecutionMode.GPU and not gpu_family_supported
             else requested_mode
+            )
         )
 
         result = clip_by_rect_owned(

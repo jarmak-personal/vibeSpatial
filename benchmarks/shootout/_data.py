@@ -320,6 +320,103 @@ def setup_fixtures(tmpdir: Path) -> dict[str, Path]:
     paths["transit"] = tmpdir / "transit.geojson"
     _write_geojson(transit_gdf, paths["transit"])
 
+    # --- Nearby-buildings WGS84 workflow fixture ---
+    # Use realistic lon/lat bounds so estimate_utm_crs() selects a stable
+    # Florida-adjacent zone and the public to_crs()/dwithin() workflow mirrors
+    # the real nearby_buildings example.
+    nearby_buildings = _make_grid_polygons(
+        scale,
+        seed=60,
+        bounds=(-82.75, 27.55, -82.15, 28.15),
+    )
+    nearby_buildings_gdf = gpd.GeoDataFrame(
+        {
+            "building_id": np.arange(len(nearby_buildings), dtype=np.int64),
+            "geometry": nearby_buildings,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["nearby_buildings"] = tmpdir / "nearby_buildings.geojson"
+    _write_geojson(nearby_buildings_gdf, paths["nearby_buildings"])
+
+    # --- Long public-API redevelopment workflow fixtures ---
+    access_bounds = (-82.50, 27.74, -82.30, 27.94)
+    xmin, ymin, xmax, ymax = access_bounds
+
+    access_buildings = _make_grid_polygons(scale, seed=70, bounds=access_bounds)
+    access_buildings_gdf = gpd.GeoDataFrame(
+        {
+            "building_id": np.arange(len(access_buildings), dtype=np.int64),
+            "geometry": access_buildings,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["access_buildings"] = tmpdir / "access_buildings.geojson"
+    _write_geojson(access_buildings_gdf, paths["access_buildings"])
+
+    access_parcels = _make_grid_polygons(scale, seed=71, bounds=access_bounds)
+    access_parcels_gdf = gpd.GeoDataFrame(
+        {
+            "parcel_id": np.arange(len(access_parcels), dtype=np.int64),
+            "geometry": access_parcels,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["access_parcels"] = tmpdir / "access_parcels.parquet"
+    _write_parquet(access_parcels_gdf, paths["access_parcels"])
+
+    access_transit = _make_clustered_points(
+        max(scale // 25, 4),
+        seed=72,
+        clusters=6,
+        bounds=access_bounds,
+    )
+    access_transit_gdf = gpd.GeoDataFrame(
+        {
+            "station_id": np.arange(len(access_transit), dtype=np.int64),
+            "geometry": access_transit,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["access_transit"] = tmpdir / "access_transit.geojson"
+    _write_geojson(access_transit_gdf, paths["access_transit"])
+
+    access_exclusions = _make_convex_polygons(
+        max(scale // 40, 3),
+        seed=73,
+        clusters=5,
+        vertices=7,
+        bounds=access_bounds,
+    )
+    access_exclusions_gdf = gpd.GeoDataFrame(
+        {
+            "exclusion_id": np.arange(len(access_exclusions), dtype=np.int64),
+            "geometry": access_exclusions,
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["access_exclusions"] = tmpdir / "access_exclusions.parquet"
+    _write_parquet(access_exclusions_gdf, paths["access_exclusions"])
+
+    access_admin = _make_star_polygons(
+        1,
+        seed=74,
+        vertices=12,
+        bounds=(xmin + 0.015, ymin + 0.015, xmax - 0.015, ymax - 0.015),
+    )
+    access_admin_gdf = gpd.GeoDataFrame(
+        {"admin_name": ["Access Region"], "geometry": access_admin},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    paths["access_admin_boundary"] = tmpdir / "access_admin_boundary.geojson"
+    _write_geojson(access_admin_gdf, paths["access_admin_boundary"])
+
     return paths
 
 

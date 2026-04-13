@@ -75,6 +75,33 @@ def test_gpu_overlay_intersection_handles_duplicate_vertices() -> None:
 
 
 @pytest.mark.gpu
+def test_gpu_overlay_intersection_matches_shapely_for_identical_triangle() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    triangle = Polygon(
+        [
+            (359036.0245962905, 3078223.402831343),
+            (358786.6047957712, 3078226.3176687625),
+            (359038.72934487346, 3078455.3271121616),
+            (359036.0245962905, 3078223.402831343),
+        ]
+    )
+    left = from_shapely_geometries([triangle])
+    right = from_shapely_geometries([triangle])
+
+    actual = overlay_intersection_owned(left, right, dispatch_mode=ExecutionMode.GPU)
+    expected = shapely.intersection(
+        np.asarray(left.to_shapely(), dtype=object),
+        np.asarray(right.to_shapely(), dtype=object),
+    )
+
+    _assert_geometry_lists_equal(actual.to_shapely(), expected.tolist())
+    coords = shapely.get_coordinates(actual.to_shapely()[0])
+    assert np.isfinite(coords).all()
+
+
+@pytest.mark.gpu
 def test_gpu_overlay_intersection_drops_null_and_empty_rows() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")

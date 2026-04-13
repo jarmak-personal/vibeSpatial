@@ -1450,10 +1450,48 @@ class GeometryArray(ExtensionArray):
     #
 
     def clip_by_rect(self, xmin, ymin, xmax, ymax) -> GeometryArray:
-        owned, selected = evaluate_geopandas_clip_by_rect(
-            self._data, xmin, ymin, xmax, ymax, prebuilt_owned=self._owned,
+        prebuilt_owned = self._owned
+        from vibespatial.runtime._runtime import has_gpu_runtime
+
+        if has_gpu_runtime():
+            geom_types = np.asarray(self.geom_type, dtype=object)
+            supported_mask = pd.isna(geom_types) | np.isin(
+                geom_types,
+                tuple(POINT_GEOM_TYPES | LINE_GEOM_TYPES | POLYGON_GEOM_TYPES),
+            )
+            if bool(np.asarray(supported_mask, dtype=bool).all()):
+                if prebuilt_owned is None:
+                    try:
+                        prebuilt_owned = self.to_owned()
+                    except Exception:
+                        prebuilt_owned = None
+                if prebuilt_owned is not None:
+                    families = set(prebuilt_owned.families)
+                    gpu_family_supported = (
+                        (GeometryFamily.POINT in families and len(families) == 1)
+                        or GeometryFamily.LINESTRING in families
+                        or GeometryFamily.MULTILINESTRING in families
+                        or GeometryFamily.POLYGON in families
+                        or GeometryFamily.MULTIPOLYGON in families
+                    )
+                else:
+                    gpu_family_supported = False
+            else:
+                gpu_family_supported = False
+            if gpu_family_supported and prebuilt_owned is not None:
+                from vibespatial.runtime.residency import Residency, TransferTrigger
+
+                if prebuilt_owned.residency is not Residency.DEVICE:
+                    prebuilt_owned.move_to(
+                        Residency.DEVICE,
+                        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                        reason="geopandas.array.clip_by_rect selected GPU-native rectangle clip",
+                    )
+
+        clipped, selected = evaluate_geopandas_clip_by_rect(
+            self._data, xmin, ymin, xmax, ymax, prebuilt_owned=prebuilt_owned,
         )
-        if owned is None:
+        if clipped is None:
             record_dispatch_event(
                 surface="geopandas.array.clip_by_rect",
                 operation="clip_by_rect",
@@ -1461,6 +1499,10 @@ class GeometryArray(ExtensionArray):
                 reason="owned rectangle-clip path is not host-competitive yet",
                 detail=f"rows={len(self)}",
                 selected=ExecutionMode.CPU,
+            )
+            return GeometryArray(
+                shapely.clip_by_rect(self._data, xmin, ymin, xmax, ymax),
+                crs=self.crs,
             )
         else:
             record_dispatch_event(
@@ -1471,10 +1513,16 @@ class GeometryArray(ExtensionArray):
                 detail=f"rows={len(self)}",
                 selected=selected,
             )
-        return GeometryArray(
-            shapely.clip_by_rect(self._data, xmin, ymin, xmax, ymax) if owned is None else owned,
-            crs=self.crs,
-        )
+
+        if isinstance(clipped, OwnedGeometryArray):
+            from vibespatial.geometry.device_array import DeviceGeometryArray
+            from vibespatial.runtime.residency import Residency
+
+            if clipped.residency is Residency.DEVICE:
+                return DeviceGeometryArray._from_owned(clipped, crs=self.crs)
+            return GeometryArray.from_owned(clipped, crs=self.crs)
+
+        return GeometryArray(clipped, crs=self.crs)
 
     def difference(self, other, grid_size=None) -> GeometryArray:
         return self._constructive_or_fallback("difference", other, grid_size=grid_size)

@@ -105,6 +105,48 @@ def test_strict_native_shootout_scripts_do_not_need_compat_env(
 
 
 @pytest.mark.gpu
+def test_strict_native_nearby_buildings_matches_baseline() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    script = Path("benchmarks/shootout") / "nearby_buildings.py"
+    with strict_native_environment():
+        result = run_shootout(
+            script,
+            repeat=1,
+            warmup=False,
+            scale="200",
+            timeout=300,
+            quiet=True,
+        )
+
+    assert result.status == "pass"
+    assert result.vibespatial.error is None
+    assert result.metadata.get("fingerprint") == "match"
+
+
+@pytest.mark.gpu
+def test_strict_native_accessibility_redevelopment_matches_baseline() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    script = Path("benchmarks/shootout") / "accessibility_redevelopment.py"
+    with strict_native_environment():
+        result = run_shootout(
+            script,
+            repeat=1,
+            warmup=False,
+            scale="200",
+            timeout=300,
+            quiet=True,
+        )
+
+    assert result.status == "pass"
+    assert result.vibespatial.error is None
+    assert result.metadata.get("fingerprint") == "match"
+
+
+@pytest.mark.gpu
 def test_strict_native_transit_service_gap_matches_baseline() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU required")

@@ -99,6 +99,19 @@ def _assert_owned_row_mapping_valid(series: GeoSeries) -> None:
     assert not device_bad_rows, f"owned device row mapping invalid: {device_bad_rows}"
 
 
+def _assert_all_geometry_coordinates_finite(series: GeoSeries) -> None:
+    for row_index, geom in enumerate(np.asarray(series.array, dtype=object)):
+        if geom is None:
+            continue
+        coords = shapely.get_coordinates(geom)
+        if coords.size == 0:
+            continue
+        assert np.isfinite(coords).all(), f"row {row_index} contained non-finite coordinates"
+        assert float(np.abs(coords).max()) < 1.0e7, (
+            f"row {row_index} contained implausible coordinate magnitude"
+        )
+
+
 def test_geometry_array_owned_supports_spatial_input_without_materialization() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
@@ -1127,6 +1140,141 @@ def test_overlay_difference_redevelopment_like_followup_overlay_stays_strict_nat
     zoned["zone_group"] = zoned["zone_type"].astype(str)
     dissolved = zoned.dissolve(by="zone_group").reset_index()
     assert dissolved.geometry.is_valid.all()
+
+
+def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwise_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from _data import setup_fixtures
+
+    polygonal_types = ["Polygon", "MultiPolygon"]
+    max_nearest_distance_m = 1_800.0
+    transit_buffer_m = 900.0
+
+    monkeypatch.setenv("VSBENCH_SCALE", "1000")
+    fixtures = setup_fixtures(tmp_path)
+
+    buildings = read_file(fixtures["access_buildings"])
+    parcels = vibespatial.read_parquet(fixtures["access_parcels"])
+    transit = read_file(fixtures["access_transit"])
+    exclusions = vibespatial.read_parquet(fixtures["access_exclusions"])
+    admin = read_file(fixtures["access_admin_boundary"])
+
+    utm_crs = buildings.geometry.estimate_utm_crs()
+    buildings = buildings.to_crs(utm_crs)
+    parcels = parcels.to_crs(utm_crs)
+    transit = transit.to_crs(utm_crs)
+    exclusions = exclusions.to_crs(utm_crs)
+    admin = admin.to_crs(utm_crs)
+
+    buildings = geopandas.clip(buildings, admin)
+    parcels = geopandas.clip(parcels, admin)
+    buildings = buildings[buildings.geometry.geom_type.isin(polygonal_types)].copy()
+    parcels = parcels[parcels.geometry.geom_type.isin(polygonal_types)].copy()
+
+    building_points = buildings[["building_id", "geometry"]].copy()
+    building_points["geometry"] = buildings.geometry.centroid
+
+    nearest = building_points.sjoin_nearest(
+        transit[["station_id", "geometry"]],
+        how="inner",
+        max_distance=max_nearest_distance_m,
+        distance_col="station_distance_m",
+    )
+    nearest = nearest.sort_values(
+        ["building_id", "station_distance_m", "station_id"]
+    ).drop_duplicates("building_id")
+
+    nearby_building_ids = nearest.loc[
+        nearest["station_distance_m"] <= max_nearest_distance_m,
+        "building_id",
+    ].drop_duplicates()
+    nearby_buildings = buildings[
+        buildings["building_id"].isin(nearby_building_ids)
+    ].copy()
+
+    transit_buffers = transit.copy()
+    transit_buffers["geometry"] = transit_buffers.geometry.buffer(transit_buffer_m)
+
+    developable = overlay(parcels, exclusions, how="difference")
+    developable = developable[
+        developable.geometry.geom_type.isin(polygonal_types)
+    ].copy()
+
+    served = geopandas.sjoin(
+        developable,
+        transit_buffers[["station_id", "geometry"]],
+        predicate="intersects",
+    )
+    served_rows = served.index.unique()
+    served_parcels = (
+        developable.loc[served_rows].copy()
+        if len(served_rows) > 0
+        else developable.iloc[:0].copy()
+    )
+
+    left = served_parcels[["parcel_id", "geometry"]]
+    right = nearby_buildings[["building_id", "geometry"]]
+
+    actual = overlay(left, right, how="intersection")
+    _assert_all_geometry_coordinates_finite(actual.geometry)
+
+    left_owned, right_owned = overlay_module._extract_owned_pair(left, right)
+    index_result = overlay_module._intersecting_index_pairs(
+        left,
+        right,
+        left_owned=left_owned,
+        right_owned=right_owned,
+    )
+    if isinstance(index_result, np.ndarray) and index_result.ndim == 2:
+        idx1, idx2 = index_result
+    else:
+        idx1, idx2 = index_result
+    idx1 = np.asarray(idx1, dtype=np.intp)
+    idx2 = np.asarray(idx2, dtype=np.intp)
+
+    pair_left = left.iloc[idx1].reset_index(drop=True)
+    pair_right = right.iloc[idx2].reset_index(drop=True)
+    exact_values = np.asarray(
+        shapely.intersection(
+            np.asarray(pair_left.geometry.array, dtype=object),
+            np.asarray(pair_right.geometry.array, dtype=object),
+        ),
+        dtype=object,
+    )
+    keep_mask = np.array(
+        [
+            geom is not None
+            and not shapely.is_empty(geom)
+            and geom.geom_type in polygonal_types
+            for geom in exact_values
+        ],
+        dtype=bool,
+    )
+
+    expected = GeoDataFrame(
+        {
+            "parcel_id": pair_left.loc[keep_mask, "parcel_id"].to_numpy(),
+            "building_id": pair_right.loc[keep_mask, "building_id"].to_numpy(),
+            "geometry": exact_values[keep_mask],
+        },
+        geometry="geometry",
+        crs=left.crs,
+    ).sort_values(["parcel_id", "building_id"]).reset_index(drop=True)
+    actual = actual.sort_values(["parcel_id", "building_id"]).reset_index(drop=True)
+
+    assert len(actual) == 4
+    assert len(actual) == len(expected)
+    assert actual[["parcel_id", "building_id"]].equals(expected[["parcel_id", "building_id"]])
+    for actual_geom, expected_geom in zip(actual.geometry, expected.geometry, strict=True):
+        assert shapely.normalize(actual_geom).equals_exact(
+            shapely.normalize(expected_geom),
+            tolerance=1e-6,
+        )
 
 
 def test_binary_constructive_intersection_stays_strict_native_for_multipolygon_polygon_batch() -> None:

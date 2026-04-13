@@ -3896,6 +3896,7 @@ def _overlay_intersection_native(
             and not prefer_exact_polygon_gpu
             and idx1.size > 0
             and idx1.size <= _OVERLAY_HOST_EXACT_PAIR_BATCH_MAX_ROWS
+            and not has_gpu_runtime()
         ):
             pairwise_selection = plan_dispatch_selection(
                 kernel_name="overlay_pairwise",

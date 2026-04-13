@@ -215,7 +215,7 @@ def test_strict_viewport_matrix_documents_current_public_api_behavior(
 
 
 @pytest.mark.gpu
-def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_gpu_intersection(
+def test_strict_clip_box_line_fixture_uses_direct_bbox_candidates_before_gpu_intersection(
     tmp_path: Path,
 ) -> None:
     _require_gpu_runtime()
@@ -243,7 +243,7 @@ def test_strict_clip_box_line_fixture_reaches_public_sindex_query_before_gpu_int
     assert by_surface["geodataframe.clip(box)"].strict_fallback is False
     assert by_surface["geodataframe.clip(box)"].result_len == 1
     assert sindex._tree is None
-    assert any(event.surface == "geopandas.sindex.query" for event in events)
+    assert not any(event.surface == "geopandas.sindex.query" for event in events)
     assert any(
         event.surface == "geopandas.array.intersection"
         and event.implementation == "binary_constructive_gpu"
@@ -322,7 +322,7 @@ def test_strict_clip_concave_polygon_mask_matches_shapely_fixture(
     expected_norm = shapely.normalize(expected_geoms[keep])
 
     with strict_native_environment():
-        result = vibespatial.clip(buildings, admin)
+        result = vibespatial.clip(buildings, admin, sort=True)
 
     assert int(result.geometry.isna().sum()) == 0
     assert result.index.to_numpy().tolist() == expected_index.tolist()
@@ -609,7 +609,7 @@ def test_strict_overlay_polygon_query_requests_device_indices(
 
 
 @pytest.mark.gpu
-def test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_gpu_intersection(
+def test_strict_clip_box_mixed_fixture_uses_direct_bbox_candidates_before_gpu_intersection(
     tmp_path: Path,
 ) -> None:
     _require_gpu_runtime()
@@ -637,7 +637,7 @@ def test_strict_clip_box_mixed_fixture_reaches_public_sindex_query_before_gpu_in
     assert by_surface["geodataframe.clip(box)"].strict_fallback is False
     assert by_surface["geodataframe.clip(box)"].result_len == 3
     assert sindex._tree is None
-    assert any(event.surface == "geopandas.sindex.query" for event in events)
+    assert not any(event.surface == "geopandas.sindex.query" for event in events)
     assert any(
         event.surface == "geopandas.array.intersection"
         and event.implementation == "binary_constructive_gpu"

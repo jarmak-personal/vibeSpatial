@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, MultiPoint, Point, Polygon, box
+from shapely.geometry import LineString, MultiLineString, MultiPoint, Point, Polygon, box
 
 import vibespatial.api as geopandas
 import vibespatial.geometry.owned as owned_mod
@@ -109,6 +109,59 @@ def test_geopandas_clip_by_rect_surface_is_observable_when_row_fallback_happens(
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.array.clip_by_rect"
     assert dispatch_events[-1].implementation == "owned_clip_by_rect"
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    ("values", "bounds"),
+    [
+        ([Point(1, 1), Point(5, 5)], (0.0, 0.0, 2.0, 2.0)),
+        ([LineString([(0, 0), (3, 3)]), LineString([(5, 5), (6, 6)])], (0.0, 0.0, 2.0, 2.0)),
+        ([box(0, 0, 4, 4), box(10, 10, 12, 12)], (0.0, 0.0, 2.0, 2.0)),
+    ],
+)
+def test_geometry_array_clip_by_rect_promotes_supported_host_families_to_device(
+    values,
+    bounds,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    xmin, ymin, xmax, ymax = bounds
+    array = geopandas.GeoSeries(values, crs="EPSG:4326").values
+
+    result = array.clip_by_rect(xmin, ymin, xmax, ymax)
+
+    assert isinstance(result, DeviceGeometryArray)
+    assert result.owned.residency is Residency.DEVICE
+    assert result.owned.device_state is not None
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), xmin, ymin, xmax, ymax)
+    expected_list = [None if geom is not None and geom.is_empty else geom for geom in expected.tolist()]
+    _assert_geometries_match(list(result.owned.to_shapely()), expected_list)
+
+
+@pytest.mark.gpu
+def test_geometry_array_clip_by_rect_preserves_multiline_parts_on_device() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        MultiLineString(
+            [
+                [(1.0, 1.0), (2.0, 2.0), (3.0, 2.0), (5.0, 3.0)],
+                [(3.0, 4.0), (5.0, 7.0), (12.0, 2.0), (10.0, 5.0), (9.0, 7.5)],
+            ]
+        )
+    ]
+    array = geopandas.GeoSeries(values, crs="EPSG:4326").values
+
+    result = array.clip_by_rect(0.0, 0.0, 10.0, 10.0)
+
+    assert isinstance(result, DeviceGeometryArray)
+    assert result.owned.residency is Residency.DEVICE
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 10.0, 10.0)
+    expected_list = [None if geom is not None and geom.is_empty else geom for geom in expected.tolist()]
+    _assert_geometries_match(list(result.owned.to_shapely()), expected_list)
 
 
 def test_clip_by_rect_benchmark_reports_candidate_and_fallback_counts() -> None:

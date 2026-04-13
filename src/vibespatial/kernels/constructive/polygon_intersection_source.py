@@ -30,6 +30,32 @@ __device__ double cross_sign(
     return (ex1 - ex0) * (py - ey0) - (ey1 - ey0) * (px - ex0);
 }
 
+__device__ __forceinline__ double side_epsilon(
+    double px, double py,
+    double ex0, double ey0,
+    double ex1, double ey1
+) {
+    const double edge_scale = fabs(ex1 - ex0) + fabs(ey1 - ey0);
+    const double point_scale = fabs(px - ex0) + fabs(py - ey0);
+    return 1e-12 * fmax(1.0, edge_scale * point_scale);
+}
+
+__device__ __forceinline__ int classify_side(
+    double px, double py,
+    double ex0, double ey0,
+    double ex1, double ey1
+) {
+    const double side = cross_sign(px, py, ex0, ey0, ex1, ey1);
+    const double eps = side_epsilon(px, py, ex0, ey0, ex1, ey1);
+    if (side > eps) {
+        return 1;
+    }
+    if (side < -eps) {
+        return -1;
+    }
+    return 0;
+}
+
 __device__ void line_intersect(
     double ax, double ay,
     double bx, double by,
@@ -47,7 +73,11 @@ __device__ void line_intersect(
     double c2 = a2 * cx + b2 * cy;
 
     double det = a1 * b2 - a2 * b1;
-    if (fabs(det) < 1e-15) {
+    const double coeff_scale = fmax(
+        fabs(a1) + fabs(b1),
+        fabs(a2) + fabs(b2)
+    );
+    if (fabs(det) <= 1e-12 * fmax(1.0, coeff_scale * coeff_scale)) {
         /* Parallel lines -- use midpoint of the shared segment. */
         *ix = (ax + bx) * 0.5;
         *iy = (ay + by) * 0.5;
@@ -107,6 +137,31 @@ __device__ __forceinline__ int collapse_redundant_vertices(
         write--;
     }
     return write;
+}
+
+__device__ __forceinline__ void append_intersection_vertex(
+    double* out_x,
+    double* out_y,
+    int* out_count,
+    double sx, double sy,
+    double px, double py,
+    double ex0, double ey0,
+    double ex1, double ey1,
+    int s_side,
+    int p_side
+) {
+    if (s_side == 0) {
+        append_unique_vertex(out_x, out_y, out_count, sx, sy);
+        return;
+    }
+    if (p_side == 0) {
+        append_unique_vertex(out_x, out_y, out_count, px, py);
+        return;
+    }
+
+    double ix, iy;
+    line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
+    append_unique_vertex(out_x, out_y, out_count, ix, iy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -218,25 +273,33 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_count(
             double sx = in_x[i], sy = in_y[i];
             double px = in_x[j], py = in_y[j];
 
-            double s_side = wsign * cross_sign(sx, sy, ex0, ey0, ex1, ey1);
-            double p_side = wsign * cross_sign(px, py, ex0, ey0, ex1, ey1);
+            int s_side = classify_side(sx, sy, ex0, ey0, ex1, ey1);
+            int p_side = classify_side(px, py, ex0, ey0, ex1, ey1);
+            s_side = (int)wsign * s_side;
+            p_side = (int)wsign * p_side;
 
-            if (s_side >= 0.0) {
+            if (s_side >= 0) {
                 /* S is inside */
                 append_unique_vertex(out_x, out_y, &out_count, sx, sy);
-                if (p_side < 0.0) {
+                if (p_side < 0) {
                     /* S inside, P outside -> emit intersection */
-                    double ix, iy;
-                    line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    append_unique_vertex(out_x, out_y, &out_count, ix, iy);
+                    append_intersection_vertex(
+                        out_x, out_y, &out_count,
+                        sx, sy, px, py,
+                        ex0, ey0, ex1, ey1,
+                        s_side, p_side
+                    );
                 }
             } else {
                 /* S is outside */
-                if (p_side >= 0.0) {
+                if (p_side >= 0) {
                     /* S outside, P inside -> emit intersection then P */
-                    double ix, iy;
-                    line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    append_unique_vertex(out_x, out_y, &out_count, ix, iy);
+                    append_intersection_vertex(
+                        out_x, out_y, &out_count,
+                        sx, sy, px, py,
+                        ex0, ey0, ex1, ey1,
+                        s_side, p_side
+                    );
                 }
             }
         }
@@ -352,21 +415,29 @@ extern "C" __global__ __launch_bounds__(256, 2) void polygon_intersection_scatte
             double sx = in_x[i], sy = in_y[i];
             double px = in_x[j], py = in_y[j];
 
-            double s_side = wsign * cross_sign(sx, sy, ex0, ey0, ex1, ey1);
-            double p_side = wsign * cross_sign(px, py, ex0, ey0, ex1, ey1);
+            int s_side = classify_side(sx, sy, ex0, ey0, ex1, ey1);
+            int p_side = classify_side(px, py, ex0, ey0, ex1, ey1);
+            s_side = (int)wsign * s_side;
+            p_side = (int)wsign * p_side;
 
-            if (s_side >= 0.0) {
+            if (s_side >= 0) {
                 append_unique_vertex(out_bx, out_by, &out_count, sx, sy);
-                if (p_side < 0.0) {
-                    double ix, iy;
-                    line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    append_unique_vertex(out_bx, out_by, &out_count, ix, iy);
+                if (p_side < 0) {
+                    append_intersection_vertex(
+                        out_bx, out_by, &out_count,
+                        sx, sy, px, py,
+                        ex0, ey0, ex1, ey1,
+                        s_side, p_side
+                    );
                 }
             } else {
-                if (p_side >= 0.0) {
-                    double ix, iy;
-                    line_intersect(sx, sy, px, py, ex0, ey0, ex1, ey1, &ix, &iy);
-                    append_unique_vertex(out_bx, out_by, &out_count, ix, iy);
+                if (p_side >= 0) {
+                    append_intersection_vertex(
+                        out_bx, out_by, &out_count,
+                        sx, sy, px, py,
+                        ex0, ey0, ex1, ey1,
+                        s_side, p_side
+                    );
                 }
             }
         }
