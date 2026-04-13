@@ -653,6 +653,12 @@ def run_shootout(
                 has_error = True
 
     meta: dict[str, Any] = {"repeat": repeat, "warmup": warmup}
+    if not warmup and repeat < 3:
+        meta["measurement_mode"] = "cold_start_probe"
+        meta["measurement_note"] = (
+            "repeat<3 with warmup disabled is cold-start sensitive; "
+            "use warmup or repeat>=3 for steady-state parity comparisons"
+        )
     if scale is not None:
         meta["scale"] = scale
     meta["vibespatial_launch"] = launch_mode

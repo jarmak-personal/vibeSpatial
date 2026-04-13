@@ -162,6 +162,10 @@ is the supported launch mode.
 | `--with DEP` | none | Extra pip deps for the geopandas env (repeatable) |
 | `--timeout` | 300 | Per-run timeout in seconds |
 
+For workflow parity checks, treat `--no-warmup --repeat 1` as a cold-start
+probe, not a steady-state benchmark. The default `--repeat 3` is the right
+floor for judging parity on the top-level workflow shootouts.
+
 #### Fingerprint correctness checking
 
 Scripts can print a deterministic summary line to stdout:

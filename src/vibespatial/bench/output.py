@@ -380,6 +380,17 @@ def _fingerprint_label(result: Any) -> str | None:
     return "MATCH" if fp == "match" else "MISMATCH"
 
 
+def _shootout_measurement_note(result: Any) -> str | None:
+    if result.metadata.get("measurement_mode") != "cold_start_probe":
+        return None
+    return str(
+        result.metadata.get(
+            "measurement_note",
+            "repeat<3 with warmup disabled is a cold-start probe",
+        )
+    )
+
+
 def _render_shootout_quiet(result: Any) -> str:
     status = "PASS" if result.status == "pass" else "ERR"
     parts = [
@@ -394,6 +405,9 @@ def _render_shootout_quiet(result: Any) -> str:
     fp = _fingerprint_label(result)
     if fp:
         parts.append(f"fingerprint={fp}")
+    note = _shootout_measurement_note(result)
+    if note:
+        parts.append("mode=cold-start")
     return " ".join(parts)
 
 
@@ -423,6 +437,9 @@ def _render_shootout_plain(result: Any) -> str:
     fp = _fingerprint_label(result)
     if fp:
         lines.append(f"  Fingerprint: {fp}")
+    note = _shootout_measurement_note(result)
+    if note:
+        lines.append(f"  Note: {note}")
     return "\n".join(lines)
 
 
@@ -475,6 +492,16 @@ def _render_shootout_rich(result: Any) -> str:
             "Fingerprint",
             f"[{fp_style}]{fp}[/]",
             "", "", "", "",
+        )
+    note = _shootout_measurement_note(result)
+    if note:
+        table.add_row(
+            "Note",
+            note,
+            "",
+            "",
+            "",
+            "",
         )
 
     console = Console(file=None, force_terminal=False)

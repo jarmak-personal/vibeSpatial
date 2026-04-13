@@ -10,8 +10,9 @@ from pathlib import Path
 import pytest
 
 from vibespatial.bench.cli import main as vsbench_main
+from vibespatial.bench.output import render_shootout
 from vibespatial.bench.schema import timing_from_samples
-from vibespatial.bench.shootout import ShootoutRun, _run_harness, run_shootout
+from vibespatial.bench.shootout import ShootoutResult, ShootoutRun, _run_harness, run_shootout
 from vibespatial.cuda.cccl_precompile import SPEC_REGISTRY
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.testing import strict_native_environment
@@ -291,3 +292,60 @@ def test_shootout_in_process_retry_keeps_full_precompile(
     assert result.status == "pass"
     assert result.metadata["vibespatial_launch"] == "in_process_retry"
     assert seen["pipeline_warm"] is True
+
+
+def test_run_shootout_marks_cold_start_probe_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_run_harness(**kwargs):
+        return ShootoutRun(
+            label=kwargs["label"],
+            timing=timing_from_samples([1.0]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+
+    result = run_shootout(
+        Path("benchmarks/shootout/network_service_area.py"),
+        repeat=1,
+        warmup=False,
+        timeout=30,
+        quiet=True,
+        baseline_python=sys.executable,
+    )
+
+    assert result.metadata["measurement_mode"] == "cold_start_probe"
+    assert "steady-state parity" in result.metadata["measurement_note"]
+
+
+def test_render_shootout_marks_cold_start_probe_mode() -> None:
+    run = ShootoutRun(
+        label="geopandas",
+        timing=timing_from_samples([1.0]),
+        stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+    )
+    result = ShootoutResult(
+        script="benchmarks/shootout/network_service_area.py",
+        geopandas=run,
+        vibespatial=ShootoutRun(
+            label="vibespatial",
+            timing=timing_from_samples([0.5]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        ),
+        speedup=2.0,
+        status="pass",
+        status_reason="ok",
+        metadata={
+            "measurement_mode": "cold_start_probe",
+            "measurement_note": "repeat<3 with warmup disabled is cold-start sensitive",
+            "fingerprint": "match",
+        },
+    )
+
+    quiet = render_shootout(result, mode="quiet")
+    human = render_shootout(result, mode="human")
+
+    assert "mode=cold-start" in quiet
+    assert "cold-start sensitive" in human
