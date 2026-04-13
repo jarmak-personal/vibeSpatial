@@ -33,12 +33,20 @@ from vibespatial.constructive.clip_rect_cpu import (
 from vibespatial.constructive.clip_rect_kernels import (
     _LB_KERNEL_NAMES,
     _LIANG_BARSKY_KERNEL_SOURCE,
+    _LINE_ROW_KERNEL_NAMES,
+    _LINE_ROW_KERNEL_SOURCE,
     _SEG_ARANGE_KERNEL_NAMES,
     _SEGMENTED_ARANGE_KERNEL_SOURCE,
     _SH_KERNEL_NAMES,
     _SUTHERLAND_HODGMAN_KERNEL_SOURCE,
 )
-from vibespatial.cuda._runtime import compile_kernel_group, count_scatter_total, get_cuda_runtime
+from vibespatial.cuda._runtime import (
+    KERNEL_PARAM_I32,
+    KERNEL_PARAM_PTR,
+    compile_kernel_group,
+    count_scatter_total,
+    get_cuda_runtime,
+)
 from vibespatial.cuda.cccl_precompile import request_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import (
@@ -54,12 +62,13 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode, RuntimeSelection
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import SPATIAL_EPSILON
+from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.precision import (
     KernelClass,
     PrecisionMode,
     PrecisionPlan,
 )
-from vibespatial.runtime.residency import Residency, combined_residency
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
 
 from .point import (
@@ -81,6 +90,7 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 request_nvrtc_warmup([
     ("sh-clip", _SUTHERLAND_HODGMAN_KERNEL_SOURCE, _SH_KERNEL_NAMES),
     ("lb-clip", _LIANG_BARSKY_KERNEL_SOURCE, _LB_KERNEL_NAMES),
+    ("line-row-clip", _LINE_ROW_KERNEL_SOURCE, _LINE_ROW_KERNEL_NAMES),
     ("seg-arange", _SEGMENTED_ARANGE_KERNEL_SOURCE, _SEG_ARANGE_KERNEL_NAMES),
 ])
 
@@ -99,6 +109,12 @@ def _compile_seg_arange_kernels():
     )
 
 
+def _compile_line_row_kernels():
+    return compile_kernel_group(
+        "line-row-clip", _LINE_ROW_KERNEL_SOURCE, _LINE_ROW_KERNEL_NAMES,
+    )
+
+
 class RectClipResult:
     """Result of a rectangle clip operation.
 
@@ -108,13 +124,17 @@ class RectClipResult:
     """
 
     __slots__ = (
+        "_candidate_rows",
+        "_candidate_rows_factory",
+        "_fallback_rows",
+        "_fallback_rows_factory",
+        "_fast_rows",
+        "_fast_rows_factory",
         "_geometries",
         "_geometries_factory",
-        "candidate_rows",
-        "fallback_rows",
-        "fast_rows",
+        "_owned_result_rows",
+        "_owned_result_rows_factory",
         "owned_result",
-        "owned_result_rows",
         "precision_plan",
         "robustness_plan",
         "row_count",
@@ -127,26 +147,34 @@ class RectClipResult:
         geometries: np.ndarray | None = None,
         geometries_factory: object | None = None,
         row_count: int,
-        candidate_rows: np.ndarray,
-        fast_rows: np.ndarray,
-        fallback_rows: np.ndarray,
+        candidate_rows: np.ndarray | None = None,
+        candidate_rows_factory: object | None = None,
+        fast_rows: np.ndarray | None = None,
+        fast_rows_factory: object | None = None,
+        fallback_rows: np.ndarray | None = None,
+        fallback_rows_factory: object | None = None,
         runtime_selection: RuntimeSelection,
         precision_plan: PrecisionPlan,
         robustness_plan: RobustnessPlan,
         owned_result: OwnedGeometryArray | None = None,
         owned_result_rows: np.ndarray | None = None,
+        owned_result_rows_factory: object | None = None,
     ):
+        self._candidate_rows = candidate_rows
+        self._candidate_rows_factory = candidate_rows_factory
+        self._fast_rows = fast_rows
+        self._fast_rows_factory = fast_rows_factory
+        self._fallback_rows = fallback_rows
+        self._fallback_rows_factory = fallback_rows_factory
         self._geometries = geometries
         self._geometries_factory = geometries_factory
+        self._owned_result_rows = owned_result_rows
+        self._owned_result_rows_factory = owned_result_rows_factory
         self.row_count = row_count
-        self.candidate_rows = candidate_rows
-        self.fast_rows = fast_rows
-        self.fallback_rows = fallback_rows
         self.runtime_selection = runtime_selection
         self.precision_plan = precision_plan
         self.robustness_plan = robustness_plan
         self.owned_result = owned_result
-        self.owned_result_rows = owned_result_rows
 
     @property
     def geometries(self) -> np.ndarray:
@@ -156,6 +184,40 @@ class RectClipResult:
         if self._geometries is None:
             return np.empty(0, dtype=object)
         return self._geometries
+
+    @property
+    def candidate_rows(self) -> np.ndarray:
+        if self._candidate_rows is None and self._candidate_rows_factory is not None:
+            self._candidate_rows = self._candidate_rows_factory()
+            self._candidate_rows_factory = None
+        if self._candidate_rows is None:
+            return np.empty(0, dtype=np.int32)
+        return self._candidate_rows
+
+    @property
+    def fast_rows(self) -> np.ndarray:
+        if self._fast_rows is None and self._fast_rows_factory is not None:
+            self._fast_rows = self._fast_rows_factory()
+            self._fast_rows_factory = None
+        if self._fast_rows is None:
+            return np.empty(0, dtype=np.int32)
+        return self._fast_rows
+
+    @property
+    def fallback_rows(self) -> np.ndarray:
+        if self._fallback_rows is None and self._fallback_rows_factory is not None:
+            self._fallback_rows = self._fallback_rows_factory()
+            self._fallback_rows_factory = None
+        if self._fallback_rows is None:
+            return np.empty(0, dtype=np.int32)
+        return self._fallback_rows
+
+    @property
+    def owned_result_rows(self) -> np.ndarray | None:
+        if self._owned_result_rows is None and self._owned_result_rows_factory is not None:
+            self._owned_result_rows = self._owned_result_rows_factory()
+            self._owned_result_rows_factory = None
+        return self._owned_result_rows
 
 
 @dataclass(frozen=True)
@@ -649,7 +711,7 @@ def _clip_line_family_gpu(
 def _extract_segments_vectorized(
     owned: OwnedGeometryArray,
     line_families: list[GeometryFamily],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[int]]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized extraction of segments from line-family buffers.
 
     Uses numpy offset arithmetic and fancy indexing on contiguous
@@ -659,10 +721,9 @@ def _extract_segments_vectorized(
     Returns
     -------
     seg_x0, seg_y0, seg_x1, seg_y1 : flat segment endpoint arrays (float64)
-    row_segment_offsets : cumulative segment count per row (int32, length = len(global_row_indices) + 1)
-    part_segment_offsets : cumulative segment count per part (int32, length = total_parts + 1)
-    part_row_map : which row index (into global_row_indices) each part belongs to (int32)
-    global_row_indices : ordered list of global row indices that have line data
+    row_segment_offsets : cumulative segment count per row (int32)
+    segment_global_rows : global row id for each segment (int32)
+    segment_part_break_after : bool mask where segment i terminates its source part
     """
     # Accumulate per-family vectorized results, then concatenate once.
     all_span_starts: list[np.ndarray] = []
@@ -682,11 +743,7 @@ def _extract_segments_vectorized(
         fam_idx = len(family_buffers)
         family_buffers.append(buffer)
         device_family_buffer = None
-        if (
-            not buffer.host_materialized
-            and owned.device_state is not None
-            and family in owned.device_state.families
-        ):
+        if owned.device_state is not None and family in owned.device_state.families:
             device_family_buffer = owned.device_state.families[family]
         device_family_buffers.append(device_family_buffer)
 
@@ -787,9 +844,8 @@ def _extract_segments_vectorized(
         return (
             empty, empty, empty, empty,
             np.zeros(n_rows + 1, dtype=np.int32),
-            np.zeros(1, dtype=np.int32),
             np.empty(0, dtype=np.int32),
-            global_row_indices,
+            np.empty(0, dtype=bool),
         )
 
     # Concatenate all per-family results into flat arrays.
@@ -807,9 +863,8 @@ def _extract_segments_vectorized(
         return (
             empty, empty, empty, empty,
             np.zeros(n_rows + 1, dtype=np.int32),
-            np.zeros(len(seg_counts) + 1, dtype=np.int32),
-            part_row_map_arr,
-            global_row_indices,
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=bool),
         )
 
     # Build per-part segment offsets (cumulative).
@@ -829,22 +884,8 @@ def _extract_segments_vectorized(
     gather_p1 = gather_p0 + 1
 
     unique_fam = np.unique(span_family_idx)
-    missing_device = [
-        int(fi)
-        for fi in unique_fam
-        if (
-            not family_buffers[int(fi)].host_materialized
-            and device_family_buffers[int(fi)] is None
-        )
-    ]
-    if missing_device:
-        raise RuntimeError(
-            "line segment extraction requires device buffers for unmaterialized host families"
-        )
-
     use_device_gather = any(
-        not family_buffers[int(fi)].host_materialized
-        and device_family_buffers[int(fi)] is not None
+        device_family_buffers[int(fi)] is not None
         for fi in unique_fam
     )
 
@@ -869,7 +910,7 @@ def _extract_segments_vectorized(
         fam_idx = int(unique_fam[0])
         buf = family_buffers[fam_idx]
         dev_buf = device_family_buffers[fam_idx]
-        if use_device_gather:
+        if dev_buf is not None:
             d_gather_p0 = cp.asarray(gather_p0.astype(np.int64, copy=False))
             d_gather_p1 = cp.asarray(gather_p1.astype(np.int64, copy=False))
             seg_x0 = cp.asarray(dev_buf.x)[d_gather_p0]
@@ -911,18 +952,109 @@ def _extract_segments_vectorized(
                 seg_x1[positions] = np.asarray(buf.x, dtype=np.float64)[idx1]
                 seg_y1[positions] = np.asarray(buf.y, dtype=np.float64)[idx1]
 
-    # Build per-row segment offsets from part data (np.bincount — truly vectorized C loop).
     row_segment_offsets = np.zeros(n_rows + 1, dtype=np.int32)
     if seg_counts.size > 0:
         row_segment_offsets[1:] = np.bincount(
-            part_row_map_arr, weights=seg_counts.astype(np.float64), minlength=n_rows,
+            part_row_map_arr,
+            weights=seg_counts.astype(np.float64),
+            minlength=n_rows,
         ).astype(np.int32)
     np.cumsum(row_segment_offsets, out=row_segment_offsets)
 
+    # Build per-segment row ids and part-boundary flags once on host so the
+    # GPU assembly path can avoid device-side searchsorted over part metadata.
+    segment_global_rows = np.repeat(
+        global_row_indices[part_row_map_arr],
+        seg_counts,
+    ).astype(np.int32, copy=False)
+    segment_part_break_after = np.zeros(total_segments, dtype=bool)
+    segment_part_break_after[part_segment_offsets[1:] - 1] = True
+
     return (
         seg_x0, seg_y0, seg_x1, seg_y1,
-        row_segment_offsets, part_segment_offsets,
-        part_row_map_arr, global_row_indices,
+        row_segment_offsets,
+        segment_global_rows,
+        segment_part_break_after,
+    )
+
+
+def _build_segmented_gather_indices_device(
+    d_offsets,
+    d_selected_indices,
+):
+    """Build gather indices for selected offset ranges with segmented_arange."""
+    import cupy as cp
+
+    from vibespatial.cuda.cccl_primitives import exclusive_sum
+
+    selected_count = int(d_selected_indices.shape[0])
+    if selected_count == 0:
+        return None
+
+    runtime = get_cuda_runtime()
+    d_selected_starts = d_offsets[d_selected_indices].astype(cp.int64, copy=False)
+    d_selected_ends = d_offsets[d_selected_indices + 1].astype(cp.int64, copy=False)
+    d_selected_lengths_i64 = (d_selected_ends - d_selected_starts).astype(cp.int64, copy=False)
+    d_write_offsets = exclusive_sum(d_selected_lengths_i64, synchronize=False)
+    total_selected_coords = count_scatter_total(runtime, d_selected_lengths_i64, d_write_offsets)
+
+    d_new_offsets = cp.empty(selected_count + 1, dtype=cp.int32)
+    d_new_offsets[:selected_count] = d_write_offsets.astype(cp.int32, copy=False)
+    d_new_offsets[selected_count] = total_selected_coords
+
+    if total_selected_coords == 0:
+        return (
+            cp.empty(0, dtype=cp.int64),
+            d_new_offsets,
+        )
+
+    d_gather = cp.empty(total_selected_coords, dtype=cp.int64)
+    kernels = _compile_seg_arange_kernels()
+    ptr = runtime.pointer
+    seg_params = (
+        (
+            ptr(d_selected_starts),
+            ptr(d_selected_lengths_i64),
+            ptr(d_write_offsets),
+            ptr(d_gather),
+            selected_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    seg_grid, seg_block = runtime.launch_config(kernels["segmented_arange"], selected_count)
+    runtime.launch(
+        kernels["segmented_arange"],
+        grid=seg_grid,
+        block=seg_block,
+        params=seg_params,
+    )
+    return d_gather, d_new_offsets
+
+
+def _gather_selected_runs_device(
+    d_flat_x,
+    d_flat_y,
+    d_geom_offsets,
+    d_selected_run_indices,
+):
+    """Gather selected line runs with the segmented-arange GPU helper."""
+    segmented = _build_segmented_gather_indices_device(
+        d_geom_offsets,
+        d_selected_run_indices,
+    )
+    if segmented is None:
+        return None
+    d_gather, d_new_offsets = segmented
+    return (
+        d_flat_x[d_gather],
+        d_flat_y[d_gather],
+        d_new_offsets,
     )
 
 
@@ -932,10 +1064,9 @@ def _build_line_clip_device_result(
     d_out_x1,
     d_out_y1,
     d_valid,
-    part_segment_offsets: np.ndarray,
-    part_row_map: np.ndarray,
-    global_row_indices: list[int],
-) -> tuple[OwnedGeometryArray | None, np.ndarray | None]:
+    segment_global_rows: np.ndarray,
+    segment_part_break_after: np.ndarray,
+) -> tuple[OwnedGeometryArray | None, object | None]:
     """Build a device-resident OwnedGeometryArray from GPU-clipped line segments.
 
     TRUE ZERO-COPY implementation: all coordinate assembly uses CuPy (Tier 2)
@@ -949,19 +1080,16 @@ def _build_line_clip_device_result(
         Clipped segment endpoints from the Liang-Barsky kernel.
     d_valid : CuPy device array (uint8)
         Per-segment validity mask from the kernel.
-    part_segment_offsets : host numpy array (int32)
-        Cumulative segment count per part (small metadata, stays on host).
-    part_row_map : host numpy array (int32)
-        Maps each part index to a row index into global_row_indices.
-    global_row_indices : list of int
-        Maps row indices to global row positions in the input OwnedGeometryArray.
+    segment_global_rows : host numpy array (int32)
+        Global row id for each original segment before clip compaction.
+    segment_part_break_after : host numpy array (bool)
+        True where segment i is the last segment of its source part.
 
     Returns
     -------
     (OwnedGeometryArray, global_row_map) or (None, None).
-    global_row_map is a host numpy int32 array mapping each compact OGA row
-    to its global row position in the input, preserving correct scatter
-    targets even when some rows are fully clipped away.
+    global_row_map is an int32 row map aligned to the compact output rows.
+    It stays on device until a host consumer asks for scatter/materialization.
     """
     import cupy as cp
 
@@ -993,20 +1121,11 @@ def _build_line_clip_device_result(
     #    Uses cp.abs -- CuPy Tier 2 element-wise ops, zero host trips.
     # ---------------------------------------------------------------
 
-    # Part boundaries: map each valid segment index to its part, then
-    # detect where consecutive valid segments cross part boundaries.
-    # part_segment_offsets is small metadata (n_parts+1 ints), upload once.
-    d_part_offsets = cp.asarray(part_segment_offsets)
-
-    # Upload part_row_map and global_row_indices for row mapping (small metadata).
-    d_part_row_map = cp.asarray(part_row_map)
-    d_global_row_indices = cp.asarray(
-        np.asarray(global_row_indices, dtype=np.int32)
-    )
-
-    # For each valid segment, find which part it belongs to via searchsorted.
-    # searchsorted(offsets[1:], idx, side='right') gives the part index.
-    d_part_ids = cp.searchsorted(d_part_offsets[1:], d_valid_indices, side="right")
+    # Upload direct per-segment metadata once. This avoids device-side
+    # searchsorted over part offsets in the hot assembly path.
+    d_segment_global_rows = cp.asarray(segment_global_rows)
+    d_segment_part_break_after = cp.asarray(segment_part_break_after)
+    d_valid_global_rows = d_segment_global_rows[d_valid_indices]
 
     # Build break mask: True at position i means a new linestring starts
     # at valid segment i.  Position 0 always starts a new line.
@@ -1023,8 +1142,8 @@ def _build_line_clip_device_result(
         d_dy = cp.abs(d_vy1[:-1] - d_vy0[1:])
         d_coord_break = (d_dx > _POINT_EPSILON) | (d_dy > _POINT_EPSILON)
 
-        # Part boundary break: different parts
-        d_part_break = d_part_ids[:-1] != d_part_ids[1:]
+        # Part boundary break: the prior valid segment terminates its part.
+        d_part_break = d_segment_part_break_after[d_valid_indices[:-1]]
 
         # Combined breaks (either discontinuity or part boundary)
         d_breaks = d_coord_break | d_part_break  # bool, length n_valid-1
@@ -1110,12 +1229,9 @@ def _build_line_clip_device_result(
 
     # ---------------------------------------------------------------
     # 5. Build global row map on device (CuPy Tier 2 gather).
-    #    For each output linestring, find the part_id of its first
-    #    segment, then map: part_id -> part_row_map -> global_row_indices.
+    #    Each run inherits the global row id of its first valid segment.
     # ---------------------------------------------------------------
-    d_run_part_ids = d_part_ids[d_run_starts]
-    d_run_row_indices = d_part_row_map[d_run_part_ids]
-    d_global_row_map = d_global_row_indices[d_run_row_indices]
+    d_global_row_map = d_valid_global_rows[d_run_starts]
 
     # ---------------------------------------------------------------
     # 6. Filter out degenerate linestrings (< 2 coords) on device
@@ -1131,58 +1247,28 @@ def _build_line_clip_device_result(
     if valid_geom_count < line_count:
         # Compact: keep only valid geometries -- fully on device
         d_valid_geom_idx = cp.flatnonzero(d_valid_geom_mask)
-        # Rebuild geometry offsets for valid geometries only
-        d_valid_lengths = d_geom_lengths[d_valid_geom_idx]
-        d_new_geom_offsets = cp.empty(valid_geom_count + 1, dtype=cp.int32)
-        d_new_geom_offsets[0] = 0
-        d_new_geom_offsets[1:] = cp.cumsum(d_valid_lengths).astype(cp.int32)
-
-        # Build gather indices on device -- no Python loop, no D2H.
-        # For each valid geometry, we need coord indices [start, ..., end-1].
-        # Use CuPy repeat + arange pattern: repeat each geom's start offset
-        # by its length, then add a per-element counter within each run.
-        d_starts = d_geom_offsets[d_valid_geom_idx]
-        # Derive total from cumsum result — no additional sync
-        d_total_new = int(d_new_geom_offsets[valid_geom_count])
-        # Per-coord offsets within each geometry run
-        d_intra = cp.arange(d_total_new, dtype=cp.int64)
-        d_run_offsets = cp.repeat(
-            d_new_geom_offsets[:valid_geom_count],
-            d_valid_lengths,
-        ).astype(cp.int64)
-        d_base = cp.repeat(d_starts, d_valid_lengths).astype(cp.int64)
-        d_gather = d_base + (d_intra - d_run_offsets)
-        d_flat_x = d_flat_x[d_gather]
-        d_flat_y = d_flat_y[d_gather]
-        d_geom_offsets = d_new_geom_offsets
+        compacted = _gather_selected_runs_device(
+            d_flat_x,
+            d_flat_y,
+            d_geom_offsets,
+            d_valid_geom_idx.astype(cp.int64, copy=False),
+        )
+        if compacted is not None:
+            d_flat_x, d_flat_y, d_geom_offsets = compacted
+        else:
+            d_flat_x = cp.empty(0, dtype=cp.float64)
+            d_flat_y = cp.empty(0, dtype=cp.float64)
+            d_geom_offsets = cp.zeros(1, dtype=cp.int32)
         # Filter the global row map to match compacted geometries
         d_global_row_map = d_global_row_map[d_valid_geom_idx]
         line_count = valid_geom_count
 
     def _compact_selected_runs(d_selected_run_indices):
-        selected_count = int(d_selected_run_indices.shape[0])
-        if selected_count == 0:
-            return None
-        d_selected_starts = d_geom_offsets[d_selected_run_indices].astype(cp.int64)
-        d_selected_ends = d_geom_offsets[d_selected_run_indices + 1].astype(cp.int64)
-        d_selected_lengths = (d_selected_ends - d_selected_starts).astype(cp.int32)
-        d_new_offsets = cp.empty(selected_count + 1, dtype=cp.int32)
-        d_new_offsets[0] = 0
-        d_new_offsets[1:] = cp.cumsum(d_selected_lengths).astype(cp.int32)
-        total_selected_coords = int(d_new_offsets[selected_count])
-        d_intra = cp.arange(total_selected_coords, dtype=cp.int64)
-        d_run_ids = cp.searchsorted(
-            d_new_offsets[1:].astype(cp.int64),
-            d_intra,
-            side="right",
-        )
-        d_gather = d_selected_starts[d_run_ids] + (
-            d_intra - d_new_offsets[d_run_ids].astype(cp.int64)
-        )
-        return (
-            d_flat_x[d_gather],
-            d_flat_y[d_gather],
-            d_new_offsets,
+        return _gather_selected_runs_device(
+            d_flat_x,
+            d_flat_y,
+            d_geom_offsets,
+            d_selected_run_indices.astype(cp.int64, copy=False),
         )
 
     d_row_breaks = cp.empty(line_count, dtype=cp.bool_)
@@ -1270,7 +1356,7 @@ def _build_line_clip_device_result(
                     bounds=None,
                 )
 
-        global_row_map = cp.asnumpy(d_unique_rows).astype(np.int32, copy=False)
+        global_row_map = d_unique_rows.astype(cp.int32, copy=False)
         oga = build_device_resident_owned(
             device_families=device_families,
             row_count=compact_row_count,
@@ -1281,9 +1367,7 @@ def _build_line_clip_device_result(
         )
         return oga, global_row_map
 
-    # Transfer global_row_map to host (small metadata -- single D2H).
-    # Caller needs host numpy for scatter into host result array.
-    global_row_map = cp.asnumpy(d_global_row_map).astype(np.int32)
+    global_row_map = d_global_row_map.astype(cp.int32, copy=False)
 
     # ---------------------------------------------------------------
     # 7. Build device-resident OwnedGeometryArray
@@ -1319,10 +1403,257 @@ def _build_line_clip_device_result(
     return oga, global_row_map
 
 
+def _clip_linestring_rows_gpu_fast_path(
+    owned: OwnedGeometryArray,
+    rect: tuple[float, float, float, float],
+    seg_x0,
+    seg_y0,
+    seg_x1,
+    seg_y1,
+    row_segment_offsets: np.ndarray,
+) -> tuple[OwnedGeometryArray, object] | None:
+    """Specialized GPU path for dense LineString-only batches."""
+    if (
+        set(owned.families) != {GeometryFamily.LINESTRING}
+        or owned.families[GeometryFamily.LINESTRING].row_count != owned.row_count
+    ):
+        return None
+    if not np.all(owned.validity):
+        return None
+
+    import cupy as cp
+
+    from vibespatial.cuda.cccl_primitives import exclusive_sum
+
+    row_count = owned.row_count
+    if row_count == 0:
+        return None
+
+    d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid = _clip_line_segments_gpu_device(
+        seg_x0, seg_y0, seg_x1, seg_y1, rect,
+    )
+    runtime = get_cuda_runtime()
+    d_row_segment_offsets = cp.asarray(row_segment_offsets)
+    d_run_counts = runtime.allocate((row_count,), cp.int32, zero=True)
+    d_coord_counts = runtime.allocate((row_count,), cp.int32, zero=True)
+    d_has_output = runtime.allocate((row_count,), cp.uint8, zero=True)
+
+    kernels = _compile_line_row_kernels()
+    ptr = runtime.pointer
+    count_params = (
+        (
+            ptr(d_out_x0),
+            ptr(d_out_y0),
+            ptr(d_out_x1),
+            ptr(d_out_y1),
+            ptr(d_valid),
+            ptr(d_row_segment_offsets),
+            ptr(d_run_counts),
+            ptr(d_coord_counts),
+            ptr(d_has_output),
+            row_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    count_grid, count_block = runtime.launch_config(kernels["line_single_run_count"], row_count)
+    runtime.launch(
+        kernels["line_single_run_count"],
+        grid=count_grid,
+        block=count_block,
+        params=count_params,
+    )
+
+    d_output_rows = cp.flatnonzero(d_has_output != 0).astype(cp.int32, copy=False)
+    output_row_count = int(d_output_rows.size)
+    if output_row_count == 0:
+        return None
+
+    d_output_run_counts = d_run_counts[d_output_rows].astype(cp.int32, copy=False)
+    d_output_coord_counts = d_coord_counts[d_output_rows].astype(cp.int32, copy=False)
+    d_single_mask = d_output_run_counts == 1
+    d_multi_mask = d_output_run_counts > 1
+    d_single_rows = d_output_rows[d_single_mask]
+    d_multi_rows = d_output_rows[d_multi_mask]
+
+    d_single_prefix = (
+        cp.cumsum(d_single_mask.astype(cp.int32)).astype(cp.int32) - d_single_mask.astype(cp.int32)
+    )
+    d_multi_prefix = (
+        cp.cumsum(d_multi_mask.astype(cp.int32)).astype(cp.int32) - d_multi_mask.astype(cp.int32)
+    )
+    output_family_row_offsets = cp.where(
+        d_single_mask,
+        d_single_prefix,
+        d_multi_prefix,
+    ).astype(cp.int32)
+    output_tags = cp.where(
+        d_single_mask,
+        FAMILY_TAGS[GeometryFamily.LINESTRING],
+        FAMILY_TAGS[GeometryFamily.MULTILINESTRING],
+    ).astype(cp.int8)
+    output_validity = cp.ones(output_row_count, dtype=cp.bool_)
+
+    device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+
+    single_count = int(d_single_rows.size)
+    if single_count > 0:
+        d_single_counts_i64 = d_output_coord_counts[d_single_mask].astype(cp.int64, copy=False)
+        d_single_offsets_i64 = exclusive_sum(d_single_counts_i64, synchronize=False)
+        total_single_coords = count_scatter_total(runtime, d_single_counts_i64, d_single_offsets_i64)
+        d_single_geom_offsets = cp.empty(single_count + 1, dtype=cp.int32)
+        d_single_geom_offsets[:single_count] = d_single_offsets_i64.astype(cp.int32, copy=False)
+        d_single_geom_offsets[single_count] = total_single_coords
+        d_single_x = runtime.allocate((total_single_coords,), cp.float64)
+        d_single_y = runtime.allocate((total_single_coords,), cp.float64)
+        single_scatter_params = (
+            (
+                ptr(d_out_x0),
+                ptr(d_out_y0),
+                ptr(d_out_x1),
+                ptr(d_out_y1),
+                ptr(d_valid),
+                ptr(d_row_segment_offsets),
+                ptr(d_single_rows),
+                ptr(d_single_geom_offsets),
+                ptr(d_single_x),
+                ptr(d_single_y),
+                single_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        single_grid, single_block = runtime.launch_config(
+            kernels["line_single_run_scatter"],
+            single_count,
+        )
+        runtime.launch(
+            kernels["line_single_run_scatter"],
+            grid=single_grid,
+            block=single_block,
+            params=single_scatter_params,
+        )
+        device_families[GeometryFamily.LINESTRING] = DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.LINESTRING,
+            x=d_single_x,
+            y=d_single_y,
+            geometry_offsets=d_single_geom_offsets,
+            empty_mask=cp.zeros(single_count, dtype=cp.bool_),
+            bounds=None,
+        )
+
+    multi_count = int(d_multi_rows.size)
+    if multi_count > 0:
+        d_multi_part_counts_i64 = d_output_run_counts[d_multi_mask].astype(cp.int64, copy=False)
+        d_multi_geom_offsets_i64 = exclusive_sum(d_multi_part_counts_i64, synchronize=False)
+        total_multi_parts = count_scatter_total(runtime, d_multi_part_counts_i64, d_multi_geom_offsets_i64)
+        d_multi_geom_offsets = cp.empty(multi_count + 1, dtype=cp.int32)
+        d_multi_geom_offsets[:multi_count] = d_multi_geom_offsets_i64.astype(cp.int32, copy=False)
+        d_multi_geom_offsets[multi_count] = total_multi_parts
+
+        d_multi_coord_counts_i64 = d_output_coord_counts[d_multi_mask].astype(cp.int64, copy=False)
+        d_multi_coord_offsets_i64 = exclusive_sum(d_multi_coord_counts_i64, synchronize=False)
+        total_multi_coords = count_scatter_total(runtime, d_multi_coord_counts_i64, d_multi_coord_offsets_i64)
+        d_multi_coord_offsets = cp.empty(multi_count + 1, dtype=cp.int32)
+        d_multi_coord_offsets[:multi_count] = d_multi_coord_offsets_i64.astype(cp.int32, copy=False)
+        d_multi_coord_offsets[multi_count] = total_multi_coords
+
+        d_multi_part_offsets = cp.empty(total_multi_parts + 1, dtype=cp.int32)
+        d_multi_x = runtime.allocate((total_multi_coords,), cp.float64)
+        d_multi_y = runtime.allocate((total_multi_coords,), cp.float64)
+        multi_scatter_params = (
+            (
+                ptr(d_out_x0),
+                ptr(d_out_y0),
+                ptr(d_out_x1),
+                ptr(d_out_y1),
+                ptr(d_valid),
+                ptr(d_row_segment_offsets),
+                ptr(d_multi_rows),
+                ptr(d_multi_geom_offsets),
+                ptr(d_multi_coord_offsets),
+                ptr(d_multi_part_offsets),
+                ptr(d_multi_x),
+                ptr(d_multi_y),
+                multi_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        multi_grid, multi_block = runtime.launch_config(
+            kernels["line_multi_run_scatter"],
+            multi_count,
+        )
+        runtime.launch(
+            kernels["line_multi_run_scatter"],
+            grid=multi_grid,
+            block=multi_block,
+            params=multi_scatter_params,
+        )
+        device_families[GeometryFamily.MULTILINESTRING] = DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.MULTILINESTRING,
+            x=d_multi_x,
+            y=d_multi_y,
+            geometry_offsets=d_multi_geom_offsets,
+            empty_mask=cp.zeros(multi_count, dtype=cp.bool_),
+            part_offsets=d_multi_part_offsets,
+            bounds=None,
+        )
+
+    if not device_families:
+        return None
+
+    return (
+        build_device_resident_owned(
+            device_families=device_families,
+            row_count=output_row_count,
+            tags=output_tags,
+            validity=output_validity,
+            family_row_offsets=output_family_row_offsets,
+            execution_mode="gpu",
+        ),
+        d_output_rows,
+    )
+
+
 def _clip_all_lines_gpu(
     owned: OwnedGeometryArray,
     rect: tuple[float, float, float, float],
-) -> tuple[OwnedGeometryArray | None, np.ndarray | None]:
+) -> tuple[OwnedGeometryArray | None, object | None]:
     """Batch-clip ALL linestring/multilinestring rows on GPU via Liang-Barsky.
 
     TRUE ZERO-COPY implementation:
@@ -1332,9 +1663,9 @@ def _clip_all_lines_gpu(
       4. Return device-resident OwnedGeometryArray -- no Shapely, no D2H transfers
 
     Returns (OwnedGeometryArray, global_row_map) or (None, None).
-    global_row_map is a host int32 array mapping each compact OGA row to
-    its global row position in the input OwnedGeometryArray, preserving
-    correct scatter targets when some rows are fully clipped away.
+    global_row_map maps each compact output row back to the input row and
+    stays device-resident until a host scatter/materialization consumer
+    actually needs it.
     """
     line_families = [
         f for f in (GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING)
@@ -1344,16 +1675,44 @@ def _clip_all_lines_gpu(
     if not line_families:
         return None, None
 
-    # -- Step 1: vectorized segment extraction (host, metadata-level) ------
+    # Repeated viewport clips over the same device-resident line layer should
+    # not rebuild static segment endpoints on every call.
+    cached_segments = None
+    cache_key = None
+    if owned.device_state is not None and set(line_families) == {GeometryFamily.LINESTRING}:
+        cache_key = ("clip_rect_linestring_segments", owned.row_count)
+        cache_entry = getattr(owned, "_cached_clip_rect_line_segments", None)
+        if cache_entry is not None and cache_entry[0] == cache_key:
+            cached_segments = cache_entry[1]
+
+    # -- Step 1: vectorized segment extraction (metadata-level) ------
+    if cached_segments is None:
+        cached_segments = _extract_segments_vectorized(owned, line_families)
+        if cache_key is not None:
+            owned._cached_clip_rect_line_segments = (cache_key, cached_segments)
+
     (
         seg_x0, seg_y0, seg_x1, seg_y1,
-        row_segment_offsets, part_segment_offsets,
-        part_row_map, global_row_indices,
-    ) = _extract_segments_vectorized(owned, line_families)
+        row_segment_offsets,
+        segment_global_rows,
+        segment_part_break_after,
+    ) = cached_segments
 
     total_segments = len(seg_x0)
     if total_segments == 0:
         return None, None
+
+    fast_path_result = _clip_linestring_rows_gpu_fast_path(
+        owned,
+        rect,
+        seg_x0,
+        seg_y0,
+        seg_x1,
+        seg_y1,
+        row_segment_offsets,
+    )
+    if fast_path_result is not None:
+        return fast_path_result
 
     # -- Step 2: GPU kernel -- outputs stay on device as CuPy arrays ------
     d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid = _clip_line_segments_gpu_device(
@@ -1363,9 +1722,8 @@ def _clip_all_lines_gpu(
     # -- Step 3: device-resident assembly (CuPy + CCCL, zero numpy) -------
     return _build_line_clip_device_result(
         d_out_x0, d_out_y0, d_out_x1, d_out_y1, d_valid,
-        part_segment_offsets,
-        part_row_map,
-        global_row_indices,
+        segment_global_rows,
+        segment_part_break_after,
     )
 
 
@@ -1958,8 +2316,9 @@ def _build_polygon_clip_owned_result(
 def _clip_all_polygons_gpu(
     owned: OwnedGeometryArray,
     rect: tuple[float, float, float, float],
+    runtime_selection: RuntimeSelection,
     precision_plan: PrecisionPlan,
-) -> tuple[OwnedGeometryArray | None, np.ndarray]:
+) -> tuple[OwnedGeometryArray | None, np.ndarray | None]:
     """Batch-clip ALL polygon/multipolygon rows on GPU in a single kernel launch.
 
     TRUE ZERO-COPY implementation:
@@ -1981,8 +2340,10 @@ def _clip_all_polygons_gpu(
     -------
     (owned_result, validity_mask) where owned_result is a device-resident
     OwnedGeometryArray built directly from clipped coordinates on the GPU
-    (contains only the valid output polygons), and validity_mask is a bool
-    array of length owned.row_count indicating which global rows have output.
+    (contains only the valid output polygons), and validity_mask is either a
+    bool array of length owned.row_count indicating which global rows have
+    output or None when the output stays row-aligned and validity can remain
+    device-resident until host materialization is requested.
     """
 
     polygon_families = [
@@ -1992,6 +2353,15 @@ def _clip_all_polygons_gpu(
     empty_validity = np.zeros(owned.row_count, dtype=bool)
     if not polygon_families:
         return None, empty_validity
+
+    fast_rect_result = _clip_all_polygons_gpu_rect_fast_path(
+        owned,
+        rect,
+        runtime_selection=runtime_selection,
+        precision_plan=precision_plan,
+    )
+    if fast_rect_result is not None:
+        return fast_rect_result
 
     # Step 1: Extract all rings -- vectorized, no per-coordinate Python loops
     (
@@ -2022,6 +2392,377 @@ def _clip_all_polygons_gpu(
     return owned_result, validity_mask
 
 
+def _clip_all_polygons_gpu_rect_fast_path(
+    owned: OwnedGeometryArray,
+    rect: tuple[float, float, float, float],
+    *,
+    runtime_selection: RuntimeSelection,
+    precision_plan: PrecisionPlan,
+) -> tuple[OwnedGeometryArray | None, np.ndarray | None] | None:
+    """Use the pair-owned rectangle kernel when the polygon batch fits it."""
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover - guarded by GPU dispatch
+        return None
+
+    from vibespatial.constructive.polygon_intersection_output import (
+        build_device_backed_polygon_intersection_output,
+        build_empty_device_backed_polygon_intersection_output,
+    )
+    from vibespatial.cuda._runtime import KERNEL_PARAM_I32, KERNEL_PARAM_PTR
+    from vibespatial.cuda.cccl_primitives import exclusive_sum
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        _device_is_dense_single_ring_polygons,
+        _extract_polygon_family_device_buffer,
+        _polygon_rect_intersection_kernels,
+    )
+
+    row_count = owned.row_count
+    if row_count == 0:
+        return None
+
+    if (
+        set(owned.families) != {GeometryFamily.POLYGON}
+        or owned.families[GeometryFamily.POLYGON].row_count != row_count
+    ):
+        return None
+
+    owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="clip_by_rect selected GPU rectangle polygon fast path",
+    )
+    left_dev, left_host = _extract_polygon_family_device_buffer(owned)
+    if left_dev is None or left_host is None or left_host.row_count != row_count:
+        return None
+    if not _device_is_dense_single_ring_polygons(left_dev, row_count):
+        return None
+
+    left_state = owned.device_state
+    if left_state is None:
+        return None
+
+    runtime = get_cuda_runtime()
+    d_xmin = cp.full(row_count, rect[0], dtype=cp.float64)
+    d_ymin = cp.full(row_count, rect[1], dtype=cp.float64)
+    d_xmax = cp.full(row_count, rect[2], dtype=cp.float64)
+    d_ymax = cp.full(row_count, rect[3], dtype=cp.float64)
+    d_left_valid = (
+        cp.asarray(left_state.validity).astype(cp.bool_, copy=False)
+        & ~left_dev.empty_mask.astype(cp.bool_, copy=False)
+    ).astype(cp.int32, copy=False)
+    d_right_valid = cp.ones(row_count, dtype=cp.int32)
+    d_counts = runtime.allocate((row_count,), cp.int32, zero=True)
+    d_valid = runtime.allocate((row_count,), cp.int32, zero=True)
+    d_boundary_overlap = runtime.allocate((row_count,), cp.int32, zero=True)
+
+    kernels = _polygon_rect_intersection_kernels()
+    ptr = runtime.pointer
+    count_params = (
+        (
+            ptr(left_dev.x),
+            ptr(left_dev.y),
+            ptr(left_dev.ring_offsets),
+            ptr(left_dev.geometry_offsets),
+            ptr(d_xmin),
+            ptr(d_ymin),
+            ptr(d_xmax),
+            ptr(d_ymax),
+            ptr(d_left_valid),
+            ptr(d_right_valid),
+            ptr(d_counts),
+            ptr(d_valid),
+            ptr(d_boundary_overlap),
+            row_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    count_grid, count_block = runtime.launch_config(
+        kernels["polygon_rect_intersection_count"],
+        row_count,
+    )
+    runtime.launch(
+        kernels["polygon_rect_intersection_count"],
+        grid=count_grid,
+        block=count_block,
+        params=count_params,
+    )
+
+    d_offsets = exclusive_sum(d_counts, synchronize=False)
+    total_verts = count_scatter_total(runtime, d_counts, d_offsets)
+    detail = (
+        f"rows={row_count}, "
+        f"precision={precision_plan.compute_precision.value}, "
+        "rect=scalar"
+    )
+    if total_verts == 0:
+        empty_result = build_empty_device_backed_polygon_intersection_output(
+            row_count=row_count,
+            runtime_selection=runtime_selection,
+        )
+        empty_result._polygon_rect_boundary_overlap = d_boundary_overlap.astype(
+            cp.bool_,
+            copy=False,
+        )
+        record_dispatch_event(
+            surface="vibespatial.kernels.constructive.polygon_rect_intersection",
+            operation="polygon_rect_intersection",
+            implementation="polygon_rect_intersection_gpu_scalar_rect",
+            reason=runtime_selection.reason,
+            detail=detail,
+            requested=runtime_selection.requested,
+            selected=ExecutionMode.GPU,
+        )
+        return empty_result, None
+
+    d_out_x = runtime.allocate((total_verts,), cp.float64)
+    d_out_y = runtime.allocate((total_verts,), cp.float64)
+    scatter_params = (
+        (
+            ptr(left_dev.x),
+            ptr(left_dev.y),
+            ptr(left_dev.ring_offsets),
+            ptr(left_dev.geometry_offsets),
+            ptr(d_xmin),
+            ptr(d_ymin),
+            ptr(d_xmax),
+            ptr(d_ymax),
+            ptr(d_left_valid),
+            ptr(d_right_valid),
+            ptr(d_offsets),
+            ptr(d_counts),
+            ptr(d_valid),
+            ptr(d_out_x),
+            ptr(d_out_y),
+            row_count,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+        ),
+    )
+    scatter_grid, scatter_block = runtime.launch_config(
+        kernels["polygon_rect_intersection_scatter"],
+        row_count,
+    )
+    runtime.launch(
+        kernels["polygon_rect_intersection_scatter"],
+        grid=scatter_grid,
+        block=scatter_block,
+        params=scatter_params,
+    )
+
+    d_ring_offsets = cp.empty(row_count + 1, dtype=cp.int32)
+    d_ring_offsets[:row_count] = cp.asarray(d_offsets)
+    d_ring_offsets[row_count] = total_verts
+    result = build_device_backed_polygon_intersection_output(
+        d_out_x,
+        d_out_y,
+        row_count=row_count,
+        validity=d_valid.astype(cp.bool_, copy=False),
+        ring_offsets=d_ring_offsets,
+        runtime_selection=runtime_selection,
+    )
+    result._polygon_rect_boundary_overlap = d_boundary_overlap.astype(cp.bool_, copy=False)
+    record_dispatch_event(
+        surface="vibespatial.kernels.constructive.polygon_rect_intersection",
+        operation="polygon_rect_intersection",
+        implementation="polygon_rect_intersection_gpu_scalar_rect",
+        reason=runtime_selection.reason,
+        detail=detail,
+        requested=runtime_selection.requested,
+        selected=ExecutionMode.GPU,
+    )
+    return result, None
+
+
+def _clip_dispatch_residency(values: object) -> Residency:
+    """Treat owned arrays with live device buffers as device-native clip inputs."""
+    residency = combined_residency(values)
+    if not isinstance(values, OwnedGeometryArray):
+        return residency
+    if values.device_state is None:
+        return residency
+    if any(
+        family in values.families
+        for family in (
+            GeometryFamily.POINT,
+            GeometryFamily.POLYGON,
+            GeometryFamily.MULTIPOLYGON,
+            GeometryFamily.LINESTRING,
+            GeometryFamily.MULTILINESTRING,
+        )
+    ):
+        return Residency.DEVICE
+    return residency
+
+
+def _supported_gpu_clip_row_families() -> tuple[GeometryFamily, ...]:
+    return (
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+    )
+
+
+def _materialize_gpu_clip_row_masks(
+    owned: OwnedGeometryArray,
+):
+    import cupy as cp
+
+    d_validity = cp.asarray(owned.device_state.validity).astype(cp.bool_, copy=False)
+    d_tags = cp.asarray(owned.device_state.tags)
+    d_fast_mask = cp.zeros(owned.row_count, dtype=cp.bool_)
+    for family in _supported_gpu_clip_row_families():
+        if family in owned.families:
+            d_fast_mask |= d_tags == FAMILY_TAGS[family]
+    d_fast_mask &= d_validity
+    d_fallback_mask = d_validity & ~d_fast_mask
+    return d_fast_mask, d_fallback_mask
+
+
+def _build_gpu_clip_row_factories(
+    owned: OwnedGeometryArray,
+) -> tuple[bool, object, object, object]:
+    """Build lazy row-classification factories for GPU clip results."""
+    if owned.device_state is None:
+        all_candidate_rows, fast_rows_arr, fallback_rows_arr = _classify_clip_rows_host(owned)
+
+        def _candidate_rows_factory():
+            return all_candidate_rows
+
+        def _fast_rows_factory():
+            return fast_rows_arr
+
+        def _fallback_rows_factory():
+            return fallback_rows_arr
+
+        return bool(fallback_rows_arr.size), _candidate_rows_factory, _fast_rows_factory, _fallback_rows_factory
+
+    import cupy as cp
+
+    d_fast_mask, d_fallback_mask = _materialize_gpu_clip_row_masks(owned)
+    has_fallback_rows = any(
+        family not in _supported_gpu_clip_row_families() for family in owned.families
+    )
+
+    def _materialize_mask_rows(d_mask):
+        return cp.asnumpy(
+            cp.flatnonzero(d_mask).astype(cp.int32, copy=False)
+        ).astype(np.int32, copy=False)  # zcopy:ok(lazy diagnostic row materialization on explicit property access)
+
+    def _fast_rows_factory():
+        return _materialize_mask_rows(d_fast_mask)
+
+    def _fallback_rows_factory():
+        return _materialize_mask_rows(d_fallback_mask)
+
+    def _candidate_rows_factory():
+        fast_rows_arr = _fast_rows_factory()
+        if not has_fallback_rows:
+            return fast_rows_arr
+        fallback_rows_arr = _fallback_rows_factory()
+        if fallback_rows_arr.size == 0:
+            return fast_rows_arr
+        return np.sort(
+            np.concatenate([fast_rows_arr, fallback_rows_arr])
+        ).astype(np.int32, copy=False)
+
+    return has_fallback_rows, _candidate_rows_factory, _fast_rows_factory, _fallback_rows_factory
+
+
+def _classify_clip_rows_host(
+    owned: OwnedGeometryArray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return candidate/fast/fallback row indices on the host."""
+    _gpu_family_tag_list = [
+        FAMILY_TAGS.get(fam, -99)
+        for fam in _supported_gpu_clip_row_families()
+        if fam in owned.families
+    ]
+    gpu_family_mask = np.isin(owned.tags, _gpu_family_tag_list)
+    valid_mask = owned.validity
+    fast_rows_arr = np.flatnonzero(valid_mask & gpu_family_mask).astype(np.int32)
+    fallback_rows_arr = np.flatnonzero(valid_mask & ~gpu_family_mask).astype(np.int32)
+    all_candidate_rows = np.sort(
+        np.concatenate([fast_rows_arr, fallback_rows_arr])
+    ).astype(np.int32)
+    return all_candidate_rows, fast_rows_arr, fallback_rows_arr
+
+
+def _coerce_row_map_device(row_map):
+    import cupy as cp
+
+    if row_map is None:
+        return None
+    if hasattr(row_map, "__cuda_array_interface__"):
+        return cp.asarray(row_map, dtype=cp.int32)
+    return cp.asarray(np.asarray(row_map, dtype=np.int32), dtype=cp.int32)
+
+
+def _combine_gpu_clip_owned_results(
+    poly_owned: OwnedGeometryArray | None,
+    poly_row_map,
+    line_result: OwnedGeometryArray | None,
+    line_row_map,
+) -> tuple[OwnedGeometryArray | None, object | None]:
+    """Combine compact polygon and line GPU clip outputs into one device OGA."""
+    if poly_owned is None:
+        return line_result, line_row_map
+    if line_result is None:
+        return poly_owned, poly_row_map
+
+    import cupy as cp
+
+    d_poly_row_map = _coerce_row_map_device(poly_row_map)
+    d_line_row_map = _coerce_row_map_device(line_row_map)
+    if d_poly_row_map is None:
+        return line_result, line_row_map
+    if d_line_row_map is None:
+        return poly_owned, poly_row_map
+
+    total_out = poly_owned.row_count + line_result.row_count
+    d_all_row_map = cp.concatenate([d_poly_row_map, d_line_row_map]).astype(cp.int32, copy=False)
+    d_order = cp.argsort(d_all_row_map.astype(cp.int64, copy=False))
+    d_positions = cp.empty(total_out, dtype=cp.int64)
+    d_positions[d_order] = cp.arange(total_out, dtype=cp.int64)
+
+    result = build_null_owned_array(total_out, residency=Residency.DEVICE)
+    result = concat_owned_scatter(result, poly_owned, d_positions[:poly_owned.row_count])
+    result = concat_owned_scatter(result, line_result, d_positions[poly_owned.row_count:])
+    return result, d_all_row_map[d_order].astype(cp.int32, copy=False)
+
+
 def clip_by_rect_owned(
     values: Sequence[object | None] | np.ndarray | OwnedGeometryArray,
     xmin: float,
@@ -2040,7 +2781,7 @@ def clip_by_rect_owned(
         row_count=_row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
-        current_residency=combined_residency(values),
+        current_residency=_clip_dispatch_residency(values),
     )
     has_polygon_families = False
     has_line_families = False
@@ -2168,53 +2909,86 @@ def clip_by_rect_owned(
             line_result = None
 
             if has_polygon_families:
-                poly_owned, poly_validity_mask = _clip_all_polygons_gpu(owned, rect, precision_plan)
+                poly_owned, poly_validity_mask = _clip_all_polygons_gpu(
+                    owned,
+                    rect,
+                    runtime_selection,
+                    precision_plan,
+                )
 
             if has_line_families:
                 line_result, line_global_row_map = _clip_all_lines_gpu(owned, rect)
             else:
                 line_result, line_global_row_map = None, None
 
-            # Identify GPU-fast family tags -- vectorized classification
-            _gpu_family_tag_list = [
-                FAMILY_TAGS.get(fam, -99)
-                for fam in (
-                    GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON,
-                    GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING,
+            if owned.device_state is None:
+                all_candidate_rows, fast_rows_arr, fallback_rows_arr = _classify_clip_rows_host(owned)
+                has_fallback_rows = bool(fallback_rows_arr.size)
+                candidate_rows_factory = None
+                fast_rows_factory = None
+                fallback_rows_factory = None
+            else:
+                has_fallback_rows, candidate_rows_factory, fast_rows_factory, fallback_rows_factory = (
+                    _build_gpu_clip_row_factories(owned)
                 )
-                if fam in owned.families
-            ]
-            gpu_family_mask = np.isin(owned.tags, _gpu_family_tag_list)
-            valid_mask = owned.validity
-            fast_rows_arr = np.flatnonzero(valid_mask & gpu_family_mask).astype(np.int32)
-            fallback_rows_arr = np.flatnonzero(valid_mask & ~gpu_family_mask).astype(np.int32)
-            all_candidate_rows = np.sort(
-                np.concatenate([fast_rows_arr, fallback_rows_arr])
-            ).astype(np.int32)
+                all_candidate_rows = None
+                fast_rows_arr = None
+                fallback_rows_arr = None
 
-            # Prefer the polygon OGA as primary owned_result; when only
-            # lines are present, carry the line OGA for zero-copy consumers.
-            owned_result = poly_owned if poly_owned is not None else line_result
+            poly_row_map = None
+            if poly_owned is not None:
+                if poly_owned.row_count == owned.row_count and poly_validity_mask is None:
+                    try:
+                        import cupy as cp
+                    except ModuleNotFoundError:  # pragma: no cover - GPU path guarded above
+                        cp = None
+                    poly_row_map = (
+                        cp.arange(owned.row_count, dtype=cp.int32)
+                        if cp is not None
+                        else np.arange(owned.row_count, dtype=np.int32)
+                    )
+                elif poly_validity_mask is not None:
+                    poly_row_map = np.flatnonzero(poly_validity_mask).astype(np.int32, copy=False)
+
+            owned_result, combined_row_map = _combine_gpu_clip_owned_results(
+                poly_owned,
+                poly_row_map,
+                line_result,
+                line_global_row_map,
+            )
             owned_result_rows = None
+            owned_result_rows_factory = None
             if (
-                poly_owned is not None
-                and line_result is None
-                and fallback_rows_arr.size == 0
-                and poly_validity_mask is not None
+                owned_result is not None
+                and not has_fallback_rows
+                and combined_row_map is not None
             ):
-                owned_result_rows = np.flatnonzero(poly_validity_mask).astype(
-                    np.int32, copy=False,
-                )
-            elif (
-                line_result is not None
-                and poly_owned is None
-                and fallback_rows_arr.size == 0
-                and line_global_row_map is not None
-            ):
-                owned_result_rows = np.asarray(
-                    line_global_row_map,
-                    dtype=np.int32,
-                )
+                def _materialize_combined_row_map():
+                    try:
+                        import cupy as cp
+                    except ModuleNotFoundError:  # pragma: no cover - GPU path guarded above
+                        cp = None
+                    if cp is not None and hasattr(combined_row_map, "__cuda_array_interface__"):
+                        return cp.asnumpy(combined_row_map).astype(np.int32, copy=False)  # zcopy:ok(explicit host row metadata for lazy public-result scatter/materialization)
+                    return np.asarray(combined_row_map, dtype=np.int32)
+
+                owned_result_rows_factory = _materialize_combined_row_map
+
+            line_result_rows_factory = None
+            if line_result is not None and line_result.row_count > 0 and line_global_row_map is not None:
+                def _materialize_line_row_map():
+                    try:
+                        import cupy as cp
+                    except ModuleNotFoundError:  # pragma: no cover - GPU path guarded above
+                        cp = None
+                    if cp is not None and hasattr(line_global_row_map, "__cuda_array_interface__"):
+                        return cp.asnumpy(line_global_row_map).astype(  # zcopy:ok(explicit host row metadata for line-result scatter into public geometry array)
+                            np.int32,
+                            copy=False,
+                        )
+                    return np.asarray(line_global_row_map, dtype=np.int32)
+
+                line_result_rows_factory = _materialize_line_row_map
 
             # Capture references for lazy factory
             _owned_ref = owned
@@ -2222,8 +2996,21 @@ def clip_by_rect_owned(
             _poly_validity_mask_ref = poly_validity_mask
             _line_result_ref = line_result
             _line_global_row_map_ref = line_global_row_map
+            _line_result_rows_factory_ref = line_result_rows_factory
             _fallback_rows_arr_ref = fallback_rows_arr
+            _fallback_rows_factory_ref = fallback_rows_factory
             _rect_ref = rect
+            _line_global_row_map_host = None
+
+            def _line_global_row_map_host_view():
+                nonlocal _line_global_row_map_host
+                if (
+                    _line_global_row_map_host is None
+                    and _line_global_row_map_ref is not None
+                    and _line_result_rows_factory_ref is not None
+                ):
+                    _line_global_row_map_host = _line_result_rows_factory_ref()
+                return _line_global_row_map_host
 
             def _materialize_poly_line_geometries():
                 result = np.empty(_owned_ref.row_count, dtype=object)
@@ -2232,16 +3019,23 @@ def clip_by_rect_owned(
                 result[_owned_ref.validity] = EMPTY
 
                 # Materialize polygon results from device-resident OGA
-                if _poly_owned_ref is not None and _poly_validity_mask_ref is not None:
+                if _poly_owned_ref is not None:
                     try:
-                        poly_shapely = _poly_owned_ref.to_shapely()
-                        valid_rows = np.flatnonzero(_poly_validity_mask_ref)
-                        # poly_owned has compact rows; scatter back to global positions
-                        n_poly = min(len(poly_shapely), len(valid_rows))
-                        if n_poly > 0:
-                            result[valid_rows[:n_poly]] = np.asarray(
-                                poly_shapely[:n_poly], dtype=object,
-                            )
+                        poly_shapely = np.asarray(_poly_owned_ref.to_shapely(), dtype=object)
+                        if _poly_validity_mask_ref is None and len(poly_shapely) == _owned_ref.row_count:
+                            valid_rows = np.flatnonzero(_poly_owned_ref.validity)
+                        elif _poly_validity_mask_ref is not None:
+                            valid_rows = np.flatnonzero(_poly_validity_mask_ref)
+                        else:
+                            valid_rows = np.empty(0, dtype=np.int64)
+                        if len(poly_shapely) == _owned_ref.row_count:
+                            if valid_rows.size > 0:
+                                result[valid_rows] = poly_shapely[valid_rows]
+                        else:
+                            # Compact polygon output: scatter back to global positions.
+                            n_poly = min(len(poly_shapely), len(valid_rows))
+                            if n_poly > 0:
+                                result[valid_rows[:n_poly]] = poly_shapely[:n_poly]
                     except Exception:
                         pass
 
@@ -2250,23 +3044,41 @@ def clip_by_rect_owned(
                 # even when some rows are fully clipped away).
                 if _line_result_ref is not None and _line_global_row_map_ref is not None:
                     try:
+                        line_global_row_map_host = _line_global_row_map_host_view()
                         line_shapely = _line_result_ref.to_shapely()
                         n_lines = len(line_shapely)
-                        if n_lines > 0:
-                            result[_line_global_row_map_ref[:n_lines]] = np.asarray(
+                        if (
+                            n_lines == _owned_ref.row_count
+                            and _line_result_ref.row_count == _owned_ref.row_count
+                        ):
+                            valid_rows = np.flatnonzero(_line_result_ref.validity)
+                            if valid_rows.size > 0:
+                                line_arr = np.asarray(line_shapely, dtype=object)
+                                result[valid_rows] = line_arr[valid_rows]
+                        elif n_lines > 0 and line_global_row_map_host is not None:
+                            result[line_global_row_map_host[:n_lines]] = np.asarray(
                                 line_shapely[:n_lines], dtype=object,
                             )
                     except Exception:
                         pass
 
                 # Handle fallback rows (non-polygon, non-line families)
-                if _fallback_rows_arr_ref.size > 0:
+                fallback_rows_arr = (
+                    _fallback_rows_arr_ref
+                    if _fallback_rows_arr_ref is not None
+                    else (
+                        _fallback_rows_factory_ref()
+                        if _fallback_rows_factory_ref is not None
+                        else np.empty(0, dtype=np.int32)
+                    )
+                )
+                if fallback_rows_arr.size > 0:
                     shapely_geoms = np.asarray(_owned_ref.to_shapely(), dtype=object)
-                    fallback_shapely = shapely_geoms[_fallback_rows_arr_ref]
+                    fallback_shapely = shapely_geoms[fallback_rows_arr]
                     clipped = clip_by_rect_array(
                         np.asarray(fallback_shapely, dtype=object), _rect_ref,
                     )
-                    result[_fallback_rows_arr_ref] = clipped
+                    result[fallback_rows_arr] = clipped
 
                 return result
 
@@ -2274,13 +3086,17 @@ def clip_by_rect_owned(
                 geometries_factory=_materialize_poly_line_geometries,
                 row_count=int(owned.row_count),
                 candidate_rows=all_candidate_rows,
+                candidate_rows_factory=candidate_rows_factory,
                 fast_rows=fast_rows_arr,
+                fast_rows_factory=fast_rows_factory,
                 fallback_rows=fallback_rows_arr,
+                fallback_rows_factory=fallback_rows_factory,
                 runtime_selection=runtime_selection,
                 precision_plan=precision_plan,
                 robustness_plan=robustness_plan,
                 owned_result=owned_result,
                 owned_result_rows=owned_result_rows,
+                owned_result_rows_factory=owned_result_rows_factory,
             )
         raise NotImplementedError("clip_by_rect GPU variant currently supports point-only, polygon, and line owned arrays")
 

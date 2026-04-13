@@ -15,6 +15,7 @@ from vibespatial import (
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
 
 
@@ -175,6 +176,338 @@ def test_clip_by_rect_benchmark_reports_candidate_and_fallback_counts() -> None:
     assert benchmark.candidate_rows == 2
     assert benchmark.fast_rows == 2
     assert benchmark.fallback_rows == 0
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_auto_sticks_to_gpu_buffers_even_when_residency_marker_is_host() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = from_shapely_geometries(
+        [box(0.0, 0.0, 4.0, 4.0), box(10.0, 10.0, 12.0, 12.0)],
+        residency=Residency.DEVICE,
+    )
+    # Emulate GPU-native readers that preserve device_state while the public
+    # residency marker still reads as host.
+    owned.residency = Residency.HOST
+
+    result = clip_by_rect_owned(owned, 0.0, 0.0, 2.0, 2.0)
+
+    assert result.runtime_selection.selected is ExecutionMode.GPU
+    assert result.owned_result is not None
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_polygon_auto_uses_pair_owned_rectangle_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial
+    import vibespatial.constructive.clip_rect as clip_rect_mod
+
+    owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 4.0, 4.0),
+            box(1.0, 1.0, 5.0, 5.0),
+            box(10.0, 10.0, 12.0, 12.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    vibespatial.clear_dispatch_events()
+
+    def _fail_generic_polygon_clip(*_args, **_kwargs):
+        raise AssertionError("dense polygon rectangle clip should route through polygon_rect_intersection")
+
+    monkeypatch.setattr(
+        clip_rect_mod,
+        "_clip_polygon_rings_gpu_device",
+        _fail_generic_polygon_clip,
+    )
+
+    result = clip_by_rect_owned(owned, 0.0, 0.0, 2.0, 2.0)
+    dispatch_events = vibespatial.get_dispatch_events(clear=True)
+
+    assert result.runtime_selection.selected is ExecutionMode.GPU
+    assert result.owned_result is not None
+    assert any(
+        event.surface == "vibespatial.kernels.constructive.polygon_rect_intersection"
+        and event.selected is ExecutionMode.GPU
+        for event in dispatch_events
+    )
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_line_path_avoids_host_metadata_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            LineString([(0.0, 0.0), (4.0, 4.0), (8.0, 0.0)]),
+            LineString([(10.0, 10.0), (12.0, 12.0)]),
+        ]
+    )
+
+    def _fail_host_metadata(*_args, **_kwargs):
+        raise AssertionError("GPU line clip should classify rows from device metadata")
+
+    monkeypatch.setattr(owned_mod.OwnedGeometryArray, "_ensure_host_metadata", _fail_host_metadata)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        6.0,
+        6.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert result.fallback_rows.size == 0
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_line_row_map_stays_lazy_until_requested() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            LineString([(0.0, 0.0), (4.0, 4.0), (8.0, 0.0)]),
+            LineString([(20.0, 20.0), (22.0, 22.0)]),
+        ]
+    )
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        6.0,
+        6.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert result._owned_result_rows is None
+    assert result._owned_result_rows_factory is not None
+
+    row_map = result.owned_result_rows
+
+    assert isinstance(row_map, np.ndarray)
+    assert row_map.dtype == np.int32
+    assert np.array_equal(row_map, np.asarray([0], dtype=np.int32))
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_row_classification_stays_lazy_until_requested() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            LineString([(0.0, 0.0), (4.0, 4.0), (8.0, 0.0)]),
+            LineString([(20.0, 20.0), (22.0, 22.0)]),
+        ]
+    )
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        6.0,
+        6.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result._candidate_rows is None
+    assert result._candidate_rows_factory is not None
+    assert result._fast_rows is None
+    assert result._fast_rows_factory is not None
+    assert result._fallback_rows is None
+    assert result._fallback_rows_factory is not None
+    assert np.array_equal(result.fast_rows, np.asarray([0, 1], dtype=np.int32))
+    assert result.fallback_rows.size == 0
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_dense_linestring_path_builds_mixed_outputs_without_generic_regroup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.constructive.clip_rect as clip_rect_mod
+
+    values = [
+        LineString([(-1.0, 0.5), (0.5, 0.5), (1.5, 0.5)]),
+        LineString(
+            [
+                (-1.0, 0.5),
+                (0.5, 0.5),
+                (0.5, 1.5),
+                (1.5, 1.5),
+                (1.5, 0.5),
+                (3.0, 0.5),
+            ]
+        ),
+        LineString([(10.0, 10.0), (12.0, 12.0)]),
+    ]
+    owned = _make_device_resident_with_host_stubs_cleared(values)
+
+    def _fail_generic(*_args, **_kwargs):
+        raise AssertionError("dense LineString rectangle clip should not use generic regroup/scatter")
+
+    monkeypatch.setattr(clip_rect_mod, "_build_line_clip_device_result", _fail_generic)
+    monkeypatch.setattr(clip_rect_mod, "concat_owned_scatter", _fail_generic)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        2.0,
+        1.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert set(result.owned_result.families) == {
+        GeometryFamily.LINESTRING,
+        GeometryFamily.MULTILINESTRING,
+    }
+    assert result.fallback_rows.size == 0
+    assert result.owned_result_rows.tolist() == [0, 1]
+
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 1.0)
+    expected_compact = [
+        geom for geom in expected.tolist()
+        if geom is not None and not geom.is_empty
+    ]
+    _assert_geometries_match(list(result.owned_result.to_shapely()), expected_compact)
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_mixed_polygon_line_owned_result_keeps_both_families() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        LineString([(0.0, 0.0), (4.0, 4.0)]),
+        box(0.0, 0.0, 4.0, 4.0),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        2.0,
+        2.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result.owned_result is not None
+    assert set(result.owned_result.families) == {
+        GeometryFamily.LINESTRING,
+        GeometryFamily.POLYGON,
+    }
+    assert np.array_equal(result.owned_result_rows, np.asarray([0, 1], dtype=np.int32))
+
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
+    expected_compact = [
+        geom for geom in expected.tolist()
+        if geom is not None and not geom.is_empty
+    ]
+    _assert_geometries_match(list(result.owned_result.to_shapely()), expected_compact)
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_mixed_polygon_line_geometries_preserve_source_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        box(0.0, 0.0, 4.0, 4.0),
+        LineString([(0.0, 0.0), (4.0, 4.0)]),
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        2.0,
+        2.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 2.0)
+    _assert_geometries_match(list(result.geometries), expected.tolist())
+
+
+@pytest.mark.gpu
+def test_clip_by_rect_gpu_dense_linestring_path_reuses_cached_segment_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.constructive.clip_rect as clip_rect_mod
+
+    owned = from_shapely_geometries(
+        [
+            LineString([(0.0, 0.0), (4.0, 4.0), (8.0, 0.0)]),
+            LineString([(1.0, 0.0), (1.0, 4.0), (4.0, 4.0), (4.0, 0.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+
+    first = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        6.0,
+        6.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    assert first.owned_result is not None
+
+    def _fail_extract(*_args, **_kwargs):
+        raise AssertionError("repeat viewport clip should reuse cached line segments")
+
+    monkeypatch.setattr(clip_rect_mod, "_extract_segments_vectorized", _fail_extract)
+
+    second = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        2.0,
+        2.0,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert second.owned_result is not None
+    expected = shapely.clip_by_rect(
+        np.asarray(
+            [
+                LineString([(0.0, 0.0), (4.0, 4.0), (8.0, 0.0)]),
+                LineString([(1.0, 0.0), (1.0, 4.0), (4.0, 4.0), (4.0, 0.0)]),
+            ],
+            dtype=object,
+        ),
+        0.0,
+        0.0,
+        2.0,
+        2.0,
+    )
+    expected_compact = [
+        geom for geom in expected.tolist()
+        if geom is not None and not geom.is_empty
+    ]
+    _assert_geometries_match(list(second.owned_result.to_shapely()), expected_compact)
 
 
 def test_clip_rectangle_polygon_boundary_rows_bypass_generic_lower_dim_assembler(
