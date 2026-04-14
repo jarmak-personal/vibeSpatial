@@ -20,6 +20,7 @@ except ImportError:
 HEALTH_TEST_SUITE = [
     "tests/test_runtime_harness.py",
     "tests/test_geopandas_shim.py",
+    "tests/test_version_consistency.py",
     "tests/test_reference_oracle.py",
     "tests/test_kernel_scaffold.py",
     "tests/test_decision_log.py",

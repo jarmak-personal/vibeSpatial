@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import geopandas
 
 
 def test_import_uses_local_package() -> None:
-    assert "/vibeSpatial/src/geopandas/__init__.py" in geopandas.__file__
+    assert Path(geopandas.__file__).as_posix().endswith("/src/geopandas/__init__.py")
 
 
 def test_runtime_selection_is_exposed() -> None:

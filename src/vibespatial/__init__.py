@@ -4,8 +4,6 @@ from pkgutil import extend_path
 
 __path__ = extend_path(__path__, __name__)
 
-__version__ = "0.1.0"
-
 # --- Public GeoPandas-compatible API surface ---
 from vibespatial.api import (
     GeoDataFrame,
@@ -20,6 +18,7 @@ from vibespatial.api._config import options
 from vibespatial.api._shapely_dispatch import install_shapely_make_valid_dispatch
 from vibespatial.api.tools import clip, overlay, sjoin, sjoin_nearest
 
+from ._version import __version__
 from .constructive.clip_rect import (
     RectClipBenchmark,
     RectClipResult,
@@ -621,6 +620,7 @@ __all__ = [
     "overlay",
     "clip",
     "options",
+    "__version__",
 ]
 
 

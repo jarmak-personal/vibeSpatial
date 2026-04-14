@@ -31,9 +31,10 @@ jobs:
         id: version
         run: |
           CURRENT=$(python3 -c "
-          import tomllib
-          with open('pyproject.toml', 'rb') as f:
-              print(tomllib.load(f)['project']['version'])
+          ns = {}
+          with open('src/vibespatial/_version.py', 'r', encoding='utf-8') as f:
+              exec(f.read(), ns)
+          print(ns['__version__'])
           ")
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
 
@@ -57,21 +58,13 @@ jobs:
           NEXT: ${{ steps.version.outputs.next }}
           CURRENT: ${{ steps.version.outputs.current }}
         run: |
-          # pyproject.toml
-          sed -i "s/^version = \"$CURRENT\"/version = \"$NEXT\"/" pyproject.toml
-
-          # src/vibespatial/api/_version.py
+          # src/vibespatial/_version.py
           TUPLE=$(echo "$NEXT" | sed 's/\./, /g')
-          sed -i "s/__version__ = version = \"$CURRENT\"/__version__ = version = \"$NEXT\"/" src/vibespatial/api/_version.py
-          sed -i "s/__version_tuple__ = version_tuple = .*/__version_tuple__ = version_tuple = ($TUPLE)/" src/vibespatial/api/_version.py
-
-          # docs/conf.py
-          sed -i "s/^release = \"$CURRENT\"/release = \"$NEXT\"/" docs/conf.py
+          sed -i "s/__version__ = \"$CURRENT\"/__version__ = \"$NEXT\"/" src/vibespatial/_version.py
+          sed -i "s/__version_tuple__ = .*/__version_tuple__ = ($TUPLE)/" src/vibespatial/_version.py
 
           echo "Updated files:"
-          grep -n "version" pyproject.toml | head -3
-          cat src/vibespatial/api/_version.py
-          grep "release" docs/conf.py
+          cat src/vibespatial/_version.py
 
       - name: Commit and tag
         env:

@@ -1,9 +1,18 @@
 """Sphinx configuration for vibeSpatial documentation."""
 
+from pathlib import Path
+
 project = "vibeSpatial"
 copyright = "2026, vibeSpatial Contributors"
 author = "vibeSpatial Contributors"
-release = "0.3.1"
+_version_ns: dict[str, object] = {}
+exec(
+    (Path(__file__).resolve().parents[1] / "src" / "vibespatial" / "_version.py").read_text(
+        encoding="utf-8"
+    ),
+    _version_ns,
+)
+release = str(_version_ns["__version__"])
 
 extensions = [
     "myst_parser",

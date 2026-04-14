@@ -49,7 +49,7 @@ uv run python scripts/check_maintainability.py --all
 
 ## Release process
 
-1. Bump version in `pyproject.toml` and `src/vibespatial/api/_version.py`
-2. Update `CHANGELOG.md`
-3. Create a GitHub Release with tag `v{version}` (e.g., `v0.1.0`)
+1. Run the GitHub Actions `Release` workflow with the desired bump type
+2. The workflow updates `src/vibespatial/_version.py`, tags `v{version}`, and creates the GitHub Release
+3. GitHub Releases are the source of truth for release notes; this repo does not maintain a `CHANGELOG.md`
 4. The publish workflow builds the wheel and publishes to PyPI

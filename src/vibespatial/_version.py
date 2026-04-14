@@ -1,0 +1,11 @@
+__all__ = [
+    "__version__",
+    "__version_tuple__",
+    "version",
+    "version_tuple",
+]
+
+__version__ = "0.3.1"
+version = __version__
+__version_tuple__ = (0, 3, 1)
+version_tuple = __version_tuple__

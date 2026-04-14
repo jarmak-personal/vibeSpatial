@@ -3,7 +3,6 @@ import pandas as pd
 
 import vibespatial.api.datasets
 from vibespatial.api._config import options
-from vibespatial.api._version import __version__
 from vibespatial.api.geoseries import GeoSeries  # noqa: E402 — must precede GeoDataFrame to avoid circular import
 from vibespatial.api.geodataframe import GeoDataFrame  # noqa: E402
 from vibespatial.api.geometry_array import points_from_xy  # noqa: E402
@@ -37,6 +36,7 @@ from vibespatial.runtime.fallbacks import (
     get_fallback_events,
     record_fallback_event,
 )
+from vibespatial._version import __version__
 
 def get_runtime_selection(
     requested: ExecutionMode | str = ExecutionMode.AUTO,
