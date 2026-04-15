@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "contract": {
+    "surfaces": {
+      "versioning": {
+        "state": "pass",
+        "passed": 2,
+        "total": 2
+      },
+      "shim": {
+        "state": "pass",
+        "passed": 3,
+        "total": 3
+      },
+      "overlay": {
+        "state": "fail",
+        "passed": 236,
+        "total": 260
+      },
+      "clip": {
+        "state": "pass",
+        "passed": 43,
+        "total": 43
+      },
+      "arrow_parquet": {
+        "state": "pass",
+        "passed": 132,
+        "total": 132
+      },
+      "io_file_layer": {
+        "state": "pass",
+        "passed": 70,
+        "total": 70
+      },
+      "gpu_dispatch_correctness": {
+        "state": "pass",
+        "passed": 1,
+        "total": 1
+      },
+      "fallback_observability": {
+        "state": "pass",
+        "passed": 18,
+        "total": 18
+      },
+      "performance_rails": {
+        "state": "fail",
+        "passed": 25,
+        "total": 26
+      }
+    }
+  },
+  "gpu": {
+    "status": "fail",
+    "gpu_accel_pct": 20.084107398678313,
+    "fallback_rate": 0.000739
+  }
+}

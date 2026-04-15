@@ -1,0 +1,80 @@
+[[surface]]
+name = "versioning"
+owners = ["src/vibespatial/_version.py", "pyproject.toml"]
+command = "uv run pytest -q tests/test_version_consistency.py"
+required = true
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.versioning"
+
+[[surface]]
+name = "shim"
+owners = ["src/geopandas"]
+command = "uv run pytest -q tests/test_geopandas_shim.py"
+required = true
+runtime = "any"
+allowed_states = ["pass", "fail", "unsupported"]
+baseline_key = "contract.shim"
+
+[[surface]]
+name = "overlay"
+owners = ["src/vibespatial/api/tools/overlay.py"]
+command = "uv run pytest -q tests/test_overlay_api.py tests/upstream/geopandas/tests/test_overlay.py"
+required = true
+runtime = "gpu-preferred"
+allowed_states = ["pass", "fail", "unsupported", "skipped-no-gpu"]
+baseline_key = "contract.overlay"
+
+[[surface]]
+name = "clip"
+owners = ["src/vibespatial/api/tools/clip.py"]
+command = "uv run pytest -q tests/test_clip_public_api.py"
+required = true
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.clip"
+
+[[surface]]
+name = "arrow_parquet"
+owners = ["src/vibespatial/io/geoarrow.py", "src/vibespatial/io/geoparquet.py"]
+command = "uv run pytest -q tests/test_io_arrow.py"
+required = true
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.arrow_parquet"
+
+[[surface]]
+name = "io_file_layer"
+owners = ["src/vibespatial/io/file.py"]
+command = "uv run pytest -q tests/test_io_file.py"
+required = true
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.io_file_layer"
+
+[[surface]]
+name = "gpu_dispatch_correctness"
+owners = ["src/vibespatial/api/geometry_array.py", "src/vibespatial/predicates/binary.py"]
+command = "uv run pytest -q tests/test_geopandas_binary_predicates.py::test_geopandas_binary_predicates_select_gpu_for_large_supported_batches"
+required = true
+runtime = "gpu-required"
+allowed_states = ["pass", "fail", "skipped-no-gpu"]
+baseline_key = "contract.gpu_dispatch_correctness"
+
+[[surface]]
+name = "fallback_observability"
+owners = ["src/geopandas/__init__.py", "src/vibespatial/runtime/fallbacks.py"]
+command = "uv run pytest -q tests/test_geopandas_fallbacks.py tests/test_gpu_acceleration_metric.py"
+required = true
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.fallback_observability"
+
+[[surface]]
+name = "performance_rails"
+owners = ["src/vibespatial/bench/pipeline.py", "src/vibespatial/bench/io_benchmark_rails.py"]
+command = "uv run pytest -q tests/test_pipeline_benchmarks.py tests/test_io_benchmark_rails.py"
+required = false
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.performance_rails"

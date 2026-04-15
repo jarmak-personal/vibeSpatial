@@ -12,6 +12,8 @@ all of `src/vibespatial` + `src/geopandas`, yielding numbers like `coverage:
 - the 6-file suite was never intended to cover the full tree,
 - GPU correctness, fallback rates, and zero-copy posture are the metrics that
   actually matter for this project,
+- the repo already has a property dashboard for the things we say we care
+  about, but that signal is disconnected from the printed health headline,
 - CPU-only upstream slices fail in ways that are expected (not yet supported),
   but currently read as red,
 - there is no trend history, so a regression and a steady-state look identical.
@@ -32,6 +34,8 @@ Good health metrics for this repo should be:
    just assert "something is bad."
 4. **Trendable.** A reader should be able to tell whether things are getting
    better or worse without running archaeology on git log.
+5. **Compositional.** Reuse the existing property dashboard and ratchet checks
+   where possible; do not build a third parallel definition of repo health.
 
 ## 3. Tiered health model
 
@@ -47,23 +51,29 @@ already does, minus the misleading coverage headline.
 
 Reports:
 
-- smoke suite pass rate (the current `HEALTH_TEST_SUITE`)
+- smoke suite pass / total (the current `HEALTH_TEST_SUITE`)
 - lint + architecture lints
 - doc hygiene
 - version/packaging consistency
+- compact property summary from `scripts/property_dashboard.py`
 
 Does **not** report:
 
 - repo-wide coverage %
 - upstream slice results
-- GPU metrics
+- live GPU runtime metrics
+
+Bootstrap should also be explicit about `unmeasured` and `configured` states.
+If a benchmark rail, transfer audit, or dispatch policy is only configured but
+not actually exercised by the current run, report that honestly instead of
+showing `PASS`.
 
 ### 3.2 Contract health (maintained surfaces)
 
 Question: *are the surfaces we claim to support still working?*
 
 Runs a curated set of upstream slices, grouped by product surface. Each
-surface has an owner, a test command, and a required/optional flag.
+surface has an owner, an executable command, and explicit allowed states.
 
 Reports per surface:
 
@@ -72,6 +82,7 @@ Reports per surface:
 - required vs optional
 - explicit `unsupported` state for surfaces we're not yet targeting (CPU-only
   paths, for instance)
+- explicit `skipped-no-gpu` where a surface requires a visible NVIDIA runtime
 
 ### 3.3 GPU health (first-class)
 
@@ -84,12 +95,15 @@ Reports:
 
 - GPU available: yes/no
 - GPU acceleration rate on maintained GPU suite
-- fallback events (count + categorized by reason)
+- fallback rate on maintained GPU suite (`fallbacks / total dispatches`) plus
+  categorized reasons
 - zero-copy violations (from `check_zero_copy.py`)
 - selected runtime vs requested runtime on benchmark rails
 - end-to-end pipeline benchmark deltas vs baseline
 
-These should be the hero numbers on the top of the printed report.
+These should be the hero numbers on the top of the printed report. Prefer
+rates to raw counts for runtime telemetry so runs of different sizes remain
+comparable. Raw counts are still useful as supporting detail.
 
 ### 3.4 Release health
 
@@ -115,23 +129,29 @@ Shape:
 [[surface]]
 name = "versioning"
 owners = ["src/vibespatial/_version.py", "pyproject.toml"]
-tests = ["tests/test_version_consistency.py"]
+command = "uv run pytest -q tests/test_version_consistency.py"
 required = true
-gpu_required = false
+runtime = "any"
+allowed_states = ["pass", "fail"]
+baseline_key = "contract.versioning"
 
 [[surface]]
 name = "shim"
 owners = ["src/geopandas"]
-tests = ["tests/test_geopandas_shim.py"]
+command = "uv run pytest -q tests/test_geopandas_shim.py"
 required = true
-gpu_required = false
+runtime = "any"
+allowed_states = ["pass", "fail", "unsupported"]
+baseline_key = "contract.shim"
 
 [[surface]]
 name = "overlay"
 owners = ["src/vibespatial/api/tools/overlay.py"]
-tests = ["tests/test_overlay_api.py", "tests/upstream/geopandas/test_overlay.py"]
+command = "uv run pytest -q tests/test_overlay_api.py tests/upstream/geopandas/test_overlay.py"
 required = true
-gpu_required = false
+runtime = "gpu-preferred"
+allowed_states = ["pass", "fail", "unsupported", "skipped-no-gpu"]
+baseline_key = "contract.overlay"
 ```
 
 Surfaces I would seed the matrix with, in priority order:
@@ -148,6 +168,11 @@ Surfaces I would seed the matrix with, in priority order:
 
 Ship (1)–(3) first. The rest land as the matrix proves out.
 
+The important design choice here is that the matrix should describe how to run
+and classify a surface, not just which files feel related to it. Commands,
+runtime expectations, and allowed states scale better than file lists once the
+suite gets larger.
+
 ## 5. What the printed report should look like
 
 Replacing the current `print_summary` with something shaped like:
@@ -155,9 +180,11 @@ Replacing the current `print_summary` with something shaped like:
 ```
 Repo Health — bootstrap: PASS
 
+Property summary: 6/6 clean, total distance 0.00
+
 GPU health: PASS (gpu available: true)
   acceleration rate:     87.4%   (baseline 86.1%, +1.3)
-  fallback events:       12      (baseline 14, -2)
+  fallback rate:         1.2%    (12 / 1000 dispatches, baseline 1.4%, -0.2)
   zero-copy violations:  0
 
 Maintained surfaces (contract):
@@ -166,9 +193,10 @@ Maintained surfaces (contract):
   overlay              FAIL    134/218   (baseline 130/218, +4)
   arrow/parquet        FAIL    52/64     (baseline 52/64,   no change)
 
-Performance rails:
-  1M pipeline:         no regression
-  profile rails:       selected runtime recorded
+Configured but unmeasured:
+  profile rails:       configured
+  transfer audit:      configured
+  dispatch policy:     configured
 
 Release integrity:    PASS
 ```
@@ -184,6 +212,10 @@ The contrast with today's `coverage: 9.25% / tests: 23 passed` is the point.
   commit to CPU-only parity.
 - **"23 tests passed" as a standalone signal.** Always report pass/total with
   surface context.
+- **Placeholder greens.** "Files exist" or "policy defined" should report as
+  `configured`, not `PASS`.
+- **Raw runtime counts without denominators.** Prefer rates for acceleration
+  and fallback telemetry, with counts as supporting detail.
 
 ## 7. Ratchets, not perfection
 
@@ -191,7 +223,7 @@ Rather than demanding every surface go green at once, require:
 
 - no regression in maintained surfaces (deltas must be `<= 0` for failures)
 - versioning / release integrity always green
-- GPU health trend non-decreasing (acceleration rate, fallback count)
+- GPU health trend non-decreasing (acceleration rate, fallback rate)
 - specific failing surfaces shrink over time
 
 Implementation: a committed `.health-baseline.json` plus a
@@ -210,14 +242,15 @@ Minimum viable persistence:
 - a follow-up script (`scripts/health_trend.py`) consumes the last N artifacts
   and emits a summary table
 
-## 9. Sequencing (strong recommendation: do this in small PRs)
+## 9. Sequencing (strong recommendation: do this as small tasks)
 
-**PR 1 — Honest bootstrap.**
+**Task 1 — Honest bootstrap.**
 - Remove repo-wide coverage % from the headline in `health.py`.
-- Promote the existing GPU acceleration block to the top of `print_summary`.
-- Keep everything else intact. This alone removes the biggest false-red.
+- Add a one-line property summary from `scripts/property_dashboard.py`.
+- Promote the existing GPU acceleration block near the top of `print_summary`.
+- Replace placeholder greens with `configured` / `unmeasured`.
 
-**PR 2 — Surface matrix MVP.**
+**Task 2 — Surface matrix MVP.**
 - Add `scripts/health_surfaces.toml` with 3 surfaces: versioning, shim,
   overlay.
 - Extend `health.py` with `--tier={bootstrap,contract,gpu,release}` so one
@@ -225,16 +258,16 @@ Minimum viable persistence:
 - Implement `--tier=contract` to consume the matrix and emit per-surface
   pass/total.
 
-**PR 3 — Baselines and ratchets.**
+**Task 3 — Baselines and ratchets.**
 - Commit `.health-baseline.json`.
 - Add `--check` logic that fails CI on regressions, not on absolute failures.
 - Add `--update-baseline` flow.
 
-**PR 4 — Trend persistence.**
+**Task 4 — Trend persistence.**
 - Emit JSON artifacts from CI.
 - Add `scripts/health_trend.py` for last-N summaries.
 
-**PR 5+ — Expand surfaces.**
+**Task 5+ — Expand surfaces.**
 - Fill the rest of the matrix (clip, arrow/parquet, IO, GPU correctness,
   fallback observability, perf rails).
 
@@ -242,11 +275,14 @@ Minimum viable persistence:
 
 - **One entrypoint, not two.** Prefer a `--tier` flag on `health.py` over a
   new `scripts/health_contract.py`. Less surface area, less drift.
+- **Use the existing property dashboard.** Bootstrap health should summarize
+  `scripts/property_dashboard.py`, not fork its logic into a new parallel
+  implementation.
 - **TOML, not JSON, for the matrix.** Matches existing repo config style.
 - **Ratchets need a committed baseline file.** Without that, "ratchet" becomes
   folklore and the first red CI run gets waved through.
-- **Don't block PR 1 on matrix design.** Just removing the misleading coverage
-  headline is most of the win.
+- **Don't block Task 1 on matrix design.** Fixing the misleading coverage
+  headline and placeholder greens is most of the immediate win.
 
 ## 11. Open questions
 
@@ -258,7 +294,7 @@ Minimum viable persistence:
 - Where does the performance rail live in the tier model — under GPU health,
   or as its own tier 5 ("perf health")? I've kept it under GPU health for
   now; splitting it out is defensible.
-- How often does the baseline get updated — per PR, per release, or on
+- How often does the baseline get updated — per task, per release, or on
   demand? I'd default to "on demand, in its own commit."
 
 ## 12. Bluntest one-liner

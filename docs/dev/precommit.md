@@ -35,14 +35,19 @@ layers, each operating at a different level of the stack:
 uv run python scripts/install_githooks.py
 ```
 
-That's it. The git hook runs deterministic checks on every commit and prints
-a reminder about the AI review skills. The hook layer is configured via
-`.claude/settings.json`; repo-local Codex skills live in `.agents/skills/`.
+That's it. The git hook runs deterministic checks plus blocking health gates on
+every commit, then prints a reminder about the AI review skills. The hook
+layer is configured via `.claude/settings.json`; repo-local Codex skills live
+in `.agents/skills/`.
 
 ## Layer 1: Deterministic Checks (git pre-commit hook)
 
-Runs on every commit for all contributors. No network, no AI, no GPU
-required. Total runtime: ~3-5 seconds. Enforced by `.githooks/pre-commit`.
+Runs on every commit for all contributors. No network, no AI. The full gate is
+designed around a visible NVIDIA runtime because the commit path now includes
+the GPU health tier; without one, that tier reports `skipped-no-gpu` instead
+of protecting against GPU regressions. Total runtime is no longer "fast lint
+only"; it includes full contract and GPU health ratchets. Enforced by
+`.githooks/pre-commit`.
 
 | Order | Check | Script | Rules |
 |-------|-------|--------|-------|
@@ -53,6 +58,9 @@ required. Total runtime: ~3-5 seconds. Enforced by `.githooks/pre-commit`.
 | 5 | Zero-copy | `check_zero_copy.py --all` | ZCOPY001-003 (add `--detail` for per-violation breakdown during debt paydown) |
 | 6 | Performance | `check_perf_patterns.py --all` | VPAT001-004 |
 | 7 | Maintainability | `check_maintainability.py --all` | MAINT001-003 |
+| 8 | Import guards | `check_import_guard.py --all` | IGRD001-002 |
+| 9 | Contract health | `health.py --tier contract --check` | Ratcheted maintained-surface regressions |
+| 10 | GPU health | `health.py --tier gpu --check` | Ratcheted GPU acceleration / fallback regressions |
 
 After checks pass, a non-blocking reminder prints the AI review commands.
 This works in terminals, VS Code git output, and CI alike.

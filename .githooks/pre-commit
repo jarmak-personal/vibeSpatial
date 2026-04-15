@@ -30,7 +30,17 @@ printf "pre-commit: checking import guards (numpy/shapely in GPU paths)...\n"
 uv run python scripts/check_import_guard.py --all
 
 # ===========================================================================
-# Tier 2: AI review reminder
+# Tier 2: Health gates (blocking, local NVIDIA workstation)
+# ===========================================================================
+
+printf "pre-commit: checking maintained contract surfaces against baseline...\n"
+uv run python scripts/health.py --tier contract --check
+
+printf "pre-commit: checking GPU health against baseline...\n"
+uv run python scripts/health.py --tier gpu --check
+
+# ===========================================================================
+# Tier 3: AI review reminder
 #
 # The AI review skills ($gpu-code-review, $pre-land-review) are designed
 # for interactive agent sessions, not automated pre-commit runs.

@@ -30,6 +30,20 @@ jobs:
         run: uv run ruff check
       - name: Run tests (non-GPU)
         run: uv run pytest -m "not gpu" --ignore=tests/upstream -q
+      - name: Collect bootstrap health report
+        if: ${{ always() && matrix.python-version == '3.13' }}
+        run: uv run python scripts/health.py --tier bootstrap --json > health-bootstrap-py${{ matrix.python-version }}.json
+      - name: Collect contract health report
+        if: ${{ always() && matrix.python-version == '3.13' }}
+        run: uv run python scripts/health.py --tier contract --json > health-contract-py${{ matrix.python-version }}.json
+      - name: Upload health artifacts
+        if: ${{ always() && matrix.python-version == '3.13' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-reports-cpu-py${{ matrix.python-version }}-${{ github.run_id }}
+          path: |
+            health-bootstrap-py${{ matrix.python-version }}.json
+            health-contract-py${{ matrix.python-version }}.json
 
   gpu-smoke:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_gpu }}
@@ -48,3 +62,12 @@ jobs:
         run: uv sync --group dev --extra cu12
       - name: Run GPU harness smoke
         run: uv run pytest --run-gpu tests/test_runtime_harness.py -m gpu
+      - name: Collect GPU health report
+        if: always()
+        run: uv run python scripts/health.py --tier gpu --json > health-gpu.json
+      - name: Upload GPU health artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: health-reports-gpu-${{ github.run_id }}
+          path: health-gpu.json
