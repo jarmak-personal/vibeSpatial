@@ -15,7 +15,9 @@ from shapely.geometry import GeometryCollection
 
 from vibespatial.api._native_results import (
     GeometryNativeResult,
-    GroupedConstructiveResult,
+    NativeTabularResult,
+    _coerce_constructive_export_frame,
+    _grouped_constructive_to_native_tabular_result,
 )
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.config import (
@@ -162,17 +164,16 @@ def _grouped_constructive_result(
     frame,
     aggregated_data: pd.DataFrame,
     as_index: bool,
-) -> GroupedConstructiveResult:
-    return GroupedConstructiveResult(
+) -> NativeTabularResult:
+    return _grouped_constructive_to_native_tabular_result(
         geometry=_grouped_union_geometry_result(
             grouped_union,
             geometry_name=frame.geometry.name,
             crs=frame.crs,
         ),
-        attributes=aggregated_data,
         geometry_name=frame.geometry.name,
         as_index=as_index,
-        frame_type=type(frame),
+        attributes=aggregated_data,
     )
 
 
@@ -234,7 +235,7 @@ class LazyDissolvedFrame:
             )
         return grouped_union.geometries
 
-    def to_native_result(self) -> GroupedConstructiveResult:
+    def to_native_result(self) -> NativeTabularResult:
         self._ensure_group_positions()
         if self._row_group_codes is not None:
             grouped_union = execute_grouped_union_codes(
@@ -265,7 +266,11 @@ class LazyDissolvedFrame:
     def materialize(self):
         if self._materialized is not None:
             return self._materialized
-        self._materialized = self.to_native_result().to_geodataframe()
+        self._materialized = _coerce_constructive_export_frame(
+            self.to_native_result().to_geodataframe(),
+            geometry_name=self._geometry_name,
+            frame_type=type(self._frame),
+        )
         return self._materialized
 
     def to_geodataframe(self):
@@ -2454,7 +2459,7 @@ def evaluate_geopandas_dissolve_native(
     method: str,
     grid_size: float | None,
     agg_kwargs: dict[str, Any],
-) -> GroupedConstructiveResult:
+) -> NativeTabularResult:
     from vibespatial.runtime.execution_trace import execution_trace
 
     with execution_trace("dissolve"):
@@ -2540,7 +2545,7 @@ def evaluate_geopandas_dissolve(
     grid_size: float | None,
     agg_kwargs: dict[str, Any],
 ):
-    return evaluate_geopandas_dissolve_native(
+    native_result = evaluate_geopandas_dissolve_native(
         frame,
         by=by,
         aggfunc=aggfunc,
@@ -2552,7 +2557,12 @@ def evaluate_geopandas_dissolve(
         method=method,
         grid_size=grid_size,
         agg_kwargs=agg_kwargs,
-    ).to_geodataframe()
+    )
+    return _coerce_constructive_export_frame(
+        native_result.to_geodataframe(),
+        geometry_name=frame.geometry.name,
+        frame_type=type(frame),
+    )
 
 
 def evaluate_geopandas_lazy_dissolve(

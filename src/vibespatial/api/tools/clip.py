@@ -12,7 +12,12 @@ from shapely.geometry import GeometryCollection, LineString, MultiPolygon, Point
 
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._compat import PANDAS_GE_30
-from vibespatial.api._native_results import GeometryNativeResult, LeftConstructiveResult
+from vibespatial.api._native_results import (
+    GeometryNativeResult,
+    LeftConstructiveResult,
+    NativeTabularResult,
+    _clip_constructive_parts_to_native_tabular_result,
+)
 from vibespatial.api.geometry_array import (
     LINE_GEOM_TYPES,
     POINT_GEOM_TYPES,
@@ -2587,7 +2592,7 @@ def _clip_gdf_with_mask_native(
     *,
     query_geometry=None,
     keep_geom_type: bool = False,
-) -> ClipNativeResult:
+) -> NativeTabularResult:
     """Build a native clip result and defer GeoPandas assembly to explicit export."""
     clipping_by_rectangle = _mask_is_list_like_rectangle(mask)
     rectangle_bounds = _rectangle_bounds_from_mask(mask)
@@ -2759,15 +2764,44 @@ def _clip_gdf_with_mask_native(
         use_rect_fast_path=clipping_by_rectangle,
     )
 
-    return ClipNativeResult(
+    parts_tuple = tuple(parts)
+    return _clip_constructive_parts_to_native_tabular_result(
         source=gdf,
-        parts=tuple(parts),
-        ordered_index=gdf_sub.index,
+        parts=parts_tuple,
         ordered_row_positions=ordered_row_positions,
         clipping_by_rectangle=clipping_by_rectangle,
         has_non_point_candidates=bool(non_point_mask.any()),
         keep_geom_type=keep_geom_type,
+        spatial_materializer=lambda: ClipNativeResult(
+            source=gdf,
+            parts=parts_tuple,
+            ordered_index=gdf_sub.index,
+            ordered_row_positions=ordered_row_positions,
+            clipping_by_rectangle=clipping_by_rectangle,
+            has_non_point_candidates=bool(non_point_mask.any()),
+            keep_geom_type=keep_geom_type,
+        ).to_spatial(),
     )
+
+
+def _clip_native_tabular_to_spatial(
+    result: NativeTabularResult,
+    *,
+    source: GeoDataFrame | GeoSeries,
+):
+    if isinstance(source, GeoDataFrame):
+        clipped = result.to_geodataframe()
+        _maybe_seed_polygon_validity_cache(clipped)
+        return clipped
+
+    clipped = result.geometry.to_geoseries(
+        index=result.attributes.index,
+        name=getattr(source, "name", None) or result.geometry_name,
+    )
+    if result.attrs:
+        clipped.attrs.update(result.attrs)
+    _maybe_seed_polygon_validity_cache(clipped)
+    return clipped
 
 
 def _build_sparse_owned_clip_output(
@@ -2847,7 +2881,7 @@ def _clip_gdf_with_mask(gdf, mask, sort=False, *, query_geometry=None):
         query_geometry=query_geometry,
         keep_geom_type=False,
     )
-    return native_result.to_spatial()
+    return _clip_native_tabular_to_spatial(native_result, source=gdf)
 
 
 def evaluate_geopandas_clip_native(
@@ -2856,7 +2890,7 @@ def evaluate_geopandas_clip_native(
     *,
     keep_geom_type: bool = False,
     sort: bool = False,
-) -> ClipNativeResult:
+) -> NativeTabularResult:
     """Build a native clip result and defer GeoPandas export to the boundary."""
     original = gdf
 
@@ -2922,10 +2956,9 @@ def evaluate_geopandas_clip_native(
         ((box_mask[0] <= box_gdf[2]) and (box_gdf[0] <= box_mask[2]))
         and ((box_mask[1] <= box_gdf[3]) and (box_gdf[1] <= box_mask[3]))
     ):
-        return ClipNativeResult(
+        return _clip_constructive_parts_to_native_tabular_result(
             source=original,
             parts=(),
-            ordered_index=original.iloc[:0].index,
             ordered_row_positions=np.empty(0, dtype=np.intp),
             clipping_by_rectangle=clipping_by_rectangle,
             has_non_point_candidates=False,
@@ -3016,9 +3049,10 @@ def clip(gdf, mask, keep_geom_type=False, sort=False):
     >>> nws_groceries.shape
     (7, 8)
     """
-    return evaluate_geopandas_clip_native(
+    native_result = evaluate_geopandas_clip_native(
         gdf,
         mask,
         keep_geom_type=keep_geom_type,
         sort=sort,
-    ).to_spatial()
+    )
+    return _clip_native_tabular_to_spatial(native_result, source=gdf)

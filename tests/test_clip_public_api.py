@@ -10,6 +10,7 @@ import shapely
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon, box
 
 import vibespatial
+from vibespatial.api._native_results import NativeTabularResult
 from vibespatial.api.geometry_array import POLYGON_GEOM_TYPES, GeometryArray
 from vibespatial.api.tools.clip import clip
 from vibespatial.geometry.device_array import DeviceGeometryArray
@@ -18,6 +19,14 @@ from vibespatial.runtime.residency import Residency
 from vibespatial.testing import strict_native_environment
 
 clip_module = importlib.import_module("vibespatial.api.tools.clip")
+
+
+def _materialize_native_clip_result(
+    result: NativeTabularResult,
+    *,
+    source: vibespatial.GeoDataFrame | vibespatial.GeoSeries,
+):
+    return clip_module._clip_native_tabular_to_spatial(result, source=source)
 
 
 def _build_mixed_viewport_fixture() -> vibespatial.GeoDataFrame:
@@ -789,10 +798,11 @@ def test_clip_multipart_result_preserves_duplicate_source_index_order() -> None:
         box(1.0, 1.0, 6.0, 6.0),
     )
 
-    result = native_result.to_spatial()
+    assert isinstance(native_result, NativeTabularResult)
+    result = _materialize_native_clip_result(native_result, source=gdf)
 
-    assert len(result) == len(native_result.ordered_index)
-    assert list(result.index) == list(native_result.ordered_index)
+    assert len(result) == len(gdf)
+    assert list(result.index) == list(gdf.index)
     assert result.index.tolist().count("dup") == 2
     assert result.index.tolist().count("uniq") == 1
 
@@ -823,7 +833,8 @@ def test_clip_single_polygon_mask_uses_direct_bbox_candidates_before_sindex(
         ),
     )
 
-    result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True).to_spatial()
+    native_result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True)
+    result = _materialize_native_clip_result(native_result, source=gdf)
 
     assert result["value"].tolist() == [1]
     assert result.geometry.iloc[0].normalize().equals(box(1.0, 1.0, 2.0, 2.0))
@@ -872,7 +883,8 @@ def test_clip_promoted_single_polygon_mask_still_uses_direct_bbox_candidates(
         ),
     )
 
-    result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True).to_spatial()
+    native_result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True)
+    result = _materialize_native_clip_result(native_result, source=gdf)
 
     assert result["value"].tolist() == [1]
     assert result.geometry.iloc[0].normalize().equals(
@@ -948,7 +960,8 @@ def test_clip_promoted_single_polygon_mask_strict_uses_device_bbox_candidates(
     )
 
     with strict_native_environment():
-        result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True).to_spatial()
+        native_result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True)
+        result = _materialize_native_clip_result(native_result, source=gdf)
 
     assert seen["called"] is True
     assert result["value"].tolist() == [1]
@@ -1028,7 +1041,8 @@ def test_clip_device_backed_single_polygon_mask_uses_device_bbox_candidates(
         ),
     )
 
-    result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True).to_spatial()
+    native_result = clip_module.evaluate_geopandas_clip_native(gdf, mask, sort=True)
+    result = _materialize_native_clip_result(native_result, source=gdf)
 
     assert seen["called"] is True
     assert result["value"].tolist() == [1]
@@ -1064,11 +1078,12 @@ def test_clip_polygon_result_seeds_validity_cache_on_owned_output() -> None:
         crs="EPSG:3857",
     )
 
-    result = clip_module.evaluate_geopandas_clip_native(
+    native_result = clip_module.evaluate_geopandas_clip_native(
         gdf,
         box(1.0, 1.0, 3.0, 3.0),
         sort=True,
-    ).to_spatial()
+    )
+    result = _materialize_native_clip_result(native_result, source=gdf)
 
     result_owned = getattr(result.geometry.values, "_owned", None)
     assert result_owned is not None
@@ -1100,11 +1115,12 @@ def test_clip_polygon_result_preserves_validity_cache_through_public_filter_copy
         crs="EPSG:3857",
     )
 
-    result = clip_module.evaluate_geopandas_clip_native(
+    native_result = clip_module.evaluate_geopandas_clip_native(
         gdf,
         box(1.0, 1.0, 3.0, 3.0),
         sort=True,
-    ).to_spatial()
+    )
+    result = _materialize_native_clip_result(native_result, source=gdf)
     filtered = result[result.geometry.geom_type.isin(POLYGON_GEOM_TYPES)].copy()
 
     filtered_owned = getattr(filtered.geometry.values, "_owned", None)

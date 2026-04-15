@@ -889,7 +889,9 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
         x_device = x_device[:row_count]
         y_device = y_device[:row_count]
         validity_device = cp.ones(row_count, dtype=cp.bool_)
-        empty_mask_device = cp.isnan(x_device) | cp.isnan(y_device)
+        # Preserve partial-NaN point coordinates exactly as encoded. Only the
+        # canonical NaN/NaN sentinel represents POINT EMPTY.
+        empty_mask_device = cp.isnan(x_device) & cp.isnan(y_device)
         has_empty = bool(empty_mask_device.any().item())
         if has_empty:
             nonempty = ~empty_mask_device
@@ -919,7 +921,9 @@ def _decode_pylibcudf_point_geoarrow_column_to_owned(column) -> OwnedGeometryArr
     x_all, y_all = _pylibcudf_point_xy_children(column)
     x_device = x_all[validity_device]
     y_device = y_all[validity_device]
-    empty_mask_device = cp.isnan(x_device) | cp.isnan(y_device)
+    # Preserve partial-NaN point coordinates exactly as encoded. Only the
+    # canonical NaN/NaN sentinel represents POINT EMPTY.
+    empty_mask_device = cp.isnan(x_device) & cp.isnan(y_device)
     nonempty = ~empty_mask_device
     geometry_offsets_device = _device_compact_offsets(nonempty.astype(cp.int32))
     return _build_device_single_family_owned(
@@ -953,7 +957,9 @@ def _decode_pylibcudf_wkb_point_column_to_owned(
     starts = offsets[:-1][point_rows]
     x_values = _pylibcudf_unpack_le_float64(payload, starts + 5)
     y_values = _pylibcudf_unpack_le_float64(payload, starts + 13)
-    empty_mask = cp.isnan(x_values) | cp.isnan(y_values)
+    # Preserve partial-NaN point coordinates exactly as encoded. Only the
+    # canonical NaN/NaN sentinel represents POINT EMPTY.
+    empty_mask = cp.isnan(x_values) & cp.isnan(y_values)
     nonempty = ~empty_mask
     geometry_offsets = _device_compact_offsets(nonempty.astype(cp.int32))
     return _build_device_single_family_owned(
@@ -1016,7 +1022,9 @@ def _decode_pylibcudf_wkb_point_linestring_column_to_owned(
     point_starts = point_offsets[:-1][point_rows]
     point_x = _pylibcudf_unpack_le_float64(point_payload, point_starts + 5)
     point_y = _pylibcudf_unpack_le_float64(point_payload, point_starts + 13)
-    point_empty = cp.isnan(point_x) | cp.isnan(point_y)
+    # Preserve partial-NaN point coordinates exactly as encoded. Only the
+    # canonical NaN/NaN sentinel represents POINT EMPTY.
+    point_empty = cp.isnan(point_x) & cp.isnan(point_y)
     point_nonempty = ~point_empty
     point_geometry_offsets = _device_compact_offsets(point_nonempty.astype(cp.int32, copy=False))
     point_family = DeviceFamilyGeometryBuffer(

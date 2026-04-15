@@ -59,6 +59,7 @@ from vibespatial.api._native_results import (
 )
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.geometry_array import to_wkb as array_to_wkb
+from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.constructive.point import clip_points_rect_owned
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
@@ -1563,6 +1564,30 @@ def test_encode_wkb_owned_preserves_empty_point_rows() -> None:
     assert restored[3].equals(Point(1, 1))
 
 
+def test_decode_wkb_arrow_point_partial_nan_rows_preserve_coordinates() -> None:
+    import struct
+
+    encoded = [
+        struct.pack("<BIdd", 1, 1, 0.0, float("nan")),
+        struct.pack("<BIdd", 1, 1, float("nan"), 1.0),
+        struct.pack("<BIdd", 1, 1, float("nan"), float("nan")),
+        None,
+    ]
+    arrow = pa.array(encoded, type=pa.binary())
+
+    restored = io_wkb.decode_wkb_arrow_array_owned(arrow).to_shapely()
+
+    x0, y0 = restored[0].coords[0]
+    x1, y1 = restored[1].coords[0]
+
+    assert x0 == 0.0
+    assert np.isnan(y0)
+    assert np.isnan(x1)
+    assert y1 == 1.0
+    assert restored[2].is_empty
+    assert restored[3] is None
+
+
 @pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
 def test_encode_owned_wkb_device_preserves_empty_point_rows() -> None:
     import pyarrow as pa
@@ -2253,6 +2278,49 @@ def test_read_geoparquet_native_chunked_preserves_secondary_geometry_and_index(t
         assert left.equals(right)
     for left, right in zip(materialized["geom2"], gdf["geom2"], strict=True):
         assert left.equals(right)
+
+
+def test_read_geoparquet_cpu_preserves_reordered_geometry_columns(tmp_path) -> None:
+    import pyarrow.parquet as pq
+
+    gdf = geopandas.GeoDataFrame(
+        {
+            "pop_est": [10.0, 20.0],
+            "continent": ["North", "South"],
+            "name": ["A", "B"],
+            "geometry": [Point(0, 0), Point(1, 1)],
+            "gdp_md_est": [100, 200],
+        },
+        crs="EPSG:4326",
+        index=pd.Index(["AAA", "BBB"], name="iso_a3"),
+    )
+    gdf["geom2"] = geopandas.GeoSeries(
+        [Point(10, 10), Point(11, 11)],
+        index=gdf.index,
+        crs=gdf.crs,
+        name="geom2",
+    )
+
+    custom_column_order = [
+        "iso_a3",
+        "geom2",
+        "pop_est",
+        "continent",
+        "name",
+        "geometry",
+        "gdp_md_est",
+    ]
+    source_path = tmp_path / "source.parquet"
+    path = tmp_path / "reordered-geometry-columns.parquet"
+    gdf.to_parquet(source_path, index=True)
+    table = pq.read_table(source_path)
+    pq.write_table(table.select(custom_column_order), path)
+
+    result = read_geoparquet_native(path, backend="cpu").to_geodataframe()
+
+    expected = gdf[custom_column_order[1:]]
+    assert list(result.columns) == custom_column_order[1:]
+    assert_geodataframe_equal(result, expected)
 
 
 def test_read_non_geometry_geoparquet_columns_as_arrow_supports_filter_only_columns_with_row_groups(

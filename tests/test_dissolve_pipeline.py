@@ -17,7 +17,7 @@ from vibespatial import (
     has_gpu_runtime,
     plan_dissolve_pipeline,
 )
-from vibespatial.api._native_results import GroupedConstructiveResult
+from vibespatial.api._native_results import NativeTabularResult
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.bench.pipeline import _dissolve_join_heavy_groups, _regular_polygons_frame
@@ -1012,5 +1012,5 @@ def test_join_heavy_direct_grouped_dissolve_matches_public_coverage_dissolve(
 
     assert used_direct is True
     assert calls == [DissolveUnionMethod.COVERAGE]
-    assert isinstance(dissolved, GroupedConstructiveResult)
+    assert isinstance(dissolved, NativeTabularResult)
     assert_geodataframe_equal(dissolved.to_geodataframe(), expected)

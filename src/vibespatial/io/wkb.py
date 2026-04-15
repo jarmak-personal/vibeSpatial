@@ -1672,7 +1672,9 @@ def _decode_point_batch(values: list[bytes], state: dict[str, Any]) -> list[int]
     records = np.frombuffer(payload, dtype=WKB_POINT_RECORD_DTYPE)
     x = np.asarray(records["x"], dtype=np.float64)
     y = np.asarray(records["y"], dtype=np.float64)
-    empty_mask = np.isnan(x) | np.isnan(y)
+    # Preserve partial-NaN point coordinates exactly as encoded. Only the
+    # canonical NaN/NaN sentinel represents POINT EMPTY in WKB.
+    empty_mask = np.isnan(x) & np.isnan(y)
     nonempty = ~empty_mask
     start = len(state["x_payload"])
     coord_starts = start + np.cumsum(nonempty, dtype=np.int32) - nonempty.astype(np.int32)
@@ -1804,7 +1806,9 @@ def _decode_arrow_wkb_point_fast(array) -> OwnedGeometryArray | None:
 
     x = np.asarray(records["x"], dtype=np.float64)
     y = np.asarray(records["y"], dtype=np.float64)
-    empty_mask = np.isnan(x) | np.isnan(y)
+    # Preserve partial-NaN point coordinates exactly as encoded. Only the
+    # canonical NaN/NaN sentinel represents POINT EMPTY in WKB.
+    empty_mask = np.isnan(x) & np.isnan(y)
     nonempty = ~empty_mask
     geometry_offsets = np.empty(valid_count + 1, dtype=np.int32)
     geometry_offsets[0] = 0

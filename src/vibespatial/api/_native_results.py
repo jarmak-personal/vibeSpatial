@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import json
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -12,471 +12,25 @@ import pandas as pd
 import shapely
 
 from vibespatial.api._compat import PANDAS_GE_30
+from vibespatial.api._native_result_core import (
+    GeometryNativeResult,
+    NativeAttributeTable,
+    NativeGeometryColumn,
+    NativeReadProvenance,
+    NativeTabularResult,
+    _host_array,
+    _materialize_attribute_geometry_frame,
+    _replace_geometry_column_preserving_backing,
+    _set_active_geometry_name,
+    native_attribute_table_from_arrow_table,  # noqa: F401
+)
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.config import SPATIAL_EPSILON
 from vibespatial.runtime.fallbacks import record_fallback_event
 
 if TYPE_CHECKING:
     from vibespatial.api.geodataframe import GeoDataFrame
     from vibespatial.api.geoseries import GeoSeries
-
-
-def _host_array(values: Any, *, dtype) -> np.ndarray:
-    host_values = values.get() if hasattr(values, "get") else values
-    return np.asarray(host_values, dtype=dtype)
-
-
-def _normalize_row_selection(row_positions):
-    if hasattr(row_positions, "__cuda_array_interface__"):
-        import cupy as cp
-
-        d_positions = cp.asarray(row_positions)
-        if d_positions.dtype == cp.bool_ or d_positions.dtype == bool:
-            return cp.flatnonzero(d_positions).astype(cp.int64, copy=False)
-        return d_positions.astype(cp.int64, copy=False)
-
-    positions = np.asarray(row_positions)
-    if positions.dtype == bool:
-        positions = np.flatnonzero(positions)
-    return np.asarray(positions, dtype=np.int64)
-
-
-def _host_row_positions(row_positions) -> np.ndarray:
-    normalized = _normalize_row_selection(row_positions)
-    if hasattr(normalized, "__cuda_array_interface__"):
-        import cupy as cp
-
-        return cp.asnumpy(normalized)
-    return np.asarray(normalized, dtype=np.int64)
-
-
-@dataclass(frozen=True)
-class NativeAttributeTable:
-    """Attribute payload that can stay columnar without requiring pandas storage."""
-
-    dataframe: pd.DataFrame | None = None
-    arrow_table: Any | None = None
-    loader: Callable[[], pd.DataFrame] | None = None
-    index_override: pd.Index | None = None
-    column_override: tuple[str, ...] | None = None
-    to_pandas_kwargs: dict[str, Any] | None = None
-
-    def __post_init__(self) -> None:
-        provided = sum(
-            value is not None for value in (self.dataframe, self.arrow_table, self.loader)
-        )
-        if provided != 1:
-            raise ValueError(
-                "NativeAttributeTable requires exactly one of dataframe, arrow_table, or loader"
-            )
-        if self.to_pandas_kwargs is None:
-            object.__setattr__(self, "to_pandas_kwargs", {})
-        if self.arrow_table is not None and self.index_override is None:
-            object.__setattr__(
-                self,
-                "index_override",
-                pd.RangeIndex(int(self.arrow_table.num_rows)),
-            )
-        if self.loader is not None:
-            if self.index_override is None:
-                raise ValueError("NativeAttributeTable loader requires index_override")
-            if self.column_override is None:
-                object.__setattr__(self, "column_override", tuple())
-
-    @classmethod
-    def from_value(cls, value) -> NativeAttributeTable:
-        if isinstance(value, NativeAttributeTable):
-            return value
-        if isinstance(value, pd.DataFrame):
-            return cls(dataframe=value)
-
-        try:
-            import pyarrow as pa
-        except ImportError:  # pragma: no cover - pyarrow is present in normal test envs
-            pa = None
-        if pa is not None and isinstance(value, pa.Table):
-            return cls(arrow_table=value)
-
-        raise TypeError("NativeAttributeTable expects pandas DataFrame or pyarrow.Table")
-
-    @classmethod
-    def from_loader(
-        cls,
-        loader: Callable[[], pd.DataFrame],
-        *,
-        index_override: pd.Index,
-        columns: tuple[str, ...] | list[str] | None = None,
-        to_pandas_kwargs: dict[str, Any] | None = None,
-    ) -> NativeAttributeTable:
-        return cls(
-            loader=loader,
-            index_override=index_override,
-            column_override=None if columns is None else tuple(columns),
-            to_pandas_kwargs=to_pandas_kwargs,
-        )
-
-    @property
-    def index(self) -> pd.Index:
-        if self.dataframe is not None:
-            return self.dataframe.index
-        return self.index_override
-
-    @property
-    def columns(self) -> pd.Index:
-        if self.dataframe is not None:
-            return self.dataframe.columns
-        if self.loader is not None:
-            return pd.Index(self.column_override)
-        return pd.Index(self.arrow_table.column_names)
-
-    def _materialize_loaded_frame(self) -> pd.DataFrame:
-        if self.loader is None:
-            if self.dataframe is None:
-                raise ValueError("loader materialization requires a loader-backed table")
-            return self.dataframe
-
-        frame = self.loader()
-        if not isinstance(frame, pd.DataFrame):
-            raise TypeError(
-                "NativeAttributeTable loader must return a pandas DataFrame"
-            )
-        if not frame.index.equals(self.index):
-            if len(frame) != len(self.index):
-                raise ValueError(
-                    "NativeAttributeTable loader returned a DataFrame with the wrong row count"
-                )
-            frame = frame.copy(deep=False)
-            frame.index = self.index
-        if self.column_override:
-            expected = tuple(self.column_override)
-            actual = tuple(frame.columns)
-            if actual != expected:
-                raise ValueError(
-                    "NativeAttributeTable loader returned columns that do not match the declared schema"
-                )
-        object.__setattr__(self, "dataframe", frame)
-        object.__setattr__(self, "loader", None)
-        object.__setattr__(self, "column_override", tuple(frame.columns))
-        return frame
-
-    def to_pandas(self, *, copy: bool = False, **kwargs) -> pd.DataFrame:
-        if self.dataframe is not None:
-            return self.dataframe.copy(deep=copy) if copy else self.dataframe
-        if self.loader is not None:
-            frame = self._materialize_loaded_frame()
-            return frame.copy(deep=copy) if copy else frame
-
-        to_pandas_kwargs = dict(self.to_pandas_kwargs or {})
-        to_pandas_kwargs.update(kwargs)
-        frame = self.arrow_table.to_pandas(**to_pandas_kwargs)
-        frame.index = self.index
-        return frame.copy(deep=copy) if copy else frame
-
-    def to_arrow(self, *, index: bool | None = None, columns=None):
-        import pyarrow as pa
-
-        if self.loader is not None:
-            frame = self.to_pandas(copy=False)
-            requested_columns = None if columns is None else list(columns)
-            if requested_columns is not None:
-                frame = frame.loc[:, requested_columns]
-            return pa.Table.from_pandas(frame, preserve_index=index)
-
-        requested_columns = None if columns is None else list(columns)
-        can_skip_index = (
-            index is False
-            or (
-                index is None
-                and isinstance(self.index_override, pd.RangeIndex)
-                and self.index_override.start == 0
-                and self.index_override.step == 1
-                and list(self.index_override.names) == [None]
-            )
-        )
-        if self.arrow_table is not None and can_skip_index:
-            table = self.arrow_table
-            if requested_columns is not None:
-                table = table.select(requested_columns)
-            return table
-
-        frame = self.to_pandas(copy=False)
-        if requested_columns is not None:
-            frame = frame.loc[:, requested_columns]
-        return pa.Table.from_pandas(frame, preserve_index=index)
-
-    def with_column(self, name: str, values) -> NativeAttributeTable:
-        if self.loader is not None:
-            declared_columns = tuple(self.column_override or ())
-            parent = self
-
-            def _load() -> pd.DataFrame:
-                frame = parent.to_pandas(copy=False).copy(deep=False)
-                frame[name] = values
-                return frame
-
-            return type(self).from_loader(
-                _load,
-                index_override=self.index,
-                columns=tuple([*declared_columns, name]),
-                to_pandas_kwargs=self.to_pandas_kwargs,
-            )
-        if self.arrow_table is not None:
-            import pyarrow as pa
-
-            table = self.arrow_table.append_column(name, pa.array(values))
-            return type(self)(
-                arrow_table=table,
-                index_override=self.index,
-                to_pandas_kwargs=self.to_pandas_kwargs,
-            )
-
-        frame = self.dataframe.copy(deep=False)
-        frame[name] = values
-        return type(self)(dataframe=frame)
-
-    def rename_columns(self, mapping: dict[str, str]) -> NativeAttributeTable:
-        if not mapping:
-            return self
-        if self.loader is not None:
-            declared_columns = tuple(
-                mapping.get(name, name) for name in (self.column_override or ())
-            )
-            parent = self
-
-            def _load() -> pd.DataFrame:
-                return parent.to_pandas(copy=False).rename(columns=mapping, copy=False)
-
-            return type(self).from_loader(
-                _load,
-                index_override=self.index,
-                columns=declared_columns,
-                to_pandas_kwargs=self.to_pandas_kwargs,
-            )
-        if self.arrow_table is not None:
-            renamed = [mapping.get(name, name) for name in self.arrow_table.column_names]
-            return type(self)(
-                arrow_table=self.arrow_table.rename_columns(renamed),
-                index_override=self.index,
-                to_pandas_kwargs=self.to_pandas_kwargs,
-            )
-        return type(self)(dataframe=self.dataframe.rename(columns=mapping, copy=False))
-
-    def take(self, row_positions) -> NativeAttributeTable:
-        host_positions = _host_row_positions(row_positions)
-        if self.loader is not None:
-            parent = self
-
-            def _load() -> pd.DataFrame:
-                return parent.to_pandas(copy=False).take(host_positions)
-
-            return type(self).from_loader(
-                _load,
-                index_override=self.index.take(host_positions),
-                columns=self.column_override,
-                to_pandas_kwargs=self.to_pandas_kwargs,
-            )
-        if self.arrow_table is not None:
-            import pyarrow as pa
-
-            return type(self)(
-                arrow_table=self.arrow_table.take(pa.array(host_positions, type=pa.int64())),
-                index_override=self.index.take(host_positions),
-                to_pandas_kwargs=self.to_pandas_kwargs,
-            )
-        return type(self)(dataframe=self.dataframe.take(host_positions))
-
-    @classmethod
-    def concat(
-        cls,
-        tables: list[NativeAttributeTable],
-        *,
-        ignore_index: bool = True,
-        sort: bool = False,
-    ) -> NativeAttributeTable:
-        if not tables:
-            return cls(dataframe=pd.DataFrame(index=pd.RangeIndex(0)))
-
-        try:
-            import pyarrow as pa
-        except ImportError:  # pragma: no cover - pyarrow present in normal envs
-            pa = None
-
-        if pa is None:
-            frames = [table.to_pandas(copy=False) for table in tables]
-            return cls(dataframe=pd.concat(frames, ignore_index=ignore_index, sort=sort))
-
-        arrow_tables = [table.to_arrow(index=False) for table in tables]
-        ordered_columns: list[str] = []
-        column_types: dict[str, Any] = {}
-
-        def _promote_arrow_types(left, right):
-            if left == right:
-                return left
-            if pa.types.is_null(left):
-                return right
-            if pa.types.is_null(right):
-                return left
-            if (
-                (pa.types.is_string(left) and pa.types.is_large_string(right))
-                or (pa.types.is_large_string(left) and pa.types.is_string(right))
-            ):
-                return pa.large_string()
-            if (
-                (pa.types.is_binary(left) and pa.types.is_large_binary(right))
-                or (pa.types.is_large_binary(left) and pa.types.is_binary(right))
-            ):
-                return pa.large_binary()
-            return left
-
-        for table in arrow_tables:
-            for field in table.schema:
-                if field.name not in column_types:
-                    column_types[field.name] = field.type
-                    ordered_columns.append(field.name)
-                else:
-                    column_types[field.name] = _promote_arrow_types(
-                        column_types[field.name],
-                        field.type,
-                    )
-
-        aligned_tables = []
-        for table in arrow_tables:
-            table_columns = set(table.column_names)
-            arrays = []
-            for name in ordered_columns:
-                if name in table_columns:
-                    column = table[name]
-                    target_type = column_types[name]
-                    if column.type != target_type:
-                        column = column.cast(target_type)
-                    arrays.append(column)
-                else:
-                    arrays.append(pa.nulls(table.num_rows, type=column_types[name]))
-            aligned_tables.append(pa.table(arrays, names=ordered_columns))
-
-        concatenated = pa.concat_tables(aligned_tables)
-        if ignore_index:
-            index_override = pd.RangeIndex(concatenated.num_rows)
-        else:
-            index_override = tables[0].index
-            for table in tables[1:]:
-                index_override = index_override.append(table.index)
-        common_kwargs = tables[0].to_pandas_kwargs
-        if any(table.to_pandas_kwargs != common_kwargs for table in tables[1:]):
-            common_kwargs = {}
-        return cls(
-            arrow_table=concatenated,
-            index_override=index_override,
-            to_pandas_kwargs=common_kwargs,
-        )
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def __getitem__(self, key):
-        if self.dataframe is not None:
-            return self.dataframe[key]
-        if isinstance(key, (list, tuple)):
-            return self.to_pandas(copy=False).loc[:, list(key)]
-        if isinstance(key, pd.Index):
-            return self.to_pandas(copy=False).loc[:, list(key)]
-        return self.to_pandas(copy=False)[key]
-
-    def __getattr__(self, name: str):
-        return getattr(self.to_pandas(copy=False), name)
-
-
-def _pandas_metadata_field_name_map(metadata: dict[str, Any]) -> dict[str, str | None]:
-    return {
-        str(column_meta["field_name"]): column_meta.get("name")
-        for column_meta in metadata.get("columns", [])
-        if column_meta.get("field_name") is not None
-    }
-
-
-def _arrow_index_override_from_pandas_metadata(
-    table,
-    *,
-    to_pandas_kwargs: dict[str, Any] | None = None,
-) -> tuple[pd.Index, Any]:
-    metadata = table.schema.metadata or {}
-    pandas_metadata_raw = metadata.get(b"pandas")
-    if pandas_metadata_raw is None:
-        return pd.RangeIndex(table.num_rows), table
-
-    pandas_metadata = json.loads(pandas_metadata_raw.decode("utf-8"))
-    index_columns = pandas_metadata.get("index_columns") or []
-    if not index_columns:
-        return pd.RangeIndex(table.num_rows), table
-
-    if len(index_columns) == 1 and isinstance(index_columns[0], dict):
-        range_spec = index_columns[0]
-        if range_spec.get("kind") == "range":
-            return (
-                pd.RangeIndex(
-                    start=int(range_spec.get("start", 0)),
-                    stop=int(range_spec.get("stop", table.num_rows)),
-                    step=int(range_spec.get("step", 1)),
-                    name=range_spec.get("name"),
-                ),
-                table,
-            )
-
-    field_name_map = _pandas_metadata_field_name_map(pandas_metadata)
-    index_field_names = [str(name) for name in index_columns]
-    index_table = table.select(index_field_names).replace_schema_metadata(None)
-    index_frame = index_table.to_pandas(**(to_pandas_kwargs or {}))
-    index_names = [field_name_map.get(name, name) for name in index_field_names]
-    if len(index_field_names) == 1:
-        index = pd.Index(index_frame.iloc[:, 0].array, name=index_names[0])
-    else:
-        index_frame.columns = index_names
-        index = pd.MultiIndex.from_frame(index_frame)
-    return index, table.drop(index_field_names)
-
-
-def native_attribute_table_from_arrow_table(
-    table,
-    *,
-    to_pandas_kwargs: dict[str, Any] | None = None,
-) -> NativeAttributeTable:
-    index_override, attr_table = _arrow_index_override_from_pandas_metadata(
-        table,
-        to_pandas_kwargs=to_pandas_kwargs,
-    )
-    return NativeAttributeTable(
-        arrow_table=attr_table,
-        index_override=index_override,
-        to_pandas_kwargs=to_pandas_kwargs,
-    )
-
-
-def _set_active_geometry_name(frame, geometry_name: str):
-    """Force the active geometry column name, replacing stale inactive collisions."""
-    current_name = frame._geometry_column_name
-    if current_name == geometry_name:
-        return frame
-    if geometry_name in frame.columns:
-        frame = frame.drop(columns=[geometry_name])
-    return frame.rename_geometry(geometry_name)
-
-
-def _replace_geometry_column_preserving_backing(frame, values, *, crs):
-    """Replace a GeoDataFrame geometry column without demoting DGA-backed data."""
-    from vibespatial.api.geometry_array import GeometryArray
-    from vibespatial.api.geoseries import GeoSeries
-    from vibespatial.geometry.device_array import DeviceGeometryArray
-
-    geom_name = frame._geometry_column_name
-    if isinstance(values, GeometryArray | DeviceGeometryArray):
-        geometry_series = pd.Series(values, index=frame.index, copy=False, name=geom_name)
-    else:
-        geometry_series = GeoSeries(values, index=frame.index, crs=crs, name=geom_name)
-    rebuilt = frame.copy(deep=False)
-    pd.DataFrame.__setitem__(rebuilt, geom_name, geometry_series)
-    rebuilt.__class__ = type(frame)
-    rebuilt._geometry_column_name = geom_name
-    rebuilt.attrs = frame.attrs.copy()
-    return rebuilt
 
 
 @dataclass(frozen=True)
@@ -496,267 +50,6 @@ class RelationIndexResult:
     def size(self) -> int:
         left, _right = self.to_host()
         return int(left.size)
-
-
-@dataclass(frozen=True)
-class GeometryNativeResult:
-    """Geometry result that stays native until explicitly materialized."""
-
-    crs: Any
-    owned: Any | None = None
-    series: GeoSeries | None = None
-
-    def __post_init__(self) -> None:
-        if (self.owned is None) == (self.series is None):
-            raise ValueError("GeometryNativeResult requires exactly one of owned or series")
-
-    @classmethod
-    def from_owned(cls, owned, *, crs) -> GeometryNativeResult:
-        return cls(crs=crs, owned=owned)
-
-    @classmethod
-    def from_geoseries(cls, series: GeoSeries) -> GeometryNativeResult:
-        owned = getattr(series.values, "_owned", None)
-        if owned is not None:
-            return cls.from_owned(owned, crs=series.crs)
-        return cls(crs=series.crs, series=series)
-
-    @classmethod
-    def from_values(
-        cls,
-        values,
-        *,
-        crs,
-        index=None,
-        name: str | None = None,
-    ) -> GeometryNativeResult:
-        from vibespatial.api.geometry_array import GeometryArray
-        owned = getattr(values, "_owned", None)
-        if "DeviceGeometryArray" in type(values).__name__ and owned is not None:
-            return cls.from_owned(owned, crs=crs)
-
-        from vibespatial.api.geoseries import GeoSeries
-
-        if isinstance(values, GeometryArray):
-            if index is None:
-                index = pd.RangeIndex(len(values))
-            return cls.from_geoseries(GeoSeries(values, index=index, name=name, crs=crs))
-
-        if owned is not None:
-            return cls.from_owned(owned, crs=crs)
-        if index is None:
-            index = pd.RangeIndex(len(values))
-        return cls.from_geoseries(GeoSeries(values, index=index, name=name, crs=crs))
-
-    def to_geoseries(self, *, index, name: str) -> GeoSeries:
-        if self.owned is not None:
-            from vibespatial.api.geometry_array import GeometryArray
-            from vibespatial.api.geoseries import GeoSeries
-            from vibespatial.io.geoarrow import geoseries_from_owned
-            from vibespatial.runtime.residency import Residency
-
-            if self.owned.residency is Residency.DEVICE:
-                return geoseries_from_owned(
-                    self.owned,
-                    name=name,
-                    crs=self.crs,
-                    index=index,
-                )
-            return GeoSeries(
-                GeometryArray.from_owned(self.owned, crs=self.crs),
-                index=index,
-                name=name,
-                crs=self.crs,
-            )
-        from vibespatial.api.geoseries import GeoSeries
-
-        values = self.series.values
-        return GeoSeries(values, index=index, name=name, crs=self.crs)
-
-    def take(self, row_positions) -> GeometryNativeResult:
-        normalized = _normalize_row_selection(row_positions)
-        if self.owned is not None:
-            return type(self).from_owned(self.owned.take(normalized), crs=self.crs)
-        host_positions = _host_row_positions(normalized)
-        return type(self).from_geoseries(self.series.take(host_positions))
-
-    @property
-    def row_count(self) -> int:
-        if self.owned is not None:
-            return int(self.owned.row_count)
-        return int(len(self.series))
-
-
-@dataclass(frozen=True)
-class NativeGeometryColumn:
-    name: str
-    geometry: GeometryNativeResult
-
-
-@dataclass(frozen=True)
-class NativeReadProvenance:
-    surface: str
-    format_name: str
-    source: str | None = None
-    backend: str | None = None
-    selected_row_groups: tuple[int, ...] | None = None
-    bbox: tuple[float, float, float, float] | None = None
-    metadata_source: str | None = None
-    planner_strategy: str | None = None
-    chunk_rows: int | None = None
-
-
-@dataclass(frozen=True)
-class NativeTabularResult:
-    """Device-native tabular export boundary for geometry plus attributes."""
-
-    attributes: NativeAttributeTable | pd.DataFrame
-    geometry: GeometryNativeResult
-    geometry_name: str
-    column_order: tuple[str, ...]
-    attrs: dict[str, Any] | None = None
-    secondary_geometry: tuple[NativeGeometryColumn, ...] = ()
-    provenance: NativeReadProvenance | None = None
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "attributes",
-            NativeAttributeTable.from_value(self.attributes),
-        )
-        row_count = len(self.attributes)
-        if self.geometry.row_count != row_count:
-            raise ValueError("primary geometry row count must match attribute row count")
-        secondary_names = [column.name for column in self.secondary_geometry]
-        if self.geometry_name in secondary_names:
-            raise ValueError("secondary geometry columns must not repeat the primary geometry name")
-        if len(secondary_names) != len(set(secondary_names)):
-            raise ValueError("secondary geometry column names must be unique")
-        for column in self.secondary_geometry:
-            if column.geometry.row_count != row_count:
-                raise ValueError("secondary geometry row counts must match attribute row count")
-        geometry_names = {self.geometry_name, *secondary_names}
-        missing = [name for name in geometry_names if name not in self.column_order]
-        if missing:
-            raise ValueError(
-                "column_order must include every geometry column in NativeTabularResult"
-            )
-
-    @property
-    def geometry_columns(self) -> tuple[NativeGeometryColumn, ...]:
-        return (
-            NativeGeometryColumn(self.geometry_name, self.geometry),
-            *self.secondary_geometry,
-        )
-
-    @property
-    def resolved_column_order(self) -> tuple[str, ...]:
-        ordered = list(self.column_order)
-        geometry_names = {column.name for column in self.geometry_columns}
-        attr_columns = list(self.attributes.columns)
-        if not attr_columns and self.attributes.loader is not None:
-            attr_columns = list(self.attributes.to_pandas(copy=False).columns)
-        missing_attr_columns = [
-            column for column in attr_columns if column not in ordered and column not in geometry_names
-        ]
-        if not missing_attr_columns:
-            return self.column_order
-        insert_at = next(
-            (index for index, name in enumerate(ordered) if name in geometry_names),
-            len(ordered),
-        )
-        ordered[insert_at:insert_at] = missing_attr_columns
-        return tuple(ordered)
-
-    def to_geodataframe(self) -> GeoDataFrame:
-        frame = _materialize_attribute_geometry_frame(
-            self.attributes,
-            self.geometry_columns,
-            geometry_name=self.geometry_name,
-            column_order=self.resolved_column_order,
-        )
-        if self.attrs:
-            frame.attrs.update(self.attrs)
-        return frame
-
-    def to_arrow(
-        self,
-        *,
-        index: bool | None = None,
-        geometry_encoding: str = "WKB",
-        interleaved: bool = True,
-        include_z: bool | None = None,
-    ):
-        from vibespatial.api.io._geoarrow import ArrowTable
-        from vibespatial.io.geoarrow import native_tabular_to_arrow
-
-        table, _geometry_encoding = native_tabular_to_arrow(
-            self,
-            index=index,
-            geometry_encoding=geometry_encoding,
-            interleaved=interleaved,
-            include_z=include_z,
-        )
-        return ArrowTable(table)
-
-    def to_parquet(
-        self,
-        path,
-        *,
-        index: bool | None = None,
-        compression: str | None = "snappy",
-        geometry_encoding: str = "WKB",
-        write_covering_bbox: bool = False,
-        schema_version: str | None = None,
-        **kwargs,
-    ) -> None:
-        from vibespatial.io.geoparquet import write_geoparquet
-
-        write_geoparquet(
-            self,
-            path,
-            index=index,
-            compression=compression,
-            geometry_encoding=geometry_encoding,
-            write_covering_bbox=write_covering_bbox,
-            schema_version=schema_version,
-            **kwargs,
-        )
-
-    def to_feather(
-        self,
-        path,
-        *,
-        index: bool | None = None,
-        compression: str | None = None,
-        schema_version: str | None = None,
-        **kwargs,
-    ) -> None:
-        from vibespatial.api.io.arrow import _to_feather
-
-        _to_feather(
-            self,
-            path,
-            index=index,
-            compression=compression,
-            schema_version=schema_version,
-            **kwargs,
-        )
-
-    def take(self, row_positions) -> NativeTabularResult:
-        normalized = _normalize_row_selection(row_positions)
-        return type(self)(
-            attributes=self.attributes.take(normalized),
-            geometry=self.geometry.take(normalized),
-            geometry_name=self.geometry_name,
-            column_order=self.column_order,
-            attrs=self.attrs,
-            secondary_geometry=tuple(
-                NativeGeometryColumn(column.name, column.geometry.take(normalized))
-                for column in self.secondary_geometry
-            ),
-            provenance=self.provenance,
-        )
 
 
 @dataclass(frozen=True)
@@ -984,47 +277,6 @@ def _reassemble_outer_geometry(left_geometry, right_geometry, l_idx, r_idx, new_
     return left_geometry_series.where(
         left_geometry_series.notna(), right_geometry_series
     )
-
-
-def _materialize_attribute_geometry_frame(
-    attributes: NativeAttributeTable | pd.DataFrame,
-    geometry_columns: tuple[NativeGeometryColumn, ...],
-    *,
-    geometry_name: str,
-    column_order: tuple[str, ...] | None = None,
-):
-    """Explicit host export for attribute tables plus native geometry columns."""
-    from vibespatial.api.geodataframe import GeoDataFrame
-
-    attributes = NativeAttributeTable.from_value(attributes)
-    frame = attributes.to_pandas(copy=False)
-    geometry_series = {
-        column.name: column.geometry.to_geoseries(index=attributes.index, name=column.name)
-        for column in geometry_columns
-    }
-    active_geometry = geometry_series[geometry_name]
-    rebuilt = GeoDataFrame(
-        frame.copy(deep=False),
-        geometry=active_geometry,
-        crs=active_geometry.crs,
-        copy=False,
-    )
-    for name, series in geometry_series.items():
-        if name == geometry_name:
-            continue
-        pd.DataFrame.__setitem__(rebuilt, name, series)
-    if column_order is not None:
-        rebuilt = rebuilt.reindex(columns=list(column_order), copy=False)
-        rebuilt.__class__ = GeoDataFrame
-        rebuilt._geometry_column_name = geometry_name
-    rebuilt.attrs = frame.attrs.copy()
-    return _replace_geometry_column_preserving_backing(
-        rebuilt,
-        active_geometry.values,
-        crs=active_geometry.crs,
-    )
-
-
 def _drop_private_attribute_columns(attributes: pd.DataFrame) -> pd.DataFrame:
     """Strip internal provenance columns from the shared export boundary."""
     private_columns = [
@@ -1062,10 +314,12 @@ def _native_attribute_table_from_projected_frames(
     import pyarrow as pa
 
     tables = []
+    declared_names: list[Any] = []
     for frame in frames:
         if frame.shape[1] == 0:
             continue
         tables.append(pa.Table.from_pandas(frame, preserve_index=False))
+        declared_names.extend(list(frame.columns))
 
     if not tables:
         return NativeAttributeTable(dataframe=pd.DataFrame(index=index_override))
@@ -1078,7 +332,132 @@ def _native_attribute_table_from_projected_frames(
     return NativeAttributeTable(
         arrow_table=pa.Table.from_arrays(arrays, names=names),
         index_override=index_override,
+        column_override=tuple(declared_names),
     )
+
+
+def _projected_frames_to_native_tabular_parts(
+    frames: list[pd.DataFrame],
+    *,
+    index_override: pd.Index,
+    storage: str = "arrow",
+    dropped_column_names: set[str] | frozenset[str] = frozenset(),
+) -> tuple[NativeAttributeTable, tuple[NativeGeometryColumn, ...], tuple[str, ...]]:
+    """Split projected frames into attribute storage plus explicit secondary geometry."""
+    from vibespatial.api.geo_base import _is_geometry_like_dtype
+
+    attribute_frames: list[pd.DataFrame] = []
+    secondary_geometry: list[NativeGeometryColumn] = []
+    column_entries: list[tuple[str, Any]] = []
+    geometry_names: set[Any] = set()
+
+    for frame in frames:
+        if frame.shape[1] == 0:
+            continue
+        geometry_mask = np.asarray(frame.dtypes.map(_is_geometry_like_dtype), dtype=bool)
+        attribute_columns: list[Any] = []
+        for position, column in enumerate(frame.columns):
+            column_name = column
+            if column_name in dropped_column_names:
+                continue
+            if geometry_mask[position]:
+                if column_name in geometry_names:
+                    raise ValueError(
+                        "duplicate projected geometry columns are not supported in the native tabular boundary"
+                    )
+                series = frame.iloc[:, position]
+                if not series.index.equals(index_override):
+                    series = series.copy(deep=False)
+                    series.index = index_override
+                secondary_geometry.append(
+                    NativeGeometryColumn(
+                        column_name,
+                        GeometryNativeResult.from_values(
+                            series.values,
+                            crs=getattr(series, "crs", None),
+                            index=index_override,
+                            name=column_name,
+                        ),
+                    )
+                )
+                geometry_names.add(column_name)
+                column_entries.append(("geometry", column_name))
+                continue
+            attribute_columns.append(column)
+            column_entries.append(("attribute", column_name))
+
+        if not attribute_columns:
+            continue
+        attrs = frame.loc[:, attribute_columns]
+        if not attrs.index.equals(index_override):
+            attrs = attrs.copy(deep=False)
+            attrs.index = index_override
+        attribute_frames.append(attrs)
+
+    attributes = _native_attribute_table_from_projected_frames(
+        attribute_frames,
+        index_override=index_override,
+        storage=storage,
+    )
+    attribute_column_iter = iter(attributes.columns)
+    column_order: list[Any] = []
+    for kind, column_name in column_entries:
+        if kind == "attribute":
+            column_order.append(next(attribute_column_iter))
+        else:
+            column_order.append(column_name)
+    return attributes, tuple(secondary_geometry), tuple(column_order)
+
+
+def _rename_native_geometry_columns(
+    columns: tuple[NativeGeometryColumn, ...],
+    mapping: dict[str, str] | None,
+) -> tuple[NativeGeometryColumn, ...]:
+    if not mapping:
+        return columns
+    return tuple(
+        NativeGeometryColumn(mapping.get(column.name, column.name), column.geometry)
+        for column in columns
+    )
+
+
+def _rename_output_column_order(
+    column_order: tuple[str, ...],
+    mapping: dict[str, str] | None,
+) -> tuple[str, ...]:
+    if not mapping:
+        return column_order
+    return tuple(mapping.get(column_name, column_name) for column_name in column_order)
+
+
+def _left_constructive_output_column_order(
+    *,
+    df: GeoDataFrame,
+    geometry_name: str,
+    attributes: NativeAttributeTable,
+    secondary_geometry: tuple[NativeGeometryColumn, ...],
+) -> tuple[str, ...]:
+    from vibespatial.api.geo_base import _is_geometry_like_dtype
+
+    source_geometry_name = df._geometry_column_name
+    source_non_geometry = df.drop(source_geometry_name, axis=1).copy(deep=False)
+    secondary_iter = iter(secondary_geometry)
+    attribute_iter = iter(attributes.columns)
+    order: list[str] = []
+    for column_name in df.columns:
+        if column_name == source_geometry_name:
+            order.append(geometry_name)
+            continue
+        if column_name == geometry_name:
+            continue
+        if (
+            column_name in source_non_geometry.columns
+            and _is_geometry_like_dtype(source_non_geometry[column_name].dtype)
+        ):
+            order.append(next(secondary_iter).name)
+            continue
+        order.append(next(attribute_iter))
+    return tuple(order)
 
 
 def _native_pairwise_attribute_table(
@@ -1234,12 +613,28 @@ def _native_relation_join_parts(
     rsuffix: str,
     on_attribute=None,
     attribute_storage: str = "arrow",
-) -> tuple[NativeAttributeTable, GeometryNativeResult, str, Any, tuple[str, ...], np.ndarray | None]:
+) -> tuple[
+    NativeAttributeTable,
+    GeometryNativeResult,
+    str,
+    Any,
+    tuple[str, ...],
+    tuple[NativeGeometryColumn, ...],
+    np.ndarray | None,
+]:
     """Build native relation-join export parts without constructing a joined DataFrame."""
     left_geometry_name = left_df.geometry.name
     left_crs = left_df.crs
     right_geometry_name = right_df.geometry.name
     right_crs = right_df.crs
+    geometry_name, crs, output_layout = _relation_join_output_layout(
+        left_df,
+        right_df,
+        how=how,
+        lsuffix=lsuffix,
+        rsuffix=rsuffix,
+        on_attribute=on_attribute,
+    )
 
     left_geometry = None
     right_geometry = None
@@ -1338,8 +733,6 @@ def _native_relation_join_parts(
         )
     else:
         joined_index = new_index
-        geometry_name = left_geometry_name
-        crs = left_crs
         geometry_series = _reassemble_outer_geometry(
             left_geometry,
             right_geometry,
@@ -1354,13 +747,29 @@ def _native_relation_join_parts(
             name=left_geometry_name,
         )
 
-    attributes = _native_attribute_table_from_projected_frames(
+    attributes, secondary_geometry, _projected_order = _projected_frames_to_native_tabular_parts(
         [left_projected, right_projected],
         index_override=joined_index,
         storage=attribute_storage,
+        dropped_column_names={geometry_name},
     )
-    column_order = tuple([*attributes.columns, geometry_name])
-    return attributes, geometry_result, geometry_name, crs, column_order, distances
+    known_columns = set(attributes.columns) | {geometry_name} | {
+        column.name for column in secondary_geometry
+    }
+    column_order = tuple(
+        column_name for column_name in output_layout if column_name in known_columns
+    )
+    if geometry_name not in column_order:
+        column_order = tuple([geometry_name, *column_order])
+    return (
+        attributes,
+        geometry_result,
+        geometry_name,
+        crs,
+        column_order,
+        secondary_geometry,
+        distances,
+    )
 
 
 def _materialize_relation_join_parts(
@@ -1611,228 +1020,24 @@ class LeftConstructiveResult:
         )
 
 
-@dataclass(frozen=True)
-class SymmetricDifferenceConstructiveResult:
-    """Deferred symmetric-difference export that preserves GeoPandas semantics."""
+def _coerce_constructive_export_frame(
+    frame,
+    *,
+    geometry_name: str,
+    frame_type: type | None,
+):
+    from vibespatial.api.geodataframe import GeoDataFrame
 
-    left_result: LeftConstructiveResult
-    right_result: LeftConstructiveResult
-    left_df: GeoDataFrame
-    right_df: GeoDataFrame
-    geometry_name: str = "geometry"
-    frame_type: type | None = None
-    crs: Any | None = None
-
-    def to_geodataframe(self) -> GeoDataFrame:
-        from vibespatial.api.geodataframe import GeoDataFrame
-
-        dfdiff1 = self.left_result.to_geodataframe(self.left_df).copy(deep=False)
-        dfdiff2 = self.right_result.to_geodataframe(self.right_df).copy(deep=False)
-        dfdiff1["__idx1"] = range(len(dfdiff1))
-        dfdiff2["__idx2"] = range(len(dfdiff2))
-        dfdiff1["__idx2"] = np.nan
-        dfdiff2["__idx1"] = np.nan
-        dfdiff1 = _set_active_geometry_name(dfdiff1, self.geometry_name)
-        dfdiff2 = _set_active_geometry_name(dfdiff2, self.geometry_name)
-
-        diff1_owned = getattr(dfdiff1.geometry.values, "_owned", None)
-        diff2_owned = getattr(dfdiff2.geometry.values, "_owned", None)
-        base_crs = self.crs if self.crs is not None else dfdiff1.crs
-
-        if diff1_owned is not None and diff2_owned is not None:
-            if dfdiff1.crs != dfdiff2.crs:
-                dfdiff2 = dfdiff2.set_crs(dfdiff1.crs, allow_override=True)
-
-            skip = {self.geometry_name, "__idx1", "__idx2"}
-            attr1 = {column for column in dfdiff1.columns if column not in skip}
-            attr2 = {column for column in dfdiff2.columns if column not in skip}
-            shared = attr1 & attr2
-            rename1 = {column: f"{column}_1" for column in shared}
-            rename2 = {column: f"{column}_2" for column in shared}
-            if rename1:
-                dfdiff1 = dfdiff1.rename(columns=rename1)
-            if rename2:
-                dfdiff2 = dfdiff2.rename(columns=rename2)
-
-            result = pd.concat([dfdiff1, dfdiff2], ignore_index=True, sort=False)
-            columns = [column for column in result.columns if column != self.geometry_name]
-            columns.append(self.geometry_name)
-            result = result.reindex(columns=columns)
-            frame_type = self.frame_type or type(dfdiff1)
-            if not isinstance(result, frame_type):
-                result = frame_type(result, geometry=self.geometry_name, crs=base_crs)
-            elif result.crs is None and base_crs is not None:
-                result = result.set_crs(base_crs, allow_override=True)
-            return result
-
-        dfsym = dfdiff1.merge(
-            dfdiff2,
-            on=["__idx1", "__idx2"],
-            how="outer",
-            suffixes=("_1", "_2"),
-        )
-        geometry_1 = np.asarray(dfsym[f"{self.geometry_name}_1"], dtype=object)
-        geometry_2 = np.asarray(dfsym[f"{self.geometry_name}_2"], dtype=object)
-        mask = pd.isna(geometry_1)
-        combined_geometry = geometry_1.copy()
-        combined_geometry[mask] = geometry_2[mask]
-        dfsym.drop(
-            [f"{self.geometry_name}_1", f"{self.geometry_name}_2"],
-            axis=1,
-            inplace=True,
-        )
-        dfsym.reset_index(drop=True, inplace=True)
-        frame_type = self.frame_type or GeoDataFrame
-        return frame_type(
-            dfsym,
-            geometry=pd.Series(combined_geometry, name=self.geometry_name),
-            crs=base_crs,
-        )
-
-
-@dataclass(frozen=True)
-class PairwiseConstructiveFragment:
-    """Deferred export fragment for a pairwise constructive native result."""
-
-    result: PairwiseConstructiveResult
-    left_df: GeoDataFrame
-    right_df: GeoDataFrame
-    attribute_assembler: Callable[[Any, Any, pd.DataFrame, pd.DataFrame], pd.DataFrame]
-    rename_columns: dict[str, str] | None = None
-    assign_columns: dict[str, Any] | None = None
-    geometry_name: str = "geometry"
-    frame_type: type | None = None
-    prefer_native_attribute_projection: bool = False
-
-    def to_geodataframe(self) -> GeoDataFrame:
-        if self.prefer_native_attribute_projection:
-            left_idx, right_idx = self.result.relation.to_host()
-            attributes = _project_pairwise_attribute_frame(
-                self.left_df,
-                self.right_df,
-                left_idx,
-                right_idx,
-                lsuffix="1",
-                rsuffix="2",
-            )
-            frame_attrs: dict[str, Any] = {}
-            if self.result.keep_geom_type_applied:
-                frame_attrs["_vibespatial_keep_geom_type_applied"] = True
-            if self.rename_columns:
-                attributes = attributes.rename(columns=self.rename_columns, copy=False)
-            trailing_columns: list[str] = []
-            if self.assign_columns:
-                attributes = attributes.copy(deep=False)
-                for column, values in self.assign_columns.items():
-                    attributes[column] = values
-                trailing_columns = list(self.assign_columns)
-            trailing_columns = [
-                column for column in trailing_columns if column in attributes.columns
-            ]
-            base_columns = [
-                column for column in attributes.columns if column not in trailing_columns
-            ]
-            frame = _materialize_attribute_geometry_frame(
-                attributes,
-                (NativeGeometryColumn(self.geometry_name, self.result.geometry),),
-                geometry_name=self.geometry_name,
-                column_order=tuple([*base_columns, self.geometry_name, *trailing_columns]),
-            )
-            if frame_attrs:
-                frame.attrs.update(frame_attrs)
-        else:
-            frame = self.result.to_geodataframe(
-                self.left_df,
-                self.right_df,
-                attribute_assembler=self.attribute_assembler,
-            )
-            if self.rename_columns:
-                frame = frame.rename(columns=self.rename_columns)
-            if self.assign_columns:
-                frame = frame.copy(deep=False)
-                for column, values in self.assign_columns.items():
-                    frame[column] = values
-        frame = _set_active_geometry_name(frame, self.geometry_name)
-        frame_type = self.frame_type or type(frame)
-        if not isinstance(frame, frame_type):
-            frame = frame_type(frame, geometry=self.geometry_name, crs=frame.crs)
-        return frame
-
-
-@dataclass(frozen=True)
-class LeftConstructiveFragment:
-    """Deferred export fragment for a left-row-preserving constructive result."""
-
-    result: LeftConstructiveResult
-    df: GeoDataFrame
-    rename_columns: dict[str, str] | None = None
-    assign_columns: dict[str, Any] | None = None
-    geometry_name: str = "geometry"
-    frame_type: type | None = None
-
-    def to_geodataframe(self) -> GeoDataFrame:
-        frame = self.result.to_geodataframe(self.df)
-        if self.rename_columns:
-            frame = frame.rename(columns=self.rename_columns)
-        if self.assign_columns:
-            frame = frame.copy(deep=False)
-            for column, values in self.assign_columns.items():
-                frame[column] = values
-        frame = _set_active_geometry_name(frame, self.geometry_name)
-        frame_type = self.frame_type or type(frame)
-        if not isinstance(frame, frame_type):
-            frame = frame_type(frame, geometry=self.geometry_name, crs=frame.crs)
-        return frame
-
-
-@dataclass(frozen=True)
-class ConcatConstructiveResult:
-    """Concatenate deferred constructive fragments and export once at the boundary."""
-
-    parts: tuple[Any, ...]
-    geometry_name: str = "geometry"
-    frame_type: type | None = None
-    crs: Any | None = None
-    result_attrs: dict[str, Any] | None = None
-
-    def to_geodataframe(self) -> GeoDataFrame:
-        from vibespatial.api.geodataframe import GeoDataFrame
-
-        frames = [part.to_geodataframe() for part in self.parts]
-        if not frames:
-            frame_type = self.frame_type or GeoDataFrame
-            result = frame_type(geometry=self.geometry_name)
-            if self.crs is not None:
-                result = result.set_crs(self.crs, allow_override=True)
-            if self.result_attrs:
-                result.attrs.update(self.result_attrs)
-            return result
-
-        base_crs = self.crs if self.crs is not None else frames[0].crs
-        aligned_frames: list[GeoDataFrame] = []
-        for frame in frames:
-            frame = _set_active_geometry_name(frame, self.geometry_name)
-            if base_crs is not None and frame.crs != base_crs:
-                frame = frame.set_crs(base_crs, allow_override=True)
-            aligned_frames.append(frame)
-
-        result = pd.concat(aligned_frames, ignore_index=True, sort=False)
-        columns = [column for column in result.columns if column != self.geometry_name]
-        columns.append(self.geometry_name)
-        result = result.reindex(columns=columns)
-        frame_type = self.frame_type or type(aligned_frames[0])
-        if not isinstance(result, frame_type):
-            result = frame_type(result, geometry=self.geometry_name, crs=base_crs)
-        elif result.crs is None and base_crs is not None:
-            result = result.set_crs(base_crs, allow_override=True)
-        merged_attrs: dict[str, Any] = {}
-        for frame in aligned_frames:
-            merged_attrs.update(frame.attrs)
-        if self.result_attrs:
-            merged_attrs.update(self.result_attrs)
-        if merged_attrs:
-            result.attrs.update(merged_attrs)
-        return result
+    frame = _set_active_geometry_name(frame, geometry_name)
+    target_type = frame_type or type(frame)
+    if not isinstance(frame, target_type):
+        frame_attrs = frame.attrs.copy()
+        frame = target_type(frame, geometry=geometry_name, crs=frame.crs)
+        if frame_attrs:
+            frame.attrs.update(frame_attrs)
+    elif isinstance(frame, GeoDataFrame) and frame._geometry_column_name != geometry_name:
+        frame._geometry_column_name = geometry_name
+    return frame
 
 
 @dataclass(frozen=True)
@@ -1928,82 +1133,294 @@ def _geometry_native_result_to_native_tabular_result(
 def _grouped_constructive_result_to_native_tabular_result(
     result: GroupedConstructiveResult,
 ) -> NativeTabularResult:
-    attributes = result.attributes.copy(deep=False)
+    return _grouped_constructive_to_native_tabular_result(
+        geometry=result.geometry,
+        attributes=result.attributes,
+        geometry_name=result.geometry_name,
+        as_index=result.as_index,
+    )
+
+
+def _grouped_constructive_to_native_tabular_result(
+    *,
+    geometry: GeometryNativeResult,
+    attributes: pd.DataFrame,
+    geometry_name: str,
+    as_index: bool,
+) -> NativeTabularResult:
+    attributes = attributes.copy(deep=False)
     leading_columns: list[str] = []
     trailing_columns = list(attributes.columns)
-    if not result.as_index:
+    if not as_index:
         attributes = attributes.reset_index()
         leading_count = len(attributes.columns) - len(trailing_columns)
         leading_columns = list(attributes.columns[:leading_count])
         trailing_columns = list(attributes.columns[leading_count:])
     return NativeTabularResult(
         attributes=attributes,
-        geometry=result.geometry,
-        geometry_name=result.geometry_name,
-        column_order=tuple([*leading_columns, result.geometry_name, *trailing_columns]),
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=tuple([*leading_columns, geometry_name, *trailing_columns]),
     )
 
 
-def _pairwise_constructive_fragment_to_native_tabular_result(
-    fragment: PairwiseConstructiveFragment,
+def _rename_native_tabular_result(
+    result: NativeTabularResult,
+    mapping: dict[str, str] | None,
+    *,
+    geometry_name: str | None = None,
+    attrs: dict[str, Any] | None = None,
 ) -> NativeTabularResult:
-    left_idx, right_idx = fragment.result.relation.to_host()
-    attrs = _native_pairwise_attribute_table(
-        fragment.left_df,
-        fragment.right_df,
-        left_idx,
-        right_idx,
-        lsuffix="1",
-        rsuffix="2",
+    renamed_attributes = (
+        result.attributes.rename_columns(mapping)
+        if mapping
+        else result.attributes
     )
-    frame_attrs: dict[str, Any] = {}
-    if fragment.result.keep_geom_type_applied:
-        frame_attrs["_vibespatial_keep_geom_type_applied"] = True
-    if fragment.rename_columns:
-        attrs = attrs.rename_columns(fragment.rename_columns)
-    trailing_columns: list[str] = []
-    if fragment.assign_columns:
-        for column, values in fragment.assign_columns.items():
-            attrs = attrs.with_column(column, values)
-        trailing_columns = list(fragment.assign_columns)
-    trailing_columns = [column for column in trailing_columns if column in attrs.columns]
-    base_columns = [column for column in attrs.columns if column not in trailing_columns]
+    renamed_geometry_name = geometry_name or (
+        mapping.get(result.geometry_name, result.geometry_name)
+        if mapping
+        else result.geometry_name
+    )
+    renamed_secondary_geometry = _rename_native_geometry_columns(
+        result.secondary_geometry,
+        mapping,
+    )
+    if renamed_secondary_geometry:
+        renamed_secondary_geometry = tuple(
+            column
+            for column in renamed_secondary_geometry
+            if column.name != renamed_geometry_name
+        )
+
+    renamed_column_order = result.resolved_column_order
+    if mapping:
+        renamed_column_order = _rename_output_column_order(
+            renamed_column_order,
+            mapping,
+        )
+    if geometry_name is not None and geometry_name != result.geometry_name:
+        renamed_column_order = tuple(
+            geometry_name if column_name == result.geometry_name else column_name
+            for column_name in renamed_column_order
+        )
+    known_columns = set(renamed_attributes.columns) | {renamed_geometry_name} | {
+        column.name for column in renamed_secondary_geometry
+    }
+    filtered_column_order: list[str] = []
+    for column_name in renamed_column_order:
+        if column_name not in known_columns or column_name in filtered_column_order:
+            continue
+        filtered_column_order.append(column_name)
+    if renamed_geometry_name not in filtered_column_order:
+        filtered_column_order.append(renamed_geometry_name)
+
+    merged_attrs = result.attrs.copy() if result.attrs else {}
+    if attrs:
+        merged_attrs.update(attrs)
     return NativeTabularResult(
-        attributes=attrs,
-        geometry=fragment.result.geometry,
-        geometry_name=fragment.geometry_name,
-        column_order=tuple([*base_columns, fragment.geometry_name, *trailing_columns]),
-        attrs=frame_attrs or None,
+        attributes=renamed_attributes,
+        geometry=result.geometry,
+        geometry_name=renamed_geometry_name,
+        column_order=tuple(filtered_column_order),
+        attrs=merged_attrs or None,
+        secondary_geometry=renamed_secondary_geometry,
+        provenance=result.provenance,
     )
 
 
-def _left_constructive_fragment_to_native_tabular_result(
-    fragment: LeftConstructiveFragment,
+def _pairwise_constructive_to_native_tabular_result(
+    *,
+    geometry: GeometryNativeResult,
+    relation: RelationIndexResult,
+    keep_geom_type_applied: bool,
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    geometry_name: str = "geometry",
+    rename_columns: dict[str, str] | None = None,
+    assign_columns: dict[str, Any] | None = None,
+    frame_attrs: dict[str, Any] | None = None,
 ) -> NativeTabularResult:
-    row_positions = np.asarray(fragment.result.row_positions, dtype=np.intp)
-    source_attrs = fragment.df.drop(fragment.df._geometry_column_name, axis=1).copy(deep=False)
+    left_idx, right_idx = relation.to_host()
+    h_left_idx = left_idx.get() if hasattr(left_idx, "get") else left_idx
+    h_right_idx = right_idx.get() if hasattr(right_idx, "get") else right_idx
+    row_count = len(h_left_idx)
+    out_index = pd.RangeIndex(row_count)
+
+    left_attrs = left_df.drop(left_df._geometry_column_name, axis=1).copy(deep=False)
+    right_attrs = right_df.drop(right_df._geometry_column_name, axis=1).copy(deep=False)
+    left_columns, right_columns = _process_column_names_with_suffix(
+        left_attrs.columns,
+        right_attrs.columns,
+        ("1", "2"),
+        left_attrs,
+        right_attrs,
+    )
+    left_attrs.columns = left_columns
+    right_attrs.columns = right_columns
+
+    left_projected = left_attrs._reindex_with_indexers({0: (out_index, h_left_idx)})
+    right_projected = right_attrs._reindex_with_indexers({0: (out_index, h_right_idx)})
+    attributes, secondary_geometry, column_order = _projected_frames_to_native_tabular_parts(
+        [left_projected, right_projected],
+        index_override=out_index,
+        dropped_column_names={"geometry"},
+    )
+    result_attrs: dict[str, Any] = {}
+    if keep_geom_type_applied:
+        result_attrs["_vibespatial_keep_geom_type_applied"] = True
+    if frame_attrs:
+        result_attrs.update(frame_attrs)
+    if rename_columns:
+        attributes = attributes.rename_columns(rename_columns)
+        secondary_geometry = _rename_native_geometry_columns(
+            secondary_geometry,
+            rename_columns,
+        )
+        column_order = _rename_output_column_order(
+            column_order,
+            rename_columns,
+        )
+    trailing_columns: list[str] = []
+    if assign_columns:
+        for column, values in assign_columns.items():
+            attributes = attributes.with_column(column, values)
+        trailing_columns = list(assign_columns)
+    trailing_columns = [column for column in trailing_columns if column in attributes.columns]
+    base_columns = [column for column in column_order if column not in trailing_columns]
+    return NativeTabularResult(
+        attributes=attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=tuple([*base_columns, geometry_name, *trailing_columns]),
+        attrs=result_attrs or None,
+        secondary_geometry=secondary_geometry,
+    )
+
+
+def _pairwise_constructive_result_to_native_tabular_result(
+    result: PairwiseConstructiveResult,
+    *,
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    geometry_name: str = "geometry",
+    rename_columns: dict[str, str] | None = None,
+    assign_columns: dict[str, Any] | None = None,
+    frame_attrs: dict[str, Any] | None = None,
+) -> NativeTabularResult:
+    return _pairwise_constructive_to_native_tabular_result(
+        geometry=result.geometry,
+        relation=result.relation,
+        keep_geom_type_applied=result.keep_geom_type_applied,
+        left_df=left_df,
+        right_df=right_df,
+        geometry_name=geometry_name,
+        rename_columns=rename_columns,
+        assign_columns=assign_columns,
+        frame_attrs=frame_attrs,
+    )
+
+
+def _left_constructive_to_native_tabular_result(
+    *,
+    geometry: GeometryNativeResult,
+    row_positions: np.ndarray,
+    df: GeoDataFrame,
+    geometry_name: str = "geometry",
+    rename_columns: dict[str, str] | None = None,
+    assign_columns: dict[str, Any] | None = None,
+    frame_attrs: dict[str, Any] | None = None,
+) -> NativeTabularResult:
+    row_positions = np.asarray(row_positions, dtype=np.intp)
+    source_attrs = df.drop(df._geometry_column_name, axis=1).copy(deep=False)
     projected = source_attrs._reindex_with_indexers(
         {0: (pd.RangeIndex(len(row_positions)), row_positions)}
     )
-    attrs = _native_attribute_table_from_projected_frames(
+    attributes, secondary_geometry, _column_order = _projected_frames_to_native_tabular_parts(
         [projected],
         index_override=source_attrs.index.take(row_positions),
+        dropped_column_names={geometry_name},
     )
-    if fragment.rename_columns:
-        attrs = attrs.rename_columns(fragment.rename_columns)
+    if rename_columns:
+        attributes = attributes.rename_columns(rename_columns)
+        secondary_geometry = _rename_native_geometry_columns(
+            secondary_geometry,
+            rename_columns,
+        )
     trailing_columns: list[str] = []
-    if fragment.assign_columns:
-        for column, values in fragment.assign_columns.items():
-            attrs = attrs.with_column(column, values)
-        trailing_columns = list(fragment.assign_columns)
-    trailing_columns = [column for column in trailing_columns if column in attrs.columns]
-    base_columns = [column for column in attrs.columns if column not in trailing_columns]
+    if assign_columns:
+        for column, values in assign_columns.items():
+            attributes = attributes.with_column(column, values)
+        trailing_columns = list(assign_columns)
+    trailing_columns = [column for column in trailing_columns if column in attributes.columns]
+    base_columns = [
+        column
+        for column in _left_constructive_output_column_order(
+            df=df,
+            geometry_name=geometry_name,
+            attributes=attributes,
+            secondary_geometry=secondary_geometry,
+        )
+        if column not in trailing_columns
+    ]
+    result_attrs = frame_attrs
+    if result_attrs is None and df.attrs:
+        result_attrs = df.attrs.copy()
     return NativeTabularResult(
-        attributes=attrs,
+        attributes=attributes,
+        geometry=geometry,
+        geometry_name=geometry_name,
+        column_order=tuple([*base_columns, *trailing_columns]),
+        attrs=result_attrs or None,
+        secondary_geometry=secondary_geometry,
+    )
+
+
+def _left_constructive_result_to_native_tabular_result(
+    result: LeftConstructiveResult,
+    *,
+    df: GeoDataFrame,
+    geometry_name: str = "geometry",
+    rename_columns: dict[str, str] | None = None,
+    assign_columns: dict[str, Any] | None = None,
+    frame_attrs: dict[str, Any] | None = None,
+) -> NativeTabularResult:
+    return _left_constructive_to_native_tabular_result(
+        geometry=result.geometry,
+        row_positions=result.row_positions,
+        df=df,
+        geometry_name=geometry_name,
+        rename_columns=rename_columns,
+        assign_columns=assign_columns,
+        frame_attrs=frame_attrs,
+    )
+
+
+def _pairwise_constructive_fragment_to_native_tabular_result(fragment) -> NativeTabularResult:
+    """Compatibility shim for legacy pairwise fragment lowering."""
+    return _pairwise_constructive_to_native_tabular_result(
         geometry=fragment.result.geometry,
-        geometry_name=fragment.geometry_name,
-        column_order=tuple([*base_columns, fragment.geometry_name, *trailing_columns]),
-        attrs=fragment.df.attrs.copy() or None,
+        relation=fragment.result.relation,
+        keep_geom_type_applied=fragment.result.keep_geom_type_applied,
+        left_df=fragment.left_df,
+        right_df=fragment.right_df,
+        geometry_name=getattr(fragment, "geometry_name", "geometry"),
+        rename_columns=getattr(fragment, "rename_columns", None),
+        assign_columns=getattr(fragment, "assign_columns", None),
+        frame_attrs=None,
+    )
+
+
+def _left_constructive_fragment_to_native_tabular_result(fragment) -> NativeTabularResult:
+    """Compatibility shim for legacy left-row fragment lowering."""
+    frame_attrs = fragment.df.attrs.copy() if fragment.df.attrs else None
+    return _left_constructive_to_native_tabular_result(
+        geometry=fragment.result.geometry,
+        row_positions=fragment.result.row_positions,
+        df=fragment.df,
+        geometry_name=getattr(fragment, "geometry_name", "geometry"),
+        rename_columns=getattr(fragment, "rename_columns", None),
+        assign_columns=getattr(fragment, "assign_columns", None),
+        frame_attrs=frame_attrs,
     )
 
 
@@ -2042,6 +1459,7 @@ def _assemble_indexed_owned_parts(index_oga_pairs, row_count: int):
 def _clip_owned_geometry_native_result(result, *, crs):
     from vibespatial.api.geometry_array import GeometryArray
     from vibespatial.geometry.owned import FAMILY_TAGS, GeometryFamily, OwnedGeometryArray
+    from vibespatial.runtime.residency import Residency
 
     if not result.parts or not all(part.geometry.owned is not None for part in result.parts):
         return None, None
@@ -2054,6 +1472,7 @@ def _clip_owned_geometry_native_result(result, *, crs):
         if len(owned_parts) == 1
         else OwnedGeometryArray.concat(owned_parts)
     )
+    initial_residency = combined_owned.residency
 
     if row_positions.size > 1:
         reorder = _reorder_concat_positions(
@@ -2089,10 +1508,22 @@ def _clip_owned_geometry_native_result(result, *, crs):
         )
         if np.any(polygon_mask):
             keep = np.ones(combined_owned.row_count, dtype=bool)
-            keep[polygon_mask] = np.asarray(
-                geometry_array.area[polygon_mask],
+            nonpositive_area = ~(
+                np.asarray(
+                    geometry_array.area[polygon_mask],
+                    dtype=np.float64,
+                ) > 0.0
+            )
+            polygon_bounds = np.asarray(
+                geometry_array.bounds,
                 dtype=np.float64,
-            ) > 0.0
+            )[polygon_mask]
+            pointlike_zero_area = (
+                nonpositive_area
+                & (np.abs(polygon_bounds[:, 2] - polygon_bounds[:, 0]) <= SPATIAL_EPSILON)
+                & (np.abs(polygon_bounds[:, 3] - polygon_bounds[:, 1]) <= SPATIAL_EPSILON)
+            )
+            keep[polygon_mask] = ~nonpositive_area | pointlike_zero_area
             if not keep.all():
                 keep_rows = np.flatnonzero(keep).astype(np.intp, copy=False)
                 row_positions = row_positions[keep_rows]
@@ -2127,13 +1558,32 @@ def _clip_owned_geometry_native_result(result, *, crs):
                     combined_owned.row_count,
                 )
 
+    if initial_residency is Residency.DEVICE and combined_owned.residency is not Residency.DEVICE:
+        from vibespatial.runtime.residency import TransferTrigger
+
+        combined_owned = combined_owned.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason=(
+                "clip native-tabular boundary restored device-backed output after "
+                "geometry analysis and cleanup"
+            ),
+        )
+
     return GeometryNativeResult.from_owned(combined_owned, crs=crs), row_positions
 
 
-def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
-    source = result.source
-
-    if not result.parts:
+def _clip_constructive_parts_to_native_tabular_result(
+    *,
+    source,
+    parts: tuple[LeftConstructiveResult, ...],
+    ordered_row_positions: np.ndarray,
+    clipping_by_rectangle: bool,
+    has_non_point_candidates: bool,
+    keep_geom_type: bool,
+    spatial_materializer: Callable[[], Any] | None = None,
+) -> NativeTabularResult:
+    if not parts:
         if hasattr(source, "_geometry_column_name"):
             geometry_name = source._geometry_column_name
             attributes = NativeAttributeTable(
@@ -2146,19 +1596,21 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
             attributes=attributes,
             geometry=_empty_geometry_native_result(geometry_name=geometry_name, crs=source.crs),
             geometry_name=geometry_name,
-            column_order=tuple([*attributes.columns, geometry_name]),
+            column_order=_clip_source_column_order(
+                source,
+                geometry_name=geometry_name,
+                attributes=attributes,
+            ),
             attrs=source.attrs.copy() or None,
         )
 
-    if len(result.parts) == 1 and not result.has_non_point_candidates and not result.keep_geom_type:
-        part = result.parts[0]
+    if len(parts) == 1 and not has_non_point_candidates and not keep_geom_type:
+        part = parts[0]
         row_positions = np.asarray(part.row_positions, dtype=np.intp)
         if hasattr(source, "_geometry_column_name"):
             geometry_name = source._geometry_column_name
             source_attrs = source.drop(columns=[geometry_name]).copy(deep=False)
-            projected = source_attrs._reindex_with_indexers(
-                {0: (pd.RangeIndex(len(row_positions)), row_positions)}
-            )
+            projected = source_attrs.iloc[row_positions].copy(deep=False)
             attributes = _native_attribute_table_from_projected_frames(
                 [projected],
                 index_override=source_attrs.index.take(row_positions),
@@ -2172,26 +1624,35 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
             attributes=attributes,
             geometry=part.geometry,
             geometry_name=geometry_name,
-            column_order=tuple([*attributes.columns, geometry_name]),
+            column_order=_clip_source_column_order(
+                source,
+                geometry_name=geometry_name,
+                attributes=attributes,
+            ),
             attrs=source.attrs.copy() or None,
         )
 
-    if not result.keep_geom_type:
+    if not keep_geom_type:
         geometry_name = (
             source._geometry_column_name
             if hasattr(source, "_geometry_column_name")
             else getattr(source, "name", None) or "geometry"
         )
         owned_geometry, owned_rows = _clip_owned_geometry_native_result(
-            result,
+            SimpleNamespace(
+                source=source,
+                parts=parts,
+                ordered_row_positions=ordered_row_positions,
+                clipping_by_rectangle=clipping_by_rectangle,
+                has_non_point_candidates=has_non_point_candidates,
+                keep_geom_type=keep_geom_type,
+            ),
             crs=source.crs,
         )
         if owned_geometry is not None and owned_rows is not None:
             if hasattr(source, "_geometry_column_name"):
                 source_attrs = source.drop(columns=[geometry_name]).copy(deep=False)
-                projected = source_attrs._reindex_with_indexers(
-                    {0: (pd.RangeIndex(len(owned_rows)), owned_rows)}
-                )
+                projected = source_attrs.iloc[owned_rows].copy(deep=False)
                 attributes = _native_attribute_table_from_projected_frames(
                     [projected],
                     index_override=source.index.take(owned_rows),
@@ -2204,25 +1665,30 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
                 attributes=attributes,
                 geometry=owned_geometry,
                 geometry_name=geometry_name,
-                column_order=tuple([*attributes.columns, geometry_name]),
+                column_order=_clip_source_column_order(
+                    source,
+                    geometry_name=geometry_name,
+                    attributes=attributes,
+                ),
                 attrs=source.attrs.copy() or None,
             )
 
-        record_fallback_event(
-            surface="geopandas.clip",
-            reason="clip native-tabular export requires host semantic cleanup before materialization",
-            detail=(
-                "owned clip rows could not be preserved in the native boundary, so "
-                "host shapely/object cleanup is the explicit export fallback"
-            ),
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.CPU,
-            pipeline="clip.to_native_tabular_result",
-            d2h_transfer=True,
-        )
+        if any(part.geometry.owned is not None for part in parts):
+            record_fallback_event(
+                surface="geopandas.clip",
+                reason="clip native-tabular export requires host semantic cleanup before materialization",
+                detail=(
+                    "owned clip rows could not be preserved in the native boundary, so "
+                    "host shapely/object cleanup is the explicit export fallback"
+                ),
+                requested=ExecutionMode.AUTO,
+                selected=ExecutionMode.CPU,
+                pipeline="clip.to_native_tabular_result",
+                d2h_transfer=True,
+            )
         row_parts: list[np.ndarray] = []
         geometry_parts: list[np.ndarray] = []
-        for part in result.parts:
+        for part in parts:
             row_positions = np.asarray(part.row_positions, dtype=np.intp)
             row_parts.append(row_positions)
             if part.geometry.owned is not None:
@@ -2237,7 +1703,7 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
             else np.empty(0, dtype=object)
         )
         if row_positions.size > 1:
-            ordered_rows = np.asarray(result.ordered_row_positions, dtype=np.intp)
+            ordered_rows = np.asarray(ordered_row_positions, dtype=np.intp)
             sorter = np.argsort(row_positions, kind="stable")
             reorder = sorter[np.searchsorted(row_positions[sorter], ordered_rows)]
             row_positions = row_positions[reorder]
@@ -2251,7 +1717,7 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
             row_positions = row_positions[keep]
             geometry_values = geometry_values[keep]
 
-        if not result.clipping_by_rectangle and result.has_non_point_candidates and geometry_values.size > 0:
+        if not clipping_by_rectangle and has_non_point_candidates and geometry_values.size > 0:
             type_ids = np.asarray(shapely.get_type_id(geometry_values), dtype=np.int32)
             polygon_mask = (type_ids == 3) | (type_ids == 6)
             if np.any(polygon_mask):
@@ -2260,8 +1726,17 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
                     dtype=np.float64,
                 ) <= 0.0
                 if np.any(nonpositive_area):
+                    polygon_bounds = np.asarray(
+                        shapely.bounds(geometry_values[polygon_mask]),
+                        dtype=np.float64,
+                    ).reshape(-1, 4)
+                    pointlike_zero_area = (
+                        nonpositive_area
+                        & (np.abs(polygon_bounds[:, 2] - polygon_bounds[:, 0]) <= SPATIAL_EPSILON)
+                        & (np.abs(polygon_bounds[:, 3] - polygon_bounds[:, 1]) <= SPATIAL_EPSILON)
+                    )
                     keep = np.ones(len(geometry_values), dtype=bool)
-                    keep[np.flatnonzero(polygon_mask)[nonpositive_area]] = False
+                    keep[np.flatnonzero(polygon_mask)[nonpositive_area & ~pointlike_zero_area]] = False
                     row_positions = row_positions[keep]
                     geometry_values = geometry_values[keep]
                     type_ids = type_ids[keep]
@@ -2283,9 +1758,7 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
         if hasattr(source, "_geometry_column_name"):
             geometry_name = source._geometry_column_name
             source_attrs = source.drop(columns=[geometry_name]).copy(deep=False)
-            projected = source_attrs._reindex_with_indexers(
-                {0: (pd.RangeIndex(len(row_positions)), row_positions)}
-            )
+            projected = source_attrs.iloc[row_positions].copy(deep=False)
             attributes = _native_attribute_table_from_projected_frames(
                 [projected],
                 index_override=source.index.take(row_positions),
@@ -2310,15 +1783,32 @@ def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
             attributes=attributes,
             geometry=geometry,
             geometry_name=geometry_name,
-            column_order=tuple([*attributes.columns, geometry_name]),
+            column_order=_clip_source_column_order(
+                source,
+                geometry_name=geometry_name,
+                attributes=attributes,
+            ),
             attrs=source.attrs.copy() or None,
         )
 
-    clipped = result._materialize_parts()
-    clipped = result._normalize_geometry_backing(clipped)
-    clipped = result._filter_result(clipped)
-    clipped = result._apply_keep_geom_type(clipped)
+    if spatial_materializer is None:
+        raise ValueError(
+            "clip native-tabular export requires a spatial materializer when keep_geom_type cleanup is needed"
+        )
+    clipped = spatial_materializer()
     return _spatial_to_native_tabular_result(clipped)
+
+
+def _clip_native_result_to_native_tabular_result(result) -> NativeTabularResult:
+    return _clip_constructive_parts_to_native_tabular_result(
+        source=result.source,
+        parts=result.parts,
+        ordered_row_positions=result.ordered_row_positions,
+        clipping_by_rectangle=result.clipping_by_rectangle,
+        has_non_point_candidates=result.has_non_point_candidates,
+        keep_geom_type=result.keep_geom_type,
+        spatial_materializer=result.to_spatial,
+    )
 
 
 def _relation_join_export_result_to_native_tabular_result(
@@ -2326,7 +1816,7 @@ def _relation_join_export_result_to_native_tabular_result(
     *,
     attribute_storage: str = "arrow",
 ) -> NativeTabularResult:
-    attributes, geometry, geometry_name, _crs, column_order, distances = _native_relation_join_parts(
+    attributes, geometry, geometry_name, _crs, column_order, secondary_geometry, distances = _native_relation_join_parts(
         result.left_df,
         result.right_df,
         result.relation_result.relation.to_host(),
@@ -2346,6 +1836,7 @@ def _relation_join_export_result_to_native_tabular_result(
         geometry_name=geometry_name,
         column_order=column_order,
         attrs=result.left_df.attrs.copy() or None,
+        secondary_geometry=secondary_geometry,
     )
 
 
@@ -2355,6 +1846,17 @@ def _empty_geometry_native_result(*, geometry_name: str, crs) -> GeometryNativeR
     return GeometryNativeResult.from_geoseries(
         GeoSeries([], index=pd.RangeIndex(0), crs=crs, name=geometry_name),
     )
+
+
+def _clip_source_column_order(
+    source,
+    *,
+    geometry_name: str,
+    attributes: NativeAttributeTable,
+) -> tuple[Any, ...]:
+    if not hasattr(source, "columns"):
+        return (geometry_name,)
+    return tuple(source.columns)
 
 
 def _concat_geometry_result_sequence(
@@ -2387,6 +1889,13 @@ def _concat_geometry_result_sequence(
         )
         for geometry in geometries
     ]
+    if crs is not None:
+        series_parts = [
+            series.set_crs(crs, allow_override=True)
+            if series.crs != crs
+            else series
+            for series in series_parts
+        ]
     combined = pd.concat(series_parts, ignore_index=True)
     return GeometryNativeResult.from_values(
         combined.values,
@@ -2482,75 +1991,97 @@ def _concat_native_tabular_results(
     )
 
 
-def _symmetric_difference_constructive_result_to_native_tabular_result(
-    result: SymmetricDifferenceConstructiveResult,
+def _symmetric_difference_native_tabular_results(
+    left_result: NativeTabularResult,
+    right_result: NativeTabularResult,
+    *,
+    geometry_name: str,
+    crs,
+    attrs: dict[str, Any] | None = None,
 ) -> NativeTabularResult:
-    left_result = _left_constructive_fragment_to_native_tabular_result(
-        LeftConstructiveFragment(
-            result=result.left_result,
-            df=result.left_df,
-            geometry_name=result.geometry_name,
-            frame_type=result.frame_type,
-        )
-    )
-    right_result = _left_constructive_fragment_to_native_tabular_result(
-        LeftConstructiveFragment(
-            result=result.right_result,
-            df=result.right_df,
-            geometry_name=result.geometry_name,
-            frame_type=result.frame_type,
-        )
-    )
-
-    left_attrs = left_result.attributes
-    right_attrs = right_result.attributes
-    shared = set(left_attrs.columns) & set(right_attrs.columns)
+    shared = set(left_result.attributes.columns) & set(right_result.attributes.columns)
     rename1 = {column: f"{column}_1" for column in shared}
     rename2 = {column: f"{column}_2" for column in shared}
     if rename1:
-        left_attrs = left_attrs.rename_columns(rename1)
+        left_result = _rename_native_tabular_result(
+            left_result,
+            rename1,
+            geometry_name=geometry_name,
+        )
+    elif left_result.geometry_name != geometry_name:
+        left_result = _rename_native_tabular_result(
+            left_result,
+            None,
+            geometry_name=geometry_name,
+        )
     if rename2:
-        right_attrs = right_attrs.rename_columns(rename2)
+        right_result = _rename_native_tabular_result(
+            right_result,
+            rename2,
+            geometry_name=geometry_name,
+        )
+    elif right_result.geometry_name != geometry_name:
+        right_result = _rename_native_tabular_result(
+            right_result,
+            None,
+            geometry_name=geometry_name,
+        )
 
-    left_result = NativeTabularResult(
-        attributes=left_attrs,
-        geometry=left_result.geometry,
-        geometry_name=result.geometry_name,
-        column_order=tuple([*left_attrs.columns, result.geometry_name]),
-        attrs=left_result.attrs,
-    )
-    right_result = NativeTabularResult(
-        attributes=right_attrs,
-        geometry=right_result.geometry,
-        geometry_name=result.geometry_name,
-        column_order=tuple([*right_attrs.columns, result.geometry_name]),
-        attrs=right_result.attrs,
-    )
-
-    base_crs = result.crs if result.crs is not None else left_result.geometry.crs
-    return _concat_native_tabular_results(
+    merged = _concat_native_tabular_results(
         [left_result, right_result],
-        geometry_name=result.geometry_name,
-        crs=base_crs,
+        geometry_name=geometry_name,
+        crs=crs,
+        attrs=attrs,
+    )
+    merged_column_order = tuple(
+        [
+            *[
+                column_name
+                for column_name in merged.resolved_column_order
+                if column_name != geometry_name
+            ],
+            geometry_name,
+        ]
+    )
+    return NativeTabularResult(
+        attributes=merged.attributes,
+        geometry=merged.geometry,
+        geometry_name=geometry_name,
+        column_order=merged_column_order,
+        attrs=merged.attrs,
+        secondary_geometry=merged.secondary_geometry,
+        provenance=merged.provenance,
     )
 
 
-def _constructive_result_to_native_tabular_result(result) -> NativeTabularResult:
-    if isinstance(result, PairwiseConstructiveFragment):
-        return _pairwise_constructive_fragment_to_native_tabular_result(result)
-    if isinstance(result, LeftConstructiveFragment):
-        return _left_constructive_fragment_to_native_tabular_result(result)
-    if isinstance(result, SymmetricDifferenceConstructiveResult):
-        return _symmetric_difference_constructive_result_to_native_tabular_result(result)
-    if isinstance(result, ConcatConstructiveResult):
-        return _concat_constructive_result_to_native_tabular_result(result)
-    return _spatial_to_native_tabular_result(result.to_geodataframe())
+def _symmetric_difference_constructive_result_to_native_tabular_result(result) -> NativeTabularResult:
+    """Compatibility shim for legacy symmetric-difference wrapper lowering."""
+    left_result = _left_constructive_result_to_native_tabular_result(
+        result.left_result,
+        df=result.left_df,
+        geometry_name=result.geometry_name,
+    )
+    right_result = _left_constructive_result_to_native_tabular_result(
+        result.right_result,
+        df=result.right_df,
+        geometry_name=result.geometry_name,
+    )
+    return _symmetric_difference_native_tabular_results(
+        left_result,
+        right_result,
+        geometry_name=result.geometry_name,
+        crs=result.crs if result.crs is not None else left_result.geometry.crs,
+    )
 
 
-def _concat_constructive_result_to_native_tabular_result(
-    result: ConcatConstructiveResult,
-) -> NativeTabularResult:
-    results = [_constructive_result_to_native_tabular_result(part) for part in result.parts]
+def _concat_constructive_result_to_native_tabular_result(result) -> NativeTabularResult:
+    """Compatibility shim for legacy concat wrapper lowering."""
+    results = []
+    for part in result.parts:
+        payload = to_native_tabular_result(part)
+        if payload is None:
+            payload = _spatial_to_native_tabular_result(part.to_geodataframe())
+        results.append(payload)
     return _concat_native_tabular_results(
         results,
         geometry_name=result.geometry_name,
@@ -2571,14 +2102,6 @@ def to_native_tabular_result(result) -> NativeTabularResult | None:
         return _grouped_constructive_result_to_native_tabular_result(result)
     if isinstance(result, ClipNativeResult):
         return _clip_native_result_to_native_tabular_result(result)
-    if isinstance(result, PairwiseConstructiveFragment):
-        return _pairwise_constructive_fragment_to_native_tabular_result(result)
-    if isinstance(result, LeftConstructiveFragment):
-        return _left_constructive_fragment_to_native_tabular_result(result)
-    if isinstance(result, SymmetricDifferenceConstructiveResult):
-        return _symmetric_difference_constructive_result_to_native_tabular_result(result)
-    if isinstance(result, ConcatConstructiveResult):
-        return _concat_constructive_result_to_native_tabular_result(result)
     if isinstance(result, RelationJoinExportResult):
         return _relation_join_export_result_to_native_tabular_result(result)
     return None

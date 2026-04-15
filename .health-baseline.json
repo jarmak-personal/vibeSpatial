@@ -13,9 +13,9 @@
         "total": 3
       },
       "overlay": {
-        "state": "fail",
-        "passed": 236,
-        "total": 260
+        "state": "pass",
+        "passed": 255,
+        "total": 261
       },
       "clip": {
         "state": "pass",
@@ -24,8 +24,8 @@
       },
       "arrow_parquet": {
         "state": "pass",
-        "passed": 132,
-        "total": 132
+        "passed": 134,
+        "total": 134
       },
       "io_file_layer": {
         "state": "pass",
@@ -50,8 +50,8 @@
     }
   },
   "gpu": {
-    "status": "fail",
-    "gpu_accel_pct": 20.084107398678313,
-    "fallback_rate": 0.000739
+    "status": "pass",
+    "gpu_accel_pct": 20.11201395583712,
+    "fallback_rate": 0.000735
   }
 }

@@ -18,14 +18,10 @@ import vibespatial.api._native_results as native_results_module
 from vibespatial import write_geoparquet
 from vibespatial.api import GeoDataFrame, GeoSeries, read_file
 from vibespatial.api._native_results import (
-    ConcatConstructiveResult,
-    LeftConstructiveFragment,
     LeftConstructiveResult,
     NativeAttributeTable,
     NativeTabularResult,
-    PairwiseConstructiveFragment,
     PairwiseConstructiveResult,
-    SymmetricDifferenceConstructiveResult,
     to_native_tabular_result,
 )
 from vibespatial.api.geometry_array import GeometryArray
@@ -599,10 +595,20 @@ def test_overlay_intersection_single_geometry_only_mask_rewrites_to_clip(
         "_overlay_intersection",
         _fail_overlay_intersection,
     )
+    monkeypatch.setattr(overlay_module, "has_gpu_runtime", lambda: False)
 
+    vibespatial.clear_dispatch_events()
     result = overlay(left, right, how="intersection")
+    events = vibespatial.get_dispatch_events(clear=True)
 
     assert_geodataframe_equal(result, expected)
+    assert any(
+        event.surface == "geopandas.overlay"
+        and event.implementation == "clip_rewrite"
+        and "execution_family=clip_rewrite" in event.detail
+        and "topology_class=mask_clip" in event.detail
+        for event in events
+    )
 
 
 def test_overlay_union_promotes_small_pairwise_intersection_in_strict_mode() -> None:
@@ -3317,6 +3323,27 @@ def test_assemble_indexed_owned_chunks_preserves_exact_intersection_cache() -> N
     assert exact_values[1].geom_type == "GeometryCollection"
 
 
+def test_exact_keep_mask_keeps_geometry_collection_rows_with_polygon_parts() -> None:
+    left_values = np.asarray([box(0, 0, 2, 2)], dtype=object)
+    right_values = np.asarray([box(1, 1, 3, 3)], dtype=object)
+    exact_values = np.asarray(
+        [GeometryCollection([box(1, 1, 2, 2), LineString([(1, 1), (2, 1)])])],
+        dtype=object,
+    )
+
+    keep_mask, dropped, returned_exact_values = (
+        overlay_module._exact_keep_mask_and_dropped_count_for_polygon_intersection_warning_rows(
+            left_values,
+            right_values,
+            exact_values=exact_values,
+        )
+    )
+
+    assert keep_mask.tolist() == [True]
+    assert dropped == 1
+    assert returned_exact_values[0].equals(exact_values[0])
+
+
 def test_keep_geom_type_filter_reuses_cached_exact_intersection_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4676,7 +4703,7 @@ def test_overlay_intersection_few_right_fast_path_batches_exact_once(
         assert got_geom.normalize().equals(expected_geom.normalize())
 
 
-def test_overlay_intersection_native_defers_attribute_assembly(
+def test_overlay_intersection_native_builds_native_tabular_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = GeoDataFrame(
@@ -4701,31 +4728,28 @@ def test_overlay_intersection_native_defers_attribute_assembly(
         "_assemble_intersection_attributes",
         _counting_assembler,
     )
+    monkeypatch.setattr(
+        PairwiseConstructiveResult,
+        "to_geodataframe",
+        lambda *_args, **_kwargs: pytest.fail(
+            "overlay intersection native path should not export through PairwiseConstructiveResult"
+        ),
+    )
 
     native_result, used_owned = overlay_module._overlay_intersection_native(left, right)
 
-    assert isinstance(native_result, PairwiseConstructiveResult)
+    assert isinstance(native_result, NativeTabularResult)
     assert assemble_calls == 0
 
-    materialized = native_result.to_geodataframe(
-        left.reset_index(drop=True),
-        right.reset_index(drop=True),
-        attribute_assembler=overlay_module._assemble_intersection_attributes,
-    )
+    materialized = native_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_intersection(left, right)
 
-    assert assemble_calls == 1
+    assert assemble_calls == 0
     assert used_owned is wrapped_used
-    assert materialized["col1"].tolist() == wrapped["col1"].tolist()
-    assert materialized["col2"].tolist() == wrapped["col2"].tolist()
-    assert len(materialized) == len(wrapped) == 2
-    assert all(
-        got.normalize().equals(expected.normalize())
-        for got, expected in zip(materialized.geometry, wrapped.geometry, strict=True)
-    )
+    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
 
 
-def test_overlay_difference_native_defers_left_frame_materialization() -> None:
+def test_overlay_difference_native_builds_native_tabular_result() -> None:
     left = GeoDataFrame(
         {"col1": [1, 2]},
         geometry=GeoSeries([box(0, 0, 2, 2), box(3, 3, 5, 5)]),
@@ -4737,21 +4761,16 @@ def test_overlay_difference_native_defers_left_frame_materialization() -> None:
 
     native_result, used_owned = overlay_module._overlay_difference_native(left, right)
 
-    assert isinstance(native_result, LeftConstructiveResult)
+    assert isinstance(native_result, NativeTabularResult)
 
-    materialized = native_result.to_geodataframe(left)
+    materialized = native_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_difference(left, right)
 
     assert used_owned is wrapped_used
-    assert materialized["col1"].tolist() == wrapped["col1"].tolist()
-    assert len(materialized) == len(wrapped)
-    assert all(
-        got.normalize().equals(expected.normalize())
-        for got, expected in zip(materialized.geometry, wrapped.geometry, strict=True)
-    )
+    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
 
 
-def test_overlay_intersection_export_result_defers_fragment_materialization(
+def test_overlay_intersection_export_result_returns_native_tabular_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = GeoDataFrame(
@@ -4763,41 +4782,39 @@ def test_overlay_intersection_export_result_defers_fragment_materialization(
         geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
     )
 
-    real_projected_pairwise = native_results_module._project_pairwise_attribute_frame
-    native_calls = 0
+    expected = overlay(left, right, how="intersection")
 
-    def _count_projected_pairwise(*args, **kwargs):
-        nonlocal native_calls
-        native_calls += 1
-        return real_projected_pairwise(*args, **kwargs)
+    def _fail(*_args, **_kwargs):
+        raise AssertionError(
+            "overlay intersection export path should not route through fragment lowering"
+        )
 
     monkeypatch.setattr(
         native_results_module,
-        "_project_pairwise_attribute_frame",
-        _count_projected_pairwise,
+        "_pairwise_constructive_fragment_to_native_tabular_result",
+        _fail,
     )
     monkeypatch.setattr(
         PairwiseConstructiveResult,
         "to_geodataframe",
-        lambda *_args, **_kwargs: pytest.fail(
-            "overlay fragment export should stay on native pairwise projection"
-        ),
+        _fail,
     )
 
     export_result, used_owned = overlay_module._overlay_intersection_export_result(left, right)
-
-    assert isinstance(export_result, PairwiseConstructiveFragment)
-    assert native_calls == 0
-
-    materialized = export_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_intersection(left, right)
 
-    assert native_calls == 2
+    assert isinstance(export_result, NativeTabularResult)
     assert used_owned is wrapped_used
-    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(
+        export_result.to_geodataframe(),
+        expected,
+        normalize=True,
+        check_column_type=False,
+    )
+    assert_geodataframe_equal(wrapped, expected, normalize=True, check_column_type=False)
 
 
-def test_overlay_difference_export_result_defers_fragment_materialization(
+def test_overlay_difference_export_result_returns_native_tabular_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = GeoDataFrame(
@@ -4809,30 +4826,39 @@ def test_overlay_difference_export_result_defers_fragment_materialization(
         geometry=GeoSeries([box(1, 1, 4, 4)]),
     )
 
-    real_left = LeftConstructiveResult.to_geodataframe
-    left_calls = 0
+    expected, _ = overlay_module._overlay_difference(left, right)
 
-    def _count_left(self, *args, **kwargs):
-        nonlocal left_calls
-        left_calls += 1
-        return real_left(self, *args, **kwargs)
+    def _fail(*_args, **_kwargs):
+        raise AssertionError(
+            "overlay difference export path should not route through fragment lowering"
+        )
 
-    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _count_left)
+    monkeypatch.setattr(
+        native_results_module,
+        "_left_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(
+        LeftConstructiveResult,
+        "to_geodataframe",
+        _fail,
+    )
 
     export_result, used_owned = overlay_module._overlay_difference_export_result(left, right)
-
-    assert isinstance(export_result, LeftConstructiveFragment)
-    assert left_calls == 0
-
-    materialized = export_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_difference(left, right)
 
-    assert left_calls == 2
+    assert isinstance(export_result, NativeTabularResult)
     assert used_owned is wrapped_used
-    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(
+        export_result.to_geodataframe(),
+        expected,
+        normalize=True,
+        check_column_type=False,
+    )
+    assert_geodataframe_equal(wrapped, expected, normalize=True, check_column_type=False)
 
 
-def test_overlay_identity_native_defers_fragment_materialization(
+def test_overlay_identity_native_uses_direct_native_tabular_builders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = GeoDataFrame(
@@ -4844,51 +4870,63 @@ def test_overlay_identity_native_defers_fragment_materialization(
         geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
     )
 
-    real_projected_pairwise = native_results_module._project_pairwise_attribute_frame
-    real_left = LeftConstructiveResult.to_geodataframe
-    pairwise_native_calls = 0
+    expected = overlay(left, right, how="identity")
+    real_pairwise = overlay_module._pairwise_constructive_to_native_tabular_result
+    real_left = overlay_module._left_constructive_to_native_tabular_result
+    pairwise_calls = 0
     left_calls = 0
 
-    def _count_projected_pairwise(*args, **kwargs):
-        nonlocal pairwise_native_calls
-        pairwise_native_calls += 1
-        return real_projected_pairwise(*args, **kwargs)
+    def _count_pairwise(*args, **kwargs):
+        nonlocal pairwise_calls
+        pairwise_calls += 1
+        return real_pairwise(*args, **kwargs)
 
-    def _count_left(self, *args, **kwargs):
+    def _count_left(*args, **kwargs):
         nonlocal left_calls
         left_calls += 1
-        return real_left(self, *args, **kwargs)
+        return real_left(*args, **kwargs)
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("identity native path should not depend on legacy wrapper lowering")
 
     monkeypatch.setattr(
-        native_results_module,
-        "_project_pairwise_attribute_frame",
-        _count_projected_pairwise,
+        overlay_module,
+        "_pairwise_constructive_to_native_tabular_result",
+        _count_pairwise,
     )
     monkeypatch.setattr(
-        PairwiseConstructiveResult,
-        "to_geodataframe",
-        lambda *_args, **_kwargs: pytest.fail(
-            "identity pairwise fragment export should stay on native pairwise projection"
-        ),
+        overlay_module,
+        "_left_constructive_to_native_tabular_result",
+        _count_left,
     )
-    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _count_left)
+    monkeypatch.setattr(
+        native_results_module,
+        "_pairwise_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(
+        native_results_module,
+        "_left_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(PairwiseConstructiveResult, "to_geodataframe", _fail)
+    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _fail)
 
     native_result, used_owned = overlay_module._overlay_identity_native(left, right)
 
-    assert isinstance(native_result, ConcatConstructiveResult)
-    assert pairwise_native_calls == 0
-    assert left_calls == 0
+    assert isinstance(native_result, NativeTabularResult)
+    assert pairwise_calls == 1
+    assert left_calls == 1
 
     materialized = native_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_identity(left, right)
 
-    assert pairwise_native_calls == 2
-    assert left_calls == 2
     assert used_owned is wrapped_used
-    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(materialized, expected, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(wrapped, expected, normalize=True, check_column_type=False)
 
 
-def test_overlay_symmetric_difference_native_defers_fragment_materialization(
+def test_overlay_symmetric_difference_native_uses_direct_native_tabular_builders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = GeoDataFrame(
@@ -4900,30 +4938,51 @@ def test_overlay_symmetric_difference_native_defers_fragment_materialization(
         geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
     )
 
-    real_left = LeftConstructiveResult.to_geodataframe
+    expected = overlay(left, right, how="symmetric_difference")
+    real_left = overlay_module._left_constructive_to_native_tabular_result
     left_calls = 0
 
-    def _count_left(self, *args, **kwargs):
+    def _count_left(*args, **kwargs):
         nonlocal left_calls
         left_calls += 1
-        return real_left(self, *args, **kwargs)
+        return real_left(*args, **kwargs)
 
-    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _count_left)
+    def _fail(*_args, **_kwargs):
+        raise AssertionError(
+            "symmetric-difference native path should not depend on legacy wrapper lowering"
+        )
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_left_constructive_to_native_tabular_result",
+        _count_left,
+    )
+    monkeypatch.setattr(
+        native_results_module,
+        "_left_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(
+        native_results_module,
+        "_symmetric_difference_constructive_result_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _fail)
 
     native_result, used_owned = overlay_module._overlay_symmetric_diff_native(left, right)
 
-    assert isinstance(native_result, SymmetricDifferenceConstructiveResult)
-    assert left_calls == 0
+    assert isinstance(native_result, NativeTabularResult)
+    assert left_calls == 2
 
     materialized = native_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_symmetric_diff(left, right)
 
-    assert left_calls == 4
     assert used_owned is wrapped_used
-    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(materialized, expected, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(wrapped, expected, normalize=True, check_column_type=False)
 
 
-def test_overlay_union_native_defers_fragment_materialization(
+def test_overlay_union_native_uses_direct_native_tabular_builders(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     left = GeoDataFrame(
@@ -4935,48 +4994,65 @@ def test_overlay_union_native_defers_fragment_materialization(
         geometry=GeoSeries([box(1, 1, 4, 4), box(6, 6, 8, 8)]),
     )
 
-    real_projected_pairwise = native_results_module._project_pairwise_attribute_frame
-    real_left = LeftConstructiveResult.to_geodataframe
-    pairwise_native_calls = 0
+    expected = overlay(left, right, how="union")
+    real_pairwise = overlay_module._pairwise_constructive_to_native_tabular_result
+    real_left = overlay_module._left_constructive_to_native_tabular_result
+    pairwise_calls = 0
     left_calls = 0
 
-    def _count_projected_pairwise(*args, **kwargs):
-        nonlocal pairwise_native_calls
-        pairwise_native_calls += 1
-        return real_projected_pairwise(*args, **kwargs)
+    def _count_pairwise(*args, **kwargs):
+        nonlocal pairwise_calls
+        pairwise_calls += 1
+        return real_pairwise(*args, **kwargs)
 
-    def _count_left(self, *args, **kwargs):
+    def _count_left(*args, **kwargs):
         nonlocal left_calls
         left_calls += 1
-        return real_left(self, *args, **kwargs)
+        return real_left(*args, **kwargs)
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("union native path should not depend on legacy wrapper lowering")
 
     monkeypatch.setattr(
-        native_results_module,
-        "_project_pairwise_attribute_frame",
-        _count_projected_pairwise,
+        overlay_module,
+        "_pairwise_constructive_to_native_tabular_result",
+        _count_pairwise,
     )
     monkeypatch.setattr(
-        PairwiseConstructiveResult,
-        "to_geodataframe",
-        lambda *_args, **_kwargs: pytest.fail(
-            "union pairwise fragment export should stay on native pairwise projection"
-        ),
+        overlay_module,
+        "_left_constructive_to_native_tabular_result",
+        _count_left,
     )
-    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _count_left)
+    monkeypatch.setattr(
+        native_results_module,
+        "_pairwise_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(
+        native_results_module,
+        "_left_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(
+        native_results_module,
+        "_concat_constructive_result_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(PairwiseConstructiveResult, "to_geodataframe", _fail)
+    monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _fail)
 
     native_result, used_owned = overlay_module._overlay_union_native(left, right)
 
-    assert isinstance(native_result, ConcatConstructiveResult)
-    assert pairwise_native_calls == 0
-    assert left_calls == 0
+    assert isinstance(native_result, NativeTabularResult)
+    assert pairwise_calls == 1
+    assert left_calls == 2
 
     materialized = native_result.to_geodataframe()
     wrapped, wrapped_used = overlay_module._overlay_union(left, right)
 
-    assert pairwise_native_calls == 2
-    assert left_calls == 4
     assert used_owned is wrapped_used
-    assert_geodataframe_equal(materialized, wrapped, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(materialized, expected, normalize=True, check_column_type=False)
+    assert_geodataframe_equal(wrapped, expected, normalize=True, check_column_type=False)
 
 
 def test_overlay_union_native_writes_without_fragment_materialization(
@@ -4998,16 +5074,24 @@ def test_overlay_union_native_writes_without_fragment_materialization(
             "native union GeoParquet write should not require GeoDataFrame export"
         )
 
-    monkeypatch.setattr(ConcatConstructiveResult, "to_geodataframe", _fail)
-    monkeypatch.setattr(SymmetricDifferenceConstructiveResult, "to_geodataframe", _fail)
+    monkeypatch.setattr(
+        native_results_module,
+        "_concat_constructive_result_to_native_tabular_result",
+        _fail,
+    )
+    monkeypatch.setattr(
+        native_results_module,
+        "_symmetric_difference_constructive_result_to_native_tabular_result",
+        _fail,
+    )
     monkeypatch.setattr(PairwiseConstructiveResult, "to_geodataframe", _fail)
     monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _fail)
-    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
-
     native_result, _used_owned = overlay_module._overlay_union_native(left, right)
 
     path = tmp_path / "overlay-union-native.parquet"
+    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
     write_geoparquet(native_result, path, geometry_encoding="geoarrow")
+    monkeypatch.undo()
 
     result = geopandas.read_parquet(path)
     assert_geodataframe_equal(result, expected, normalize=True, check_column_type=False)
@@ -5048,13 +5132,13 @@ def test_overlay_intersection_export_native_tabular_skips_pandas_attribute_assem
     )
     expected = overlay(left, right, how="intersection")
 
-    real_native_pairwise = native_results_module._native_pairwise_attribute_table
+    real_pairwise = overlay_module._pairwise_constructive_to_native_tabular_result
     native_calls = 0
 
-    def _counting_native_pairwise(*args, **kwargs):
+    def _counting_pairwise(*args, **kwargs):
         nonlocal native_calls
         native_calls += 1
-        return real_native_pairwise(*args, **kwargs)
+        return real_pairwise(*args, **kwargs)
 
     def _fail(*_args, **_kwargs):
         raise AssertionError(
@@ -5062,9 +5146,9 @@ def test_overlay_intersection_export_native_tabular_skips_pandas_attribute_assem
         )
 
     monkeypatch.setattr(
-        native_results_module,
-        "_native_pairwise_attribute_table",
-        _counting_native_pairwise,
+        overlay_module,
+        "_pairwise_constructive_to_native_tabular_result",
+        _counting_pairwise,
     )
     monkeypatch.setattr(overlay_module, "_assemble_intersection_attributes", _fail)
 
@@ -5121,13 +5205,13 @@ def test_overlay_union_native_tabular_skips_pandas_attribute_assembler(
     )
     expected = overlay(left, right, how="union")
 
-    real_native_pairwise = native_results_module._native_pairwise_attribute_table
+    real_pairwise = overlay_module._pairwise_constructive_to_native_tabular_result
     native_calls = 0
 
-    def _counting_native_pairwise(*args, **kwargs):
+    def _counting_pairwise(*args, **kwargs):
         nonlocal native_calls
         native_calls += 1
-        return real_native_pairwise(*args, **kwargs)
+        return real_pairwise(*args, **kwargs)
 
     def _fail(*_args, **_kwargs):
         raise AssertionError(
@@ -5135,9 +5219,9 @@ def test_overlay_union_native_tabular_skips_pandas_attribute_assembler(
         )
 
     monkeypatch.setattr(
-        native_results_module,
-        "_native_pairwise_attribute_table",
-        _counting_native_pairwise,
+        overlay_module,
+        "_pairwise_constructive_to_native_tabular_result",
+        _counting_pairwise,
     )
     monkeypatch.setattr(overlay_module, "_assemble_intersection_attributes", _fail)
 
@@ -5176,9 +5260,8 @@ def test_overlay_union_native_tabular_builds_arrow_without_frame_materialization
     def _fail(*_args, **_kwargs):
         raise AssertionError("native Arrow export should not require GeoDataFrame export")
 
-    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
-
     expected = overlay(left, right, how="union")
+    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
     result = pa.table(tabular.to_arrow(geometry_encoding="WKB"))
 
     assert result.column_names == ["col1", "col2", "geometry"]
@@ -5211,15 +5294,16 @@ def test_overlay_union_native_tabular_writes_feather_without_frame_materializati
     def _fail(*_args, **_kwargs):
         raise AssertionError("native Feather write should not require GeoDataFrame export")
 
-    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
-
     path = tmp_path / "overlay-union-native.feather"
+    expected = overlay(left, right, how="union")
+    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
     tabular.to_feather(path)
+    monkeypatch.undo()
 
     result = geopandas.read_feather(path)
     assert_geodataframe_equal(
         result,
-        overlay(left, right, how="union"),
+        expected,
         normalize=True,
         check_column_type=False,
     )
@@ -5244,14 +5328,18 @@ def test_overlay_intersection_export_result_writes_without_fragment_materializat
             "native intersection GeoParquet write should not require GeoDataFrame export"
         )
 
-    monkeypatch.setattr(PairwiseConstructiveFragment, "to_geodataframe", _fail)
+    monkeypatch.setattr(
+        native_results_module,
+        "_pairwise_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
     monkeypatch.setattr(PairwiseConstructiveResult, "to_geodataframe", _fail)
-    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
-
     export_result, _used_owned = overlay_module._overlay_intersection_export_result(left, right)
 
     path = tmp_path / "overlay-intersection-export.parquet"
+    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
     write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+    monkeypatch.undo()
 
     result = geopandas.read_parquet(path)
     assert_geodataframe_equal(result, expected, normalize=True, check_column_type=False)
@@ -5276,14 +5364,18 @@ def test_overlay_difference_export_result_writes_without_fragment_materializatio
             "native difference GeoParquet write should not require GeoDataFrame export"
         )
 
-    monkeypatch.setattr(LeftConstructiveFragment, "to_geodataframe", _fail)
+    monkeypatch.setattr(
+        native_results_module,
+        "_left_constructive_fragment_to_native_tabular_result",
+        _fail,
+    )
     monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _fail)
-    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
-
     export_result, _used_owned = overlay_module._overlay_difference_export_result(left, right)
 
     path = tmp_path / "overlay-difference-export.parquet"
+    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
     write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+    monkeypatch.undo()
 
     result = geopandas.read_parquet(path)
     assert_geodataframe_equal(result, expected, normalize=True, check_column_type=False)
@@ -5308,14 +5400,18 @@ def test_overlay_symmetric_difference_native_writes_without_fragment_materializa
             "native symmetric-difference GeoParquet write should not require GeoDataFrame export"
         )
 
-    monkeypatch.setattr(SymmetricDifferenceConstructiveResult, "to_geodataframe", _fail)
+    monkeypatch.setattr(
+        native_results_module,
+        "_symmetric_difference_constructive_result_to_native_tabular_result",
+        _fail,
+    )
     monkeypatch.setattr(LeftConstructiveResult, "to_geodataframe", _fail)
-    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
-
     native_result, _used_owned = overlay_module._overlay_symmetric_diff_native(left, right)
 
     path = tmp_path / "overlay-symdiff-native.parquet"
+    monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
     write_geoparquet(native_result, path, geometry_encoding="geoarrow")
+    monkeypatch.undo()
 
     result = geopandas.read_parquet(path)
     assert_geodataframe_equal(result, expected, normalize=True, check_column_type=False)

@@ -18,7 +18,6 @@ import vibespatial.api._native_results as native_results_module
 from vibespatial import write_geoparquet
 from vibespatial.api import GeoDataFrame, GeoSeries
 from vibespatial.api._native_results import (
-    GroupedConstructiveResult,
     NativeAttributeTable,
     NativeTabularResult,
     RelationIndexResult,
@@ -355,6 +354,7 @@ class TestSpatialNearestReturnsIndexArrays:
 
         path = tmp_path / "sjoin-native-no-materialize.parquet"
         write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+        monkeypatch.undo()
 
         result = geopandas.read_parquet(path)
         assert_geodataframe_equal(result, expected)
@@ -784,6 +784,7 @@ class TestSpatialNearestReturnsIndexArrays:
 
         path = tmp_path / "sjoin-nearest-native-no-materialize.parquet"
         write_geoparquet(export_result, path, geometry_encoding="geoarrow")
+        monkeypatch.undo()
 
         result = geopandas.read_parquet(path)
         assert_geodataframe_equal(
@@ -830,7 +831,7 @@ class TestSpatialNearestReturnsIndexArrays:
             ),
         )
 
-        real_export = GroupedConstructiveResult.to_geodataframe
+        real_export = NativeTabularResult.to_geodataframe
         export_calls = 0
 
         def _counting_export(self, *args, **kwargs):
@@ -839,7 +840,7 @@ class TestSpatialNearestReturnsIndexArrays:
             return real_export(self, *args, **kwargs)
 
         monkeypatch.setattr(
-            GroupedConstructiveResult,
+            NativeTabularResult,
             "to_geodataframe",
             _counting_export,
         )
@@ -858,7 +859,7 @@ class TestSpatialNearestReturnsIndexArrays:
             agg_kwargs={},
         )
 
-        assert isinstance(native_result, GroupedConstructiveResult)
+        assert isinstance(native_result, NativeTabularResult)
         assert export_calls == 0
 
         materialized = native_result.to_geodataframe()
@@ -930,14 +931,20 @@ class TestSpatialNearestReturnsIndexArrays:
                 "native grouped GeoParquet write should not require GeoDataFrame export"
             )
 
+        real_export = NativeTabularResult.to_geodataframe
         monkeypatch.setattr(
-            GroupedConstructiveResult,
+            NativeTabularResult,
             "to_geodataframe",
             _fail,
         )
 
         path = tmp_path / "dissolve-native.parquet"
         write_geoparquet(native_result, path, geometry_encoding="geoarrow")
+        monkeypatch.setattr(
+            NativeTabularResult,
+            "to_geodataframe",
+            real_export,
+        )
 
         result = geopandas.read_parquet(path)
         assert_geodataframe_equal(result, expected)
@@ -957,17 +964,17 @@ class TestSpatialNearestReturnsIndexArrays:
         )
         mask = box(0.5, 0.5, 2.5, 2.5)
 
-        real_export = clip_module.ClipNativeResult.to_spatial
+        real_export = clip_module._clip_native_tabular_to_spatial
         export_calls = 0
 
-        def _counting_export(self, *args, **kwargs):
+        def _counting_export(*args, **kwargs):
             nonlocal export_calls
             export_calls += 1
-            return real_export(self, *args, **kwargs)
+            return real_export(*args, **kwargs)
 
         monkeypatch.setattr(
-            clip_module.ClipNativeResult,
-            "to_spatial",
+            clip_module,
+            "_clip_native_tabular_to_spatial",
             _counting_export,
         )
 
@@ -978,10 +985,13 @@ class TestSpatialNearestReturnsIndexArrays:
             sort=False,
         )
 
-        assert isinstance(native_result, clip_module.ClipNativeResult)
+        assert isinstance(native_result, NativeTabularResult)
         assert export_calls == 0
 
-        materialized = native_result.to_spatial()
+        materialized = clip_module._clip_native_tabular_to_spatial(
+            native_result,
+            source=frame,
+        )
         wrapped = geopandas.clip(frame, mask)
 
         assert export_calls == 2
@@ -1019,14 +1029,15 @@ class TestSpatialNearestReturnsIndexArrays:
             )
 
         monkeypatch.setattr(
-            clip_module.ClipNativeResult,
-            "to_spatial",
+            clip_module,
+            "_clip_native_tabular_to_spatial",
             _fail,
         )
-        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
 
         path = tmp_path / "clip-native.parquet"
+        monkeypatch.setattr(NativeTabularResult, "to_geodataframe", _fail)
         write_geoparquet(native_result, path, geometry_encoding="geoarrow")
+        monkeypatch.undo()
 
         result = geopandas.read_parquet(path)
         assert_geodataframe_equal(result, expected)
@@ -1134,10 +1145,10 @@ class TestSpatialNearestReturnsIndexArrays:
 
         def _fail(*_args, **_kwargs):
             raise AssertionError(
-                "point-only native clip tabular export should not require ClipNativeResult.to_spatial()"
+                "point-only native clip tabular export should not require clip source-type export"
             )
 
-        monkeypatch.setattr(clip_module.ClipNativeResult, "to_spatial", _fail)
+        monkeypatch.setattr(clip_module, "_clip_native_tabular_to_spatial", _fail)
 
         tabular = to_native_tabular_result(native_result)
 
@@ -1175,10 +1186,10 @@ class TestSpatialNearestReturnsIndexArrays:
 
         def _fail(*_args, **_kwargs):
             raise AssertionError(
-                "non-point native clip tabular export should not require ClipNativeResult.to_spatial()"
+                "non-point native clip tabular export should not require clip source-type export"
             )
 
-        monkeypatch.setattr(clip_module.ClipNativeResult, "to_spatial", _fail)
+        monkeypatch.setattr(clip_module, "_clip_native_tabular_to_spatial", _fail)
         to_shapely_calls = 0
 
         real_to_shapely = OwnedGeometryArray.to_shapely

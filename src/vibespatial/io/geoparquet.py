@@ -1258,14 +1258,9 @@ def _geoparquet_table_to_native_tabular_result(
     decoded_geometry: dict[str, GeometryNativeResult] = {}
     row_count = None
     for column_name in geometry_columns:
-        column_index = result_column_names.index(column_name)
         column_meta = geo_metadata["columns"][column_name]
         crs = _geoparquet_geometry_column_crs(column_meta)
-        scan_column_index = (
-            table_column_names.index(column_name)
-            if scanned_with_pylibcudf
-            else column_index
-        )
+        scan_column_index = table_column_names.index(column_name)
         try:
             if scanned_with_pylibcudf:
                 owned = _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
@@ -1279,7 +1274,7 @@ def _geoparquet_table_to_native_tabular_result(
                 owned = _decode_arrow_geoparquet_table_to_owned(
                     table,
                     geo_metadata,
-                    column_index=column_index,
+                    column_index=scan_column_index,
                 )
             if row_count is None:
                 row_count = owned.row_count

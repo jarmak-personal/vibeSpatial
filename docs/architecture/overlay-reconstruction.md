@@ -5,7 +5,7 @@ Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented out
 Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
 STOP IF: You already have the reconstruction planner open and only need local implementation detail.
 Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-Body Budget: 112/220 lines
+Body Budget: 119/220 lines
 Document: docs/architecture/overlay-reconstruction.md
 
 Section Map (Body Lines)
@@ -20,7 +20,7 @@ Section Map (Body Lines)
 | 37-46 | Options Considered |
 | 47-60 | Decision |
 | 61-74 | CCCL Mapping |
-| 75-112 | Consequences |
+| 75-119 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
@@ -97,6 +97,13 @@ overlay operations.
 
 ## Consequences
 
+- public `overlay()` now chooses an execution family before heavy work starts
+  (`clip_rewrite`, `broadcast_right_intersection`,
+  `broadcast_right_difference`, `coverage_union`, `grouped_union`, or
+  `generic_reconstruction`) and records that family in dispatch telemetry
+- every constructive family still lowers through one canonical
+  `NativeTabularResult` boundary, so planner selection changes execution
+  shape without reintroducing host-side composition trees
 - Phase 5 now has one reconstruction graph instead of operation-specific glue
 - `o17.9.6.2` lands the device split-event and directed-edge primitive that
   feeds the later half-edge graph work

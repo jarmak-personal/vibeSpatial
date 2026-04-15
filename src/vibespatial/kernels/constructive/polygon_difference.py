@@ -70,10 +70,10 @@ def _polygon_difference_gpu(
     final coordinate materialization at the face assembly boundary (same
     transfer point as all other overlay operations).
     """
-    from vibespatial.overlay.gpu import (
-        _build_overlay_execution_plan,
-        _materialize_overlay_execution_plan,
-    )
+    from vibespatial.cuda._runtime import maybe_trim_pool_memory
+    from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
+    from vibespatial.overlay.faces import _select_overlay_face_indices_gpu
+    from vibespatial.overlay.gpu import _build_overlay_execution_plan
 
     runtime_selection = RuntimeSelection(
         requested=ExecutionMode.GPU,
@@ -86,11 +86,21 @@ def _polygon_difference_gpu(
         right,
         dispatch_mode=ExecutionMode.GPU,
     )
-    result, _ = _materialize_overlay_execution_plan(
-        plan,
-        operation="difference",
-        requested=ExecutionMode.GPU,
-    )
+    d_selected_face_indices = _select_overlay_face_indices_gpu(plan.faces, operation="difference")
+    try:
+        result = _build_polygon_output_from_faces_gpu(
+            plan.half_edge_graph,
+            plan.faces,
+            d_selected_face_indices,
+            preserve_row_count=left.row_count,
+        )
+    finally:
+        del d_selected_face_indices
+        maybe_trim_pool_memory()
+    if result is None:
+        raise RuntimeError(
+            "GPU polygon_difference face assembly unavailable (no device state)"
+        )
     result.runtime_history.append(runtime_selection)
     return result
 

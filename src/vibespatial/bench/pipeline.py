@@ -15,7 +15,7 @@ from shapely.geometry import box
 import vibespatial.api as geopandas
 from vibespatial.api._native_results import (
     GeometryNativeResult,
-    GroupedConstructiveResult,
+    _grouped_constructive_to_native_tabular_result,
 )
 from vibespatial.constructive.clip_rect import clip_by_rect_owned
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
@@ -540,7 +540,7 @@ def _dissolve_join_heavy_groups(
                     crs=geometry_result.crs,
                 )
             )
-        return GroupedConstructiveResult(
+        return _grouped_constructive_to_native_tabular_result(
             geometry=geometry_result,
             attributes=pd.DataFrame(index=group_index),
             geometry_name=geometry_name,

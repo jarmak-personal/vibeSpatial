@@ -748,23 +748,25 @@ def spatial_overlay_owned(
     # broadcast_right + intersection: containment bypass (lyy.16) + batched SH
     # clip (lyy.18) reduce work before per-group overlay.  Other strategies
     # fall through to the existing per-group path.
-    from vibespatial.overlay.strategies import select_overlay_strategy
+    from vibespatial.overlay.strategies import (
+        OverlayExecutionFamily,
+        select_overlay_strategy,
+    )
 
     strategy = select_overlay_strategy(
         left, right, how,
         candidate_pair_count=candidate_pairs.count,
     )
 
-    _ws_label = strategy.workload_shape.value if strategy.workload_shape is not None else strategy.name
     record_dispatch_event(
         surface="geopandas.spatial_overlay",
         operation=f"spatial_overlay_{how}",
         implementation=f"spatial_overlay_{strategy.name}",
         reason=strategy.reason,
-        detail=(
-            f"left={left.row_count}, right={right.row_count}, "
-            f"pairs={candidate_pairs.count}, strategy={strategy.name}, "
-            f"workload_shape={_ws_label}"
+        detail=strategy.telemetry_detail(
+            left_rows=left.row_count,
+            right_rows=right.row_count,
+            candidate_pair_count=candidate_pairs.count,
         ),
         requested=requested,
         selected=ExecutionMode.GPU if cp is not None else ExecutionMode.CPU,
@@ -779,8 +781,11 @@ def spatial_overlay_owned(
     _containment_remainder_mask: cp.ndarray | None = None  # type: ignore[name-defined]
     _sh_clip_result: OwnedGeometryArray | None = None
 
-    _bypass_eligible_ops = ("intersection", "difference")
-    if strategy.name == "broadcast_right" and how in _bypass_eligible_ops and cp is not None:
+    _broadcast_right_families = {
+        OverlayExecutionFamily.BROADCAST_RIGHT_INTERSECTION,
+        OverlayExecutionFamily.BROADCAST_RIGHT_DIFFERENCE,
+    }
+    if strategy.execution_family in _broadcast_right_families and cp is not None:
         try:
             _containment_result, _containment_remainder_mask = (
                 _containment_bypass_gpu(left_subset, right_subset, how)
@@ -871,7 +876,10 @@ def spatial_overlay_owned(
         # polygon_intersection kernel launch, further reducing the number of
         # polygons that fall through to the expensive per-group overlay.
         # SH clip is only applicable to intersection (clipping semantics).
-        if how == "intersection" and left_subset.row_count > 0:
+        if (
+            strategy.execution_family is OverlayExecutionFamily.BROADCAST_RIGHT_INTERSECTION
+            and left_subset.row_count > 0
+        ):
             try:
                 clip_eligible, clip_vert_count = _is_clip_polygon_sh_eligible(right_subset)
                 if clip_eligible:
@@ -1020,7 +1028,7 @@ def spatial_overlay_owned(
         )
         _pairwise_mode = _pairwise_selection.selected
 
-        if how in ("difference", "symmetric_difference"):
+        if strategy.execution_family is OverlayExecutionFamily.GROUPED_UNION:
             # Union all right neighbours per left group, then compute one
             # set operation per unique left geometry.
             # This mirrors the approach in _overlay_difference (api/tools/overlay.py).
@@ -1052,7 +1060,10 @@ def spatial_overlay_owned(
                 dispatch_mode=_pairwise_mode,
             )
 
-        elif how in ("intersection", "union") and strategy.name != "broadcast_right":
+        elif strategy.execution_family in {
+            OverlayExecutionFamily.COVERAGE_UNION,
+            OverlayExecutionFamily.GENERIC_RECONSTRUCTION,
+        } and how in ("intersection", "union"):
             # Batch all surviving pairs into one row-isolated overlay plan.
             # This keeps per-pair topology isolated without materializing
             # group boundaries to host or iterating group-by-group in Python.
@@ -1099,7 +1110,7 @@ def spatial_overlay_owned(
             # classify_segment_intersections).
             _cached_right_segs: DeviceSegmentTable | None = None
             _is_broadcast_right_overlay = (
-                strategy.name == "broadcast_right"
+                strategy.execution_family in _broadcast_right_families
                 and right_subset.row_count == 1
                 and cp is not None
             )

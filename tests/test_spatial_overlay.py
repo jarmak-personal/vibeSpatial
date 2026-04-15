@@ -420,6 +420,9 @@ class TestOverlayDispatchEventWorkloadShape:
         assert overlay_events, "Expected at least one spatial_overlay dispatch event"
         ev = overlay_events[0]
         assert "workload_shape=broadcast_right" in ev.detail
+        assert "execution_family=broadcast_right_intersection" in ev.detail
+        assert "topology_class=broadcast_mask" in ev.detail
+        assert "fusion_stages=" in ev.detail
 
     def test_pairwise_dispatch_event_has_workload_shape(self):
         """Row-matched case should record workload_shape=pairwise."""
@@ -436,6 +439,7 @@ class TestOverlayDispatchEventWorkloadShape:
         assert overlay_events, "Expected at least one spatial_overlay dispatch event"
         ev = overlay_events[0]
         assert "workload_shape=pairwise" in ev.detail
+        assert "execution_family=generic_reconstruction" in ev.detail
 
     def test_n_vs_m_dispatch_event_has_workload_shape(self):
         """N-vs-M case should record workload_shape=per_group (strategy name fallback)."""
@@ -452,6 +456,7 @@ class TestOverlayDispatchEventWorkloadShape:
         assert overlay_events, "Expected at least one spatial_overlay dispatch event"
         ev = overlay_events[0]
         assert "workload_shape=per_group" in ev.detail
+        assert "execution_family=generic_reconstruction" in ev.detail
 
 
 class TestSelectOverlayStrategyWorkloadShape:
@@ -467,6 +472,11 @@ class TestSelectOverlayStrategyWorkloadShape:
         strategy = select_overlay_strategy(left, right, "intersection")
         assert strategy.name == "broadcast_right"
         assert strategy.workload_shape is WorkloadShape.BROADCAST_RIGHT
+        assert strategy.execution_family.value == "broadcast_right_intersection"
+        assert strategy.topology_class.value == "broadcast_mask"
+        assert strategy.result_shape.value == "left_rows"
+        assert strategy.fusion_plan is not None
+        assert len(strategy.fusion_plan.stages) >= 2
 
     def test_broadcast_left_has_no_shared_enum(self):
         from vibespatial.overlay.strategies import select_overlay_strategy
@@ -477,6 +487,7 @@ class TestSelectOverlayStrategyWorkloadShape:
         strategy = select_overlay_strategy(left, right, "intersection")
         assert strategy.name == "broadcast_left"
         assert strategy.workload_shape is None
+        assert strategy.execution_family.value == "generic_reconstruction"
 
     def test_pairwise_uses_shared_enum(self):
         from vibespatial.overlay.strategies import select_overlay_strategy
@@ -488,6 +499,7 @@ class TestSelectOverlayStrategyWorkloadShape:
         strategy = select_overlay_strategy(left, right, "intersection")
         assert strategy.name == "per_group"
         assert strategy.workload_shape is WorkloadShape.PAIRWISE
+        assert strategy.execution_family.value == "generic_reconstruction"
 
     def test_n_vs_m_has_no_shared_enum(self):
         from vibespatial.overlay.strategies import select_overlay_strategy
@@ -498,3 +510,29 @@ class TestSelectOverlayStrategyWorkloadShape:
         strategy = select_overlay_strategy(left, right, "intersection")
         assert strategy.name == "per_group"
         assert strategy.workload_shape is None
+        assert strategy.execution_family.value == "generic_reconstruction"
+
+    def test_pairwise_union_uses_coverage_union_family(self):
+        from vibespatial.overlay.strategies import select_overlay_strategy
+
+        left = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+        right = from_shapely_geometries([box(0, 0, 2, 2), box(2, 0, 4, 2)])
+
+        strategy = select_overlay_strategy(left, right, "union", candidate_pair_count=2)
+        assert strategy.execution_family.value == "coverage_union"
+        assert strategy.topology_class.value == "coverage"
+        assert strategy.result_shape.value == "pairwise_rows"
+        assert "row_isolated_overlay" in strategy.fusion_stage_labels
+
+    def test_grouped_difference_uses_grouped_union_family(self):
+        from vibespatial.overlay.strategies import select_overlay_strategy
+
+        left = from_shapely_geometries([box(0, 0, 10, 10)])
+        right = from_shapely_geometries([box(2, 0, 4, 4), box(6, 0, 8, 4)])
+
+        strategy = select_overlay_strategy(left, right, "difference", candidate_pair_count=2)
+        assert strategy.name == "broadcast_left"
+        assert strategy.execution_family.value == "grouped_union"
+        assert strategy.topology_class.value == "grouped_set"
+        assert strategy.result_shape.value == "grouped_left_rows"
+        assert "segmented_union" in strategy.fusion_stage_labels
