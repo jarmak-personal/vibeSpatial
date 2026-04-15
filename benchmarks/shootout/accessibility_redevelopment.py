@@ -93,17 +93,12 @@ served_parcels = (
 )
 
 if len(nearby_buildings) > 0 and len(served_parcels) > 0:
-    occupied = gpd.sjoin(
+    occupied = gpd.overlay(
         served_parcels[["parcel_id", "geometry"]],
         nearby_buildings[["building_id", "geometry"]],
-        predicate="intersects",
+        how="intersection",
     )
-    occupied_rows = occupied.index.unique()
-    occupied = (
-        served_parcels.loc[occupied_rows].copy()
-        if len(occupied_rows) > 0
-        else served_parcels.iloc[:0].copy()
-    )
+    occupied = occupied[occupied.geometry.geom_type.isin(POLYGONAL_TYPES)].copy()
 else:
     occupied = gpd.GeoDataFrame({"geometry": []}, geometry="geometry", crs=parcels.crs)
 

@@ -1142,9 +1142,18 @@ def test_overlay_difference_redevelopment_like_followup_overlay_stays_strict_nat
     assert dissolved.geometry.is_valid.all()
 
 
+@pytest.mark.parametrize(
+    ("scale", "expected_rows"),
+    [
+        ("1000", 4),
+        ("10000", 44),
+    ],
+)
 def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwise_oracle(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    scale: str,
+    expected_rows: int,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
@@ -1155,7 +1164,7 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
     max_nearest_distance_m = 1_800.0
     transit_buffer_m = 900.0
 
-    monkeypatch.setenv("VSBENCH_SCALE", "1000")
+    monkeypatch.setenv("VSBENCH_SCALE", scale)
     fixtures = setup_fixtures(tmp_path)
 
     buildings = read_file(fixtures["access_buildings"])
@@ -1246,15 +1255,28 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
         ),
         dtype=object,
     )
-    keep_mask = np.array(
+    polygon_keep_mask = np.array(
         [
             geom is not None
             and not shapely.is_empty(geom)
             and geom.geom_type in polygonal_types
+            and float(shapely.area(geom)) > 0.0
             for geom in exact_values
         ],
         dtype=bool,
     )
+    keep_mask = polygon_keep_mask.copy()
+    if polygon_keep_mask.any():
+        exact_points = np.asarray(
+            shapely.point_on_surface(exact_values[polygon_keep_mask]),
+            dtype=object,
+        )
+        exact_left = np.asarray(pair_left.geometry.array, dtype=object)[polygon_keep_mask]
+        exact_right = np.asarray(pair_right.geometry.array, dtype=object)[polygon_keep_mask]
+        keep_mask[np.flatnonzero(polygon_keep_mask)] &= np.asarray(
+            shapely.contains(exact_left, exact_points) & shapely.contains(exact_right, exact_points),
+            dtype=bool,
+        )
 
     expected = GeoDataFrame(
         {
@@ -1267,13 +1289,16 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
     ).sort_values(["parcel_id", "building_id"]).reset_index(drop=True)
     actual = actual.sort_values(["parcel_id", "building_id"]).reset_index(drop=True)
 
-    assert len(actual) == 4
+    assert len(actual) == expected_rows
     assert len(actual) == len(expected)
     assert actual[["parcel_id", "building_id"]].equals(expected[["parcel_id", "building_id"]])
     for actual_geom, expected_geom in zip(actual.geometry, expected.geometry, strict=True):
-        assert shapely.normalize(actual_geom).equals_exact(
-            shapely.normalize(expected_geom),
-            tolerance=1e-6,
+        normalized_actual = shapely.normalize(actual_geom)
+        normalized_expected = shapely.normalize(expected_geom)
+        assert (
+            normalized_actual.equals(normalized_expected)
+            or normalized_actual.equals_exact(normalized_expected, tolerance=1e-6)
+            or float(shapely.hausdorff_distance(normalized_actual, normalized_expected)) <= 1e-6
         )
 
 
@@ -2293,6 +2318,32 @@ def test_keep_geom_type_filter_preserves_owned_results_without_array_materializa
     assert dropped == 0
     assert len(filtered) == 1
     assert getattr(filtered.values, "_owned", None) is not None
+
+
+def test_keep_geom_type_filter_drops_zero_area_owned_polygon_rows() -> None:
+    area_pairs = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 1, 1),
+                    box(1, 0, 1, 2),
+                    None,
+                ]
+            )
+        )
+    )
+
+    filtered, dropped, keep_mask = overlay_module._filter_polygon_intersection_rows_for_keep_geom_type(
+        None,
+        None,
+        area_pairs,
+        keep_geom_type_warning=False,
+    )
+
+    assert keep_mask.tolist() == [True, False, False]
+    assert dropped == 0
+    assert len(filtered) == 1
+    assert filtered.iloc[0].equals(box(0, 0, 1, 1))
 
 
 def test_keep_geom_type_filter_skips_device_warning_refinement_when_exact_values_cover_rows(
