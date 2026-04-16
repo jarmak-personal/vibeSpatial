@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import importlib
+import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from shapely.geometry import Polygon, box
+from shapely.geometry import LineString, Polygon, box
 
 import vibespatial.api as geopandas
 from vibespatial import DissolveUnionMethod, has_gpu_runtime
 from vibespatial.api.testing import assert_geodataframe_equal
+from vibespatial.geometry.device_array import DeviceGeometryArray
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.overlay.dissolve import (
     evaluate_geopandas_dissolve,
     execute_grouped_box_union_gpu,
@@ -18,6 +22,8 @@ from vibespatial.overlay.dissolve import (
     execute_grouped_coverage_union_gpu,
     execute_grouped_disjoint_subset_union_codes,
 )
+from vibespatial.runtime.event_log import EVENT_LOG_ENV_VAR, read_event_records
+from vibespatial.runtime.residency import Residency
 
 dissolve_module = importlib.import_module("vibespatial.overlay.dissolve")
 
@@ -93,6 +99,51 @@ def test_gpu_dissolve_matches_geopandas_for_box_coverages() -> None:
     expected = frame.dissolve(by="group", aggfunc="first", method="coverage")
 
     assert_geodataframe_equal(actual, expected)
+
+
+@pytest.mark.gpu
+def test_public_dissolve_gpu_coverage_smoke() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    lines = [
+        LineString([(0.0, 0.0), (10.0, 0.0)]),
+        LineString([(10.0, 0.0), (0.0, 0.0)]),
+        LineString([(0.0, 5.0), (10.0, 5.0)]),
+        LineString([(10.0, 5.0), (0.0, 5.0)]),
+    ] * 32
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(len(lines), dtype=np.int32),
+            "value": np.arange(len(lines), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(lines, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+
+    actual = buffered.dissolve(by="group")
+    expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
+    actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+    event_log = os.environ.get(EVENT_LOG_ENV_VAR)
+    if event_log:
+        records = read_event_records(Path(event_log))
+        assert any(
+            record.get("event_type") == "dispatch"
+            and record.get("surface") == "geopandas.geodataframe.dissolve"
+            and record.get("operation") == "dissolve"
+            and record.get("selected") == "gpu"
+            for record in records
+        )
 
 
 @pytest.mark.gpu

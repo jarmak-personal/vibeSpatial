@@ -35,7 +35,11 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection  # noqa: E402
 from vibespatial.runtime.config import COARSE_BOUNDS_TILE_SIZE, SEGMENT_TILE_SIZE  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
-from vibespatial.runtime.residency import Residency, TransferTrigger  # noqa: E402
+from vibespatial.runtime.residency import (  # noqa: E402
+    Residency,
+    TransferTrigger,
+    combined_residency,
+)
 from vibespatial.spatial.indexing_cpu import iter_geometry_parts  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -46,6 +50,7 @@ def _default_index_runtime_selection() -> RuntimeSelection:
         kernel_name="flat_index_build",
         kernel_class=KernelClass.COARSE,
         row_count=1,  # always exceeds threshold of 0
+        current_residency=Residency.HOST,
     )
 
 
@@ -287,6 +292,7 @@ def generate_bounds_pairs(
         row_count=total_geom_count,
         requested_mode=ExecutionMode.AUTO,
         gpu_available=has_gpu_runtime(),
+        current_residency=left.residency if same_input else combined_residency(left, right_array),
     )
     use_gpu = selection.selected is ExecutionMode.GPU and cp is not None
     if use_gpu:
@@ -1150,6 +1156,7 @@ def extract_segment_mbrs(geometry_array: OwnedGeometryArray) -> SegmentMBRTable:
         row_count=geometry_array.row_count,
         requested_mode=ExecutionMode.AUTO,
         gpu_available=has_gpu_runtime() and cp is not None,
+        current_residency=geometry_array.residency,
     )
     if selection.selected is ExecutionMode.GPU and cp is not None:
         try:
@@ -1496,6 +1503,7 @@ def generate_segment_mbr_pairs(
             and left_segments.residency is Residency.DEVICE
             and right_segments.residency is Residency.DEVICE
         ),
+        current_residency=combined_residency(left, right),
     )
     if selection.selected is ExecutionMode.GPU and cp is not None:
         try:

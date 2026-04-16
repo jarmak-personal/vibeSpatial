@@ -42,7 +42,7 @@ from vibespatial.cuda.cccl_primitives import (
     upper_bound_counting,
 )
 from vibespatial.geometry.owned import OwnedGeometryArray
-from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, combined_residency, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
 
@@ -375,6 +375,7 @@ def spatial_index_knn_device(
         row_count=n_queries * min(n_tree, 100),  # estimate work per query
         requested_precision=precision,
         gpu_available=True,
+        current_residency=combined_residency(query_owned, tree_owned),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None

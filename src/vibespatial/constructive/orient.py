@@ -257,6 +257,7 @@ def orient_owned(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=owned.residency,
     )
 
     if selection.selected is ExecutionMode.GPU:

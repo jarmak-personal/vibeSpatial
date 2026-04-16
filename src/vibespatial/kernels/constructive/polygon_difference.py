@@ -29,7 +29,7 @@ from vibespatial.geometry.owned import (
     OwnedGeometryArray,
     from_shapely_geometries,
 )
-from vibespatial.runtime import ExecutionMode, RuntimeSelection
+from vibespatial.runtime import ExecutionMode, RuntimeSelection, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -213,6 +213,7 @@ def polygon_difference(
         row_count=left.row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(left, right),
     )
 
     # ADR-0002: CONSTRUCTIVE kernels stay fp64. precision_plan is computed

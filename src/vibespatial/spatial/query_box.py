@@ -52,6 +52,7 @@ def _query_regular_grid_point_index(
         kernel_class=KernelClass.COARSE,
         row_count=query_owned.row_count,
         gpu_available=has_gpu_runtime(),
+        current_residency=query_owned.residency,
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -185,6 +186,7 @@ def _query_regular_grid_rect_box_index(
         kernel_class=KernelClass.COARSE,
         row_count=query_count * flat_index.size,
         gpu_available=has_gpu_runtime(),
+        current_residency=flat_index.geometry_array.residency,
     )
     if selection.selected is not ExecutionMode.GPU:
         return None
@@ -615,6 +617,7 @@ def _query_point_tree_box_index(
             row_count=tree_owned.row_count * query_row_count,
             requested_mode=ExecutionMode.GPU if force_gpu else ExecutionMode.AUTO,
             gpu_available=has_gpu_runtime(),
+            current_residency=tree_owned.residency,
         )
     except RuntimeError:
         return None

@@ -33,7 +33,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event  # noqa: E402
 from vibespatial.runtime.fallbacks import record_fallback_event  # noqa: E402
 from vibespatial.runtime.kernel_registry import register_kernel_variant  # noqa: E402
 from vibespatial.runtime.precision import KernelClass  # noqa: E402
-from vibespatial.runtime.residency import Residency  # noqa: E402
+from vibespatial.runtime.residency import Residency, combined_residency  # noqa: E402
 from vibespatial.spatial.segment_primitives import (  # noqa: E402
     DeviceSegmentTable,
     SegmentIntersectionResult,
@@ -1025,6 +1025,9 @@ def spatial_overlay_owned(
             row_count=candidate_pairs.count,
             requested_mode=ExecutionMode.GPU if _pairs_on_device else requested,
             gpu_available=cp is not None,
+            current_residency=(
+                Residency.DEVICE if _pairs_on_device else combined_residency(left, right)
+            ),
         )
         _pairwise_mode = _pairwise_selection.selected
 

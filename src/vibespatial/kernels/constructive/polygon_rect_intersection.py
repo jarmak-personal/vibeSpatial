@@ -40,7 +40,7 @@ from vibespatial.cuda.cccl_primitives import exclusive_sum
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -821,6 +821,7 @@ def polygon_rect_intersection(
         row_count=n,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(left, right),
     )
     if selection.selected is ExecutionMode.GPU:
         precision_plan = selection.precision_plan

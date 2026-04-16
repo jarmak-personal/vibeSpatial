@@ -550,7 +550,10 @@ def _sequential_grouped_difference_owned(
     dispatch_mode: ExecutionMode,
 ):
     """Compute grouped exact difference via repeated pairwise exact differences."""
-    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.constructive.binary_constructive import (
+        _binary_constructive_gpu,
+        _resolve_indexed_polygon_fast_path_candidate,
+    )
     with hotpath_stage("overlay.diff.group_metadata", category="setup"):
         group_offsets = np.asarray(group_offsets, dtype=np.int64)
         group_lengths = np.diff(group_offsets).astype(np.int64, copy=False)
@@ -1716,13 +1719,27 @@ def _device_count_dropped_polygon_intersection_warning_rows(
     if area_owned is None:
         return None
 
-    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.constructive.binary_constructive import _binary_constructive_gpu
     from vibespatial.constructive.boundary import boundary_owned
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.predicates.binary import evaluate_binary_predicate
     from vibespatial.runtime.residency import Residency
+    from vibespatial.spatial.query_box import _extract_owned_polygon_box_bounds
 
     warning_keep_mask = np.asarray(keep_mask[warning_rows], dtype=bool)
+    rect_overlap_mask = getattr(area_owned, "_polygon_rect_boundary_overlap", None)
+    rect_warning_rows_all_kept = False
+    if rect_overlap_mask is not None:
+        rect_overlap_mask = (
+            rect_overlap_mask.get()
+            if hasattr(rect_overlap_mask, "get")
+            else np.asarray(rect_overlap_mask, dtype=bool)
+        )
+        rect_overlap_mask = np.asarray(rect_overlap_mask, dtype=bool)
+        if rect_overlap_mask.size == area_owned.row_count:
+            rect_warning_rows_all_kept = bool(
+                np.all(warning_keep_mask & rect_overlap_mask[warning_rows])
+            )
     if (
         left_source_owned is not None
         and right_source_owned is not None
@@ -1747,6 +1764,8 @@ def _device_count_dropped_polygon_intersection_warning_rows(
         warning_right_rows = warning_rows.astype(np.intp, copy=False)
     else:
         return None
+    if rect_warning_rows_all_kept:
+        return 0
     if np.any(warning_keep_mask) and getattr(area_owned, "residency", None) is not Residency.DEVICE:
         return None
     if warning_rows.size > 128:
@@ -1772,12 +1791,20 @@ def _device_count_dropped_polygon_intersection_warning_rows(
 
         dropped = 0
         chunk_rows = 256
+        source_box_workload = (
+            _extract_owned_polygon_box_bounds(device_left_owned) is not None
+            and _extract_owned_polygon_box_bounds(device_right_owned) is not None
+        )
         for start in range(0, warning_rows.size, chunk_rows):
             stop = min(start + chunk_rows, warning_rows.size)
             chunk_warning_rows = warning_rows[start:stop]
             chunk_keep_mask = warning_keep_mask[start:stop]
             chunk_left_rows = warning_left_rows[start:stop]
             chunk_right_rows = warning_right_rows[start:stop]
+
+            if source_box_workload:
+                dropped += int(np.count_nonzero(~chunk_keep_mask))
+                continue
 
             warning_left = _take_owned_rows(
                 device_left_owned,
@@ -1787,6 +1814,8 @@ def _device_count_dropped_polygon_intersection_warning_rows(
                 device_right_owned,
                 chunk_right_rows,
             )
+            warning_left = _resolve_indexed_polygon_fast_path_candidate(warning_left)
+            warning_right = _resolve_indexed_polygon_fast_path_candidate(warning_right)
             warning_left_boundary = boundary_owned(warning_left)
             warning_right_boundary = boundary_owned(warning_right)
             if (
@@ -1794,12 +1823,15 @@ def _device_count_dropped_polygon_intersection_warning_rows(
                 or not _has_only_linear_boundary_families(warning_right_boundary)
             ):
                 return None
-            boundary_overlap = binary_constructive_owned(
+            boundary_overlap = _binary_constructive_gpu(
                 "intersection",
                 warning_left_boundary,
                 warning_right_boundary,
                 dispatch_mode=ExecutionMode.GPU,
             )
+            if boundary_overlap is None:
+                dropped += int(chunk_warning_rows.size)
+                continue
             if boundary_overlap.row_count != chunk_warning_rows.size:
                 return None
 
@@ -1815,20 +1847,32 @@ def _device_count_dropped_polygon_intersection_warning_rows(
             if kept_local_rows.size == 0:
                 continue
 
-            kept_boundary_overlap = boundary_overlap.device_take(
-                cp.asarray(kept_local_rows, dtype=cp.int64)
-            )
+            if getattr(boundary_overlap, "residency", None) is Residency.DEVICE:
+                kept_boundary_overlap = boundary_overlap.device_take(
+                    cp.asarray(kept_local_rows, dtype=cp.int64)
+                )
+            else:
+                kept_boundary_overlap = boundary_overlap.take(kept_local_rows)
             kept_area = _take_owned_rows(area_owned, chunk_warning_rows[kept_local_rows])
             kept_area_boundary = boundary_owned(kept_area)
-            covered_mask = np.asarray(
-                evaluate_binary_predicate(
-                    "covered_by",
-                    kept_boundary_overlap,
-                    kept_area_boundary,
-                    dispatch_mode=ExecutionMode.GPU,
-                ).values,
-                dtype=bool,
-            )
+            covered_mask = None
+            for covered_dispatch_mode in (ExecutionMode.GPU, ExecutionMode.CPU):
+                try:
+                    candidate_mask = np.asarray(
+                        evaluate_binary_predicate(
+                            "covered_by",
+                            kept_boundary_overlap,
+                            kept_area_boundary,
+                            dispatch_mode=covered_dispatch_mode,
+                        ).values,
+                        dtype=bool,
+                    )
+                except Exception:
+                    if covered_dispatch_mode is ExecutionMode.CPU:
+                        raise
+                    continue
+                covered_mask = candidate_mask
+                break
             if covered_mask.size != kept_local_rows.size:
                 return None
             dropped += int(np.count_nonzero(~covered_mask))

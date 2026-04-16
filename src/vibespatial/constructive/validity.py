@@ -1865,6 +1865,7 @@ def is_simple_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(owned),
     )
 
     # ADR-0002: PREDICATE class kernels always use fp64 for exact comparisons.

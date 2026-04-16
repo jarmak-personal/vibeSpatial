@@ -345,6 +345,7 @@ def polygon_buffer_owned_array(
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=polygons.row_count,
         requested_mode=dispatch_mode,
+        current_residency=polygons.residency,
     ).selected
 
     if selected_mode is not ExecutionMode.GPU:
@@ -613,6 +614,7 @@ def polygon_centroids_owned(
         kernel_class=KernelClass.METRIC,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=owned.residency,
     )
     if selection.selected is ExecutionMode.GPU:
         from vibespatial.runtime.precision import CoordinateStats
@@ -632,6 +634,7 @@ def polygon_centroids_owned(
             requested_precision=precision,
             precision_kernel_class=KernelClass.CONSTRUCTIVE,
             coordinate_stats=CoordinateStats(max_abs_coord=max_abs, span=span),
+            current_residency=owned.residency,
         )
         precision_plan = selection.precision_plan
         result = _polygon_centroids_gpu(

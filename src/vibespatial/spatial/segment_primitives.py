@@ -48,7 +48,7 @@ from vibespatial.runtime.precision import (  # noqa: E402
     PrecisionMode,
     PrecisionPlan,
 )
-from vibespatial.runtime.residency import Residency  # noqa: E402
+from vibespatial.runtime.residency import Residency, combined_residency  # noqa: E402
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan  # noqa: E402
 from vibespatial.spatial.segment_primitives_kernels import (  # noqa: E402
     _CANDIDATE_SCATTER_KERNEL_NAMES,
@@ -2056,6 +2056,7 @@ def _select_segment_runtime(
     dispatch_mode: ExecutionMode | str,
     *,
     candidate_count: int,
+    current_residency: Residency,
 ) -> AdaptivePlan:
     return plan_dispatch_selection(
         kernel_name="segment_classify",
@@ -2063,6 +2064,7 @@ def _select_segment_runtime(
         row_count=candidate_count,
         requested_mode=dispatch_mode,
         requested_precision=PrecisionMode.AUTO,
+        current_residency=current_residency,
     )
 
 
@@ -2607,7 +2609,9 @@ def classify_segment_intersections(
 
         stage = "select_runtime"
         runtime_selection = _select_segment_runtime(
-            dispatch_mode, candidate_count=estimated_candidates,
+            dispatch_mode,
+            candidate_count=estimated_candidates,
+            current_residency=combined_residency(left, right),
         )
         if precision is PrecisionMode.AUTO:
             precision_plan = runtime_selection.precision_plan
@@ -2618,6 +2622,7 @@ def classify_segment_intersections(
                 row_count=estimated_candidates,
                 requested_mode=dispatch_mode,
                 requested_precision=precision,
+                current_residency=combined_residency(left, right),
             )
             precision_plan = runtime_selection.precision_plan
 

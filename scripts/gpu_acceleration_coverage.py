@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import tempfile
 from collections import Counter
@@ -88,6 +89,10 @@ CONSTRUCTIVE_OPERATIONS = {
     "symmetric_difference",
     "union",
 }
+
+SUPPLEMENTAL_OBSERVATION_TARGETS: tuple[tuple[str, ...], ...] = (
+    ("tests/test_gpu_dissolve.py::test_public_dissolve_gpu_coverage_smoke",),
+)
 
 
 @dataclass(frozen=True)
@@ -189,11 +194,15 @@ def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     for record in dispatch_records:
         family = classify_dispatch_family(record)
         counts = family_counts.setdefault(family, Counter())
+        work_units = _extract_work_units(record)
         counts["total_dispatches"] += 1
+        counts["total_work_units"] += work_units
         if record.get("selected") == "gpu":
             counts["gpu_dispatches"] += 1
+            counts["gpu_work_units"] += work_units
         elif record.get("selected") == "cpu":
             counts["cpu_dispatches"] += 1
+            counts["cpu_work_units"] += work_units
 
     weighted_dispatch_units = 0
     weighted_gpu_units = 0
@@ -218,6 +227,13 @@ def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             "gpu_dispatches": gpu,
             "cpu_dispatches": counts["cpu_dispatches"],
             "gpu_accel_pct": compute_gpu_accel_pct(total_dispatches=total, gpu_dispatches=gpu),
+            "total_work_units": counts["total_work_units"],
+            "gpu_work_units": counts["gpu_work_units"],
+            "cpu_work_units": counts["cpu_work_units"],
+            "gpu_work_pct": compute_gpu_accel_pct(
+                total_dispatches=counts["total_work_units"],
+                gpu_dispatches=counts["gpu_work_units"],
+            ),
         }
 
     fallback_reasons = Counter(str(record.get("reason", "")) for record in fallback_records)
@@ -249,32 +265,63 @@ def compute_gpu_accel_pct(*, total_dispatches: int, gpu_dispatches: int) -> floa
     return 100.0 * gpu_dispatches / total_dispatches
 
 
+def _extract_work_units(record: dict[str, Any]) -> int:
+    detail = str(record.get("detail", "") or "")
+    for key in ("rows", "total_geoms"):
+        match = re.search(rf"(?:^|[,\s]){key}=(\d+)", detail)
+        if match is not None:
+            return max(int(match.group(1)), 1)
+    return 1
+
+
+def _accumulate_pytest_counts(total: dict[str, int], counts: dict[str, int]) -> None:
+    for key in total:
+        total[key] += counts.get(key, 0)
+
+
 def run_dispatch_observation(targets: tuple[str, ...], *, cwd: Path, timeout: int) -> DispatchObservationReport:
     gpu_available = has_gpu_runtime()
-    command = ["uv", "run", "pytest", "-q", *targets]
     env = dict(os.environ)
     env[STRICT_NATIVE_ENV_VAR] = "0"
+    commands: list[str] = []
+    counts = {"passed": 0, "failed": 0, "skipped": 0, "xfailed": 0, "xpassed": 0}
+    failing_tests: list[str] = []
+    returncode = 0
+    target_sets = [targets]
+    if gpu_available:
+        target_sets.extend(
+            supplemental
+            for supplemental in SUPPLEMENTAL_OBSERVATION_TARGETS
+            if supplemental != targets
+        )
     with tempfile.TemporaryDirectory() as temp_dir:
         event_log_path = Path(temp_dir) / "dispatch-events.jsonl"
         env[EVENT_LOG_ENV_VAR] = str(event_log_path)
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-            env=env,
-        )
-        combined_output = completed.stdout + "\n" + completed.stderr
-        counts, failing_tests = parse_pytest_summary(combined_output)
+        for target_set in target_sets:
+            command = ["uv", "run", "pytest", "-q", *target_set]
+            commands.append(" ".join(command))
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+            combined_output = completed.stdout + "\n" + completed.stderr
+            run_counts, run_failing_tests = parse_pytest_summary(combined_output)
+            _accumulate_pytest_counts(counts, run_counts)
+            failing_tests.extend(run_failing_tests)
+            if completed.returncode != 0:
+                returncode = completed.returncode
         summary = summarize_event_records(read_event_records(event_log_path))
     return DispatchObservationReport(
-        command=" ".join(command),
+        command=" && ".join(commands),
         targets=targets,
         gpu_available=gpu_available,
         counts=counts,
-        failing_tests=failing_tests,
+        failing_tests=tuple(failing_tests),
         total_dispatches=summary["total_dispatches"],
         gpu_dispatches=summary["gpu_dispatches"],
         cpu_dispatches=summary["cpu_dispatches"],
@@ -289,7 +336,7 @@ def run_dispatch_observation(targets: tuple[str, ...], *, cwd: Path, timeout: in
         family_breakdown=summary["family_breakdown"],
         fallback_reasons=summary["fallback_reasons"],
         fallback_surfaces=summary["fallback_surfaces"],
-        returncode=completed.returncode,
+        returncode=returncode,
     )
 
 

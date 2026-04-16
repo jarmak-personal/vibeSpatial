@@ -135,3 +135,51 @@ def test_upstream_test_data_files_are_allowed(tmp_path: Path) -> None:
     write_file(tmp_path / "tests" / "upstream" / "geopandas" / "tests" / "data" / "sample.geojson", "{}\n")
 
     assert run_checks(tmp_path) == []
+
+
+def test_auto_geometry_dispatch_requires_explicit_residency(tmp_path: Path) -> None:
+    write_file(
+        tmp_path / "src" / "vibespatial" / "ops.py",
+        """
+from vibespatial.geometry.owned import OwnedGeometryArray
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import KernelClass
+
+
+def area_owned(owned: OwnedGeometryArray, dispatch_mode):
+    return plan_dispatch_selection(
+        kernel_name="geometry_area",
+        kernel_class=KernelClass.METRIC,
+        row_count=owned.row_count,
+        requested_mode=dispatch_mode,
+    )
+""".strip()
+        + "\n",
+    )
+
+    errors = run_checks(tmp_path)
+    assert [error.code for error in errors] == ["ARCH008"]
+
+
+def test_auto_geometry_dispatch_with_explicit_residency_passes(tmp_path: Path) -> None:
+    write_file(
+        tmp_path / "src" / "vibespatial" / "ops.py",
+        """
+from vibespatial.geometry.owned import OwnedGeometryArray
+from vibespatial.runtime.adaptive import plan_dispatch_selection
+from vibespatial.runtime.precision import KernelClass
+
+
+def area_owned(owned: OwnedGeometryArray, dispatch_mode):
+    return plan_dispatch_selection(
+        kernel_name="geometry_area",
+        kernel_class=KernelClass.METRIC,
+        row_count=owned.row_count,
+        requested_mode=dispatch_mode,
+        current_residency=owned.residency,
+    )
+""".strip()
+        + "\n",
+    )
+
+    assert run_checks(tmp_path) == []

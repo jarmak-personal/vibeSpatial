@@ -36,7 +36,7 @@ from vibespatial.geometry.owned import (
     FAMILY_TAGS,
     OwnedGeometryArray,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
@@ -375,6 +375,7 @@ def relate_de9im(
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
         requested_mode=requested_mode,
+        current_residency=combined_residency(left, right),
     )
 
     # Build null mask from validity.

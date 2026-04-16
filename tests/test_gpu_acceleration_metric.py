@@ -81,8 +81,37 @@ def test_summarize_event_records_counts_dispatch_modes_and_fallbacks() -> None:
     assert summary["family_breakdown"]["measurement"]["included_in_value_metric"] is False
     assert summary["family_breakdown"]["io_read"]["weight"] == 5
     assert summary["family_breakdown"]["io_write"]["weight"] == 4
+    assert summary["family_breakdown"]["io_read"]["gpu_work_pct"] == 100.0
+    assert summary["family_breakdown"]["io_read"]["total_work_units"] == 1
+    assert summary["family_breakdown"]["measurement"]["total_work_units"] == 10
     assert summary["fallback_reasons"] == {"below crossover": 1}
     assert summary["fallback_surfaces"] == {"geopandas.array.intersection": 1}
+
+
+def test_summarize_event_records_uses_row_detail_for_family_work_units() -> None:
+    summary = summarize_event_records(
+        [
+            {
+                "event_type": "dispatch",
+                "selected": "cpu",
+                "surface": "geopandas.geodataframe.dissolve",
+                "operation": "dissolve",
+                "detail": "rows=4, method=unary",
+            },
+            {
+                "event_type": "dispatch",
+                "selected": "gpu",
+                "surface": "geopandas.geodataframe.dissolve",
+                "operation": "dissolve",
+                "detail": "rows=128, method=unary",
+            },
+        ]
+    )
+
+    assert summary["family_breakdown"]["dissolve"]["gpu_accel_pct"] == 50.0
+    assert summary["family_breakdown"]["dissolve"]["gpu_work_pct"] == pytest.approx(100.0 * 128.0 / 132.0)
+    assert summary["family_breakdown"]["dissolve"]["gpu_work_units"] == 128
+    assert summary["family_breakdown"]["dissolve"]["total_work_units"] == 132
 
 
 def test_classify_dispatch_family_treats_internal_io_planning_as_internal() -> None:

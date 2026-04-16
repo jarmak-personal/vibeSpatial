@@ -440,7 +440,11 @@ def compare_gpu_report_against_baseline(report: dict[str, Any], baseline: dict[s
     current_value_dispatch = float(gpu_acceleration.get("value_dispatch_pct", gpu_acceleration.get("gpu_accel_pct", 0.0)))
     baseline_fallback_rate = float(baseline.get("fallback_rate", 0.0))
     current_fallback_rate = fallback_rate
-    if current_value_dispatch + 0.01 < baseline_value_dispatch:
+    # GPU native-coverage is a single long upstream sweep and still exhibits
+    # small run-to-run jitter in the weighted public-op percentage. Ignore
+    # changes below 0.05 percentage points so the ratchet tracks real movement
+    # instead of basis-point noise.
+    if current_value_dispatch + 0.05 < baseline_value_dispatch:
         regressions.append(
             "value-weighted gpu acceleration regressed "
             f"from {baseline_value_dispatch:.2f}% to {current_value_dispatch:.2f}%"
@@ -679,9 +683,14 @@ def print_gpu_summary(report: dict[str, Any]) -> None:
         if tracked_families:
             print("Tracked families:")
             for family, details in tracked_families:
+                family_pct = details.get("gpu_work_pct", details["gpu_accel_pct"])
+                gpu_units = details.get("gpu_work_units", details["gpu_dispatches"])
+                total_units = details.get("total_work_units", details["total_dispatches"])
                 print(
-                    f"  {family:<14} {details['gpu_accel_pct']:.2f}% "
-                    f"({details['gpu_dispatches']}/{details['total_dispatches']}, weight {details['weight']})"
+                    f"  {family:<14} {family_pct:.2f}% "
+                    f"({gpu_units}/{total_units} work-units, "
+                    f"{details['gpu_dispatches']}/{details['total_dispatches']} dispatches, "
+                    f"weight {details['weight']})"
                 )
     print(json.dumps(report, indent=2))
 

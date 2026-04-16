@@ -8,6 +8,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DOC = "docs/architecture/runtime.md"
+RESIDENCY_DOC = "docs/architecture/residency.md"
 SYNTHETIC_DOC = "docs/testing/synthetic-data.md"
 ALLOWED_MATERIALIZATION_METHODS = {"to_pandas", "to_numpy", "values", "__repr__"}
 DATA_FILE_ALLOWED_SUFFIXES = {".py", ".md"}
@@ -23,6 +24,21 @@ KERNEL_TRANSFER_APIS = {
     "to_pylist": "arrow_array.to_pylist()",
     "asnumpy": "cupy.asnumpy()",
     "tolist": "array.tolist()",
+}
+GEOMETRY_CONTEXT_PARAM_NAMES = {
+    "geometry_array",
+    "geometries",
+    "left",
+    "owned",
+    "points",
+    "polygons",
+    "query_owned",
+    "right",
+    "tree_owned",
+}
+RESIDENCY_LINT_ALLOWLIST: set[tuple[str, str]] = {
+    ("src/vibespatial/constructive/normalize.py", "normalize_owned"),
+    ("src/vibespatial/constructive/normalize.py", "_normalize_gpu"),
 }
 
 
@@ -75,6 +91,39 @@ def call_name(node: ast.Call) -> str | None:
     if isinstance(node.func, ast.Attribute):
         return node.func.attr
     return None
+
+
+def annotation_text(node: ast.arg) -> str:
+    if node.annotation is None:
+        return ""
+    try:
+        return ast.unparse(node.annotation)
+    except Exception:  # pragma: no cover - defensive only
+        return ""
+
+
+def function_has_geometry_context(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    for arg in (*node.args.args, *node.args.kwonlyargs):
+        if arg.arg in GEOMETRY_CONTEXT_PARAM_NAMES:
+            return True
+        if "GeometryArray" in annotation_text(arg):
+            return True
+    return False
+
+
+def call_requests_explicit_non_auto_mode(node: ast.Call) -> bool:
+    requested_mode = None
+    for keyword in node.keywords:
+        if keyword.arg == "requested_mode":
+            requested_mode = keyword.value
+            break
+    if requested_mode is None:
+        return False
+    if isinstance(requested_mode, ast.Attribute):
+        return requested_mode.attr in {"CPU", "GPU"}
+    if isinstance(requested_mode, ast.Constant) and isinstance(requested_mode.value, str):
+        return requested_mode.value.lower() in {"cpu", "gpu"}
+    return False
 
 
 def collect_text_tokens(tree: ast.AST) -> set[str]:
@@ -371,6 +420,44 @@ def check_test_data_files(repo_root: Path) -> list[LintError]:
     return errors
 
 
+def check_dispatch_residency_context(repo_root: Path) -> list[LintError]:
+    errors: list[LintError] = []
+    root = repo_root / "src" / "vibespatial"
+    for path in iter_python_files(root):
+        relative = str(path.relative_to(repo_root))
+        tree = parse_module(path)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not function_has_geometry_context(node):
+                continue
+            if (relative, node.name) in RESIDENCY_LINT_ALLOWLIST:
+                continue
+            for descendant in ast.walk(node):
+                if not isinstance(descendant, ast.Call):
+                    continue
+                if call_name(descendant) != "plan_dispatch_selection":
+                    continue
+                keyword_names = {keyword.arg for keyword in descendant.keywords if keyword.arg is not None}
+                if "current_residency" in keyword_names:
+                    continue
+                if call_requests_explicit_non_auto_mode(descendant):
+                    continue
+                errors.append(
+                    LintError(
+                        code="ARCH008",
+                        path=path,
+                        line=descendant.lineno,
+                        message=(
+                            "Geometry-carrying AUTO dispatch planning must pass current_residency "
+                            "explicitly so device-backed pipelines stay GPU-sticky."
+                        ),
+                        doc_path=RESIDENCY_DOC,
+                    )
+                )
+    return errors
+
+
 def run_checks(repo_root: Path) -> list[LintError]:
     errors: list[LintError] = []
     errors.extend(check_vendor_imports(repo_root))
@@ -379,6 +466,7 @@ def run_checks(repo_root: Path) -> list[LintError]:
     errors.extend(check_kernel_host_transfers(repo_root))
     errors.extend(check_gpu_kernel_tests(repo_root))
     errors.extend(check_test_data_files(repo_root))
+    errors.extend(check_dispatch_residency_context(repo_root))
     return sorted(errors, key=lambda error: (str(error.path), error.line, error.code))
 
 

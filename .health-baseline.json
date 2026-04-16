@@ -51,8 +51,8 @@
   },
   "gpu": {
     "status": "fail",
-    "raw_dispatch_pct": 19.742049634492712,
-    "value_dispatch_pct": 62.09003870442045,
-    "fallback_rate": 0.001257
+    "raw_dispatch_pct": 21.42357712208083,
+    "value_dispatch_pct": 65.99764352171617,
+    "fallback_rate": 0.001445
   }
 }

@@ -58,7 +58,7 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
     tile_single_row,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.crossover import WorkloadShape, detect_workload_shape
 from vibespatial.runtime.dispatch import record_dispatch_event
@@ -699,6 +699,7 @@ def snap_owned(
         row_count=n,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(left, right),
     )
 
     precision_plan = selection.precision_plan

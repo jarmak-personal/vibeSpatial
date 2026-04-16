@@ -671,6 +671,7 @@ def convex_hull_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=owned.residency,
     )
 
     selected_mode = selection.selected

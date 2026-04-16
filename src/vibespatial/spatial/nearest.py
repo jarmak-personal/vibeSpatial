@@ -17,7 +17,7 @@ from vibespatial.cuda.cccl_primitives import (
     upper_bound,
     upper_bound_counting,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 
 request_warmup([
@@ -1345,6 +1345,7 @@ def _generate_point_nearest_candidates_gpu(
         kernel_class=KernelClass.METRIC,
         row_count=query_owned.row_count * tree_owned.row_count,
         gpu_available=True,
+        current_residency=combined_residency(query_owned, tree_owned),
     )
     if selection.selected is not ExecutionMode.GPU:
         return None

@@ -526,6 +526,34 @@ def test_evaluate_check_report_ignores_gpu_noise_below_display_precision() -> No
     assert regressions == []
 
 
+def test_evaluate_check_report_ignores_small_gpu_value_dispatch_jitter() -> None:
+    report = {
+        "tier": "gpu",
+        "status": "fail",
+        "exit_code": 1,
+        "gpu_acceleration": {
+            "gpu_accel_pct": 21.425570648368577,
+            "raw_dispatch_pct": 21.425570648368577,
+            "value_dispatch_pct": 65.9644556509008,
+            "total_dispatches": 21423,
+            "fallback_dispatches": 31,
+        },
+    }
+    baseline = {
+        "gpu": {
+            "status": "fail",
+            "raw_dispatch_pct": 21.42357712208083,
+            "value_dispatch_pct": 65.99764352171617,
+            "fallback_rate": 0.001445,
+        }
+    }
+
+    exit_code, regressions = health.evaluate_check_report(report, baseline)
+
+    assert exit_code == 0
+    assert regressions == []
+
+
 def test_evaluate_check_report_uses_value_dispatch_metric_over_raw_helper_metric() -> None:
     report = {
         "tier": "gpu",

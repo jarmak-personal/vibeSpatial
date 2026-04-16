@@ -650,6 +650,7 @@ def is_ring_owned(
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=owned.residency,
     )
 
     # Start with all False -- only closed, simple LineStrings become True.
@@ -1585,6 +1586,7 @@ def get_geometry_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=owned.residency,
     )
 
     if selection.selected is ExecutionMode.GPU:

@@ -18,7 +18,7 @@ import logging
 import numpy as np
 import shapely
 
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import AdaptivePlan, plan_dispatch_selection
 from vibespatial.runtime.config import GEOM_EQUALS_DEFAULT_TOLERANCE
 from vibespatial.runtime.dispatch import record_dispatch_event
@@ -71,6 +71,7 @@ def geom_equals_exact_owned(
         kernel_class=KernelClass.PREDICATE,
         row_count=row_count,
         requested_mode=dispatch_mode,
+        current_residency=combined_residency(left, right),
     )
 
     if selection.selected is ExecutionMode.GPU and row_count >= _EQUALS_EXACT_GPU_THRESHOLD:

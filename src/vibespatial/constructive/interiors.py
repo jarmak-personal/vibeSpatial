@@ -330,6 +330,7 @@ def interiors_owned(
         row_count=row_count,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=owned.residency,
     )
 
     if selection.selected is ExecutionMode.GPU:

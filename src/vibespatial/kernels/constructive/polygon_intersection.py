@@ -51,7 +51,7 @@ from vibespatial.kernels.constructive.polygon_intersection_source import (
     _MAX_CLIP_VERTS,  # noqa: F401 — re-exported for overlay/gpu.py and binary_constructive.py
     _POLYGON_INTERSECTION_KERNEL_SOURCE,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -392,6 +392,7 @@ def polygon_intersection(
         row_count=n,
         requested_mode=dispatch_mode,
         requested_precision=precision,
+        current_residency=combined_residency(left, right),
     )
 
     if selection.selected is ExecutionMode.GPU:

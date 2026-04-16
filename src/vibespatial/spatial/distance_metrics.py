@@ -23,7 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover - CPU-only installs
 
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, tile_single_row
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.precision import KernelClass
 
@@ -634,6 +634,7 @@ def hausdorff_distance_owned(
         kernel_class=KernelClass.METRIC,
         row_count=n,
         requested_mode=ExecutionMode.AUTO,
+        current_residency=combined_residency(owned_a, owned_b),
     )
 
     if selection.selected is ExecutionMode.GPU:
@@ -700,6 +701,7 @@ def frechet_distance_owned(
         kernel_class=KernelClass.METRIC,
         row_count=n,
         requested_mode=ExecutionMode.AUTO,
+        current_residency=combined_residency(owned_a, owned_b),
     )
 
     if selection.selected is ExecutionMode.GPU:
