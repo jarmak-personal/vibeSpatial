@@ -17644,6 +17644,25 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/2026-04-16-post-f9cfb75/shootout_suite_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "04",
+        "10k",
+        "16",
+        "2026",
+        "benchmark",
+        "f9cfb75",
+        "json",
+        "post",
+        "results",
+        "shootout",
+        "suite"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-04-16-residency-stickiness/shootout_suite_10k.json",
       "referenced_by": [],
       "symbols": [],
@@ -45209,23 +45228,37 @@
       "symbols": [
         "test_gpu_bounds_matches_cpu_reference",
         "test_gpu_bounds_runs_from_device_resident_buffers",
-        "_sample_geometries"
+        "test_public_bounds_dispatch_records_gpu_selection_when_runtime_available",
+        "test_public_total_bounds_dispatch_records_gpu_selection_when_runtime_available",
+        "_sample_geometries",
+        "_owned_backed_series"
       ],
       "tokens": [
+        "available",
+        "backed",
         "bounds",
         "buffers",
         "cpu",
         "device",
+        "dispatch",
         "geometries",
         "gpu",
         "matches",
+        "owned",
+        "public",
         "py",
+        "records",
         "reference",
         "resident",
         "runs",
+        "runtime",
         "sample",
+        "selection",
+        "series",
         "test",
-        "tests"
+        "tests",
+        "total",
+        "when"
       ]
     },
     {
@@ -46069,6 +46102,7 @@
         "test_evaluate_check_report_fails_gpu_regression",
         "test_evaluate_check_report_ignores_gpu_noise_below_display_precision",
         "test_evaluate_check_report_ignores_small_gpu_value_dispatch_jitter",
+        "test_evaluate_check_report_ignores_gpu_value_dispatch_jitter_within_tenth_point",
         "test_evaluate_check_report_uses_value_dispatch_metric_over_raw_helper_metric",
         "test_update_baseline_payload_stores_contract_snapshot",
         "test_update_baseline_payload_stores_value_weighted_gpu_snapshot"
@@ -46111,6 +46145,7 @@
         "over",
         "parses",
         "payload",
+        "point",
         "pre",
         "precision",
         "print",
@@ -46137,6 +46172,7 @@
         "summary",
         "surface",
         "surfaces",
+        "tenth",
         "test",
         "tests",
         "toml",
@@ -46146,6 +46182,7 @@
         "value",
         "weighted",
         "when",
+        "within",
         "without"
       ]
     },

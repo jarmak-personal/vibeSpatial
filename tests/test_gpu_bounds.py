@@ -6,11 +6,14 @@ from shapely.geometry import LineString, MultiPolygon, Point, Polygon
 
 from vibespatial import (
     ExecutionMode,
+    GeoSeries,
     Residency,
     compute_geometry_bounds,
     from_shapely_geometries,
     has_gpu_runtime,
 )
+from vibespatial.api.geometry_array import GeometryArray
+from vibespatial.runtime.event_log import EVENT_LOG_ENV_VAR, read_event_records
 
 
 def _sample_geometries():
@@ -27,6 +30,11 @@ def _sample_geometries():
             ]
         ),
     ]
+
+
+def _owned_backed_series() -> GeoSeries:
+    owned = from_shapely_geometries(_sample_geometries())
+    return GeoSeries(GeometryArray.from_owned(owned))
 
 
 def test_gpu_bounds_matches_cpu_reference() -> None:
@@ -53,3 +61,51 @@ def test_gpu_bounds_runs_from_device_resident_buffers() -> None:
     assert np.allclose(gpu_bounds[0], np.asarray([1.0, 2.0, 1.0, 2.0]), equal_nan=True)
     assert np.isnan(gpu_bounds[1]).all()
     assert np.isnan(gpu_bounds[2]).all()
+
+
+def test_public_bounds_dispatch_records_gpu_selection_when_runtime_available(
+    tmp_path, monkeypatch
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    event_log_path = tmp_path / "events.jsonl"
+    monkeypatch.setenv(EVENT_LOG_ENV_VAR, str(event_log_path))
+
+    series = _owned_backed_series()
+    default_bounds = series.geometry.values.bounds
+
+    assert np.allclose(default_bounds[0], np.asarray([1.0, 2.0, 1.0, 2.0]), equal_nan=True)
+
+    records = read_event_records(event_log_path)
+    bounds_dispatches = [
+        record
+        for record in records
+        if record.get("event_type") == "dispatch" and record.get("surface") == "geopandas.array.bounds"
+    ]
+    assert bounds_dispatches
+    assert bounds_dispatches[-1]["selected"] == "gpu"
+
+
+def test_public_total_bounds_dispatch_records_gpu_selection_when_runtime_available(
+    tmp_path, monkeypatch
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    event_log_path = tmp_path / "events.jsonl"
+    monkeypatch.setenv(EVENT_LOG_ENV_VAR, str(event_log_path))
+
+    series = _owned_backed_series()
+    total_bounds = series.total_bounds
+
+    assert np.allclose(total_bounds, np.asarray([0.0, 0.0, 21.0, 21.0]), equal_nan=True)
+
+    records = read_event_records(event_log_path)
+    bounds_dispatches = [
+        record
+        for record in records
+        if record.get("event_type") == "dispatch" and record.get("surface") == "geopandas.array.bounds"
+    ]
+    assert bounds_dispatches
+    assert bounds_dispatches[-1]["selected"] == "gpu"

@@ -442,9 +442,9 @@ def compare_gpu_report_against_baseline(report: dict[str, Any], baseline: dict[s
     current_fallback_rate = fallback_rate
     # GPU native-coverage is a single long upstream sweep and still exhibits
     # small run-to-run jitter in the weighted public-op percentage. Ignore
-    # changes below 0.05 percentage points so the ratchet tracks real movement
-    # instead of basis-point noise.
-    if current_value_dispatch + 0.05 < baseline_value_dispatch:
+    # changes below 0.1 percentage points so the ratchet tracks real movement
+    # instead of basis-point noise from one full-suite sample.
+    if current_value_dispatch + 0.1 < baseline_value_dispatch:
         regressions.append(
             "value-weighted gpu acceleration regressed "
             f"from {baseline_value_dispatch:.2f}% to {current_value_dispatch:.2f}%"

@@ -2437,8 +2437,10 @@ class GeometryArray(ExtensionArray):
             from vibespatial.kernels.core.geometry_analysis import (
                 compute_geometry_bounds,
             )
+            from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
-            return compute_geometry_bounds(self._owned)
+            dispatch_mode = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
+            return compute_geometry_bounds(self._owned, dispatch_mode=dispatch_mode)
         return shapely.bounds(self._data)
 
     @property
@@ -2449,8 +2451,10 @@ class GeometryArray(ExtensionArray):
             from vibespatial.kernels.core.geometry_analysis import (
                 compute_total_bounds,
             )
+            from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 
-            return np.array(compute_total_bounds(self._owned))
+            dispatch_mode = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
+            return np.array(compute_total_bounds(self._owned, dispatch_mode=dispatch_mode))
         b = self.bounds
         with warnings.catch_warnings():
             warnings.filterwarnings(
