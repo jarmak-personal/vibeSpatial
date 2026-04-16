@@ -1860,12 +1860,12 @@ def native_tabular_to_arrow(
 
     geometry_encoding_dict: dict[str, str] = {}
     for geometry_column in geometry_columns:
-        geometry_series = geometry_column.geometry.to_geoseries(
-            index=payload.attributes.index,
-            name=geometry_column.name,
-        )
         geometry_column_index = resolved_column_order.index(geometry_column.name)
         if geometry_encoding.lower() == "geoarrow":
+            geometry_series = geometry_column.geometry.to_geoseries(
+                index=payload.attributes.index,
+                name=geometry_column.name,
+            )
             field, geom_arr = _construct_geoarrow_array_with_explicit_fallback(
                 geometry_series,
                 field_name=geometry_column.name,
@@ -1880,14 +1880,18 @@ def native_tabular_to_arrow(
                 .removeprefix("geoarrow.")
             )
         elif geometry_encoding.lower() == "wkb":
-            owned = geometry_column.geometry.owned or getattr(geometry_series.values, "_owned", None)
+            owned = geometry_column.geometry.owned
             if owned is not None:
                 field, geom_arr = _encode_owned_wkb_array(
                     owned,
                     field_name=geometry_column.name,
-                    crs=geometry_series.crs,
+                    crs=geometry_column.geometry.crs,
                 )
             else:
+                geometry_series = geometry_column.geometry.to_geoseries(
+                    index=payload.attributes.index,
+                    name=geometry_column.name,
+                )
                 field, geom_arr = construct_wkb_array(
                     np.asarray(geometry_series.array),
                     field_name=geometry_column.name,

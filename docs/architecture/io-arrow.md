@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 232/260 lines
+Body Budget: 243/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-194 | Current Behavior |
-| 195-232 | Measured Local Baseline |
+| 76-205 | Current Behavior |
+| 206-243 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -107,6 +107,9 @@ geometry buffers while keeping GPU-native formats as the design center.
   - one header scan separates native rows from the explicit fallback pool
   - point, linestring, polygon, multipoint, multilinestring, and multipolygon
     rows use family-specialized native decode or encode
+  - homogeneous Arrow WKB point, uniform-linestring, and uniform-polygon
+    batches now take raw-buffer fast paths ahead of the generic GPU bridge and
+    bulk-promote to device when a GPU runtime is available
   - malformed, unsupported, or non-little-endian rows compact into explicit
     fallback instead of forcing the whole batch through Shapely
 - `geopandas.read_parquet(..., bbox=...)` now builds a repo-owned metadata
@@ -169,6 +172,14 @@ geometry buffers while keeping GPU-native formats as the design center.
 - The GeoParquet writer consumes that shared native tabular boundary directly,
   so writer-local payload assembly is no longer the place where native result
   semantics live.
+- Native GeoParquet payload writes now also keep Arrow-backed attributes plus
+  owned geometry on the device writer until the sink actually declines a
+  feature, so the public `to_parquet` boundary no longer eagerly materializes
+  a temporary `GeoSeries` just to discover that the native writer would have
+  accepted the payload.
+- Shared native Arrow export now follows the same rule for WKB payloads: when
+  owned geometry is already available, it encodes directly from the owned
+  buffers instead of rebuilding a temporary `GeoSeries` before Arrow emission.
 - Terminal GeoParquet compatibility decisions such as non-filesystem sinks or
   non-native compression now record an explicit CPU dispatch at the sink
   boundary instead of a fallback event, so strict-native mode still rejects

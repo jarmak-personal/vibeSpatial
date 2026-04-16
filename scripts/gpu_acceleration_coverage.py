@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,67 @@ from vibespatial import STRICT_NATIVE_ENV_VAR
 from vibespatial.runtime import has_gpu_runtime
 from vibespatial.runtime.event_log import EVENT_LOG_ENV_VAR, read_event_records
 
+FAMILY_WEIGHT_UNITS: dict[str, int] = {
+    "io_read": 5,
+    "io_write": 4,
+    "overlay": 5,
+    "constructive": 4,
+    "dissolve": 5,
+    "query": 4,
+    "other_public": 2,
+    "measurement": 0,
+    "equality": 0,
+    "normalization": 0,
+    "internal": 0,
+}
+
+IO_READ_OPERATIONS = {
+    "from_arrow",
+    "read_file",
+    "read_native",
+    "read_owned",
+    "read_parquet",
+    "row_group_pushdown",
+}
+IO_WRITE_OPERATIONS = {
+    "encode_to_parquet",
+    "to_arrow",
+    "to_file",
+    "to_parquet",
+}
+QUERY_OPERATIONS = {
+    "contains",
+    "covered_by",
+    "covers",
+    "crosses",
+    "dwithin",
+    "intersects",
+    "nearest",
+    "overlaps",
+    "query",
+    "sjoin",
+    "sjoin_nearest",
+    "touches",
+    "within",
+}
+MEASUREMENT_OPERATIONS = {"area", "boundary", "bounds", "length"}
+EQUALITY_OPERATIONS = {"equals", "equals_exact", "equals_identical", "geom_equals", "geom_equals_exact"}
+NORMALIZATION_OPERATIONS = {"normalize"}
+CONSTRUCTIVE_OPERATIONS = {
+    "buffer",
+    "centroid",
+    "clip_by_rect",
+    "convex_hull",
+    "difference",
+    "identity",
+    "intersection",
+    "make_valid",
+    "representative_point",
+    "simplify",
+    "symmetric_difference",
+    "union",
+}
+
 
 @dataclass(frozen=True)
 class DispatchObservationReport:
@@ -39,6 +101,16 @@ class DispatchObservationReport:
     gpu_dispatches: int
     cpu_dispatches: int
     fallback_dispatches: int
+    deferred_dispatches: int
+    raw_dispatch_pct: float
+    value_dispatch_pct: float
+    value_dispatches: int
+    value_gpu_dispatches: int
+    weighted_dispatch_units: int
+    weighted_gpu_units: int
+    family_breakdown: dict[str, dict[str, Any]]
+    fallback_reasons: dict[str, int]
+    fallback_surfaces: dict[str, int]
     returncode: int
 
 
@@ -53,17 +125,121 @@ class GPUAccelerationCoverageReport:
     gpu_dispatches: int
     cpu_dispatches: int
     fallback_dispatches: int
+    deferred_dispatches: int
+    raw_dispatch_pct: float
+    value_dispatch_pct: float
+    value_dispatches: int
+    value_gpu_dispatches: int
+    weighted_dispatch_units: int
+    weighted_gpu_units: int
+    family_breakdown: dict[str, dict[str, Any]]
+    fallback_reasons: dict[str, int]
+    fallback_surfaces: dict[str, int]
     api_compat: NativeCoverageReport
     observed_dispatch: DispatchObservationReport
 
 
-def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, int]:
-    dispatch_records = [record for record in records if record.get("event_type") == "dispatch"]
+def classify_dispatch_family(record: dict[str, Any]) -> str:
+    surface = str(record.get("surface", ""))
+    operation = str(record.get("operation", ""))
+    is_public_surface = surface.startswith("geopandas.") or surface.startswith("DeviceGeometryArray.")
+
+    if is_public_surface and (operation in NORMALIZATION_OPERATIONS or surface == "normalize"):
+        return "normalization"
+    if is_public_surface and (
+        operation in EQUALITY_OPERATIONS or surface in {"geom_equals", "geom_equals_exact"}
+    ):
+        return "equality"
+    if is_public_surface and operation in MEASUREMENT_OPERATIONS:
+        return "measurement"
+    if is_public_surface and (operation == "dissolve" or surface == "geopandas.geodataframe.dissolve"):
+        return "dissolve"
+    if is_public_surface and operation in IO_READ_OPERATIONS:
+        return "io_read"
+    if is_public_surface and operation in IO_WRITE_OPERATIONS:
+        return "io_write"
+    if is_public_surface and (operation.startswith("overlay_") or surface == "geopandas.overlay"):
+        return "overlay"
+    if is_public_surface and operation in QUERY_OPERATIONS:
+        return "query"
+    if is_public_surface and operation in CONSTRUCTIVE_OPERATIONS:
+        return "constructive"
+    if surface.startswith("geopandas.read_") or surface.startswith("vibespatial.read_"):
+        return "io_read"
+    if any(surface.endswith(suffix) for suffix in (".to_arrow", ".to_file", ".to_parquet", ".from_arrow")):
+        return "io_write" if ".to_" in surface else "io_read"
+    if surface.startswith(("geopandas.sindex.", "geopandas.tools.sjoin")):
+        return "query"
+    if surface.startswith(("geopandas.", "DeviceGeometryArray.")):
+        return "other_public"
+    return "internal"
+
+
+def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    all_dispatch_records = [record for record in records if record.get("event_type") == "dispatch"]
+    dispatch_records = [
+        record for record in all_dispatch_records if str(record.get("selected")) in {"cpu", "gpu"}
+    ]
+    fallback_records = [record for record in records if record.get("event_type") == "fallback"]
+    total_dispatches = len(dispatch_records)
+    gpu_dispatches = sum(1 for record in dispatch_records if record.get("selected") == "gpu")
+    cpu_dispatches = sum(1 for record in dispatch_records if record.get("selected") == "cpu")
+
+    family_counts: dict[str, Counter[str]] = {}
+    for record in dispatch_records:
+        family = classify_dispatch_family(record)
+        counts = family_counts.setdefault(family, Counter())
+        counts["total_dispatches"] += 1
+        if record.get("selected") == "gpu":
+            counts["gpu_dispatches"] += 1
+        elif record.get("selected") == "cpu":
+            counts["cpu_dispatches"] += 1
+
+    weighted_dispatch_units = 0
+    weighted_gpu_units = 0
+    value_dispatches = 0
+    value_gpu_dispatches = 0
+    family_breakdown: dict[str, dict[str, Any]] = {}
+    for family in sorted(family_counts):
+        counts = family_counts[family]
+        total = counts["total_dispatches"]
+        gpu = counts["gpu_dispatches"]
+        weight = FAMILY_WEIGHT_UNITS.get(family, 0)
+        included = weight > 0
+        if included:
+            value_dispatches += total
+            value_gpu_dispatches += gpu
+            weighted_dispatch_units += total * weight
+            weighted_gpu_units += gpu * weight
+        family_breakdown[family] = {
+            "weight": weight,
+            "included_in_value_metric": included,
+            "total_dispatches": total,
+            "gpu_dispatches": gpu,
+            "cpu_dispatches": counts["cpu_dispatches"],
+            "gpu_accel_pct": compute_gpu_accel_pct(total_dispatches=total, gpu_dispatches=gpu),
+        }
+
+    fallback_reasons = Counter(str(record.get("reason", "")) for record in fallback_records)
+    fallback_surfaces = Counter(str(record.get("surface", "")) for record in fallback_records)
     return {
-        "total_dispatches": len(dispatch_records),
-        "gpu_dispatches": sum(1 for record in dispatch_records if record.get("selected") == "gpu"),
-        "cpu_dispatches": sum(1 for record in dispatch_records if record.get("selected") == "cpu"),
-        "fallback_dispatches": sum(1 for record in records if record.get("event_type") == "fallback"),
+        "total_dispatches": total_dispatches,
+        "gpu_dispatches": gpu_dispatches,
+        "cpu_dispatches": cpu_dispatches,
+        "fallback_dispatches": len(fallback_records),
+        "deferred_dispatches": len(all_dispatch_records) - len(dispatch_records),
+        "raw_dispatch_pct": compute_gpu_accel_pct(total_dispatches=total_dispatches, gpu_dispatches=gpu_dispatches),
+        "value_dispatch_pct": compute_gpu_accel_pct(
+            total_dispatches=weighted_dispatch_units,
+            gpu_dispatches=weighted_gpu_units,
+        ),
+        "value_dispatches": value_dispatches,
+        "value_gpu_dispatches": value_gpu_dispatches,
+        "weighted_dispatch_units": weighted_dispatch_units,
+        "weighted_gpu_units": weighted_gpu_units,
+        "family_breakdown": family_breakdown,
+        "fallback_reasons": dict(fallback_reasons.most_common()),
+        "fallback_surfaces": dict(fallback_surfaces.most_common()),
     }
 
 
@@ -103,6 +279,16 @@ def run_dispatch_observation(targets: tuple[str, ...], *, cwd: Path, timeout: in
         gpu_dispatches=summary["gpu_dispatches"],
         cpu_dispatches=summary["cpu_dispatches"],
         fallback_dispatches=summary["fallback_dispatches"],
+        deferred_dispatches=summary["deferred_dispatches"],
+        raw_dispatch_pct=summary["raw_dispatch_pct"],
+        value_dispatch_pct=summary["value_dispatch_pct"],
+        value_dispatches=summary["value_dispatches"],
+        value_gpu_dispatches=summary["value_gpu_dispatches"],
+        weighted_dispatch_units=summary["weighted_dispatch_units"],
+        weighted_gpu_units=summary["weighted_gpu_units"],
+        family_breakdown=summary["family_breakdown"],
+        fallback_reasons=summary["fallback_reasons"],
+        fallback_surfaces=summary["fallback_surfaces"],
         returncode=completed.returncode,
     )
 
@@ -116,14 +302,21 @@ def build_gpu_acceleration_report(
         gpu_available=observed_dispatch.gpu_available,
         api_compat_pct=api_compat.native_pass_rate_percent,
         api_suite_pct=api_compat.suite_pass_rate_percent,
-        gpu_accel_pct=compute_gpu_accel_pct(
-            total_dispatches=observed_dispatch.total_dispatches,
-            gpu_dispatches=observed_dispatch.gpu_dispatches,
-        ),
+        gpu_accel_pct=observed_dispatch.raw_dispatch_pct,
         total_dispatches=observed_dispatch.total_dispatches,
         gpu_dispatches=observed_dispatch.gpu_dispatches,
         cpu_dispatches=observed_dispatch.cpu_dispatches,
         fallback_dispatches=observed_dispatch.fallback_dispatches,
+        deferred_dispatches=observed_dispatch.deferred_dispatches,
+        raw_dispatch_pct=observed_dispatch.raw_dispatch_pct,
+        value_dispatch_pct=observed_dispatch.value_dispatch_pct,
+        value_dispatches=observed_dispatch.value_dispatches,
+        value_gpu_dispatches=observed_dispatch.value_gpu_dispatches,
+        weighted_dispatch_units=observed_dispatch.weighted_dispatch_units,
+        weighted_gpu_units=observed_dispatch.weighted_gpu_units,
+        family_breakdown=observed_dispatch.family_breakdown,
+        fallback_reasons=observed_dispatch.fallback_reasons,
+        fallback_surfaces=observed_dispatch.fallback_surfaces,
         api_compat=api_compat,
         observed_dispatch=observed_dispatch,
     )
@@ -149,7 +342,13 @@ def print_human_summary(report: GPUAccelerationCoverageReport) -> None:
         f"{report.gpu_dispatches} GPU, {report.cpu_dispatches} CPU, "
         f"{report.fallback_dispatches} fallback"
     )
-    print(f"- GPU acceleration coverage: {report.gpu_accel_pct:.2f}%")
+    if report.deferred_dispatches:
+        print(f"- deferred dispatch records: {report.deferred_dispatches}")
+    print(
+        f"- value-weighted public ops: {report.value_dispatch_pct:.2f}% "
+        f"({report.value_gpu_dispatches} GPU / {report.value_dispatches} tracked dispatches)"
+    )
+    print(f"- raw dispatch breadth: {report.raw_dispatch_pct:.2f}%")
 
 
 def main(argv: list[str] | None = None) -> int:

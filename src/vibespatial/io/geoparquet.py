@@ -358,12 +358,12 @@ def _write_geoparquet_native_tabular_result(
         )
         return
 
-    geometry_series = _payload_geometry_series(payload)
-
     device_write = _write_geoparquet_native_device_payload(
         payload.attributes,
-        geometry_series,
+        payload.geometry.owned,
         path,
+        geometry_name=payload.geometry_name,
+        geometry_crs=payload.geometry.crs,
         index=index,
         compression=compression,
         geometry_encoding=geometry_encoding,
@@ -389,6 +389,8 @@ def _write_geoparquet_native_tabular_result(
             detail=device_write.compatibility_detail,
             implementation="native_payload_arrow_compatibility_export",
         )
+
+    geometry_series = _payload_geometry_series(payload)
 
     table, geometry_encoding_dict = native_tabular_to_arrow(
         payload,

@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 275/280 lines
+Body Budget: 280/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -13,14 +13,14 @@ Section Map (Body Lines)
 |---|---|
 | 1-2 | Preamble |
 | 3-7 | Intent |
-| 8-17 | Request Signals |
-| 18-23 | Open First |
-| 24-29 | Verify |
-| 30-35 | Risks |
-| 36-54 | Decision |
-| 55-64 | Performance Notes |
-| 65-185 | Current Behavior |
-| 186-275 | Measured Local Baseline |
+| 8-16 | Request Signals |
+| 17-22 | Open First |
+| 23-28 | Verify |
+| 29-34 | Risks |
+| 35-57 | Decision |
+| 58-67 | Performance Notes |
+| 68-188 | Current Behavior |
+| 189-280 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -37,7 +37,6 @@ keeping GPU-native formats primary and legacy formats explicit.
 - to_file
 - file format
 - gdal
-
 ## Open First
 
 - docs/architecture/io-files.md
@@ -58,9 +57,13 @@ keeping GPU-native formats primary and legacy formats explicit.
 
 ## Decision
 
-- GeoJSON is a first-class hybrid path. Files >10 MB auto-route to GPU
-  byte-classification (ADR-0038); smaller files and filtered reads use pyogrio.
-- Shapefile is a first-class hybrid path with pyogrio-first routing.
+- GeoJSON is a first-class hybrid path. Unfiltered public reads auto-route to
+  the repo-owned GPU byte-classify path whenever a GPU runtime is available
+  because `read + downstream GPU consumer` is the planning objective for
+  `read_file`; filtered reads still use pyogrio.
+- Shapefile is a first-class hybrid path. Eligible public reads prefer the
+  repo-owned native plan: direct SHP GPU decode first, Arrow/WKB fallback
+  second.
 - Promoted pyogrio-backed vector containers such as GeoPackage, FileGDB, GML,
   GPX, TopoJSON, GeoJSON-Seq, and FlatGeobuf stay hybrid rather than being
   treated as canonical GPU-native formats.
@@ -77,13 +80,13 @@ keeping GPU-native formats primary and legacy formats explicit.
 
 ## Performance Notes
 
-- GeoJSON files >10 MB now auto-route to GPU byte-classification (ADR-0038)
-  for geometry, with pyogrio as fallback. Shapefile stays pyogrio-first.
-- The pyogrio bias is retained for Shapefile and small GeoJSON because that
-  path keeps us closer to Arrow- and columnar-oriented follow-on work.
-- Legacy GDAL formats should not masquerade as native; the extra explicit
-  fallback event is part of the performance contract because it exposes work
-  that still bypasses the GPU-oriented stack.
+- GeoJSON public `read_file(...)` now prefers pipeline-optimal routing over a
+  coarse file-size heuristic. The 10k bar is parity-or-better on the public
+  `read_file + first GPU stage` path, not isolated parser throughput.
+- `fast-json` remains the measured standalone GeoJSON parser winner, so its
+  benchmark rails still act as the host baseline.
+- Legacy GDAL formats should not masquerade as native; explicit fallback
+  events expose work that still bypasses the GPU-oriented stack.
 
 ## Current Behavior
 
@@ -98,7 +101,6 @@ keeping GPU-native formats primary and legacy formats explicit.
   - `hybrid`: GeoJSON, Shapefile, WKT, CSV, KML, OSM PBF, GeoPackage,
     FileGDB, FlatGeobuf, GML, GPX, TopoJSON, GeoJSON-Seq
   - `fallback`: untargeted legacy GDAL formats
-- `GeoDataFrame.to_file` uses the same routing policy.
 - Repo-owned `to_file(..., engine="pyogrio")` now writes through
   `pyogrio.write_arrow(...)` from the shared native tabular boundary whenever
   a native result is available, instead of rebuilding a host GeoDataFrame as
@@ -108,12 +110,13 @@ keeping GPU-native formats primary and legacy formats explicit.
   append mode, timezone-preserving datetime fields, unsupported metadata
   combinations, and other legacy driver semantics that the native Arrow sink
   does not yet match exactly.
-- Repo-owned `read_file` GPU branches that can already produce owned geometry
-  plus columnar attributes now lower through the shared `NativeTabularResult`
-  boundary before terminal `GeoDataFrame` materialization. That now includes
-  the pyogrio Arrow + GPU WKB compatibility path, direct WKT/CSV/KML readers,
-  both Shapefile GPU paths, the GeoJSON byte-classify path after property
-  extraction, and the OSM PBF hybrid path after protobuf/tag extraction.
+- Repo-owned `read_file` GPU branches that can already produce owned geometry plus columnar
+  attributes now lower through the shared `NativeTabularResult` boundary before
+  terminal `GeoDataFrame` materialization. That now includes the pyogrio Arrow +
+  native WKB bridge, which probes uniform raw-Arrow point/linestring/polygon fast
+  paths before the generic GPU decoder, direct WKT/CSV/KML readers, both
+  Shapefile GPU paths, the GeoJSON byte-classify path after property extraction,
+  and the OSM PBF hybrid path after protobuf/tag extraction.
 - The OSM PBF public boundary now uses a bounded, lossless tag projection instead of widening every observed tag key into its own eager object column. Common OSM keys stay first-class and the remainder stay in `other_tags`, avoiding the previous Florida-scale `2843`-column host explosion.
 - Public OSM standard layers (`points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`) now prefer `pyogrio` container reads through the shared native boundary. Those supported-layer scans run in parallel for the default public `read_file("*.osm.pbf")` path, so the user-facing wall time is no longer dominated by five serial OSM driver passes. Layers with native-supported geometry stay on Arrow + GPU WKB; `other_relations` uses an explicit compatibility bridge because real PBF data still carries `GeometryCollection`. The repo-owned hybrid OSM parser remains the path for `layer="all"` and the full-data native contract.
 - Default public `read_file("*.osm.pbf")` now combines those supported public layers by default instead of forcing the full mixed all-data parser into one eager frame. Small node-only fixtures and other empty supported-layer cases explicitly fall back to the full native parser so data is not lost.
@@ -125,35 +128,34 @@ keeping GPU-native formats primary and legacy formats explicit.
   blowup, and then routes the geometry column into the native GPU WKT/WKB
   decode path. The byte-classify reader still owns small files and lat/lon
   layouts.
-- FlatGeobuf now defaults to the pyogrio Arrow + GPU WKB path on public
-  `read_file(...)` / `read_vector_file_native(...)`. The repo still has a
-  direct GPU FlatBuffer decoder in `fgb_gpu.py`, but the Florida shootout
-  shows the Arrow path is materially faster today, so the direct route is not
-  the default execution shape.
-- Direct format-native helpers now exist for the promoted compatibility readers that already have a credible shared boundary: `read_geojson_native(...)` and `read_shapefile_native(...)`.
+- FlatGeobuf now defaults to the repo-owned direct FlatBuffer GPU decoder for
+  eligible local unfiltered public `read_file(...)` /
+  `read_vector_file_native(...)` calls. Explicit `engine="pyogrio"` and
+  container-shaped requests stay on the shared Arrow + GPU WKB native
+  boundary.
 - GeoJSON remains an explicit hybrid compatibility boundary because property
   extraction is still CPU-side even though geometry decode is GPU-native.
-  The shared native read boundary now preserves GeoJSON properties lazily
-  until explicit attribute access or terminal public export, so geometry-only
-  native consumers do not pay the property parse cost up front.
-  The GPU byte-classify path now accepts both filesystem paths and in-memory
-  RFC 7946 text/bytes sources, avoiding synthetic write-then-read loops when
-  the payload is already resident on host.
-  Explicit `track_properties=False` reads now drop property retention
-  completely; accessing properties after a geometry-only read is an explicit
-  contract error and requires a re-read with `track_properties=True`.
+  Public `read_file(...)` now tries that repo-owned GPU path for all eligible
+  unfiltered GeoJSON reads, not only files above a coarse byte threshold. If
+  the GPU parser fails, the public boundary falls back to repo-owned
+  `fast-json` before reaching vendored pyogrio. The shared native read
+  boundary preserves properties lazily, accepts both filesystem and in-memory
+  RFC 7946 sources, and treats `track_properties=False` as an explicit
+  geometry-only contract.
 - Shapefile remains an explicit hybrid compatibility boundary because the
   container and DBF attribute story are still legacy-oriented even when
   geometry decode is native; untargeted legacy GDAL formats stay outside the
   GPU-native promise and route through explicit fallback compatibility adapters.
 - Repo-owned GeoJSON ingest now also has an internal staged owned path:
-  - `auto` prefers `gpu-byte-classify` when a GPU runtime is available,
-    producing device-resident geometry via NVRTC kernels. On CPU-only hosts,
-    `auto` falls back to `fast-json`: `orjson` for parsing (when available,
-    otherwise CPython `json`) plus vectorized per-family coordinate extraction
-    directly into numpy owned buffers. The `fast-json` path is 2.4-2.6x
-    faster than the previous `full-json` default, and 3.5-3.9x faster than
-    `pyogrio`.
+  - `auto` now has two explicit objectives:
+    - `pipeline` prefers `gpu-byte-classify` when a GPU runtime is available so
+      the first downstream GPU consumer does not pay an immediate promotion
+    - `standalone` prefers `fast-json`, which is still the measured isolated
+      ingest winner on this machine
+    On CPU-only hosts both objectives fall back to `fast-json`: `orjson` (when
+    available, otherwise CPython `json`) plus vectorized per-family coordinate
+    extraction into numpy owned buffers. That path is 2.4-2.6x faster than the
+    previous `full-json` default and 3.5-3.9x faster than `pyogrio`.
   - `prefer="chunked"` splits the features array into byte-range chunks,
     parses each chunk with orjson, and extracts coordinates with vectorized
     numpy. Slightly slower than single-pass fast-json but reduces peak memory.
@@ -188,9 +190,10 @@ keeping GPU-native formats primary and legacy formats explicit.
     File-to-device transfer uses kvikio when installed (parallel POSIX reads
     with pinned bounce buffers, no GDS required), falling back to
     `cp.asarray` otherwise. Thread count is tunable via `KVIKIO_NTHREADS`.
-  - the `read_file` GPU path auto-selects `gpu-byte-classify` for GeoJSON
-    files >10 MB when a CUDA device is available, before falling back to
-    the pyogrio GPU WKB path
+  - the public `read_file` GeoJSON path now auto-selects `gpu-byte-classify`
+    for eligible unfiltered reads whenever a CUDA device is available because
+    the planning objective is end-to-end pipeline shape rather than naked file
+    parse speed
   - the stream tokenizer and structural feature-span tokenizer remain available
     as explicit strategies
   - assemble geometry directly into owned buffers without Shapely objects
@@ -208,9 +211,11 @@ keeping GPU-native formats primary and legacy formats explicit.
 
 ## Measured Local Baseline
 
-On this machine the `fast-json` strategy is the clear GeoJSON ingest winner.
-It uses `orjson` for parsing and vectorized per-family coordinate extraction
-directly into numpy arrays, eliminating the old per-feature assembly loop.
+On this machine `fast-json` is still the clear standalone GeoJSON ingest
+winner. The public-path KPI is different: GeoJSON is now measured on
+`read_file(...) + first downstream GPU stage`, with `10k` as the minimum
+acceptance scale, because that is the behavior that determines whether we read
+on CPU and immediately pay a promotion tax.
 
 - point-heavy GeoJSON at `100K` rows:
   - `pyogrio`: about `300K` rows/s

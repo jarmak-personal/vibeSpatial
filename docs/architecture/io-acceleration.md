@@ -5,7 +5,7 @@ Scope: Post-Phase-6b GPU-native IO execution model, staged decode policy, and fo
 Read If: You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.
 STOP IF: Your task already has the routed IO implementation files open and only needs local adapter detail.
 Source Of Truth: IO acceleration policy for turning repo-owned adapters into GPU-dominant ingest and emission paths.
-Body Budget: 152/260 lines
+Body Budget: 160/260 lines
 Document: docs/architecture/io-acceleration.md
 
 Section Map (Body Lines)
@@ -18,12 +18,12 @@ Section Map (Body Lines)
 | 23-30 | Open First |
 | 31-36 | Verify |
 | 37-43 | Risks |
-| 44-62 | Decision |
-| 63-76 | Execution Model |
-| 77-107 | Format Strategy |
-| 108-120 | CCCL Preference Order |
-| 121-139 | Performance Targets |
-| 140-152 | Non-Negotiable Constraints |
+| 44-65 | Decision |
+| 66-79 | Execution Model |
+| 80-115 | Format Strategy |
+| 116-128 | CCCL Preference Order |
+| 129-147 | Performance Targets |
+| 148-160 | Non-Negotiable Constraints |
 DOC_HEADER:END -->
 
 ## Purpose
@@ -83,6 +83,9 @@ shared decode architecture and explicit format-level floor targets.
   decode and encode steps.
 - GeoJSON and Shapefile remain hybrid, but must be batch-oriented and must not
   materialize Shapely objects during normal ingest or emission.
+- Public `read_file(...)` planning should optimize `read + first meaningful GPU
+  consumer`, not naked parser throughput, so small supported reads do not
+  default to CPU only to pay an immediate promotion on the next stage.
 - CCCL primitives are the default building blocks for scans, compaction,
   partitioning, prefix sums, scatters, run-length encoding, and reductions.
 
@@ -123,6 +126,11 @@ The critical rule is that decode happens after pruning, not before it.
 - Separate text tokenization from geometry assembly.
 - Keep property columns and geometry assembly on independent tracks so geometry
   can become GPU-native even while some attribute handling remains hybrid.
+- Homogeneous point FeatureCollections on the geometry-only GPU path should
+  take a direct point-geometry fast path before quote/depth/type planning:
+  scan compact `"geometry": {"type": "Point", ...}` objects, parse coordinate
+  pairs directly, and only fall back to the generic span-and-number pipeline
+  when that compact layout check fails.
 
 ### Shapefile
 
@@ -158,7 +166,7 @@ host baseline for the same format, whichever is faster.
 | GeoArrow native decode or encode | `4x` faster | `8x` faster | `10M` points / `1M` polygons |
 | WKB decode | `4x` faster | `8x` faster | `10M` points / `1M` polygons |
 | WKB encode | `3x` faster | `5x` faster | `10M` points / `1M` polygons |
-| GeoJSON point or line ingest | `2x` faster | `4x` faster | `1M` features |
+| GeoJSON public ingest + first GPU stage | parity at `10K`, `2x` faster at `1M` | `4x` faster | point/line public `read_file(...)` workloads |
 | GeoJSON polygon ingest | `1.25x` faster | `2x` faster | `250K` polygons |
 | Shapefile point or line ingest | `1.5x` faster | `3x` faster | `1M` records |
 | Shapefile polygon ingest | `1.1x` faster | `2x` faster | `250K` polygons |

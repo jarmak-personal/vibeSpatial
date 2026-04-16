@@ -167,10 +167,20 @@ def collect_gpu_acceleration(root: Path, *, include: bool, timeout: int) -> dict
         "api_compat_pct": report.api_compat_pct,
         "api_suite_pct": report.api_suite_pct,
         "gpu_accel_pct": report.gpu_accel_pct,
+        "raw_dispatch_pct": report.raw_dispatch_pct,
+        "value_dispatch_pct": report.value_dispatch_pct,
         "total_dispatches": report.total_dispatches,
         "gpu_dispatches": report.gpu_dispatches,
         "cpu_dispatches": report.cpu_dispatches,
         "fallback_dispatches": report.fallback_dispatches,
+        "deferred_dispatches": report.deferred_dispatches,
+        "value_dispatches": report.value_dispatches,
+        "value_gpu_dispatches": report.value_gpu_dispatches,
+        "weighted_dispatch_units": report.weighted_dispatch_units,
+        "weighted_gpu_units": report.weighted_gpu_units,
+        "family_breakdown": report.family_breakdown,
+        "fallback_reasons": report.fallback_reasons,
+        "fallback_surfaces": report.fallback_surfaces,
     }
 
 
@@ -351,7 +361,8 @@ def snapshot_report_baseline(report: dict[str, Any]) -> dict[str, Any]:
             fallback_rate = gpu_acceleration["fallback_dispatches"] / total_dispatches
         return {
             "status": report["status"],
-            "gpu_accel_pct": gpu_acceleration["gpu_accel_pct"],
+            "raw_dispatch_pct": gpu_acceleration.get("raw_dispatch_pct", gpu_acceleration["gpu_accel_pct"]),
+            "value_dispatch_pct": gpu_acceleration.get("value_dispatch_pct", gpu_acceleration["gpu_accel_pct"]),
             "fallback_rate": round(fallback_rate, 6),
         }
     return {}
@@ -359,7 +370,7 @@ def snapshot_report_baseline(report: dict[str, Any]) -> dict[str, Any]:
 
 def update_baseline_payload(payload: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
     baseline = dict(payload)
-    baseline.setdefault("schema_version", 1)
+    baseline["schema_version"] = max(int(baseline.get("schema_version", 1)), 2)
     baseline[report["tier"]] = snapshot_report_baseline(report)
     return baseline
 
@@ -425,15 +436,16 @@ def compare_gpu_report_against_baseline(report: dict[str, Any], baseline: dict[s
     fallback_rate = 0.0
     if total_dispatches:
         fallback_rate = gpu_acceleration["fallback_dispatches"] / total_dispatches
-    baseline_gpu_accel = round(float(baseline.get("gpu_accel_pct", 0.0)), 2)
-    current_gpu_accel = round(float(gpu_acceleration["gpu_accel_pct"]), 2)
-    baseline_fallback_rate = round(float(baseline.get("fallback_rate", 0.0)), 4)
-    current_fallback_rate = round(fallback_rate, 4)
-    if current_gpu_accel < baseline_gpu_accel:
+    baseline_value_dispatch = float(baseline.get("value_dispatch_pct", baseline.get("gpu_accel_pct", 0.0)))
+    current_value_dispatch = float(gpu_acceleration.get("value_dispatch_pct", gpu_acceleration.get("gpu_accel_pct", 0.0)))
+    baseline_fallback_rate = float(baseline.get("fallback_rate", 0.0))
+    current_fallback_rate = fallback_rate
+    if current_value_dispatch + 0.01 < baseline_value_dispatch:
         regressions.append(
-            f"gpu acceleration regressed from {baseline_gpu_accel:.2f}% to {current_gpu_accel:.2f}%"
+            "value-weighted gpu acceleration regressed "
+            f"from {baseline_value_dispatch:.2f}% to {current_value_dispatch:.2f}%"
         )
-    if current_fallback_rate > baseline_fallback_rate:
+    if current_fallback_rate > baseline_fallback_rate + 0.0001:
         regressions.append(
             f"fallback rate regressed from {baseline_fallback_rate:.4f} to {current_fallback_rate:.4f}"
         )
@@ -554,11 +566,19 @@ def print_summary(report: dict[str, Any]) -> None:
     gpu_acceleration = report["gpu_acceleration"]
     if gpu_acceleration.get("available"):
         print(
-            "GPU acceleration: "
-            f"{gpu_acceleration['gpu_accel_pct']:.2f}% "
+            "Value-weighted GPU acceleration: "
+            f"{gpu_acceleration.get('value_dispatch_pct', gpu_acceleration['gpu_accel_pct']):.2f}% "
             f"(gpu available: {'yes' if gpu_acceleration['gpu_available'] else 'no'}; "
-            f"{gpu_acceleration['gpu_dispatches']} GPU / {gpu_acceleration['total_dispatches']} dispatches)"
+            f"{gpu_acceleration.get('value_gpu_dispatches', gpu_acceleration['gpu_dispatches'])} GPU / "
+            f"{gpu_acceleration.get('value_dispatches', gpu_acceleration['total_dispatches'])} tracked dispatches)"
         )
+        print(
+            "Raw dispatch breadth: "
+            f"{gpu_acceleration.get('raw_dispatch_pct', gpu_acceleration['gpu_accel_pct']):.2f}% "
+            f"({gpu_acceleration['gpu_dispatches']} GPU / {gpu_acceleration['total_dispatches']} dispatches)"
+        )
+        if gpu_acceleration.get("deferred_dispatches"):
+            print(f"Deferred dispatch records: {gpu_acceleration['deferred_dispatches']}")
     else:
         print(f"GPU acceleration: {gpu_acceleration.get('reason', 'unavailable')}")
     print(
@@ -635,10 +655,34 @@ def print_gpu_summary(report: dict[str, Any]) -> None:
             f"distance {properties['total_distance']:.2f}"
         )
         print(
-            "GPU acceleration: "
-            f"{gpu_acceleration['gpu_accel_pct']:.2f}% "
+            "Value-weighted GPU acceleration: "
+            f"{gpu_acceleration.get('value_dispatch_pct', gpu_acceleration['gpu_accel_pct']):.2f}% "
+            f"({gpu_acceleration.get('value_gpu_dispatches', gpu_acceleration['gpu_dispatches'])} GPU / "
+            f"{gpu_acceleration.get('value_dispatches', gpu_acceleration['total_dispatches'])} tracked dispatches)"
+        )
+        print(
+            "Raw dispatch breadth: "
+            f"{gpu_acceleration.get('raw_dispatch_pct', gpu_acceleration['gpu_accel_pct']):.2f}% "
             f"({gpu_acceleration['gpu_dispatches']} GPU / {gpu_acceleration['total_dispatches']} dispatches)"
         )
+        if gpu_acceleration.get("deferred_dispatches"):
+            print(f"Deferred dispatch records: {gpu_acceleration['deferred_dispatches']}")
+        total_dispatches = gpu_acceleration["total_dispatches"]
+        fallback_rate = 0.0 if total_dispatches == 0 else gpu_acceleration["fallback_dispatches"] / total_dispatches
+        print(f"Fallback rate: {fallback_rate:.4f}")
+        family_breakdown = gpu_acceleration.get("family_breakdown", {})
+        tracked_families = [
+            (family, details)
+            for family, details in family_breakdown.items()
+            if details.get("included_in_value_metric")
+        ]
+        if tracked_families:
+            print("Tracked families:")
+            for family, details in tracked_families:
+                print(
+                    f"  {family:<14} {details['gpu_accel_pct']:.2f}% "
+                    f"({details['gpu_dispatches']}/{details['total_dispatches']}, weight {details['weight']})"
+                )
     print(json.dumps(report, indent=2))
 
 

@@ -61,6 +61,7 @@ def _simdjson_loads(data):
 class GeoJSONIngestPlan:
     implementation: str
     selected_strategy: str
+    objective: str
     uses_stream_tokenizer: bool
     uses_pylibcudf: bool
     uses_native_geometry_assembly: bool
@@ -111,15 +112,24 @@ class GeoJSONIngestBenchmark:
     rows_per_second: float
 
 
-def plan_geojson_ingest(*, prefer: str = "auto") -> GeoJSONIngestPlan:
+def _normalize_geojson_ingest_objective(objective: str) -> str:
+    normalized = objective.strip().lower().replace("_", "-")
+    if normalized not in {"pipeline", "standalone"}:
+        raise ValueError("GeoJSON ingest objective must be 'pipeline' or 'standalone'")
+    return normalized
+
+
+def plan_geojson_ingest(
+    *,
+    prefer: str = "auto",
+    objective: str = "pipeline",
+) -> GeoJSONIngestPlan:
+    normalized_objective = _normalize_geojson_ingest_objective(objective)
     use_pylibcudf = False
     if prefer == "auto":
-        # Prefer GPU byte-classify when a GPU runtime is available; this
-        # keeps data device-resident (zero-copy) and avoids a HOST->DEVICE
-        # transfer when downstream kernels consume the geometry.
         from vibespatial.runtime._runtime import has_gpu_runtime
 
-        if has_gpu_runtime():
+        if has_gpu_runtime() and normalized_objective == "pipeline":
             selected_strategy = "gpu-byte-classify"
         else:
             selected_strategy = "fast-json"
@@ -137,11 +147,19 @@ def plan_geojson_ingest(*, prefer: str = "auto") -> GeoJSONIngestPlan:
         "gpu-byte-classify": "geojson_gpu_byte_classify",
     }.get(selected_strategy, "geojson_stream_native")
     if selected_strategy == "fast-json":
-        reason = (
-            "Fast GeoJSON ingest using orjson (if available) for parsing and vectorized "
-            "per-family coordinate extraction directly into numpy arrays. Eliminates "
-            "per-feature geometry assembly loops and span-discovery overhead."
-        )
+        if prefer == "auto" and normalized_objective == "standalone":
+            reason = (
+                "Standalone GeoJSON ingest defaults to fast-json because the current "
+                "fastest measured isolated read path is orjson-backed vectorized "
+                "assembly rather than GPU byte classification."
+            )
+        else:
+            reason = (
+                "Fast GeoJSON ingest using orjson (if available) for parsing and "
+                "vectorized per-family coordinate extraction directly into numpy arrays. "
+                "Eliminates per-feature geometry assembly loops and span-discovery "
+                "overhead."
+            )
     elif selected_strategy == "simdjson":
         if not _HAS_SIMDJSON:
             raise RuntimeError(
@@ -166,11 +184,20 @@ def plan_geojson_ingest(*, prefer: str = "auto") -> GeoJSONIngestPlan:
             "structural tokenizer paths remain the GPU-oriented seam for future optimization."
         )
     if selected_strategy == "gpu-byte-classify":
-        reason = (
-            "GPU byte-classification GeoJSON ingest: NVRTC kernels for byte classification, "
-            "structural scanning, coordinate extraction, and ASCII-to-fp64 parsing. "
-            "Property extraction stays on CPU (hybrid design)."
-        )
+        if prefer == "auto" and normalized_objective == "pipeline":
+            reason = (
+                "Pipeline-oriented GeoJSON ingest prefers GPU byte classification so "
+                "public read_file auto-routing keeps geometry device-resident for the "
+                "first downstream GPU consumer instead of paying an immediate host-to-"
+                "device promotion after read."
+            )
+        else:
+            reason = (
+                "GPU byte-classification GeoJSON ingest: NVRTC kernels for byte "
+                "classification, structural scanning, coordinate extraction, and "
+                "ASCII-to-fp64 parsing. Property extraction stays on CPU (hybrid "
+                "design)."
+            )
     elif prefer == "pylibcudf":
         use_pylibcudf = True
         selected_strategy = "pylibcudf"
@@ -203,6 +230,7 @@ def plan_geojson_ingest(*, prefer: str = "auto") -> GeoJSONIngestPlan:
     return GeoJSONIngestPlan(
         implementation=implementation,
         selected_strategy=selected_strategy,
+        objective=normalized_objective,
         uses_stream_tokenizer=selected_strategy in {"stream", "tokenizer"},
         uses_pylibcudf=use_pylibcudf,
         uses_native_geometry_assembly=True,
@@ -1331,9 +1359,10 @@ def read_geojson_owned(
     source: str | bytes | bytearray | memoryview | Path,
     *,
     prefer: str = "auto",
+    objective: str = "pipeline",
     track_properties: bool = True,
 ) -> GeoJSONOwnedBatch:
-    plan = plan_geojson_ingest(prefer=prefer)
+    plan = plan_geojson_ingest(prefer=prefer, objective=objective)
     if plan.selected_strategy == "gpu-byte-classify":
         from .geojson_gpu import read_geojson_gpu
         record_dispatch_event(
@@ -1369,7 +1398,7 @@ def read_geojson_owned(
                 reason="GPU byte-classify fallback to fast-json",
                 selected=ExecutionMode.CPU,
             )
-            plan = plan_geojson_ingest(prefer="fast-json")
+            plan = plan_geojson_ingest(prefer="fast-json", objective=objective)
     # For the simdjson strategy, prefer reading as bytes to avoid str->bytes encode overhead.
     if plan.selected_strategy == "simdjson":
         if isinstance(source, Path):

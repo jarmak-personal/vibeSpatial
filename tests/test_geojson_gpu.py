@@ -159,6 +159,86 @@ def test_gpu_byte_classify_supports_in_memory_bytes_source() -> None:
     assert batch.properties[1]["id"] == 2
 
 
+@needs_gpu
+def test_gpu_byte_classify_point_fast_path_skips_generic_numeric_pipeline(monkeypatch) -> None:
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+
+    fc = _make_feature_collection([
+        _make_point_feature([0.5, 1.5], {"id": 1}),
+        _make_point_feature([2.5, 3.5], {"id": 2}),
+        _make_point_feature([4.5, 5.5], {"id": 3}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("homogeneous point GeoJSON should bypass the generic structural pipeline")
+
+    monkeypatch.setattr(io_geojson_gpu, "quote_parity", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "bracket_depth", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_coord_key_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_type_key_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_classify_type_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_coord_span_end_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "number_boundaries", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "extract_number_positions", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "parse_ascii_floats", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "mark_spans", _fail)
+
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify", track_properties=False)
+    materialized = batch.geometry.to_shapely()
+
+    assert batch.geometry.device_state is not None
+    np.testing.assert_allclose(
+        np.asarray([geom.x for geom in materialized], dtype=np.float64),
+        np.asarray([0.5, 2.5, 4.5], dtype=np.float64),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        np.asarray([geom.y for geom in materialized], dtype=np.float64),
+        np.asarray([1.5, 3.5, 5.5], dtype=np.float64),
+        atol=1e-12,
+    )
+
+
+@needs_gpu
+def test_gpu_byte_classify_point_fast_path_ignores_escaped_geometry_text(monkeypatch) -> None:
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+
+    fc = _make_feature_collection([
+        _make_point_feature(
+            [0.5, 1.5],
+            {"note": 'embedded {"geometry": {"type": "Point", "coordinates": [99, 100]}}'},
+        ),
+        _make_point_feature([2.5, 3.5], {"id": 2}),
+    ])
+    payload = json.dumps(fc).encode("utf-8")
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("escaped property text should not force the generic structural pipeline")
+
+    monkeypatch.setattr(io_geojson_gpu, "quote_parity", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "bracket_depth", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_coord_key_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_type_key_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_classify_type_kernels", _fail)
+    monkeypatch.setattr(io_geojson_gpu, "_coord_span_end_kernels", _fail)
+
+    batch = read_geojson_owned(payload, prefer="gpu-byte-classify", track_properties=False)
+    materialized = batch.geometry.to_shapely()
+
+    assert batch.geometry.row_count == 2
+    np.testing.assert_allclose(
+        np.asarray([geom.x for geom in materialized], dtype=np.float64),
+        np.asarray([0.5, 2.5], dtype=np.float64),
+        atol=1e-12,
+    )
+    np.testing.assert_allclose(
+        np.asarray([geom.y for geom in materialized], dtype=np.float64),
+        np.asarray([1.5, 3.5], dtype=np.float64),
+        atol=1e-12,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Test 2: Quote-state — property containing "coordinates": as text
 # ---------------------------------------------------------------------------

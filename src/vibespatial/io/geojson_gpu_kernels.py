@@ -69,6 +69,284 @@ extern "C" __global__ void coord_span_end(
 }
 """
 
+_POINT_PAIR_PARSE_SOURCE = r"""
+__device__ __forceinline__ int is_ws(unsigned char c) {
+    return c == ' ' || c == '\n' || c == '\r' || c == '\t';
+}
+
+__device__ __forceinline__ int match_literal(
+    const unsigned char* __restrict__ input,
+    long long n_bytes,
+    long long pos,
+    const unsigned char* __restrict__ pat,
+    int pat_len
+) {
+    if (pos < 0 || pos + pat_len > n_bytes) {
+        return 0;
+    }
+    for (int i = 0; i < pat_len; ++i) {
+        if (input[pos + i] != pat[i]) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+__device__ __forceinline__ int parse_json_float_token(
+    const unsigned char* __restrict__ input,
+    long long n_bytes,
+    long long start,
+    double* __restrict__ out_value,
+    long long* __restrict__ out_next
+) {
+    long long pos = start;
+    int negative = 0;
+    int saw_digit = 0;
+    int in_exponent = 0;
+    int exp_negative = 0;
+    int exp_val = 0;
+    double result = 0.0;
+    double frac_mult = 0.0;
+
+    while (pos < n_bytes) {
+        unsigned char c = input[pos];
+        if (c == '-') {
+            if (in_exponent) {
+                exp_negative = 1;
+            } else if (pos == start) {
+                negative = 1;
+            } else {
+                break;
+            }
+        } else if (c == '+') {
+            if (!(in_exponent || pos == start)) {
+                break;
+            }
+        } else if (c == '.') {
+            if (frac_mult > 0.0 || in_exponent) {
+                break;
+            }
+            frac_mult = 0.1;
+        } else if (c == 'e' || c == 'E') {
+            if (in_exponent || !saw_digit) {
+                break;
+            }
+            in_exponent = 1;
+        } else if (c >= '0' && c <= '9') {
+            int d = c - '0';
+            saw_digit = 1;
+            if (in_exponent) {
+                exp_val = exp_val * 10 + d;
+            } else if (frac_mult > 0.0) {
+                result += d * frac_mult;
+                frac_mult *= 0.1;
+            } else {
+                result = result * 10.0 + d;
+            }
+        } else {
+            break;
+        }
+        pos++;
+    }
+
+    if (!saw_digit) {
+        return 0;
+    }
+
+    if (negative) {
+        result = -result;
+    }
+
+    if (in_exponent) {
+        double exp_mult = 1.0;
+        for (int e = 0; e < exp_val; ++e) {
+            exp_mult *= 10.0;
+        }
+        result = exp_negative ? (result / exp_mult) : (result * exp_mult);
+    }
+
+    *out_value = result;
+    *out_next = pos;
+    return 1;
+}
+
+extern "C" __global__ void find_geometry_key(
+    const unsigned char* __restrict__ input,
+    unsigned char* __restrict__ hits,
+    long long n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx > n - 10) {
+        if (idx < n) hits[idx] = 0;
+        return;
+    }
+
+    const unsigned char pat[10] = {
+        '"','g','e','o','m','e','t','r','y','"'
+    };
+
+    unsigned char match = 1;
+    for (int i = 0; i < 10; ++i) {
+        if (input[idx + i] != pat[i]) {
+            match = 0;
+            break;
+        }
+    }
+    // Compact point fast path runs before quote-parity. Reject escaped
+    // matches so property strings containing \"geometry\" do not qualify.
+    if (match && idx > 0 && input[idx - 1] == '\\') {
+        match = 0;
+    }
+    hits[idx] = match;
+}
+
+extern "C" __global__ void parse_point_geometry_objects(
+    const unsigned char* __restrict__ input,
+    const long long* __restrict__ geometry_positions,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    unsigned char* __restrict__ valid,
+    int n_features,
+    long long n_bytes
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_features) return;
+
+    const unsigned char type_key[6] = {'"','t','y','p','e','"'};
+    const unsigned char point_value[7] = {'"','P','o','i','n','t','"'};
+    const unsigned char coord_key[13] = {
+        '"','c','o','o','r','d','i','n','a','t','e','s','"'
+    };
+
+    long long pos = geometry_positions[idx] + 10;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ':') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != '{') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+
+    if (!match_literal(input, n_bytes, pos, type_key, 6)) goto invalid;
+    pos += 6;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ':') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+
+    if (!match_literal(input, n_bytes, pos, point_value, 7)) goto invalid;
+    pos += 7;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ',') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+
+    if (!match_literal(input, n_bytes, pos, coord_key, 13)) goto invalid;
+    pos += 13;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ':') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != '[') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+
+    double x = 0.0;
+    double y = 0.0;
+    long long next = pos;
+    if (!parse_json_float_token(input, n_bytes, pos, &x, &next)) goto invalid;
+
+    pos = next;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ',') goto invalid;
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+
+    if (!parse_json_float_token(input, n_bytes, pos, &y, &next)) goto invalid;
+    pos = next;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ']') goto invalid;
+
+    valid[idx] = 1;
+    out_x[idx] = x;
+    out_y[idx] = y;
+    return;
+
+invalid:
+    valid[idx] = 0;
+    out_x[idx] = 0.0;
+    out_y[idx] = 0.0;
+}
+
+extern "C" __global__ void parse_point_coordinate_pairs(
+    const unsigned char* __restrict__ input,
+    const long long* __restrict__ coord_positions,
+    double* __restrict__ out_x,
+    double* __restrict__ out_y,
+    unsigned char* __restrict__ valid,
+    int n_features,
+    long long n_bytes
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_features) return;
+
+    long long pos = coord_positions[idx] + 14;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != '[') {
+        valid[idx] = 0;
+        out_x[idx] = 0.0;
+        out_y[idx] = 0.0;
+        return;
+    }
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] == ']') {
+        valid[idx] = 0;
+        out_x[idx] = 0.0;
+        out_y[idx] = 0.0;
+        return;
+    }
+
+    double x = 0.0;
+    double y = 0.0;
+    long long next = pos;
+    if (!parse_json_float_token(input, n_bytes, pos, &x, &next)) {
+        valid[idx] = 0;
+        out_x[idx] = 0.0;
+        out_y[idx] = 0.0;
+        return;
+    }
+
+    pos = next;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] != ',') {
+        valid[idx] = 0;
+        out_x[idx] = 0.0;
+        out_y[idx] = 0.0;
+        return;
+    }
+    pos++;
+    while (pos < n_bytes && is_ws(input[pos])) pos++;
+    if (pos >= n_bytes || input[pos] == ']') {
+        valid[idx] = 0;
+        out_x[idx] = 0.0;
+        out_y[idx] = 0.0;
+        return;
+    }
+
+    if (!parse_json_float_token(input, n_bytes, pos, &y, &next)) {
+        valid[idx] = 0;
+        out_x[idx] = 0.0;
+        out_y[idx] = 0.0;
+        return;
+    }
+
+    valid[idx] = 1;
+    out_x[idx] = x;
+    out_y[idx] = y;
+}
+"""
+
 _RING_COUNT_SOURCE = r"""
 extern "C" __global__ void count_rings_and_coords(
     const unsigned char* __restrict__ input,
@@ -464,3 +742,8 @@ _SCATTER_COORDS_NAMES = ("scatter_ring_offsets",)
 _FEATURE_BOUNDARY_NAMES = ("find_feature_starts", "find_feature_boundaries")
 _TYPE_KEY_NAMES = ("find_type_key",)
 _CLASSIFY_TYPE_NAMES = ("classify_type_value",)
+_POINT_PAIR_NAMES = (
+    "find_geometry_key",
+    "parse_point_geometry_objects",
+    "parse_point_coordinate_pairs",
+)

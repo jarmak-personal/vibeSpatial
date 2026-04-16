@@ -10,7 +10,6 @@ import numpy as np
 
 from vibespatial import (
     benchmark_geoarrow_bridge,
-    benchmark_geojson_ingest,
     benchmark_native_geometry_codec,
     benchmark_shapefile_ingest,
     benchmark_wkb_bridge,
@@ -235,6 +234,126 @@ def _sample_geodataframe(geometry_type: str, rows: int, *, seed: int = 0):
             SyntheticSpec("polygon", "regular-grid", count=rows, seed=seed, vertices=6)
         ).to_geodataframe()
     raise ValueError(f"Unsupported geometry type: {geometry_type}")
+
+
+def _consume_first_gpu_stage(frame) -> None:
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+    compute_geometry_bounds_device(frame.geometry.values.to_owned())
+
+
+def _benchmark_geojson_public_pipeline(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float] | None:
+    import vibespatial.api as geopandas
+    from vibespatial.runtime._runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        return None
+
+    gdf = _sample_geodataframe("point", rows, seed=seed)
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "sample.geojson"
+        gdf.to_file(path, driver="GeoJSON")
+
+        _consume_first_gpu_stage(geopandas.read_file(path, engine="pyogrio"))
+        _consume_first_gpu_stage(geopandas.read_file(path))
+
+        start = perf_counter()
+        for _ in range(repeat):
+            frame = geopandas.read_file(path, engine="pyogrio")
+            _consume_first_gpu_stage(frame)
+        baseline_elapsed = (perf_counter() - start) / repeat
+
+        start = perf_counter()
+        for _ in range(repeat):
+            frame = geopandas.read_file(path)
+            _consume_first_gpu_stage(frame)
+        candidate_elapsed = (perf_counter() - start) / repeat
+
+    baseline_rows_per_second = rows / baseline_elapsed if baseline_elapsed else float("inf")
+    candidate_rows_per_second = rows / candidate_elapsed if candidate_elapsed else float("inf")
+    return baseline_rows_per_second, candidate_rows_per_second
+
+
+def _benchmark_shapefile_public_pipeline(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float] | None:
+    import vibespatial.api as geopandas
+    from vibespatial.runtime._runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        return None
+
+    gdf = _sample_geodataframe("point", rows, seed=seed)
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "sample.shp"
+        gdf.to_file(path, driver="ESRI Shapefile")
+
+        _consume_first_gpu_stage(geopandas.read_file(path, engine="pyogrio"))
+        _consume_first_gpu_stage(geopandas.read_file(path))
+
+        start = perf_counter()
+        for _ in range(repeat):
+            frame = geopandas.read_file(path, engine="pyogrio")
+            _consume_first_gpu_stage(frame)
+        baseline_elapsed = (perf_counter() - start) / repeat
+
+        start = perf_counter()
+        for _ in range(repeat):
+            frame = geopandas.read_file(path)
+            _consume_first_gpu_stage(frame)
+        candidate_elapsed = (perf_counter() - start) / repeat
+
+    baseline_rows_per_second = rows / baseline_elapsed if baseline_elapsed else float("inf")
+    candidate_rows_per_second = rows / candidate_elapsed if candidate_elapsed else float("inf")
+    return baseline_rows_per_second, candidate_rows_per_second
+
+
+def _benchmark_pyogrio_vector_public_pipeline(
+    *,
+    driver: str,
+    suffix: str,
+    rows: int,
+    repeat: int,
+    candidate_engine: str | None = "pyogrio",
+    seed: int = 0,
+) -> tuple[float, float] | None:
+    import pyogrio
+
+    import vibespatial.api as geopandas
+    from vibespatial.runtime._runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        return None
+
+    gdf = _sample_geodataframe("point", rows, seed=seed)
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / f"sample{suffix}"
+        gdf.to_file(path, driver=driver)
+
+        def _read_candidate():
+            if candidate_engine is None:
+                return geopandas.read_file(path)
+            return geopandas.read_file(path, engine=candidate_engine)
+
+        _consume_first_gpu_stage(pyogrio.read_dataframe(path))
+        _consume_first_gpu_stage(_read_candidate())
+
+        start = perf_counter()
+        for _ in range(repeat):
+            frame = pyogrio.read_dataframe(path)
+            _consume_first_gpu_stage(frame)
+        baseline_elapsed = (perf_counter() - start) / repeat
+
+        start = perf_counter()
+        for _ in range(repeat):
+            frame = _read_candidate()
+            _consume_first_gpu_stage(frame)
+        candidate_elapsed = (perf_counter() - start) / repeat
+
+    baseline_rows_per_second = rows / baseline_elapsed if baseline_elapsed else float("inf")
+    candidate_rows_per_second = rows / candidate_elapsed if candidate_elapsed else float("inf")
+    return baseline_rows_per_second, candidate_rows_per_second
 
 
 def _build_covering_summary(*, scale: int, selectivity: float, seed: int = 0):
@@ -698,7 +817,9 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
     point_scales = {"smoke": [10_000], "ci": [100_000], "all": [10_000, 100_000, 1_000_000]}[suite]
     line_scales = {"smoke": [10_000], "ci": [100_000], "all": [10_000, 100_000, 1_000_000]}[suite]
     polygon_scales = {"smoke": [5_000], "ci": [50_000], "all": [5_000, 50_000, 250_000]}[suite]
-    geojson_scales = {"smoke": [10_000], "ci": [100_000], "all": [100_000]}[suite]
+    geojson_scales = {"smoke": [10_000], "ci": [10_000], "all": [10_000, 100_000]}[suite]
+    shapefile_public_scales = {"smoke": [10_000], "ci": [10_000], "all": [10_000, 100_000]}[suite]
+    vector_container_scales = {"smoke": [10_000], "ci": [10_000], "all": [10_000, 100_000]}[suite]
     results: list[IOBenchmarkCase] = []
 
     for rows in point_scales:
@@ -786,28 +907,150 @@ def benchmark_io_file_suite(*, suite: str = "all", repeat: int = 1) -> list[IOBe
         )
 
     for rows in geojson_scales:
-        point_benchmarks = benchmark_geojson_ingest(geometry_type="point", rows=rows, repeat=repeat)
-        baseline = _benchmark_lookup(point_benchmarks, "pyogrio_host")
-        candidate = _benchmark_lookup(point_benchmarks, "full_json_baseline")
-        results.append(
-            _speedup_case(
-                case_id=f"geojson-point-{rows}",
-                family="file",
-                format_name="geojson_ingest",
-                geometry_profile="point-heavy",
-                scale=rows,
-                target_floor=2.0,
-                enforced=False,
-                baseline_label="pyogrio_host",
-                candidate_label="full_json_baseline",
-                baseline_rows_per_second=baseline.rows_per_second,
-                candidate_rows_per_second=candidate.rows_per_second,
-                rows_decoded=rows,
-                bytes_scanned=None,
-                copies_made=1,
-                notes="GeoJSON remains informational here; the faster full-json native path is still host-dominant rather than GPU-dominant.",
+        pipeline = _benchmark_geojson_public_pipeline(rows=rows, repeat=repeat)
+        if pipeline is None:
+            results.append(
+                _unavailable_case(
+                    case_id=f"geojson-point-pipeline-{rows}",
+                    family="file",
+                    format_name="geojson_public_pipeline",
+                    geometry_profile="point-heavy",
+                    scale=rows,
+                    enforced=True,
+                    notes=(
+                        "GeoJSON public pipeline rail requires a visible GPU because it "
+                        "measures read_file plus the first downstream GPU consumer."
+                    ),
+                )
             )
-        )
+        else:
+            baseline_rows_per_second, candidate_rows_per_second = pipeline
+            results.append(
+                _speedup_case(
+                    case_id=f"geojson-point-pipeline-{rows}",
+                    family="file",
+                    format_name="geojson_public_pipeline",
+                    geometry_profile="point-heavy",
+                    scale=rows,
+                    target_floor=1.0,
+                    enforced=True,
+                    baseline_label="pyogrio_host_plus_first_gpu_stage",
+                    candidate_label="public_auto_pipeline",
+                    baseline_rows_per_second=baseline_rows_per_second,
+                    candidate_rows_per_second=candidate_rows_per_second,
+                    rows_decoded=rows,
+                    bytes_scanned=None,
+                    copies_made=1,
+                    notes=(
+                        "GeoJSON auto-routing should reach parity or better at 10k+ on the "
+                        "public read_file path once the first downstream GPU consumer is "
+                        "included, so read-then-promote churn does not dominate."
+                    ),
+                )
+            )
+
+    for rows in shapefile_public_scales:
+        pipeline = _benchmark_shapefile_public_pipeline(rows=rows, repeat=repeat)
+        if pipeline is None:
+            results.append(
+                _unavailable_case(
+                    case_id=f"shapefile-point-pipeline-{rows}",
+                    family="file",
+                    format_name="shapefile_public_pipeline",
+                    geometry_profile="point-heavy",
+                    scale=rows,
+                    enforced=True,
+                    notes=(
+                        "Shapefile public pipeline rail requires a visible GPU because it "
+                        "measures read_file plus the first downstream GPU consumer."
+                    ),
+                )
+            )
+        else:
+            baseline_rows_per_second, candidate_rows_per_second = pipeline
+            results.append(
+                _speedup_case(
+                    case_id=f"shapefile-point-pipeline-{rows}",
+                    family="file",
+                    format_name="shapefile_public_pipeline",
+                    geometry_profile="point-heavy",
+                    scale=rows,
+                    target_floor=1.0,
+                    enforced=True,
+                    baseline_label="pyogrio_host_plus_first_gpu_stage",
+                    candidate_label="public_auto_pipeline",
+                    baseline_rows_per_second=baseline_rows_per_second,
+                    candidate_rows_per_second=candidate_rows_per_second,
+                    rows_decoded=rows,
+                    bytes_scanned=None,
+                    copies_made=1,
+                    notes=(
+                        "Shapefile auto-routing should reach parity or better at 10k+ on the "
+                        "public read_file path once the first downstream GPU consumer is "
+                        "included."
+                    ),
+                )
+            )
+
+    container_cases = (
+        ("GPKG", ".gpkg", "geopackage_public_pipeline", "pyogrio", "public_engine_pyogrio_native_boundary"),
+        ("FlatGeobuf", ".fgb", "flatgeobuf_public_pipeline", None, "public_auto_pipeline"),
+    )
+    for rows in vector_container_scales:
+        for driver, suffix, format_name, candidate_engine, candidate_label in container_cases:
+            pipeline = _benchmark_pyogrio_vector_public_pipeline(
+                driver=driver,
+                suffix=suffix,
+                rows=rows,
+                repeat=repeat,
+                candidate_engine=candidate_engine,
+            )
+            if pipeline is None:
+                results.append(
+                    _unavailable_case(
+                        case_id=f"{format_name}-{rows}",
+                        family="file",
+                        format_name=format_name,
+                        geometry_profile="point-heavy",
+                        scale=rows,
+                        enforced=True,
+                        notes=(
+                            f"{driver} public pipeline rail requires a visible GPU because "
+                            "it measures read_file plus the first downstream GPU consumer."
+                        ),
+                    )
+                )
+            else:
+                baseline_rows_per_second, candidate_rows_per_second = pipeline
+                results.append(
+                    _speedup_case(
+                        case_id=f"{format_name}-{rows}",
+                        family="file",
+                        format_name=format_name,
+                        geometry_profile="point-heavy",
+                        scale=rows,
+                        target_floor=1.0,
+                        enforced=True,
+                        baseline_label="pyogrio_host_plus_first_gpu_stage",
+                        candidate_label=candidate_label,
+                        baseline_rows_per_second=baseline_rows_per_second,
+                        candidate_rows_per_second=candidate_rows_per_second,
+                        rows_decoded=rows,
+                        bytes_scanned=None,
+                        copies_made=1,
+                        notes=(
+                            f"{driver} explicit pyogrio reads should stay at parity or better "
+                            "on the public read_file path once the first downstream GPU "
+                            "consumer is included."
+                            if candidate_engine == "pyogrio"
+                            else (
+                                f"{driver} auto-routing should stay at parity or better on "
+                                "the public read_file path once the first downstream GPU "
+                                "consumer is included."
+                            )
+                        ),
+                    )
+                )
 
     return results
 
@@ -837,7 +1080,7 @@ def io_suite_to_json(
             "notes": [
                 "10M-scale coverage remains a manual deep-run path for the cheapest point-heavy cases.",
                 "copies_made is a conservative path-level estimate, not a byte-for-byte allocator trace.",
-                "GeoJSON remains informational-only in this rail until the device-rowized tokenizer wins.",
+                "GeoJSON rails now target the public read_file pipeline with the first downstream GPU consumer, not isolated parser throughput.",
             ],
         },
         "results": [asdict(result) for result in results],

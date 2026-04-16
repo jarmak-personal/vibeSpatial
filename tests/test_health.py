@@ -446,6 +446,8 @@ def test_evaluate_check_report_allows_steady_state_gpu_failure() -> None:
         "exit_code": 1,
         "gpu_acceleration": {
             "gpu_accel_pct": 20.08,
+            "raw_dispatch_pct": 20.08,
+            "value_dispatch_pct": 67.25,
             "total_dispatches": 1000,
             "fallback_dispatches": 16,
         },
@@ -453,7 +455,8 @@ def test_evaluate_check_report_allows_steady_state_gpu_failure() -> None:
     baseline = {
         "gpu": {
             "status": "fail",
-            "gpu_accel_pct": 20.08,
+            "raw_dispatch_pct": 20.08,
+            "value_dispatch_pct": 67.25,
             "fallback_rate": 0.016,
         }
     }
@@ -471,6 +474,8 @@ def test_evaluate_check_report_fails_gpu_regression() -> None:
         "exit_code": 1,
         "gpu_acceleration": {
             "gpu_accel_pct": 19.5,
+            "raw_dispatch_pct": 19.5,
+            "value_dispatch_pct": 66.5,
             "total_dispatches": 1000,
             "fallback_dispatches": 20,
         },
@@ -478,7 +483,8 @@ def test_evaluate_check_report_fails_gpu_regression() -> None:
     baseline = {
         "gpu": {
             "status": "fail",
-            "gpu_accel_pct": 20.08,
+            "raw_dispatch_pct": 20.08,
+            "value_dispatch_pct": 67.25,
             "fallback_rate": 0.016,
         }
     }
@@ -487,7 +493,7 @@ def test_evaluate_check_report_fails_gpu_regression() -> None:
 
     assert exit_code == 1
     assert regressions == [
-        "gpu acceleration regressed from 20.08% to 19.50%",
+        "value-weighted gpu acceleration regressed from 67.25% to 66.50%",
         "fallback rate regressed from 0.0160 to 0.0200",
     ]
 
@@ -498,7 +504,9 @@ def test_evaluate_check_report_ignores_gpu_noise_below_display_precision() -> No
         "status": "fail",
         "exit_code": 1,
         "gpu_acceleration": {
-            "gpu_accel_pct": 20.08401033973412,
+            "gpu_accel_pct": 20.681345681345682,
+            "raw_dispatch_pct": 20.681345681345682,
+            "value_dispatch_pct": 65.08094347877969,
             "total_dispatches": 21664,
             "fallback_dispatches": 16,
         },
@@ -506,8 +514,37 @@ def test_evaluate_check_report_ignores_gpu_noise_below_display_precision() -> No
     baseline = {
         "gpu": {
             "status": "fail",
-            "gpu_accel_pct": 20.084107398678313,
-            "fallback_rate": 0.000739,
+            "raw_dispatch_pct": 20.681184751287258,
+            "value_dispatch_pct": 65.08649830980315,
+            "fallback_rate": 0.000735,
+        }
+    }
+
+    exit_code, regressions = health.evaluate_check_report(report, baseline)
+
+    assert exit_code == 0
+    assert regressions == []
+
+
+def test_evaluate_check_report_uses_value_dispatch_metric_over_raw_helper_metric() -> None:
+    report = {
+        "tier": "gpu",
+        "status": "fail",
+        "exit_code": 1,
+        "gpu_acceleration": {
+            "gpu_accel_pct": 18.0,
+            "raw_dispatch_pct": 18.0,
+            "value_dispatch_pct": 67.25,
+            "total_dispatches": 1000,
+            "fallback_dispatches": 16,
+        },
+    }
+    baseline = {
+        "gpu": {
+            "status": "fail",
+            "raw_dispatch_pct": 20.08,
+            "value_dispatch_pct": 67.25,
+            "fallback_rate": 0.016,
         }
     }
 
@@ -528,10 +565,34 @@ def test_update_baseline_payload_stores_contract_snapshot() -> None:
 
     payload = health.update_baseline_payload({}, report)
 
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert payload["contract"]["surfaces"]["versioning"] == {
         "state": "pass",
         "passed": 2,
         "total": 2,
     }
     assert payload["contract"]["surfaces"]["overlay"]["passed"] == 236
+
+
+def test_update_baseline_payload_stores_value_weighted_gpu_snapshot() -> None:
+    report = {
+        "tier": "gpu",
+        "status": "pass",
+        "gpu_acceleration": {
+            "gpu_accel_pct": 20.08,
+            "raw_dispatch_pct": 20.08,
+            "value_dispatch_pct": 67.25,
+            "total_dispatches": 1000,
+            "fallback_dispatches": 16,
+        },
+    }
+
+    payload = health.update_baseline_payload({}, report)
+
+    assert payload["schema_version"] == 2
+    assert payload["gpu"] == {
+        "status": "pass",
+        "raw_dispatch_pct": 20.08,
+        "value_dispatch_pct": 67.25,
+        "fallback_rate": 0.016,
+    }

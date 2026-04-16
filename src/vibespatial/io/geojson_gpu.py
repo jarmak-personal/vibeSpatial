@@ -50,6 +50,8 @@ from vibespatial.io.geojson_gpu_kernels import (
     _MPOLY_COUNT_SOURCE,
     _MPOLY_SCATTER_NAMES,
     _MPOLY_SCATTER_SOURCE,
+    _POINT_PAIR_NAMES,
+    _POINT_PAIR_PARSE_SOURCE,
     _RING_COUNT_NAMES,
     _RING_COUNT_SOURCE,
     _SCATTER_COORDS_NAMES,
@@ -89,6 +91,7 @@ from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup  # noqa: E402
 request_nvrtc_warmup([
     ("geojson-coord-key", _COORD_KEY_SOURCE, _COORD_KEY_NAMES),
     ("geojson-coord-span-end", _COORD_SPAN_END_SOURCE, _COORD_SPAN_END_NAMES),
+    ("geojson-point-pair-parse", _POINT_PAIR_PARSE_SOURCE, _POINT_PAIR_NAMES),
     ("geojson-ring-count", _RING_COUNT_SOURCE, _RING_COUNT_NAMES),
     ("geojson-mpoly-count", _MPOLY_COUNT_SOURCE, _MPOLY_COUNT_NAMES),
     ("geojson-mpoly-scatter", _MPOLY_SCATTER_SOURCE, _MPOLY_SCATTER_NAMES),
@@ -109,6 +112,14 @@ def _coord_key_kernels():
 
 def _coord_span_end_kernels():
     return compile_kernel_group("geojson-coord-span-end", _COORD_SPAN_END_SOURCE, _COORD_SPAN_END_NAMES)
+
+
+def _point_pair_kernels():
+    return compile_kernel_group(
+        "geojson-point-pair-parse",
+        _POINT_PAIR_PARSE_SOURCE,
+        _POINT_PAIR_NAMES,
+    )
 
 
 def _ring_count_kernels():
@@ -351,6 +362,95 @@ def _resolve_geojson_gpu_source(
     return cp.asarray(host_bytes), host_bytes, None, None
 
 
+def _try_parse_compact_point_geometries(
+    runtime,
+    d_bytes: cp.ndarray,
+    *,
+    host_bytes: np.ndarray | None,
+    source_path: Path | None,
+    source_mtime_ns: int | None,
+    target_crs: str | None,
+) -> GeoJSONGpuResult | None:
+    n = len(d_bytes)
+    if n == 0:
+        return None
+
+    ptr = runtime.pointer
+    n_i64 = np.int64(n)
+    point_kernels = _point_pair_kernels()
+    d_geometry_hits = cp.zeros(n, dtype=cp.uint8)
+    _launch_kernel(runtime, point_kernels["find_geometry_key"], n, (
+        (ptr(d_bytes), ptr(d_geometry_hits), n_i64),
+        (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+    ))
+    d_geometry_positions = cp.flatnonzero(d_geometry_hits).astype(cp.int64)
+    del d_geometry_hits
+    n_features = int(d_geometry_positions.size)
+    if n_features == 0:
+        del d_geometry_positions
+        return None
+
+    d_point_x = cp.empty(n_features, dtype=cp.float64)
+    d_point_y = cp.empty(n_features, dtype=cp.float64)
+    d_point_valid = cp.empty(n_features, dtype=cp.uint8)
+    _launch_kernel(runtime, point_kernels["parse_point_geometry_objects"], n_features, (
+        (
+            ptr(d_bytes),
+            ptr(d_geometry_positions),
+            ptr(d_point_x),
+            ptr(d_point_y),
+            ptr(d_point_valid),
+            np.int32(n_features),
+            n_i64,
+        ),
+        (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I64,
+        ),
+    ))
+    if not bool(cp.all(d_point_valid).item()):
+        del d_geometry_positions, d_point_x, d_point_y, d_point_valid
+        return None
+    del d_point_valid, d_geometry_positions
+
+    if target_crs is not None:
+        from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
+
+        transform_coordinates_inplace(
+            d_point_x,
+            d_point_y,
+            src_crs="EPSG:4326",
+            dst_crs=target_crs,
+        )
+
+    d_effective_pairs = cp.ones(n_features, dtype=cp.int32)
+    d_feature_coord_offsets = cp.arange(n_features + 1, dtype=cp.int32)
+    owned = _assemble_homogeneous(
+        FAMILY_TAGS[GeometryFamily.POINT],
+        n_features,
+        cp.ascontiguousarray(d_point_x),
+        cp.ascontiguousarray(d_point_y),
+        d_effective_pairs,
+        d_feature_coord_offsets,
+        None,
+        None,
+        None,
+    )
+    return GeoJSONGpuResult(
+        owned=owned,
+        n_features=n_features,
+        path=source_path,
+        source_nbytes=n,
+        source_mtime_ns=source_mtime_ns,
+        host_bytes=host_bytes,
+    )
+
+
 def read_geojson_gpu(
     source: str | bytes | bytearray | memoryview | Path,
     *,
@@ -379,6 +479,18 @@ def read_geojson_gpu(
     n = len(d_bytes)
     n_i64 = np.int64(n)
     ptr = runtime.pointer
+
+    if not capture_feature_boundaries:
+        compact_point_result = _try_parse_compact_point_geometries(
+            runtime,
+            d_bytes,
+            host_bytes=host_bytes,
+            source_path=source_path,
+            source_mtime_ns=source_mtime_ns,
+            target_crs=target_crs,
+        )
+        if compact_point_result is not None:
+            return compact_point_result
 
     # S1b: Quote parity (0=outside, 1=inside string) via gpu_parse primitive.
     d_quote_parity = quote_parity(d_bytes)
@@ -483,6 +595,59 @@ def read_geojson_gpu(
     mpoly_tag = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
     has_polygons = bool(cp.any(unique_tags == pg_tag))
     has_multipolygons = bool(cp.any(unique_tags == mpoly_tag))
+
+    if single_tag == FAMILY_TAGS[GeometryFamily.POINT]:
+        point_kernels = _point_pair_kernels()
+        d_point_x = cp.empty(n_features, dtype=cp.float64)
+        d_point_y = cp.empty(n_features, dtype=cp.float64)
+        d_point_valid = cp.empty(n_features, dtype=cp.uint8)
+        _launch_kernel(runtime, point_kernels["parse_point_coordinate_pairs"], n_features, (
+            (ptr(d_bytes), ptr(d_coord_positions), ptr(d_point_x), ptr(d_point_y), ptr(d_point_valid),
+             np.int32(n_features), n_i64),
+            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_I32, KERNEL_PARAM_I64),
+        ))
+        if bool(cp.all(d_point_valid).item()):
+            del d_point_valid
+            del d_depth
+
+            if target_crs is not None:
+                from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
+
+                transform_coordinates_inplace(
+                    d_point_x,
+                    d_point_y,
+                    src_crs="EPSG:4326",
+                    dst_crs=target_crs,
+                )
+
+            d_effective_pairs = cp.ones(n_features, dtype=cp.int32)
+            d_feature_coord_offsets = cp.arange(n_features + 1, dtype=cp.int32)
+            del d_bytes
+            del d_coord_positions
+
+            owned = _assemble_homogeneous(
+                single_tag,
+                n_features,
+                cp.ascontiguousarray(d_point_x),
+                cp.ascontiguousarray(d_point_y),
+                d_effective_pairs,
+                d_feature_coord_offsets,
+                None,
+                None,
+                None,
+            )
+            return GeoJSONGpuResult(
+                owned=owned,
+                n_features=n_features,
+                path=source_path,
+                source_nbytes=n,
+                source_mtime_ns=source_mtime_ns,
+                host_bytes=host_bytes,
+                device_feature_starts=d_feat_start_pos,
+                device_feature_ends=d_feat_end_pos,
+            )
+        del d_point_x, d_point_y, d_point_valid
 
     # S3b: Find coordinate span ends
     span_kernels = _coord_span_end_kernels()

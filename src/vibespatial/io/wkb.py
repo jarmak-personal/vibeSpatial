@@ -3,6 +3,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 from importlib.util import find_spec
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -35,7 +36,7 @@ from vibespatial.runtime.fallbacks import (
     record_fallback_event,
     strict_native_mode_enabled,
 )
-from vibespatial.runtime.residency import Residency
+from vibespatial.runtime.residency import Residency, TransferTrigger
 
 from .support import IOFormat, IOOperation, IOPathKind, plan_io_support
 from .wkb_cpu import iter_geometry_parts
@@ -612,9 +613,11 @@ def _build_native_host_attribute_table(df, non_geometry_columns, *, index, pa):
 
 def _write_geoparquet_native_device_payload(
     attribute_frame,
-    geometry_series,
+    geometry_owned,
     path,
     *,
+    geometry_name,
+    geometry_crs,
     index,
     compression,
     geometry_encoding,
@@ -648,9 +651,7 @@ def _write_geoparquet_native_device_payload(
     _RECOGNIZED_KWARGS = {"row_group_size", "max_page_size"}
     recognized_kwargs = {k: v for k, v in kwargs.items() if k in _RECOGNIZED_KWARGS}
     unrecognized_kwargs = {k: v for k, v in kwargs.items() if k not in _RECOGNIZED_KWARGS}
-    geometry_name = getattr(geometry_series, "name", None) or "geometry"
-    geometry_array = geometry_series.array
-    owned = getattr(geometry_array, "_owned", None)
+    owned = geometry_owned
     if owned is None:
         return _NativeDeviceWriteStatus(written=False)
     if owned.residency is not Residency.DEVICE or owned.device_state is None:
@@ -766,8 +767,24 @@ def _write_geoparquet_native_device_payload(
             for child_idx, child_name in enumerate(("xmin", "ymin", "xmax", "ymax")):
                 metadata.column_metadata[idx].child(child_idx).set_name(child_name)
 
+    normalized_geometry_crs = geometry_crs
+    if normalized_geometry_crs is not None and not hasattr(
+        normalized_geometry_crs,
+        "to_json_dict",
+    ):
+        try:
+            from pyproj import CRS
+
+            normalized_geometry_crs = CRS.from_user_input(normalized_geometry_crs)
+        except Exception:
+            pass
+
+    geometry_metadata_view = SimpleNamespace(
+        array=DeviceGeometryArray._from_owned(owned, crs=normalized_geometry_crs),
+        crs=normalized_geometry_crs,
+    )
     geo_metadata = _create_geometry_metadata(
-        {geometry_name: geometry_series},
+        {geometry_name: geometry_metadata_view},
         primary_column=geometry_name,
         schema_version=schema_version,
         geometry_encoding=geometry_encoding_dict,
@@ -793,9 +810,9 @@ def _write_geoparquet_native_device_payload(
     def _geometry_field() -> pa.Field:
         if geometry_encoding_dict[geometry_name] == "WKB":
             field_metadata = {}
-            if geometry_series.crs is not None:
+            if normalized_geometry_crs is not None:
                 try:
-                    crs_json = geometry_series.crs.to_json_dict()
+                    crs_json = normalized_geometry_crs.to_json_dict()
                 except AttributeError:
                     crs_json = None
                 if crs_json is not None:
@@ -835,7 +852,7 @@ def _write_geoparquet_native_device_payload(
             nullable=True,
             metadata=_geoarrow_field_metadata(
                 extension_name=extension_name,
-                crs=geometry_series.crs,
+                crs=normalized_geometry_crs,
             ),
         )
 
@@ -2176,6 +2193,53 @@ def _decode_arrow_wkb_polygon_uniform_fast(array) -> OwnedGeometryArray | None:
     )
     return owned
 
+
+def _promote_arrow_fast_owned_to_device(
+    owned: OwnedGeometryArray | None,
+    *,
+    detail: str,
+) -> OwnedGeometryArray | None:
+    from vibespatial.runtime import ExecutionMode, get_requested_mode
+
+    if owned is None:
+        return None
+    if get_requested_mode() is ExecutionMode.CPU:
+        return owned
+    runtime = get_cuda_runtime()
+    if not runtime.available():
+        return owned
+    owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=detail,
+    )
+    return owned
+
+
+def _try_uniform_arrow_wkb_fast_decode(array) -> OwnedGeometryArray | None:
+    point_fast = _promote_arrow_fast_owned_to_device(
+        _decode_arrow_wkb_point_fast(array),
+        detail="bulk h2d promotion after uniform Arrow WKB point fast parse",
+    )
+    if point_fast is not None:
+        return point_fast
+
+    linestring_uniform_fast = _promote_arrow_fast_owned_to_device(
+        _decode_arrow_wkb_linestring_uniform_fast(array),
+        detail="bulk h2d promotion after uniform Arrow WKB linestring fast parse",
+    )
+    if linestring_uniform_fast is not None:
+        return linestring_uniform_fast
+
+    polygon_uniform_fast = _promote_arrow_fast_owned_to_device(
+        _decode_arrow_wkb_polygon_uniform_fast(array),
+        detail="bulk h2d promotion after uniform Arrow WKB polygon fast parse",
+    )
+    if polygon_uniform_fast is not None:
+        return polygon_uniform_fast
+
+    return None
+
 def _decode_arrow_wkb_multipolygon_fast(array) -> OwnedGeometryArray | None:
     """Decode a WKB Arrow binary column containing only MultiPolygon geometries.
 
@@ -2720,6 +2784,10 @@ def _try_gpu_wkb_list_decode(
 
 
 def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGeometryArray:
+    uniform_fast = _try_uniform_arrow_wkb_fast_decode(array)
+    if uniform_fast is not None:
+        return uniform_fast
+
     gpu_attempt = _try_gpu_wkb_arrow_decode(array, on_invalid=on_invalid)
     if gpu_attempt.result is not None:
         return gpu_attempt.result
@@ -2732,15 +2800,6 @@ def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGe
             pipeline="io/wkb_decode",
             d2h_transfer=True,
         )
-    point_fast = _decode_arrow_wkb_point_fast(array)
-    if point_fast is not None:
-        return point_fast
-    linestring_uniform_fast = _decode_arrow_wkb_linestring_uniform_fast(array)
-    if linestring_uniform_fast is not None:
-        return linestring_uniform_fast
-    polygon_uniform_fast = _decode_arrow_wkb_polygon_uniform_fast(array)
-    if polygon_uniform_fast is not None:
-        return polygon_uniform_fast
     linestring_fast = _decode_arrow_wkb_linestring_fast(array)
     if linestring_fast is not None:
         return linestring_fast

@@ -40,16 +40,16 @@ def test_stable_shapefile_repeat_enforces_minimum_samples() -> None:
     assert _stable_shapefile_repeat(5) == 5
 
 
-def test_io_file_smoke_suite_keeps_geojson_informational() -> None:
+def test_io_file_smoke_suite_tracks_public_geojson_pipeline() -> None:
     results = benchmark_io_file_suite(suite="smoke", repeat=1)
     by_id = {result.case_id: result for result in results}
 
     assert "shapefile-point-10000" in by_id
     assert "shapefile-line-10000" in by_id
     assert "shapefile-polygon-5000" in by_id
-    assert "geojson-point-10000" in by_id
-    assert by_id["geojson-point-10000"].enforced is False
-    assert by_id["geojson-point-10000"].status in {"pass", "informational"}
+    assert "geojson-point-pipeline-10000" in by_id
+    assert by_id["geojson-point-pipeline-10000"].enforced is True
+    assert by_id["geojson-point-pipeline-10000"].status in {"pass", "fail", "unavailable"}
 
     payload = json.loads(io_suite_to_json(results, suite="smoke", repeat=1, scope="io-file"))
     assert payload["metadata"]["scope"] == "io-file"

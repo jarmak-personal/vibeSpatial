@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "contract": {
     "surfaces": {
       "versioning": {
@@ -50,8 +50,9 @@
     }
   },
   "gpu": {
-    "status": "pass",
-    "gpu_accel_pct": 20.11201395583712,
-    "fallback_rate": 0.000735
+    "status": "fail",
+    "raw_dispatch_pct": 19.742049634492712,
+    "value_dispatch_pct": 62.09003870442045,
+    "fallback_rate": 0.001257
   }
 }

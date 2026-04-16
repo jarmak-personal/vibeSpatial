@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -733,6 +734,36 @@ def plan_shapefile_ingest(*, prefer: str = "auto") -> ShapefileIngestPlan:
     )
 
 
+def _supports_direct_shapefile_geometry_decode(source: str | Path) -> bool:
+    """True when the direct SHP decoder can preserve the source geometry model.
+
+    The current direct SHP path is correct for Point, MultiPoint, and PolyLine
+    records. Polygon records still need the Arrow/WKB boundary because SHP
+    polygons can encode multipart exterior rings within a single record, and the
+    direct decoder does not yet rebuild those as MultiPolygon geometries.
+    """
+    try:
+        from .shp_gpu import (
+            SHP_MULTIPOINT,
+            SHP_POINT,
+            SHP_POLYLINE,
+            _read_shx_index,
+        )
+    except Exception:
+        return False
+
+    source_path = Path(source)
+    if source_path.suffix.lower() != ".shp":
+        return False
+
+    try:
+        header, _, _ = _read_shx_index(source_path.with_suffix(".shx"))
+    except Exception:
+        return False
+
+    return header.shape_type in {SHP_POINT, SHP_MULTIPOINT, SHP_POLYLINE}
+
+
 def _normalize_feature_window(rows) -> tuple[int, int | None]:
     if rows is None:
         return 0, None
@@ -826,12 +857,14 @@ def read_geojson_native(
     source: str | Path,
     *,
     prefer: str = "auto",
+    objective: str = "pipeline",
     track_properties: bool = True,
     target_crs: str | None = None,
 ):
     batch = read_geojson_owned(
         source,
         prefer=prefer,
+        objective=objective,
         track_properties=track_properties,
     )
     effective_crs = _resolve_target_crs_for_owned(
@@ -869,7 +902,7 @@ def read_shapefile_owned(
     **kwargs,
 ) -> ShapefileOwnedBatch:
     plan = plan_shapefile_ingest()
-    direct_supported = (
+    direct_eligible = (
         bbox is None
         and columns is None
         and rows is None
@@ -877,6 +910,7 @@ def read_shapefile_owned(
         and isinstance(source, str | Path)
         and "://" not in str(source)
     )
+    direct_supported = direct_eligible and _supports_direct_shapefile_geometry_decode(source)
     if direct_supported:
         payload = _try_shapefile_shp_direct_gpu_read_native(source)
         if payload is not None:
@@ -901,25 +935,10 @@ def read_shapefile_owned(
                 metadata=metadata,
             )
 
-        record_fallback_event(
-            surface="vibespatial.io.shapefile",
-            reason=(
-                "direct SHP GPU decode unavailable for this source; falling back to the "
-                "Arrow WKB compatibility path"
-            ),
-            detail=str(source),
-            pipeline="io/read_shapefile_owned",
-        )
-    elif plan.selected_strategy == "shp-direct-gpu":
-        record_fallback_event(
-            surface="vibespatial.io.shapefile",
-            reason=(
-                "direct SHP GPU decode requires an unfiltered local-file read with no "
-                "bbox, column projection, row window, or pyogrio-specific kwargs"
-            ),
-            detail=str(source),
-            pipeline="io/read_shapefile_owned",
-        )
+    # Falling through here is still the supported native path for Shapefile
+    # reads. The Arrow/WKB route uses CPU container parsing plus native GPU WKB
+    # decode, so it should be surfaced as a dispatch choice, not as a strict-
+    # mode fallback event.
 
     fallback_plan = plan_shapefile_ingest(prefer="arrow-wkb")
     import pyogrio
@@ -1038,11 +1057,17 @@ def plan_vector_file_io(
     if normalized_driver == "GeoJSON":
         io_format = IOFormat.GEOJSON
         implementation = "geojson_hybrid_adapter"
-        reason = "GeoJSON stays a staged hybrid path with pyogrio-first routing."
+        reason = (
+            "GeoJSON stays a staged hybrid path with pipeline-oriented auto routing "
+            "that prefers the repo-owned GPU ingest path for unfiltered reads."
+        )
     elif normalized_driver == "ESRI Shapefile":
         io_format = IOFormat.SHAPEFILE
         implementation = "shapefile_hybrid_adapter"
-        reason = "Shapefile stays an explicit hybrid path because the container remains host-oriented."
+        reason = (
+            "Shapefile stays an explicit hybrid path with pipeline-oriented auto routing "
+            "that prefers the repo-owned native read plan on eligible public reads."
+        )
     elif normalized_driver == "WKT":
         io_format = IOFormat.WKT
         implementation = "wkt_gpu_hybrid_adapter"
@@ -1077,12 +1102,11 @@ def plan_vector_file_io(
         reason = "File Geodatabase uses pyogrio Arrow container parse with GPU WKB geometry decode."
     elif normalized_driver == "FlatGeobuf":
         io_format = IOFormat.FLATGEOBUF
-        implementation = "flatgeobuf_pyogrio_arrow_gpu_wkb"
+        implementation = "flatgeobuf_gpu_hybrid_adapter"
         reason = (
-            "FlatGeobuf defaults to pyogrio Arrow container parse with GPU WKB "
-            "geometry decode. The direct GPU FlatBuffer decoder remains "
-            "available for targeted experimentation, but the Arrow path is the "
-            "faster default on real datasets."
+            "FlatGeobuf stays hybrid: eligible local unfiltered reads prefer the "
+            "repo-owned direct FlatBuffer GPU decoder, while explicit pyogrio and "
+            "container-shaped requests stay on the shared Arrow/WKB native boundary."
         )
     elif normalized_driver == "GML":
         io_format = IOFormat.GML
@@ -1737,16 +1761,78 @@ def _try_fgb_gpu_read_native(filename, *, target_crs: str | None = None):
     )
 
 
-# Minimum file size (in bytes) for GPU fast-path routing.
-# Below this threshold, let the CPU handle it -- kernel launch overhead
-# dominates for small files.
+# Minimum file size (in bytes) for direct GPU byte-classify routing on formats
+# that still need a coarse size gate. GeoJSON intentionally bypasses this:
+# unfiltered public reads prefer the repo-owned GPU ingest path so the first
+# downstream GPU consumer does not pay an immediate host-to-device promotion.
 _GPU_MIN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+_GEOJSON_POINT_TYPE_PATTERN = re.compile(rb'"type"\s*:\s*"Point"')
+_GEOJSON_NON_POINT_TYPE_PATTERN = re.compile(
+    rb'"type"\s*:\s*"(?:LineString|Polygon|MultiPoint|MultiLineString|MultiPolygon|GeometryCollection)"'
+)
+
+
+def _prefer_pipeline_native_read(plan: VectorFilePlan) -> bool:
+    return plan.format in {
+        IOFormat.GEOJSON,
+        IOFormat.SHAPEFILE,
+    }
+
+
+def _geojson_pipeline_prefers_gpu_for_source(filename) -> bool:
+    if not isinstance(filename, str | Path):
+        return False
+    path = Path(filename)
+    if not path.exists() or not path.is_file():
+        return False
+    try:
+        payload = path.read_bytes()
+    except OSError:
+        return False
+    if not _GEOJSON_POINT_TYPE_PATTERN.search(payload):
+        return False
+    return _GEOJSON_NON_POINT_TYPE_PATTERN.search(payload) is None
+
+
+def _supports_explicit_pyogrio_native_read(plan: VectorFilePlan, engine, filename) -> bool:
+    if not isinstance(filename, str | Path):
+        return False
+    if not Path(filename).exists():
+        return False
+    return engine == "pyogrio" and plan.format in {
+        IOFormat.GEOPACKAGE,
+        IOFormat.FILE_GEODATABASE,
+        IOFormat.FLATGEOBUF,
+        IOFormat.GML,
+        IOFormat.GPX,
+        IOFormat.TOPOJSON,
+        IOFormat.GEOJSONSEQ,
+    }
+
+
+def _supports_direct_flatgeobuf_native_read(
+    filename,
+    *,
+    engine,
+    bbox,
+    columns,
+    rows,
+    kwargs,
+) -> bool:
+    if engine is not None or bbox is not None or columns is not None or rows is not None:
+        return False
+    if kwargs:
+        return False
+    if not isinstance(filename, str | Path):
+        return False
+    return "://" not in str(filename)
 
 
 def _try_gpu_read_file_native(
     filename,
     *,
     plan,
+    engine=None,
     bbox,
     columns,
     rows,
@@ -1934,58 +2020,106 @@ def _try_gpu_read_file_native(
                 )
                 return payload
 
-        if plan.format is IOFormat.SHAPEFILE and file_size > _GPU_MIN_FILE_SIZE:
-            payload = _try_shapefile_shp_direct_gpu_read_native(
-                filename,
-                target_crs=target_crs,
-            )
-            if payload is not None:
-                record_dispatch_event(
-                    surface="geopandas.read_file",
-                    operation="read_file",
-                    implementation="shapefile_shp_direct_gpu_adapter",
-                    reason=(
-                        "GPU-native Shapefile read: direct SHP binary decode on GPU "
-                        "(no WKB intermediate), GPU DBF parser for attributes."
-                    ),
-                    selected=ExecutionMode.GPU,
-                )
-                return payload
-            payload = _try_shapefile_dbf_gpu_read_native(
-                filename,
-                target_crs=target_crs,
-            )
-            if payload is not None:
-                record_dispatch_event(
-                    surface="geopandas.read_file",
-                    operation="read_file",
-                    implementation="shapefile_gpu_dbf_adapter",
-                    reason=(
-                        "GPU-dominant Shapefile read: pyogrio Arrow for geometry with "
-                        "GPU WKB decode, GPU DBF parser for numeric attributes."
-                    ),
-                    selected=ExecutionMode.GPU,
-                )
-                return payload
-
-        if plan.format is IOFormat.GEOJSON and file_size > _GPU_MIN_FILE_SIZE:
-            from .geojson_gpu import read_geojson_gpu
-
-            payload = _native_geojson_result_from_gpu_result(
-                read_geojson_gpu(file_path, target_crs=target_crs),
+        if plan.format is IOFormat.SHAPEFILE and _prefer_pipeline_native_read(plan):
+            payload = read_shapefile_native(
+                file_path,
                 target_crs=target_crs,
             )
             record_dispatch_event(
                 surface="geopandas.read_file",
                 operation="read_file",
-                implementation="geojson_gpu_byte_classify_adapter",
+                implementation="shapefile_native_pipeline_gpu_adapter",
                 reason=(
-                    "GPU byte-classification: direct GPU parsing of GeoJSON with "
-                    "NVRTC kernels, bypassing pyogrio for geometry."
+                    "Pipeline-oriented Shapefile ingest prefers the repo-owned native "
+                    "read plan so public read_file can use direct SHP GPU decode when "
+                    "available and fall back to Arrow/WKB only when required."
                 ),
                 selected=ExecutionMode.GPU,
             )
             return payload
+
+        if plan.format is IOFormat.GEOJSON and _prefer_pipeline_native_read(plan):
+            geojson_plan = plan_geojson_ingest(
+                prefer="auto" if _geojson_pipeline_prefers_gpu_for_source(file_path) else "fast-json",
+                objective="pipeline",
+            )
+            try:
+                payload = read_geojson_native(
+                    file_path,
+                    prefer=geojson_plan.selected_strategy,
+                    objective=geojson_plan.objective,
+                    target_crs=target_crs,
+                )
+                selected = (
+                    ExecutionMode.GPU
+                    if geojson_plan.selected_strategy == "gpu-byte-classify"
+                    else ExecutionMode.CPU
+                )
+            except Exception as exc:
+                record_fallback_event(
+                    surface="geopandas.read_file",
+                    reason=(
+                        "GPU byte-classify GeoJSON ingest failed; falling back to the "
+                        "repo-owned fast-json path"
+                    ),
+                    detail=str(exc),
+                    selected=ExecutionMode.CPU,
+                    pipeline="io/read_file",
+                    d2h_transfer=False,
+                )
+                geojson_plan = plan_geojson_ingest(prefer="fast-json", objective="pipeline")
+                payload = read_geojson_native(
+                    file_path,
+                    prefer=geojson_plan.selected_strategy,
+                    objective=geojson_plan.objective,
+                    target_crs=target_crs,
+                )
+                selected = ExecutionMode.CPU
+            record_dispatch_event(
+                surface="geopandas.read_file",
+                operation="read_file",
+                implementation=f"{geojson_plan.implementation}_adapter",
+                reason=geojson_plan.reason,
+                selected=selected,
+            )
+            return payload
+
+        if plan.format is IOFormat.FLATGEOBUF and _supports_direct_flatgeobuf_native_read(
+            filename,
+            engine=engine,
+            bbox=bbox,
+            columns=columns,
+            rows=rows,
+            kwargs=kwargs,
+        ):
+            try:
+                payload = _try_fgb_gpu_read_native(filename, target_crs=target_crs)
+            except Exception as exc:
+                record_fallback_event(
+                    surface="geopandas.read_file",
+                    reason=(
+                        "GPU direct FlatGeobuf decode failed; falling back to the "
+                        "pyogrio Arrow/WKB native bridge"
+                    ),
+                    detail=str(exc),
+                    selected=ExecutionMode.GPU,
+                    pipeline="io/read_file",
+                    d2h_transfer=False,
+                )
+            else:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="flatgeobuf_gpu_direct_decode_adapter",
+                    reason=(
+                        "Pipeline-oriented FlatGeobuf ingest prefers the repo-owned "
+                        "direct FlatBuffer GPU decoder for eligible local unfiltered "
+                        "reads; explicit engine='pyogrio' stays on the shared Arrow/WKB "
+                        "native boundary."
+                    ),
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
 
     skip_features, max_features = _normalize_feature_window(rows)
     arrow_columns = columns
@@ -2039,6 +2173,7 @@ def _try_gpu_read_file(
     filename,
     *,
     plan,
+    engine=None,
     bbox,
     columns,
     rows,
@@ -2057,6 +2192,7 @@ def _try_gpu_read_file(
         payload = _try_gpu_read_file_native(
             filename,
             plan=plan,
+            engine=engine,
             bbox=bbox,
             columns=columns,
             rows=rows,
@@ -2163,10 +2299,16 @@ def read_vector_file_native(
         and mask is None
         and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
     )
-    if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
+    allow_native_with_explicit_pyogrio = _supports_explicit_pyogrio_native_read(plan, engine, filename)
+    if (
+        plan.format in _GPU_DISPATCH_FORMATS
+        and mask is None
+        and (engine is None or allow_native_with_explicit_pyogrio)
+    ):
         payload = _try_gpu_read_file_native(
             filename,
             plan=plan,
+            engine=engine,
             bbox=bbox,
             columns=columns,
             rows=rows,
@@ -2263,19 +2405,25 @@ def read_vector_file(
     Geodatabase, FlatGeobuf, GeoJSON, GeoJSON-Seq, GML, GPX, TopoJSON,
     WKT, CSV, KML, OSM PBF, and any format readable by pyogrio/fiona.
 
-    GPU acceleration is automatic for GeoJSON, Shapefile, WKT, CSV, KML,
-    and OSM PBF formats.  For CSV, KML, GeoJSON, and Shapefile, GPU
-    acceleration activates only for files larger than 10 MB (below this
-    threshold, CPU is faster due to kernel launch overhead).  WKT and
-    full-data OSM PBF reads use the native GPU path. Standard OSM layers
-    (``points``, ``lines``, ``multipolygons``) may use the pyogrio
-    compatibility path when the native all-data parser is not required.
+    GPU acceleration is automatic for GeoJSON, Shapefile, FlatGeobuf, WKT,
+    CSV, KML, and OSM PBF formats. GeoJSON and Shapefile auto-routing now
+    optimize for pipeline shape rather than isolated read latency: eligible
+    unfiltered reads prefer the repo-owned native ingest path so downstream
+    GPU work does not immediately pay a host-to-device promotion. FlatGeobuf
+    now follows the same policy for eligible local unfiltered reads, using
+    the repo-owned direct FlatBuffer decoder by default. CSV and KML still
+    use a coarse 10 MB direct-GPU threshold where launch overhead dominates
+    on very small files. WKT and full-data OSM PBF reads use the native GPU
+    path. Standard OSM layers (``points``, ``lines``, ``multipolygons``)
+    may use the pyogrio compatibility path when the native all-data parser
+    is not required.
 
-    The GPU fast path is disabled when any of ``bbox``, ``columns``,
-    ``rows``, or ``mask`` parameters are specified, or when ``engine``
-    is explicitly set.  In those cases the reader falls through to the
-    CPU pyogrio/fiona path, except for pyogrio-backed GPU WKB routes that
-    still operate through the shared native read boundary.
+    ``mask`` still disables the GPU-native read path. ``bbox``, ``columns``,
+    and ``rows`` continue to work on the promoted pyogrio-backed vector
+    containers through the shared native Arrow/WKB boundary. Explicit
+    ``engine="pyogrio"`` stays on that native pyogrio-backed boundary for
+    GeoPackage, FileGDB, FlatGeobuf, GML, GPX, TopoJSON, and GeoJSON-Seq;
+    other explicit engine selections fall through to the compatibility path.
 
     Aliased as ``vibespatial.read_file()``.
 
@@ -2381,10 +2529,16 @@ def read_vector_file(
         and mask is None
         and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
     )
-    if plan.format in _GPU_DISPATCH_FORMATS and mask is None and engine is None:
+    allow_native_with_explicit_pyogrio = _supports_explicit_pyogrio_native_read(plan, engine, filename)
+    if (
+        plan.format in _GPU_DISPATCH_FORMATS
+        and mask is None
+        and (engine is None or allow_native_with_explicit_pyogrio)
+    ):
         gpu_result = _try_gpu_read_file(
             filename,
             plan=plan,
+            engine=engine,
             bbox=bbox,
             columns=columns,
             rows=rows,

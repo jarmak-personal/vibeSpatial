@@ -275,6 +275,26 @@ def test_native_tabular_to_arrow_supports_geometry_only_payload() -> None:
     assert roundtrip.geometry.iloc[1].equals(Point(1, 1))
 
 
+def test_native_tabular_to_arrow_wkb_owned_skips_geoseries_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    monkeypatch.setattr(
+        GeometryNativeResult,
+        "to_geoseries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("WKB arrow export should not need GeoSeries materialization when owned geometry is available")
+        ),
+    )
+
+    table = pa.table(payload.to_arrow(geometry_encoding="WKB"))
+
+    assert table.column_names == ["geometry"]
+    assert len(table) == 2
+
+
 def test_decode_wkb_owned_large_native_list_uses_direct_device_pipeline(monkeypatch) -> None:
     if not has_gpu_runtime():
         return
@@ -377,6 +397,7 @@ def test_decode_wkb_owned_records_fallback_when_staged_gpu_decode_misses(monkeyp
 
 def test_decode_wkb_arrow_array_records_fallback_when_gpu_bridge_misses(monkeypatch) -> None:
     geopandas.clear_fallback_events()
+    monkeypatch.setattr(io_wkb, "_try_uniform_arrow_wkb_fast_decode", lambda _array: None)
     monkeypatch.setattr(
         io_wkb,
         "_try_gpu_wkb_arrow_decode",
@@ -1586,6 +1607,42 @@ def test_decode_wkb_arrow_point_partial_nan_rows_preserve_coordinates() -> None:
     assert y1 == 1.0
     assert restored[2].is_empty
     assert restored[3] is None
+
+
+def test_decode_wkb_arrow_uniform_fast_paths_skip_generic_gpu_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("uniform Arrow WKB fast paths should run before the generic GPU bridge")
+
+    monkeypatch.setattr("vibespatial.io.wkb._try_gpu_wkb_arrow_decode", _boom)
+
+    point_arrow = pa.array([Point(0, 0).wkb, Point(1, 1).wkb], type=pa.binary())
+    point_restored = io_wkb.decode_wkb_arrow_array_owned(point_arrow).to_shapely()
+    assert point_restored[0].equals(Point(0, 0))
+    assert point_restored[1].equals(Point(1, 1))
+
+    line_arrow = pa.array(
+        [
+            LineString([(0, 0), (1, 1)]).wkb,
+            LineString([(2, 2), (3, 3)]).wkb,
+        ],
+        type=pa.binary(),
+    )
+    line_restored = io_wkb.decode_wkb_arrow_array_owned(line_arrow).to_shapely()
+    assert line_restored[0].equals(LineString([(0, 0), (1, 1)]))
+    assert line_restored[1].equals(LineString([(2, 2), (3, 3)]))
+
+    polygon_arrow = pa.array(
+        [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]).wkb,
+            Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]).wkb,
+        ],
+        type=pa.binary(),
+    )
+    polygon_restored = io_wkb.decode_wkb_arrow_array_owned(polygon_arrow).to_shapely()
+    assert polygon_restored[0].equals(Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]))
+    assert polygon_restored[1].equals(Polygon([(2, 2), (3, 2), (3, 3), (2, 2)]))
 
 
 @pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
@@ -2808,6 +2865,39 @@ def test_arrow_backed_native_attributes_device_parquet_without_pandas_materializ
     assert table.column_names == ["value", "geometry"]
     assert table.schema.metadata is not None
     assert b"geo" in table.schema.metadata
+
+
+@pytest.mark.skipif(not has_pylibcudf_support(), reason="pylibcudf not available")
+def test_native_tabular_device_parquet_skips_geoseries_materialization(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import pyarrow.parquet as pq
+
+    _gdf, owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+    payload = NativeTabularResult(
+        attributes=NativeAttributeTable(
+            arrow_table=pa.table({"value": [1, 2]}),
+            index_override=pd.RangeIndex(2),
+        ),
+        geometry=GeometryNativeResult.from_owned(owned, crs="EPSG:4326"),
+        geometry_name="geometry",
+        column_order=("value", "geometry"),
+    )
+
+    monkeypatch.setattr(
+        GeometryNativeResult,
+        "to_geoseries",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("native device parquet write should not need GeoSeries materialization on the fast path")
+        ),
+    )
+
+    path = tmp_path / "native-device-no-geoseries.parquet"
+    payload.to_parquet(path)
+    table = pq.read_table(path)
+
+    assert table.column_names == ["value", "geometry"]
 
 
 def test_lazy_native_attribute_table_take_preserves_loader() -> None:
