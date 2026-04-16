@@ -28,6 +28,7 @@ from vibespatial.api._native_results import (
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.file import (
+    _materialize_native_file_read_result,
     _native_file_result_from_owned,
     _native_geojson_result_from_gpu_result,
     _pyogrio_arrow_wkb_to_native_tabular_result,
@@ -199,6 +200,58 @@ def test_public_strict_mixed_geojson_read_uses_gpu_adapter() -> None:
     assert result.geom_type.tolist() == expected.geom_type.tolist()
     for expected_geom, actual_geom in zip(expected.geometry, result.geometry, strict=True):
         assert expected_geom.equals_exact(actual_geom, 0.0)
+
+
+@pytest.mark.gpu
+def test_public_geojson_read_preserves_null_geometry_features(tmp_path) -> None:
+    path = tmp_path / "null-features.geojson"
+    path.write_text(
+        """
+        {
+          "type": "FeatureCollection",
+          "features": [
+            {
+              "type": "Feature",
+              "properties": {"Name": "Null Geometry"},
+              "geometry": null
+            },
+            {
+              "type": "Feature",
+              "properties": {"Name": "SF to NY"},
+              "geometry": {
+                "type": "LineString",
+                "coordinates": [[-122.4051293283311, 37.786780113640894], [-73.859832357849271, 40.487594916296196]]
+              }
+            }
+          ]
+        }
+        """
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert len(result) == 2
+    assert result["Name"].tolist() == ["Null Geometry", "SF to NY"]
+    assert result.geometry.iloc[0] is None
+    assert result.geometry.iloc[1].geom_type == "LineString"
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+
+
+@pytest.mark.gpu
+def test_public_geojson_read_ignores_root_crs_properties_objects_for_feature_count() -> None:
+    path = Path("tests/upstream/geopandas/tests/data/null_geom.geojson")
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert len(result) == 2
+    assert result["Name"].tolist() == ["Null Geometry", "SF to NY"]
+    assert result.geometry.iloc[0] is None
+    assert result.geometry.iloc[1].geom_type == "LineString"
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
 
 
 @pytest.mark.gpu
@@ -1761,7 +1814,7 @@ def test_read_vector_file_native_explicit_pyogrio_keeps_promoted_container_on_na
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
-def test_public_read_file_explicit_pyogrio_keeps_promoted_container_on_native_gpu_path(
+def test_public_read_file_explicit_pyogrio_geopackage_uses_compatibility_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -1769,26 +1822,41 @@ def test_public_read_file_explicit_pyogrio_keeps_promoted_container_on_native_gp
     frame = _sample_frame()
     frame.to_file(path, driver="GPKG")
 
-    payload = read_vector_file_native(path)
     calls: list[dict[str, object]] = []
-
-    def _fake_try_gpu_read_file(*args, **kwargs):
-        calls.append(kwargs)
-        return payload.to_geodataframe()
-
-    monkeypatch.setattr("vibespatial.io.file._try_gpu_read_file", _fake_try_gpu_read_file)
     monkeypatch.setattr(
         "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: calls.append(_kwargs) or frame.copy(),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_gpu_read_file",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("explicit pyogrio on promoted vector containers should not force host compatibility read")
+            AssertionError("explicit pyogrio GeoPackage reads should use vendored compatibility semantics")
         ),
     )
 
-    geopandas.clear_dispatch_events()
     result = geopandas.read_file(path, engine="pyogrio")
 
     assert calls
     assert result["id"].tolist() == frame["id"].tolist()
+
+
+def test_materialize_native_file_read_result_parses_mixed_offset_strings_to_utc() -> None:
+    class _FakePayload:
+        def to_geodataframe(self):
+            return geopandas.GeoDataFrame(
+                {
+                    "date": [
+                        "2014-08-26 10:01:23.040001+02:00",
+                        "2019-03-07 17:31:43.118999+01:00",
+                    ],
+                    "geometry": [Point(0, 0), Point(1, 1)],
+                },
+                crs="EPSG:4326",
+            )
+
+    result = _materialize_native_file_read_result(_FakePayload())
+
+    assert str(result["date"].dtype) == "datetime64[ms, UTC]"
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")

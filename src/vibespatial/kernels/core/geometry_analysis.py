@@ -58,6 +58,14 @@ def _current_cuda_stream():
     return cp.cuda.get_current_stream()
 
 
+def _resolve_bounds_dispatch_mode(dispatch_mode: ExecutionMode | str) -> ExecutionMode:
+    mode = ExecutionMode(dispatch_mode)
+    if mode is not ExecutionMode.AUTO:
+        return mode
+    runtime = get_cuda_runtime()
+    return ExecutionMode.GPU if runtime.available() else ExecutionMode.CPU
+
+
 def _compute_geometry_bounds_cpu_scalar(geometry_array: OwnedGeometryArray):
     return _compute_geometry_bounds_cpu_scalar_host(geometry_array)
 
@@ -488,10 +496,11 @@ def compute_geometry_bounds_device(
 def compute_geometry_bounds(
     geometry_array: OwnedGeometryArray,
     *,
-    dispatch_mode: ExecutionMode | str = ExecutionMode.CPU,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ):
     normalize_precision_mode(precision)
+    dispatch_mode = _resolve_bounds_dispatch_mode(dispatch_mode)
     row_count = geometry_array.row_count
     geometry_families = tuple(sorted(family.value for family in geometry_array.families))
 
@@ -573,10 +582,11 @@ def compute_geometry_bounds(
 def compute_total_bounds(
     geometry_array: OwnedGeometryArray,
     *,
-    dispatch_mode: ExecutionMode | str = ExecutionMode.CPU,
+    dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> tuple[float, float, float, float]:
     normalize_precision_mode(precision)
+    dispatch_mode = _resolve_bounds_dispatch_mode(dispatch_mode)
     bounds = compute_geometry_bounds(geometry_array, dispatch_mode=dispatch_mode, precision=precision)
     return compute_total_bounds_from_bounds(bounds)
 

@@ -317,6 +317,76 @@ def test_empty_geometry(tmp_path):
     assert owned.validity[1]
 
 
+@needs_gpu
+def test_null_geometry_feature_is_preserved(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": 1, "label": "null"},
+                "geometry": None,
+            },
+            {
+                "type": "Feature",
+                "properties": {"id": 2, "label": "line"},
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [[0, 0], [1, 1]],
+                },
+            },
+        ],
+    }
+    path = tmp_path / "test_null_geometry.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+
+    assert batch.geometry.row_count == 2
+    assert len(batch.geometry.validity) == 2
+    assert not batch.geometry.validity[0]
+    assert batch.geometry.validity[1]
+    assert batch.properties == [
+        {"id": 1, "label": "null"},
+        {"id": 2, "label": "line"},
+    ]
+
+
+@needs_gpu
+def test_null_geometry_feature_is_preserved_for_point_fast_path(tmp_path):
+    fc = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": 1, "label": "null"},
+                "geometry": None,
+            },
+            {
+                "type": "Feature",
+                "properties": {"id": 2, "label": "point"},
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [1.5, 2.5],
+                },
+            },
+        ],
+    }
+    path = tmp_path / "test_null_point_geometry.geojson"
+    _write_geojson(path, fc)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+
+    assert batch.geometry.row_count == 2
+    assert len(batch.geometry.validity) == 2
+    assert not batch.geometry.validity[0]
+    assert batch.geometry.validity[1]
+    assert batch.properties == [
+        {"id": 1, "label": "null"},
+        {"id": 2, "label": "point"},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Test 5: Float precision — negatives, scientific notation, many decimals
 # ---------------------------------------------------------------------------

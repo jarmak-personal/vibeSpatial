@@ -470,6 +470,8 @@ def clip_by_rect_cpu(
         if shapely_values is not None:
             candidate_shapely = shapely_values[candidate_rows]
         else:
+            if any(not buffer.host_materialized for buffer in owned.families.values()):
+                owned._ensure_host_state()
             candidate_shapely = materialize_candidates_vectorized(owned, candidate_rows)
         clipped = shapely.clip_by_rect(candidate_shapely, *rect)
         result[candidate_rows] = np.asarray(clipped, dtype=object)

@@ -9,6 +9,7 @@ from vibespatial import (
     GeoSeries,
     Residency,
     compute_geometry_bounds,
+    compute_total_bounds,
     from_shapely_geometries,
     has_gpu_runtime,
 )
@@ -63,6 +64,30 @@ def test_gpu_bounds_runs_from_device_resident_buffers() -> None:
     assert np.isnan(gpu_bounds[2]).all()
 
 
+def test_default_compute_geometry_bounds_records_gpu_selection_when_runtime_available(
+    tmp_path, monkeypatch
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    event_log_path = tmp_path / "events.jsonl"
+    monkeypatch.setenv(EVENT_LOG_ENV_VAR, str(event_log_path))
+
+    owned = from_shapely_geometries(_sample_geometries())
+    default_bounds = compute_geometry_bounds(owned)
+
+    assert np.allclose(default_bounds[0], np.asarray([1.0, 2.0, 1.0, 2.0]), equal_nan=True)
+
+    records = read_event_records(event_log_path)
+    bounds_dispatches = [
+        record
+        for record in records
+        if record.get("event_type") == "dispatch" and record.get("surface") == "geopandas.array.bounds"
+    ]
+    assert bounds_dispatches
+    assert bounds_dispatches[-1]["selected"] == "gpu"
+
+
 def test_public_bounds_dispatch_records_gpu_selection_when_runtime_available(
     tmp_path, monkeypatch
 ) -> None:
@@ -76,6 +101,30 @@ def test_public_bounds_dispatch_records_gpu_selection_when_runtime_available(
     default_bounds = series.geometry.values.bounds
 
     assert np.allclose(default_bounds[0], np.asarray([1.0, 2.0, 1.0, 2.0]), equal_nan=True)
+
+    records = read_event_records(event_log_path)
+    bounds_dispatches = [
+        record
+        for record in records
+        if record.get("event_type") == "dispatch" and record.get("surface") == "geopandas.array.bounds"
+    ]
+    assert bounds_dispatches
+    assert bounds_dispatches[-1]["selected"] == "gpu"
+
+
+def test_default_compute_total_bounds_records_gpu_selection_when_runtime_available(
+    tmp_path, monkeypatch
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    event_log_path = tmp_path / "events.jsonl"
+    monkeypatch.setenv(EVENT_LOG_ENV_VAR, str(event_log_path))
+
+    owned = from_shapely_geometries(_sample_geometries())
+    total_bounds = compute_total_bounds(owned)
+
+    assert np.allclose(total_bounds, np.asarray([0.0, 0.0, 21.0, 21.0]), equal_nan=True)
 
     records = read_event_records(event_log_path)
     bounds_dispatches = [

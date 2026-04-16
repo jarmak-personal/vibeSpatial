@@ -77,6 +77,43 @@ def test_clip_by_rect_owned_preserves_polygon_holes() -> None:
     assert result.fallback_rows.size == 0
 
 
+@pytest.mark.gpu
+def test_clip_by_rect_cpu_materializes_device_backed_multipoints_before_host_bridge() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    owned = _make_device_resident_with_host_stubs_cleared(
+        [
+            MultiPoint([(-12.0, -15.0), (2.0, 2.0), (3.0, 4.0), (9.0, 8.0)]),
+            Point(-11.0, -14.0),
+        ]
+    )
+
+    result = clip_by_rect_owned(
+        owned,
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        dispatch_mode=ExecutionMode.CPU,
+    )
+    expected = shapely.clip_by_rect(
+        np.asarray(
+            [
+                MultiPoint([(-12.0, -15.0), (2.0, 2.0), (3.0, 4.0), (9.0, 8.0)]),
+                Point(-11.0, -14.0),
+            ],
+            dtype=object,
+        ),
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+    )
+
+    _assert_geometries_match(result.geometries.tolist(), list(expected))
+
+
 def test_clip_by_rect_owned_falls_back_for_invalid_polygon_rows() -> None:
     invalid = Polygon([(0, 0), (2, 2), (0, 2), (2, 0), (0, 0)])
 

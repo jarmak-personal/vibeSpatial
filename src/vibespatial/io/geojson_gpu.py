@@ -36,6 +36,8 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     OwnedGeometryArray,
     _device_gather_offset_slices,
+    build_null_owned_array,
+    device_concat_owned_scatter,
 )
 from vibespatial.io.geojson_gpu_kernels import (
     _CLASSIFY_TYPE_NAMES,
@@ -66,6 +68,7 @@ from vibespatial.io.gpu_parse.numeric import (
 )
 from vibespatial.io.gpu_parse.pattern import mark_spans
 from vibespatial.io.gpu_parse.structural import bracket_depth, quote_parity
+from vibespatial.runtime.residency import Residency
 
 from .pylibcudf import _build_device_mixed_owned, _build_device_single_family_owned
 
@@ -509,28 +512,6 @@ def read_geojson_gpu(
     del d_hits
     n_features = int(len(d_coord_positions))
 
-    if n_features == 0:
-        # Empty file — return empty Point geometry
-        owned = _build_device_single_family_owned(
-            family=GeometryFamily.POINT,
-            validity_device=cp.ones(0, dtype=cp.bool_),
-            x_device=cp.empty(0, dtype=cp.float64),
-            y_device=cp.empty(0, dtype=cp.float64),
-            geometry_offsets_device=cp.zeros(1, dtype=cp.int32),
-            empty_mask_device=cp.zeros(0, dtype=cp.bool_),
-            detail="GPU byte-classification GeoJSON parse (empty)",
-        )
-        return GeoJSONGpuResult(
-            owned=owned,
-            n_features=0,
-            path=source_path,
-            source_nbytes=n,
-            source_mtime_ns=source_mtime_ns,
-            host_bytes=host_bytes,
-            feature_starts=np.empty(0, dtype=np.int64),
-            feature_ends=np.empty(0, dtype=np.int64),
-        )
-
     d_feat_start_pos = None
     d_feat_end_pos = None
     if capture_feature_boundaries:
@@ -548,9 +529,50 @@ def read_geojson_gpu(
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
         ))
         d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
-        if int(d_feat_start_pos.size) > n_features:
-            d_feat_start_pos = d_feat_start_pos[-n_features:]
         del d_feat_start
+
+    total_features = int(d_feat_start_pos.size) if d_feat_start_pos is not None else n_features
+
+    if n_features == 0:
+        if total_features == 0:
+            owned = _build_device_single_family_owned(
+                family=GeometryFamily.POINT,
+                validity_device=cp.ones(0, dtype=cp.bool_),
+                x_device=cp.empty(0, dtype=cp.float64),
+                y_device=cp.empty(0, dtype=cp.float64),
+                geometry_offsets_device=cp.zeros(1, dtype=cp.int32),
+                empty_mask_device=cp.zeros(0, dtype=cp.bool_),
+                detail="GPU byte-classification GeoJSON parse (empty)",
+            )
+            return GeoJSONGpuResult(
+                owned=owned,
+                n_features=0,
+                path=source_path,
+                source_nbytes=n,
+                source_mtime_ns=source_mtime_ns,
+                host_bytes=host_bytes,
+                feature_starts=np.empty(0, dtype=np.int64),
+                feature_ends=np.empty(0, dtype=np.int64),
+            )
+
+        return GeoJSONGpuResult(
+            owned=build_null_owned_array(total_features, residency=Residency.DEVICE),
+            n_features=total_features,
+            path=source_path,
+            source_nbytes=n,
+            source_mtime_ns=source_mtime_ns,
+            host_bytes=host_bytes,
+            device_feature_starts=d_feat_start_pos,
+            device_feature_ends=d_feat_end_pos,
+        )
+
+    d_feature_row_ids = None
+    if d_feat_start_pos is not None:
+        d_feature_row_ids = cp.searchsorted(
+            d_feat_start_pos[1:],
+            d_coord_positions,
+            side="right",
+        ).astype(cp.int64, copy=False)
 
     # S3.5: Type detection — find "type": at geometry depth and classify
     tk_kernels = _type_key_kernels()
@@ -637,9 +659,12 @@ def read_geojson_gpu(
                 None,
                 None,
             )
+            if d_feature_row_ids is not None and total_features != n_features:
+                base = build_null_owned_array(total_features, residency=Residency.DEVICE)
+                owned = device_concat_owned_scatter(base, owned, d_feature_row_ids)
             return GeoJSONGpuResult(
                 owned=owned,
-                n_features=n_features,
+                n_features=total_features,
                 path=source_path,
                 source_nbytes=n,
                 source_mtime_ns=source_mtime_ns,
@@ -930,9 +955,13 @@ def read_geojson_gpu(
             d_mpoly_ring_offsets=d_mpoly_ring_offsets,
         )
 
+    if d_feature_row_ids is not None and total_features != n_features:
+        base = build_null_owned_array(total_features, residency=Residency.DEVICE)
+        owned = device_concat_owned_scatter(base, owned, d_feature_row_ids)
+
     return GeoJSONGpuResult(
         owned=owned,
-        n_features=n_features,
+        n_features=total_features,
         path=source_path,
         source_nbytes=n,
         source_mtime_ns=source_mtime_ns,

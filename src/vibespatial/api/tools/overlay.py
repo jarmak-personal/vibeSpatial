@@ -550,10 +550,7 @@ def _sequential_grouped_difference_owned(
     dispatch_mode: ExecutionMode,
 ):
     """Compute grouped exact difference via repeated pairwise exact differences."""
-    from vibespatial.constructive.binary_constructive import (
-        _binary_constructive_gpu,
-        _resolve_indexed_polygon_fast_path_candidate,
-    )
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
     with hotpath_stage("overlay.diff.group_metadata", category="setup"):
         group_offsets = np.asarray(group_offsets, dtype=np.int64)
         group_lengths = np.diff(group_offsets).astype(np.int64, copy=False)
@@ -683,6 +680,38 @@ def _grouped_overlay_difference_owned(
         max_group_size = int(group_lengths.max(initial=0))
     if max_group_size <= 0:
         return left_batch
+    if max_group_size <= 1:
+        selected_mode = (
+            ExecutionMode.GPU
+            if dispatch_mode is not ExecutionMode.CPU and has_gpu_runtime()
+            else ExecutionMode.CPU
+        )
+        record_dispatch_event(
+            surface="geopandas.array.difference",
+            operation="difference",
+            implementation=(
+                "grouped_overlay_difference_single_pair_gpu"
+                if selected_mode is ExecutionMode.GPU
+                else "grouped_overlay_difference_single_pair_cpu"
+            ),
+            reason=(
+                "grouped exact overlay difference reduced to the rowwise exact difference "
+                "path because each group had at most one candidate"
+            ),
+            detail=(
+                f"groups={left_batch.row_count}, "
+                f"pairs={right_batch.row_count}, "
+                f"max_group_size={max_group_size}"
+            ),
+            requested=dispatch_mode,
+            selected=selected_mode,
+        )
+        return _sequential_grouped_difference_owned(
+            left_batch,
+            right_batch,
+            group_offsets,
+            dispatch_mode=dispatch_mode,
+        )
 
     try:
         with hotpath_stage("overlay.diff.group_rows.expand", category="setup"):
@@ -814,6 +843,21 @@ def _grouped_overlay_difference_owned(
                     ),
                     requested=dispatch_mode,
                     selected=ExecutionMode.GPU,
+                )
+            left_area = np.asarray(
+                GeometryArray.from_owned(left_batch).area,
+                dtype=np.float64,
+            )
+            diff_area = np.asarray(
+                GeometryArray.from_owned(diff_owned).area,
+                dtype=np.float64,
+            )
+            area_expanded = diff_area > (left_area + 1.0e-9)
+            if bool(np.any(area_expanded)):
+                expanded_rows = np.flatnonzero(area_expanded).astype(np.int64, copy=False)
+                raise RuntimeError(
+                    "grouped overlay difference expanded polygon area for rows "
+                    f"{expanded_rows[:8].tolist()}"
                 )
         if strict_native_mode_enabled() and _selected is not ExecutionMode.GPU:
             record_fallback_event(
@@ -1719,7 +1763,10 @@ def _device_count_dropped_polygon_intersection_warning_rows(
     if area_owned is None:
         return None
 
-    from vibespatial.constructive.binary_constructive import _binary_constructive_gpu
+    from vibespatial.constructive.binary_constructive import (
+        _binary_constructive_gpu,
+        _resolve_indexed_polygon_fast_path_candidate,
+    )
     from vibespatial.constructive.boundary import boundary_owned
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.predicates.binary import evaluate_binary_predicate

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -837,18 +838,48 @@ def _pyogrio_arrow_wkb_to_native_tabular_result(
 
 
 def _materialize_native_file_read_result(payload):
-    import datetime
+    import pandas as pd
+    from pandas.api.types import is_object_dtype, is_string_dtype
 
     frame = payload.to_geodataframe()
+
+    def _looks_like_datetime_strings(series) -> bool:
+        non_null = series.dropna()
+        if non_null.empty:
+            return False
+        values = non_null.astype(str)
+        return bool(
+            values.str.match(
+                r"^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?$"
+            ).all()
+        )
+
     for col in frame.columns:
         if col == frame.geometry.name:
             continue
         series = frame[col]
-        if hasattr(series, "dt") and series.dt.tz is not None:
+        if not (is_object_dtype(series.dtype) or is_string_dtype(series.dtype)):
+            continue
+        if not _looks_like_datetime_strings(series):
+            continue
+        as_dt = None
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "error",
+                    "In a future version of pandas, parsing datetimes with mixed time zones will raise an error",
+                    FutureWarning,
+                )
+                as_dt = pd.to_datetime(series)
+        except Exception:
+            pass
+        if as_dt is None or as_dt.dtype == "object":
             try:
-                frame[col] = series.dt.tz_convert(datetime.UTC)
+                as_dt = pd.to_datetime(series, utc=True)
             except Exception:
                 pass
+        if as_dt is not None and as_dt.dtype != "object":
+            frame[col] = as_dt.dt.as_unit("ms")
     return frame
 
 
@@ -1797,6 +1828,20 @@ def _supports_explicit_pyogrio_native_read(plan: VectorFilePlan, engine, filenam
     }
 
 
+def _supports_public_explicit_pyogrio_native_read(
+    plan: VectorFilePlan,
+    engine,
+    filename,
+) -> bool:
+    if not _supports_explicit_pyogrio_native_read(plan, engine, filename):
+        return False
+    # Public GeoPackage reads still need vendored GeoPandas/pyogrio compatibility
+    # semantics for null/object/datetime round-trips. Keep the internal/native
+    # path available, but let the public boundary use the upstream-compatible
+    # reader when the user explicitly asked for pyogrio.
+    return plan.format is not IOFormat.GEOPACKAGE
+
+
 def _supports_direct_flatgeobuf_native_read(
     filename,
     *,
@@ -2286,7 +2331,11 @@ def read_vector_file_native(
         and mask is None
         and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
     )
-    allow_native_with_explicit_pyogrio = _supports_explicit_pyogrio_native_read(plan, engine, filename)
+    allow_native_with_explicit_pyogrio = _supports_explicit_pyogrio_native_read(
+        plan,
+        engine,
+        filename,
+    )
     if (
         plan.format in _GPU_DISPATCH_FORMATS
         and mask is None
@@ -2322,13 +2371,6 @@ def read_vector_file_native(
                 "require the GPU OSM reader."
             )
 
-    record_dispatch_event(
-        surface="geopandas.read_file",
-        operation="read_file",
-        implementation=plan.implementation,
-        reason=plan.reason,
-        selected=ExecutionMode.CPU,
-    )
     chosen_engine = engine
     if plan.format in {IOFormat.GEOJSON, IOFormat.SHAPEFILE} and engine is None:
         chosen_engine = "pyogrio"
@@ -2336,6 +2378,18 @@ def read_vector_file_native(
         from vibespatial.api.io import file as api_file
 
         chosen_engine = api_file._check_engine(chosen_engine, "'read_file' function")
+    compat_override = chosen_engine is not None
+    compat_detail = ""
+    if compat_override:
+        compat_detail = f"compat_override=1 explicit_engine={chosen_engine}"
+    record_dispatch_event(
+        surface="geopandas.read_file",
+        operation="read_file",
+        implementation=plan.implementation,
+        reason=plan.reason,
+        detail=compat_detail,
+        selected=ExecutionMode.CPU,
+    )
     from vibespatial.api.io.file import _read_file
 
     if osm_pyogrio_default:
@@ -2516,7 +2570,11 @@ def read_vector_file(
         and mask is None
         and _osm_uses_pyogrio_compat_layer(layer=osm_layer, tags=osm_tags)
     )
-    allow_native_with_explicit_pyogrio = _supports_explicit_pyogrio_native_read(plan, engine, filename)
+    allow_native_with_explicit_pyogrio = _supports_public_explicit_pyogrio_native_read(
+        plan,
+        engine,
+        filename,
+    )
     if (
         plan.format in _GPU_DISPATCH_FORMATS
         and mask is None

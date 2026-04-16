@@ -610,9 +610,28 @@ extern "C" __global__ void find_feature_starts(
     unsigned char c = input[idx];
     int d = depth[idx];
 
-    // Features are objects at depth 3: FeatureCollection { depth=1,
-    // "features": [ depth=2, Feature { depth=3.
-    is_feature_start[idx] = (c == '{' && d == 3) ? 1 : 0;
+    if (!(c == '{' && d == 3)) {
+        is_feature_start[idx] = 0;
+        return;
+    }
+
+    // Features are objects at depth 3 that appear as array elements inside
+    // "features": [ ... ]. Other depth-3 objects can exist, for example a
+    // root-level "crs": {"properties": {...}} payload. Walk backward to the
+    // previous non-whitespace byte and only treat objects following '[' or ','
+    // as feature starts.
+    long long prev = idx - 1;
+    while (prev >= 0) {
+        unsigned char p = input[prev];
+        if (p == ' ' || p == '\n' || p == '\r' || p == '\t') {
+            prev--;
+            continue;
+        }
+        is_feature_start[idx] = (p == '[' || p == ',') ? 1 : 0;
+        return;
+    }
+
+    is_feature_start[idx] = 0;
 }
 
 extern "C" __global__ void find_feature_boundaries(
@@ -628,9 +647,24 @@ extern "C" __global__ void find_feature_boundaries(
     unsigned char c = input[idx];
     int d = depth[idx];
 
-    // Features are objects at depth 3: FeatureCollection { depth=1,
-    // "features": [ depth=2, Feature { depth=3. Closing } drops to depth=2.
-    is_feature_start[idx] = (c == '{' && d == 3) ? 1 : 0;
+    if (c == '{' && d == 3) {
+        long long prev = idx - 1;
+        unsigned char is_array_element = 0;
+        while (prev >= 0) {
+            unsigned char p = input[prev];
+            if (p == ' ' || p == '\n' || p == '\r' || p == '\t') {
+                prev--;
+                continue;
+            }
+            is_array_element = (p == '[' || p == ',') ? 1 : 0;
+            break;
+        }
+        is_feature_start[idx] = is_array_element;
+    } else {
+        is_feature_start[idx] = 0;
+    }
+
+    // Closing } drops to depth=2 for actual feature objects.
     is_feature_end[idx] = (c == '}' && d == 2) ? 1 : 0;
 }
 """

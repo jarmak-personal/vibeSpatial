@@ -37,6 +37,7 @@ FAMILY_WEIGHT_UNITS: dict[str, int] = {
     "dissolve": 5,
     "query": 4,
     "other_public": 2,
+    "compat_override": 0,
     "measurement": 0,
     "equality": 0,
     "normalization": 0,
@@ -147,8 +148,11 @@ class GPUAccelerationCoverageReport:
 def classify_dispatch_family(record: dict[str, Any]) -> str:
     surface = str(record.get("surface", ""))
     operation = str(record.get("operation", ""))
+    detail = str(record.get("detail", "") or "")
     is_public_surface = surface.startswith("geopandas.") or surface.startswith("DeviceGeometryArray.")
 
+    if surface == "geopandas.read_file" and "compat_override=1" in detail:
+        return "compat_override"
     if is_public_surface and (operation in NORMALIZATION_OPERATIONS or surface == "normalize"):
         return "normalization"
     if is_public_surface and (

@@ -6433,3 +6433,53 @@ def test_overlay_strict_nybb_single_pair_intersection_matches_host() -> None:
     assert len(result) == 1
     assert result.geometry.iloc[0].geom_type == expected.geom_type
     assert result.geometry.iloc[0].normalize().equals_exact(expected.normalize(), tolerance=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("how", "keep_geom_type"),
+    [
+        ("union", True),
+        ("union", False),
+        ("symmetric_difference", True),
+        ("symmetric_difference", False),
+    ],
+)
+def test_overlay_touching_polygon_groups_do_not_merge_owned_difference_rows(
+    how: str,
+    keep_geom_type: bool,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    df1 = GeoDataFrame(
+        {
+            "col1": [1, 2],
+            "geometry": GeoSeries(
+                [
+                    Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                    Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+                ]
+            ),
+        }
+    )
+    df2 = GeoDataFrame(
+        {
+            "col2": [1, 2, 3],
+            "geometry": GeoSeries(
+                [
+                    Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                    Polygon([(-1, 1), (1, 1), (1, 3), (-1, 3)]),
+                    Polygon([(3, 3), (5, 3), (5, 5), (3, 5)]),
+                ]
+            ),
+        }
+    )
+
+    result = overlay(df1, df2, how=how, keep_geom_type=keep_geom_type)
+    polygon_only = result.loc[result["col1"].isna() & (result["col2"] == 2), "geometry"]
+
+    assert len(polygon_only) == 1
+    assert shapely.equals(
+        polygon_only.iloc[0],
+        Polygon([(-1, 1), (1, 1), (1, 3), (-1, 3)]),
+    )

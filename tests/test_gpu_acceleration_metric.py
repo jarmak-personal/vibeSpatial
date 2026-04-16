@@ -139,6 +139,32 @@ def test_classify_dispatch_family_treats_internal_io_planning_as_internal() -> N
     )
 
 
+def test_explicit_public_read_compat_overrides_are_excluded_from_value_metric() -> None:
+    summary = summarize_event_records(
+        [
+            {
+                "event_type": "dispatch",
+                "selected": "cpu",
+                "surface": "geopandas.read_file",
+                "operation": "read_file",
+                "detail": "compat_override=1 explicit_engine=pyogrio",
+            },
+            {
+                "event_type": "dispatch",
+                "selected": "gpu",
+                "surface": "geopandas.read_file",
+                "operation": "read_file",
+            },
+        ]
+    )
+
+    assert summary["family_breakdown"]["compat_override"]["included_in_value_metric"] is False
+    assert summary["family_breakdown"]["io_read"]["included_in_value_metric"] is True
+    assert summary["value_dispatches"] == 1
+    assert summary["value_gpu_dispatches"] == 1
+    assert summary["value_dispatch_pct"] == 100.0
+
+
 def test_build_gpu_acceleration_report_combines_api_and_dispatch_metrics() -> None:
     api_compat = NativeCoverageReport(
         command="uv run pytest -q tests/upstream/geopandas",
