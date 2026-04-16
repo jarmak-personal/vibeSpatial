@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -1766,10 +1765,6 @@ def _try_fgb_gpu_read_native(filename, *, target_crs: str | None = None):
 # unfiltered public reads prefer the repo-owned GPU ingest path so the first
 # downstream GPU consumer does not pay an immediate host-to-device promotion.
 _GPU_MIN_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
-_GEOJSON_POINT_TYPE_PATTERN = re.compile(rb'"type"\s*:\s*"Point"')
-_GEOJSON_NON_POINT_TYPE_PATTERN = re.compile(
-    rb'"type"\s*:\s*"(?:LineString|Polygon|MultiPoint|MultiLineString|MultiPolygon|GeometryCollection)"'
-)
 
 
 def _prefer_pipeline_native_read(plan: VectorFilePlan) -> bool:
@@ -1783,15 +1778,7 @@ def _geojson_pipeline_prefers_gpu_for_source(filename) -> bool:
     if not isinstance(filename, str | Path):
         return False
     path = Path(filename)
-    if not path.exists() or not path.is_file():
-        return False
-    try:
-        payload = path.read_bytes()
-    except OSError:
-        return False
-    if not _GEOJSON_POINT_TYPE_PATTERN.search(payload):
-        return False
-    return _GEOJSON_NON_POINT_TYPE_PATTERN.search(payload) is None
+    return path.exists() and path.is_file()
 
 
 def _supports_explicit_pyogrio_native_read(plan: VectorFilePlan, engine, filename) -> bool:

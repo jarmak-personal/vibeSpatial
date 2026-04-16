@@ -17520,6 +17520,26 @@
     },
     {
       "kind": "repo",
+      "path": "benchmark_results/2026-04-15-geojson-routing-restored/shootout_suite_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "04",
+        "10k",
+        "15",
+        "2026",
+        "benchmark",
+        "geojson",
+        "json",
+        "restored",
+        "results",
+        "routing",
+        "shootout",
+        "suite"
+      ]
+    },
+    {
+      "kind": "repo",
       "path": "benchmark_results/2026-04-15-overlay-greens/shootout_suite_10k.json",
       "referenced_by": [],
       "symbols": [],
@@ -17532,6 +17552,26 @@
         "greens",
         "json",
         "overlay",
+        "results",
+        "shootout",
+        "suite"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": "benchmark_results/2026-04-15-public-io-push/shootout_suite_10k.json",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "04",
+        "10k",
+        "15",
+        "2026",
+        "benchmark",
+        "io",
+        "json",
+        "public",
+        "push",
         "results",
         "shootout",
         "suite"
@@ -46623,7 +46663,8 @@
         "test_geojson_roundtrip_uses_gpu_adapter",
         "test_geojson_gpu_adapter_failure_records_explicit_fallback",
         "test_public_geojson_read_prefers_pipeline_gpu_adapter_even_for_small_files",
-        "test_public_polygon_geojson_read_keeps_fast_json_path",
+        "test_public_polygon_geojson_read_prefers_pipeline_gpu_adapter",
+        "test_public_strict_mixed_geojson_read_uses_gpu_adapter",
         "test_large_flatgeobuf_read_prefers_direct_gpu_decoder",
         "test_explicit_pyogrio_flatgeobuf_read_keeps_native_arrow_wkb_path",
         "test_large_csv_wkt_read_prefers_pylibcudf_table_adapter",
@@ -46681,8 +46722,7 @@
         "test_geojson_gpu_native_boundary_keeps_properties_lazy_until_materialization",
         "test_plan_geojson_ingest_auto_selects_best_available",
         "test_plan_geojson_ingest_standalone_auto_prefers_fast_json",
-        "test_plan_geojson_ingest_rejects_unknown_objective",
-        "test_plan_geojson_ingest_explicit_fast_json"
+        "test_plan_geojson_ingest_rejects_unknown_objective"
       ],
       "tokens": [
         "accepts",
@@ -46766,6 +46806,7 @@
         "materialization",
         "message",
         "missing",
+        "mixed",
         "multipart",
         "multipolygons",
         "name",
@@ -46824,6 +46865,7 @@
         "standalone",
         "stays",
         "streams",
+        "strict",
         "string",
         "supported",
         "supports",

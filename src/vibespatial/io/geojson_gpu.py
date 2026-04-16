@@ -742,35 +742,53 @@ def read_geojson_gpu(
     cp.cumsum(d_effective_pairs, out=d_feature_coord_offsets[1:])
     total_pairs = int(d_feature_coord_offsets[-1].get())
 
-    # S3e: Polygon/MultiLineString ring offsets (when polygons or mls present)
+    # S3e: Global segment offsets for Polygon/MultiLineString plus the
+    # pseudo-segments needed to preserve gaps created by Point, LineString,
+    # and MultiPoint rows in mixed files.
     mls_tag_val = np.int8(FAMILY_TAGS[GeometryFamily.MULTILINESTRING])
     has_ring_types = has_polygons or bool(cp.any(unique_tags == mls_tag_val))
     if has_ring_types and d_ring_counts is not None:
-        d_pair_offset_starts = cp.empty(n_features, dtype=cp.int32)
-        cp.cumsum(d_pair_counts, out=d_pair_offset_starts)
-        d_pair_offset_starts = cp.concatenate(
-            [cp.zeros(1, dtype=cp.int32), d_pair_offset_starts[:-1]]
+        d_ring_segment_counts = cp.where(
+            d_family_tags == pt_tag,
+            np.int32(1),
+            cp.where(
+                (d_family_tags == ls_tag) | (d_family_tags == mpt_tag),
+                d_effective_pairs,
+                cp.where(
+                    (d_family_tags == pg_tag) | (d_family_tags == mls_tag_val),
+                    d_ring_counts,
+                    cp.zeros(n_features, dtype=cp.int32),
+                ),
+            ),
         )
+        # Ring/part offset scatter must index into the GLOBAL flat coordinate
+        # array, not a polygon-only prefix sum.  Mixed files can interleave
+        # point/linestring rows between polygon rows; using cumsum(d_pair_counts)
+        # drops those coordinate spans and reattaches later polygon rings to the
+        # wrong global coordinates.
+        d_pair_offset_starts = d_feature_coord_offsets[:n_features].copy()
 
         d_all_geometry_offsets = cp.empty(n_features + 1, dtype=cp.int32)
         d_all_geometry_offsets[0] = 0
-        cp.cumsum(d_ring_counts, out=d_all_geometry_offsets[1:])
+        cp.cumsum(d_ring_segment_counts, out=d_all_geometry_offsets[1:])
         total_rings = int(d_all_geometry_offsets[-1].get())
 
         d_ring_offsets = cp.empty(total_rings + 1, dtype=cp.int32)
-        d_ring_offsets[-1] = (d_pair_offset_starts[-1] + d_pair_counts[-1]) if n_features > 0 else 0
+        d_ring_offsets[-1] = int(d_feature_coord_offsets[n_features]) if n_features > 0 else 0
 
         d_ring_scatter_starts = d_all_geometry_offsets[:n_features].copy()
         scatter_kernels = _scatter_coords_kernels()
         _launch_kernel(runtime, scatter_kernels["scatter_ring_offsets"], n_features, (
             (ptr(d_bytes), ptr(d_depth), ptr(d_coord_positions), ptr(d_coord_ends),
+             ptr(d_family_tags), ptr(d_effective_pairs),
              ptr(d_ring_scatter_starts), ptr(d_pair_offset_starts),
              ptr(d_ring_offsets), np.int32(n_features)),
             (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
              KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
         ))
-        del d_pair_offset_starts, d_ring_scatter_starts
+        del d_ring_segment_counts, d_pair_offset_starts, d_ring_scatter_starts
 
     # S3f: MultiPolygon 3-level offset scatter
     if has_multipolygons and d_mpoly_part_counts is not None:

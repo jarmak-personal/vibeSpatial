@@ -534,6 +534,8 @@ extern "C" __global__ void scatter_ring_offsets(
     const int* __restrict__ depth,
     const long long* __restrict__ coord_starts,
     const long long* __restrict__ coord_ends,
+    const signed char* __restrict__ family_tags,
+    const int* __restrict__ coord_pair_counts,
     const int* __restrict__ ring_offset_starts,
     const int* __restrict__ coord_pair_offset_starts,
     int* __restrict__ ring_offsets,
@@ -544,8 +546,28 @@ extern "C" __global__ void scatter_ring_offsets(
 
     long long start = coord_starts[idx] + 14;
     long long end = coord_ends[idx];
+    signed char family = family_tags[idx];
+    int coord_pairs = coord_pair_counts[idx];
     int ring_out = ring_offset_starts[idx];
     int pair_out = coord_pair_offset_starts[idx];
+
+    // Point / LineString / MultiPoint rows still need pseudo-segment
+    // boundaries in the shared global ring-offset space so later polygon rows
+    // can preserve their true coordinate starts.
+    if (family == 0) {
+        ring_offsets[ring_out] = pair_out;
+        ring_offsets[ring_out + 1] = pair_out + coord_pairs;
+        return;
+    }
+    if (family == 1 || family == 3) {
+        for (int i = 0; i <= coord_pairs; ++i) {
+            ring_offsets[ring_out + i] = pair_out + i;
+        }
+        return;
+    }
+    if (family != 2 && family != 4) {
+        return;
+    }
 
     // Skip to opening bracket
     while (start < end && input[start] != '[') start++;

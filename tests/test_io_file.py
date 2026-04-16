@@ -164,20 +164,10 @@ def test_public_geojson_read_prefers_pipeline_gpu_adapter_even_for_small_files(
 
 
 @pytest.mark.gpu
-def test_public_polygon_geojson_read_keeps_fast_json_path(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:
+def test_public_polygon_geojson_read_prefers_pipeline_gpu_adapter(tmp_path) -> None:
     path = tmp_path / "sample-polygons.geojson"
     frame = _sample_polygon_frame()
     frame.to_file(path, driver="GeoJSON")
-
-    monkeypatch.setattr(
-        "vibespatial.io.geojson_gpu.read_geojson_gpu",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("polygon GeoJSON fixtures should not auto-route to the GPU parser yet")
-        ),
-    )
 
     geopandas.clear_dispatch_events()
     result = geopandas.read_file(path)
@@ -186,7 +176,29 @@ def test_public_polygon_geojson_read_keeps_fast_json_path(
     assert result["id"].tolist() == frame["id"].tolist()
     assert result.geometry.iloc[0].equals(frame.geometry.iloc[0])
     assert events
-    assert events[-1].implementation == "geojson_fast_json_vectorized_adapter"
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+
+
+@pytest.mark.gpu
+def test_public_strict_mixed_geojson_read_uses_gpu_adapter() -> None:
+    path = Path("tests/upstream/geopandas/tests/data/overlay/strict/polys_union_False.geojson")
+    expected = read_geojson_native(path, prefer="fast-json").to_geodataframe()
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert events
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+    assert result.columns.tolist() == expected.columns.tolist()
+    pd.testing.assert_frame_equal(
+        result.drop(columns="geometry"),
+        expected.drop(columns="geometry"),
+        check_dtype=False,
+        check_like=False,
+    )
+    assert result.geom_type.tolist() == expected.geom_type.tolist()
+    for expected_geom, actual_geom in zip(expected.geometry, result.geometry, strict=True):
+        assert expected_geom.equals_exact(actual_geom, 0.0)
 
 
 @pytest.mark.gpu

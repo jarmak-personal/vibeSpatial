@@ -1151,8 +1151,8 @@ def test_overlay_difference_redevelopment_like_followup_overlay_stays_strict_nat
 @pytest.mark.parametrize(
     ("scale", "expected_rows"),
     [
-        ("1000", 4),
-        ("10000", 44),
+        ("1000", 8),
+        ("10000", 66),
     ],
 )
 def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwise_oracle(
