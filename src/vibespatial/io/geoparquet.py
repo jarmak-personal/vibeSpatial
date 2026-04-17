@@ -64,6 +64,27 @@ _SMALL_TERMINAL_ARROW_EXPORT_FAMILIES = frozenset({
 })
 
 
+def _record_public_geoparquet_dispatch(
+    *,
+    selected: ExecutionMode,
+    implementation: str,
+    reason: str,
+    row_count: int,
+    detail: str | None = None,
+) -> None:
+    row_detail = f"rows={row_count}"
+    if detail:
+        row_detail = f"{row_detail}, {detail}"
+    record_dispatch_event(
+        surface="geopandas.geodataframe.to_parquet",
+        operation="to_parquet",
+        implementation=implementation,
+        reason=reason,
+        detail=row_detail,
+        selected=selected,
+    )
+
+
 def _payload_geometry_series(payload: NativeTabularResult):
     return _authoritative_geometry_series(
         payload.geometry.to_geoseries(
@@ -148,17 +169,21 @@ def _authoritative_native_tabular_result(
     )
 
 
-def _record_terminal_geoparquet_compatibility_export(*, detail: str, implementation: str) -> None:
-    record_dispatch_event(
-        surface="geopandas.geodataframe.to_parquet",
-        operation="to_parquet",
+def _record_terminal_geoparquet_compatibility_export(
+    *,
+    detail: str,
+    implementation: str,
+    row_count: int,
+) -> None:
+    _record_public_geoparquet_dispatch(
+        selected=ExecutionMode.CPU,
         implementation=implementation,
         reason=(
             "terminal GeoParquet export used the explicit Arrow compatibility writer "
             "after the native device writer declined a sink feature"
         ),
+        row_count=row_count,
         detail=detail,
-        selected=ExecutionMode.CPU,
     )
 
 
@@ -345,6 +370,7 @@ def _write_geoparquet_native_tabular_result(
         _record_terminal_geoparquet_compatibility_export(
             detail=small_write_detail,
             implementation="native_payload_arrow_terminal_export",
+            row_count=payload.geometry.row_count,
         )
         _write_native_tabular_result_with_arrow(
             payload,
@@ -374,6 +400,15 @@ def _write_geoparquet_native_tabular_result(
         **kwargs,
     )
     if device_write.written:
+        _record_public_geoparquet_dispatch(
+            selected=ExecutionMode.GPU,
+            implementation="native_payload_device_export",
+            reason=(
+                "GeoParquet export stayed on the native device payload writer and did not "
+                "materialize a public GeoDataFrame-shaped Arrow export"
+            ),
+            row_count=payload.geometry.row_count,
+        )
         return
     if device_write.fallback_detail is not None:
         record_fallback_event(
@@ -384,10 +419,31 @@ def _write_geoparquet_native_tabular_result(
             pipeline="io/to_parquet",
             d2h_transfer=True,
         )
+        _record_public_geoparquet_dispatch(
+            selected=ExecutionMode.CPU,
+            implementation="native_payload_arrow_fallback_export",
+            reason=(
+                "GeoParquet export fell back to the explicit Arrow writer after the "
+                "native device payload writer declined the sink"
+            ),
+            row_count=payload.geometry.row_count,
+            detail=device_write.fallback_detail,
+        )
     elif device_write.compatibility_detail is not None:
         _record_terminal_geoparquet_compatibility_export(
             detail=device_write.compatibility_detail,
             implementation="native_payload_arrow_compatibility_export",
+            row_count=payload.geometry.row_count,
+        )
+    else:
+        _record_public_geoparquet_dispatch(
+            selected=ExecutionMode.CPU,
+            implementation="native_payload_arrow_export",
+            reason=(
+                "GeoParquet export used the explicit Arrow writer because the native "
+                "device payload writer was unavailable for this payload"
+            ),
+            row_count=payload.geometry.row_count,
         )
 
     geometry_series = _payload_geometry_series(payload)
@@ -2367,13 +2423,6 @@ def write_geoparquet(
                 "An existing column 'bbox' already exists in the dataframe. "
                 "Please rename to write covering bbox."
             )
-        record_dispatch_event(
-            surface="geopandas.geodataframe.to_parquet",
-            operation="to_parquet",
-            implementation="repo_owned_geoparquet_adapter",
-            reason="GeoParquet export routes through the repo-owned adapter and preserves the GPU-first metadata contract.",
-            selected=ExecutionMode.CPU,
-        )
         _write_geoparquet_native_tabular_result(
             payload,
             path,
@@ -2385,14 +2434,6 @@ def write_geoparquet(
             **kwargs,
         )
         return
-
-    record_dispatch_event(
-        surface="geopandas.geodataframe.to_parquet",
-        operation="to_parquet",
-        implementation="repo_owned_geoparquet_adapter",
-        reason="GeoParquet export routes through the repo-owned adapter and preserves the GPU-first metadata contract.",
-        selected=ExecutionMode.CPU,
-    )
 
     if write_covering_bbox and "bbox" in df.columns:
         raise ValueError(
@@ -2428,6 +2469,7 @@ def write_geoparquet(
             _record_terminal_geoparquet_compatibility_export(
                 detail=small_write_detail,
                 implementation="native_geodataframe_arrow_terminal_export",
+                row_count=len(df),
             )
             from vibespatial.api._native_results import _spatial_to_native_tabular_result
 
@@ -2468,6 +2510,15 @@ def write_geoparquet(
         write_covering_bbox=write_covering_bbox,
         **kwargs,
     )
+    _record_public_geoparquet_dispatch(
+        selected=ExecutionMode.CPU,
+        implementation="repo_owned_geoparquet_arrow_export",
+        reason=(
+            "GeoParquet export used the explicit Arrow compatibility writer because the "
+            "public frame was not fully backed by native owned geometry buffers"
+        ),
+        row_count=len(df),
+    )
 
 def _write_geoparquet_native(
     df,
@@ -2504,6 +2555,15 @@ def _write_geoparquet_native(
         **kwargs,
     )
     if device_write.written:
+        _record_public_geoparquet_dispatch(
+            selected=ExecutionMode.GPU,
+            implementation="native_geodataframe_device_export",
+            reason=(
+                "GeoParquet export stayed on the native device writer for a device-backed "
+                "public GeoDataFrame"
+            ),
+            row_count=len(df),
+        )
         return
     if device_write.fallback_detail is not None:
         record_fallback_event(
@@ -2514,10 +2574,31 @@ def _write_geoparquet_native(
             pipeline="io/to_parquet",
             d2h_transfer=True,
         )
+        _record_public_geoparquet_dispatch(
+            selected=ExecutionMode.CPU,
+            implementation="native_geodataframe_arrow_fallback_export",
+            reason=(
+                "GeoParquet export fell back to the explicit Arrow writer after the "
+                "native device writer declined the sink"
+            ),
+            row_count=len(df),
+            detail=device_write.fallback_detail,
+        )
     elif device_write.compatibility_detail is not None:
         _record_terminal_geoparquet_compatibility_export(
             detail=device_write.compatibility_detail,
             implementation="native_geodataframe_arrow_compatibility_export",
+            row_count=len(df),
+        )
+    else:
+        _record_public_geoparquet_dispatch(
+            selected=ExecutionMode.CPU,
+            implementation="native_geodataframe_arrow_export",
+            reason=(
+                "GeoParquet export used the explicit Arrow writer because the native "
+                "device writer was unavailable for this public GeoDataFrame"
+            ),
+            row_count=len(df),
         )
 
     # Build a table from non-geometry columns

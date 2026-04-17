@@ -38,6 +38,7 @@ FAMILY_WEIGHT_UNITS: dict[str, int] = {
     "query": 4,
     "other_public": 2,
     "compat_override": 0,
+    "compat_write": 0,
     "measurement": 0,
     "equality": 0,
     "normalization": 0,
@@ -153,6 +154,8 @@ def classify_dispatch_family(record: dict[str, Any]) -> str:
 
     if surface == "geopandas.read_file" and "compat_override=1" in detail:
         return "compat_override"
+    if surface in {"geopandas.geodataframe.to_file", "geopandas.geoseries.to_file"}:
+        return "compat_write"
     if is_public_surface and (operation in NORMALIZATION_OPERATIONS or surface == "normalize"):
         return "normalization"
     if is_public_surface and (
@@ -173,6 +176,10 @@ def classify_dispatch_family(record: dict[str, Any]) -> str:
         return "query"
     if is_public_surface and operation in CONSTRUCTIVE_OPERATIONS:
         return "constructive"
+    if surface.startswith(("vibespatial.io.geoparquet", "vibespatial.io.wkb", "vibespatial.io.geoarrow")) and (
+        operation in IO_WRITE_OPERATIONS or operation == "encode_to_parquet"
+    ):
+        return "io_write"
     if surface.startswith("geopandas.read_") or surface.startswith("vibespatial.read_"):
         return "io_read"
     if any(surface.endswith(suffix) for suffix in (".to_arrow", ".to_file", ".to_parquet", ".from_arrow")):

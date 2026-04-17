@@ -165,6 +165,56 @@ def test_explicit_public_read_compat_overrides_are_excluded_from_value_metric() 
     assert summary["value_dispatch_pct"] == 100.0
 
 
+def test_public_to_file_compatibility_writes_are_excluded_from_value_metric() -> None:
+    summary = summarize_event_records(
+        [
+            {
+                "event_type": "dispatch",
+                "selected": "cpu",
+                "surface": "geopandas.geodataframe.to_file",
+                "operation": "to_file",
+            },
+            {
+                "event_type": "dispatch",
+                "selected": "gpu",
+                "surface": "vibespatial.io.geoparquet",
+                "operation": "to_parquet",
+            },
+        ]
+    )
+
+    assert summary["family_breakdown"]["compat_write"]["included_in_value_metric"] is False
+    assert summary["family_breakdown"]["io_write"]["included_in_value_metric"] is True
+    assert summary["value_dispatches"] == 1
+    assert summary["value_gpu_dispatches"] == 1
+    assert summary["value_dispatch_pct"] == 100.0
+
+
+def test_internal_geoparquet_and_wkb_write_events_count_as_io_write() -> None:
+    assert (
+        classify_dispatch_family(
+            {
+                "event_type": "dispatch",
+                "selected": "gpu",
+                "surface": "vibespatial.io.geoparquet",
+                "operation": "to_parquet",
+            }
+        )
+        == "io_write"
+    )
+    assert (
+        classify_dispatch_family(
+            {
+                "event_type": "dispatch",
+                "selected": "gpu",
+                "surface": "vibespatial.io.wkb",
+                "operation": "encode_to_parquet",
+            }
+        )
+        == "io_write"
+    )
+
+
 def test_build_gpu_acceleration_report_combines_api_and_dispatch_metrics() -> None:
     api_compat = NativeCoverageReport(
         command="uv run pytest -q tests/upstream/geopandas",

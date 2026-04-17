@@ -3030,6 +3030,7 @@ def _encode_owned_wkb_array(
     *,
     field_name: str = "geometry",
     crs: Any | None = None,
+    return_mode: bool = False,
 ) -> tuple:
     """Encode OwnedGeometryArray to WKB pyarrow array.
 
@@ -3046,7 +3047,7 @@ def _encode_owned_wkb_array(
             reason="GPU WKB encode for parquet write -- no host coordinate materialization",
             selected=ExecutionMode.GPU,
         )
-        return gpu_result
+        return (*gpu_result, ExecutionMode.GPU) if return_mode else gpu_result
 
     # Make one final direct device-encode attempt before surfacing a host
     # fallback.  Strict-native writers must not fail just because the generic
@@ -3084,7 +3085,7 @@ def _encode_owned_wkb_array(
                 reason="direct device-owned WKB encode for parquet write",
                 selected=ExecutionMode.GPU,
             )
-            return field, wkb_arr
+            return (field, wkb_arr, ExecutionMode.GPU) if return_mode else (field, wkb_arr)
         except Exception:
             pass
 
@@ -3124,7 +3125,8 @@ def _encode_owned_wkb_array(
             ).encode()
     field_metadata[b"ARROW:extension:name"] = b"geoarrow.wkb"
     field = pa.field(field_name, pa.binary(), nullable=True, metadata=field_metadata)
-    return field, wkb_arr
+    result = (field, wkb_arr)
+    return (*result, ExecutionMode.CPU) if return_mode else result
 
 
 def _encode_family_row_wkb(

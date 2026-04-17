@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import types
 from io import BytesIO
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -293,6 +294,28 @@ def test_native_tabular_to_arrow_wkb_owned_skips_geoseries_materialization(
 
     assert table.column_names == ["geometry"]
     assert len(table) == 2
+
+
+def test_native_tabular_to_arrow_wkb_owned_records_gpu_dispatch() -> None:
+    if not has_gpu_runtime():
+        return
+
+    geopandas.clear_dispatch_events()
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)], residency=Residency.DEVICE)
+    payload = to_native_tabular_result(GeometryNativeResult.from_owned(owned, crs="EPSG:4326"))
+
+    assert payload is not None
+
+    table = pa.table(payload.to_arrow(geometry_encoding="WKB"))
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert table.column_names == ["geometry"]
+    assert any(
+        event.surface == "vibespatial.native_tabular.to_arrow"
+        and event.implementation == "native_tabular_device_arrow_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
 
 
 def test_decode_wkb_owned_large_native_list_uses_direct_device_pipeline(monkeypatch) -> None:
@@ -1819,6 +1842,47 @@ def test_geodataframe_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     assert geopandas.get_fallback_events(clear=True) == []
 
 
+def test_device_geoseries_to_arrow_geoarrow_records_gpu_dispatch() -> None:
+    if not has_gpu_runtime():
+        return
+
+    geopandas.clear_dispatch_events()
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+
+    arrow_array = io_arrow.geoseries_to_arrow(gdf.geometry, geometry_encoding="geoarrow")
+    schema_capsule, _array_capsule = arrow_array.__arrow_c_array__()
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+    assert any(
+        event.surface == "geopandas.geoseries.to_arrow"
+        and event.implementation == "native_series_device_arrow_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+
+
+def test_device_geodataframe_to_arrow_geoarrow_records_gpu_dispatch() -> None:
+    if not has_gpu_runtime():
+        return
+
+    geopandas.clear_dispatch_events()
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+
+    arrow_table = io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow")
+    table = pa.table(arrow_table)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert table.schema.field("geometry").metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+    assert any(
+        event.surface == "geopandas.geodataframe.to_arrow"
+        and event.implementation == "native_geoarrow_device_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+
+
 def test_geodataframe_to_arrow_device_geoarrow_records_fallback_before_host_materialization(
     monkeypatch,
 ) -> None:
@@ -2635,6 +2699,36 @@ def test_device_geodataframe_to_parquet_compatibility_decline_records_dispatch_n
     )
 
 
+def test_device_geodataframe_to_parquet_records_gpu_dispatch_when_native_writer_succeeds(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    geopandas.clear_dispatch_events()
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+
+    def _write_success(*args, **kwargs):
+        path = args[1]
+        Path(path).touch()
+        return io_wkb._NativeDeviceWriteStatus(written=True)
+
+    monkeypatch.setattr(io_geoparquet, "_write_geoparquet_native_device", _write_success)
+
+    path = tmp_path / "device-gdf-gpu-dispatch.parquet"
+    gdf.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert path.exists()
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_geodataframe_device_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+
+
 def test_device_geodataframe_small_terminal_write_prefers_arrow_export(
     monkeypatch,
     tmp_path,
@@ -2801,6 +2895,43 @@ def test_native_tabular_small_terminal_write_prefers_arrow_export(
         event.surface == "geopandas.geodataframe.to_parquet"
         and event.implementation == "native_payload_arrow_terminal_export"
         and "small terminal GeoParquet write prefers the explicit Arrow export" in event.detail
+        for event in dispatches
+    )
+
+
+def test_native_tabular_to_parquet_records_gpu_dispatch_when_device_writer_succeeds(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    geopandas.clear_dispatch_events()
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries([Point(0, 0), Point(1, 1)], residency=Residency.DEVICE),
+            crs="EPSG:4326",
+        )
+    )
+    assert payload is not None
+
+    def _write_success(*args, **kwargs):
+        path = args[2]
+        Path(path).touch()
+        return io_wkb._NativeDeviceWriteStatus(written=True)
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_write_geoparquet_native_device_payload",
+        _write_success,
+    )
+
+    path = tmp_path / "native-payload-gpu-dispatch.parquet"
+    payload.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert path.exists()
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_payload_device_export"
+        and event.selected == "gpu"
         for event in dispatches
     )
 

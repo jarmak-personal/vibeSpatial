@@ -788,6 +788,7 @@ def _construct_geoarrow_array_with_explicit_fallback(
     include_z: bool | None,
     surface: str,
     fallback_to_wkb_on_error: bool,
+    return_mode: bool = False,
 ):
     from vibespatial.api.io._geoarrow import construct_geometry_array, construct_wkb_array
 
@@ -810,19 +811,21 @@ def _construct_geoarrow_array_with_explicit_fallback(
                     _owned_geoarrow_family_set(owned)
                 )
                 if not requires_promotion:
-                    return _encode_owned_geoarrow_array_device(
+                    result = _encode_owned_geoarrow_array_device(
                         owned,
                         family=family,
                         field_name=field_name,
                         crs=series.crs,
                         interleaved=interleaved,
                     )
-            return encode_owned_geoarrow_array(
+                    return (*result, ExecutionMode.GPU) if return_mode else result
+            result = encode_owned_geoarrow_array(
                 owned if owned is not None else series.array.to_owned(),
                 field_name=field_name,
                 crs=series.crs,
                 interleaved=interleaved,
             )
+            return (*result, ExecutionMode.CPU) if return_mode else result
         except Exception as exc:
             fast_path_reason = str(exc)
     if owned is not None:
@@ -847,6 +850,7 @@ def _construct_geoarrow_array_with_explicit_fallback(
                 owned,
                 field_name=field_name,
                 crs=series.crs,
+                return_mode=return_mode,
             )
         record_fallback_event(
             surface=surface,
@@ -857,11 +861,12 @@ def _construct_geoarrow_array_with_explicit_fallback(
             d2h_transfer=True,
         )
         values = np.asarray(arr)
-        return construct_wkb_array(
+        result = construct_wkb_array(
             values,
             field_name=field_name,
             crs=series.crs,
         )
+        return (*result, ExecutionMode.CPU) if return_mode else result
     if owned is not None:
         record_fallback_event(
             surface=surface,
@@ -872,13 +877,21 @@ def _construct_geoarrow_array_with_explicit_fallback(
             d2h_transfer=True,
         )
     values = np.asarray(arr)
-    return construct_geometry_array(
+    result = construct_geometry_array(
         values,
         include_z=include_z,
         field_name=field_name,
         crs=series.crs,
         interleaved=interleaved,
     )
+    return (*result, ExecutionMode.CPU) if return_mode else result
+
+
+def _series_owned_geometry(series):
+    arr = series.array
+    if isinstance(arr, DeviceGeometryArray):
+        return arr.to_owned()
+    return getattr(arr, "_owned", None)
 
 
 def _geoarrow_point_type(*, interleaved: bool):
@@ -1773,45 +1786,72 @@ def geodataframe_to_arrow(
     import pandas as pd
     import pyarrow as pa
 
-    from vibespatial.api.io._geoarrow import ArrowTable
+    from vibespatial.api.io._geoarrow import ArrowTable, construct_wkb_array
 
-    record_dispatch_event(
-        surface="geopandas.geodataframe.to_arrow",
-        operation="to_arrow",
-        implementation="repo_owned_geoarrow_adapter",
-        reason="GeoArrow export routes through the repo-owned adapter and owned buffer policy.",
-        selected=ExecutionMode.CPU,
+    geometry_mask = df.dtypes.map(
+        lambda dtype: getattr(dtype, "name", None) in ("geometry", "device_geometry")
     )
-    if geometry_encoding.lower() == "geoarrow":
-        geometry_mask = df.dtypes.map(
-            lambda dtype: getattr(dtype, "name", None) in ("geometry", "device_geometry")
-        )
-        geometry_columns = df.columns[geometry_mask]
-        geometry_indices = np.asarray(geometry_mask).nonzero()[0]
-        df_attr = pd.DataFrame(df.copy(deep=False))
-        for col in geometry_columns:
-            df_attr[col] = None
-        table = pa.Table.from_pandas(df_attr, preserve_index=index)
-        for column_index, column_name in zip(geometry_indices, geometry_columns):
-            field, geom_arr = _construct_geoarrow_array_with_explicit_fallback(
-                df[column_name],
+    geometry_columns = df.columns[geometry_mask]
+    geometry_indices = np.asarray(geometry_mask).nonzero()[0]
+    df_attr = pd.DataFrame(df.copy(deep=False))
+    for col in geometry_columns:
+        df_attr[col] = None
+    table = pa.Table.from_pandas(df_attr, preserve_index=index)
+    geometry_modes: list[ExecutionMode] = []
+    normalized_encoding = geometry_encoding.lower()
+    for column_index, column_name in zip(geometry_indices, geometry_columns):
+        series = df[column_name]
+        if normalized_encoding == "geoarrow":
+            field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
+                series,
                 field_name=column_name,
                 interleaved=interleaved,
                 include_z=include_z,
                 surface="geopandas.geodataframe.to_arrow",
                 fallback_to_wkb_on_error=False,
+                return_mode=True,
             )
-            table = table.set_column(column_index, field, geom_arr)
-        return ArrowTable(table)
-
-    from vibespatial.api.io._geoarrow import geopandas_to_arrow
-
-    table, _ = geopandas_to_arrow(
-        df,
-        index=index,
-        geometry_encoding=geometry_encoding,
-        interleaved=interleaved,
-        include_z=include_z,
+        elif normalized_encoding == "wkb":
+            owned = _series_owned_geometry(series)
+            if owned is not None:
+                field, geom_arr, selected = _encode_owned_wkb_array(
+                    owned,
+                    field_name=column_name,
+                    crs=series.crs,
+                    return_mode=True,
+                )
+            else:
+                field, geom_arr = construct_wkb_array(
+                    np.asarray(series.array),
+                    field_name=column_name,
+                    crs=series.crs,
+                )
+                selected = ExecutionMode.CPU
+        else:
+            raise ValueError(
+                f"Expected geometry encoding 'WKB' or 'geoarrow' got {geometry_encoding}"
+            )
+        geometry_modes.append(selected)
+        table = table.set_column(column_index, field, geom_arr)
+    selected = (
+        ExecutionMode.GPU
+        if geometry_modes and all(mode is ExecutionMode.GPU for mode in geometry_modes)
+        else ExecutionMode.CPU
+    )
+    record_dispatch_event(
+        surface="geopandas.geodataframe.to_arrow",
+        operation="to_arrow",
+        implementation=(
+            "native_geoarrow_device_export"
+            if selected is ExecutionMode.GPU
+            else "repo_owned_geoarrow_adapter"
+        ),
+        reason=(
+            "GeoArrow export encoded every geometry column through the repo-owned device path."
+            if selected is ExecutionMode.GPU
+            else "GeoArrow export routes through the repo-owned adapter and owned buffer policy."
+        ),
+        selected=selected,
     )
     return ArrowTable(table)
 
@@ -1832,14 +1872,6 @@ def native_tabular_to_arrow(
     if not isinstance(payload, NativeTabularResult):
         raise TypeError("native_tabular_to_arrow expects a NativeTabularResult")
 
-    record_dispatch_event(
-        surface="vibespatial.native_tabular.to_arrow",
-        operation="to_arrow",
-        implementation="repo_owned_geoarrow_adapter",
-        reason="Native tabular export lowers directly to Arrow without rebuilding a GeoDataFrame.",
-        selected=ExecutionMode.CPU,
-    )
-
     resolved_column_order = list(payload.resolved_column_order)
     geometry_columns = sorted(
         payload.geometry_columns,
@@ -1859,20 +1891,21 @@ def native_tabular_to_arrow(
         )
 
     geometry_encoding_dict: dict[str, str] = {}
+    geometry_modes: list[ExecutionMode] = []
     for geometry_column in geometry_columns:
         geometry_column_index = resolved_column_order.index(geometry_column.name)
         if geometry_encoding.lower() == "geoarrow":
-            geometry_series = geometry_column.geometry.to_geoseries(
-                index=payload.attributes.index,
-                name=geometry_column.name,
-            )
-            field, geom_arr = _construct_geoarrow_array_with_explicit_fallback(
-                geometry_series,
+            field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
+                geometry_column.geometry.to_geoseries(
+                    index=payload.attributes.index,
+                    name=geometry_column.name,
+                ),
                 field_name=geometry_column.name,
                 interleaved=interleaved,
                 include_z=include_z,
                 surface="vibespatial.native_tabular.to_arrow",
                 fallback_to_wkb_on_error=False,
+                return_mode=True,
             )
             geometry_encoding_dict[geometry_column.name] = (
                 field.metadata[b"ARROW:extension:name"]
@@ -1882,10 +1915,11 @@ def native_tabular_to_arrow(
         elif geometry_encoding.lower() == "wkb":
             owned = geometry_column.geometry.owned
             if owned is not None:
-                field, geom_arr = _encode_owned_wkb_array(
+                field, geom_arr, selected = _encode_owned_wkb_array(
                     owned,
                     field_name=geometry_column.name,
                     crs=geometry_column.geometry.crs,
+                    return_mode=True,
                 )
             else:
                 geometry_series = geometry_column.geometry.to_geoseries(
@@ -1897,13 +1931,35 @@ def native_tabular_to_arrow(
                     field_name=geometry_column.name,
                     crs=geometry_series.crs,
                 )
+                selected = ExecutionMode.CPU
             geometry_encoding_dict[geometry_column.name] = "WKB"
         else:
             raise ValueError(
                 f"Expected geometry encoding 'WKB' or 'geoarrow' got {geometry_encoding}"
             )
 
+        geometry_modes.append(selected)
         table = table.add_column(geometry_column_index, field, geom_arr)
+    selected = (
+        ExecutionMode.GPU
+        if geometry_modes and all(mode is ExecutionMode.GPU for mode in geometry_modes)
+        else ExecutionMode.CPU
+    )
+    record_dispatch_event(
+        surface="vibespatial.native_tabular.to_arrow",
+        operation="to_arrow",
+        implementation=(
+            "native_tabular_device_arrow_export"
+            if selected is ExecutionMode.GPU
+            else "repo_owned_geoarrow_adapter"
+        ),
+        reason=(
+            "Native tabular Arrow export encoded every geometry column through the device-backed path."
+            if selected is ExecutionMode.GPU
+            else "Native tabular export lowers directly to Arrow without rebuilding a GeoDataFrame."
+        ),
+        selected=selected,
+    )
     return table, geometry_encoding_dict
 
 def geoseries_to_arrow(
@@ -1915,34 +1971,54 @@ def geoseries_to_arrow(
 ):
     from vibespatial.api.io._geoarrow import GeoArrowArray, construct_wkb_array
 
-    record_dispatch_event(
-        surface="geopandas.geoseries.to_arrow",
-        operation="to_arrow",
-        implementation="repo_owned_geoarrow_adapter",
-        reason="GeoArrow export routes through the repo-owned adapter and owned buffer policy.",
-        selected=ExecutionMode.CPU,
-    )
     field_name = series.name if series.name is not None else ""
-    if geometry_encoding.lower() == "geoarrow":
-        field, geom_arr = _construct_geoarrow_array_with_explicit_fallback(
+    normalized_encoding = geometry_encoding.lower()
+    if normalized_encoding == "geoarrow":
+        field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
             series,
             field_name=field_name,
             interleaved=interleaved,
             include_z=include_z,
             surface="geopandas.geoseries.to_arrow",
             fallback_to_wkb_on_error=True,
+            return_mode=True,
         )
-    elif geometry_encoding.lower() == "wkb":
-        field, geom_arr = construct_wkb_array(
-            series.array.to_numpy(),
-            field_name=field_name,
-            crs=series.crs,
-        )
+    elif normalized_encoding == "wkb":
+        owned = _series_owned_geometry(series)
+        if owned is not None:
+            field, geom_arr, selected = _encode_owned_wkb_array(
+                owned,
+                field_name=field_name,
+                crs=series.crs,
+                return_mode=True,
+            )
+        else:
+            field, geom_arr = construct_wkb_array(
+                series.array.to_numpy(),
+                field_name=field_name,
+                crs=series.crs,
+            )
+            selected = ExecutionMode.CPU
     else:
         raise ValueError(
             "Expected geometry encoding 'WKB' or 'geoarrow' "
             f"got {geometry_encoding}"
         )
+    record_dispatch_event(
+        surface="geopandas.geoseries.to_arrow",
+        operation="to_arrow",
+        implementation=(
+            "native_series_device_arrow_export"
+            if selected is ExecutionMode.GPU
+            else "repo_owned_geoarrow_adapter"
+        ),
+        reason=(
+            "GeoSeries Arrow export encoded geometry through the device-backed path."
+            if selected is ExecutionMode.GPU
+            else "GeoArrow export routes through the repo-owned adapter and owned buffer policy."
+        ),
+        selected=selected,
+    )
     return GeoArrowArray(field, geom_arr)
 
 def geodataframe_from_arrow(table, *, geometry: str | None = None, to_pandas_kwargs: dict | None = None):
