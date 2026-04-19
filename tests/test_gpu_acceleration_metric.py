@@ -268,6 +268,49 @@ def test_public_to_file_compatibility_writes_are_excluded_from_value_metric() ->
     assert summary["value_dispatch_pct"] == 100.0
 
 
+def test_public_host_to_arrow_compatibility_writes_are_excluded_from_value_metric() -> None:
+    summary = summarize_event_records(
+        [
+            {
+                "event_type": "dispatch",
+                "selected": "cpu",
+                "surface": "geopandas.geodataframe.to_arrow",
+                "operation": "to_arrow",
+                "detail": (
+                    "format=geoarrow encoding=wkb row_count=2 geometry_columns=1 "
+                    "owned_columns=0 device_columns=0 compatibility_writer=1 "
+                    "reason=host_arrow_export"
+                ),
+            },
+            {
+                "event_type": "dispatch",
+                "selected": "cpu",
+                "surface": "geopandas.geodataframe.to_arrow",
+                "operation": "to_arrow",
+                "detail": (
+                    "format=geoarrow encoding=geoarrow row_count=2 geometry_columns=1 "
+                    "owned_columns=1 device_columns=1"
+                ),
+            },
+        ]
+    )
+
+    assert classify_dispatch_family(
+        {
+            "event_type": "dispatch",
+            "selected": "cpu",
+            "surface": "geopandas.geodataframe.to_arrow",
+            "operation": "to_arrow",
+            "detail": "format=geoarrow compatibility_writer=1 reason=host_arrow_export",
+        }
+    ) == "compat_write"
+    assert summary["compat_write_breakdown"]["by_format"]["geoarrow"]["cpu_dispatches"] == 1
+    assert summary["compat_write_breakdown"]["by_reason"]["host_arrow_export"]["cpu_dispatches"] == 1
+    assert summary["io_write_breakdown"]["by_format"]["geoarrow"]["cpu_dispatches"] == 1
+    assert summary["value_dispatches"] == 1
+    assert summary["value_gpu_dispatches"] == 0
+
+
 def test_public_native_arrow_to_file_writes_count_as_io_write() -> None:
     summary = summarize_event_records(
         [

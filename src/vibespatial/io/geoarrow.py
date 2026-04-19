@@ -85,6 +85,13 @@ class WKBBridgeBenchmark:
     rows_per_second: float
 
 
+@dataclass(frozen=True)
+class _ArrowGeometryColumnDispatch:
+    name: str
+    owned: bool
+    device_backed: bool
+
+
 class _GeoArrowNativeCompatibilityRoute(RuntimeError):
     """Signal that GeoArrow import should use the explicit compatibility adapter."""
 
@@ -897,6 +904,46 @@ def _series_owned_geometry(series):
     if isinstance(arr, DeviceGeometryArray):
         return arr.to_owned()
     return getattr(arr, "_owned", None)
+
+
+def _arrow_geometry_column_dispatch(series, name: str) -> _ArrowGeometryColumnDispatch:
+    owned = _series_owned_geometry(series)
+    device_backed = False
+    if owned is not None:
+        device_backed = owned.residency is Residency.DEVICE or owned.device_state is not None
+    return _ArrowGeometryColumnDispatch(
+        name=name,
+        owned=owned is not None,
+        device_backed=device_backed,
+    )
+
+
+def _public_arrow_compatibility_writer(
+    *,
+    selected: ExecutionMode,
+    columns: list[_ArrowGeometryColumnDispatch],
+) -> bool:
+    return selected is ExecutionMode.CPU and not any(column.device_backed for column in columns)
+
+
+def _arrow_export_dispatch_detail(
+    *,
+    geometry_encoding: str,
+    row_count: int,
+    columns: list[_ArrowGeometryColumnDispatch],
+    compatibility_writer: bool = False,
+) -> str:
+    parts = [
+        "format=geoarrow",
+        f"encoding={geometry_encoding.lower()}",
+        f"row_count={row_count}",
+        f"geometry_columns={len(columns)}",
+        f"owned_columns={sum(int(column.owned) for column in columns)}",
+        f"device_columns={sum(int(column.device_backed) for column in columns)}",
+    ]
+    if compatibility_writer:
+        parts.extend(("compatibility_writer=1", "reason=host_arrow_export"))
+    return " ".join(parts)
 
 
 def _geoarrow_point_type(*, interleaved: bool):
@@ -1870,9 +1917,13 @@ def geodataframe_to_arrow(
         df_attr[col] = None
     table = pa.Table.from_pandas(df_attr, preserve_index=index)
     geometry_modes: list[ExecutionMode] = []
+    geometry_dispatch_columns: list[_ArrowGeometryColumnDispatch] = []
     normalized_encoding = geometry_encoding.lower()
     for column_index, column_name in zip(geometry_indices, geometry_columns):
         series = df[column_name]
+        geometry_dispatch_columns.append(
+            _arrow_geometry_column_dispatch(series, str(column_name))
+        )
         if normalized_encoding == "geoarrow":
             field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
                 series,
@@ -1910,6 +1961,10 @@ def geodataframe_to_arrow(
         if geometry_modes and all(mode is ExecutionMode.GPU for mode in geometry_modes)
         else ExecutionMode.CPU
     )
+    compatibility_writer = _public_arrow_compatibility_writer(
+        selected=selected,
+        columns=geometry_dispatch_columns,
+    )
     record_dispatch_event(
         surface="geopandas.geodataframe.to_arrow",
         operation="to_arrow",
@@ -1922,6 +1977,12 @@ def geodataframe_to_arrow(
             "GeoArrow export encoded every geometry column through the repo-owned device path."
             if selected is ExecutionMode.GPU
             else "GeoArrow export routes through the repo-owned adapter and owned buffer policy."
+        ),
+        detail=_arrow_export_dispatch_detail(
+            geometry_encoding=geometry_encoding,
+            row_count=len(df),
+            columns=geometry_dispatch_columns,
+            compatibility_writer=compatibility_writer,
         ),
         selected=selected,
     )
@@ -1965,8 +2026,22 @@ def native_tabular_to_arrow(
 
     geometry_encoding_dict: dict[str, str] = {}
     geometry_modes: list[ExecutionMode] = []
+    geometry_dispatch_columns: list[_ArrowGeometryColumnDispatch] = []
     for geometry_column in geometry_columns:
         geometry_column_index = resolved_column_order.index(geometry_column.name)
+        geometry_dispatch_columns.append(
+            _ArrowGeometryColumnDispatch(
+                name=geometry_column.name,
+                owned=geometry_column.geometry.owned is not None,
+                device_backed=(
+                    geometry_column.geometry.owned is not None
+                    and (
+                        geometry_column.geometry.owned.residency is Residency.DEVICE
+                        or geometry_column.geometry.owned.device_state is not None
+                    )
+                ),
+            )
+        )
         if geometry_encoding.lower() == "geoarrow":
             field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
                 geometry_column.geometry.to_geoseries(
@@ -2032,6 +2107,11 @@ def native_tabular_to_arrow(
             if selected is ExecutionMode.GPU
             else "Native tabular export lowers directly to Arrow without rebuilding a GeoDataFrame."
         ),
+        detail=_arrow_export_dispatch_detail(
+            geometry_encoding=geometry_encoding,
+            row_count=payload.geometry.row_count,
+            columns=geometry_dispatch_columns,
+        ),
         selected=selected,
     )
     return table, geometry_encoding_dict
@@ -2046,6 +2126,9 @@ def geoseries_to_arrow(
     from vibespatial.api.io._geoarrow import GeoArrowArray, construct_wkb_array
 
     field_name = series.name if series.name is not None else ""
+    geometry_dispatch_columns = [
+        _arrow_geometry_column_dispatch(series, str(field_name))
+    ]
     normalized_encoding = geometry_encoding.lower()
     if normalized_encoding == "geoarrow":
         field, geom_arr, selected = _construct_geoarrow_array_with_explicit_fallback(
@@ -2078,6 +2161,10 @@ def geoseries_to_arrow(
             "Expected geometry encoding 'WKB' or 'geoarrow' "
             f"got {geometry_encoding}"
         )
+    compatibility_writer = _public_arrow_compatibility_writer(
+        selected=selected,
+        columns=geometry_dispatch_columns,
+    )
     record_dispatch_event(
         surface="geopandas.geoseries.to_arrow",
         operation="to_arrow",
@@ -2090,6 +2177,12 @@ def geoseries_to_arrow(
             "GeoSeries Arrow export encoded geometry through the device-backed path."
             if selected is ExecutionMode.GPU
             else "GeoArrow export routes through the repo-owned adapter and owned buffer policy."
+        ),
+        detail=_arrow_export_dispatch_detail(
+            geometry_encoding=geometry_encoding,
+            row_count=len(series),
+            columns=geometry_dispatch_columns,
+            compatibility_writer=compatibility_writer,
         ),
         selected=selected,
     )

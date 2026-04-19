@@ -171,6 +171,8 @@ def classify_dispatch_family(record: dict[str, Any]) -> str:
         return "io_write"
     if surface in {"geopandas.geodataframe.to_file", "geopandas.geoseries.to_file"}:
         return "compat_write"
+    if is_public_surface and operation in IO_WRITE_OPERATIONS and "compatibility_writer=1" in detail:
+        return "compat_write"
     if is_public_surface and (operation in NORMALIZATION_OPERATIONS or surface == "normalize"):
         return "normalization"
     if is_public_surface and (

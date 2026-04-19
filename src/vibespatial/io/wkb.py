@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import os
 import struct
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -83,6 +85,16 @@ class _NativeDeviceWriteStatus:
     written: bool
     fallback_detail: str | None = None
     compatibility_detail: str | None = None
+
+
+def _pylibcudf_sink(path) -> str | io.IOBase | None:
+    if isinstance(path, io.IOBase):
+        return path
+    if isinstance(path, bytes):
+        return os.fsdecode(path)
+    if isinstance(path, (str, os.PathLike)):
+        return str(path)
+    return None
 
 
 class _GpuWkbOnInvalidError(ValueError):
@@ -629,7 +641,6 @@ def _write_geoparquet_native_device_payload(
 ) -> _NativeDeviceWriteStatus:
     import base64
     import json
-    import os
 
     import pyarrow as pa
 
@@ -672,11 +683,13 @@ def _write_geoparquet_native_device_payload(
                 f"compression={compression!r}"
             ),
         )
-    if not isinstance(path, (str, bytes, os.PathLike)):
+    sink = _pylibcudf_sink(path)
+    if sink is None:
         return _NativeDeviceWriteStatus(
             written=False,
             compatibility_detail=(
-                "native device GeoParquet payload writer requires a filesystem path sink"
+                "native device GeoParquet payload writer requires a filesystem path "
+                "or Python IO sink"
             ),
         )
     if plc is None or not has_pylibcudf_support():
@@ -889,7 +902,7 @@ def _write_geoparquet_native_device_payload(
     ).decode()
 
     builder = plc.io.parquet.ParquetWriterOptions.builder(
-        plc.io.types.SinkInfo([str(path)]),
+        plc.io.types.SinkInfo([sink]),
         plc_table,
     )
     builder.metadata(metadata)
@@ -925,7 +938,6 @@ def _write_geoparquet_native_device(
 ) -> _NativeDeviceWriteStatus:
     import base64
     import json
-    import os
 
     import pyarrow as pa
 
@@ -972,11 +984,12 @@ def _write_geoparquet_native_device(
                 f"compression={compression!r}"
             ),
         )
-    if not isinstance(path, (str, bytes, os.PathLike)):
+    sink = _pylibcudf_sink(path)
+    if sink is None:
         return _NativeDeviceWriteStatus(
             written=False,
             compatibility_detail=(
-                "native device GeoParquet writer requires a filesystem path sink"
+                "native device GeoParquet writer requires a filesystem path or Python IO sink"
             ),
         )
     if plc is None or not has_pylibcudf_support():
@@ -1188,7 +1201,7 @@ def _write_geoparquet_native_device(
     ).decode()
 
     builder = plc.io.parquet.ParquetWriterOptions.builder(
-        plc.io.types.SinkInfo([str(path)]),
+        plc.io.types.SinkInfo([sink]),
         plc_table,
     )
     builder.metadata(metadata)

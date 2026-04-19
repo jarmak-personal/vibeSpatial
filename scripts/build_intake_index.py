@@ -20,6 +20,7 @@ EXCLUDED_DIRS = {
     ".pytest_cache",
     ".ruff_cache",
     "__pycache__",
+    "benchmark_results",
 }
 STOPWORDS = {
     "a",

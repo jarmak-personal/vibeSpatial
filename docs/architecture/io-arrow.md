@@ -5,7 +5,7 @@ Scope: Arrow, GeoParquet, and WKB IO boundary around owned geometry buffers and 
 Read If: You are changing Arrow, GeoParquet, WKB adapters, or owned-buffer IO decode and encode.
 STOP IF: Your task already has the specific IO adapter open and only needs local implementation detail.
 Source Of Truth: IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.
-Body Budget: 243/260 lines
+Body Budget: 247/260 lines
 Document: docs/architecture/io-arrow.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 32-37 | Risks |
 | 38-53 | Decision |
 | 54-75 | Performance Notes |
-| 76-205 | Current Behavior |
-| 206-243 | Measured Local Baseline |
+| 76-209 | Current Behavior |
+| 210-247 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -180,6 +180,10 @@ geometry buffers while keeping GPU-native formats as the design center.
 - Shared native Arrow export now follows the same rule for WKB payloads: when
   owned geometry is already available, it encodes directly from the owned
   buffers instead of rebuilding a temporary `GeoSeries` before Arrow emission.
+- Public host-originated `GeoDataFrame.to_arrow` and `GeoSeries.to_arrow`
+  exports now record an explicit GeoArrow compatibility-writer boundary, while
+  device-backed CPU misses stay in `io_write` coverage as real acceleration
+  gaps instead of being hidden by the compatibility bucket.
 - Terminal GeoParquet compatibility decisions such as non-filesystem sinks or
   non-native compression now record an explicit CPU dispatch at the sink
   boundary instead of a fallback event, so strict-native mode still rejects

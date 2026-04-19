@@ -31,6 +31,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
+from vibespatial.runtime.residency import Residency
 
 from .geoarrow import (
     _authoritative_geoarrow_host_view,
@@ -188,6 +189,32 @@ def _record_terminal_geoparquet_compatibility_export(
     )
 
 
+def _terminal_arrow_export_selected_mode(owned: OwnedGeometryArray | None) -> ExecutionMode:
+    if owned is not None and (owned.device_state is not None or owned.residency is Residency.DEVICE):
+        return ExecutionMode.GPU
+    return ExecutionMode.CPU
+
+
+def _record_terminal_geoparquet_native_arrow_export(
+    *,
+    detail: str,
+    implementation: str,
+    row_count: int,
+    owned: OwnedGeometryArray | None,
+) -> None:
+    selected = _terminal_arrow_export_selected_mode(owned)
+    _record_public_geoparquet_dispatch(
+        selected=selected,
+        implementation=implementation,
+        reason=(
+            "terminal GeoParquet export used the shared native Arrow sink after "
+            "owned geometry encoding"
+        ),
+        row_count=row_count,
+        detail=detail,
+    )
+
+
 def _owned_prefers_small_terminal_arrow_export(owned: OwnedGeometryArray | None) -> bool:
     if owned is None:
         return False
@@ -203,8 +230,9 @@ def _small_terminal_arrow_export_detail(
     if not polygonal_terminal_candidate or row_count > _SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS:
         return None
     return (
-        "small terminal GeoParquet write prefers the explicit Arrow export at the sink; "
-        "polygonal outputs are faster through the Arrow sink at this size; "
+        "small terminal GeoParquet write prefers the shared native Arrow sink; "
+        "polygonal outputs are faster through the Arrow sink at this size while "
+        "geometry encoding stays owned/native; "
         f"row_count={row_count} <= {_SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS}"
     )
 
@@ -371,10 +399,11 @@ def _write_geoparquet_native_tabular_result(
         ),
     )
     if small_write_detail is not None:
-        _record_terminal_geoparquet_compatibility_export(
+        _record_terminal_geoparquet_native_arrow_export(
             detail=small_write_detail,
             implementation="native_payload_arrow_terminal_export",
             row_count=payload.geometry.row_count,
+            owned=payload.geometry.owned,
         )
         _write_native_tabular_result_with_arrow(
             payload,
@@ -2462,23 +2491,25 @@ def write_geoparquet(
 
     if all_geometry_columns_owned:
         small_write_detail = None
+        terminal_owned = None
         if geometry_columns.size == 1:
+            terminal_owned = df[geometry_columns[0]].array.to_owned()
             small_write_detail = _small_terminal_arrow_export_detail(
                 row_count=len(df),
-                polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(
-                    df[geometry_columns[0]].array.to_owned()
-                ),
+                polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(terminal_owned),
             )
         if small_write_detail is not None:
-            _record_terminal_geoparquet_compatibility_export(
+            _record_terminal_geoparquet_native_arrow_export(
                 detail=small_write_detail,
                 implementation="native_geodataframe_arrow_terminal_export",
                 row_count=len(df),
+                owned=terminal_owned,
             )
             from vibespatial.api._native_results import _spatial_to_native_tabular_result
 
             payload = _spatial_to_native_tabular_result(df)
-            _write_geoparquet_native_tabular_result(
+            payload = _authoritative_native_tabular_result(payload)
+            _write_native_tabular_result_with_arrow(
                 payload,
                 path,
                 index=index,

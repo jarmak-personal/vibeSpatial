@@ -1923,6 +1923,7 @@ def test_geoseries_to_arrow_supported_single_multi_mix_uses_native_geoarrow_prom
 
 def test_geoseries_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
     series = geopandas.GeoSeries([Point(0, 0), Point(1, 1), Point(2, 2)])
 
     arrow_array = io_arrow.geoseries_to_arrow(series, geometry_encoding="geoarrow")
@@ -1931,9 +1932,13 @@ def test_geoseries_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
 
     field = pa.Field._import_from_c_capsule(schema_capsule)
     pa_array = pa.Array._import_from_c_capsule(field.__arrow_c_schema__(), array_capsule)
+    dispatches = geopandas.get_dispatch_events(clear=True)
 
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.point"
     assert pa_array.type.list_size == 2
+    assert dispatches[-1].surface == "geopandas.geoseries.to_arrow"
+    assert "compatibility_writer=1" in dispatches[-1].detail
+    assert "reason=host_arrow_export" in dispatches[-1].detail
     assert geopandas.get_fallback_events(clear=True) == []
 
 
@@ -1959,6 +1964,7 @@ def test_geoseries_to_arrow_point_fast_path_preserves_empty_point_rows() -> None
 
 def test_geodataframe_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
     geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
     gdf = geopandas.GeoDataFrame(
         {"value": [1, 2, 3], "geometry": [Point(0, 0), Point(1, 1), Point(2, 2)]}
     )
@@ -1968,8 +1974,13 @@ def test_geodataframe_to_arrow_uses_native_point_geoarrow_fast_path() -> None:
 
     table = pa.table(arrow_table)
     field = table.schema.field("geometry")
+    dispatches = geopandas.get_dispatch_events(clear=True)
 
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.point"
+    assert dispatches[-1].surface == "geopandas.geodataframe.to_arrow"
+    assert "format=geoarrow" in dispatches[-1].detail
+    assert "compatibility_writer=1" in dispatches[-1].detail
+    assert "reason=host_arrow_export" in dispatches[-1].detail
     assert geopandas.get_fallback_events(clear=True) == []
 
 
@@ -1990,6 +2001,7 @@ def test_device_geoseries_to_arrow_geoarrow_records_gpu_dispatch() -> None:
         event.surface == "geopandas.geoseries.to_arrow"
         and event.implementation == "native_series_device_arrow_export"
         and event.selected == "gpu"
+        and "compatibility_writer=1" not in event.detail
         for event in dispatches
     )
 
@@ -2010,6 +2022,7 @@ def test_device_geodataframe_to_arrow_geoarrow_records_gpu_dispatch() -> None:
         event.surface == "geopandas.geodataframe.to_arrow"
         and event.implementation == "native_geoarrow_device_export"
         and event.selected == "gpu"
+        and "compatibility_writer=1" not in event.detail
         for event in dispatches
     )
 
@@ -2077,15 +2090,22 @@ def test_geodataframe_to_arrow_device_geoarrow_raises_strict_native_before_host_
 
 def test_geodataframe_to_arrow_device_supported_single_multi_mix_avoids_fallback_and_materialization() -> None:
     geopandas.clear_fallback_events()
+    geopandas.clear_dispatch_events()
     gdf, owned = _make_device_dga_gdf([Point(0, 0), MultiPoint([(1, 1), (2, 2)])])
     owned.diagnostics.clear()
 
     arrow_table = io_arrow.geodataframe_to_arrow(gdf, geometry_encoding="geoarrow")
     table = pa.table(arrow_table)
     field = table.schema.field("geometry")
+    dispatches = geopandas.get_dispatch_events(clear=True)
     mat_events = [event for event in owned.diagnostics if event.kind == DiagnosticKind.MATERIALIZATION]
 
     assert field.metadata[b"ARROW:extension:name"] == b"geoarrow.multipoint"
+    assert all(
+        "compatibility_writer=1" not in event.detail
+        for event in dispatches
+        if event.surface == "geopandas.geodataframe.to_arrow"
+    )
     assert geopandas.get_fallback_events(clear=True) == []
     assert mat_events == []
 
@@ -2705,6 +2725,60 @@ def test_device_backed_to_parquet_preserves_arrow_schema_metadata(tmp_path) -> N
     assert b"pandas" in table.schema.metadata
 
 
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_device_backed_to_parquet_bytesio_uses_native_writer() -> None:
+    geopandas.clear_dispatch_events()
+    gdf, _owned = _make_device_dga_gdf([Point(0, 0), Point(1, 1)])
+    sink = BytesIO()
+
+    gdf.to_parquet(sink, geometry_encoding="geoarrow")
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert sink.tell() > 0
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_geodataframe_device_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+    sink.seek(0)
+    result = geopandas.read_parquet(sink)
+    assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
+
+
+@pytest.mark.skipif(
+    not has_gpu_runtime() or not has_pylibcudf_support(),
+    reason="GPU GeoParquet writer unavailable",
+)
+def test_native_tabular_to_parquet_bytesio_uses_native_payload_writer() -> None:
+    geopandas.clear_dispatch_events()
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries([Point(0, 0), Point(1, 1)], residency=Residency.DEVICE),
+            crs="EPSG:4326",
+        )
+    )
+    assert payload is not None
+    sink = BytesIO()
+
+    payload.to_parquet(sink, geometry_encoding="geoarrow")
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert sink.tell() > 0
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_payload_device_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+    sink.seek(0)
+    result = geopandas.read_parquet(sink)
+    assert list(result.geometry.astype(str)) == ["POINT (0 0)", "POINT (1 1)"]
+
+
 def test_native_tabular_geometry_only_to_parquet_populates_schema_metadata(tmp_path) -> None:
     import pyarrow.parquet as pq
 
@@ -2887,7 +2961,38 @@ def test_device_geodataframe_small_terminal_write_prefers_arrow_export(
     assert any(
         event.surface == "geopandas.geodataframe.to_parquet"
         and event.implementation == "native_geodataframe_arrow_terminal_export"
-        and "small terminal GeoParquet write prefers the explicit Arrow export" in event.detail
+        and event.selected == "gpu"
+        and "small terminal GeoParquet write prefers the shared native Arrow sink" in event.detail
+        for event in dispatches
+    )
+    assert not any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_payload_arrow_terminal_export"
+        for event in dispatches
+    )
+
+
+def test_host_owned_small_terminal_write_records_cpu_in_strict_native(tmp_path) -> None:
+    from vibespatial.testing import strict_native_environment
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    geoms = [box(float(i), float(i), float(i) + 1.0, float(i) + 1.0) for i in range(300)]
+    gdf = _make_dga_gdf(geoms)
+
+    path = tmp_path / "host-owned-small-terminal-strict.parquet"
+    with strict_native_environment():
+        gdf.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert path.exists()
+    assert fallbacks == []
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_geodataframe_arrow_terminal_export"
+        and event.selected == "cpu"
+        and "small terminal GeoParquet write prefers the shared native Arrow sink" in event.detail
         for event in dispatches
     )
 
@@ -3025,7 +3130,8 @@ def test_native_tabular_small_terminal_write_prefers_arrow_export(
     assert any(
         event.surface == "geopandas.geodataframe.to_parquet"
         and event.implementation == "native_payload_arrow_terminal_export"
-        and "small terminal GeoParquet write prefers the explicit Arrow export" in event.detail
+        and event.selected == "gpu"
+        and "small terminal GeoParquet write prefers the shared native Arrow sink" in event.detail
         for event in dispatches
     )
 
