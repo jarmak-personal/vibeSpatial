@@ -51,6 +51,7 @@ from vibespatial.runtime.precision import (
     PrecisionPlan,
     normalize_precision_mode,
 )
+from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.runtime.robustness import select_robustness_plan
 
 if TYPE_CHECKING:
@@ -64,6 +65,17 @@ except ModuleNotFoundError:  # pragma: no cover
 _get_empty_owned = _segmented_union_cpu_module.get_empty_owned
 _segmented_union_cpu = _segmented_union_cpu_module.segmented_union_cpu
 _segmented_union_pair_cpu = _segmented_union_cpu_module.segmented_union_pair_cpu
+
+
+def _empty_group_owned_like(source: OwnedGeometryArray) -> OwnedGeometryArray:
+    empty = _get_empty_owned().take(singleton_indices(0))
+    if source.residency is Residency.DEVICE and cp is not None:
+        empty.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="segmented union empty group matches device-resident input",
+        )
+    return empty
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +241,7 @@ def _segmented_union_gpu(
     ADR-0002: CONSTRUCTIVE class, fp64 (segment intersection precision).
     ADR-0033: Inherits overlay pipeline tiers (NVRTC + CCCL + CuPy).
     """
+    from vibespatial.constructive.union_all import union_all_gpu_owned
 
     # Validate: GPU overlay requires polygon-family geometries.
     polygon_tags = {FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]}
@@ -244,7 +257,7 @@ def _segmented_union_gpu(
 
         keep = valid_row_indices(geometries)
         if keep.size == 0:
-            return _get_empty_owned()
+            return _empty_group_owned_like(geometries)
         if keep.size < geometries.row_count:
             geometries = geometries.take(keep)
         if geometries.row_count == 1:
@@ -266,13 +279,13 @@ def _segmented_union_gpu(
         group_size = end - start
 
         if group_size == 0:
-            group_results.append(_get_empty_owned())
+            group_results.append(_empty_group_owned_like(geometries))
             continue
 
         if group_size == 1:
             single = geometries.take(singleton_indices(start))
             if not single.validity[0]:
-                group_results.append(_get_empty_owned())
+                group_results.append(_empty_group_owned_like(geometries))
             else:
                 group_results.append(single)
             continue
@@ -284,7 +297,7 @@ def _segmented_union_gpu(
         # Filter out invalid/empty rows (vectorized, not Python loop).
         keep = valid_row_indices(group_owned)
         if keep.size == 0:
-            group_results.append(_get_empty_owned())
+            group_results.append(_empty_group_owned_like(geometries))
             continue
         if keep.size < group_owned.row_count:
             group_owned = group_owned.take(keep)
@@ -293,9 +306,12 @@ def _segmented_union_gpu(
             group_results.append(group_owned)
             continue
 
-        # Tree-reduce: each round halves the geometry count.
         try:
-            reduced = _tree_reduce_group(group_owned)
+            reduced = union_all_gpu_owned(
+                group_owned,
+                dispatch_mode=ExecutionMode.GPU,
+                precision=precision_plan.compute_precision,
+            )
             group_results.append(reduced)
         except Exception:
             # Fall back to CPU for this group on any GPU overlay failure.

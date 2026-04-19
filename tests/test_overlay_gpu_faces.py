@@ -14,6 +14,7 @@ from vibespatial import (
     has_gpu_runtime,
 )
 from vibespatial.runtime.hotpath_trace import get_hotpath_trace, reset_hotpath_trace
+from vibespatial.runtime.residency import Residency
 
 
 def _build_face_table(left_geometries, right_geometries):
@@ -145,3 +146,46 @@ def test_gpu_face_coverage_trace_accounts_for_mixed_family_overlap(
     trace_names = [stage.name for stage in get_hotpath_trace()]
 
     assert "overlay.faces.coverage.left.mixed_family_overlap" in trace_names
+
+
+@pytest.mark.gpu
+def test_gpu_face_coverage_trace_uses_same_row_multipolygon_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.overlay.gpu import _overlay_owned
+
+    left = from_shapely_geometries(
+        [
+            Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]),
+            Polygon([(5, 0), (9, 0), (9, 4), (5, 4), (5, 0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    right_multi = MultiPolygon(
+        [
+            Polygon([(1, -1), (3, -1), (3, 5), (1, 5), (1, -1)]),
+            Polygon([(6, -1), (8, -1), (8, 5), (6, 5), (6, -1)]),
+        ]
+    )
+    right = from_shapely_geometries(
+        [right_multi, right_multi],
+        residency=Residency.DEVICE,
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+
+    result = _overlay_owned(
+        left,
+        right,
+        operation="intersection",
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    )
+    trace_names = [stage.name for stage in get_hotpath_trace()]
+
+    assert result.row_count == left.row_count
+    assert "overlay.faces.coverage.right.multipolygon_same_row" in trace_names

@@ -51,6 +51,124 @@ _BUFFERED_TWO_POINT_SMALL_PARTIAL_UNION_MAX_ROWS = 2
 logger = logging.getLogger(__name__)
 
 
+def _collect_polygonal_parts(geometry) -> list[object]:
+    if geometry is None or shapely.is_empty(geometry):
+        return []
+    geom_type = geometry.geom_type
+    if geom_type == "Polygon":
+        return [geometry]
+    if geom_type == "MultiPolygon":
+        return list(shapely.get_parts(geometry))
+    if geom_type != "GeometryCollection":
+        return []
+
+    parts: list[object] = []
+    for part in shapely.get_parts(geometry):
+        parts.extend(_collect_polygonal_parts(part))
+    return parts
+
+
+def _canonicalize_polygonal_make_valid_geometry(geometry):
+    if geometry is None or shapely.is_empty(geometry):
+        return geometry
+    if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+        return geometry
+
+    polygonal_parts = _collect_polygonal_parts(geometry)
+    if not polygonal_parts:
+        return geometry
+    if len(polygonal_parts) == 1:
+        return polygonal_parts[0]
+
+    merged = shapely.union_all(np.asarray(polygonal_parts, dtype=object))
+    if merged is None or shapely.is_empty(merged):
+        return merged
+    if merged.geom_type in {"Polygon", "MultiPolygon"}:
+        return merged
+
+    repaired = shapely.make_valid(merged)
+    repaired_parts = _collect_polygonal_parts(repaired)
+    if not repaired_parts:
+        return repaired
+    if len(repaired_parts) == 1:
+        return repaired_parts[0]
+    return shapely.union_all(np.asarray(repaired_parts, dtype=object))
+
+
+def _canonicalize_polygonal_make_valid_values(values: np.ndarray) -> np.ndarray:
+    if values.size == 0:
+        return values
+    return np.asarray(
+        [_canonicalize_polygonal_make_valid_geometry(value) for value in values],
+        dtype=object,
+    )
+
+
+def _recompute_invalid_grouped_union_owned_rows(
+    reduced: OwnedGeometryArray,
+    *,
+    ordered_owned: OwnedGeometryArray,
+    offsets: np.ndarray,
+    group_count: int,
+) -> OwnedGeometryArray:
+    from vibespatial.constructive.validity import is_valid_owned
+    from vibespatial.geometry.owned import (
+        concat_owned_scatter,
+        from_shapely_geometries,
+        seed_all_validity_cache,
+    )
+
+    invalid_mask = ~np.asarray(is_valid_owned(reduced), dtype=bool)
+    if not bool(np.all(reduced.validity)):
+        invalid_mask = invalid_mask.copy()
+        invalid_mask[~reduced.validity] = False
+    if not invalid_mask.any():
+        seed_all_validity_cache(reduced)
+        return reduced
+
+    invalid_rows = np.flatnonzero(invalid_mask).astype(np.int64, copy=False)
+    repaired_values: list[object] = []
+    for row in invalid_rows:
+        start = int(offsets[row])
+        stop = int(offsets[row + 1])
+        members = np.asarray(
+            ordered_owned.take(np.arange(start, stop, dtype=np.int64)).to_shapely(),
+            dtype=object,
+        )
+        members = members[
+            [geom is not None and not shapely.is_empty(geom) for geom in members]
+        ]
+        if members.size == 0:
+            repaired_values.append(_EMPTY)
+            continue
+
+        merged = shapely.union_all(members)
+        if merged is not None and merged.geom_type == "GeometryCollection":
+            merged = _canonicalize_polygonal_make_valid_geometry(merged)
+        if merged is not None and not shapely.is_valid(merged):
+            merged = _canonicalize_polygonal_make_valid_geometry(shapely.make_valid(merged))
+        repaired_values.append(merged)
+
+    repaired_subset = from_shapely_geometries(
+        repaired_values,
+        residency=reduced.residency,
+    )
+    repaired = concat_owned_scatter(reduced, repaired_subset, invalid_rows)
+    seed_all_validity_cache(repaired)
+    record_dispatch_event(
+        surface="geopandas.geodataframe.dissolve",
+        operation="grouped_union_boundary_repair",
+        implementation="shapely.union_all_subset",
+        reason="recomputed invalid grouped GPU unions from original per-group members",
+        detail=(
+            f"groups={group_count}, "
+            f"repaired={int(np.count_nonzero(invalid_mask))}"
+        ),
+        selected=ExecutionMode.CPU,
+    )
+    return repaired
+
+
 class DissolveUnionMethod(StrEnum):
     UNARY = "unary"
     COVERAGE = "coverage"
@@ -129,28 +247,6 @@ def _grouped_union_geometry_result(
             group_count=grouped_union.group_count,
             geometry_name=geometry_name,
             crs=crs,
-        )
-
-    invalid_mask = ~np.asarray(shapely.is_valid(grouped_union.geometries), dtype=bool)
-    if invalid_mask.any():
-        repaired = np.asarray(grouped_union.geometries, dtype=object).copy()
-        repaired[invalid_mask] = np.asarray(
-            shapely.make_valid(repaired[invalid_mask]),
-            dtype=object,
-        )
-        record_dispatch_event(
-            surface="geopandas.geodataframe.dissolve",
-            operation="grouped_union_boundary_repair",
-            implementation="shapely.make_valid",
-            reason="grouped union boundary repair for invalid dissolved rows",
-            detail=(
-                f"groups={grouped_union.group_count}, "
-                f"repaired={int(np.count_nonzero(invalid_mask))}"
-            ),
-            selected=ExecutionMode.CPU,
-        )
-        return GeometryNativeResult.from_geoseries(
-            GeoSeries(repaired, name=geometry_name, crs=crs)
         )
 
     return GeometryNativeResult.from_geoseries(
@@ -673,6 +769,21 @@ def _group_positions_from_codes(row_group_codes: np.ndarray, group_count: int) -
     ]
 
 
+def _owned_supports_polygonal_grouped_union(owned: OwnedGeometryArray) -> bool:
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    valid_tags = owned.tags[owned.validity]
+    polygon_tags = np.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=valid_tags.dtype if valid_tags.size else np.int8,
+    )
+    return bool(valid_tags.size == 0 or np.all(np.isin(valid_tags, polygon_tags)))
+
+
 def _union_block(values: np.ndarray, method: DissolveUnionMethod, grid_size: float | None) -> object:
     if values.size == 0:
         return _EMPTY
@@ -756,6 +867,7 @@ def _repair_grouped_union_owned_if_needed(
                 shapely.make_valid(repaired_values),
                 dtype=object,
             )
+            repaired_values = _canonicalize_polygonal_make_valid_values(repaired_values)
             repaired_subset = from_shapely_geometries(
                 repaired_values.tolist(),
                 residency=repaired_owned.residency,
@@ -791,7 +903,13 @@ def _repair_grouped_union_owned_if_needed(
         selected=ExecutionMode.CPU,
     )
     return GeometryNativeResult.from_geoseries(
-        GeoSeries(mv_result.geometries, name=geometry_name, crs=crs)
+        GeoSeries(
+            _canonicalize_polygonal_make_valid_values(
+                np.asarray(mv_result.geometries, dtype=object)
+            ),
+            name=geometry_name,
+            crs=crs,
+        )
     )
 
 
@@ -1226,7 +1344,7 @@ def execute_grouped_box_union_gpu_codes(
 
 
 def execute_grouped_coverage_union_gpu(
-    values: np.ndarray,
+    values: Sequence[object | None] | np.ndarray | None,
     group_positions: list[np.ndarray],
     *,
     owned: OwnedGeometryArray | None = None,
@@ -1240,47 +1358,163 @@ def execute_grouped_coverage_union_gpu(
     if cp is None:
         return None
 
-    valid_mask = np.asarray([geom is not None and not shapely.is_empty(geom) for geom in values], dtype=bool)
-    if np.any(valid_mask):
-        type_ids = shapely.get_type_id(values[valid_mask])
-        if not np.all(np.isin(type_ids, [3, 6])):  # Polygon / MultiPolygon
-            return None
-
     if owned is None:
         try:
-            owned = getattr(values, "_owned", None)
+            owned = getattr(values, "_owned", None) if values is not None else None
         except Exception:
             owned = None
     if owned is None:
         return None
+    if not _owned_supports_polygonal_grouped_union(owned):
+        return None
+
+    host_values: np.ndarray | None = None
+
+    def _values() -> np.ndarray | None:
+        nonlocal host_values
+        if values is None:
+            return None
+        if host_values is None:
+            host_values = np.asarray(values, dtype=object)
+        return host_values
 
     from vibespatial.constructive.union_all import coverage_union_all_gpu_owned
 
-    merged = np.empty(len(group_positions), dtype=object)
+    group_owned_results: list[OwnedGeometryArray] = []
+    all_groups_observed = all(len(positions) > 0 for positions in group_positions)
+    merged = None if all_groups_observed else np.empty(len(group_positions), dtype=object)
     non_empty_groups = 0
     empty_groups = 0
 
     for group_index, positions in enumerate(group_positions):
         positions = np.asarray(positions, dtype=np.intp)
         if positions.size == 0:
-            merged[group_index] = _EMPTY
+            if merged is not None:
+                merged[group_index] = _EMPTY
             empty_groups += 1
             continue
         non_empty_groups += 1
         if positions.size == 1:
-            merged[group_index] = values[int(positions[0])]
+            single = owned.take(positions)
+            group_owned_results.append(single)
+            if merged is not None:
+                materialized = _values()
+                if materialized is not None:
+                    merged[group_index] = materialized[int(positions[0])]
+                else:
+                    single_geoms = single.to_shapely()
+                    merged[group_index] = single_geoms[0] if single_geoms else _EMPTY
             continue
         group_owned = owned.take(positions)
         reduced = coverage_union_all_gpu_owned(group_owned)
-        reduced_geoms = reduced.to_shapely()
-        merged[group_index] = reduced_geoms[0] if reduced_geoms else _EMPTY
+        if reduced is None:
+            return None
+        group_owned_results.append(reduced)
+        if merged is not None:
+            reduced_geoms = reduced.to_shapely()
+            merged[group_index] = reduced_geoms[0] if reduced_geoms else _EMPTY
+
+    if all_groups_observed and len(group_owned_results) == len(group_positions):
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=len(group_positions),
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=DissolveUnionMethod.COVERAGE,
+            owned=type(owned).concat(group_owned_results),
+        )
 
     return GroupedUnionResult(
-        geometries=merged,
+        geometries=merged if merged is not None else np.empty(0, dtype=object),
         group_count=len(group_positions),
         non_empty_groups=non_empty_groups,
         empty_groups=empty_groups,
         method=DissolveUnionMethod.COVERAGE,
+    )
+
+
+def execute_grouped_disjoint_subset_union_gpu(
+    values: Sequence[object | None] | np.ndarray | None,
+    group_positions: list[np.ndarray],
+    *,
+    owned: OwnedGeometryArray | None = None,
+) -> GroupedUnionResult | None:
+    """Union disjoint-subset groups on GPU via owned disjoint-subset reduction."""
+    if cp is None:
+        return None
+
+    if owned is None:
+        try:
+            owned = getattr(values, "_owned", None) if values is not None else None
+        except Exception:
+            owned = None
+    if owned is None:
+        return None
+    if not _owned_supports_polygonal_grouped_union(owned):
+        return None
+
+    host_values: np.ndarray | None = None
+
+    def _values() -> np.ndarray | None:
+        nonlocal host_values
+        if values is None:
+            return None
+        if host_values is None:
+            host_values = np.asarray(values, dtype=object)
+        return host_values
+
+    from vibespatial.constructive.union_all import disjoint_subset_union_all_owned
+
+    group_owned_results: list[OwnedGeometryArray] = []
+    all_groups_observed = all(len(positions) > 0 for positions in group_positions)
+    merged = None if all_groups_observed else np.empty(len(group_positions), dtype=object)
+    non_empty_groups = 0
+    empty_groups = 0
+
+    for group_index, positions in enumerate(group_positions):
+        positions = np.asarray(positions, dtype=np.intp)
+        if positions.size == 0:
+            if merged is not None:
+                merged[group_index] = _EMPTY
+            empty_groups += 1
+            continue
+        non_empty_groups += 1
+        if positions.size == 1:
+            single = owned.take(positions)
+            group_owned_results.append(single)
+            if merged is not None:
+                materialized = _values()
+                if materialized is not None:
+                    merged[group_index] = materialized[int(positions[0])]
+                else:
+                    single_geoms = single.to_shapely()
+                    merged[group_index] = single_geoms[0] if single_geoms else _EMPTY
+            continue
+        group_owned = owned.take(positions)
+        reduced = disjoint_subset_union_all_owned(group_owned)
+        if reduced is None:
+            return None
+        group_owned_results.append(reduced)
+        if merged is not None:
+            reduced_geoms = reduced.to_shapely()
+            merged[group_index] = reduced_geoms[0] if reduced_geoms else _EMPTY
+
+    if all_groups_observed and len(group_owned_results) == len(group_positions):
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=len(group_positions),
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=DissolveUnionMethod.DISJOINT_SUBSET,
+            owned=type(owned).concat(group_owned_results),
+        )
+
+    return GroupedUnionResult(
+        geometries=merged if merged is not None else np.empty(0, dtype=object),
+        group_count=len(group_positions),
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=DissolveUnionMethod.DISJOINT_SUBSET,
     )
 
 
@@ -1734,6 +1968,12 @@ def execute_grouped_union_codes(
 
             ordered_owned = _spatially_localize_polygon_union_inputs(ordered_owned)
         reduced = segmented_union_all(ordered_owned, offsets)
+        reduced = _recompute_invalid_grouped_union_owned_rows(
+            reduced,
+            ordered_owned=ordered_owned,
+            offsets=offsets,
+            group_count=int(unique_codes.size),
+        )
         if unique_codes.size == group_count and np.array_equal(
             unique_codes,
             np.arange(group_count, dtype=unique_codes.dtype),
@@ -1794,16 +2034,44 @@ def execute_grouped_union_codes(
             return accelerated
     if (
         normalized is DissolveUnionMethod.COVERAGE
-        and geometry_count >= OVERLAY_UNION_ALL_GPU_THRESHOLD
     ):
         if owned is not None:
             accelerated = execute_grouped_coverage_union_gpu(
-                _values(),
+                None,
                 _group_positions_from_codes(row_group_codes, group_count),
                 owned=owned,
             )
             if accelerated is not None:
                 return accelerated
+    if normalized is DissolveUnionMethod.DISJOINT_SUBSET:
+        if owned is not None:
+            accelerated = execute_grouped_disjoint_subset_union_gpu(
+                None,
+                _group_positions_from_codes(row_group_codes, group_count),
+                owned=owned,
+            )
+            if accelerated is not None:
+                return accelerated
+        exact = execute_grouped_disjoint_subset_union_codes(
+            _values(),
+            row_group_codes,
+            group_count=group_count,
+        )
+        if owned is not None and exact.geometries is not None:
+            from vibespatial.geometry.owned import from_shapely_geometries
+
+            exact = GroupedUnionResult(
+                geometries=exact.geometries,
+                group_count=exact.group_count,
+                non_empty_groups=exact.non_empty_groups,
+                empty_groups=exact.empty_groups,
+                method=exact.method,
+                owned=from_shapely_geometries(
+                    exact.geometries.tolist(),
+                    residency=owned.residency,
+                ),
+            )
+        return exact
     return None
 
 
@@ -1816,6 +2084,22 @@ def execute_grouped_union(
     owned: OwnedGeometryArray | None = None,
 ) -> GroupedUnionResult:
     normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
+    if normalized is DissolveUnionMethod.COVERAGE and owned is not None:
+        accelerated = execute_grouped_coverage_union_gpu(
+            None,
+            group_positions,
+            owned=owned,
+        )
+        if accelerated is not None:
+            return accelerated
+    if normalized is DissolveUnionMethod.DISJOINT_SUBSET and owned is not None:
+        accelerated = execute_grouped_disjoint_subset_union_gpu(
+            None,
+            group_positions,
+            owned=owned,
+        )
+        if accelerated is not None:
+            return accelerated
     values = np.asarray(geometries, dtype=object)
     # GPU box union fast path
     if (
@@ -2402,19 +2686,6 @@ def _maybe_rewrite_buffered_line_dissolve_method(
     tag = getattr(geometry_values, "_provenance", None)
     if tag is None or tag.operation != "buffer":
         return normalized_method
-    geometry_owned = getattr(geometry_values, "_owned", None)
-    if (
-        geometry_owned is not None
-        and geometry_owned.residency is Residency.DEVICE
-    ):
-        if strict_native_mode_enabled():
-            return normalized_method
-        source_owned = _provenance_source_owned(tag)
-        if (
-            source_owned is not None
-            and _dedupe_two_point_linestring_rows_gpu(source_owned) is not None
-        ):
-            return normalized_method
 
     source_types = tag.source_geom_types
     if not source_types or not source_types <= frozenset({"linestring", "multilinestring"}):
@@ -2431,6 +2702,16 @@ def _maybe_rewrite_buffered_line_dissolve_method(
     max_group_size = _max_group_size(row_group_codes, group_positions, group_count)
     if max_group_size < OVERLAY_UNION_ALL_GPU_THRESHOLD:
         return normalized_method
+
+    geometry_owned = getattr(geometry_values, "_owned", None)
+    if geometry_owned is not None and geometry_owned.residency is Residency.DEVICE:
+        if strict_native_mode_enabled():
+            return normalized_method
+        source_owned = _provenance_source_owned(tag)
+        if source_owned is None:
+            return normalized_method
+        if _dedupe_two_point_linestring_rows_gpu(source_owned) is not None:
+            return normalized_method
 
     record_rewrite_event(
         rule_name="R8_dissolve_buffered_lines_to_disjoint_subset",
@@ -2558,11 +2839,12 @@ def evaluate_geopandas_dissolve(
         grid_size=grid_size,
         agg_kwargs=agg_kwargs,
     )
-    return _coerce_constructive_export_frame(
+    exported = _coerce_constructive_export_frame(
         native_result.to_geodataframe(),
         geometry_name=frame.geometry.name,
         frame_type=type(frame),
     )
+    return exported
 
 
 def evaluate_geopandas_lazy_dissolve(

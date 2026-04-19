@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
+import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 import pyarrow as pa
 import pytest
-from shapely.geometry import GeometryCollection, LineString, Point, Polygon
+from shapely.geometry import GeometryCollection, LineString, Point, Polygon, box
 
 import vibespatial.api as geopandas
 import vibespatial.io.geojson as io_geojson
@@ -28,11 +32,13 @@ from vibespatial.api._native_results import (
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.io.file import (
+    _is_remote_named_file_source,
     _materialize_native_file_read_result,
     _native_file_result_from_owned,
     _native_geojson_result_from_gpu_result,
     _pyogrio_arrow_wkb_to_native_tabular_result,
     _read_osm_pbf_pyogrio_layer_public,
+    _resolve_named_file_source_path,
     plan_vector_file_io,
     read_vector_file,
     read_vector_file_native,
@@ -64,6 +70,18 @@ def _sample_polygon_frame() -> geopandas.GeoDataFrame:
         },
         crs="EPSG:4326",
     )
+
+
+def _write_zipped_shapefile(tmp_path: Path) -> Path:
+    source_dir = tmp_path / "shapefile"
+    source_dir.mkdir()
+    shp_path = source_dir / "sample.shp"
+    _sample_frame().to_file(shp_path, driver="ESRI Shapefile")
+    zip_path = tmp_path / "sample.zip"
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        for child in source_dir.iterdir():
+            archive.write(child, arcname=child.name)
+    return zip_path
 
 
 def test_native_attribute_table_concat_harmonizes_string_widths() -> None:
@@ -162,6 +180,195 @@ def test_public_geojson_read_prefers_pipeline_gpu_adapter_even_for_small_files(
     assert calls[-1]["capture_feature_boundaries"] is True
     assert events
     assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+    assert "format=geojson" in events[-1].detail
+    assert "request=default" in events[-1].detail
+    assert "engine=auto" in events[-1].detail
+
+
+@pytest.mark.gpu
+def test_public_explicit_pyogrio_geojson_read_keeps_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.geojson"
+    frame = _sample_frame()
+    frame.to_file(path, driver="GeoJSON")
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries(frame.geometry.tolist()),
+        crs="EPSG:4326",
+        attributes=frame.drop(columns="geometry"),
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("vibespatial.io.file.read_geojson_native", lambda *_args, **_kwargs: payload)
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit pyogrio GeoJSON reads should stay on the native path")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path, engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == frame["id"].tolist()
+    assert events
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+    assert "explicit_engine=pyogrio" in events[-1].detail
+    assert "compat_override=1" not in events[-1].detail
+
+
+@pytest.mark.gpu
+def test_public_explicit_pyogrio_geojson_json_string_keeps_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feature_collection = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": 1, "value": 10},
+                "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            },
+            {
+                "type": "Feature",
+                "properties": {"id": 2, "value": 20},
+                "geometry": {"type": "Point", "coordinates": [1.0, 1.0]},
+            },
+        ],
+    }
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0), Point(1, 1)]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame({"id": [1, 2], "value": [10, 20]}),
+    )
+    seen_sources: list[object] = []
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file.read_geojson_native",
+        lambda source, *_args, **_kwargs: seen_sources.append(source) or payload,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("in-memory explicit pyogrio GeoJSON reads should stay on the native path")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(json.dumps(feature_collection), engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert seen_sources and isinstance(seen_sources[-1], str)
+    assert events
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+    assert "explicit_engine=pyogrio" in events[-1].detail
+    assert "source=memory" in events[-1].detail
+
+
+@pytest.mark.gpu
+def test_public_explicit_pyogrio_geojson_bytesio_keeps_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    feature_collection = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": {"id": 1},
+                "geometry": {"type": "Point", "coordinates": [0.0, 0.0]},
+            }
+        ],
+    }
+    payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0)]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame({"id": [1]}),
+    )
+    seen_sources: list[object] = []
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file.read_geojson_native",
+        lambda source, *_args, **_kwargs: seen_sources.append(source) or payload,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("BytesIO explicit pyogrio GeoJSON reads should stay on the native path")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(io.BytesIO(json.dumps(feature_collection).encode("utf-8")), engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1]
+    assert seen_sources and isinstance(seen_sources[-1], bytes)
+    assert events
+    assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
+    assert "explicit_engine=pyogrio" in events[-1].detail
+    assert "source=memory" in events[-1].detail
+
+
+@pytest.mark.gpu
+def test_public_explicit_pyogrio_tempfile_single_feature_stays_compatibility_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temp = tempfile.TemporaryFile()
+    temp.write(
+        b"""
+        {
+          "type": "Feature",
+          "geometry": {"type": "Point", "coordinates": [0, 0]},
+          "properties": {"name": "Null Island"}
+        }
+        """
+    )
+    temp.seek(0)
+
+    frame = geopandas.GeoDataFrame({"name": ["Null Island"], "geometry": [Point(0, 0)]}, crs="EPSG:4326")
+    calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: calls.append(_kwargs) or frame.copy(),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_gpu_read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("single-feature tempfile GeoJSON should stay on the compatibility path")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(temp, engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+    temp.close()
+
+    assert calls
+    assert result["name"].tolist() == ["Null Island"]
+    assert events
+    assert events[-1].implementation == "legacy_gdal_adapter"
+    assert "format=gdal-legacy" in events[-1].detail
+    assert "source=memory" in events[-1].detail
 
 
 @pytest.mark.gpu
@@ -1198,6 +1405,254 @@ def test_public_shapefile_read_prefers_repo_owned_native_pipeline(
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_explicit_pyogrio_shapefile_read_uses_arrow_gpu_wkb_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.shp"
+    path.write_text("")
+
+    table = pa.table({"geometry": [Point(0, 0).wkb, Point(1, 1).wkb], "id": [1, 2]})
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    read_arrow_calls: list[dict[str, object]] = []
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {
+                "geometry_name": "geometry",
+                "crs": "EPSG:4326",
+                "geometry_type": "Point",
+            },
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file.read_shapefile_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit pyogrio Shapefile reads should use the pyogrio Arrow bridge")
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit pyogrio Shapefile reads should not demote to compatibility")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path, engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is True
+    assert events
+    assert events[-1].implementation == "shapefile_pyogrio_arrow_gpu_wkb"
+    assert "explicit_engine=pyogrio" in events[-1].detail
+    assert "compat_override=1" not in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_explicit_pyogrio_shapefile_filters_use_arrow_gpu_wkb_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.shp"
+    path.write_text("")
+
+    table = pa.table({"geometry": [Point(0, 0).wkb], "id": [1]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    read_arrow_calls: list[dict[str, object]] = []
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {
+                "geometry_name": "geometry",
+                "crs": "EPSG:4326",
+                "geometry_type": "Point",
+            },
+            table,
+        ),
+    )
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit pyogrio Shapefile filters should stay native")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(
+        path,
+        engine="pyogrio",
+        bbox=box(-1, -1, 1, 1),
+        columns=["id"],
+        rows=slice(1, 3),
+    )
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["bbox"] == pytest.approx((-1, -1, 1, 1))
+    assert read_arrow_calls[-1]["columns"] == ["id"]
+    assert read_arrow_calls[-1]["skip_features"] == 1
+    assert read_arrow_calls[-1]["max_features"] == 2
+    assert events[-1].implementation == "shapefile_pyogrio_arrow_gpu_wkb"
+    assert "request=bbox+columns+rows" in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_explicit_pyogrio_shapefile_invalid_rows_skip_gpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.shp"
+    path.write_text("")
+    read_file_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_gpu_read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid pyogrio rows should not enter the GPU read attempt")
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: read_file_calls.append(_kwargs) or (_ for _ in ()).throw(
+            TypeError("rows must be an int, slice, or None")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    with pytest.raises(TypeError, match="rows must be an int, slice, or None"):
+        geopandas.read_file(path, engine="pyogrio", rows="not_a_slice")
+    events = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert read_file_calls
+    assert read_file_calls[-1]["rows"] == "not_a_slice"
+    assert not fallbacks
+    assert events
+    assert events[-1].implementation == "shapefile_hybrid_adapter"
+    assert "compat_override=1" in events[-1].detail
+
+
+def test_public_read_file_bbox_mask_invalid_request_skips_dispatch_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.shp"
+    path.write_text("")
+
+    monkeypatch.setattr(
+        "vibespatial.io.file._try_gpu_read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid bbox+mask requests should not enter GPU read dispatch")
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("invalid bbox+mask requests should fail before compatibility dispatch")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    with pytest.raises(ValueError, match="mask and bbox can not be set together"):
+        geopandas.read_file(
+            path,
+            bbox=(-1, -1, 1, 1),
+            mask=box(-1, -1, 1, 1),
+        )
+
+    assert not geopandas.get_dispatch_events(clear=True)
+    assert not geopandas.get_fallback_events(clear=True)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_explicit_pyogrio_shapefile_mask_keeps_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.shp"
+    frame = _sample_frame()
+    frame.to_file(path, driver="ESRI Shapefile")
+
+    table = pa.table({"geometry": [Point(0, 0).wkb, Point(1, 1).wkb], "id": [1, 2]})
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    read_arrow_calls: list[dict[str, object]] = []
+    mask_series = geopandas.GeoSeries([box(-0.25, -0.25, 0.25, 0.25)], crs="EPSG:4326")
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {
+                "geometry_name": "geometry",
+                "crs": "EPSG:4326",
+                "geometry_type": "Point",
+            },
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("masked explicit pyogrio Shapefile reads should stay on the native path")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path, engine="pyogrio", mask=mask_series)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is True
+    assert read_arrow_calls[-1]["mask"].bounds == pytest.approx(mask_series.iloc[0].bounds)
+    assert events
+    assert events[-1].implementation == "shapefile_pyogrio_arrow_gpu_wkb"
+    assert "request=mask" in events[-1].detail
+    assert "explicit_engine=pyogrio" in events[-1].detail
+    assert "compat_override=1" not in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
 def test_pyogrio_shapefile_write_passes_explicit_geometry_type_for_null_rows(monkeypatch, tmp_path) -> None:
     import pyogrio
 
@@ -1291,6 +1746,138 @@ def test_public_pyogrio_to_file_uses_compat_writer(monkeypatch, tmp_path) -> Non
     assert dataframe_calls == 1
     assert result["value"].tolist() == [10, 20]
     assert result.geometry.iloc[1].equals(Point(1, 1))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_device_pyogrio_to_file_uses_native_arrow_sink(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    geometry = geopandas.GeoSeries(
+        DeviceGeometryArray._from_owned(from_shapely_geometries([Point(0, 0), Point(1, 1)])),
+        crs="EPSG:4326",
+    )
+    frame = geopandas.GeoDataFrame({"value": [10, 20], "geometry": geometry}, crs="EPSG:4326")
+    path = tmp_path / "public-device.geojson"
+    arrow_calls = 0
+    real_write_arrow = pyogrio.write_arrow
+
+    def fail_write_dataframe(*_args, **_kwargs):
+        raise AssertionError("device-backed public to_file should use the native Arrow sink")
+
+    def capture_write_arrow(arrow_obj, filename, *args, **kwargs):
+        nonlocal arrow_calls
+        arrow_calls += 1
+        return real_write_arrow(arrow_obj, filename, *args, **kwargs)
+
+    monkeypatch.setattr(pyogrio, "write_dataframe", fail_write_dataframe)
+    monkeypatch.setattr(pyogrio, "write_arrow", capture_write_arrow)
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    frame.to_file(path, driver="GeoJSON", engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    result = geopandas.read_file(path, engine="pyogrio")
+
+    write_events = [event for event in events if event.operation == "to_file"]
+    assert arrow_calls == 1
+    assert write_events
+    assert write_events[-1].selected.value == "gpu"
+    assert "native_arrow_sink=1" in write_events[-1].detail
+    assert not fallbacks
+    assert result["value"].tolist() == [10, 20]
+    assert result.geometry.iloc[1].equals(Point(1, 1))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_device_geopackage_to_file_uses_native_arrow_sink(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    geometry = geopandas.GeoSeries(
+        DeviceGeometryArray._from_owned(from_shapely_geometries([Point(0, 0), Point(1, 1)])),
+        crs="EPSG:4326",
+    )
+    frame = geopandas.GeoDataFrame({"value": [10, 20], "geometry": geometry}, crs="EPSG:4326")
+    path = tmp_path / "public-device.gpkg"
+    captured: dict[str, object] = {}
+    real_write_arrow = pyogrio.write_arrow
+
+    def fail_write_dataframe(*_args, **_kwargs):
+        raise AssertionError("device-backed public GPKG to_file should use the native Arrow sink")
+
+    def capture_write_arrow(arrow_obj, filename, *args, **kwargs):
+        captured.update(kwargs)
+        return real_write_arrow(arrow_obj, filename, *args, **kwargs)
+
+    monkeypatch.setattr(pyogrio, "write_dataframe", fail_write_dataframe)
+    monkeypatch.setattr(pyogrio, "write_arrow", capture_write_arrow)
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    frame.to_file(
+        path,
+        driver="GPKG",
+        engine="pyogrio",
+        layer="device_layer",
+        metadata={"source": "vibespatial-test"},
+    )
+    events = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    result = geopandas.read_file(path, engine="pyogrio", layer="device_layer")
+
+    write_events = [event for event in events if event.operation == "to_file"]
+    assert captured["layer"] == "device_layer"
+    assert captured["metadata"] == {"source": "vibespatial-test"}
+    assert write_events
+    assert write_events[-1].selected.value == "gpu"
+    assert "format=geopackage" in write_events[-1].detail
+    assert not fallbacks
+    assert result["value"].tolist() == [10, 20]
+    assert result.geometry.iloc[1].equals(Point(1, 1))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_device_flatgeobuf_to_file_uses_native_arrow_sink(monkeypatch, tmp_path) -> None:
+    import pyogrio
+
+    geometry = geopandas.GeoSeries(
+        DeviceGeometryArray._from_owned(from_shapely_geometries([Point(0, 0), Point(1, 1)])),
+        crs="EPSG:4326",
+    )
+    frame = geopandas.GeoDataFrame({"value": [10, 20], "geometry": geometry}, crs="EPSG:4326")
+    path = tmp_path / "public-device.fgb"
+    arrow_calls = 0
+    real_write_arrow = pyogrio.write_arrow
+
+    def fail_write_dataframe(*_args, **_kwargs):
+        raise AssertionError("device-backed public FlatGeobuf to_file should use the native Arrow sink")
+
+    def capture_write_arrow(arrow_obj, filename, *args, **kwargs):
+        nonlocal arrow_calls
+        arrow_calls += 1
+        return real_write_arrow(arrow_obj, filename, *args, **kwargs)
+
+    monkeypatch.setattr(pyogrio, "write_dataframe", fail_write_dataframe)
+    monkeypatch.setattr(pyogrio, "write_arrow", capture_write_arrow)
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    frame.to_file(path, driver="FlatGeobuf", engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+    result = geopandas.read_file(path)
+
+    write_events = [event for event in events if event.operation == "to_file"]
+    assert arrow_calls == 1
+    assert write_events
+    assert write_events[-1].selected.value == "gpu"
+    assert "format=flatgeobuf" in write_events[-1].detail
+    assert "native_arrow_sink=1" in write_events[-1].detail
+    assert not fallbacks
+    by_value = {value: geom for value, geom in zip(result["value"], result.geometry, strict=True)}
+    assert sorted(by_value) == [10, 20]
+    assert by_value[10].equals(Point(0, 0))
+    assert by_value[20].equals(Point(1, 1))
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
@@ -1689,6 +2276,79 @@ def test_plan_vector_file_io_exposes_promoted_read_boundary_classification() -> 
     assert plan_vector_file_io("data.unknown", operation=IOOperation.READ).selected_path is IOPathKind.FALLBACK
 
 
+def test_resolve_named_file_source_path_normalizes_local_archive_uris(tmp_path: Path) -> None:
+    zip_path = _write_zipped_shapefile(tmp_path)
+    expected = zip_path
+
+    assert _resolve_named_file_source_path(f"zip://{zip_path}") == expected
+    assert _resolve_named_file_source_path(f"/vsizip/{zip_path}") == expected
+    assert _resolve_named_file_source_path(f"file+file://{zip_path}") == expected
+    assert _resolve_named_file_source_path(f"{zip_path}!sample.shp") == expected
+
+
+def test_resolve_named_file_source_path_preserves_remote_urls() -> None:
+    for source in (
+        "https://example.com/data.geojson",
+        "http://example.com/data.geojson",
+        "s3://bucket/data.geojson",
+        "zip://https://example.com/data.zip",
+        "/vsizip/https://example.com/data.zip",
+    ):
+        assert _resolve_named_file_source_path(source) is None
+        assert _is_remote_named_file_source(source) is True
+
+
+def test_public_read_file_remote_geojson_skips_local_native_parser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    calls: list[dict[str, object]] = []
+
+    def fail_native_geojson(*_args, **_kwargs):
+        raise AssertionError("remote GeoJSON URLs must not enter the local native parser")
+
+    def fake_read_file(_filename, **kwargs):
+        calls.append(kwargs)
+        return _sample_frame()
+
+    monkeypatch.setenv("VIBESPATIAL_STRICT_NATIVE", "1")
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("vibespatial.io.file.read_geojson_native", fail_native_geojson)
+    monkeypatch.setattr("vibespatial.api.io.file._read_file", fake_read_file)
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    result = read_vector_file("https://example.com/data.geojson")
+    events = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert calls
+    assert calls[-1]["engine"] == "pyogrio"
+    assert events
+    assert events[-1].selected.value == "cpu"
+    assert "source=remote" in events[-1].detail
+    assert not fallbacks
+
+
+def test_plan_vector_file_io_classifies_local_archive_uris_as_shapefile(tmp_path: Path) -> None:
+    zip_path = _write_zipped_shapefile(tmp_path)
+
+    for source in (
+        f"zip://{zip_path}",
+        f"/vsizip/{zip_path}",
+        f"file+file://{zip_path}",
+        f"{zip_path}!sample.shp",
+    ):
+        plan = plan_vector_file_io(source, operation=IOOperation.READ)
+        assert plan.format.value == "shapefile"
+        assert plan.selected_path is IOPathKind.HYBRID
+
+
 def test_gpkg_routes_through_legacy_host_adapter(tmp_path) -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
@@ -1781,6 +2441,7 @@ def test_read_vector_file_native_explicit_pyogrio_keeps_promoted_container_on_na
 
     table = pa.table({"geometry": [Point(0, 0).wkb], "value": [10]})
     owned = from_shapely_geometries([Point(0, 0)])
+    read_arrow_calls: list[dict[str, object]] = []
 
     class _FakeRuntime:
         def available(self) -> bool:
@@ -1790,7 +2451,7 @@ def test_read_vector_file_native_explicit_pyogrio_keeps_promoted_container_on_na
     monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
     monkeypatch.setattr(
         "pyogrio.read_arrow",
-        lambda *_args, **_kwargs: (
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
             {"geometry_name": "geometry", "crs": "EPSG:4326"},
             table,
         ),
@@ -1808,30 +2469,348 @@ def test_read_vector_file_native_explicit_pyogrio_keeps_promoted_container_on_na
 
     payload = read_vector_file_native(path, engine="pyogrio")
 
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is False
     assert isinstance(payload, NativeTabularResult)
     assert payload.geometry.owned is owned
     assert payload.attributes["value"].tolist() == [10]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
-def test_public_read_file_explicit_pyogrio_geopackage_uses_compatibility_path(
+def test_read_vector_file_native_masked_geopackage_keeps_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "example.gpkg"
+    path.write_text("")
+
+    table = pa.table({"geometry": [Point(0, 0).wkb], "value": [10]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    read_arrow_calls: list[dict[str, object]] = []
+    mask_frame = geopandas.GeoDataFrame(
+        geometry=[box(-0.25, -0.25, 0.25, 0.25)],
+        crs="EPSG:4326",
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("masked promoted native reads should not demote to compatibility")
+        ),
+    )
+
+    payload = read_vector_file_native(path, mask=mask_frame)
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.owned is owned
+    assert payload.attributes["value"].tolist() == [10]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["mask"].bounds == pytest.approx(
+        mask_frame.geometry.iloc[0].bounds
+    )
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_explicit_pyogrio_geopackage_keeps_native_gpu_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
     path = tmp_path / "sample.gpkg"
-    frame = _sample_frame()
-    frame.to_file(path, driver="GPKG")
+    path.write_text("")
+    table = pa.table({"geometry": [Point(0, 0).wkb, Point(1, 1).wkb], "id": [1, 2]})
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    read_arrow_calls: list[dict[str, object]] = []
 
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("explicit pyogrio GeoPackage reads should stay on the native path")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path, engine="pyogrio")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is True
+    assert events
+    assert events[-1].implementation == "geopackage_pyogrio_arrow_gpu_wkb"
+    assert "explicit_engine=pyogrio" in events[-1].detail
+    assert "compat_override=1" not in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_explicit_pyogrio_geopackage_mask_keeps_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.gpkg"
+    path.write_text("")
+    table = pa.table({"geometry": [Point(0, 0).wkb, Point(1, 1).wkb], "id": [1, 2]})
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+    read_arrow_calls: list[dict[str, object]] = []
+    mask_series = geopandas.GeoSeries([box(-0.25, -0.25, 0.25, 0.25)], crs="EPSG:4326")
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("masked explicit pyogrio GeoPackage reads should stay native")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file(path, engine="pyogrio", mask=mask_series)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["id"].tolist() == [1, 2]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["datetime_as_string"] is True
+    assert read_arrow_calls[-1]["mask"].bounds == pytest.approx(mask_series.iloc[0].bounds)
+    assert events
+    assert events[-1].implementation == "geopackage_pyogrio_arrow_gpu_wkb"
+    assert "request=mask" in events[-1].detail
+    assert "explicit_engine=pyogrio" in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_explicit_pyogrio_geopackage_layer_filters_keep_native_gpu_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.gpkg"
+    path.write_text("")
+    table = pa.table({"geometry": [Point(0, 0).wkb], "id": [1]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    read_arrow_calls: list[dict[str, object]] = []
+    filter_frame = geopandas.GeoDataFrame(
+        geometry=[box(-0.25, -0.25, 0.25, 0.25)],
+        crs="EPSG:4326",
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("layer-filtered explicit pyogrio GeoPackage reads should stay native")
+        ),
+    )
+
+    geopandas.clear_dispatch_events()
+    bbox_result = geopandas.read_file(path, engine="pyogrio", bbox=filter_frame, layer="layer1")
+    mask_result = geopandas.read_file(path, engine="pyogrio", mask=filter_frame, layer="layer1")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert bbox_result["id"].tolist() == [1]
+    assert mask_result["id"].tolist() == [1]
+    assert len(read_arrow_calls) == 2
+    assert read_arrow_calls[0]["layer"] == "layer1"
+    assert read_arrow_calls[0]["bbox"] == pytest.approx(filter_frame.total_bounds)
+    assert read_arrow_calls[1]["layer"] == "layer1"
+    assert read_arrow_calls[1]["mask"].bounds == pytest.approx(filter_frame.geometry.iloc[0].bounds)
+    assert events[-2].implementation == "geopackage_pyogrio_arrow_gpu_wkb"
+    assert events[-1].implementation == "geopackage_pyogrio_arrow_gpu_wkb"
+    assert "request=bbox+layer" in events[-2].detail
+    assert "request=mask+layer" in events[-1].detail
+    assert "compat_override=1" not in events[-2].detail
+    assert "compat_override=1" not in events[-1].detail
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_masked_geopackage_reprojects_mask_before_native_arrow_read(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    pytest.importorskip("pyproj")
+
+    path = tmp_path / "sample.gpkg"
+    path.write_text("")
+    table = pa.table({"geometry": [Point(0, 0).wkb], "id": [1]})
+    owned = from_shapely_geometries([Point(0, 0)])
+    read_arrow_calls: list[dict[str, object]] = []
+    mask_wgs84 = geopandas.GeoSeries([box(-0.25, -0.25, 0.25, 0.25)], crs="EPSG:4326")
+    mask_mercator = mask_wgs84.to_crs("EPSG:3857")
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr("pyogrio.read_info", lambda *_args, **_kwargs: {"crs": "EPSG:4326"})
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: read_arrow_calls.append(_kwargs) or (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+    monkeypatch.setattr(
+        "vibespatial.api.io.file._read_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mismatched-CRS mask should still stay on the native path")
+        ),
+    )
+
+    result = geopandas.read_file(path, mask=mask_mercator)
+
+    assert result["id"].tolist() == [1]
+    assert read_arrow_calls
+    assert read_arrow_calls[-1]["mask"].bounds == pytest.approx(mask_wgs84.iloc[0].bounds)
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_explicit_pyogrio_geopackage_preserves_all_null_object_field(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.gpkg"
+    path.write_text("")
+    table = pa.table(
+        {
+            "geometry": [Point(0, 0).wkb, Point(1, 1).wkb],
+            "a": pa.array([None, None], type=pa.string()),
+        }
+    )
+    owned = from_shapely_geometries([Point(0, 0), Point(1, 1)])
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {
+                "geometry_name": "geometry",
+                "crs": "EPSG:4326",
+                "fields": ["a"],
+                "dtypes": ["object"],
+                "geometry_type": "Point",
+            },
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    result = geopandas.read_file(path, engine="pyogrio")
+
+    assert str(result["a"].dtype) == "object"
+    assert result["a"].tolist() == [None, None]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_public_read_file_explicit_pyogrio_geopackage_unsupported_geometry_type_uses_compatibility_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "sample.gpkg"
+    path.write_text("")
+    frame = _sample_frame()
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326", "geometry_type": "Point Z"},
+            pa.table({"geometry": [Point(0, 0).wkb]}),
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsupported GeoPackage geometry types should not enter the native WKB decode path")
+        ),
+    )
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         "vibespatial.api.io.file._read_file",
         lambda *_args, **_kwargs: calls.append(_kwargs) or frame.copy(),
-    )
-    monkeypatch.setattr(
-        "vibespatial.io.file._try_gpu_read_file",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("explicit pyogrio GeoPackage reads should use vendored compatibility semantics")
-        ),
     )
 
     result = geopandas.read_file(path, engine="pyogrio")

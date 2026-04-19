@@ -2783,7 +2783,12 @@ def _try_gpu_wkb_list_decode(
         )
 
 
-def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGeometryArray:
+def decode_wkb_arrow_array_owned(
+    array,
+    *,
+    on_invalid: str = "raise",
+    allow_fallback: bool = True,
+) -> OwnedGeometryArray:
     uniform_fast = _try_uniform_arrow_wkb_fast_decode(array)
     if uniform_fast is not None:
         return uniform_fast
@@ -2792,6 +2797,8 @@ def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGe
     if gpu_attempt.result is not None:
         return gpu_attempt.result
     if gpu_attempt.fallback_detail is not None:
+        if not allow_fallback:
+            raise NotImplementedError(gpu_attempt.fallback_detail)
         record_fallback_event(
             surface="vibespatial.io.wkb",
             reason="explicit CPU fallback after GPU Arrow WKB decode could not complete",
@@ -2809,6 +2816,8 @@ def decode_wkb_arrow_array_owned(array, *, on_invalid: str = "raise") -> OwnedGe
     multipolygon_fast = _decode_arrow_wkb_multipolygon_fast(array)
     if multipolygon_fast is not None:
         return multipolygon_fast
+    if not allow_fallback:
+        raise NotImplementedError("Arrow WKB decode requires a supported native path")
     values = np.asarray(array.to_numpy(zero_copy_only=False), dtype=object)
     return decode_wkb_owned(list(values), on_invalid=on_invalid)
 
@@ -3031,6 +3040,7 @@ def _encode_owned_wkb_array(
     field_name: str = "geometry",
     crs: Any | None = None,
     return_mode: bool = False,
+    force_device: bool = False,
 ) -> tuple:
     """Encode OwnedGeometryArray to WKB pyarrow array.
 
@@ -3054,7 +3064,7 @@ def _encode_owned_wkb_array(
     # helper declined GPU encode on a small batch or because the owned array is
     # still host-resident at the write boundary; _encode_owned_wkb_column_device
     # will materialize device state on demand.
-    if strict_native_mode_enabled() or (
+    if force_device or strict_native_mode_enabled() or (
         owned.residency is Residency.DEVICE and owned.device_state is not None
     ):
         try:

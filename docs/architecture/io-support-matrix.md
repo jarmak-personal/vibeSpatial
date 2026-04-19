@@ -5,7 +5,7 @@ Scope: IO format classification as GPU-native, hybrid, or fallback-only.
 Read If: You are classifying a format pathway or adding a new IO format target.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: IO format classification matrix for GPU-native versus hybrid versus fallback paths.
-Body Budget: 55/220 lines
+Body Budget: 58/220 lines
 Document: docs/architecture/io-support-matrix.md
 
 Section Map (Body Lines)
@@ -17,9 +17,9 @@ Section Map (Body Lines)
 | 16-21 | Open First |
 | 22-25 | Verify |
 | 26-30 | Risks |
-| 31-38 | Decision |
-| 39-49 | Matrix |
-| 50-55 | Performance Notes |
+| 31-39 | Decision |
+| 40-52 | Matrix |
+| 53-58 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -55,7 +55,8 @@ and which remain explicit fallback adapters.
 - GeoArrow is the canonical GPU-native interchange format.
 - GeoParquet is the canonical GPU-native persisted format.
 - WKB is a hybrid compatibility bridge.
-- GeoJSON and Shapefile are explicit hybrid pipelines.
+- GeoJSON, Shapefile, promoted GeoPackage, and FlatGeobuf are explicit hybrid
+  pipelines.
 - Untargeted GDAL formats remain fallback-only until justified.
 
 ## Matrix
@@ -67,6 +68,8 @@ and which remain explicit fallback adapters.
 | WKB | hybrid | hybrid | hybrid | no |
 | GeoJSON | hybrid | hybrid with native read boundary | hybrid | no (geometry GPU-accelerated) |
 | Shapefile | hybrid | hybrid with native read boundary | hybrid | no |
+| GeoPackage | hybrid | hybrid with native read boundary | hybrid with native write boundary | no |
+| FlatGeobuf | hybrid | hybrid with native read boundary | hybrid with native write boundary | no |
 | GDAL legacy | fallback | fallback | fallback | no |
 
 ## Performance Notes

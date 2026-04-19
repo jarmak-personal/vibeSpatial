@@ -2534,9 +2534,14 @@ def _clip_complex_polygon_partition_with_rectangle_mask(
     """Preserve area and lower-dimensional remnants for complex rectangle clip rows."""
     rectangle_mask = box(*rectangle_bounds)
     area_values = _clip_polygon_partition_with_polygon_mask(partition, rectangle_mask)
-    boundary_values = _clip_polygon_partition_with_rectangle_mask(partition, rectangle_bounds)
+    source_values = partition.geometry.values if isinstance(partition, GeoDataFrame) else partition.values
     area_objects = np.asarray(area_values, dtype=object)
-    boundary_objects = np.asarray(boundary_values, dtype=object)
+    source_objects = np.asarray(source_values, dtype=object)
+    rectangle_boundary = shapely.boundary(rectangle_mask)
+    boundary_objects = np.asarray(
+        shapely.intersection(shapely.boundary(source_objects), rectangle_boundary),
+        dtype=object,
+    )
     combined = np.empty(len(partition), dtype=object)
 
     for row_index, (area_geom, boundary_geom) in enumerate(
@@ -2546,9 +2551,6 @@ def _clip_complex_polygon_partition_with_rectangle_mask(
             combined[row_index] = boundary_geom
             continue
         if boundary_geom is None or getattr(boundary_geom, "is_empty", False):
-            combined[row_index] = area_geom
-            continue
-        if bool(shapely.equals(area_geom, boundary_geom)):
             combined[row_index] = area_geom
             continue
         combined[row_index] = GeometryCollection([area_geom, boundary_geom])

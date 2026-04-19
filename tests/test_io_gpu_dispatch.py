@@ -120,7 +120,7 @@ class TestWktGpuDispatch:
 
 
 class TestCsvGpuDispatch:
-    """CSV files route to GPU for large files, fall through to CPU for small."""
+    """CSV files route to GPU for eligible local unfiltered reads."""
 
     @needs_gpu
     def test_read_csv_latlon_large_file(self, tmp_path) -> None:
@@ -149,25 +149,22 @@ class TestCsvGpuDispatch:
         impl_names = [e.implementation for e in events]
         assert "csv_gpu_byte_classify_adapter" in impl_names
 
-    def test_small_csv_uses_cpu_fallback(self, tmp_path) -> None:
-        """Small CSV files below the threshold should not use GPU adapter."""
+    @needs_gpu
+    def test_small_csv_uses_gpu_adapter(self, tmp_path) -> None:
+        """Small CSV files should not demote solely because of a static size gate."""
         csv_path = tmp_path / "small.csv"
         csv_path.write_text("name,lat,lon\nAlice,40.7,-74.0\nBob,34.0,-118.2\n")
 
         assert csv_path.stat().st_size < _GPU_MIN_FILE_SIZE
 
         geopandas.clear_dispatch_events()
-        # This should go through CPU path (pyogrio).  It may or may not
-        # succeed depending on pyogrio's CSV support, but it should NOT
-        # dispatch to the GPU adapter.
-        try:
-            geopandas.read_file(csv_path)
-        except Exception:
-            pass  # pyogrio may not support CSV natively; that's fine
+        result = geopandas.read_file(csv_path)
 
         events = geopandas.get_dispatch_events(clear=True)
         impl_names = [e.implementation for e in events]
-        assert "csv_gpu_byte_classify_adapter" not in impl_names
+        assert len(result) == 2
+        assert result.geometry.iloc[0].equals(Point(-74.0, 40.7))
+        assert "csv_gpu_byte_classify_adapter" in impl_names
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +173,7 @@ class TestCsvGpuDispatch:
 
 
 class TestKmlGpuDispatch:
-    """KML files route to GPU for large files, fall through to CPU for small."""
+    """KML files route to GPU for eligible local unfiltered reads."""
 
     @staticmethod
     def _wrap_kml(*placemarks: str) -> str:
@@ -224,8 +221,9 @@ class TestKmlGpuDispatch:
         impl_names = [e.implementation for e in events]
         assert "kml_gpu_byte_classify_adapter" in impl_names
 
-    def test_small_kml_uses_cpu_fallback(self, tmp_path) -> None:
-        """Small KML files below the threshold should not use GPU adapter."""
+    @needs_gpu
+    def test_small_kml_uses_gpu_adapter(self, tmp_path) -> None:
+        """Small KML files should not demote solely because of a static size gate."""
         kml_path = tmp_path / "small.kml"
         kml_content = self._wrap_kml(
             self._point_placemark(-74.0, 40.7),
@@ -236,14 +234,13 @@ class TestKmlGpuDispatch:
         assert kml_path.stat().st_size < _GPU_MIN_FILE_SIZE
 
         geopandas.clear_dispatch_events()
-        try:
-            geopandas.read_file(kml_path)
-        except Exception:
-            pass  # pyogrio may not support KML natively
+        result = geopandas.read_file(kml_path)
 
         events = geopandas.get_dispatch_events(clear=True)
         impl_names = [e.implementation for e in events]
-        assert "kml_gpu_byte_classify_adapter" not in impl_names
+        assert len(result) == 2
+        assert result.geometry.iloc[0].equals(Point(-74.0, 40.7))
+        assert "kml_gpu_byte_classify_adapter" in impl_names
 
 
 # ---------------------------------------------------------------------------

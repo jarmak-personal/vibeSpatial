@@ -35,6 +35,7 @@ from vibespatial.runtime.fallbacks import record_fallback_event
 from .geoarrow import (
     _authoritative_geoarrow_host_view,
     _decode_geoarrow_array_to_owned,
+    _GeoArrowNativeCompatibilityRoute,
     _owned_geoarrow_fast_path_reason,
     encode_owned_geoarrow_array,
     native_tabular_to_arrow,
@@ -297,7 +298,10 @@ def _decode_pylibcudf_geoparquet_column_with_arrow_fallback(
                     nullable=field.nullable,
                     metadata=field.metadata,
                 )
-        return _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+        try:
+            return _decode_geoarrow_array_to_owned(field, array, encoding=encoding)
+        except _GeoArrowNativeCompatibilityRoute as geoarrow_exc:
+            raise NotImplementedError(str(geoarrow_exc)) from geoarrow_exc
 
 
 def _decode_arrow_geoparquet_column_to_host_geoseries(

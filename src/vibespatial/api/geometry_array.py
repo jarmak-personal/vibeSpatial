@@ -180,6 +180,14 @@ class GeometryDtype(ExtensionDtype):
     name = "geometry"
     na_value = None
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, str) and getattr(other, "name", None) == "device_geometry":
+            return True
+        return super().__eq__(other)
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
     @classmethod
     def construct_from_string(cls, string):
         if not isinstance(string, str):
@@ -199,6 +207,56 @@ class GeometryDtype(ExtensionDtype):
 register_extension_dtype(GeometryDtype)
 
 
+def _canonical_crs_identity(crs: Any) -> tuple[str, str] | None:
+    """Return a stable CRS identity for semantic equality checks.
+
+    PyProj can parse equivalent CRS definitions into objects that compare
+    unequal with ``==`` and ``.equals()`` (for example WKT1 WGS84 vs EPSG:4326).
+    Prefer canonical authority / EPSG identities when available, then fall
+    back to normalized textual forms.
+    """
+    if crs is None:
+        return None
+
+    to_authority = getattr(crs, "to_authority", None)
+    if callable(to_authority):
+        try:
+            authority = to_authority()
+        except Exception:
+            authority = None
+        if authority is not None:
+            return ("authority", f"{authority[0]}:{authority[1]}")
+
+    to_epsg = getattr(crs, "to_epsg", None)
+    if callable(to_epsg):
+        try:
+            epsg = to_epsg()
+        except Exception:
+            epsg = None
+        if epsg is not None:
+            return ("epsg", str(int(epsg)))
+
+    to_string = getattr(crs, "to_string", None)
+    if callable(to_string):
+        try:
+            string_value = to_string()
+        except Exception:
+            string_value = None
+        if string_value:
+            return ("string", string_value)
+
+    to_wkt = getattr(crs, "to_wkt", None)
+    if callable(to_wkt):
+        try:
+            wkt_value = to_wkt()
+        except Exception:
+            wkt_value = None
+        if wkt_value:
+            return ("wkt", " ".join(wkt_value.split()))
+
+    return ("repr", str(crs))
+
+
 def _check_crs(
     left: GeoPandasBase, right: GeoPandasBase, allow_none: bool = False
 ) -> bool:
@@ -210,9 +268,15 @@ def _check_crs(
     if allow_none:
         if not left.crs or not right.crs:
             return True
-    if not left.crs == right.crs:
-        return False
-    return True
+    left_crs = left.crs
+    right_crs = right.crs
+    if left_crs is None or right_crs is None:
+        return left_crs == right_crs
+
+    if left_crs == right_crs:
+        return True
+
+    return _canonical_crs_identity(left_crs) == _canonical_crs_identity(right_crs)
 
 
 def _crs_mismatch_warn(
@@ -2948,13 +3012,43 @@ class GeometryArray(ExtensionArray):
         -------
         ExtensionArray
         """
-        # Owned-path: if ALL arrays have owned backing, concatenate at the
-        # buffer level without materializing Shapely objects.  This preserves
-        # device-resident geometry through pd.concat on GeoDataFrames.
-        if all(ga._owned is not None for ga in to_concat):
-            owned_arrays = [ga._owned for ga in to_concat]
+        # Owned-path: if any mixed geometry/device geometry concat has owned
+        # backing, promote the host pieces into owned buffers. Dtype equality
+        # lets pandas route host-first mixed concat here, so this must not touch
+        # ``_data`` on device-backed inputs.
+        if any(getattr(ga, "_owned", None) is not None for ga in to_concat):
+            from vibespatial.geometry.device_array import DeviceGeometryArray
+            from vibespatial.runtime.residency import Residency, TransferTrigger
+
+            target_residency = (
+                Residency.DEVICE
+                if any(
+                    getattr(owned, "residency", None) is Residency.DEVICE
+                    for ga in to_concat
+                    if (owned := getattr(ga, "_owned", None)) is not None
+                )
+                else Residency.HOST
+            )
+            owned_arrays = []
+            for ga in to_concat:
+                owned = getattr(ga, "_owned", None)
+                if owned is None:
+                    owned = from_shapely_geometries(
+                        np.asarray(ga, dtype=object).tolist(),
+                        residency=target_residency,
+                    )
+                elif owned.residency is not target_residency:
+                    owned = owned.move_to(
+                        target_residency,
+                        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                        reason="align mixed geometry arrays for geometry concat",
+                    )
+                owned_arrays.append(owned)
             result_owned = OwnedGeometryArray.concat(owned_arrays)
-            return GeometryArray.from_owned(result_owned, crs=_get_common_crs(to_concat))
+            crs = _get_common_crs(to_concat)
+            if any(getattr(getattr(ga, "dtype", None), "name", None) == "device_geometry" for ga in to_concat):
+                return DeviceGeometryArray._from_owned(result_owned, crs=crs)
+            return GeometryArray.from_owned(result_owned, crs=crs)
 
         data = np.concatenate([ga._data for ga in to_concat])
         return GeometryArray(data, crs=_get_common_crs(to_concat))

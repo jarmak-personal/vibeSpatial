@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import math
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -117,6 +118,32 @@ def test_clip_polygon_rectangle_mask_routes_multilinestring_rows_through_rect_fa
         and event.selected.value == "gpu"
         for event in dispatch_events
     )
+
+
+def test_clip_equivalent_wkt_and_epsg_crs_does_not_warn() -> None:
+    pyproj = pytest.importorskip("pyproj")
+
+    source = vibespatial.GeoDataFrame(
+        {"geometry": [Point(0.0, 0.0)]},
+        crs=pyproj.CRS.from_wkt(pyproj.CRS.from_epsg(4326).to_wkt(version="WKT1_GDAL")),
+    )
+    mask = vibespatial.GeoDataFrame(
+        {"geometry": [box(-1.0, -1.0, 1.0, 1.0)]},
+        crs="EPSG:4326",
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = clip(source, mask)
+
+    mismatch_warnings = [
+        warning
+        for warning in caught
+        if "CRS mismatch between the CRS" in str(warning.message)
+    ]
+
+    assert mismatch_warnings == []
+    assert len(result) == 1
 
 
 def test_clip_polygon_rectangle_mask_multilinestring_survives_strict_native_mode(

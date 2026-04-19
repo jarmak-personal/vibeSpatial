@@ -131,11 +131,15 @@ def _deduplicate_atomic_edge_geometry(
     """Collapse duplicate geometric segments before half-edge graph build.
 
     Collinear overlap emits the same atomic segment once per source polygon.
-    The half-edge graph needs one geometric segment, not duplicate copies,
-    otherwise coincident spans produce malformed self-touching face cycles.
+    Some sources traverse that shared span in opposite directions, so a
+    forward-only oriented dedup still leaves duplicate half-edges after the
+    reverse pair is regenerated. The half-edge graph needs one geometric
+    segment, not duplicate copies, otherwise coincident spans produce
+    malformed self-touching face cycles.
 
-    This helper keeps the first forward representative for each unique
-    quantized segment, then regenerates exactly one forward/reverse pair.
+    This helper canonicalizes segment endpoints before grouping, keeps the
+    first representative for each unique quantized geometry, then regenerates
+    exactly one forward/reverse pair from the canonical orientation.
     """
     d_direction = cp.asarray(direction)
     forward_indices = cp.flatnonzero(d_direction == 0).astype(cp.int32, copy=False)
@@ -151,16 +155,24 @@ def _deduplicate_atomic_edge_geometry(
     q_src_y = cp.rint(d_src_y * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
     q_dst_x = cp.rint(d_dst_x * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
     q_dst_y = cp.rint(d_dst_y * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
-    sort_keys = [forward_indices, q_dst_y, q_dst_x, q_src_y, q_src_x]
+    swap_mask = (q_src_x > q_dst_x) | (
+        (q_src_x == q_dst_x) & (q_src_y > q_dst_y)
+    )
+    canon_q_src_x = cp.where(swap_mask, q_dst_x, q_src_x)
+    canon_q_src_y = cp.where(swap_mask, q_dst_y, q_src_y)
+    canon_q_dst_x = cp.where(swap_mask, q_src_x, q_dst_x)
+    canon_q_dst_y = cp.where(swap_mask, q_src_y, q_dst_y)
+
+    sort_keys = [forward_indices, canon_q_dst_y, canon_q_dst_x, canon_q_src_y, canon_q_src_x]
     if row_indices is not None:
         d_rows = cp.asarray(row_indices)[forward_indices]
         sort_keys.append(d_rows)
     sort_order = cp.lexsort(cp.stack(sort_keys))
     sorted_forward = forward_indices[sort_order]
-    sorted_q_src_x = q_src_x[sort_order]
-    sorted_q_src_y = q_src_y[sort_order]
-    sorted_q_dst_x = q_dst_x[sort_order]
-    sorted_q_dst_y = q_dst_y[sort_order]
+    sorted_q_src_x = canon_q_src_x[sort_order]
+    sorted_q_src_y = canon_q_src_y[sort_order]
+    sorted_q_dst_x = canon_q_dst_x[sort_order]
+    sorted_q_dst_y = canon_q_dst_y[sort_order]
     if row_indices is not None:
         sorted_rows = d_rows[sort_order]
 
@@ -179,10 +191,21 @@ def _deduplicate_atomic_edge_geometry(
     unique_count = int(representatives.size)
 
     rep_source_ids = cp.asarray(source_ids)[representatives]
-    rep_src_x = cp.asarray(src_x)[representatives]
-    rep_src_y = cp.asarray(src_y)[representatives]
-    rep_dst_x = cp.asarray(dst_x)[representatives]
-    rep_dst_y = cp.asarray(dst_y)[representatives]
+    rep_src_x_raw = cp.asarray(src_x)[representatives]
+    rep_src_y_raw = cp.asarray(src_y)[representatives]
+    rep_dst_x_raw = cp.asarray(dst_x)[representatives]
+    rep_dst_y_raw = cp.asarray(dst_y)[representatives]
+    rep_q_src_x = cp.rint(rep_src_x_raw * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    rep_q_src_y = cp.rint(rep_src_y_raw * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    rep_q_dst_x = cp.rint(rep_dst_x_raw * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    rep_q_dst_y = cp.rint(rep_dst_y_raw * _OVERLAY_COORDINATE_SCALE).astype(cp.int64, copy=False)
+    rep_swap_mask = (rep_q_src_x > rep_q_dst_x) | (
+        (rep_q_src_x == rep_q_dst_x) & (rep_q_src_y > rep_q_dst_y)
+    )
+    rep_src_x = cp.where(rep_swap_mask, rep_dst_x_raw, rep_src_x_raw)
+    rep_src_y = cp.where(rep_swap_mask, rep_dst_y_raw, rep_src_y_raw)
+    rep_dst_x = cp.where(rep_swap_mask, rep_src_x_raw, rep_dst_x_raw)
+    rep_dst_y = cp.where(rep_swap_mask, rep_src_y_raw, rep_dst_y_raw)
 
     out_size = unique_count * 2
     dedup_source_ids = cp.empty(out_size, dtype=cp.int32)

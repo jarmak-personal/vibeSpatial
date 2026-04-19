@@ -226,6 +226,27 @@ class TestTransformCoordinatesInplace:
         assert 400_000 < result_x < 600_000, f"UTM easting {result_x} out of range"
         assert 5_000_000 < result_y < 6_000_000, f"UTM northing {result_y} out of range"
 
+    def test_epsg2263_to_4326_matches_pyproj_reference(self):
+        """NY State Plane -> WGS84 matches the pyproj reference exactly enough."""
+        from pyproj import Transformer as PyProjTransformer
+
+        from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace
+
+        src_x = 970217.0224
+        src_y = 145643.3322
+        ref_x, ref_y = PyProjTransformer.from_crs(
+            2263,
+            4326,
+            always_xy=True,
+        ).transform(src_x, src_y)
+
+        d_x = cp.array([src_x], dtype=cp.float64)
+        d_y = cp.array([src_y], dtype=cp.float64)
+        transform_coordinates_inplace(d_x, d_y, "EPSG:2263", "EPSG:4326")
+
+        np.testing.assert_allclose(float(d_x[0]), ref_x, atol=1e-12)
+        np.testing.assert_allclose(float(d_y[0]), ref_y, atol=1e-12)
+
     def test_crs_alias_normalization(self):
         """CRS aliases (WGS84, OGC:CRS84) are accepted."""
         from vibespatial.io.gpu_parse.transform import transform_coordinates_inplace

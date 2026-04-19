@@ -669,6 +669,115 @@ extern "C" __global__ void find_feature_boundaries(
 }
 """
 
+_PROPERTY_OBJECT_SOURCE = r"""
+extern "C" __global__ void find_properties_key(
+    const unsigned char* __restrict__ input,
+    const unsigned char* __restrict__ quote_parity,
+    const int* __restrict__ depth,
+    unsigned char* __restrict__ hits,
+    long long n
+) {
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx > n - 13) {
+        if (idx < n) hits[idx] = 0;
+        return;
+    }
+
+    // Pattern: "properties":  (13 bytes)
+    const unsigned char pat[13] = {
+        '"','p','r','o','p','e','r','t','i','e','s','"',':'
+    };
+
+    unsigned char match = 1;
+    for (int i = 0; i < 13; ++i) {
+        if (input[idx + i] != pat[i]) { match = 0; break; }
+    }
+    if (match && quote_parity[idx + 12] != 0) {
+        match = 0;
+    }
+    // Feature-level keys live at depth 3:
+    // FeatureCollection{1} > features[2] > Feature{3}
+    if (match && depth[idx + 12] != 3) {
+        match = 0;
+    }
+    hits[idx] = match;
+}
+
+extern "C" __global__ void find_property_object_bounds(
+    const unsigned char* __restrict__ input,
+    const long long* __restrict__ property_positions,
+    long long* __restrict__ property_starts,
+    long long* __restrict__ property_ends,
+    int n_matches,
+    long long n_bytes
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_matches) return;
+
+    long long pos = property_positions[idx] + 13;  // skip past "properties":
+
+    while (pos < n_bytes && (
+        input[pos] == ' ' || input[pos] == '\n' || input[pos] == '\r' || input[pos] == '\t'
+    )) {
+        pos++;
+    }
+
+    if (pos >= n_bytes) {
+        property_starts[idx] = -1;
+        property_ends[idx] = -1;
+        return;
+    }
+
+    // Null properties map to an empty dict on the host side.
+    if (input[pos] == 'n') {
+        property_starts[idx] = -1;
+        property_ends[idx] = -1;
+        return;
+    }
+
+    if (input[pos] != '{') {
+        property_starts[idx] = -1;
+        property_ends[idx] = -1;
+        return;
+    }
+
+    long long start = pos;
+    long long end = -1;
+    int depth = 0;
+    unsigned char in_string = 0;
+    unsigned char escape = 0;
+
+    for (long long i = start; i < n_bytes; ++i) {
+        unsigned char c = input[i];
+        if (in_string) {
+            if (escape) {
+                escape = 0;
+            } else if (c == '\\') {
+                escape = 1;
+            } else if (c == '"') {
+                in_string = 0;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            in_string = 1;
+        } else if (c == '{') {
+            depth++;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0) {
+                end = i + 1;
+                break;
+            }
+        }
+    }
+
+    property_starts[idx] = (end >= 0) ? start : -1;
+    property_ends[idx] = end;
+}
+"""
+
 _TYPE_KEY_SOURCE = r"""
 extern "C" __global__ void find_type_key(
     const unsigned char* __restrict__ input,
@@ -796,6 +905,7 @@ _MPOLY_COUNT_NAMES = ("count_mpoly_levels",)
 _MPOLY_SCATTER_NAMES = ("scatter_mpoly_offsets",)
 _SCATTER_COORDS_NAMES = ("scatter_ring_offsets",)
 _FEATURE_BOUNDARY_NAMES = ("find_feature_starts", "find_feature_boundaries")
+_PROPERTY_OBJECT_NAMES = ("find_properties_key", "find_property_object_bounds")
 _TYPE_KEY_NAMES = ("find_type_key",)
 _CLASSIFY_TYPE_NAMES = ("classify_type_value",)
 _POINT_PAIR_NAMES = (

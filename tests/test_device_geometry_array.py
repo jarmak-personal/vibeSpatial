@@ -21,7 +21,7 @@ from shapely.geometry import (
 )
 
 import vibespatial.api as geopandas
-from vibespatial.api.geometry_array import GeometryArray
+from vibespatial.api.geometry_array import GeometryArray, GeometryDtype
 from vibespatial.geometry.device_array import DeviceGeometryArray, DeviceGeometryDtype
 from vibespatial.geometry.owned import (
     DiagnosticKind,
@@ -119,6 +119,20 @@ class TestDeviceGeometryDtype:
 
     def test_na_value(self):
         assert DeviceGeometryDtype.na_value is None
+
+    def test_geometry_dtype_equality_is_symmetric(self):
+        assert DeviceGeometryDtype() == GeometryDtype()
+        assert GeometryDtype() == DeviceGeometryDtype()
+        assert pd.api.types.is_dtype_equal(GeometryDtype(), DeviceGeometryDtype())
+        assert DeviceGeometryDtype() == "geometry"
+        assert not (DeviceGeometryDtype() == "device_geometry")
+        assert DeviceGeometryDtype.construct_from_string("device_geometry") == DeviceGeometryDtype()
+        assert GeometryDtype() == "geometry"
+        assert not (GeometryDtype() == "device_geometry")
+        assert hash(DeviceGeometryDtype()) == hash(GeometryDtype()) == hash("geometry")
+        dtype_lookup = {DeviceGeometryDtype(): "device"}
+        assert dtype_lookup[GeometryDtype()] == "device"
+        assert dtype_lookup["geometry"] == "device"
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +333,19 @@ class TestTakeCopyConcatNoRoundtrip:
         assert result[3].x == 3.0
         assert result[4].x == 4.0
 
+    def test_owned_concat_preserves_complete_validity_cache(self, points):
+        owned1 = from_shapely_geometries(points[:3])
+        owned2 = from_shapely_geometries(points[3:])
+        owned1._cached_is_valid_mask = np.asarray([True, False, True], dtype=bool)
+        owned2._cached_is_valid_mask = np.asarray([True, True], dtype=bool)
+
+        result = OwnedGeometryArray.concat([owned1, owned2])
+
+        assert np.array_equal(
+            result._cached_is_valid_mask,
+            np.asarray([True, False, True, True, True], dtype=bool),
+        )
+
     def test_concat_empty(self):
         result = DeviceGeometryArray._concat_same_type([])
         assert len(result) == 0
@@ -335,6 +362,19 @@ class TestTakeCopyConcatNoRoundtrip:
         assert result[1] is None
         assert result[2] is None
         assert result[3].x == 1.0
+
+    def test_concat_with_host_geometry_array_promotes_to_owned(self, points):
+        owned = from_shapely_geometries(points[:3])
+        dga = DeviceGeometryArray._from_owned(owned)
+        host = GeometryArray(np.asarray(points[3:], dtype=object))
+
+        result = DeviceGeometryArray._concat_same_type([dga, host])
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert len(result) == 5
+        assert result[0].x == 0.0
+        assert result[4].x == 4.0
+        assert getattr(result, "_owned", None) is not None
 
     def test_concat_no_shapely_materialization(self, points):
         owned1 = from_shapely_geometries(points[:3])
@@ -634,6 +674,26 @@ class TestGeoDataFrameIntegration:
         result = pd.concat([df1, df2], ignore_index=True)
         assert len(result) == 5
         assert result["geom"].dtype == DeviceGeometryDtype()
+
+    def test_dataframe_concat_host_first_mixed_geometry_promotes_to_device_array(self, points):
+        host = pd.DataFrame(
+            {"a": range(3), "geom": GeometryArray(np.asarray(points[:3], dtype=object))}
+        )
+        device = pd.DataFrame(
+            {
+                "a": range(3, 5),
+                "geom": DeviceGeometryArray._from_owned(
+                    from_shapely_geometries(points[3:])
+                ),
+            }
+        )
+
+        result = pd.concat([host, device], ignore_index=True)
+
+        assert len(result) == 5
+        assert result["geom"].dtype == DeviceGeometryDtype()
+        assert isinstance(result["geom"].values, DeviceGeometryArray)
+        assert getattr(result["geom"].values, "_owned", None) is not None
 
     def test_dataframe_take(self, dga_points):
         df = pd.DataFrame({"a": range(5), "geom": dga_points})
@@ -939,6 +999,23 @@ class TestEquality:
         dga2 = DeviceGeometryArray._from_sequence([Point(1, 1)])
         result = dga1 == dga2
         assert not result.any()
+
+
+class TestPointCoordinateProperties:
+    def test_x_y_use_owned_point_buffers_without_materialization(self):
+        dga = _make_device_only_dga([Point(1, 2), Point(), None, Point(3, 4)])
+
+        np.testing.assert_allclose(
+            dga.x,
+            np.asarray([1.0, np.nan, np.nan, 3.0], dtype=np.float64),
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            dga.y,
+            np.asarray([2.0, np.nan, np.nan, 4.0], dtype=np.float64),
+            equal_nan=True,
+        )
+        assert dga._shapely_cache is None
 
 
 # ---------------------------------------------------------------------------
@@ -1418,6 +1495,72 @@ class TestConstructiveOpsReturnDGA:
             Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]),
         ])
         result = poly_dga.intersection(other)
+        assert isinstance(result, DeviceGeometryArray)
+        assert len(result) == 2
+
+    def test_intersection_with_device_backed_geoseries_uses_owned_path(
+        self,
+        monkeypatch,
+        poly_dga,
+    ):
+        import vibespatial.geometry.device_array as device_array_module
+
+        right_owned = from_shapely_geometries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]),
+            ],
+            residency=Residency.DEVICE if has_gpu_runtime() else Residency.HOST,
+        )
+        right = geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(right_owned, crs="EPSG:3857"),
+            crs="EPSG:3857",
+        )
+
+        def _unexpected_fallback(**_kwargs):
+            raise AssertionError("device-backed GeoSeries should not fall back to Shapely")
+
+        monkeypatch.setattr(
+            device_array_module,
+            "_record_shapely_fallback_event",
+            _unexpected_fallback,
+        )
+
+        result = poly_dga.intersection(right)
+
+        assert isinstance(result, DeviceGeometryArray)
+        assert len(result) == 2
+
+    def test_intersection_with_public_geometryarray_geoseries_uses_to_owned_path(
+        self,
+        monkeypatch,
+        poly_dga,
+    ):
+        import vibespatial.geometry.device_array as device_array_module
+
+        right = geopandas.GeoSeries(
+            [
+                Polygon([(1, 1), (3, 1), (3, 3), (1, 3)]),
+                Polygon([(2, 2), (4, 2), (4, 4), (2, 4)]),
+            ],
+            crs="EPSG:3857",
+        )
+        assert getattr(right.values, "_owned", None) is None
+        assert hasattr(right.values, "to_owned")
+
+        def _unexpected_fallback(**_kwargs):
+            raise AssertionError(
+                "public GeometryArray-backed GeoSeries should coerce via to_owned()"
+            )
+
+        monkeypatch.setattr(
+            device_array_module,
+            "_record_shapely_fallback_event",
+            _unexpected_fallback,
+        )
+
+        result = poly_dga.intersection(right)
+
         assert isinstance(result, DeviceGeometryArray)
         assert len(result) == 2
 

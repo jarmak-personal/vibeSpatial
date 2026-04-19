@@ -116,6 +116,10 @@ class DispatchObservationReport:
     weighted_dispatch_units: int
     weighted_gpu_units: int
     family_breakdown: dict[str, dict[str, Any]]
+    io_read_breakdown: dict[str, dict[str, dict[str, Any]]]
+    compat_read_breakdown: dict[str, dict[str, dict[str, Any]]]
+    io_write_breakdown: dict[str, dict[str, dict[str, Any]]]
+    compat_write_breakdown: dict[str, dict[str, dict[str, Any]]]
     fallback_reasons: dict[str, int]
     fallback_surfaces: dict[str, int]
     returncode: int
@@ -140,6 +144,10 @@ class GPUAccelerationCoverageReport:
     weighted_dispatch_units: int
     weighted_gpu_units: int
     family_breakdown: dict[str, dict[str, Any]]
+    io_read_breakdown: dict[str, dict[str, dict[str, Any]]]
+    compat_read_breakdown: dict[str, dict[str, dict[str, Any]]]
+    io_write_breakdown: dict[str, dict[str, dict[str, Any]]]
+    compat_write_breakdown: dict[str, dict[str, dict[str, Any]]]
     fallback_reasons: dict[str, int]
     fallback_surfaces: dict[str, int]
     api_compat: NativeCoverageReport
@@ -154,6 +162,13 @@ def classify_dispatch_family(record: dict[str, Any]) -> str:
 
     if surface == "geopandas.read_file" and "compat_override=1" in detail:
         return "compat_override"
+    if (
+        surface in {"geopandas.geodataframe.to_file", "geopandas.geoseries.to_file"}
+        and operation in IO_WRITE_OPERATIONS
+        and record.get("selected") == "gpu"
+        and "native_arrow_sink=1" in detail
+    ):
+        return "io_write"
     if surface in {"geopandas.geodataframe.to_file", "geopandas.geoseries.to_file"}:
         return "compat_write"
     if is_public_surface and (operation in NORMALIZATION_OPERATIONS or surface == "normalize"):
@@ -191,6 +206,112 @@ def classify_dispatch_family(record: dict[str, Any]) -> str:
     return "internal"
 
 
+def _extract_detail_value(detail: str, key: str) -> str | None:
+    match = re.search(rf"(?:^|[,\s]){re.escape(key)}=([^\s,]+)", detail)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def classify_io_read_format(record: dict[str, Any]) -> str:
+    detail = str(record.get("detail", "") or "")
+    detail_format = _extract_detail_value(detail, "format")
+    if detail_format:
+        return detail_format
+    operation = str(record.get("operation", ""))
+    surface = str(record.get("surface", ""))
+    if operation == "read_parquet" or surface == "geopandas.read_parquet":
+        return "geoparquet"
+    if operation == "from_arrow" or surface.endswith(".from_arrow"):
+        return "geoarrow"
+    if surface.startswith("geopandas.read_"):
+        return surface.removeprefix("geopandas.read_").replace("_", "-")
+    return "other"
+
+
+def classify_io_read_request_shape(record: dict[str, Any]) -> str | None:
+    detail = str(record.get("detail", "") or "")
+    request_shape = _extract_detail_value(detail, "request")
+    if request_shape:
+        return request_shape
+    if str(record.get("surface", "")) == "geopandas.read_file":
+        return "unspecified"
+    return None
+
+
+def classify_io_write_format(record: dict[str, Any]) -> str:
+    detail = str(record.get("detail", "") or "")
+    detail_format = _extract_detail_value(detail, "format")
+    if detail_format:
+        return detail_format
+    operation = str(record.get("operation", ""))
+    surface = str(record.get("surface", ""))
+    if surface.startswith("vibespatial.io.wkb"):
+        return "wkb"
+    if surface.startswith("vibespatial.io.geoarrow"):
+        return "geoarrow"
+    if surface.startswith("vibespatial.io.geoparquet"):
+        return "geoparquet"
+    if operation == "to_parquet" or surface.endswith(".to_parquet"):
+        return "geoparquet"
+    if operation == "to_arrow" or surface.endswith(".to_arrow"):
+        return "geoarrow"
+    if surface.endswith(".to_file"):
+        return "file"
+    return "other"
+
+
+def classify_compat_write_reason(record: dict[str, Any]) -> str:
+    detail = str(record.get("detail", "") or "")
+    reason = _extract_detail_value(detail, "reason")
+    if reason:
+        return reason
+    if "compatibility_writer=1" in detail:
+        return "compatibility_writer"
+    return "unspecified"
+
+
+def _accumulate_breakdown_count(
+    counters: dict[str, Counter[str]],
+    *,
+    key: str,
+    record: dict[str, Any],
+    work_units: int,
+) -> None:
+    counts = counters.setdefault(key, Counter())
+    counts["total_dispatches"] += 1
+    counts["total_work_units"] += work_units
+    if record.get("selected") == "gpu":
+        counts["gpu_dispatches"] += 1
+        counts["gpu_work_units"] += work_units
+    elif record.get("selected") == "cpu":
+        counts["cpu_dispatches"] += 1
+        counts["cpu_work_units"] += work_units
+
+
+def _summarize_breakdown_counts(counters: dict[str, Counter[str]]) -> dict[str, dict[str, Any]]:
+    breakdown: dict[str, dict[str, Any]] = {}
+    for key in sorted(counters):
+        counts = counters[key]
+        breakdown[key] = {
+            "total_dispatches": counts["total_dispatches"],
+            "gpu_dispatches": counts["gpu_dispatches"],
+            "cpu_dispatches": counts["cpu_dispatches"],
+            "gpu_accel_pct": compute_gpu_accel_pct(
+                total_dispatches=counts["total_dispatches"],
+                gpu_dispatches=counts["gpu_dispatches"],
+            ),
+            "total_work_units": counts["total_work_units"],
+            "gpu_work_units": counts["gpu_work_units"],
+            "cpu_work_units": counts["cpu_work_units"],
+            "gpu_work_pct": compute_gpu_accel_pct(
+                total_dispatches=counts["total_work_units"],
+                gpu_dispatches=counts["gpu_work_units"],
+            ),
+        }
+    return breakdown
+
+
 def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     all_dispatch_records = [record for record in records if record.get("event_type") == "dispatch"]
     dispatch_records = [
@@ -202,6 +323,17 @@ def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     cpu_dispatches = sum(1 for record in dispatch_records if record.get("selected") == "cpu")
 
     family_counts: dict[str, Counter[str]] = {}
+    io_read_format_counts: dict[str, Counter[str]] = {}
+    io_read_request_counts: dict[str, Counter[str]] = {}
+    io_read_surface_counts: dict[str, Counter[str]] = {}
+    compat_read_format_counts: dict[str, Counter[str]] = {}
+    compat_read_request_counts: dict[str, Counter[str]] = {}
+    compat_read_surface_counts: dict[str, Counter[str]] = {}
+    io_write_format_counts: dict[str, Counter[str]] = {}
+    io_write_surface_counts: dict[str, Counter[str]] = {}
+    compat_write_format_counts: dict[str, Counter[str]] = {}
+    compat_write_reason_counts: dict[str, Counter[str]] = {}
+    compat_write_surface_counts: dict[str, Counter[str]] = {}
     for record in dispatch_records:
         family = classify_dispatch_family(record)
         counts = family_counts.setdefault(family, Counter())
@@ -214,6 +346,80 @@ def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         elif record.get("selected") == "cpu":
             counts["cpu_dispatches"] += 1
             counts["cpu_work_units"] += work_units
+        if family == "io_read":
+            _accumulate_breakdown_count(
+                io_read_format_counts,
+                key=classify_io_read_format(record),
+                record=record,
+                work_units=work_units,
+            )
+            request_shape = classify_io_read_request_shape(record)
+            if request_shape is not None:
+                _accumulate_breakdown_count(
+                    io_read_request_counts,
+                    key=request_shape,
+                    record=record,
+                    work_units=work_units,
+                )
+            _accumulate_breakdown_count(
+                io_read_surface_counts,
+                key=f"{record.get('surface', '')}:{record.get('operation', '')}",
+                record=record,
+                work_units=work_units,
+            )
+        if family == "compat_override" and str(record.get("surface", "")) == "geopandas.read_file":
+            _accumulate_breakdown_count(
+                compat_read_format_counts,
+                key=classify_io_read_format(record),
+                record=record,
+                work_units=work_units,
+            )
+            request_shape = classify_io_read_request_shape(record)
+            if request_shape is not None:
+                _accumulate_breakdown_count(
+                    compat_read_request_counts,
+                    key=request_shape,
+                    record=record,
+                    work_units=work_units,
+                )
+            _accumulate_breakdown_count(
+                compat_read_surface_counts,
+                key=f"{record.get('surface', '')}:{record.get('operation', '')}",
+                record=record,
+                work_units=work_units,
+            )
+        if family == "io_write":
+            _accumulate_breakdown_count(
+                io_write_format_counts,
+                key=classify_io_write_format(record),
+                record=record,
+                work_units=work_units,
+            )
+            _accumulate_breakdown_count(
+                io_write_surface_counts,
+                key=f"{record.get('surface', '')}:{record.get('operation', '')}",
+                record=record,
+                work_units=work_units,
+            )
+        if family == "compat_write":
+            _accumulate_breakdown_count(
+                compat_write_format_counts,
+                key=classify_io_write_format(record),
+                record=record,
+                work_units=work_units,
+            )
+            _accumulate_breakdown_count(
+                compat_write_reason_counts,
+                key=classify_compat_write_reason(record),
+                record=record,
+                work_units=work_units,
+            )
+            _accumulate_breakdown_count(
+                compat_write_surface_counts,
+                key=f"{record.get('surface', '')}:{record.get('operation', '')}",
+                record=record,
+                work_units=work_units,
+            )
 
     weighted_dispatch_units = 0
     weighted_gpu_units = 0
@@ -265,6 +471,25 @@ def summarize_event_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "weighted_dispatch_units": weighted_dispatch_units,
         "weighted_gpu_units": weighted_gpu_units,
         "family_breakdown": family_breakdown,
+        "io_read_breakdown": {
+            "by_format": _summarize_breakdown_counts(io_read_format_counts),
+            "by_request_shape": _summarize_breakdown_counts(io_read_request_counts),
+            "by_surface": _summarize_breakdown_counts(io_read_surface_counts),
+        },
+        "compat_read_breakdown": {
+            "by_format": _summarize_breakdown_counts(compat_read_format_counts),
+            "by_request_shape": _summarize_breakdown_counts(compat_read_request_counts),
+            "by_surface": _summarize_breakdown_counts(compat_read_surface_counts),
+        },
+        "io_write_breakdown": {
+            "by_format": _summarize_breakdown_counts(io_write_format_counts),
+            "by_surface": _summarize_breakdown_counts(io_write_surface_counts),
+        },
+        "compat_write_breakdown": {
+            "by_format": _summarize_breakdown_counts(compat_write_format_counts),
+            "by_reason": _summarize_breakdown_counts(compat_write_reason_counts),
+            "by_surface": _summarize_breakdown_counts(compat_write_surface_counts),
+        },
         "fallback_reasons": dict(fallback_reasons.most_common()),
         "fallback_surfaces": dict(fallback_surfaces.most_common()),
     }
@@ -345,6 +570,10 @@ def run_dispatch_observation(targets: tuple[str, ...], *, cwd: Path, timeout: in
         weighted_dispatch_units=summary["weighted_dispatch_units"],
         weighted_gpu_units=summary["weighted_gpu_units"],
         family_breakdown=summary["family_breakdown"],
+        io_read_breakdown=summary["io_read_breakdown"],
+        compat_read_breakdown=summary["compat_read_breakdown"],
+        io_write_breakdown=summary["io_write_breakdown"],
+        compat_write_breakdown=summary["compat_write_breakdown"],
         fallback_reasons=summary["fallback_reasons"],
         fallback_surfaces=summary["fallback_surfaces"],
         returncode=returncode,
@@ -373,6 +602,10 @@ def build_gpu_acceleration_report(
         weighted_dispatch_units=observed_dispatch.weighted_dispatch_units,
         weighted_gpu_units=observed_dispatch.weighted_gpu_units,
         family_breakdown=observed_dispatch.family_breakdown,
+        io_read_breakdown=observed_dispatch.io_read_breakdown,
+        compat_read_breakdown=observed_dispatch.compat_read_breakdown,
+        io_write_breakdown=observed_dispatch.io_write_breakdown,
+        compat_write_breakdown=observed_dispatch.compat_write_breakdown,
         fallback_reasons=observed_dispatch.fallback_reasons,
         fallback_surfaces=observed_dispatch.fallback_surfaces,
         api_compat=api_compat,
@@ -407,6 +640,45 @@ def print_human_summary(report: GPUAccelerationCoverageReport) -> None:
         f"({report.value_gpu_dispatches} GPU / {report.value_dispatches} tracked dispatches)"
     )
     print(f"- raw dispatch breadth: {report.raw_dispatch_pct:.2f}%")
+    io_read_formats = report.io_read_breakdown.get("by_format", {})
+    if io_read_formats:
+        print("- io_read by format:")
+        for format_name, details in io_read_formats.items():
+            print(
+                f"  {format_name:<16} {details['gpu_accel_pct']:.2f}% "
+                f"({details['gpu_dispatches']}/{details['total_dispatches']} dispatches)"
+            )
+    compat_read_formats = report.compat_read_breakdown.get("by_format", {})
+    if compat_read_formats:
+        print("- explicit compat read overrides:")
+        for format_name, details in compat_read_formats.items():
+            print(
+                f"  {format_name:<16} {details['gpu_accel_pct']:.2f}% "
+                f"({details['gpu_dispatches']}/{details['total_dispatches']} dispatches)"
+            )
+    io_write_formats = report.io_write_breakdown.get("by_format", {})
+    if io_write_formats:
+        print("- io_write by format:")
+        for format_name, details in io_write_formats.items():
+            print(
+                f"  {format_name:<16} {details['gpu_accel_pct']:.2f}% "
+                f"({details['gpu_dispatches']}/{details['total_dispatches']} dispatches)"
+            )
+    compat_write_formats = report.compat_write_breakdown.get("by_format", {})
+    if compat_write_formats:
+        print("- explicit compat writes by format:")
+        for format_name, details in compat_write_formats.items():
+            print(
+                f"  {format_name:<16} {details['gpu_accel_pct']:.2f}% "
+                f"({details['gpu_dispatches']}/{details['total_dispatches']} dispatches)"
+            )
+    compat_write_reasons = report.compat_write_breakdown.get("by_reason", {})
+    if compat_write_reasons:
+        print("- explicit compat writes by reason:")
+        for reason, details in compat_write_reasons.items():
+            print(
+                f"  {reason:<48} {details['total_dispatches']} dispatches"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

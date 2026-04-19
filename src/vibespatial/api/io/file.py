@@ -517,23 +517,11 @@ def _read_file_pyogrio(path_or_bytes, bbox=None, mask=None, rows=None, **kwargs)
 
     if mask is not None:
         # NOTE: mask cannot be used at same time as bbox keyword
-        if isinstance(mask, GeoDataFrame | GeoSeries):
-            crs = pyogrio.read_info(path_or_bytes, layer=kwargs.get("layer")).get("crs")
-            if crs is not None and mask.crs is not None:
-                mask = mask.to_crs(crs)
-            else:
-                _warn_missing_crs_of_dataframe_and_mask(crs, mask)
-
-            if isinstance(path_or_bytes, IOBase):
-                path_or_bytes.seek(0)
-
-            mask = shapely.unary_union(mask.geometry.values)
-        elif isinstance(mask, BaseGeometry):
-            mask = shapely.unary_union(mask)
-        elif isinstance(mask, dict) or hasattr(mask, "__geo_interface__"):
-            # convert GeoJSON to shapely geometry
-            mask = shapely.geometry.shape(mask)
-
+        mask = _normalize_pyogrio_mask_filter(
+            mask,
+            path_or_bytes=path_or_bytes,
+            layer=kwargs.get("layer"),
+        )
         kwargs["mask"] = mask
 
     if kwargs.pop("ignore_geometry", False):
@@ -574,6 +562,33 @@ def _read_file_pyogrio(path_or_bytes, bbox=None, mask=None, rows=None, **kwargs)
         kwargs["columns"] = kwargs.pop("include_fields")
 
     return pyogrio.read_dataframe(path_or_bytes, bbox=bbox, **kwargs)
+
+
+def _normalize_pyogrio_mask_filter(mask, *, path_or_bytes, layer=None, dataset_crs=None):
+    import pyogrio
+
+    if mask is None:
+        return None
+
+    if isinstance(mask, GeoDataFrame | GeoSeries):
+        crs = dataset_crs
+        if crs is None:
+            crs = pyogrio.read_info(path_or_bytes, layer=layer).get("crs")
+            if isinstance(path_or_bytes, IOBase):
+                path_or_bytes.seek(0)
+        if crs is not None and mask.crs is not None:
+            mask = mask.to_crs(crs)
+        else:
+            _warn_missing_crs_of_dataframe_and_mask(crs, mask)
+        return shapely.unary_union(mask.geometry.values)
+
+    if isinstance(mask, BaseGeometry):
+        return shapely.unary_union(mask)
+
+    if isinstance(mask, dict) or hasattr(mask, "__geo_interface__"):
+        return shapely.geometry.shape(mask)
+
+    return mask
 
 
 def _warn_missing_crs_of_dataframe_and_mask(source_dataset_crs, mask):

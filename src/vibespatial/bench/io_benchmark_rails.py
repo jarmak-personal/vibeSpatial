@@ -243,6 +243,8 @@ def _consume_first_gpu_stage(frame) -> None:
 
 
 def _benchmark_geojson_public_pipeline(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float] | None:
+    import pyogrio
+
     import vibespatial.api as geopandas
     from vibespatial.runtime._runtime import has_gpu_runtime
 
@@ -255,12 +257,12 @@ def _benchmark_geojson_public_pipeline(*, rows: int, repeat: int, seed: int = 0)
         path = Path(td) / "sample.geojson"
         gdf.to_file(path, driver="GeoJSON")
 
-        _consume_first_gpu_stage(geopandas.read_file(path, engine="pyogrio"))
+        _consume_first_gpu_stage(pyogrio.read_dataframe(path))
         _consume_first_gpu_stage(geopandas.read_file(path))
 
         start = perf_counter()
         for _ in range(repeat):
-            frame = geopandas.read_file(path, engine="pyogrio")
+            frame = pyogrio.read_dataframe(path)
             _consume_first_gpu_stage(frame)
         baseline_elapsed = (perf_counter() - start) / repeat
 
@@ -276,6 +278,8 @@ def _benchmark_geojson_public_pipeline(*, rows: int, repeat: int, seed: int = 0)
 
 
 def _benchmark_shapefile_public_pipeline(*, rows: int, repeat: int, seed: int = 0) -> tuple[float, float] | None:
+    import pyogrio
+
     import vibespatial.api as geopandas
     from vibespatial.runtime._runtime import has_gpu_runtime
 
@@ -288,12 +292,12 @@ def _benchmark_shapefile_public_pipeline(*, rows: int, repeat: int, seed: int = 
         path = Path(td) / "sample.shp"
         gdf.to_file(path, driver="ESRI Shapefile")
 
-        _consume_first_gpu_stage(geopandas.read_file(path, engine="pyogrio"))
+        _consume_first_gpu_stage(pyogrio.read_dataframe(path))
         _consume_first_gpu_stage(geopandas.read_file(path))
 
         start = perf_counter()
         for _ in range(repeat):
-            frame = geopandas.read_file(path, engine="pyogrio")
+            frame = pyogrio.read_dataframe(path)
             _consume_first_gpu_stage(frame)
         baseline_elapsed = (perf_counter() - start) / repeat
 

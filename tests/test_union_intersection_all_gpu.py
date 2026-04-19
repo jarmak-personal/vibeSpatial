@@ -14,6 +14,8 @@ import pytest
 import shapely
 from shapely.geometry import box
 
+import geopandas
+from tests.upstream.geopandas.tests.util import _NATURALEARTH_LOWRES
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
 
 # ---------------------------------------------------------------------------
@@ -250,6 +252,70 @@ class TestUnionAllGPU:
         assert sum(partial_calls) == len(polys)
         assert max(partial_calls) < len(polys)
         assert _geom_equiv(_to_shapely(result), expected)
+
+    def test_single_row_touching_country_union_is_valid(self):
+        """Touch-only country unions should stay valid and exact on GPU."""
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+        world = geopandas.read_file(_NATURALEARTH_LOWRES)
+        brazil = world.loc[world["name"] == "Brazil", "geometry"].iloc[0]
+        paraguay = world.loc[world["name"] == "Paraguay", "geometry"].iloc[0]
+
+        left = from_shapely_geometries([brazil])
+        right = from_shapely_geometries([paraguay])
+        result = binary_constructive_owned("union", left, right, dispatch_mode="gpu")
+        result_geom = _to_shapely(result)
+        expected = shapely.union_all(np.asarray([brazil, paraguay], dtype=object))
+
+        assert bool(shapely.is_valid(result_geom))
+        assert _geom_equiv(result_geom, expected)
+
+    def test_single_row_partial_shared_edge_union_is_valid(self):
+        """Partial shared-edge unions must use the exact partition path."""
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+        left_poly = box(0, 0, 2, 2)
+        right_poly = box(2, 1, 3, 2)
+
+        left = from_shapely_geometries([left_poly])
+        right = from_shapely_geometries([right_poly])
+        result = binary_constructive_owned("union", left, right, dispatch_mode="gpu")
+        result_geom = _to_shapely(result)
+        expected = shapely.union(left_poly, right_poly)
+
+        assert bool(shapely.is_valid(result_geom))
+        assert _geom_equiv(result_geom, expected)
+
+    def test_multi_row_union_uses_batched_partition_not_per_row_exact(self, monkeypatch):
+        """Aligned batches must not fall back to one exact overlay graph per row."""
+        from vibespatial.constructive import binary_constructive as binary_module
+
+        def _fail_per_row_exact(*_args, **_kwargs):
+            raise AssertionError("multi-row union used per-row exact fallback")
+
+        monkeypatch.setattr(
+            binary_module,
+            "_dispatch_single_row_polygon_union_gpu",
+            _fail_per_row_exact,
+        )
+
+        left_polys = [box(i * 10, 0, i * 10 + 2, 2) for i in range(3)]
+        right_polys = [box(i * 10 + 2, 1, i * 10 + 3, 2) for i in range(3)]
+        left = from_shapely_geometries(left_polys)
+        right = from_shapely_geometries(right_polys)
+
+        result = binary_module.binary_constructive_owned(
+            "union",
+            left,
+            right,
+            dispatch_mode="gpu",
+        )
+        actual = result.to_shapely()
+
+        assert result.row_count == len(left_polys)
+        for got, left_poly, right_poly in zip(actual, left_polys, right_polys, strict=True):
+            assert bool(shapely.is_valid(got))
+            assert _geom_equiv(got, shapely.union(left_poly, right_poly))
 
     def test_tree_reduce_batches_rounds(self, monkeypatch):
         """Tree reduction should issue one batched pairwise call per reduction round."""

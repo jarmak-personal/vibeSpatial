@@ -5,6 +5,11 @@ import pytest
 import shapely
 from shapely.geometry import LineString, Point, box
 
+import vibespatial as geopandas
+from tests.upstream.geopandas.tests.util import (
+    _NATURALEARTH_CITIES,
+    _NATURALEARTH_LOWRES,
+)
 from vibespatial import (
     DEFAULT_CONSUMER_PROFILE,
     DeviceSnapshot,
@@ -17,6 +22,7 @@ from vibespatial import (
 )
 from vibespatial.predicates.binary import _gpu_candidate_pairs_supported
 from vibespatial.runtime.kernel_registry import get_kernel_variants
+from vibespatial.runtime.residency import Residency
 
 
 @pytest.mark.parametrize(
@@ -99,6 +105,32 @@ def test_binary_predicate_explicit_gpu_matches_cpu_for_supported_point_region_ca
     gpu = evaluate_binary_predicate("contains", left, right, dispatch_mode=ExecutionMode.GPU)
 
     assert gpu.values.tolist() == cpu.values.tolist()
+
+
+@pytest.mark.gpu
+def test_binary_predicate_gpu_intersects_matches_host_for_scalar_polygon_regression() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    cities = geopandas.read_file(_NATURALEARTH_CITIES)
+    world = geopandas.read_file(_NATURALEARTH_LOWRES)
+    south_america = world.loc[world["continent"] == "South America", "geometry"].union_all()
+    owned = from_shapely_geometries(
+        np.asarray(cities.geometry, dtype=object),
+        residency=Residency.DEVICE,
+    )
+
+    gpu = evaluate_binary_predicate(
+        "intersects",
+        owned,
+        south_america,
+        dispatch_mode=ExecutionMode.GPU,
+        null_behavior=NullBehavior.FALSE,
+    )
+    expected = np.asarray(cities.geometry.intersects(south_america), dtype=bool)
+
+    np.testing.assert_array_equal(np.asarray(gpu.values, dtype=bool), expected)
+    assert bool(gpu.values[62]) is True
 
 
 def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_pairs(monkeypatch) -> None:

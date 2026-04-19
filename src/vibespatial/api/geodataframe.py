@@ -2388,7 +2388,8 @@ default 'snappy'
         GeoDataFrame.explode : explode multi-part geometries into single geometries
 
         """
-        if by is None and level is None:
+        collapse_all = by is None and level is None
+        if collapse_all:
             by = np.zeros(len(self), dtype="int64")  # type: ignore [assignment]
 
         aggregated = evaluate_geopandas_dissolve(
@@ -2406,11 +2407,8 @@ default 'snappy'
         )
         from vibespatial.geometry.device_array import DeviceGeometryArray
 
-        selected = (
-            ExecutionMode.GPU
-            if isinstance(aggregated.geometry.values, DeviceGeometryArray)
-            else ExecutionMode.CPU
-        )
+        used_device = isinstance(aggregated.geometry.values, DeviceGeometryArray)
+        selected = ExecutionMode.GPU if used_device else ExecutionMode.CPU
         record_dispatch_event(
             surface="geopandas.geodataframe.dissolve",
             operation="dissolve",

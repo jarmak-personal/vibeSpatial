@@ -84,6 +84,11 @@ class WKBBridgeBenchmark:
     elapsed_seconds: float
     rows_per_second: float
 
+
+class _GeoArrowNativeCompatibilityRoute(RuntimeError):
+    """Signal that GeoArrow import should use the explicit compatibility adapter."""
+
+
 def plan_geoarrow_codec(operation: IOOperation | str) -> GeoArrowCodecPlan:
     normalized = operation if isinstance(operation, IOOperation) else IOOperation(operation)
     plan = plan_io_support(IOFormat.GEOARROW, normalized)
@@ -1467,7 +1472,13 @@ def _decode_geoarrow_multipolygon(array, family):
         view=view,
     )
 
-def _decode_geoarrow_array_to_owned(field, array, *, encoding: str | None = None) -> OwnedGeometryArray:
+def _decode_geoarrow_array_to_owned(
+    field,
+    array,
+    *,
+    encoding: str | None = None,
+    allow_wkb_fallback: bool = True,
+) -> OwnedGeometryArray:
 
     metadata = field.metadata or {}
     ext_name = metadata.get(b"ARROW:extension:name", b"").decode()
@@ -1483,7 +1494,13 @@ def _decode_geoarrow_array_to_owned(field, array, *, encoding: str | None = None
         "geoarrow.multipolygon": GeometryFamily.MULTIPOLYGON,
     }
     if ext_name == "geoarrow.wkb":
-        return decode_wkb_arrow_array_owned(array)
+        try:
+            return decode_wkb_arrow_array_owned(
+                array,
+                allow_fallback=allow_wkb_fallback,
+            )
+        except NotImplementedError as exc:
+            raise _GeoArrowNativeCompatibilityRoute(str(exc)) from exc
     if ext_name not in family_map:
         raise ValueError(f"Unsupported GeoArrow extension type: {ext_name}")
     family = family_map[ext_name]
@@ -1504,6 +1521,61 @@ def _decode_geoarrow_array_to_owned(field, array, *, encoding: str | None = None
         return _decode_geoarrow_multipolygon(array, family)
 
     raise AssertionError(f"Unhandled family: {family}")
+
+
+def _geoarrow_leaf_point_type(storage_type):
+    import pyarrow as pa
+
+    while pa.types.is_list(storage_type) or pa.types.is_large_list(storage_type):
+        storage_type = storage_type.value_type
+    return storage_type
+
+
+def _geoarrow_storage_type_supports_native_2d_import(storage_type) -> bool:
+    import pyarrow as pa
+
+    point_type = _geoarrow_leaf_point_type(storage_type)
+    if pa.types.is_fixed_size_list(point_type):
+        return point_type.list_size == 2
+    if pa.types.is_struct(point_type):
+        field_names = [field.name for field in point_type]
+        return field_names == ["x", "y"]
+    return False
+
+
+def _geoarrow_native_import_support(field, array) -> tuple[bool, str]:
+    import pyarrow as pa
+
+    metadata = field.metadata or {}
+    ext_name = metadata.get(b"ARROW:extension:name", b"").decode()
+
+    if not ext_name:
+        return False, "Arrow import requires a GeoArrow extension field."
+
+    if ext_name == "geoarrow.wkb":
+        wkb_array = array.combine_chunks() if isinstance(array, pa.ChunkedArray) else array
+        if not pa.types.is_binary(wkb_array.type) and not pa.types.is_large_binary(wkb_array.type):
+            return (
+                False,
+                "Non-binary WKB imports route through the explicit compatibility bridge.",
+            )
+        return True, ""
+
+    family_exts = {
+        "geoarrow.point",
+        "geoarrow.linestring",
+        "geoarrow.polygon",
+        "geoarrow.multipoint",
+        "geoarrow.multilinestring",
+        "geoarrow.multipolygon",
+    }
+    if ext_name not in family_exts:
+        return False, f"Unsupported GeoArrow extension type {ext_name!r} routes through the explicit compatibility bridge."
+
+    if not _geoarrow_storage_type_supports_native_2d_import(field.type):
+        return False, "Z-enabled GeoArrow import currently routes through the explicit compatibility bridge."
+
+    return True, ""
 
 def _sample_owned_for_geoarrow_benchmark(
     *,
@@ -1863,6 +1935,7 @@ def native_tabular_to_arrow(
     geometry_encoding: str = "WKB",
     interleaved: bool = True,
     include_z: bool | None = None,
+    force_device_geometry_encode: bool = False,
 ):
 
     from vibespatial.api._native_results import NativeTabularResult
@@ -1920,6 +1993,7 @@ def native_tabular_to_arrow(
                     field_name=geometry_column.name,
                     crs=geometry_column.geometry.crs,
                     return_mode=True,
+                    force_device=force_device_geometry_encode,
                 )
             else:
                 geometry_series = geometry_column.geometry.to_geoseries(
@@ -2022,29 +2096,186 @@ def geoseries_to_arrow(
     return GeoArrowArray(field, geom_arr)
 
 def geodataframe_from_arrow(table, *, geometry: str | None = None, to_pandas_kwargs: dict | None = None):
+    import pyarrow as pa
+
+    from vibespatial.api import GeoDataFrame
+    from vibespatial.api.io._geoarrow import _get_arrow_geometry_field, arrow_to_geopandas
+
+    if not isinstance(table, pa.Table):
+        table = pa.table(table)
+
+    geom_fields = []
+    for index, field in enumerate(table.schema):
+        geom = _get_arrow_geometry_field(field)
+        if geom is not None:
+            geom_fields.append((index, field.name, *geom))
+
+    if not geom_fields:
+        raise ValueError("No geometry column found in the Arrow table.")
+
+    table_attr = table.drop([field_name for _, field_name, *_rest in geom_fields])
+    if to_pandas_kwargs is None:
+        to_pandas_kwargs = {}
+    df = table_attr.to_pandas(**to_pandas_kwargs)
+
+    native_supported = True
+    native_reason = ""
+    for index, _column_name, _ext_name, _ext_meta in geom_fields:
+        geometry_array = table.column(index)
+        native_supported, native_reason = _geoarrow_native_import_support(
+            table.schema.field(index),
+            geometry_array,
+        )
+        if not native_supported:
+            break
+
+    if not native_supported:
+        result = arrow_to_geopandas(table, geometry=geometry, to_pandas_kwargs=to_pandas_kwargs)
+        record_dispatch_event(
+            surface="geopandas.geodataframe.from_arrow",
+            operation="from_arrow",
+            implementation="repo_owned_geoarrow_adapter",
+            reason=native_reason,
+            selected=ExecutionMode.CPU,
+        )
+        return result
+
+    try:
+        selected = ExecutionMode.GPU
+        for index, column_name, ext_name, ext_meta in geom_fields:
+            crs = None
+            if ext_meta is not None and "crs" in ext_meta:
+                crs = ext_meta["crs"]
+            array = table[column_name]
+            if isinstance(array, pa.ChunkedArray):
+                array = array.combine_chunks()
+            owned = _decode_geoarrow_array_to_owned(
+                table.schema.field(index),
+                array,
+                allow_wkb_fallback=False,
+            )
+            series = geoseries_from_owned(owned, name=column_name, crs=crs)
+            if not isinstance(series.values, DeviceGeometryArray):
+                selected = ExecutionMode.CPU
+            df.insert(index, column_name, series)
+    except _GeoArrowNativeCompatibilityRoute as exc:
+        result = arrow_to_geopandas(table, geometry=geometry, to_pandas_kwargs=to_pandas_kwargs)
+        record_dispatch_event(
+            surface="geopandas.geodataframe.from_arrow",
+            operation="from_arrow",
+            implementation="repo_owned_geoarrow_adapter",
+            reason=str(exc),
+            selected=ExecutionMode.CPU,
+        )
+        return result
+    except Exception as exc:
+        record_fallback_event(
+            surface="geopandas.geodataframe.from_arrow",
+            reason="Native GeoArrow import failed; falling back to the host adapter",
+            detail=str(exc),
+            selected=ExecutionMode.CPU,
+            pipeline="io/from_arrow",
+            d2h_transfer=False,
+        )
+        result = arrow_to_geopandas(table, geometry=geometry, to_pandas_kwargs=to_pandas_kwargs)
+        record_dispatch_event(
+            surface="geopandas.geodataframe.from_arrow",
+            operation="from_arrow",
+            implementation="repo_owned_geoarrow_adapter",
+            reason="GeoArrow import routes through the repo-owned host adapter when native decode fails.",
+            selected=ExecutionMode.CPU,
+        )
+        return result
+
+    result = GeoDataFrame(df, geometry=geometry or geom_fields[0][1])
     record_dispatch_event(
         surface="geopandas.geodataframe.from_arrow",
         operation="from_arrow",
-        implementation="repo_owned_geoarrow_adapter",
-        reason="GeoArrow import routes through the repo-owned adapter and owned buffer policy.",
-        selected=ExecutionMode.CPU,
+        implementation="native_owned_geoarrow_import",
+        reason="GeoArrow import decodes the Arrow geometry columns into owned buffers before public export.",
+        selected=selected,
     )
-    from vibespatial.api.io._geoarrow import arrow_to_geopandas
-
-    return arrow_to_geopandas(table, geometry=geometry, to_pandas_kwargs=to_pandas_kwargs)
+    return result
 
 def geoseries_from_arrow(arr, **kwargs):
+    import pyarrow as pa
+
+    from vibespatial.api.geoseries import GeoSeries
+    from vibespatial.api.io._geoarrow import _get_arrow_geometry_field, arrow_to_geometry_array
+
+    schema_capsule, array_capsule = arr.__arrow_c_array__()
+    field = pa.Field._import_from_c_capsule(schema_capsule)
+    pa_arr = pa.Array._import_from_c_capsule(field.__arrow_c_schema__(), array_capsule)
+
+    geom_info = _get_arrow_geometry_field(field)
+    if geom_info is None:
+        raise ValueError("No GeoArrow geometry field found.")
+    ext_name, ext_meta = geom_info
+    crs = None
+    if ext_meta is not None and "crs" in ext_meta:
+        crs = ext_meta["crs"]
+
+    native_supported, native_reason = _geoarrow_native_import_support(field, pa_arr)
+    if not native_supported:
+        series = GeoSeries(arrow_to_geometry_array(arr), **kwargs)
+        record_dispatch_event(
+            surface="geopandas.geoseries.from_arrow",
+            operation="from_arrow",
+            implementation="repo_owned_geoarrow_adapter",
+            reason=native_reason,
+            selected=ExecutionMode.CPU,
+        )
+        return series
+
+    try:
+        owned = _decode_geoarrow_array_to_owned(
+            field,
+            pa_arr,
+            allow_wkb_fallback=False,
+        )
+        native_kwargs = dict(kwargs)
+        series_crs = native_kwargs.pop("crs", crs)
+        series = geoseries_from_owned(owned, crs=series_crs, **native_kwargs)
+        selected = ExecutionMode.GPU if isinstance(series.values, DeviceGeometryArray) else ExecutionMode.CPU
+    except _GeoArrowNativeCompatibilityRoute as exc:
+        series = GeoSeries(arrow_to_geometry_array(arr), **kwargs)
+        selected = ExecutionMode.CPU
+        record_dispatch_event(
+            surface="geopandas.geoseries.from_arrow",
+            operation="from_arrow",
+            implementation="repo_owned_geoarrow_adapter",
+            reason=str(exc),
+            selected=selected,
+        )
+        return series
+    except Exception as exc:
+        record_fallback_event(
+            surface="geopandas.geoseries.from_arrow",
+            reason="Native GeoArrow series import failed; falling back to the host adapter",
+            detail=str(exc),
+            selected=ExecutionMode.CPU,
+            pipeline="io/from_arrow",
+            d2h_transfer=False,
+        )
+        series = GeoSeries(arrow_to_geometry_array(arr), **kwargs)
+        selected = ExecutionMode.CPU
+        record_dispatch_event(
+            surface="geopandas.geoseries.from_arrow",
+            operation="from_arrow",
+            implementation="repo_owned_geoarrow_adapter",
+            reason="GeoArrow series import routes through the repo-owned host adapter when native decode fails.",
+            selected=selected,
+        )
+        return series
+
     record_dispatch_event(
         surface="geopandas.geoseries.from_arrow",
         operation="from_arrow",
-        implementation="repo_owned_geoarrow_adapter",
-        reason="GeoArrow import routes through the repo-owned adapter and owned buffer policy.",
-        selected=ExecutionMode.CPU,
+        implementation="native_owned_geoarrow_import",
+        reason="GeoArrow series import decodes the Arrow geometry column into owned buffers before public export.",
+        selected=selected,
     )
-    from vibespatial.api.geoseries import GeoSeries
-    from vibespatial.api.io._geoarrow import arrow_to_geometry_array
-
-    return GeoSeries(arrow_to_geometry_array(arr), **kwargs)
+    return series
 
 def geoseries_from_owned(
     array: OwnedGeometryArray,

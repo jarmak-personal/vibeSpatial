@@ -536,7 +536,68 @@ def test_hybrid_properties_materialize_host_state_lazily(monkeypatch, tmp_path):
     assert props[1]["id"] == 2
     assert props[1]["name"] == "beta"
     assert fromfile_calls == 1
-    assert asnumpy_calls == 1
+    assert asnumpy_calls == 2
+
+
+@needs_gpu
+def test_hybrid_properties_use_property_object_spans_before_feature_parse(monkeypatch, tmp_path):
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+
+    features = [
+        _make_polygon_feature(
+            _simple_square(0, 0),
+            {"id": 1, "note": 'brace { } and "quotes" stay inside the property string'},
+        ),
+        _make_polygon_feature(_simple_square(1, 1), {"id": 2, "note": "beta"}),
+    ]
+    fc = _make_feature_collection(features)
+    path = tmp_path / "test_props_object_spans.geojson"
+    _write_geojson(path, fc)
+
+    def fail_full_feature_parse(*_args, **_kwargs):
+        raise AssertionError("property-object spans should avoid reparsing whole feature payloads")
+
+    monkeypatch.setattr(io_geojson_gpu, "_extract_properties_cpu", fail_full_feature_parse)
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    props = batch.properties
+
+    assert props[0]["id"] == 1
+    assert props[0]["note"] == 'brace { } and "quotes" stay inside the property string'
+    assert props[1]["id"] == 2
+    assert props[1]["note"] == "beta"
+
+
+@needs_gpu
+def test_hybrid_properties_fall_back_when_property_spans_are_incomplete(
+    monkeypatch,
+    tmp_path,
+):
+    import vibespatial.io.geojson_gpu as io_geojson_gpu
+
+    text = """{
+  "type": "FeatureCollection",
+  "features": [
+    {"type":"Feature","properties":{"id":1},"geometry":{"type":"Point","coordinates":[0,0]}},
+    {"type":"Feature","properties" : {"id":2},"geometry":{"type":"Point","coordinates":[1,1]}}
+  ]
+}"""
+    path = tmp_path / "test_props_mixed_spacing.geojson"
+    path.write_text(text)
+
+    def fail_span_parse(*_args, **_kwargs):
+        raise AssertionError("incomplete property spans must fall back to feature parsing")
+
+    monkeypatch.setattr(
+        io_geojson_gpu,
+        "_extract_properties_from_object_spans_cpu",
+        fail_span_parse,
+    )
+
+    batch = read_geojson_owned(path, prefer="gpu-byte-classify")
+    props = batch.properties
+
+    assert props == [{"id": 1}, {"id": 2}]
 
 
 @needs_gpu

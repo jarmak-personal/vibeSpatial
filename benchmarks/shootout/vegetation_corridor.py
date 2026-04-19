@@ -39,13 +39,19 @@ lines["geometry"] = lines.geometry.buffer(10.0)
 lines["group"] = 0
 dissolved = lines.dissolve(by="group")
 
-# make_valid on both sides before overlay
-dissolved["geometry"] = shapely.make_valid(dissolved.geometry.values)
-vegetation["geometry"] = shapely.make_valid(vegetation.geometry.values)
+# Repair invalid inputs through the public API before overlay so both the
+# GeoPandas baseline and vibeSpatial exercise their intended make_valid paths.
+dissolved["geometry"] = dissolved.geometry.make_valid()
+vegetation["geometry"] = vegetation.geometry.make_valid()
 
 # Intersect vegetation with corridor
 try:
-    clipped = gpd.overlay(vegetation, dissolved[["geometry"]], how="intersection")
+    clipped = gpd.overlay(
+        vegetation,
+        dissolved[["geometry"]],
+        how="intersection",
+        make_valid=False,
+    )
 except Exception:
     # Fallback: vectorized intersection when overlay hits GEOS
     # TopologyException or IllegalArgumentException at scale.

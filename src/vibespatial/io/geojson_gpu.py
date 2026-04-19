@@ -54,6 +54,8 @@ from vibespatial.io.geojson_gpu_kernels import (
     _MPOLY_SCATTER_SOURCE,
     _POINT_PAIR_NAMES,
     _POINT_PAIR_PARSE_SOURCE,
+    _PROPERTY_OBJECT_NAMES,
+    _PROPERTY_OBJECT_SOURCE,
     _RING_COUNT_NAMES,
     _RING_COUNT_SOURCE,
     _SCATTER_COORDS_NAMES,
@@ -100,6 +102,7 @@ request_nvrtc_warmup([
     ("geojson-mpoly-scatter", _MPOLY_SCATTER_SOURCE, _MPOLY_SCATTER_NAMES),
     ("geojson-scatter-coords", _SCATTER_COORDS_SOURCE, _SCATTER_COORDS_NAMES),
     ("geojson-feature-boundary", _FEATURE_BOUNDARY_SOURCE, _FEATURE_BOUNDARY_NAMES),
+    ("geojson-property-object", _PROPERTY_OBJECT_SOURCE, _PROPERTY_OBJECT_NAMES),
     ("geojson-type-key", _TYPE_KEY_SOURCE, _TYPE_KEY_NAMES),
     ("geojson-classify-type", _CLASSIFY_TYPE_SOURCE, _CLASSIFY_TYPE_NAMES),
 ])
@@ -145,6 +148,14 @@ def _feature_boundary_kernels():
     return compile_kernel_group("geojson-feature-boundary", _FEATURE_BOUNDARY_SOURCE, _FEATURE_BOUNDARY_NAMES)
 
 
+def _property_object_kernels():
+    return compile_kernel_group(
+        "geojson-property-object",
+        _PROPERTY_OBJECT_SOURCE,
+        _PROPERTY_OBJECT_NAMES,
+    )
+
+
 def _type_key_kernels():
     return compile_kernel_group("geojson-type-key", _TYPE_KEY_SOURCE, _TYPE_KEY_NAMES)
 
@@ -169,6 +180,10 @@ class GeoJSONGpuResult:
     feature_ends: np.ndarray | None = None
     device_feature_starts: object | None = None
     device_feature_ends: object | None = None
+    property_starts: np.ndarray | None = None
+    property_ends: np.ndarray | None = None
+    device_property_starts: object | None = None
+    device_property_ends: object | None = None
 
     def _ensure_host_bytes(self) -> np.ndarray:
         if self.host_bytes is None:
@@ -205,8 +220,36 @@ class GeoJSONGpuResult:
 
         return host_bytes, self.feature_starts, self.feature_ends
 
+    def _ensure_host_property_object_spans(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        host_bytes = self._ensure_host_bytes()
+        if self.property_starts is None:
+            if self.device_property_starts is None:
+                self.property_starts = np.empty(0, dtype=np.int64)
+            else:
+                self.property_starts = cp.asnumpy(self.device_property_starts)
+                self.device_property_starts = None
+        if self.property_ends is None:
+            if self.device_property_ends is None:
+                self.property_ends = np.empty(0, dtype=np.int64)
+            else:
+                self.property_ends = cp.asnumpy(self.device_property_ends)
+                self.device_property_ends = None
+        return host_bytes, self.property_starts, self.property_ends
+
     def properties_loader(self) -> Callable[[], list[dict[str, object]]]:
         def _load() -> list[dict[str, object]]:
+            if (
+                self.property_starts is not None
+                or self.property_ends is not None
+                or self.device_property_starts is not None
+                or self.device_property_ends is not None
+            ):
+                host_bytes, property_starts, property_ends = self._ensure_host_property_object_spans()
+                return _extract_properties_from_object_spans_cpu(
+                    host_bytes,
+                    property_starts,
+                    property_ends,
+                )
             if (
                 self.feature_starts is not None
                 or self.feature_ends is not None
@@ -247,6 +290,28 @@ def _extract_properties_cpu(
             feature = _fast_json_loads(feature_bytes)
             props = feature.get("properties") or {}
             result.append(dict(props))
+        except Exception:
+            result.append({})
+    return result
+
+
+def _extract_properties_from_object_spans_cpu(
+    host_bytes: np.ndarray,
+    property_starts: np.ndarray,
+    property_ends: np.ndarray,
+) -> list[dict[str, object]]:
+    from .geojson import _fast_json_loads
+
+    result: list[dict[str, object]] = []
+    for start, end in zip(property_starts, property_ends, strict=True):
+        start_i = int(start)
+        end_i = int(end)
+        if start_i < 0 or end_i <= start_i:
+            result.append({})
+            continue
+        try:
+            props = _fast_json_loads(host_bytes[start_i:end_i].tobytes())
+            result.append(dict(props) if isinstance(props, dict) else {})
         except Exception:
             result.append({})
     return result
@@ -514,6 +579,8 @@ def read_geojson_gpu(
 
     d_feat_start_pos = None
     d_feat_end_pos = None
+    d_prop_object_starts = None
+    d_prop_object_ends = None
     if capture_feature_boundaries:
         # S3a: Find feature boundaries for property extraction while the
         # live set is still minimal. The kernel only needs d_bytes + d_depth,
@@ -530,6 +597,49 @@ def read_geojson_gpu(
         ))
         d_feat_start_pos = cp.flatnonzero(d_feat_start).astype(cp.int64)
         del d_feat_start
+
+        if int(d_feat_start_pos.size):
+            prop_kernels = _property_object_kernels()
+            d_prop_hits = cp.zeros(n, dtype=cp.uint8)
+            _launch_kernel(runtime, prop_kernels["find_properties_key"], n, (
+                (ptr(d_bytes), ptr(d_quote_parity), ptr(d_depth), ptr(d_prop_hits), n_i64),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I64),
+            ))
+            d_prop_positions = cp.flatnonzero(d_prop_hits).astype(cp.int64)
+            del d_prop_hits
+
+            if int(d_prop_positions.size) == int(d_feat_start_pos.size):
+                d_prop_value_starts = cp.empty(int(d_prop_positions.size), dtype=cp.int64)
+                d_prop_value_ends = cp.empty(int(d_prop_positions.size), dtype=cp.int64)
+                _launch_kernel(runtime, prop_kernels["find_property_object_bounds"], int(d_prop_positions.size), (
+                    (
+                        ptr(d_bytes),
+                        ptr(d_prop_positions),
+                        ptr(d_prop_value_starts),
+                        ptr(d_prop_value_ends),
+                        np.int32(int(d_prop_positions.size)),
+                        n_i64,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_I64,
+                    ),
+                ))
+                d_prop_feature_rows = cp.searchsorted(
+                    d_feat_start_pos[1:],
+                    d_prop_positions,
+                    side="right",
+                ).astype(cp.int64, copy=False)
+                d_prop_object_starts = cp.full(int(d_feat_start_pos.size), -1, dtype=cp.int64)
+                d_prop_object_ends = cp.full(int(d_feat_start_pos.size), -1, dtype=cp.int64)
+                d_prop_object_starts[d_prop_feature_rows] = d_prop_value_starts
+                d_prop_object_ends[d_prop_feature_rows] = d_prop_value_ends
+                del d_prop_feature_rows, d_prop_value_starts, d_prop_value_ends
+            del d_prop_positions
 
     total_features = int(d_feat_start_pos.size) if d_feat_start_pos is not None else n_features
 
@@ -553,6 +663,8 @@ def read_geojson_gpu(
                 host_bytes=host_bytes,
                 feature_starts=np.empty(0, dtype=np.int64),
                 feature_ends=np.empty(0, dtype=np.int64),
+                property_starts=np.empty(0, dtype=np.int64),
+                property_ends=np.empty(0, dtype=np.int64),
             )
 
         return GeoJSONGpuResult(
@@ -564,6 +676,8 @@ def read_geojson_gpu(
             host_bytes=host_bytes,
             device_feature_starts=d_feat_start_pos,
             device_feature_ends=d_feat_end_pos,
+            device_property_starts=d_prop_object_starts,
+            device_property_ends=d_prop_object_ends,
         )
 
     d_feature_row_ids = None
@@ -671,6 +785,8 @@ def read_geojson_gpu(
                 host_bytes=host_bytes,
                 device_feature_starts=d_feat_start_pos,
                 device_feature_ends=d_feat_end_pos,
+                device_property_starts=d_prop_object_starts,
+                device_property_ends=d_prop_object_ends,
             )
         del d_point_x, d_point_y, d_point_valid
 
@@ -968,6 +1084,8 @@ def read_geojson_gpu(
         host_bytes=host_bytes,
         device_feature_starts=d_feat_start_pos,
         device_feature_ends=d_feat_end_pos,
+        device_property_starts=d_prop_object_starts,
+        device_property_ends=d_prop_object_ends,
     )
 
 

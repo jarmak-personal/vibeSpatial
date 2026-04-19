@@ -70,6 +70,17 @@ def seed_all_validity_cache(owned: OwnedGeometryArray | None) -> None:
     owned._cached_is_valid_mask = np.ones(owned.row_count, dtype=bool)
 
 
+def _concat_validity_caches(arrays: list[OwnedGeometryArray]) -> np.ndarray | None:
+    """Concatenate per-row validity caches when every input cache is complete."""
+    caches: list[np.ndarray] = []
+    for array in arrays:
+        cache = getattr(array, "_cached_is_valid_mask", None)
+        if cache is None or int(cache.size) != array.row_count:
+            return None
+        caches.append(np.asarray(cache, dtype=bool))
+    return np.concatenate(caches) if caches else np.empty(0, dtype=bool)
+
+
 class DiagnosticKind(StrEnum):
     CREATED = "created"
     TRANSFER = "transfer"
@@ -1074,6 +1085,9 @@ class OwnedGeometryArray:
             f"concatenated {len(arrays)} arrays totalling {total} rows",
             visible=False,
         )
+        cached_validity = _concat_validity_caches(arrays)
+        if cached_validity is not None:
+            result._cached_is_valid_mask = cached_validity
         return result
 
     @classmethod
@@ -1181,6 +1195,9 @@ class OwnedGeometryArray:
             f"totalling {total_rows} rows",
             visible=False,
         )
+        cached_validity = _concat_validity_caches(arrays)
+        if cached_validity is not None:
+            result._cached_is_valid_mask = cached_validity
         return result
 
     def diagnostics_report(self) -> dict[str, Any]:
@@ -3360,53 +3377,82 @@ def materialize_broadcast(tiled: OwnedGeometryArray) -> OwnedGeometryArray:
             new_families[family] = buf
             continue
 
-        # The source has 1 geometry row; replicate it family_n times.
-        # Coordinate span for the single source row.
         src_geom_start = int(buf.geometry_offsets[0])
         src_geom_end = int(buf.geometry_offsets[1])
-        src_n_rings = src_geom_end - src_geom_start
 
-        if buf.ring_offsets is not None:
-            src_coord_start = int(buf.ring_offsets[src_geom_start])
-            src_coord_end = int(buf.ring_offsets[src_geom_end])
+        new_part_offsets = None
+        new_ring_offsets = None
+
+        if buf.part_offsets is None and buf.ring_offsets is None:
+            # Point-like / coordinate-direct families: row -> coordinates.
+            src_coord_start = src_geom_start
+            src_coord_end = src_geom_end
+            src_geometry_width = src_coord_end - src_coord_start
+            new_geom_offsets = np.arange(family_n + 1, dtype=np.int32) * src_geometry_width
+        elif buf.part_offsets is None and buf.ring_offsets is not None:
+            # Polygon: row -> rings -> coordinates.
+            src_ring_start = src_geom_start
+            src_ring_end = src_geom_end
+            src_coord_start = int(buf.ring_offsets[src_ring_start])
+            src_coord_end = int(buf.ring_offsets[src_ring_end])
+            src_ring_lens = np.diff(buf.ring_offsets[src_ring_start:src_ring_end + 1])
+            tiled_ring_lens = np.tile(src_ring_lens, family_n)
+            new_ring_offsets = np.empty(len(tiled_ring_lens) + 1, dtype=np.int32)
+            new_ring_offsets[0] = 0
+            np.cumsum(tiled_ring_lens, out=new_ring_offsets[1:])
+            src_geometry_width = src_ring_end - src_ring_start
+            new_geom_offsets = np.arange(family_n + 1, dtype=np.int32) * src_geometry_width
+        elif buf.part_offsets is not None and buf.ring_offsets is None:
+            # MultiLineString: row -> parts -> coordinates.
+            src_part_start = src_geom_start
+            src_part_end = src_geom_end
+            src_coord_start = int(buf.part_offsets[src_part_start])
+            src_coord_end = int(buf.part_offsets[src_part_end])
+            src_part_lens = np.diff(buf.part_offsets[src_part_start:src_part_end + 1])
+            tiled_part_lens = np.tile(src_part_lens, family_n)
+            new_part_offsets = np.empty(len(tiled_part_lens) + 1, dtype=np.int32)
+            new_part_offsets[0] = 0
+            np.cumsum(tiled_part_lens, out=new_part_offsets[1:])
+            src_geometry_width = src_part_end - src_part_start
+            new_geom_offsets = np.arange(family_n + 1, dtype=np.int32) * src_geometry_width
         else:
-            src_coord_start = 0
-            src_coord_end = len(buf.x)
+            # MultiPolygon: row -> polygons -> rings -> coordinates.
+            src_polygon_start = src_geom_start
+            src_polygon_end = src_geom_end
+            src_ring_start = int(buf.part_offsets[src_polygon_start])
+            src_ring_end = int(buf.part_offsets[src_polygon_end])
+            src_coord_start = int(buf.ring_offsets[src_ring_start])
+            src_coord_end = int(buf.ring_offsets[src_ring_end])
 
-        # Replicate coordinates: tile the single row's coords N times.
+            src_polygon_ring_lens = np.diff(
+                buf.part_offsets[src_polygon_start:src_polygon_end + 1]
+            )
+            tiled_polygon_ring_lens = np.tile(src_polygon_ring_lens, family_n)
+            new_part_offsets = np.empty(len(tiled_polygon_ring_lens) + 1, dtype=np.int32)
+            new_part_offsets[0] = 0
+            np.cumsum(tiled_polygon_ring_lens, out=new_part_offsets[1:])
+
+            src_ring_coord_lens = np.diff(buf.ring_offsets[src_ring_start:src_ring_end + 1])
+            tiled_ring_coord_lens = np.tile(src_ring_coord_lens, family_n)
+            new_ring_offsets = np.empty(len(tiled_ring_coord_lens) + 1, dtype=np.int32)
+            new_ring_offsets[0] = 0
+            np.cumsum(tiled_ring_coord_lens, out=new_ring_offsets[1:])
+
+            src_geometry_width = src_polygon_end - src_polygon_start
+            new_geom_offsets = np.arange(family_n + 1, dtype=np.int32) * src_geometry_width
+
+        # Replicate coordinates for the single source row.
         src_x = buf.x[src_coord_start:src_coord_end]
         src_y = buf.y[src_coord_start:src_coord_end]
         new_x = np.tile(src_x, family_n)
         new_y = np.tile(src_y, family_n)
 
-        # Build geometry_offsets: each row has src_n_rings rings.
-        # [0, R, 2R, ..., family_n*R]
-        new_geom_offsets = np.arange(family_n + 1, dtype=np.int32) * src_n_rings
-
-        # Build ring_offsets (if present): each ring has the same length.
-        new_ring_offsets = None
-        if buf.ring_offsets is not None:
-            src_ring_lens = np.diff(
-                buf.ring_offsets[src_geom_start:src_geom_end + 1]
-            )
-            # Tile ring lengths, then cumulative sum with leading 0.
-            tiled_ring_lens = np.tile(src_ring_lens, family_n)
-            new_ring_offsets = np.empty(
-                len(tiled_ring_lens) + 1, dtype=np.int32,
-            )
-            new_ring_offsets[0] = 0
-            np.cumsum(tiled_ring_lens, out=new_ring_offsets[1:])
-
-        # Build part_offsets (if present, for multi-geometries).
-        new_part_offsets = None
-        if buf.part_offsets is not None:
-            src_n_parts = int(buf.part_offsets[1]) - int(buf.part_offsets[0])
-            new_part_offsets = np.arange(
-                family_n + 1, dtype=np.int32,
-            ) * src_n_parts
-
         # Replicate empty_mask.
         new_empty_mask = np.repeat(buf.empty_mask[:1], family_n)
+
+        bounds = None
+        if buf.bounds is not None:
+            bounds = np.repeat(buf.bounds[:1], family_n, axis=0)
 
         new_families[family] = FamilyGeometryBuffer(
             family=family,
@@ -3418,6 +3464,7 @@ def materialize_broadcast(tiled: OwnedGeometryArray) -> OwnedGeometryArray:
             empty_mask=new_empty_mask,
             part_offsets=new_part_offsets,
             ring_offsets=new_ring_offsets,
+            bounds=bounds,
         )
 
     # Build new family_row_offsets that map to 0..family_n-1 (not all 0).
@@ -3429,10 +3476,17 @@ def materialize_broadcast(tiled: OwnedGeometryArray) -> OwnedGeometryArray:
         mask = tiled.tags == tag_val
         new_fro[mask] = np.arange(int(mask.sum()), dtype=np.int32)
 
-    return OwnedGeometryArray(
+    result = OwnedGeometryArray(
         validity=tiled.validity.copy(),
         tags=tiled.tags.copy(),
         family_row_offsets=new_fro,
         families=new_families,
         residency=Residency.HOST,
     )
+    if tiled.device_state is not None:
+        result.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="materialized broadcast-right geometry on device",
+        )
+    return result

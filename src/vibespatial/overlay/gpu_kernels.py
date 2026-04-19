@@ -591,6 +591,89 @@ label_face_coverage_polygon(
   }
 }
 
+// Row-isolated fast path: each face only needs to test against the polygon
+// whose row id matches the face source row.
+extern "C" __global__ void __launch_bounds__(256, 4)
+label_face_coverage_polygon_same_row(
+    const double* __restrict__ label_x,
+    const double* __restrict__ label_y,
+    const int* __restrict__ face_source_rows,
+    const double* __restrict__ polygon_x,
+    const double* __restrict__ polygon_y,
+    const int* __restrict__ polygon_geometry_offsets,
+    const int* __restrict__ polygon_ring_offsets,
+    int polygon_count,
+    signed char* __restrict__ out_covered,
+    int face_count
+) {
+  const int f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= face_count) return;
+  const int poly = face_source_rows[f];
+  if (poly < 0 || poly >= polygon_count) return;
+  const double px = label_x[f];
+  const double py = label_y[f];
+  const int ring_start = polygon_geometry_offsets[poly];
+  const int ring_end = polygon_geometry_offsets[poly + 1];
+  bool inside = false;
+  for (int ring = ring_start; ring < ring_end; ++ring) {
+    bool on_boundary = false;
+    const int coord_start = polygon_ring_offsets[ring];
+    const int coord_end = polygon_ring_offsets[ring + 1];
+    const bool ring_inside = vs_ring_contains_point_with_boundary(
+        px, py, polygon_x, polygon_y, coord_start, coord_end,
+        OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
+    if (on_boundary) { out_covered[f] = 1; return; }
+    if (ring_inside) inside = !inside;
+  }
+  if (inside) out_covered[f] = 1;
+}
+
+// Compute per-polygon bounds for a multipolygon family buffer.
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_multipolygon_polygon_bounds(
+    const double* __restrict__ mp_x,
+    const double* __restrict__ mp_y,
+    const int* __restrict__ mp_part_offsets,
+    const int* __restrict__ mp_ring_offsets,
+    int polygon_count,
+    double* __restrict__ out_bounds
+) {
+  const int polygon = blockIdx.x * blockDim.x + threadIdx.x;
+  if (polygon >= polygon_count) return;
+  const int ring_start = mp_part_offsets[polygon];
+  const int ring_end = mp_part_offsets[polygon + 1];
+  if (ring_start >= ring_end) {
+    const int base = polygon * 4;
+    out_bounds[base + 0] = 0.0;
+    out_bounds[base + 1] = 0.0;
+    out_bounds[base + 2] = 0.0;
+    out_bounds[base + 3] = 0.0;
+    return;
+  }
+  const int first_coord = mp_ring_offsets[ring_start];
+  double min_x = mp_x[first_coord];
+  double min_y = mp_y[first_coord];
+  double max_x = min_x;
+  double max_y = min_y;
+  for (int ring = ring_start; ring < ring_end; ++ring) {
+    const int coord_start = mp_ring_offsets[ring];
+    const int coord_end = mp_ring_offsets[ring + 1];
+    for (int coord = coord_start; coord < coord_end; ++coord) {
+      const double x = mp_x[coord];
+      const double y = mp_y[coord];
+      min_x = fmin(min_x, x);
+      min_y = fmin(min_y, y);
+      max_x = fmax(max_x, x);
+      max_y = fmax(max_y, y);
+    }
+  }
+  const int base = polygon * 4;
+  out_bounds[base + 0] = min_x;
+  out_bounds[base + 1] = min_y;
+  out_bounds[base + 2] = max_x;
+  out_bounds[base + 3] = max_y;
+}
+
 // Test face sample points against all multipolygons on one side.
 // One thread per face.
 extern "C" __global__ void __launch_bounds__(256, 4)
@@ -638,11 +721,67 @@ label_face_coverage_multipolygon(
     }
   }
 }
+
+// Row-isolated fast path: each face only needs to test against the
+// multipolygon whose row id matches the face source row.
+extern "C" __global__ void __launch_bounds__(256, 4)
+label_face_coverage_multipolygon_same_row(
+    const double* __restrict__ label_x,
+    const double* __restrict__ label_y,
+    const int* __restrict__ face_source_rows,
+    const double* __restrict__ mp_x,
+    const double* __restrict__ mp_y,
+    const int* __restrict__ mp_geometry_offsets,
+    const int* __restrict__ mp_part_offsets,
+    const int* __restrict__ mp_ring_offsets,
+    const double* __restrict__ mp_polygon_bounds,
+    int mp_count,
+    signed char* __restrict__ out_covered,
+    int face_count
+) {
+  const int f = blockIdx.x * blockDim.x + threadIdx.x;
+  if (f >= face_count) return;
+  if (out_covered[f] == 1) return;
+  const int mp = face_source_rows[f];
+  if (mp < 0 || mp >= mp_count) return;
+  const double px = label_x[f];
+  const double py = label_y[f];
+  const int polygon_start = mp_geometry_offsets[mp];
+  const int polygon_end = mp_geometry_offsets[mp + 1];
+  for (int polygon = polygon_start; polygon < polygon_end; ++polygon) {
+    const int bounds_base = polygon * 4;
+    if (
+        px < mp_polygon_bounds[bounds_base + 0] ||
+        px > mp_polygon_bounds[bounds_base + 2] ||
+        py < mp_polygon_bounds[bounds_base + 1] ||
+        py > mp_polygon_bounds[bounds_base + 3]
+    ) {
+      continue;
+    }
+    const int ring_start = mp_part_offsets[polygon];
+    const int ring_end = mp_part_offsets[polygon + 1];
+    bool inside = false;
+    for (int ring = ring_start; ring < ring_end; ++ring) {
+      bool on_boundary = false;
+      const int coord_start = mp_ring_offsets[ring];
+      const int coord_end = mp_ring_offsets[ring + 1];
+      const bool ring_inside = vs_ring_contains_point_with_boundary(
+          px, py, mp_x, mp_y, coord_start, coord_end,
+          OVERLAY_BOUNDARY_TOLERANCE, &on_boundary);
+      if (on_boundary) { out_covered[f] = 1; return; }
+      if (ring_inside) inside = !inside;
+    }
+    if (inside) { out_covered[f] = 1; return; }
+  }
+}
 """)
 
 _OVERLAY_FACE_LABEL_KERNEL_NAMES = (
     "label_face_coverage_polygon",
+    "label_face_coverage_polygon_same_row",
+    "compute_multipolygon_polygon_bounds",
     "label_face_coverage_multipolygon",
+    "label_face_coverage_multipolygon_same_row",
 )
 
 # ---------------------------------------------------------------------------

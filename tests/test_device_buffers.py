@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon
 
 from vibespatial import Residency, TransferTrigger, from_shapely_geometries, has_gpu_runtime
 from vibespatial.cuda._runtime import get_cuda_runtime
@@ -12,6 +12,7 @@ from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
     FamilyGeometryBuffer,
     build_device_resident_owned,
+    materialize_broadcast,
     tile_single_row,
 )
 from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
@@ -136,6 +137,68 @@ def test_broadcast_device_bounds_cache_uses_physical_family_rows() -> None:
         np.repeat(family_bounds, 8, axis=0),
         equal_nan=True,
     )
+
+
+def test_materialize_broadcast_multilinestring_round_trips() -> None:
+    geom = MultiLineString(
+        [
+            [(0, 0), (1, 0), (1, 1)],
+            [(2, 2), (3, 2)],
+        ]
+    )
+    base = from_shapely_geometries([geom])
+    materialized = materialize_broadcast(tile_single_row(base, 4))
+
+    restored = materialized.to_shapely()
+    assert len(restored) == 4
+    for value in restored:
+        assert value is not None and value.equals(geom)
+
+
+def test_materialize_broadcast_multipolygon_round_trips() -> None:
+    geom = MultiPolygon(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            Polygon(
+                [(4, 0), (8, 0), (8, 4), (4, 0)],
+                holes=[[(5, 1), (6, 1), (6, 2), (5, 1)]],
+            ),
+        ]
+    )
+    base = from_shapely_geometries([geom])
+    materialized = materialize_broadcast(tile_single_row(base, 3))
+
+    restored = materialized.to_shapely()
+    assert len(restored) == 3
+    for value in restored:
+        assert value is not None and value.equals(geom)
+
+
+def test_materialize_broadcast_multipolygon_device_segment_extraction() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.spatial.segment_primitives import _extract_segments_gpu
+
+    geom = MultiPolygon(
+        [
+            Polygon([(0, 0), (2, 0), (2, 2), (0, 0)]),
+            Polygon(
+                [(4, 0), (8, 0), (8, 4), (4, 0)],
+                holes=[[(5, 1), (6, 1), (6, 2), (5, 1)]],
+            ),
+        ]
+    )
+    base = from_shapely_geometries([geom], residency=Residency.DEVICE)
+    materialized = materialize_broadcast(tile_single_row(base, 3)).move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="broadcast multipolygon segment extraction test",
+    )
+
+    segments = _extract_segments_gpu(materialized)
+    base_segments = _extract_segments_gpu(base)
+    assert int(segments.count) == int(base_segments.count) * 3
 
 
 def test_cache_bounds_ignores_invalid_rows_with_stale_family_tags() -> None:

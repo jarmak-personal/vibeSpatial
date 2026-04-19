@@ -36,6 +36,7 @@ from vibespatial.geometry.owned import (
     from_shapely_geometries,
 )
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.crossover import WorkloadShape
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.testing import strict_native_environment
@@ -974,7 +975,10 @@ def test_overlay_difference_matches_union_for_overlapping_gt2_neighbors(
     assert len(result) == 1
     assert grouped_union_calls == 1
     assert grouped_plan_calls >= 1
-    assert grouped_materialize_calls == 1
+    # The grouped plan materializes once; exact repair may route the compacted
+    # invalid row through the row-preserving difference planner, which can
+    # materialize its own difference plan without changing the public result.
+    assert 1 <= grouped_materialize_calls <= 3
     assert difference_calls == 1
     assert shapely.symmetric_difference(result.geometry.iloc[0], expected).area < 1e-8
 
@@ -4037,6 +4041,149 @@ def test_overlay_intersection_many_vs_one_auto_keeps_public_path_on_gpu() -> Non
     )
 
 
+def test_overlay_intersection_polygonal_geometrycollection_mask_matches_polygon_mask() -> None:
+    left_geometry = DeviceGeometryArray._from_owned(
+        from_shapely_geometries(
+            [
+                Polygon([(-1, 1), (2, 1), (2, 4), (-1, 4), (-1, 1)]),
+                Polygon([(1, -1), (4, -1), (4, 2), (1, 2), (1, -1)]),
+                Polygon([(3, 3), (6, 3), (6, 6), (3, 6), (3, 3)]),
+            ],
+            residency=Residency.DEVICE if vibespatial.has_gpu_runtime() else Residency.HOST,
+        )
+    )
+    left = GeoDataFrame(
+        {"col1": [1, 2, 3]},
+        geometry=left_geometry,
+    )
+    polygon_mask = Polygon([(0, 0), (6, 0), (6, 2), (2, 2), (2, 6), (0, 6), (0, 0)])
+    right_polygon = GeoDataFrame(
+        {"zone": [1]},
+        geometry=GeoSeries([polygon_mask]),
+    )
+    right_collection = GeoDataFrame(
+        {"zone": [1]},
+        geometry=GeoSeries(
+            [
+                GeometryCollection(
+                    [
+                        polygon_mask,
+                        MultiLineString(
+                            [[(0, 0), (6, 0)], [(2, 2), (2, 6)]],
+                        ),
+                    ]
+                )
+            ]
+        ),
+    )
+
+    vibespatial.clear_fallback_events()
+    result = overlay(left, right_collection, how="intersection")
+    events = vibespatial.get_fallback_events(clear=True)
+    expected = overlay(left, right_polygon, how="intersection")
+
+    result = result.sort_values("col1").reset_index(drop=True)
+    expected = expected.sort_values("col1").reset_index(drop=True)
+
+    assert_geodataframe_equal(result, expected)
+    assert not any(
+        event.surface == "DeviceGeometryArray.intersection"
+        and "unsupported other type for owned constructive path" in str(event.reason)
+        for event in events
+    )
+
+
+def test_overlay_keep_geom_type_rejects_source_collection_but_normalizes_mask() -> None:
+    polygon = box(0, 0, 2, 2)
+    line = LineString([(0, 0), (2, 0)])
+    collection_mask = GeometryCollection([polygon, line])
+    left_collection = GeoDataFrame({"name": ["source"]}, geometry=[collection_mask])
+    right_polygon = GeoDataFrame({"mask": [1]}, geometry=[box(1, 1, 3, 3)])
+
+    with pytest.raises(TypeError):
+        overlay(left_collection, right_polygon, how="intersection", keep_geom_type=True)
+
+    left_collection_late = GeoDataFrame(
+        {"name": ["polygon", "collection"]},
+        geometry=[polygon, collection_mask],
+    )
+    late_result = overlay(
+        left_collection_late,
+        right_polygon,
+        how="intersection",
+        keep_geom_type=True,
+    )
+    assert set(late_result.geometry.geom_type) <= {"Polygon"}
+
+    left_polygon = GeoDataFrame({"name": ["source"]}, geometry=[polygon])
+    right_collection = GeoDataFrame({"mask": [1]}, geometry=[collection_mask])
+    result = overlay(left_polygon, right_collection, how="intersection", keep_geom_type=True)
+
+    assert result.geometry.geom_type.tolist() == ["Polygon"]
+    assert result.geometry.iloc[0].equals(polygon)
+
+
+@pytest.mark.parametrize("collection_side", ["left", "right"])
+def test_overlay_keep_geom_type_false_preserves_collection_lower_dimensional_parts(
+    collection_side: str,
+) -> None:
+    polygon = box(0, 0, 2, 2)
+    point = Point(5, 5)
+    collection = GeometryCollection([polygon, point])
+    other = box(10, 10, 12, 12)
+    if collection_side == "left":
+        left = GeoDataFrame({"left": [1]}, geometry=[collection])
+        right = GeoDataFrame({"right": [1]}, geometry=[other])
+    else:
+        left = GeoDataFrame({"left": [1]}, geometry=[other])
+        right = GeoDataFrame({"right": [1]}, geometry=[collection])
+
+    result = overlay(left, right, how="union", keep_geom_type=False)
+    collections = result.loc[result.geometry.geom_type == "GeometryCollection", "geometry"]
+
+    assert len(collections) == 1
+    assert shapely.equals(collections.iloc[0], collection)
+
+
+def test_polygonal_collection_normalization_preserves_device_residency() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    polygon = box(0, 0, 2, 2)
+    line = LineString([(0, 0), (2, 0)])
+    frame = GeoDataFrame(
+        {"mask": [1]},
+        geometry=GeoSeries([GeometryCollection([polygon, line])]),
+    )
+    frame.geometry.values._owned = from_shapely_geometries(
+        [polygon],
+        residency=Residency.DEVICE,
+    )
+
+    normalized, changed = overlay_module._normalize_polygonal_collection_input(frame)
+
+    assert changed
+    assert normalized.geometry.dtype.name == "device_geometry"
+    owned = getattr(normalized.geometry.values, "_owned", None)
+    assert owned is not None
+    assert owned.residency is Residency.DEVICE
+
+
+def test_polygonal_collection_normalization_ignores_lower_dimensional_collections() -> None:
+    collection = GeometryCollection(
+        [
+            LineString([(0, 0), (1, 0)]),
+            Point(0, 0),
+        ]
+    )
+    frame = GeoDataFrame({"mask": [1]}, geometry=GeoSeries([collection]))
+
+    normalized, changed = overlay_module._normalize_polygonal_collection_input(frame)
+
+    assert normalized is frame
+    assert not changed
+
+
 def test_overlay_intersection_many_vs_one_small_remainder_prefers_broadcast_right_exact_helper(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4106,7 +4253,6 @@ def test_overlay_intersection_many_vs_one_large_remainder_uses_cached_right_segm
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
-    binary_module = importlib.import_module("vibespatial.constructive.binary_constructive")
     complex_left = from_shapely_geometries(
         [box(float(i) - 1.0, 1.0, float(i) + 2.0, 4.0) for i in range(24)],
         residency=Residency.DEVICE,
@@ -4116,9 +4262,8 @@ def test_overlay_intersection_many_vs_one_large_remainder_uses_cached_right_segm
         residency=Residency.DEVICE,
     )
 
-    helper_calls: list[tuple[int, int]] = []
-    overlay_cached_flags: list[bool] = []
-    real_broadcast = binary_module._broadcast_right_cached_segments
+    overlay_gpu_module = importlib.import_module("vibespatial.overlay.gpu")
+    overlay_calls: list[tuple[int, int, bool]] = []
     real_overlay_owned = overlay_gpu_module._overlay_owned
 
     monkeypatch.setattr(
@@ -4138,24 +4283,21 @@ def test_overlay_intersection_many_vs_one_large_remainder_uses_cached_right_segm
         16,
     )
 
-    def _wrapped_broadcast(right_arg, row_count, *, _cached_right_segments=None):
-        helper_calls.append((right_arg.row_count, row_count))
-        return real_broadcast(
-            right_arg,
-            row_count,
-            _cached_right_segments=_cached_right_segments,
+    def _wrapped_overlay(left_arg, right_arg, **kwargs):
+        overlay_calls.append(
+            (
+                left_arg.row_count,
+                right_arg.row_count,
+                kwargs.get("_cached_right_segments") is not None,
+            )
         )
-
-    def _wrapped_overlay(*args, **kwargs):
-        overlay_cached_flags.append(kwargs.get("_cached_right_segments") is not None)
-        return real_overlay_owned(*args, **kwargs)
+        return real_overlay_owned(left_arg, right_arg, **kwargs)
 
     monkeypatch.setattr(
-        binary_module,
-        "_broadcast_right_cached_segments",
-        _wrapped_broadcast,
+        overlay_gpu_module,
+        "_overlay_owned",
+        _wrapped_overlay,
     )
-    monkeypatch.setattr(overlay_gpu_module, "_overlay_owned", _wrapped_overlay)
 
     result = overlay_module._many_vs_one_intersection_owned(
         complex_left,
@@ -4163,8 +4305,7 @@ def test_overlay_intersection_many_vs_one_large_remainder_uses_cached_right_segm
         0,
     )
 
-    assert helper_calls == [(1, 24)]
-    assert overlay_cached_flags == [True]
+    assert overlay_calls == [(24, 24, True)]
     assert result.row_count == complex_left.row_count
 
 
@@ -4185,7 +4326,7 @@ def test_overlay_intersection_many_vs_one_large_host_remainder_promotes_to_devic
         residency=Residency.HOST,
     )
 
-    overlay_calls: list[tuple[str, str, int]] = []
+    overlay_calls: list[tuple[str, str, int, int]] = []
     real_overlay_owned = overlay_gpu_module._overlay_owned
 
     monkeypatch.setattr(
@@ -4206,8 +4347,18 @@ def test_overlay_intersection_many_vs_one_large_host_remainder_promotes_to_devic
     )
     monkeypatch.setattr(
         overlay_module,
-        "OVERLAY_GPU_REMAINDER_THRESHOLD",
-        8,
+        "plan_dispatch_selection",
+        lambda *args, **kwargs: SimpleNamespace(
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+        ),
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "_host_exact_polygon_intersection_owned_batch",
+        lambda *args, **kwargs: pytest.fail(
+            "GPU runtime should not short-circuit host-backed many-vs-one batches to host exact intersection"
+        ),
     )
 
     def _wrapped_overlay(*args, **kwargs):
@@ -4216,11 +4367,16 @@ def test_overlay_intersection_many_vs_one_large_host_remainder_promotes_to_devic
                 str(args[0].residency),
                 str(args[1].residency),
                 args[0].row_count,
+                args[1].row_count,
             )
         )
         return real_overlay_owned(*args, **kwargs)
 
-    monkeypatch.setattr(overlay_gpu_module, "_overlay_owned", _wrapped_overlay)
+    monkeypatch.setattr(
+        overlay_gpu_module,
+        "_overlay_owned",
+        _wrapped_overlay,
+    )
     monkeypatch.setattr(
         overlay_module,
         "record_fallback_event",
@@ -4237,7 +4393,163 @@ def test_overlay_intersection_many_vs_one_large_host_remainder_promotes_to_devic
         0,
     )
 
-    assert overlay_calls == [("device", "host", 24)]
+    assert overlay_calls == [("device", "device", 24, 24)]
+    assert result.residency is Residency.DEVICE
+    assert result.row_count == complex_left.row_count
+
+
+def test_overlay_intersection_many_vs_one_large_remainder_chunks_exact_gpu_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    overlay_gpu_module = importlib.import_module("vibespatial.overlay.gpu")
+    complex_left = from_shapely_geometries(
+        [box(float(i) - 1.0, 1.0, float(i) + 2.0, 4.0) for i in range(10)],
+        residency=Residency.DEVICE,
+    )
+    right_one = from_shapely_geometries(
+        [box(0.0, 0.0, 16.0, 6.0)],
+        residency=Residency.DEVICE,
+    )
+    chunk_sizes: list[int] = []
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_prepare_many_vs_one_intersection_chunks",
+        lambda *args, **kwargs: (
+            [],
+            complex_left,
+            np.arange(complex_left.row_count, dtype=np.intp),
+            right_one,
+            ExecutionMode.GPU,
+        ),
+    )
+    monkeypatch.setattr(overlay_module, "_OVERLAY_ROWWISE_REMAINDER_MAX", 0)
+    monkeypatch.setattr(
+        overlay_module,
+        "_OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES",
+        200,
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "record_fallback_event",
+        lambda *args, **kwargs: pytest.fail(
+            "chunked many-vs-one GPU remainder should not fall back to host exact intersection"
+        )
+        if "many-vs-one remainder" in str(kwargs.get("reason", ""))
+        else None,
+    )
+
+    real_overlay_owned = overlay_gpu_module._overlay_owned
+
+    def _wrapped_overlay(left_arg, right_arg, **kwargs):
+        chunk_sizes.append(left_arg.row_count)
+        return real_overlay_owned(left_arg, right_arg, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_gpu_module,
+        "_overlay_owned",
+        _wrapped_overlay,
+    )
+
+    result = overlay_module._many_vs_one_intersection_owned(
+        complex_left,
+        right_one,
+        0,
+    )
+
+    assert len(chunk_sizes) > 1
+    assert sum(chunk_sizes) == complex_left.row_count
+    assert all(size < complex_left.row_count for size in chunk_sizes)
+    assert result.row_count == complex_left.row_count
+
+
+def test_overlay_intersection_many_vs_one_large_remainder_retries_smaller_gpu_batches_on_memory_pressure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    binary_constructive_module = importlib.import_module(
+        "vibespatial.constructive.binary_constructive"
+    )
+    overlay_gpu_module = importlib.import_module("vibespatial.overlay.gpu")
+    complex_left = from_shapely_geometries(
+        [box(float(i) - 1.0, 1.0, float(i) + 2.0, 4.0) for i in range(10)],
+        residency=Residency.DEVICE,
+    )
+    right_one = from_shapely_geometries(
+        [box(0.0, 0.0, 16.0, 6.0)],
+        residency=Residency.DEVICE,
+    )
+    chunk_sizes: list[int] = []
+    raised_large_chunk = {"value": False}
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_prepare_many_vs_one_intersection_chunks",
+        lambda *args, **kwargs: (
+            [],
+            complex_left,
+            np.arange(complex_left.row_count, dtype=np.intp),
+            right_one,
+            ExecutionMode.GPU,
+        ),
+    )
+    monkeypatch.setattr(overlay_module, "_OVERLAY_ROWWISE_REMAINDER_MAX", 0)
+    monkeypatch.setattr(
+        overlay_module,
+        "_OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES",
+        1,
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "_OVERLAY_BROADCAST_RIGHT_EXACT_MIN_CHUNK_ROWS",
+        8,
+    )
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_broadcast_right_gpu",
+        lambda *args, **kwargs: pytest.fail(
+            "memory-pressure retry should stay on the tiled exact GPU path"
+        ),
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "record_fallback_event",
+        lambda *args, **kwargs: pytest.fail(
+            "many-vs-one GPU retry should not fall back to host exact intersection"
+        )
+        if "many-vs-one remainder" in str(kwargs.get("reason", ""))
+        else None,
+    )
+
+    real_overlay_owned = overlay_gpu_module._overlay_owned
+
+    def _wrapped_overlay(left_arg, right_arg, **kwargs):
+        chunk_sizes.append(left_arg.row_count)
+        if left_arg.row_count == 8 and not raised_large_chunk["value"]:
+            raised_large_chunk["value"] = True
+            raise RuntimeError("max feasible pairs")
+        return real_overlay_owned(left_arg, right_arg, **kwargs)
+
+    monkeypatch.setattr(
+        overlay_gpu_module,
+        "_overlay_owned",
+        _wrapped_overlay,
+    )
+
+    result = overlay_module._many_vs_one_intersection_owned(
+        complex_left,
+        right_one,
+        0,
+    )
+
+    assert raised_large_chunk["value"] is True
+    assert chunk_sizes[0] == 8
+    assert chunk_sizes[1:] == [4, 6]
     assert result.row_count == complex_left.row_count
 
 
@@ -4527,6 +4839,82 @@ def test_overlay_intersection_many_vs_one_cpu_selected_exact_host_batch_skips_pr
     assert result.row_count == left_sub.row_count
     assert int(np.count_nonzero(exact_mask)) == left_sub.row_count
     assert not bool(overlap_mask.any())
+
+
+def test_many_vs_one_exact_batch_plans_broadcast_right_workload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left_sub = from_shapely_geometries(
+        [box(float(i), 0.0, float(i) + 2.0, 2.0) for i in range(64)],
+        residency=Residency.DEVICE,
+    )
+    right_one = from_shapely_geometries(
+        [box(0.5, 0.5, 63.5, 2.5)],
+        residency=Residency.DEVICE,
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_plan_dispatch_selection(*args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            selected=ExecutionMode.CPU,
+            requested=ExecutionMode.AUTO,
+            reason="synthetic cpu selection",
+        )
+
+    monkeypatch.setattr(
+        overlay_module,
+        "plan_dispatch_selection",
+        _fake_plan_dispatch_selection,
+    )
+
+    result = overlay_module._many_vs_one_intersection_owned(
+        left_sub,
+        right_one,
+        0,
+    )
+
+    assert result.row_count == left_sub.row_count
+    assert seen["workload_shape"] is WorkloadShape.BROADCAST_RIGHT
+    assert seen["current_residency"] is Residency.DEVICE
+
+
+def test_prepare_many_vs_one_chunks_plans_broadcast_right_workload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    left_sub = from_shapely_geometries(
+        [box(float(i), 0.0, float(i) + 2.0, 2.0) for i in range(64)],
+        residency=Residency.DEVICE,
+    )
+    right_one = from_shapely_geometries(
+        [box(0.5, 0.5, 63.5, 2.5)],
+        residency=Residency.DEVICE,
+    )
+    seen: dict[str, object] = {}
+
+    def _fake_plan_dispatch_selection(*args, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(selected=ExecutionMode.GPU)
+
+    monkeypatch.setattr(
+        overlay_module,
+        "plan_dispatch_selection",
+        _fake_plan_dispatch_selection,
+    )
+
+    prepared = overlay_module._prepare_many_vs_one_intersection_chunks(
+        left_sub,
+        right_one,
+        0,
+        global_positions=np.arange(left_sub.row_count, dtype=np.intp),
+    )
+
+    assert prepared is not None
+    assert seen["workload_shape"] is WorkloadShape.BROADCAST_RIGHT
+    assert seen["current_residency"] is Residency.DEVICE
 
 
 def test_host_exact_polygon_intersection_series_batch_preserves_exact_cache() -> None:

@@ -134,9 +134,9 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         format=IOFormat.GEOPACKAGE,
         default_path=IOPathKind.HYBRID,
         read_path=IOPathKind.HYBRID,
-        write_path=IOPathKind.FALLBACK,
+        write_path=IOPathKind.HYBRID,
         canonical_gpu=False,
-        reason="GeoPackage read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+        reason="GeoPackage uses pyogrio Arrow container IO with GPU WKB geometry decode/encode for device-backed geometry.",
     ),
     IOFormat.FILE_GEODATABASE: IOSupportEntry(
         format=IOFormat.FILE_GEODATABASE,
@@ -150,9 +150,9 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         format=IOFormat.FLATGEOBUF,
         default_path=IOPathKind.HYBRID,
         read_path=IOPathKind.HYBRID,
-        write_path=IOPathKind.FALLBACK,
+        write_path=IOPathKind.HYBRID,
         canonical_gpu=False,
-        reason="FlatGeobuf read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+        reason="FlatGeobuf uses direct GPU decode or pyogrio Arrow container IO with GPU WKB geometry decode/encode for device-backed geometry.",
     ),
     IOFormat.GML: IOSupportEntry(
         format=IOFormat.GML,

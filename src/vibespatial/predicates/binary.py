@@ -613,6 +613,66 @@ def _evaluate_gpu_point_region_fast_path(
     points = left if point_on_left else right
     regions = right if point_on_left else left
 
+    point_region_boolean_predicate = (
+        predicate == "intersects"
+        or predicate == "disjoint"
+        or (point_on_left and predicate == "covered_by")
+        or ((not point_on_left) and predicate == "covers")
+    )
+    if point_region_boolean_predicate:
+        from vibespatial.kernels.predicates.point_in_polygon import point_in_polygon
+
+        pip_values = np.asarray(
+            point_in_polygon(
+                points,
+                regions,
+                dispatch_mode=ExecutionMode.GPU,
+                precision=precision,
+            ),
+            dtype=object,
+        )
+        active_rows = ~null_mask
+        bool_values = np.zeros(left.row_count, dtype=bool)
+        if active_rows.any():
+            bool_values[active_rows] = np.asarray(
+                pip_values[active_rows],
+                dtype=bool,
+            )
+        if predicate == "disjoint":
+            bool_values[active_rows] = ~bool_values[active_rows]
+
+        if null_behavior is NullBehavior.FALSE:
+            result_values = bool_values
+        else:
+            result_values = _fill_output(
+                left.row_count,
+                null_behavior=null_behavior,
+                null_mask=null_mask,
+            )
+            result_values[active_rows] = bool_values[active_rows]
+
+        precision_plan = select_precision_plan(
+            runtime_selection=runtime_selection,
+            kernel_class=KernelClass.PREDICATE,
+            requested=precision,
+        )
+        robustness_plan = select_robustness_plan(
+            kernel_class=KernelClass.PREDICATE,
+            precision_plan=precision_plan,
+        )
+        active_row_ids = np.flatnonzero(active_rows).astype(np.int32, copy=False)
+        return BinaryPredicateResult(
+            predicate=predicate,
+            values=result_values,
+            row_count=left.row_count,
+            candidate_rows=active_row_ids,
+            coarse_true_rows=np.empty(0, dtype=np.int32),
+            coarse_false_rows=np.empty(0, dtype=np.int32),
+            runtime_selection=runtime_selection,
+            precision_plan=precision_plan,
+            robustness_plan=robustness_plan,
+        )
+
     points.move_to(
         Residency.DEVICE,
         trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,

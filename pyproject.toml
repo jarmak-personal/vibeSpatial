@@ -40,7 +40,7 @@ dependencies = [
   "pyogrio>=0.8",
   "pyproj>=3.7.0",
   "shapely>=2.1.0",
-  "vibeproj",
+  "vibeproj>=1.0.4",
 ]
 
 license = "Apache-2.0"

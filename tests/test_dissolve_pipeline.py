@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import GeometryCollection, LineString, Point, box
 
 import vibespatial.api as geopandas
 from vibespatial import (
@@ -65,6 +66,28 @@ def test_execute_grouped_union_emits_empty_geometry_for_unobserved_group() -> No
     assert grouped.empty_groups == 1
     assert grouped.geometries[1].geom_type == "GeometryCollection"
     assert grouped.geometries[1].is_empty
+
+
+@pytest.mark.gpu
+def test_execute_grouped_union_owned_coverage_avoids_geometry_materialization() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    class ExplodingGeometries:
+        def __array__(self, dtype=None):
+            raise AssertionError("owned coverage dissolve materialized geometry objects")
+
+    owned = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+    grouped = execute_grouped_union(
+        ExplodingGeometries(),
+        [np.asarray([0], dtype=np.int32), np.asarray([1], dtype=np.int32)],
+        method=DissolveUnionMethod.COVERAGE,
+        owned=owned,
+    )
+
+    assert grouped.geometries is None
+    assert grouped.owned is not None
+    assert grouped.owned.row_count == 2
 
 
 def test_evaluate_geopandas_dissolve_matches_current_categorical_semantics() -> None:
@@ -250,6 +273,23 @@ def test_execute_grouped_union_codes_avoids_geometry_array_materialization_for_o
     assert grouped.non_empty_groups == 1
     assert grouped.owned is not None
     assert grouped.geometries is None
+
+
+def test_public_dissolve_matches_public_union_all_component_order_for_nybb_fixture() -> None:
+    path = Path("tests/upstream/geopandas/tests/data/nybb_16a.zip")
+    frame = geopandas.read_file(path)
+    frame = frame[["geometry", "BoroName", "BoroCode"]]
+    frame = frame.rename(columns={"geometry": "myshapes"})
+    frame = frame.set_geometry("myshapes")
+    frame["manhattan_bronx"] = 5
+    frame.loc[3:4, "manhattan_bronx"] = 6
+
+    dissolved = frame.dissolve("manhattan_bronx")
+    expected = frame.loc[0:2].geometry.union_all()
+
+    # The dissolve exact path should preserve the same MultiPolygon component
+    # ordering as the standalone public union_all() path for the grouped input.
+    assert shapely.to_wkb(dissolved.loc[5, "myshapes"]) == shapely.to_wkb(expected)
 
 
 def test_evaluate_geopandas_dissolve_rewrites_buffered_line_unary_to_disjoint_subset() -> None:
@@ -843,6 +883,87 @@ def test_grouped_union_geometry_result_strict_native_raises_on_host_repair_fallb
             geometry_name="geometry",
             crs="EPSG:3857",
         )
+
+
+def test_grouped_union_geometry_result_make_valid_fallback_extracts_polygonal_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+    make_valid_module = importlib.import_module("vibespatial.constructive.make_valid_pipeline")
+
+    owned = from_shapely_geometries([box(0.0, 0.0, 1.0, 1.0)])
+    repaired = GeometryCollection(
+        [
+            box(0.0, 0.0, 2.0, 2.0),
+            LineString([(0.0, 0.0), (2.0, 2.0)]),
+        ]
+    )
+
+    monkeypatch.setattr(
+        validity_module,
+        "is_valid_owned",
+        lambda *_args, **_kwargs: np.asarray([False], dtype=bool),
+    )
+    monkeypatch.setattr(
+        make_valid_module,
+        "make_valid_owned",
+        lambda **_kwargs: SimpleNamespace(
+            owned=None,
+            geometries=np.asarray([repaired], dtype=object),
+            repaired_rows=np.asarray([0], dtype=np.int32),
+            selected=ExecutionMode.CPU,
+        ),
+    )
+
+    grouped = dissolve_module.GroupedUnionResult(
+        geometries=None,
+        group_count=1,
+        non_empty_groups=1,
+        empty_groups=0,
+        method=DissolveUnionMethod.UNARY,
+        owned=owned,
+    )
+
+    result = dissolve_module._grouped_union_geometry_result(
+        grouped,
+        geometry_name="geometry",
+        crs="EPSG:3857",
+    )
+
+    assert result.series is not None
+    assert result.series.iloc[0].geom_type == "Polygon"
+    assert result.series.iloc[0].equals(box(0.0, 0.0, 2.0, 2.0))
+
+
+def test_execute_grouped_union_codes_recomputes_invalid_gpu_rows_from_original_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segmented_union_module = importlib.import_module("vibespatial.kernels.constructive.segmented_union")
+
+    geoms = [box(0.0, 0.0, 1.0, 1.0), box(1.0, 0.0, 2.0, 1.0)]
+    owned = from_shapely_geometries(geoms)
+    invalid_union = shapely.Polygon([(0.0, 0.0), (2.0, 0.0), (0.0, 1.0), (2.0, 1.0), (0.0, 0.0)])
+
+    monkeypatch.setattr(
+        segmented_union_module,
+        "segmented_union_all",
+        lambda *_args, **_kwargs: from_shapely_geometries([invalid_union]),
+    )
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        np.asarray(geoms, dtype=object),
+        np.asarray([0, 0], dtype=np.int64),
+        group_count=1,
+        method=DissolveUnionMethod.UNARY,
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.owned is not None
+    actual = grouped.owned.to_shapely()[0]
+    expected = shapely.union_all(np.asarray(geoms, dtype=object))
+    assert actual.geom_type == expected.geom_type
+    assert shapely.equals(actual, expected)
 
 
 def test_execute_grouped_box_union_gpu_owned_codes_builds_device_backed_coverage_rectangles() -> None:

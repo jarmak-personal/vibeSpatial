@@ -98,6 +98,14 @@ class DeviceGeometryDtype(ExtensionDtype):
     name = "device_geometry"
     na_value = None
 
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return other == "geometry"
+        return isinstance(other, DeviceGeometryDtype) or getattr(other, "name", None) == "geometry"
+
+    def __hash__(self) -> int:
+        return hash("geometry")
+
     @classmethod
     def construct_from_string(cls, string: str) -> DeviceGeometryDtype:
         if not isinstance(string, str):
@@ -298,6 +306,28 @@ class DeviceGeometryArray(ExtensionArray):
         if len(self) == 0:
             return np.array([np.nan, np.nan, np.nan, np.nan])
         return _compute_total_bounds_from_owned(self._owned)
+
+    @property
+    def x(self) -> np.ndarray:
+        """Return point x coordinates without materializing Shapely objects."""
+        from vibespatial.constructive.properties import get_x_owned
+
+        non_null = self._owned.validity
+        point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+        if np.all(self._owned.tags[non_null] == point_tag):
+            return get_x_owned(self._owned)
+        raise ValueError("x attribute access only provided for Point geometries")
+
+    @property
+    def y(self) -> np.ndarray:
+        """Return point y coordinates without materializing Shapely objects."""
+        from vibespatial.constructive.properties import get_y_owned
+
+        non_null = self._owned.validity
+        point_tag = FAMILY_TAGS[GeometryFamily.POINT]
+        if np.all(self._owned.tags[non_null] == point_tag):
+            return get_y_owned(self._owned)
+        raise ValueError("y attribute access only provided for Point geometries")
 
     # ------------------------------------------------------------------
     # CRS / projection
@@ -544,24 +574,49 @@ class DeviceGeometryArray(ExtensionArray):
         return shapely.union_all(self._ensure_shapely_cache())
 
     def union_all(self, method="unary", grid_size=None):
+        import shapely
+
+        from vibespatial.constructive.union_all import (
+            coverage_union_all_gpu_owned,
+            disjoint_subset_union_all_owned,
+            union_all_gpu_owned,
+        )
+
+        if method != "unary" and grid_size is not None:
+            raise ValueError(f"grid_size is not supported for method '{method}'.")
+
+        if method == "unary":
+            result_owned = union_all_gpu_owned(self._owned, grid_size=grid_size)
+            result_geoms = result_owned.to_shapely()
+            return result_geoms[0] if len(result_geoms) else shapely.GeometryCollection()
+
         if method == "coverage":
-            # Coverage union has specific topological assumptions; stays CPU
-            import shapely
+            result_owned = coverage_union_all_gpu_owned(self._owned)
+            result_geoms = result_owned.to_shapely()
+            return result_geoms[0] if len(result_geoms) else shapely.GeometryCollection()
+
+        if method == "disjoint_subset":
+            result_owned = disjoint_subset_union_all_owned(self._owned)
+            if result_owned is not None:
+                result_geoms = result_owned.to_shapely()
+                return result_geoms[0] if len(result_geoms) else shapely.GeometryCollection()
             _record_shapely_fallback_event(
                 surface="DeviceGeometryArray.union_all",
-                reason="coverage method requires Shapely materialization",
+                reason="mixed families require Shapely materialization",
                 owned=self._owned,
                 detail=f"rows={len(self)}, method={method}",
                 pipeline="constructive/union_all",
             )
             self._owned._record(
                 DiagnosticKind.MATERIALIZATION,
-                "DeviceGeometryArray.union_all: coverage method (CPU-only)",
+                "DeviceGeometryArray.union_all: mixed-family disjoint_subset fallback",
                 visible=True,
             )
-            return shapely.coverage_union_all(self._ensure_shapely_cache())
-        from vibespatial.overlay.dissolve import union_all_gpu
-        return union_all_gpu(self._owned, grid_size=grid_size)
+            return shapely.disjoint_subset_union_all(self._ensure_shapely_cache())
+
+        raise ValueError(
+            f"Method '{method}' not recognized. Use 'coverage', 'unary' or 'disjoint_subset'."
+        )
 
     def buffer(self, distance, quad_segs=None, **kwargs):
         """Buffer -- routes through owned dispatch with GPU kernel when possible."""
@@ -1290,15 +1345,39 @@ class DeviceGeometryArray(ExtensionArray):
                 )
             return other._owned
         other_values = getattr(other, "values", other)
-        if _is_host_geometry_array_like(other_values):
-            if len(other) != len(self):
+        if isinstance(other_values, DeviceGeometryArray):
+            if len(other_values) != len(self):
                 raise ValueError(
-                    f"Lengths do not match: {len(self)} vs {len(other)}"
+                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
+                )
+            return other_values._owned
+        other_owned = getattr(other_values, "_owned", None)
+        if isinstance(other_owned, OwnedGeometryArray):
+            if len(other_values) != len(self):
+                raise ValueError(
+                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
+                )
+            return other_owned
+        if _is_host_geometry_array_like(other_values):
+            if len(other_values) != len(self):
+                raise ValueError(
+                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
                 )
             try:
                 return from_shapely_geometries(other_values._data.tolist())
             except NotImplementedError:
                 return None
+        if hasattr(other_values, "to_owned"):
+            if len(other_values) != len(self):
+                raise ValueError(
+                    f"Lengths do not match: {len(self)} vs {len(other_values)}"
+                )
+            try:
+                coerced_owned = other_values.to_owned()
+            except NotImplementedError:
+                coerced_owned = None
+            if isinstance(coerced_owned, OwnedGeometryArray):
+                return coerced_owned
         from shapely.geometry.base import BaseGeometry as _BG
         if isinstance(other, _BG):
             try:
@@ -1794,7 +1873,29 @@ class DeviceGeometryArray(ExtensionArray):
             )
             return cls._from_owned(empty_owned)
 
-        all_owned = [arr._owned for arr in to_concat]
+        target_residency = next(
+            (
+                owned.residency
+                for arr in to_concat
+                if (owned := getattr(arr, "_owned", None)) is not None
+            ),
+            Residency.HOST,
+        )
+        all_owned = []
+        for arr in to_concat:
+            owned = getattr(arr, "_owned", None)
+            if owned is None:
+                owned = from_shapely_geometries(
+                    np.asarray(arr, dtype=object).tolist(),
+                    residency=target_residency,
+                )
+            elif owned.residency is not target_residency:
+                owned = owned.move_to(
+                    target_residency,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason="align mixed geometry arrays for device_geometry concat",
+                )
+            all_owned.append(owned)
         new_owned = OwnedGeometryArray.concat(all_owned)
 
         # Use CRS from first array that has one

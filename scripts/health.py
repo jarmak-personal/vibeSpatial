@@ -179,6 +179,8 @@ def collect_gpu_acceleration(root: Path, *, include: bool, timeout: int) -> dict
         "weighted_dispatch_units": report.weighted_dispatch_units,
         "weighted_gpu_units": report.weighted_gpu_units,
         "family_breakdown": report.family_breakdown,
+        "io_read_breakdown": report.io_read_breakdown,
+        "compat_read_breakdown": report.compat_read_breakdown,
         "fallback_reasons": report.fallback_reasons,
         "fallback_surfaces": report.fallback_surfaces,
     }
@@ -691,6 +693,24 @@ def print_gpu_summary(report: dict[str, Any]) -> None:
                     f"({gpu_units}/{total_units} work-units, "
                     f"{details['gpu_dispatches']}/{details['total_dispatches']} dispatches, "
                     f"weight {details['weight']})"
+                )
+        io_read_breakdown = gpu_acceleration.get("io_read_breakdown", {})
+        io_read_formats = io_read_breakdown.get("by_format", {})
+        if io_read_formats:
+            print("IO read formats:")
+            for format_name, details in io_read_formats.items():
+                print(
+                    f"  {format_name:<14} {details['gpu_accel_pct']:.2f}% "
+                    f"({details['gpu_dispatches']}/{details['total_dispatches']} dispatches)"
+                )
+        compat_read_breakdown = gpu_acceleration.get("compat_read_breakdown", {})
+        compat_read_formats = compat_read_breakdown.get("by_format", {})
+        if compat_read_formats:
+            print("Explicit compat read overrides:")
+            for format_name, details in compat_read_formats.items():
+                print(
+                    f"  {format_name:<14} {details['gpu_accel_pct']:.2f}% "
+                    f"({details['gpu_dispatches']}/{details['total_dispatches']} dispatches)"
                 )
     print(json.dumps(report, indent=2))
 

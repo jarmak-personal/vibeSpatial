@@ -1866,13 +1866,17 @@ def _profile_vegetation_corridor_geopandas_pipeline(
             stage.rows_out = int(len(dissolved))
 
         with profiler.stage("intersect_vegetation", category="refine", device=ExecutionMode.CPU, rows_in=int(len(veg_gdf))) as stage:
-            # make_valid on both sides prevents TopologyException from
-            # non-noded intersections in the dissolved corridor boundary
-            # and from invalid vegetation polygons at large scale.
-            dissolved["geometry"] = shapely.make_valid(dissolved.geometry.values)
-            veg_gdf["geometry"] = shapely.make_valid(veg_gdf.geometry.values)
+            # Route repair through the public API so device-backed dissolve/read
+            # outputs can stay on the GPU before overlay.
+            dissolved["geometry"] = dissolved.geometry.make_valid()
+            veg_gdf["geometry"] = veg_gdf.geometry.make_valid()
             try:
-                clipped = geopandas.overlay(veg_gdf, dissolved[["geometry"]], how="intersection")
+                clipped = geopandas.overlay(
+                    veg_gdf,
+                    dissolved[["geometry"]],
+                    how="intersection",
+                    make_valid=False,
+                )
             except Exception:
                 # Fallback: vectorized intersection when overlay hits GEOS
                 # TopologyException or IllegalArgumentException at scale.

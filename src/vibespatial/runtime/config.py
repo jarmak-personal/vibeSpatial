@@ -75,6 +75,7 @@ OVERLAY_GPU_FAILURE_THRESHOLD = 3
 # unbatched path is cheaper than extra gather/split overhead.
 OVERLAY_PAIR_BATCH_THRESHOLD = 200_000
 
-# Many-vs-one overlay remainder routing only re-enters the GPU for small
-# residual batches; larger remainders stay on the CPU path intentionally.
+# Host-only installs still use this crossover for many-vs-one exact overlay
+# remainders. GPU-enabled runtimes now prefer the device remainder helpers
+# regardless of size and only use the host path after an explicit GPU failure.
 OVERLAY_GPU_REMAINDER_THRESHOLD = 1_000

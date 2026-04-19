@@ -39,15 +39,8 @@ def valid_row_indices(owned: OwnedGeometryArray) -> np.ndarray:
 def concat_owned_arrays(
     arrays: list[OwnedGeometryArray],
 ) -> OwnedGeometryArray:
-    """Concatenate OwnedGeometryArrays at the buffer level (zero-copy)."""
-    from vibespatial.geometry.owned import (
-        FAMILY_TAGS,
-        NULL_TAG,
-        DiagnosticKind,
-    )
+    """Concatenate OwnedGeometryArrays without forcing device results to host."""
     from vibespatial.geometry.owned import OwnedGeometryArray as _OGA
-
-    TAG_FAMILIES_LOCAL = {v: k for k, v in FAMILY_TAGS.items()}
 
     if not arrays:
         return _OGA(
@@ -57,55 +50,7 @@ def concat_owned_arrays(
             families={},
         )
 
-    if len(arrays) == 1:
-        return arrays[0]
-
-    for arr in arrays:
-        arr._ensure_host_state()
-
-    new_validity = np.concatenate([o.validity for o in arrays])
-    new_tags = np.concatenate([o.tags for o in arrays])
-
-    all_families = {}
-    for owned in arrays:
-        for family, buf in owned.families.items():
-            all_families.setdefault(family, []).append(buf)
-
-    new_families = {}
-    for family, bufs in all_families.items():
-        new_families[family] = concat_family_buffers(family, bufs)
-
-    new_family_row_offsets = np.full(new_validity.size, -1, dtype=np.int32)
-    family_cursor = {f: 0 for f in all_families}
-    global_offset = 0
-    for owned in arrays:
-        n = owned.row_count
-        for i in range(n):
-            global_idx = global_offset + i
-            tag = new_tags[global_idx]
-            if tag == NULL_TAG:
-                continue
-            family = TAG_FAMILIES_LOCAL[int(tag)]
-            new_family_row_offsets[global_idx] = (
-                family_cursor[family] + owned.family_row_offsets[i]
-            )
-        for family in all_families:
-            if family in owned.families:
-                family_cursor[family] += owned.families[family].row_count
-        global_offset += n
-
-    result = _OGA(
-        validity=new_validity,
-        tags=new_tags,
-        family_row_offsets=new_family_row_offsets,
-        families=new_families,
-    )
-    result._record(
-        DiagnosticKind.CREATED,
-        f"segmented_union: buffer-level concat of {len(arrays)} arrays",
-        visible=False,
-    )
-    return result
+    return _OGA.concat(arrays)
 
 
 def concat_family_buffers(

@@ -301,6 +301,19 @@ class TestSegmentedUnionGPU:
         assert not shapely.is_empty(result_geoms[1])
 
     @requires_gpu
+    def test_empty_groups_gpu_preserve_device_residency(self):
+        """GPU: empty group sentinels must not force device input back to host."""
+        geoms = [box(0, 0, 1, 1)]
+        owned = _make_owned(geoms, residency=Residency.DEVICE)
+        offsets = np.array([0, 0, 1], dtype=np.int64)
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.row_count == 2
+        assert result.residency is Residency.DEVICE
+        assert result.device_state is not None
+
+    @requires_gpu
     def test_two_element_overlapping_gpu(self, overlapping_boxes):
         """GPU: two overlapping boxes should union correctly."""
         geoms = overlapping_boxes[:2]
@@ -367,6 +380,85 @@ class TestSegmentedUnionGPU:
         result_geoms = result.to_shapely()
         assert len(result_geoms) == 1
         _assert_geom_equal(result_geoms[0], ref[0])
+
+    @requires_gpu
+    def test_multipolygon_group_larger_than_two_matches_shapely(self):
+        """GPU: 3-row MultiPolygon groups should stay correct on the native reducer."""
+        geoms = [
+            MultiPolygon([box(0, 0, 1, 1), box(3, 0, 4, 1)]),
+            MultiPolygon([box(0.5, 0, 1.5, 1), box(5, 0, 6, 1)]),
+            MultiPolygon([box(1.0, 0, 2.0, 1), box(7, 0, 8, 1)]),
+        ]
+        owned = _make_owned(geoms)
+        offsets = np.array([0, 3], dtype=np.int64)
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+        ref = _shapely_segmented_union(geoms, offsets)
+
+        result_geoms = result.to_shapely()
+        assert len(result_geoms) == 1
+        _assert_geom_equal(result_geoms[0], ref[0])
+
+    @requires_gpu
+    def test_multi_group_gpu_uses_native_union_all_per_group(self, monkeypatch):
+        """GPU: grouped union should route each multi-row group through native union_all."""
+        geoms = [
+            MultiPolygon([box(0, 0, 1, 1), box(3, 0, 4, 1)]),
+            MultiPolygon([box(0.5, 0, 1.5, 1), box(5, 0, 6, 1)]),
+            MultiPolygon([box(1.0, 0, 2.0, 1), box(7, 0, 8, 1)]),
+            box(10, 0, 11, 1),
+            box(10.5, 0, 11.5, 1),
+        ]
+        owned = _make_owned(geoms)
+        offsets = np.array([0, 3, 5], dtype=np.int64)
+
+        from vibespatial.constructive.union_all import union_all_gpu_owned as real_union_all
+
+        call_rows: list[int] = []
+
+        def _count_union_all(group_owned, **kwargs):
+            call_rows.append(group_owned.row_count)
+            return real_union_all(group_owned, **kwargs)
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.union_all.union_all_gpu_owned",
+            _count_union_all,
+        )
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+        ref = _shapely_segmented_union(geoms, offsets)
+
+        result_geoms = result.to_shapely()
+        assert call_rows == [3, 2]
+        assert len(result_geoms) == 2
+        for gpu_g, ref_g in zip(result_geoms, ref):
+            _assert_geom_equal(gpu_g, ref_g)
+
+    @requires_gpu
+    def test_multi_group_gpu_concat_preserves_device_residency(self, monkeypatch):
+        """GPU: per-group results must not be host-materialized during final concat."""
+        geoms = [box(i, 0, i + 1, 1) for i in range(4)]
+        owned = _make_owned(geoms, residency=Residency.DEVICE)
+        offsets = np.array([0, 2, 4], dtype=np.int64)
+        group_results = [
+            _make_owned([box(0, 0, 2, 1)], residency=Residency.DEVICE),
+            _make_owned([box(2, 0, 4, 1)], residency=Residency.DEVICE),
+        ]
+
+        def _fake_union_all_gpu_owned(group_owned, **_kwargs):
+            return group_results.pop(0)
+
+        monkeypatch.setattr(
+            "vibespatial.constructive.union_all.union_all_gpu_owned",
+            _fake_union_all_gpu_owned,
+        )
+
+        result = segmented_union_all(owned, offsets, dispatch_mode=ExecutionMode.GPU)
+
+        assert result.row_count == 2
+        assert result.residency is Residency.DEVICE
+        assert result.device_state is not None
+        assert not any(buffer.host_materialized for buffer in result.families.values())
 
     @requires_gpu
     def test_single_group_gpu_uses_global_tree_reduce_fast_path(self, monkeypatch):

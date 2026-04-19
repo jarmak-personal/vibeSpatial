@@ -5,25 +5,28 @@ Scope: Overlay reconstruction staging, face-labeling plan, and CCCL-oriented out
 Read If: You are changing union, difference, symmetric difference, or overlay output reconstruction.
 STOP IF: You already have the reconstruction planner open and only need local implementation detail.
 Source Of Truth: Phase-5 reconstruction plan from segment primitives to public overlay outputs.
-Body Budget: 119/220 lines
+Body Budget: 122/220 lines
 Document: docs/architecture/overlay-reconstruction.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-4 | Preamble |
-| 5-13 | Request Signals |
-| 14-20 | Open First |
-| 21-25 | Verify |
-| 26-31 | Risks |
-| 32-36 | Intent |
-| 37-46 | Options Considered |
-| 47-60 | Decision |
-| 61-74 | CCCL Mapping |
-| 75-119 | Consequences |
+| 1-7 | Preamble |
+| 8-16 | Request Signals |
+| 17-23 | Open First |
+| 24-28 | Verify |
+| 29-34 | Risks |
+| 35-39 | Intent |
+| 40-49 | Options Considered |
+| 50-63 | Decision |
+| 64-77 | CCCL Mapping |
+| 78-122 | Consequences |
 DOC_HEADER:END -->
 
 `o17.5.3` fixes the constructive assembly shape before full overlay kernels land.
+
+For debugging workflow, pinned-pair isolation, and regression strategy, see
+`docs/testing/overlay-debugging-playbook.md`.
 
 ## Request Signals
 

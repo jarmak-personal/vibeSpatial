@@ -276,6 +276,137 @@ def test_native_tabular_to_arrow_supports_geometry_only_payload() -> None:
     assert roundtrip.geometry.iloc[1].equals(Point(1, 1))
 
 
+def test_geodataframe_from_arrow_wkb_keeps_device_geometry_when_runtime_available() -> None:
+    geopandas.clear_dispatch_events()
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": geopandas.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326"),
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+    table = pa.table(source.to_arrow())
+    result = geopandas.GeoDataFrame.from_arrow(table)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    expected_geometry_array_type = DeviceGeometryArray if has_gpu_runtime() else GeometryArray
+    assert list(result["value"]) == [1, 2]
+    assert isinstance(result.geometry.values, expected_geometry_array_type)
+    assert events
+    assert events[-1].surface == "geopandas.geodataframe.from_arrow"
+    assert events[-1].implementation == "native_owned_geoarrow_import"
+    assert events[-1].selected == ("gpu" if has_gpu_runtime() else "cpu")
+
+
+def test_geoseries_from_arrow_wkb_keeps_device_geometry_when_runtime_available() -> None:
+    geopandas.clear_dispatch_events()
+    source = geopandas.GeoSeries([Point(0, 0), Point(1, 1)], crs="EPSG:4326")
+
+    arr = source.to_arrow()
+    result = geopandas.GeoSeries.from_arrow(arr)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    expected_geometry_array_type = DeviceGeometryArray if has_gpu_runtime() else GeometryArray
+    assert isinstance(result.values, expected_geometry_array_type)
+    assert events
+    assert events[-1].surface == "geopandas.geoseries.from_arrow"
+    assert events[-1].implementation == "native_owned_geoarrow_import"
+    assert events[-1].selected == ("gpu" if has_gpu_runtime() else "cpu")
+
+
+def test_geoseries_from_arrow_wkb_explicit_crs_keeps_native_path() -> None:
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    source = geopandas.GeoSeries([Point(0, 0), Point(1, 1)])
+
+    arr = source.to_arrow()
+    result = geopandas.GeoSeries.from_arrow(arr, crs="EPSG:3857")
+    events = geopandas.get_dispatch_events(clear=True)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    expected_geometry_array_type = DeviceGeometryArray if has_gpu_runtime() else GeometryArray
+    assert isinstance(result.values, expected_geometry_array_type)
+    assert result.crs.to_string() == "EPSG:3857"
+    assert events
+    assert events[-1].surface == "geopandas.geoseries.from_arrow"
+    assert events[-1].implementation == "native_owned_geoarrow_import"
+    assert events[-1].selected == ("gpu" if has_gpu_runtime() else "cpu")
+    assert not fallbacks
+
+
+def test_geodataframe_from_arrow_wkb_z_routes_explicit_compatibility_without_fallback() -> None:
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": geopandas.GeoSeries(
+                [Point(0, 0, 1), Point(1, 1, 2)],
+                crs="EPSG:4326",
+            ),
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    table = pa.table(source.to_arrow())
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    result = geopandas.GeoDataFrame.from_arrow(table)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert list(result["value"]) == [1, 2]
+    assert result.geometry.iloc[0].equals(Point(0, 0))
+    assert result.geometry.iloc[1].equals(Point(1, 1))
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert events[-1].surface == "geopandas.geodataframe.from_arrow"
+    assert events[-1].implementation == "repo_owned_geoarrow_adapter"
+    assert events[-1].selected == "cpu"
+
+
+def test_geoseries_from_arrow_wkb_z_routes_explicit_compatibility_without_fallback() -> None:
+    source = geopandas.GeoSeries([Point(0, 0, 1), Point(1, 1, 2)], crs="EPSG:4326")
+    arr = source.to_arrow()
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    result = geopandas.GeoSeries.from_arrow(arr)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result.iloc[0].equals(Point(0, 0))
+    assert result.iloc[1].equals(Point(1, 1))
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert events[-1].surface == "geopandas.geoseries.from_arrow"
+    assert events[-1].implementation == "repo_owned_geoarrow_adapter"
+    assert events[-1].selected == "cpu"
+
+
+def test_geodataframe_from_arrow_unknown_geoarrow_type_routes_explicit_compatibility_without_fallback() -> None:
+    source = geopandas.GeoDataFrame(
+        {"value": [1], "geometry": [Point(0, 0)]},
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    table = pa.table(source.to_arrow())
+    geometry_index = table.schema.get_field_index("geometry")
+    unknown_field = table.schema.field("geometry").with_metadata(
+        {
+            b"ARROW:extension:name": b"geoarrow.unknown",
+            b"ARROW:extension:metadata": b"{}",
+        }
+    )
+    table = table.set_column(geometry_index, unknown_field, table.column(geometry_index))
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    with pytest.raises(TypeError, match="Unknown GeoArrow extension type"):
+        geopandas.GeoDataFrame.from_arrow(table)
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert geopandas.get_fallback_events(clear=True) == []
+    assert events == []
+
+
 def test_native_tabular_to_arrow_wkb_owned_skips_geoseries_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -37,6 +37,7 @@ from vibespatial.runtime.config import (
     OVERLAY_GPU_REMAINDER_THRESHOLD,
     OVERLAY_PAIR_BATCH_THRESHOLD,
 )
+from vibespatial.runtime.crossover import WorkloadShape
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.hotpath_trace import hotpath_stage, hotpath_trace_enabled
@@ -52,6 +53,8 @@ _OVERLAY_FEW_RIGHT_GROUP_MIN_AVG = 8.0
 _OVERLAY_FEW_RIGHT_CACHED_SEG_MIN_ROWS = 256
 _OVERLAY_ROWWISE_REMAINDER_MAX = 32
 _OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX = 128
+_OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES = 512 * 1024 * 1024
+_OVERLAY_BROADCAST_RIGHT_EXACT_MIN_CHUNK_ROWS = 128
 _OVERLAY_HOST_EXACT_PAIR_BATCH_MAX_ROWS = 128
 _OVERLAY_HOST_EXACT_PUBLIC_BOUNDARY_MAX_ROWS = 256
 _MANY_VS_ONE_DIRECT_FULL_BATCH_MIN_ROWS = 64
@@ -107,8 +110,128 @@ def _series_polygon_mask(series: GeoSeries) -> np.ndarray:
     return np.asarray(series.geom_type.isin(POLYGON_GEOM_TYPES), dtype=bool)
 
 
+def _polygonal_collection_input_values(series: GeoSeries) -> np.ndarray | None:
+    """Return polygon-only values when GeometryCollections only add lower-dimensional parts."""
+    values = np.asarray(series.values, dtype=object)
+    if values.size == 0:
+        return None
+    type_ids = shapely.get_type_id(values)
+    collection_mask = type_ids == _SHAPELY_TYPE_ID_GEOMETRYCOLLECTION
+    if not collection_mask.any():
+        return None
+
+    polygon_only = _strip_non_polygon_collection_parts(values)
+    collection_values = polygon_only[collection_mask]
+    collection_type_ids = shapely.get_type_id(collection_values)
+    collection_has_polygonal_part = (
+        (~shapely.is_missing(collection_values))
+        & (~shapely.is_empty(collection_values))
+        & (
+            (collection_type_ids == _SHAPELY_TYPE_ID_POLYGON)
+            | (collection_type_ids == _SHAPELY_TYPE_ID_MULTIPOLYGON)
+        )
+    )
+    if not bool(np.all(collection_has_polygonal_part)):
+        return None
+
+    polygon_type_ids = shapely.get_type_id(polygon_only)
+    missing_mask = shapely.is_missing(polygon_only)
+    empty_mask = shapely.is_empty(polygon_only)
+    polygon_like = (
+        missing_mask
+        | empty_mask
+        | (polygon_type_ids == _SHAPELY_TYPE_ID_POLYGON)
+        | (polygon_type_ids == _SHAPELY_TYPE_ID_MULTIPOLYGON)
+    )
+    if not bool(np.all(polygon_like)):
+        return None
+    return polygon_only
+
+
+def _normalize_polygonal_collection_input(
+    df: GeoDataFrame,
+) -> tuple[GeoDataFrame, bool]:
+    """Strip lower-dimensional remnants from polygonal GeometryCollection inputs."""
+    polygon_only = _polygonal_collection_input_values(df.geometry)
+    if polygon_only is None:
+        return df, False
+
+    from vibespatial.geometry.device_array import DeviceGeometryArray
+    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.runtime.residency import Residency
+
+    source_owned = getattr(df.geometry.values, "_owned", None)
+    target_residency = source_owned.residency if source_owned is not None else Residency.HOST
+    owned = from_shapely_geometries(
+        list(polygon_only),
+        residency=target_residency,
+    )
+    if target_residency is Residency.DEVICE:
+        values = DeviceGeometryArray._from_owned(owned, crs=df.crs)
+    else:
+        values = GeometryArray.from_owned(owned, crs=df.crs)
+
+    normalized = df.copy()
+    geom_name = normalized._geometry_column_name
+    normalized[geom_name] = GeoSeries(values, index=normalized.index, crs=df.crs)
+    return normalized, True
+
+
 def _series_all_polygons(series: GeoSeries) -> bool:
     return bool(_series_polygon_mask(series).all())
+
+
+def _broadcast_right_exact_chunk_rows(
+    segment_count: int,
+    *,
+    has_part_indices: bool,
+    has_ring_indices: bool,
+    total_rows: int,
+) -> int:
+    """Choose a broadcast-right exact chunk size that caps segment-table growth."""
+    if segment_count <= 0 or total_rows <= 1:
+        return max(1, total_rows)
+
+    bytes_per_segment = 40
+    if has_part_indices:
+        bytes_per_segment += 4
+    if has_ring_indices:
+        bytes_per_segment += 4
+    per_row_bytes = max(1, segment_count * bytes_per_segment)
+    chunk_rows = _OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES // per_row_bytes
+    chunk_rows = max(1, min(total_rows, int(chunk_rows)))
+    if total_rows >= _OVERLAY_BROADCAST_RIGHT_EXACT_MIN_CHUNK_ROWS:
+        chunk_rows = max(chunk_rows, _OVERLAY_BROADCAST_RIGHT_EXACT_MIN_CHUNK_ROWS)
+    return min(total_rows, chunk_rows)
+
+
+def _reduce_broadcast_right_exact_chunk_rows(
+    current_rows: int,
+    *,
+    initial_rows: int,
+) -> int | None:
+    """Return the next smaller GPU batch size for broadcast-right exact work."""
+    if current_rows <= 1:
+        return None
+    if current_rows > initial_rows:
+        next_rows = initial_rows
+    else:
+        next_rows = max(1, current_rows // 2)
+    if next_rows >= current_rows:
+        return None
+    return next_rows
+
+
+def _is_gpu_memory_pressure(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "out_of_memory" in text
+        or "cudaerroroutofmemory" in text
+        or "cudaerrormemoryallocation" in text
+        or "maximum pool size exceeded" in text
+        or "exceeds gpu memory capacity" in text
+        or "max feasible pairs" in text
+    )
 
 
 def _maybe_seed_polygon_validity_cache(spatial) -> None:
@@ -3892,15 +4015,17 @@ def _many_vs_one_intersection_owned(
         spatial-join pairs).  Contained rows are pass-through; remainder rows
         are clipped or overlaid.
     """
-    from vibespatial.constructive.binary_constructive import (
-        _host_rectangle_polygon_mask,
-        binary_constructive_owned,
-    )
+    from vibespatial.constructive.binary_constructive import _host_rectangle_polygon_mask
+    from vibespatial.runtime.residency import combined_residency
+
     n_pairs = int(left_sub.row_count)
+    right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
     pairwise_selection = plan_dispatch_selection(
         kernel_name="overlay_pairwise",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n_pairs,
+        current_residency=combined_residency(left_sub, right_one),
+        workload_shape=WorkloadShape.BROADCAST_RIGHT,
     )
     if (
         not strict_native_mode_enabled()
@@ -3908,7 +4033,6 @@ def _many_vs_one_intersection_owned(
         and n_pairs >= _MANY_VS_ONE_DIRECT_FULL_BATCH_MIN_ROWS
         and n_pairs <= _MANY_VS_ONE_HOST_EXACT_MAX_ROWS
     ):
-        right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
         exact_result = _host_exact_polygon_intersection_owned_batch(
             left_sub,
             right_one,
@@ -3944,14 +4068,10 @@ def _many_vs_one_intersection_owned(
             )
 
     # ---- Tier 3: Overlay for remaining boundary-crossing polygons ----
-    # After containment bypass and SH batch clip, only a small number of
-    # complex polygons remain (those crossing the boundary with holes or
-    # high vertex counts).  For this small remainder, vectorized Shapely
-    # intersection is faster than launching the full GPU overlay pipeline
-    # (which has high fixed cost per kernel invocation for segment
-    # extraction, split-event classification, and face reconstruction).
-    # The crossover to GPU overlay is beneficial when the remainder set
-    # is large (>= 1000 rows) AND the clip polygon is moderately complex.
+    # The remainder path is the exact-overlay escape hatch after the cheap
+    # containment and SH-clip tiers. Already-device data stays on device, but
+    # host-resident small remainders keep the latency crossover that avoids
+    # paying GPU promotion and exact-overlay launch cost for tiny batches.
     def _shapely_remainder_intersection(left_rem_oga, right_one_oga):
         """Intersect remainder polygons via vectorized Shapely (CPU)."""
         return _host_exact_polygon_intersection_owned_batch(
@@ -3970,70 +4090,131 @@ def _many_vs_one_intersection_owned(
         from vibespatial.constructive.binary_constructive import (
             _broadcast_right_cached_segments,
             _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
-            _dispatch_polygon_intersection_overlay_rowwise_gpu,
+            _free_device_segment_table,
         )
-        from vibespatial.geometry.owned import materialize_broadcast, tile_single_row
+        from vibespatial.cuda._runtime import maybe_trim_pool_memory
+        from vibespatial.geometry.owned import (
+            OwnedGeometryArray,
+            materialize_broadcast,
+            tile_single_row,
+        )
         from vibespatial.overlay.gpu import _overlay_owned
+        from vibespatial.spatial.segment_primitives import _extract_segments_gpu
 
-        right_rep = materialize_broadcast(tile_single_row(right_one_oga, left_rem_oga.row_count))
-        cached_right_segments = _broadcast_right_cached_segments(
-            right_one_oga,
-            left_rem_oga.row_count,
-        )
+        gpu_dispatch_mode = ExecutionMode.GPU
+        base_right_segments = None
         try:
             if left_rem_oga.row_count <= _OVERLAY_ROWWISE_REMAINDER_MAX:
                 broadcast_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
                     left_rem_oga,
                     right_one_oga,
-                    dispatch_mode=_pairwise_mode,
-                    _cached_right_segments=cached_right_segments,
+                    dispatch_mode=gpu_dispatch_mode,
+                    _cached_right_segments=None,
                 )
                 if (
                     broadcast_result is not None
                     and broadcast_result.row_count == left_rem_oga.row_count
                 ):
                     return broadcast_result
-            if left_rem_oga.row_count <= _OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX:
-                rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-                    left_rem_oga,
-                    right_rep,
-                    dispatch_mode=_pairwise_mode,
-                    _cached_right_segments=cached_right_segments,
+
+            if left_rem_oga.row_count > 1:
+                base_right_segments = _extract_segments_gpu(right_one_oga)
+
+            initial_chunk_rows = int(left_rem_oga.row_count)
+            if base_right_segments is not None:
+                initial_chunk_rows = _broadcast_right_exact_chunk_rows(
+                    int(base_right_segments.count),
+                    has_part_indices=base_right_segments.part_indices is not None,
+                    has_ring_indices=base_right_segments.ring_indices is not None,
+                    total_rows=int(left_rem_oga.row_count),
                 )
-                if rowwise_result is not None and rowwise_result.row_count == left_rem_oga.row_count:
-                    return rowwise_result
-            if _pairwise_mode is ExecutionMode.GPU:
-                batched_result = _overlay_owned(
-                    left_rem_oga,
-                    right_rep,
-                    operation="intersection",
-                    dispatch_mode=ExecutionMode.GPU,
-                    _cached_right_segments=cached_right_segments,
-                    _row_isolated=True,
-                )
-                if batched_result.row_count == left_rem_oga.row_count:
-                    return batched_result
-            rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
-                left_rem_oga,
-                right_rep,
-                dispatch_mode=_pairwise_mode,
-                _cached_right_segments=cached_right_segments,
-            )
-            if rowwise_result is not None and rowwise_result.row_count == left_rem_oga.row_count:
-                return rowwise_result
-            return binary_constructive_owned(
-                "intersection", left_rem_oga, right_rep,
-                dispatch_mode=_pairwise_mode,
-                _cached_right_segments=cached_right_segments,
+
+            chunk_results = []
+            start = 0
+            total_rows = int(left_rem_oga.row_count)
+            while start < total_rows:
+                chunk_rows = min(initial_chunk_rows, total_rows - start)
+                while True:
+                    stop = min(total_rows, start + chunk_rows)
+                    left_chunk = left_rem_oga.take(
+                        np.arange(start, stop, dtype=np.int64)
+                    )
+                    chunk_cached_segments = None
+                    try:
+                        if base_right_segments is not None:
+                            chunk_cached_segments = _broadcast_right_cached_segments(
+                                right_one_oga,
+                                left_chunk.row_count,
+                                _cached_right_segments=base_right_segments,
+                            )
+                        right_chunk = materialize_broadcast(
+                            tile_single_row(right_one_oga, left_chunk.row_count)
+                        )
+                        chunk_result = _overlay_owned(
+                            left_chunk,
+                            right_chunk,
+                            operation="intersection",
+                            dispatch_mode=ExecutionMode.GPU,
+                            _cached_right_segments=chunk_cached_segments,
+                            _row_isolated=True,
+                        )
+                        break
+                    except Exception as exc:
+                        if _is_gpu_memory_pressure(exc):
+                            next_chunk_rows = _reduce_broadcast_right_exact_chunk_rows(
+                                left_chunk.row_count,
+                                initial_rows=min(
+                                    initial_chunk_rows,
+                                    total_rows - start,
+                                ),
+                            )
+                            if next_chunk_rows is not None:
+                                logger.debug(
+                                    "many-vs-one exact GPU batch hit memory pressure; "
+                                    "retrying smaller chunk",
+                                    extra={
+                                        "current_chunk_rows": left_chunk.row_count,
+                                        "next_chunk_rows": next_chunk_rows,
+                                    },
+                                    exc_info=True,
+                                )
+                                chunk_rows = next_chunk_rows
+                                continue
+                        logger.debug(
+                            "many-vs-one exact GPU batch failed; "
+                            "falling back to scalar-right helper for this chunk",
+                            exc_info=True,
+                        )
+                        chunk_result = _dispatch_polygon_intersection_overlay_broadcast_right_gpu(
+                            left_chunk,
+                            right_one_oga,
+                            dispatch_mode=gpu_dispatch_mode,
+                            _cached_right_segments=base_right_segments,
+                        )
+                        break
+                    finally:
+                        if (
+                            chunk_cached_segments is not None
+                            and chunk_cached_segments is not base_right_segments
+                        ):
+                            _free_device_segment_table(chunk_cached_segments)
+
+                if chunk_result is None or chunk_result.row_count != left_chunk.row_count:
+                    raise RuntimeError(
+                        "broadcast-right exact GPU helper did not preserve row cardinality"
+                    )
+                chunk_results.append(chunk_result)
+                start = stop
+                maybe_trim_pool_memory()
+            return (
+                chunk_results[0]
+                if len(chunk_results) == 1
+                else OwnedGeometryArray.concat(chunk_results)
             )
         finally:
-            if cached_right_segments is not None:
+            if base_right_segments is not None:
                 try:
-                    from vibespatial.constructive.binary_constructive import (
-                        _free_device_segment_table,
-                    )
-
-                    _free_device_segment_table(cached_right_segments)
+                    _free_device_segment_table(base_right_segments)
                 except Exception:
                     logger.debug(
                         "many-vs-one cached right-segment cleanup failed",
@@ -4044,32 +4225,41 @@ def _many_vs_one_intersection_owned(
         """Choose the remainder path based on residency and crossover shape."""
         from vibespatial.runtime.residency import Residency, TransferTrigger
 
+        def _promote_remainder_inputs_to_device(
+            left_input,
+            right_input,
+            *,
+            strict: bool,
+        ):
+            if left_input.residency is not Residency.DEVICE:
+                left_input = left_input.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason=(
+                        "strict many-vs-one remainder promoted left polygons to device"
+                        if strict
+                        else "many-vs-one remainder promoted left polygons to device"
+                    ),
+                )
+            if right_input.residency is not Residency.DEVICE:
+                right_input = right_input.move_to(
+                    Residency.DEVICE,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason=(
+                        "strict many-vs-one remainder promoted clip polygon to device"
+                        if strict
+                        else "many-vs-one remainder promoted clip polygon to device"
+                    ),
+                )
+            return left_input, right_input
+
         if strict_native_mode_enabled():
-            if left_rem_oga.residency is not Residency.DEVICE:
-                try:
-                    left_rem_oga = left_rem_oga.move_to(
-                        Residency.DEVICE,
-                        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                        reason="strict many-vs-one remainder promoted left polygons to device",
-                    )
-                except Exception:
-                    logger.debug(
-                        "strict many-vs-one left promotion failed before device remainder path",
-                        exc_info=True,
-                    )
-            if right_one_oga.residency is not Residency.DEVICE:
-                try:
-                    right_one_oga = right_one_oga.move_to(
-                        Residency.DEVICE,
-                        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                        reason="strict many-vs-one remainder promoted clip polygon to device",
-                    )
-                except Exception:
-                    logger.debug(
-                        "strict many-vs-one right promotion failed before device remainder path",
-                        exc_info=True,
-                    )
             try:
+                left_rem_oga, right_one_oga = _promote_remainder_inputs_to_device(
+                    left_rem_oga,
+                    right_one_oga,
+                    strict=True,
+                )
                 return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
             except Exception:
                 logger.debug(
@@ -4077,45 +4267,44 @@ def _many_vs_one_intersection_owned(
                     "falling back to host crossover policy",
                     exc_info=True,
                 )
-        elif left_rem_oga.residency is Residency.DEVICE:
+        elif (
+            left_rem_oga.residency is Residency.DEVICE
+            or right_one_oga.residency is Residency.DEVICE
+        ):
             try:
+                left_rem_oga, right_one_oga = _promote_remainder_inputs_to_device(
+                    left_rem_oga,
+                    right_one_oga,
+                    strict=False,
+                )
                 return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
             except Exception:
                 logger.debug(
-                    "many-vs-one device remainder path failed; "
+                    "many-vs-one device-resident remainder path failed; "
                     "falling back to host crossover policy",
                     exc_info=True,
                 )
-        if left_rem_oga.row_count >= OVERLAY_GPU_REMAINDER_THRESHOLD:
+        elif has_gpu_runtime() and (
+            left_rem_oga.row_count >= OVERLAY_GPU_REMAINDER_THRESHOLD
+            or (
+                _pairwise_mode is ExecutionMode.GPU
+                and left_rem_oga.row_count > _OVERLAY_ROWWISE_REMAINDER_MAX
+            )
+        ):
             try:
-                left_device = left_rem_oga.move_to(
-                    Residency.DEVICE,
-                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                    reason="many-vs-one remainder promoted left polygons to device",
+                left_rem_oga, right_one_oga = _promote_remainder_inputs_to_device(
+                    left_rem_oga,
+                    right_one_oga,
+                    strict=False,
                 )
-                right_device = right_one_oga.move_to(
-                    Residency.DEVICE,
-                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
-                    reason="many-vs-one remainder promoted clip polygon to device",
-                )
-                return _gpu_remainder_intersection(left_device, right_device)
+                return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
             except Exception:
                 logger.debug(
-                    "many-vs-one remainder device promotion failed; "
-                    "falling back to host crossover policy",
+                    "many-vs-one large remainder GPU path failed after host crossover check; "
+                    "falling back to vectorized Shapely intersection",
                     exc_info=True,
                 )
-        if left_rem_oga.row_count < OVERLAY_GPU_REMAINDER_THRESHOLD:
-            return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
-        try:
-            return _gpu_remainder_intersection(left_rem_oga, right_one_oga)
-        except Exception:
-            logger.debug(
-                "many-vs-one large remainder GPU path failed after host crossover check; "
-                "falling back to vectorized Shapely intersection",
-                exc_info=True,
-            )
-            return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
+        return _shapely_remainder_intersection(left_rem_oga, right_one_oga)
 
     complex_result = None
     if complex_left is not None and complex_global_positions is not None:
@@ -4265,13 +4454,16 @@ def _prepare_many_vs_one_intersection_chunks(
     global_positions: np.ndarray,
 ):
     """Prepare contained/SH chunks and return any complex remainder batch."""
-    from vibespatial.runtime.residency import Residency
+    from vibespatial.runtime.residency import Residency, combined_residency
 
     n_pairs = left_sub.row_count
+    right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
     _pairwise_mode = plan_dispatch_selection(
         kernel_name="overlay_pairwise",
         kernel_class=KernelClass.CONSTRUCTIVE,
         row_count=n_pairs,
+        current_residency=combined_residency(left_sub, right_one),
+        workload_shape=WorkloadShape.BROADCAST_RIGHT,
     )
     _pairwise_mode = (
         ExecutionMode.GPU
@@ -4281,8 +4473,6 @@ def _prepare_many_vs_one_intersection_chunks(
         )
         else _pairwise_mode.selected
     )
-
-    right_one = right_owned.take(np.array([unique_right_idx], dtype=np.intp))
 
     _contained_result = None
     _remainder_mask = None
@@ -5977,9 +6167,18 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                 )
         return df
 
-    # Determine the geometry type before make_valid, as make_valid may change it
+    # Check the source geometry type before make_valid, as make_valid may change it.
     if keep_geom_type:
-        geom_type = df1.geom_type.iloc[0]
+        source_geom_types = df1.geom_type
+        geom_type = source_geom_types.iloc[0]
+        if geom_type == "GeometryCollection":
+            # GeoPandas defines keep_geom_type from df1's leading geometry
+            # family. A leading source-side collection has no single family to
+            # preserve. Later polygonal collections are normalized below.
+            raise TypeError(
+                "keep_geom_type can not be called on a GeoDataFrame with "
+                "GeometryCollection."
+            )
 
     cached_intersection_index_result = None
     if how == "intersection":
@@ -6013,6 +6212,17 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
             dispatch_mode=boundary_make_valid_mode,
             all_polygons=right_all_polygons,
         )
+
+    if keep_geom_type and not left_all_polygons:
+        df1, left_normalized = _normalize_polygonal_collection_input(df1)
+        if left_normalized:
+            left_polygon_mask = _series_polygon_mask(df1.geometry)
+            left_all_polygons = bool(left_polygon_mask.all())
+    if keep_geom_type and not right_all_polygons:
+        df2, right_normalized = _normalize_polygonal_collection_input(df2)
+        if right_normalized:
+            right_polygon_mask = _series_polygon_mask(df2.geometry)
+            right_all_polygons = bool(right_polygon_mask.all())
 
     candidate_pair_count = (
         int(len(cached_intersection_index_result[0]))

@@ -691,6 +691,7 @@ class NativeTabularResult:
         geometry_encoding: str = "WKB",
         interleaved: bool = True,
         include_z: bool | None = None,
+        force_device_geometry_encode: bool = False,
     ):
         from vibespatial.api.io._geoarrow import ArrowTable
         from vibespatial.io.geoarrow import native_tabular_to_arrow
@@ -701,6 +702,7 @@ class NativeTabularResult:
             geometry_encoding=geometry_encoding,
             interleaved=interleaved,
             include_z=include_z,
+            force_device_geometry_encode=force_device_geometry_encode,
         )
         return ArrowTable(table)
 

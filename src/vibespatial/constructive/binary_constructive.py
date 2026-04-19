@@ -97,6 +97,11 @@ _POLYGON_CONTRACTION_MIN_ROWS = 32
 # exact overlay across the aligned batch.
 _MIXED_POLYGON_INTERSECTION_ROWWISE_MAX = 16
 
+# Exact polygon union rescue is intentionally a tiny-batch fallback.  Larger
+# aligned batches must use the batched partition/coverage path so union does
+# not devolve into one topology graph per row.
+_POLYGON_UNION_EXACT_ROW_FALLBACK_MAX = 8
+
 
 def _sync_hotpath() -> None:
     if hotpath_trace_enabled():
@@ -928,7 +933,7 @@ def _dispatch_polygon_overlay_rowwise_gpu(
     if left.row_count != right.row_count:
         return None
 
-    if left.row_count > 1:
+    if left.row_count > 1 and op != "union":
         try:
             batch_result = _dispatch_overlay_gpu(
                 op,
@@ -947,6 +952,14 @@ def _dispatch_polygon_overlay_rowwise_gpu(
                 exc_info=True,
             )
 
+    if op == "union":
+        return _dispatch_polygon_union_repair_gpu(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=_cached_right_segments,
+        )
+
     out_validity = cp.zeros(left.row_count, dtype=cp.bool_)
     out_tags = cp.full(left.row_count, NULL_TAG, dtype=cp.int8)
     out_family_row_offsets = cp.full(left.row_count, -1, dtype=cp.int32)
@@ -961,17 +974,20 @@ def _dispatch_polygon_overlay_rowwise_gpu(
         left_row = left.take(d_row)
         right_row = right.take(d_row)
 
-        sub_result = _dispatch_overlay_gpu(
-            op,
-            left_row,
-            right_row,
-            dispatch_mode=dispatch_mode,
-            # The cached segment table is built for the original aligned
-            # multi-row right operand. Reusing it after right.take([i])
-            # breaks row isolation and can leak full-batch topology into a
-            # single-row overlay subcall.
-            _cached_right_segments=None,
-        )
+        sub_result = None
+
+        if sub_result is None:
+            sub_result = _dispatch_overlay_gpu(
+                op,
+                left_row,
+                right_row,
+                dispatch_mode=dispatch_mode,
+                # The cached segment table is built for the original aligned
+                # multi-row right operand. Reusing it after right.take([i])
+                # breaks row isolation and can leak full-batch topology into a
+                # single-row overlay subcall.
+                _cached_right_segments=None,
+            )
         sub_result = _collapse_polygon_overlay_sub_result(sub_result)
         if sub_result is None:
             logger.debug(
@@ -1553,6 +1569,838 @@ def _assemble_disjoint_polygonal_pieces_gpu(
         family_row_offsets=cp.asarray([0], dtype=cp.int32),
         execution_mode="gpu",
     )
+
+
+def _explode_single_polygon_family_row_to_polygons_gpu(
+    owned: OwnedGeometryArray,
+) -> OwnedGeometryArray | None:
+    """Return polygon rows for a single polygon-family geometry on device."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if owned.row_count != 1 or not bool(owned.validity[0]):
+        return None
+
+    state = owned._ensure_device_state()
+    family = TAG_FAMILIES.get(int(state.tags[0]))
+    if family is GeometryFamily.POLYGON:
+        return owned
+    if family is GeometryFamily.MULTIPOLYGON:
+        exploded, _ = _explode_multipolygon_rows_to_polygons_gpu(owned)
+        return exploded
+    return None
+
+
+def _build_atomic_edges_from_boundary_segments_gpu(
+    start_x: DeviceArray,
+    start_y: DeviceArray,
+    end_x: DeviceArray,
+    end_y: DeviceArray,
+    *,
+    row_indices: DeviceArray | None = None,
+    runtime_selection,
+):
+    """Build atomic half-edges from surviving boundary segments."""
+    from vibespatial.overlay.types import AtomicEdgeDeviceState, AtomicEdgeTable
+
+    boundary_count = int(start_x.size)
+    if boundary_count == 0:
+        return None
+
+    d_segment_ids = cp.arange(boundary_count, dtype=cp.int32)
+    total_atomic = boundary_count * 2
+    d_src_x = cp.empty(total_atomic, dtype=cp.float64)
+    d_src_y = cp.empty(total_atomic, dtype=cp.float64)
+    d_dst_x = cp.empty(total_atomic, dtype=cp.float64)
+    d_dst_y = cp.empty(total_atomic, dtype=cp.float64)
+    d_source_ids = cp.empty(total_atomic, dtype=cp.int32)
+    d_direction = cp.empty(total_atomic, dtype=cp.int8)
+    if row_indices is None:
+        d_row_indices = cp.zeros(total_atomic, dtype=cp.int32)
+    else:
+        d_boundary_rows = cp.asarray(row_indices, dtype=cp.int32)
+        if int(d_boundary_rows.size) != boundary_count:
+            raise ValueError("boundary row index count must match segment count")
+        d_row_indices = cp.empty(total_atomic, dtype=cp.int32)
+        d_row_indices[0::2] = d_boundary_rows
+        d_row_indices[1::2] = d_boundary_rows
+    d_part_indices = cp.zeros(total_atomic, dtype=cp.int32)
+    d_ring_indices = cp.empty(total_atomic, dtype=cp.int32)
+    d_source_side = cp.ones(total_atomic, dtype=cp.int8)
+
+    d_src_x[0::2] = start_x
+    d_src_x[1::2] = end_x
+    d_src_y[0::2] = start_y
+    d_src_y[1::2] = end_y
+    d_dst_x[0::2] = end_x
+    d_dst_x[1::2] = start_x
+    d_dst_y[0::2] = end_y
+    d_dst_y[1::2] = start_y
+    d_source_ids[0::2] = d_segment_ids
+    d_source_ids[1::2] = d_segment_ids
+    d_direction[0::2] = 1
+    d_direction[1::2] = -1
+    d_ring_indices[0::2] = d_segment_ids
+    d_ring_indices[1::2] = d_segment_ids
+
+    return AtomicEdgeTable(
+        left_segment_count=boundary_count,
+        right_segment_count=0,
+        runtime_selection=runtime_selection,
+        device_state=AtomicEdgeDeviceState(
+            source_segment_ids=d_source_ids,
+            direction=d_direction,
+            src_x=d_src_x,
+            src_y=d_src_y,
+            dst_x=d_dst_x,
+            dst_y=d_dst_y,
+            row_indices=d_row_indices,
+            part_indices=d_part_indices,
+            ring_indices=d_ring_indices,
+            source_side=d_source_side,
+        ),
+        _count=total_atomic,
+    )
+
+
+def _explode_polygonal_rows_to_polygons_gpu(
+    owned: OwnedGeometryArray,
+) -> tuple[OwnedGeometryArray, DeviceArray] | None:
+    """Explode polygon-family rows to polygon rows and keep source row ids."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    state = owned._ensure_device_state()
+    polygon_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    multipolygon_tag = FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+    valid_polygon_rows = cp.flatnonzero(
+        state.validity & (state.tags == polygon_tag)
+    ).astype(cp.int64, copy=False)
+    valid_multipolygon_rows = cp.flatnonzero(
+        state.validity & (state.tags == multipolygon_tag)
+    ).astype(cp.int64, copy=False)
+
+    polygon_parts: list[OwnedGeometryArray] = []
+    source_rows: list[DeviceArray] = []
+
+    if int(valid_polygon_rows.size) > 0:
+        polygon_parts.append(owned.take(valid_polygon_rows))
+        source_rows.append(valid_polygon_rows.astype(cp.int32, copy=False))
+
+    if int(valid_multipolygon_rows.size) > 0:
+        multipolygon_rows = owned.take(valid_multipolygon_rows)
+        exploded, local_source_rows = _explode_multipolygon_rows_to_polygons_gpu(
+            multipolygon_rows,
+        )
+        if exploded.row_count > 0:
+            polygon_parts.append(exploded)
+            source_rows.append(
+                valid_multipolygon_rows[
+                    cp.asarray(local_source_rows, dtype=cp.int64)
+                ].astype(cp.int32, copy=False)
+            )
+
+    if not polygon_parts:
+        return None
+    if len(polygon_parts) == 1:
+        return polygon_parts[0], source_rows[0]
+    return OwnedGeometryArray.concat(polygon_parts), cp.concatenate(source_rows)
+
+
+def _dispatch_row_aligned_polygon_known_coverage_union_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Coverage-union aligned polygon rows in one row-isolated GPU graph."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count or left.row_count == 0:
+        return None
+    if not (
+        bool(cp.all(left._ensure_device_state().validity).item())
+        and bool(cp.all(right._ensure_device_state().validity).item())
+    ):
+        return None
+
+    from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
+    from vibespatial.overlay.graph import _gpu_face_walk, build_gpu_half_edge_graph
+    from vibespatial.overlay.types import OverlayFaceDeviceState, OverlayFaceTable
+
+    left_exploded = _explode_polygonal_rows_to_polygons_gpu(left)
+    right_exploded = _explode_polygonal_rows_to_polygons_gpu(right)
+    if left_exploded is None or right_exploded is None:
+        return None
+    left_polygons, left_source_rows = left_exploded
+    right_polygons, right_source_rows = right_exploded
+    if left_polygons.row_count == 0 or right_polygons.row_count == 0:
+        return None
+
+    left_state = left_polygons._ensure_device_state()
+    right_state = right_polygons._ensure_device_state()
+    left_buffer = left_state.families.get(GeometryFamily.POLYGON)
+    right_buffer = right_state.families.get(GeometryFamily.POLYGON)
+    if left_buffer is None or right_buffer is None:
+        return None
+
+    merged = _concat_device_family_buffers(
+        GeometryFamily.POLYGON,
+        [left_buffer, right_buffer],
+    )
+    polygon_source_rows = cp.concatenate(
+        [
+            cp.asarray(left_source_rows, dtype=cp.int32),
+            cp.asarray(right_source_rows, dtype=cp.int32),
+        ]
+    )
+    d_x = cp.asarray(merged.x)
+    d_y = cp.asarray(merged.y)
+    d_geometry_offsets = cp.asarray(merged.geometry_offsets, dtype=cp.int64)
+    d_ring_offsets = cp.asarray(merged.ring_offsets, dtype=cp.int64)
+    if int(d_geometry_offsets.size) < 2 or int(d_ring_offsets.size) < 2 or int(d_x.size) < 2:
+        return None
+
+    d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
+    d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int64, copy=False)
+    total_segments = int(cp.sum(d_seg_counts).item())
+    if total_segments == 0:
+        return None
+
+    d_seg_offsets = cp.empty(int(d_seg_counts.size) + 1, dtype=cp.int64)
+    d_seg_offsets[0] = 0
+    cp.cumsum(d_seg_counts, out=d_seg_offsets[1:])
+    d_seg_ids = cp.arange(total_segments, dtype=cp.int64)
+    d_ring_of_seg = cp.searchsorted(
+        d_seg_offsets[1:],
+        d_seg_ids,
+        side="right",
+    ).astype(cp.int64, copy=False)
+    d_polygon_of_ring = cp.searchsorted(
+        d_geometry_offsets[1:],
+        d_ring_of_seg,
+        side="right",
+    ).astype(cp.int64, copy=False)
+    d_segment_rows = polygon_source_rows[d_polygon_of_ring]
+    d_local_seg = d_seg_ids - d_seg_offsets[d_ring_of_seg]
+    d_vertex_ids = d_ring_offsets[d_ring_of_seg] + d_local_seg
+
+    start_x = d_x[d_vertex_ids]
+    start_y = d_y[d_vertex_ids]
+    end_x = d_x[d_vertex_ids + 1]
+    end_y = d_y[d_vertex_ids + 1]
+
+    swap = (
+        (start_x > end_x)
+        | ((start_x == end_x) & (start_y > end_y))
+    )
+    key_x0 = cp.where(swap, end_x, start_x)
+    key_y0 = cp.where(swap, end_y, start_y)
+    key_x1 = cp.where(swap, start_x, end_x)
+    key_y1 = cp.where(swap, start_y, end_y)
+
+    order = cp.lexsort(
+        cp.stack((key_y1, key_x1, key_y0, key_x0, d_segment_rows))
+    ).astype(cp.int64, copy=False)
+    if int(order.size) == 0:
+        return None
+    sorted_rows = d_segment_rows[order]
+    sorted_x0 = key_x0[order]
+    sorted_y0 = key_y0[order]
+    sorted_x1 = key_x1[order]
+    sorted_y1 = key_y1[order]
+    start_mask = cp.empty(int(order.size), dtype=cp.bool_)
+    start_mask[0] = True
+    if int(order.size) > 1:
+        start_mask[1:] = (
+            (sorted_rows[1:] != sorted_rows[:-1])
+            | (sorted_x0[1:] != sorted_x0[:-1])
+            | (sorted_y0[1:] != sorted_y0[:-1])
+            | (sorted_x1[1:] != sorted_x1[:-1])
+            | (sorted_y1[1:] != sorted_y1[:-1])
+        )
+    run_starts = cp.flatnonzero(start_mask).astype(cp.int64, copy=False)
+    run_lengths = cp.diff(
+        cp.concatenate((run_starts, cp.asarray([int(order.size)], dtype=cp.int64)))
+    )
+    boundary_orders = order[run_starts[run_lengths % 2 == 1]]
+    if int(boundary_orders.size) == 0:
+        return None
+
+    selection = plan_dispatch_selection(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=left.row_count,
+        requested_mode=dispatch_mode,
+        requested_precision=PrecisionMode.AUTO,
+        current_residency=combined_residency(left, right),
+    )
+    atomic_edges = _build_atomic_edges_from_boundary_segments_gpu(
+        start_x[boundary_orders],
+        start_y[boundary_orders],
+        end_x[boundary_orders],
+        end_y[boundary_orders],
+        row_indices=d_segment_rows[boundary_orders],
+        runtime_selection=selection.runtime_selection,
+    )
+    if atomic_edges is None:
+        return None
+
+    half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=True)
+    if half_edge_graph.edge_count == 0:
+        return None
+
+    (
+        face_offsets,
+        face_edge_ids,
+        bounded_mask,
+        signed_area,
+        centroid_x,
+        centroid_y,
+        label_x,
+        label_y,
+        face_count,
+    ) = _gpu_face_walk(half_edge_graph)
+    if face_count == 0:
+        return None
+
+    selected_face_indices = cp.flatnonzero(
+        (bounded_mask != 0) & (signed_area > 0)
+    ).astype(cp.int32, copy=False)
+    if int(selected_face_indices.size) == 0:
+        return None
+
+    faces = OverlayFaceTable(
+        runtime_selection=selection.runtime_selection,
+        _face_count=face_count,
+        device_state=OverlayFaceDeviceState(
+            face_offsets=face_offsets,
+            face_edge_ids=face_edge_ids,
+            bounded_mask=bounded_mask,
+            signed_area=signed_area,
+            centroid_x=centroid_x,
+            centroid_y=centroid_y,
+            left_covered=cp.ones(face_count, dtype=cp.int8),
+            right_covered=cp.zeros(face_count, dtype=cp.int8),
+        ),
+    )
+    result = _build_polygon_output_from_faces_gpu(
+        half_edge_graph,
+        faces,
+        selected_face_indices,
+        preserve_row_count=left.row_count,
+    )
+    if result is None or result.row_count != left.row_count:
+        return None
+    return result
+
+
+def _dispatch_single_row_polygon_known_coverage_union_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Exact GPU union for a known coverage pair of single-row polygon inputs."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count or left.row_count != 1:
+        return None
+    if not (bool(left.validity[0]) and bool(right.validity[0])):
+        return None
+
+    from vibespatial.overlay.assemble import _build_polygon_output_from_faces_gpu
+    from vibespatial.overlay.graph import _gpu_face_walk, build_gpu_half_edge_graph
+    from vibespatial.overlay.types import OverlayFaceDeviceState, OverlayFaceTable
+
+    left_polygons = _explode_single_polygon_family_row_to_polygons_gpu(left)
+    right_polygons = _explode_single_polygon_family_row_to_polygons_gpu(right)
+    if (
+        left_polygons is None
+        or right_polygons is None
+        or left_polygons.row_count == 0
+        or right_polygons.row_count == 0
+    ):
+        return None
+
+    left_state = left_polygons._ensure_device_state()
+    right_state = right_polygons._ensure_device_state()
+    left_buffer = left_state.families.get(GeometryFamily.POLYGON)
+    right_buffer = right_state.families.get(GeometryFamily.POLYGON)
+    if left_buffer is None or right_buffer is None:
+        return None
+
+    merged = _concat_device_family_buffers(
+        GeometryFamily.POLYGON,
+        [left_buffer, right_buffer],
+    )
+    d_x = cp.asarray(merged.x)
+    d_y = cp.asarray(merged.y)
+    d_ring_offsets = cp.asarray(merged.ring_offsets, dtype=cp.int64)
+    if int(d_ring_offsets.size) < 2 or int(d_x.size) < 2:
+        return None
+
+    d_ring_sizes = d_ring_offsets[1:] - d_ring_offsets[:-1]
+    d_seg_counts = cp.maximum(d_ring_sizes - 1, 0).astype(cp.int64, copy=False)
+    total_segments = int(cp.sum(d_seg_counts).item())
+    if total_segments == 0:
+        return None
+
+    d_seg_offsets = cp.empty(int(d_seg_counts.size) + 1, dtype=cp.int64)
+    d_seg_offsets[0] = 0
+    cp.cumsum(d_seg_counts, out=d_seg_offsets[1:])
+    d_seg_ids = cp.arange(total_segments, dtype=cp.int64)
+    d_ring_of_seg = cp.searchsorted(
+        d_seg_offsets[1:],
+        d_seg_ids,
+        side="right",
+    ).astype(cp.int64, copy=False)
+    d_local_seg = d_seg_ids - d_seg_offsets[d_ring_of_seg]
+    d_vertex_ids = d_ring_offsets[d_ring_of_seg] + d_local_seg
+
+    start_x = d_x[d_vertex_ids]
+    start_y = d_y[d_vertex_ids]
+    end_x = d_x[d_vertex_ids + 1]
+    end_y = d_y[d_vertex_ids + 1]
+
+    swap = (
+        (start_x > end_x)
+        | ((start_x == end_x) & (start_y > end_y))
+    )
+    key_x0 = cp.where(swap, end_x, start_x)
+    key_y0 = cp.where(swap, end_y, start_y)
+    key_x1 = cp.where(swap, start_x, end_x)
+    key_y1 = cp.where(swap, start_y, end_y)
+
+    order = cp.lexsort(
+        cp.stack((key_y1, key_x1, key_y0, key_x0))
+    ).astype(cp.int64, copy=False)
+    if int(order.size) == 0:
+        return None
+    sorted_x0 = key_x0[order]
+    sorted_y0 = key_y0[order]
+    sorted_x1 = key_x1[order]
+    sorted_y1 = key_y1[order]
+    start_mask = cp.empty(int(order.size), dtype=cp.bool_)
+    start_mask[0] = True
+    if int(order.size) > 1:
+        start_mask[1:] = (
+            (sorted_x0[1:] != sorted_x0[:-1])
+            | (sorted_y0[1:] != sorted_y0[:-1])
+            | (sorted_x1[1:] != sorted_x1[:-1])
+            | (sorted_y1[1:] != sorted_y1[:-1])
+        )
+    run_starts = cp.flatnonzero(start_mask).astype(cp.int64, copy=False)
+    run_lengths = cp.diff(
+        cp.concatenate((run_starts, cp.asarray([int(order.size)], dtype=cp.int64)))
+    )
+    boundary_orders = order[run_starts[run_lengths % 2 == 1]]
+    if int(boundary_orders.size) == 0:
+        return None
+
+    selection = plan_dispatch_selection(
+        kernel_name="binary_constructive",
+        kernel_class=KernelClass.CONSTRUCTIVE,
+        row_count=1,
+        requested_mode=dispatch_mode,
+        requested_precision=PrecisionMode.AUTO,
+        current_residency=combined_residency(left, right),
+    )
+    atomic_edges = _build_atomic_edges_from_boundary_segments_gpu(
+        start_x[boundary_orders],
+        start_y[boundary_orders],
+        end_x[boundary_orders],
+        end_y[boundary_orders],
+        runtime_selection=selection.runtime_selection,
+    )
+    if atomic_edges is None:
+        return None
+
+    half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
+    if half_edge_graph.edge_count == 0:
+        return None
+
+    (
+        face_offsets,
+        face_edge_ids,
+        bounded_mask,
+        signed_area,
+        centroid_x,
+        centroid_y,
+        label_x,
+        label_y,
+        face_count,
+    ) = _gpu_face_walk(half_edge_graph)
+    if face_count == 0:
+        return None
+
+    selected_face_indices = cp.flatnonzero(
+        (bounded_mask != 0) & (signed_area > 0)
+    ).astype(cp.int32, copy=False)
+    if int(selected_face_indices.size) == 0:
+        return None
+
+    faces = OverlayFaceTable(
+        runtime_selection=selection.runtime_selection,
+        _face_count=face_count,
+        device_state=OverlayFaceDeviceState(
+            face_offsets=face_offsets,
+            face_edge_ids=face_edge_ids,
+            bounded_mask=bounded_mask,
+            signed_area=signed_area,
+            centroid_x=centroid_x,
+            centroid_y=centroid_y,
+            left_covered=cp.ones(face_count, dtype=cp.int8),
+            right_covered=cp.zeros(face_count, dtype=cp.int8),
+        ),
+    )
+    result = _build_polygon_output_from_faces_gpu(
+        half_edge_graph,
+        faces,
+        selected_face_indices,
+        preserve_row_count=1,
+    )
+    if result is None or result.row_count != 1:
+        return None
+    return result
+
+
+def _dispatch_single_row_polygon_partition_union_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Exact GPU union for overlapping single-row polygon-family pairs.
+
+    Build one exact overlay plan, materialize the exact partition pieces
+    ``left - right``, ``left ∩ right``, and ``right - left`` from that same
+    topology, then coverage-merge those pieces on GPU. This avoids the
+    currently broken direct union face-selection path while keeping the
+    constructive result device-resident end to end.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count or left.row_count != 1:
+        return None
+    if not (bool(left.validity[0]) and bool(right.validity[0])):
+        return None
+
+    from vibespatial.overlay.gpu import (
+        _build_overlay_execution_plan,
+        _materialize_overlay_execution_plan,
+    )
+
+    plan = _build_overlay_execution_plan(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    try:
+        left_only, _ = _materialize_overlay_execution_plan(
+            plan,
+            operation="difference",
+            requested=ExecutionMode.GPU,
+            preserve_row_count=1,
+        )
+        overlap, _ = _materialize_overlay_execution_plan(
+            plan,
+            operation="intersection",
+            requested=ExecutionMode.GPU,
+            preserve_row_count=1,
+        )
+        right_only, _ = _materialize_overlay_execution_plan(
+            plan,
+            operation="right_difference",
+            requested=ExecutionMode.GPU,
+            preserve_row_count=1,
+        )
+    finally:
+        del plan
+
+    if (
+        left_only.row_count != 1
+        or overlap.row_count != 1
+        or right_only.row_count != 1
+    ):
+        return None
+
+    piece_candidates = [piece for piece in (left_only, overlap, right_only) if bool(piece.validity[0])]
+    if not piece_candidates:
+        return _empty_device_constructive_output(1)
+    if len(piece_candidates) == 1:
+        return piece_candidates[0]
+
+    if not all(_is_polygon_only(piece) for piece in piece_candidates):
+        return None
+
+    merged = piece_candidates[0]
+    for next_piece in piece_candidates[1:]:
+        merged = _dispatch_single_row_polygon_known_coverage_union_gpu(
+            merged,
+            next_piece,
+            dispatch_mode=dispatch_mode,
+        )
+        if merged is None or merged.row_count != 1:
+            return None
+        if not bool(merged.validity[0]):
+            return next_piece
+        if not _is_polygon_only(merged):
+            return None
+
+    return merged
+
+
+def _dispatch_single_row_polygon_union_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Exact single-row polygon union, preferring the dedicated GPU plans."""
+    candidates = (
+        lambda: _dispatch_single_row_polygon_partition_union_gpu(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+        ),
+        lambda: _dispatch_multipolygon_polygon_union_gpu(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+        ),
+    )
+    for dispatch in candidates:
+        dispatched = dispatch()
+        if dispatched is None:
+            continue
+        sub_result = _collapse_polygon_overlay_sub_result(dispatched)
+        if sub_result is None or sub_result.row_count != 1:
+            continue
+        sub_state = sub_result._ensure_device_state()
+        if not bool(sub_state.validity[0]):
+            continue
+        return sub_result
+    logger.debug("single-row polygon union could not find a valid GPU result")
+    return None
+
+
+def _dispatch_polygon_union_repair_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+    _cached_right_segments: DeviceSegmentTable | None = None,
+) -> OwnedGeometryArray | None:
+    """Union aligned polygon rows via batched exact partition plans."""
+
+    try:
+        batched = _dispatch_polygon_partition_union_gpu(
+            left,
+            right,
+            dispatch_mode=dispatch_mode,
+        )
+        if batched is not None and batched.row_count == left.row_count:
+            return batched
+    except Exception:
+        logger.debug(
+            "batched exact polygon union path failed",
+            exc_info=True,
+        )
+
+    if left.row_count <= _POLYGON_UNION_EXACT_ROW_FALLBACK_MAX:
+        try:
+            exact_rows = np.arange(left.row_count, dtype=np.int64)
+            return _dispatch_exact_rowwise_polygon_union_rows_gpu(
+                left,
+                right,
+                exact_rows,
+                dispatch_mode=dispatch_mode,
+            )
+        except Exception:
+            logger.debug(
+                "tiny exact rowwise polygon union fallback failed",
+                exc_info=True,
+            )
+    return None
+
+
+def _merge_row_aligned_polygon_piece_batches_gpu(
+    left_piece: OwnedGeometryArray,
+    right_piece: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Union two row-aligned exact piece batches without leaving the device."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left_piece.row_count != right_piece.row_count:
+        return None
+
+    left_valid = np.asarray(left_piece.validity, dtype=bool)
+    right_valid = np.asarray(right_piece.validity, dtype=bool)
+    out = _empty_device_constructive_output(left_piece.row_count)
+
+    both_rows = np.flatnonzero(left_valid & right_valid).astype(np.int64, copy=False)
+    left_only_rows = np.flatnonzero(left_valid & ~right_valid).astype(np.int64, copy=False)
+    right_only_rows = np.flatnonzero(~left_valid & right_valid).astype(np.int64, copy=False)
+
+    if both_rows.size > 0:
+        merged = _dispatch_row_aligned_polygon_known_coverage_union_gpu(
+            left_piece.take(both_rows),
+            right_piece.take(both_rows),
+            dispatch_mode=dispatch_mode,
+        )
+        if merged is None or merged.row_count != both_rows.size:
+            return None
+        out = device_concat_owned_scatter(out, merged, cp.asarray(both_rows, dtype=cp.int64))
+    if left_only_rows.size > 0:
+        out = device_concat_owned_scatter(
+            out,
+            left_piece.take(left_only_rows),
+            cp.asarray(left_only_rows, dtype=cp.int64),
+        )
+    if right_only_rows.size > 0:
+        out = device_concat_owned_scatter(
+            out,
+            right_piece.take(right_only_rows),
+            cp.asarray(right_only_rows, dtype=cp.int64),
+        )
+    return out
+
+
+def _dispatch_exact_rowwise_polygon_union_rows_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    row_indices: np.ndarray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Recompute selected polygon union rows exactly on GPU."""
+    row_indices = np.asarray(row_indices, dtype=np.int64)
+    if row_indices.size == 0:
+        return _empty_device_constructive_output(0)
+
+    if row_indices.size == left.row_count:
+        row_results: list[OwnedGeometryArray] = []
+        for row_index in row_indices.tolist():
+            if not (bool(left.validity[row_index]) and bool(right.validity[row_index])):
+                return None
+            d_row = cp.asarray([row_index], dtype=cp.int64)
+            sub_result = _dispatch_single_row_polygon_union_gpu(
+                left.take(d_row),
+                right.take(d_row),
+                dispatch_mode=dispatch_mode,
+            )
+            if sub_result is None:
+                return None
+            row_results.append(sub_result)
+        return OwnedGeometryArray.concat(row_results)
+
+    replacement_rows: list[OwnedGeometryArray] = []
+    for row_index in row_indices.tolist():
+        if not (bool(left.validity[row_index]) and bool(right.validity[row_index])):
+            return None
+        d_row = cp.asarray([row_index], dtype=cp.int64)
+        sub_result = _dispatch_single_row_polygon_union_gpu(
+            left.take(d_row),
+            right.take(d_row),
+            dispatch_mode=dispatch_mode,
+        )
+        if sub_result is None:
+            return None
+        replacement_rows.append(sub_result)
+    return OwnedGeometryArray.concat(replacement_rows)
+
+
+def _dispatch_polygon_partition_union_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Exact row-aligned polygon union using one batched partition plan."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count:
+        return None
+    if left.row_count == 0:
+        return _empty_device_constructive_output(0)
+
+    left_valid = np.asarray(left.validity, dtype=bool)
+    right_valid = np.asarray(right.validity, dtype=bool)
+    both_rows = np.flatnonzero(left_valid & right_valid).astype(np.int64, copy=False)
+    left_only_rows = np.flatnonzero(left_valid & ~right_valid).astype(np.int64, copy=False)
+    right_only_rows = np.flatnonzero(~left_valid & right_valid).astype(np.int64, copy=False)
+
+    out = _empty_device_constructive_output(left.row_count)
+    if both_rows.size > 0:
+        from vibespatial.overlay.gpu import (
+            _build_overlay_execution_plan,
+            _materialize_overlay_execution_plan,
+        )
+
+        sub_left = left.take(both_rows)
+        sub_right = right.take(both_rows)
+        plan = _build_overlay_execution_plan(
+            sub_left,
+            sub_right,
+            dispatch_mode=ExecutionMode.GPU,
+            _row_isolated=True,
+        )
+        try:
+            left_only, _ = _materialize_overlay_execution_plan(
+                plan,
+                operation="difference",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=sub_left.row_count,
+            )
+            overlap, _ = _materialize_overlay_execution_plan(
+                plan,
+                operation="intersection",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=sub_left.row_count,
+            )
+            right_only, _ = _materialize_overlay_execution_plan(
+                plan,
+                operation="right_difference",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=sub_left.row_count,
+            )
+        finally:
+            del plan
+
+        merged = _merge_row_aligned_polygon_piece_batches_gpu(
+            left_only,
+            overlap,
+            dispatch_mode=dispatch_mode,
+        )
+        if merged is None or merged.row_count != sub_left.row_count:
+            return None
+        merged = _merge_row_aligned_polygon_piece_batches_gpu(
+            merged,
+            right_only,
+            dispatch_mode=dispatch_mode,
+        )
+        if merged is None or merged.row_count != sub_left.row_count:
+            return None
+        out = device_concat_owned_scatter(
+            out,
+            merged,
+            cp.asarray(both_rows, dtype=cp.int64),
+        )
+
+    if left_only_rows.size > 0:
+        out = device_concat_owned_scatter(
+            out,
+            left.take(left_only_rows),
+            cp.asarray(left_only_rows, dtype=cp.int64),
+        )
+    if right_only_rows.size > 0:
+        out = device_concat_owned_scatter(
+            out,
+            right.take(right_only_rows),
+            cp.asarray(right_only_rows, dtype=cp.int64),
+        )
+    return out
 
 
 def _dispatch_multipolygon_polygon_union_gpu(
@@ -2298,6 +3146,19 @@ def _binary_constructive_gpu(
     if _is_polygon_only(left) and _is_polygon_only(right):
         if op == "union":
             try:
+                exact_partition_union = _dispatch_single_row_polygon_partition_union_gpu(
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                )
+                if exact_partition_union is not None and exact_partition_union.row_count == left.row_count:
+                    return exact_partition_union
+            except Exception:
+                logger.debug(
+                    "single-row polygon partition union GPU rescue failed",
+                    exc_info=True,
+                )
+            try:
                 multipart_union = _dispatch_multipolygon_polygon_union_gpu(
                     left,
                     right,
@@ -2570,7 +3431,10 @@ def _binary_constructive_gpu(
                     exc_info=True,
                 )
 
-        # Fall through to the general overlay pipeline for union,
+        if op == "union":
+            return None
+
+        # Fall through to the general overlay pipeline for
         # symmetric_difference, or when direct kernels fail.
         try:
             result = _dispatch_overlay_gpu(
