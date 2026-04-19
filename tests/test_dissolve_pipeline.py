@@ -292,7 +292,7 @@ def test_public_dissolve_matches_public_union_all_component_order_for_nybb_fixtu
     assert shapely.to_wkb(dissolved.loc[5, "myshapes"]) == shapely.to_wkb(expected)
 
 
-def test_evaluate_geopandas_dissolve_rewrites_buffered_line_unary_to_disjoint_subset() -> None:
+def test_evaluate_geopandas_dissolve_routes_small_buffered_line_unary_to_exact_cpu_rescue() -> None:
     frame = geopandas.GeoDataFrame(
         {
             "group": np.zeros(64, dtype=np.int32),
@@ -308,6 +308,7 @@ def test_evaluate_geopandas_dissolve_rewrites_buffered_line_unary_to_disjoint_su
     buffered["geometry"] = buffered.geometry.buffer(0.5)
 
     clear_rewrite_events()
+    geopandas.clear_fallback_events()
     actual = evaluate_geopandas_dissolve(
         buffered,
         by="group",
@@ -322,6 +323,7 @@ def test_evaluate_geopandas_dissolve_rewrites_buffered_line_unary_to_disjoint_su
         agg_kwargs={},
     )
     rewrite_events = get_rewrite_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
 
     expected = evaluate_geopandas_dissolve(
         buffered,
@@ -337,9 +339,14 @@ def test_evaluate_geopandas_dissolve_rewrites_buffered_line_unary_to_disjoint_su
         agg_kwargs={},
     )
 
-    assert any(
+    assert not any(
         event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
         for event in rewrite_events
+    )
+    assert any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        for event in fallback_events
     )
     actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
     expected_geom = np.asarray(expected.geometry.array, dtype=object)[0]
@@ -649,6 +656,7 @@ def test_evaluate_geopandas_dissolve_does_not_rewrite_polygon_buffer_unary() -> 
     )
 
 
+@pytest.mark.gpu
 def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
     lines = [
         LineString([(float(i), 0.0), (float(i), 10.0)])
@@ -674,6 +682,7 @@ def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
     assert getattr(buffered.geometry.values, "_provenance", None) is not None
 
     clear_rewrite_events()
+    geopandas.clear_fallback_events()
     result = evaluate_geopandas_dissolve(
         buffered,
         by="group",
@@ -688,17 +697,25 @@ def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
         agg_kwargs={},
     )
     rewrite_events = get_rewrite_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
 
     assert len(result) == 1
     assert isinstance(result.geometry.values, DeviceGeometryArray)
     assert getattr(result.geometry.values, "_owned", None) is not None
+    assert any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        and event.d2h_transfer
+        for event in fallback_events
+    )
     assert not any(
         event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
         for event in rewrite_events
     )
 
 
-def test_device_backed_buffered_line_dissolve_strict_native_skips_host_rewrite() -> None:
+@pytest.mark.gpu
+def test_device_backed_buffered_line_dissolve_strict_native_rejects_cpu_rescue() -> None:
     lines = [
         LineString([(float(i), 0.0), (float(i), 10.0)])
         for i in range(64)
@@ -724,31 +741,30 @@ def test_device_backed_buffered_line_dissolve_strict_native_skips_host_rewrite()
 
     clear_rewrite_events()
     with strict_native_environment():
-        result = evaluate_geopandas_dissolve(
-            buffered,
-            by="group",
-            aggfunc="first",
-            as_index=True,
-            level=None,
-            sort=True,
-            observed=False,
-            dropna=True,
-            method="unary",
-            grid_size=None,
-            agg_kwargs={},
-        )
+        with pytest.raises(StrictNativeFallbackError):
+            evaluate_geopandas_dissolve(
+                buffered,
+                by="group",
+                aggfunc="first",
+                as_index=True,
+                level=None,
+                sort=True,
+                observed=False,
+                dropna=True,
+                method="unary",
+                grid_size=None,
+                agg_kwargs={},
+            )
     rewrite_events = get_rewrite_events(clear=True)
 
-    assert len(result) == 1
-    assert isinstance(result.geometry.values, DeviceGeometryArray)
-    assert getattr(result.geometry.values, "_owned", None) is not None
     assert not any(
         event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
         for event in rewrite_events
     )
 
 
-def test_device_backed_multivertex_buffered_line_dissolve_rewrites_to_disjoint_subset() -> None:
+@pytest.mark.gpu
+def test_device_backed_multivertex_buffered_line_dissolve_uses_exact_cpu_rescue() -> None:
     lines = [
         LineString(
             [
@@ -779,6 +795,7 @@ def test_device_backed_multivertex_buffered_line_dissolve_rewrites_to_disjoint_s
     buffered["geometry"] = buffered.geometry.buffer(0.5)
 
     clear_rewrite_events()
+    geopandas.clear_fallback_events()
     result = evaluate_geopandas_dissolve(
         buffered,
         by="group",
@@ -793,10 +810,17 @@ def test_device_backed_multivertex_buffered_line_dissolve_rewrites_to_disjoint_s
         agg_kwargs={},
     )
     rewrite_events = get_rewrite_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
 
-    assert any(
+    assert not any(
         event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
         for event in rewrite_events
+    )
+    assert any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        and event.d2h_transfer
+        for event in fallback_events
     )
     actual_geom = np.asarray(result.geometry.array, dtype=object)[0]
     expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))

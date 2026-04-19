@@ -4282,6 +4282,11 @@ def test_overlay_intersection_many_vs_one_large_remainder_uses_cached_right_segm
         "_OVERLAY_ROWWISE_REMAINDER_MAX",
         16,
     )
+    monkeypatch.setattr(
+        overlay_module,
+        "_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX",
+        16,
+    )
 
     def _wrapped_overlay(left_arg, right_arg, **kwargs):
         overlay_calls.append(
@@ -4343,6 +4348,11 @@ def test_overlay_intersection_many_vs_one_large_host_remainder_promotes_to_devic
     monkeypatch.setattr(
         overlay_module,
         "_OVERLAY_ROWWISE_REMAINDER_MAX",
+        16,
+    )
+    monkeypatch.setattr(
+        overlay_module,
+        "_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX",
         16,
     )
     monkeypatch.setattr(
@@ -4427,6 +4437,7 @@ def test_overlay_intersection_many_vs_one_large_remainder_chunks_exact_gpu_batch
         ),
     )
     monkeypatch.setattr(overlay_module, "_OVERLAY_ROWWISE_REMAINDER_MAX", 0)
+    monkeypatch.setattr(overlay_module, "_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX", 0)
     monkeypatch.setattr(
         overlay_module,
         "_OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES",
@@ -4499,6 +4510,7 @@ def test_overlay_intersection_many_vs_one_large_remainder_retries_smaller_gpu_ba
         ),
     )
     monkeypatch.setattr(overlay_module, "_OVERLAY_ROWWISE_REMAINDER_MAX", 0)
+    monkeypatch.setattr(overlay_module, "_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX", 0)
     monkeypatch.setattr(
         overlay_module,
         "_OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES",

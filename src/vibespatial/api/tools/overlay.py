@@ -52,7 +52,7 @@ _OVERLAY_FEW_RIGHT_GROUP_MAX = 64
 _OVERLAY_FEW_RIGHT_GROUP_MIN_AVG = 8.0
 _OVERLAY_FEW_RIGHT_CACHED_SEG_MIN_ROWS = 256
 _OVERLAY_ROWWISE_REMAINDER_MAX = 32
-_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX = 128
+_OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX = 2_048
 _OVERLAY_BROADCAST_RIGHT_EXACT_TARGET_SEGMENT_BYTES = 512 * 1024 * 1024
 _OVERLAY_BROADCAST_RIGHT_EXACT_MIN_CHUNK_ROWS = 128
 _OVERLAY_HOST_EXACT_PAIR_BATCH_MAX_ROWS = 128
@@ -4090,6 +4090,7 @@ def _many_vs_one_intersection_owned(
         from vibespatial.constructive.binary_constructive import (
             _broadcast_right_cached_segments,
             _dispatch_polygon_intersection_overlay_broadcast_right_gpu,
+            _dispatch_polygon_intersection_overlay_rowwise_gpu,
             _free_device_segment_table,
         )
         from vibespatial.cuda._runtime import maybe_trim_pool_memory
@@ -4116,6 +4117,37 @@ def _many_vs_one_intersection_owned(
                     and broadcast_result.row_count == left_rem_oga.row_count
                 ):
                     return broadcast_result
+
+            if left_rem_oga.row_count <= _OVERLAY_MEDIUM_REMAINDER_ROWWISE_MAX:
+                cached_right_segments = None
+                try:
+                    cached_right_segments = _broadcast_right_cached_segments(
+                        right_one_oga,
+                        left_rem_oga.row_count,
+                    )
+                    right_rep = materialize_broadcast(
+                        tile_single_row(right_one_oga, left_rem_oga.row_count)
+                    )
+                    rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+                        left_rem_oga,
+                        right_rep,
+                        dispatch_mode=gpu_dispatch_mode,
+                        _cached_right_segments=cached_right_segments,
+                    )
+                    if (
+                        rowwise_result is not None
+                        and rowwise_result.row_count == left_rem_oga.row_count
+                    ):
+                        return rowwise_result
+                except Exception:
+                    logger.debug(
+                        "many-vs-one medium exact rowwise GPU path failed; "
+                        "falling through to batched overlay graph",
+                        exc_info=True,
+                    )
+                finally:
+                    if cached_right_segments is not None:
+                        _free_device_segment_table(cached_right_segments)
 
             if left_rem_oga.row_count > 1:
                 base_right_segments = _extract_segments_gpu(right_one_oga)
@@ -4311,17 +4343,20 @@ def _many_vs_one_intersection_owned(
         complex_result = _remainder_intersection(complex_left, right_one)
         if complex_result is not None:
             try:
-                left_rect_mask = _host_rectangle_polygon_mask(complex_left)
                 right_rect_mask = _host_rectangle_polygon_mask(right_one)
                 if (
-                    left_rect_mask is not None
-                    and right_rect_mask is not None
+                    right_rect_mask is not None
                     and right_rect_mask.size == 1
                     and bool(right_rect_mask[0])
                 ):
-                    left_rect_mask = np.asarray(left_rect_mask, dtype=bool)
-                    if left_rect_mask.size == complex_result.row_count and left_rect_mask.any():
-                        complex_result._polygon_rect_exact_polygon_only = left_rect_mask
+                    left_rect_mask = _host_rectangle_polygon_mask(complex_left)
+                    if left_rect_mask is not None:
+                        left_rect_mask = np.asarray(left_rect_mask, dtype=bool)
+                        if (
+                            left_rect_mask.size == complex_result.row_count
+                            and left_rect_mask.any()
+                        ):
+                            complex_result._polygon_rect_exact_polygon_only = left_rect_mask
             except Exception:
                 logger.debug(
                     "many-vs-one exact-overlay rectangle classification failed",

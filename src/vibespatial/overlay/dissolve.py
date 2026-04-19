@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 _EMPTY = GeometryCollection()
 _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS = 256
 _BUFFERED_TWO_POINT_SMALL_PARTIAL_UNION_MAX_ROWS = 2
+_BUFFERED_LINE_EXACT_CPU_MAX_ROWS = 2_048
 logger = logging.getLogger(__name__)
 
 
@@ -2663,6 +2664,147 @@ def _maybe_execute_buffered_two_point_line_host_disjoint_subset_rewrite(
     )
 
 
+def _maybe_execute_buffered_line_exact_cpu_rewrite(
+    frame,
+    *,
+    normalized_method: DissolveUnionMethod,
+    grid_size: float | None,
+    row_group_codes: np.ndarray | None,
+    group_count: int,
+    tag,
+) -> GroupedUnionResult | None:
+    if (
+        normalized_method is not DissolveUnionMethod.UNARY
+        or grid_size is not None
+        or row_group_codes is None
+        or group_count != 1
+        or tag is None
+        or tag.operation != "buffer"
+        or not provenance_rewrites_enabled()
+    ):
+        return None
+
+    source_types = tag.source_geom_types
+    if not source_types or not source_types <= frozenset({"linestring", "multilinestring"}):
+        return None
+
+    try:
+        distance_value = float(tag.get_param("distance", 0.0))
+    except (TypeError, ValueError):
+        return None
+    if distance_value <= 0.0 or bool(tag.get_param("single_sided", False)):
+        return None
+
+    observed_rows = np.flatnonzero(row_group_codes >= 0).astype(np.int64, copy=False)
+    if (
+        observed_rows.size < OVERLAY_UNION_ALL_GPU_THRESHOLD
+        or observed_rows.size > _BUFFERED_LINE_EXACT_CPU_MAX_ROWS
+    ):
+        return None
+
+    geometry_owned = getattr(frame.geometry.values, "_owned", None)
+    from vibespatial.runtime.residency import Residency
+
+    result_residency = (
+        Residency.DEVICE
+        if (
+            geometry_owned is not None
+            and geometry_owned.residency is Residency.DEVICE
+            and cp is not None
+        )
+        else Residency.HOST
+    )
+
+    record_fallback_event(
+        surface="geopandas.geodataframe.dissolve",
+        reason="small buffered-line dissolve uses exact GEOS union until the GPU union path is both exact and faster",
+        detail=(
+            f"rows={observed_rows.size}, max_rows={_BUFFERED_LINE_EXACT_CPU_MAX_ROWS}, "
+            f"buffer_distance={distance_value}"
+        ),
+        requested=ExecutionMode.AUTO,
+        selected=ExecutionMode.CPU,
+        pipeline="dissolve.buffered_line_exact_union",
+        d2h_transfer=geometry_owned is not None and geometry_owned.residency is Residency.DEVICE,
+    )
+
+    quad_segs_param = tag.get_param("quad_segs", 16)
+    quad_segs = 16 if quad_segs_param is None else int(quad_segs_param)
+    cap_style_param = tag.get_param("cap_style", "round")
+    join_style_param = tag.get_param("join_style", "round")
+    cap_style = "round" if cap_style_param is None else str(cap_style_param)
+    join_style = "round" if join_style_param is None else str(join_style_param)
+
+    merged = None
+    source_owned = _provenance_source_owned(tag)
+    if source_owned is not None:
+        if observed_rows.size != source_owned.row_count:
+            source_owned = source_owned.take(observed_rows)
+        unique_rows = _dedupe_two_point_linestring_rows_gpu(source_owned)
+        if (
+            unique_rows is not None
+            and 0 < unique_rows.size < source_owned.row_count
+        ):
+            unique_lines = np.asarray(
+                source_owned.take(unique_rows.astype(np.int64, copy=False)).to_shapely(),
+                dtype=object,
+            )
+            buffered_unique = shapely.buffer(
+                unique_lines,
+                distance_value,
+                quad_segs=quad_segs,
+                cap_style=cap_style,
+                join_style=join_style,
+                single_sided=False,
+            )
+            merged = shapely.union_all(np.asarray(buffered_unique, dtype=object))
+
+    if merged is None:
+        if geometry_owned is not None:
+            members = np.asarray(
+                geometry_owned.take(observed_rows).to_shapely(),
+                dtype=object,
+            )
+        else:
+            values = np.asarray(frame.geometry.values, dtype=object)
+            members = values[observed_rows]
+        members = members[
+            [geom is not None and not shapely.is_empty(geom) for geom in members]
+        ]
+        merged = _EMPTY if members.size == 0 else shapely.union_all(members)
+
+    if merged is not None and merged.geom_type == "GeometryCollection":
+        merged = _canonicalize_polygonal_make_valid_geometry(merged)
+    if merged is not None and not shapely.is_valid(merged):
+        merged = _canonicalize_polygonal_make_valid_geometry(shapely.make_valid(merged))
+
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    owned = from_shapely_geometries([merged], residency=result_residency)
+    record_dispatch_event(
+        surface="geopandas.geodataframe.dissolve",
+        operation="dissolve",
+        implementation="buffered_line_exact_cpu_union",
+        reason="performance/correctness guard for small buffered-line dissolve groups",
+        detail=(
+            f"rows={observed_rows.size}, buffer_distance={distance_value}, "
+            f"result_residency={result_residency.value}"
+        ),
+        requested=ExecutionMode.AUTO,
+        selected=ExecutionMode.CPU,
+    )
+
+    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=normalized_method,
+        owned=owned,
+    )
+
+
 def _maybe_rewrite_buffered_line_dissolve_method(
     frame,
     *,
@@ -2766,6 +2908,15 @@ def evaluate_geopandas_dissolve_native(
             group_count=len(aggregated_data.index),
             tag=provenance_tag,
         )
+        if grouped_union is None:
+            grouped_union = _maybe_execute_buffered_line_exact_cpu_rewrite(
+                frame,
+                normalized_method=normalized_method,
+                grid_size=grid_size,
+                row_group_codes=row_group_codes,
+                group_count=len(aggregated_data.index),
+                tag=provenance_tag,
+            )
         if grouped_union is None:
             normalized_method = _maybe_rewrite_buffered_line_dissolve_method(
                 frame,

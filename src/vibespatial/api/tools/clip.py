@@ -390,6 +390,9 @@ def _all_axis_aligned_rectangle_polygons(values) -> bool:
     parcel clips do not pay a per-row Shapely envelope check just to prove a
     shape that is already explicit in the coordinate buffers.
     """
+    if len(values) == 0:
+        return True
+
     owned = getattr(values, "_owned", None)
     if owned is None and hasattr(values, "to_owned"):
         try:
@@ -408,6 +411,13 @@ def _all_axis_aligned_rectangle_polygons(values) -> bool:
             rect_mask = None
         if rect_mask is not None and rect_mask.size == len(values):
             return bool(np.all(rect_mask))
+
+    try:
+        first_geom = values[0]
+    except Exception:
+        first_geom = None
+    if first_geom is not None and not _is_axis_aligned_rectangle_polygon(first_geom):
+        return False
 
     boundary_geoms = np.asarray(values, dtype=object)
     return all(_is_axis_aligned_rectangle_polygon(geom) for geom in boundary_geoms)
@@ -2058,34 +2068,28 @@ def _clip_polygon_partition_with_polygon_mask(
                 copy=False,
             )
             if hit_rows.size > 0:
-                if prefer_exact_polygon_rect_batch:
-                    exact_rows = _merge_row_sets(hit_rows, uncertain_rows)
-                elif allow_rectangle_kernel:
-                    hit_owned = _take_owned_rows(left_owned, hit_rows)
-                    broadcast_mask = (
-                        mask_owned
-                        if hit_owned.row_count == 1
-                        else materialize_broadcast(
-                            tile_single_row(mask_owned, hit_owned.row_count),
-                        )
+                hit_owned = _take_owned_rows(left_owned, hit_rows)
+                broadcast_mask = (
+                    mask_owned
+                    if hit_owned.row_count == 1
+                    else materialize_broadcast(
+                        tile_single_row(mask_owned, hit_owned.row_count),
                     )
-                    inside_hits = np.asarray(
-                        evaluate_binary_predicate(
-                            "covered_by",
-                            hit_owned,
-                            broadcast_mask,
-                            dispatch_mode=ExecutionMode.GPU,
-                        ).values,
-                        dtype=bool,
-                    )
-                    inside_rows = hit_rows[inside_hits]
-                    exact_rows = _merge_row_sets(
-                        hit_rows[~inside_hits],
-                        uncertain_rows,
-                    )
-                else:
-                    inside_rows = np.asarray([], dtype=np.intp)
-                    exact_rows = _merge_row_sets(hit_rows, uncertain_rows)
+                )
+                inside_hits = np.asarray(
+                    evaluate_binary_predicate(
+                        "covered_by",
+                        hit_owned,
+                        broadcast_mask,
+                        dispatch_mode=ExecutionMode.GPU,
+                    ).values,
+                    dtype=bool,
+                )
+                inside_rows = hit_rows[inside_hits]
+                exact_rows = _merge_row_sets(
+                    hit_rows[~inside_hits],
+                    uncertain_rows,
+                )
             elif uncertain_rows.size > 0:
                 exact_rows = uncertain_rows
 
