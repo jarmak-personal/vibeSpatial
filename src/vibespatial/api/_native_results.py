@@ -2059,11 +2059,15 @@ def _concat_geometry_result_sequence(
             else series
             for series in series_parts
         ]
-    combined = pd.concat(series_parts, ignore_index=True)
+    object_parts = [np.asarray(series.values, dtype=object) for series in series_parts]
+    if len(object_parts) == 1:
+        combined_values = object_parts[0]
+    else:
+        combined_values = np.concatenate(object_parts)
     return GeometryNativeResult.from_values(
-        combined.values,
+        combined_values,
         crs=crs,
-        index=combined.index,
+        index=pd.RangeIndex(int(combined_values.size)),
         name=geometry_name,
     )
 

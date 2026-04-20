@@ -27,6 +27,7 @@ from vibespatial import (
 from vibespatial.api._native_results import (
     NativeAttributeTable,
     NativeTabularResult,
+    _concat_native_tabular_results,
     _spatial_to_native_tabular_result,
 )
 from vibespatial.geometry.device_array import DeviceGeometryArray
@@ -691,17 +692,24 @@ def test_osm_other_relations_tags_false_stays_on_pyogrio_layer_path(
         ),
     )
 
+    geopandas.clear_dispatch_events()
     payload = read_vector_file_native(
         "example.osm.pbf",
         layer="other_relations",
         tags=False,
         geometry_only=True,
     )
+    events = geopandas.get_dispatch_events(clear=True)
 
     assert captured["layer"] == "other_relations"
     assert captured["columns"] == []
     assert list(payload.attributes.columns) == []
     assert payload.geometry.row_count == 1
+    assert any(
+        event.implementation.endswith("_pyogrio_arrow_gpu_wkb")
+        and event.selected is geopandas.ExecutionMode.GPU
+        for event in events
+    )
 
 
 @pytest.mark.gpu
@@ -1149,6 +1157,47 @@ def test_osm_points_layer_tags_false_projects_only_osm_id(
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
 @pytest.mark.gpu
+def test_osm_other_relations_public_dispatch_reports_cpu_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fallback_frame = geopandas.GeoDataFrame(
+        {"osm_id": [300], "osm_element": ["relation"]},
+        geometry=[GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])])],
+        crs="EPSG:4326",
+    )
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("other_relations should not attempt unsupported GPU WKB decode")
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_osm_pbf_pyogrio_layer_public",
+        lambda *_args, **_kwargs: fallback_frame,
+    )
+
+    geopandas.clear_dispatch_events()
+    result = geopandas.read_file("example.osm.pbf", layer="other_relations")
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result["osm_element"].tolist() == ["relation"]
+    assert result.geometry.geom_type.tolist() == ["GeometryCollection"]
+    assert any(
+        event.implementation == "osm_pbf_pyogrio_geometrycollection_compat_bridge"
+        and event.selected is geopandas.ExecutionMode.CPU
+        for event in events
+    )
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+@pytest.mark.gpu
 def test_osm_public_multipolygons_without_osm_way_id_stays_relation_shaped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1198,12 +1247,8 @@ def test_osm_points_layer_cpu_fallback_uses_pyogrio_compatibility_path(
 def test_osm_other_relations_layer_uses_explicit_compatibility_bridge_for_geometrycollection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import pyarrow as pa
-
     from vibespatial.io.file import _read_osm_pbf_pyogrio_layer_native
 
-    metadata = {"geometry_name": "geometry", "crs": "EPSG:4326"}
-    table = pa.table({"geometry": pa.array([b"010100000000000000000000000000000000000000"], type=pa.binary())})
     fallback_frame = geopandas.GeoDataFrame(
         {"osm_id": [300], "osm_element": ["relation"]},
         geometry=[GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])])],
@@ -1212,12 +1257,8 @@ def test_osm_other_relations_layer_uses_explicit_compatibility_bridge_for_geomet
 
     monkeypatch.setattr(
         "pyogrio.read_arrow",
-        lambda *args, **kwargs: (metadata, table),
-    )
-    monkeypatch.setattr(
-        "vibespatial.io.file._pyogrio_arrow_wkb_to_native_tabular_result",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            NotImplementedError("unsupported geometry family: GeometryCollection")
+            AssertionError("other_relations should not attempt unsupported GPU WKB decode")
         ),
     )
     monkeypatch.setattr(
@@ -1235,6 +1276,34 @@ def test_osm_other_relations_layer_uses_explicit_compatibility_bridge_for_geomet
     assert fallbacks
     assert fallbacks[-1].surface == "vibespatial.io.osm_pbf"
     assert "GeometryCollection" in (fallbacks[-1].detail or "")
+
+
+def test_osm_supported_layer_concat_preserves_geometrycollection_bridge() -> None:
+    device_payload = _native_file_result_from_owned(
+        from_shapely_geometries([Point(0, 0), LineString([(0, 0), (1, 1)])]),
+        crs="EPSG:4326",
+        attributes=pd.DataFrame(
+            {
+                "osm_element": ["node", "way"],
+                "osm_id": [100, 200],
+            }
+        ),
+    )
+    bridge_frame = geopandas.GeoDataFrame(
+        {"osm_id": [300], "osm_element": ["relation"]},
+        geometry=[GeometryCollection([Point(0, 0), LineString([(0, 0), (1, 1)])])],
+        crs="EPSG:4326",
+    )
+
+    payload = _concat_native_tabular_results(
+        [device_payload, _spatial_to_native_tabular_result(bridge_frame)],
+        geometry_name="geometry",
+        crs="EPSG:4326",
+    )
+    result = payload.to_geodataframe()
+
+    assert result["osm_element"].tolist() == ["node", "way", "relation"]
+    assert result.geometry.geom_type.tolist() == ["Point", "LineString", "GeometryCollection"]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
@@ -2273,6 +2342,10 @@ def test_plan_vector_file_io_exposes_promoted_read_boundary_classification() -> 
     assert plan_vector_file_io("data.geojson", operation=IOOperation.READ).selected_path is IOPathKind.HYBRID
     assert plan_vector_file_io("data.shp", operation=IOOperation.READ).selected_path is IOPathKind.HYBRID
     assert plan_vector_file_io("data.gpkg", operation=IOOperation.READ).selected_path is IOPathKind.HYBRID
+    geojsonseq = plan_vector_file_io("data.geojsonseq", operation=IOOperation.READ)
+    assert geojsonseq.selected_path is IOPathKind.HYBRID
+    assert geojsonseq.implementation == "geojsonseq_hybrid_adapter"
+    assert "GPU GeoJSON parser" in geojsonseq.reason
     assert plan_vector_file_io("data.unknown", operation=IOOperation.READ).selected_path is IOPathKind.FALLBACK
 
 
@@ -2403,6 +2476,59 @@ def test_read_vector_file_native_returns_native_payload_for_pyogrio_arrow_gpu_wk
     assert isinstance(payload, NativeTabularResult)
     assert payload.geometry.owned is owned
     assert payload.attributes["value"].tolist() == [10]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyogrio") is None, reason="pyogrio not available")
+def test_geojsonseq_gpu_failure_reports_cpu_fallback_to_arrow_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "sample.geojsonseq"
+    path.write_text(
+        json.dumps(
+            {
+                "type": "Feature",
+                "properties": {"id": 7},
+                "geometry": {"type": "Point", "coordinates": [0, 0]},
+            }
+        )
+    )
+    table = pa.table({"geometry": [Point(0, 0).wkb], "id": [7]})
+    owned = from_shapely_geometries([Point(0, 0)])
+
+    class _FakeRuntime:
+        def available(self) -> bool:
+            return True
+
+    monkeypatch.setattr("vibespatial.cuda._runtime.get_cuda_runtime", lambda: _FakeRuntime())
+    monkeypatch.setattr("vibespatial.runtime.get_requested_mode", lambda: geopandas.ExecutionMode.AUTO)
+    monkeypatch.setattr(
+        "vibespatial.io.file._read_geojsonseq_native",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("geojsonseq gpu boom")),
+    )
+    monkeypatch.setattr(
+        "pyogrio.read_arrow",
+        lambda *_args, **_kwargs: (
+            {"geometry_name": "geometry", "crs": "EPSG:4326"},
+            table,
+        ),
+    )
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.decode_wkb_arrow_array_owned",
+        lambda _column: owned,
+    )
+
+    geopandas.clear_fallback_events()
+    payload = read_vector_file_native(path)
+    fallbacks = geopandas.get_fallback_events(clear=True)
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.attributes["id"].tolist() == [7]
+    assert any(
+        "GPU GeoJSONSeq ingest failed" in event.reason
+        and event.selected is geopandas.ExecutionMode.CPU
+        for event in fallbacks
+    )
 
 
 def test_read_vector_file_native_lowers_cpu_path_to_shared_native_boundary(

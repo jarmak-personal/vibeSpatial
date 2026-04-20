@@ -911,7 +911,7 @@ def _extract_attributes(
     data: bytes,
     feature_offsets: np.ndarray,
     header: FgbHeader,
-) -> dict[str, list] | None:
+) -> dict[str, object] | None:
     """Extract attribute columns from FGB feature properties (CPU).
 
     FGB properties are binary-encoded per the column schema defined in
@@ -925,6 +925,14 @@ def _extract_attributes(
     """
     if not header.columns:
         return None
+
+    dense_result = _extract_dense_long_string_attributes(
+        data,
+        feature_offsets,
+        header,
+    )
+    if dense_result is not None:
+        return dense_result
 
     n_features = len(feature_offsets)
     n_cols = len(header.columns)
@@ -1010,6 +1018,120 @@ def _extract_attributes(
     return result
 
 
+def _extract_dense_long_string_attributes(
+    data: bytes,
+    feature_offsets: np.ndarray,
+    header: FgbHeader,
+) -> dict[str, object] | None:
+    """Fast path for dense ``int64 + string`` FGB property tables.
+
+    Large exported workflow fixtures often carry a fixed release/version
+    column plus one low-cardinality string column. The generic extractor is
+    correct but spends most of its time in Python dispatch and repeated UTF-8
+    decoding. This path keeps the same binary validation while using typed
+    numeric storage and a tiny string intern cache.
+    """
+    if len(header.columns) != 2:
+        return None
+    long_idx = next(
+        (
+            idx
+            for idx, column in enumerate(header.columns)
+            if column.type == FGB_COL_LONG
+        ),
+        None,
+    )
+    string_idx = next(
+        (
+            idx
+            for idx, column in enumerate(header.columns)
+            if column.type in (FGB_COL_STRING, FGB_COL_JSON, FGB_COL_DATETIME)
+        ),
+        None,
+    )
+    if long_idx is None or string_idx is None:
+        return None
+
+    n_features = int(len(feature_offsets))
+    long_values = np.empty(n_features, dtype=np.int64)
+    long_valid = np.zeros(n_features, dtype=bool)
+    string_values: list[str | None] = [None] * n_features
+    string_cache: dict[bytes, str] = {}
+
+    unpack_i32 = struct.Struct("<i").unpack_from
+    unpack_u16 = struct.Struct("<H").unpack_from
+    unpack_u32 = struct.Struct("<I").unpack_from
+    unpack_i64 = struct.Struct("<q").unpack_from
+
+    for feat_idx, raw_feat_off in enumerate(feature_offsets):
+        feat_off = int(raw_feat_off)
+        fb_start = feat_off + 4
+        root_off = fb_start + unpack_u32(data, fb_start)[0]
+
+        vtable_offset = root_off - unpack_i32(data, root_off)[0]
+        vtable_size = unpack_u16(data, vtable_offset)[0]
+        props_voffset_pos = 6  # field 1: properties byte vector
+        if props_voffset_pos >= vtable_size:
+            continue
+        props_voffset = unpack_u16(data, vtable_offset + props_voffset_pos)[0]
+        if props_voffset == 0:
+            continue
+
+        props_field = root_off + props_voffset
+        props_vector = props_field + unpack_i32(data, props_field)[0]
+        props_len = unpack_i32(data, props_vector)[0]
+        pos = props_vector + 4
+        props_end = pos + props_len
+
+        while pos < props_end:
+            if pos + 2 > props_end:
+                return None
+            col_idx = unpack_u16(data, pos)[0]
+            pos += 2
+
+            if col_idx == long_idx:
+                if pos + 8 > props_end:
+                    return None
+                long_values[feat_idx] = unpack_i64(data, pos)[0]
+                long_valid[feat_idx] = True
+                pos += 8
+            elif col_idx == string_idx:
+                if pos + 4 > props_end:
+                    return None
+                str_len = unpack_u32(data, pos)[0]
+                pos += 4
+                str_end = pos + str_len
+                if str_end > props_end:
+                    return None
+                if str_len == 0:
+                    string_values[feat_idx] = ""
+                else:
+                    raw = data[pos:str_end]
+                    value = string_cache.get(raw)
+                    if value is None:
+                        value = raw.decode("utf-8", errors="replace")
+                        string_cache[raw] = value
+                    string_values[feat_idx] = value
+                pos = str_end
+            else:
+                return None
+
+    long_column: object
+    if bool(long_valid.all()):
+        long_column = long_values
+    else:
+        object_values: list[int | None] = [None] * n_features
+        valid_positions = np.flatnonzero(long_valid)
+        for pos in valid_positions:
+            object_values[int(pos)] = int(long_values[int(pos)])
+        long_column = object_values
+
+    return {
+        header.columns[long_idx].name: long_column,
+        header.columns[string_idx].name: string_values,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Phase 6: Assembly + Public API
 # ---------------------------------------------------------------------------
@@ -1020,7 +1142,7 @@ class FgbGpuResult:
     """Result of GPU FlatGeobuf decode."""
 
     geometry: OwnedGeometryArray
-    attributes: dict[str, list] | None
+    attributes: dict[str, object] | None
     n_features: int
     crs: str | None
 

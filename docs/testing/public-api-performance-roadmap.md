@@ -175,6 +175,18 @@ Remediation progress:
   GeoPandas plus `pyarrow`, so the external denominator cannot see the
   repo-local `.venv` or compatibility shim and still supports the Parquet
   fixture files used by workflow scripts.
+- M4 IO-zero remediation is closed for the targeted weak surfaces. Default
+  public OSM PBF now survives the explicit `GeometryCollection` compatibility
+  island during native layer concat and skips the doomed owned WKB decode for
+  `other_relations`, `GeoSeries.from_wkt(...)` uses the GPU WKT parser for
+  large clean WKT arrays, FlatGeobuf dense `int64 + string` properties avoid
+  the previous row-by-row decode hotspot, and eligible GeoJSONSeq reads reuse
+  the GPU GeoJSON parser through a FeatureCollection byte rewrite. The April
+  20 IO 10k repeat-3 artifact measured CSV WKT at `2.85x`, FlatGeobuf at
+  `1.49x`, GeoJSONSeq at `7.24x`, and Shapefile at `1.95x`; full public OSM
+  now reports a vibeSpatial median of `57.02s` with the expected
+  `other=33824` fingerprint while the isolated GeoPandas denominator times
+  out at the current 300s limit.
 
 ## Milestones
 

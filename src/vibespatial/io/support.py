@@ -184,7 +184,7 @@ IO_SUPPORT_MATRIX: dict[IOFormat, IOSupportEntry] = {
         read_path=IOPathKind.HYBRID,
         write_path=IOPathKind.FALLBACK,
         canonical_gpu=False,
-        reason="GeoJSON-Seq read uses pyogrio Arrow container parse with GPU WKB geometry decode; write via pyogrio.",
+        reason="GeoJSON-Seq read uses the native GPU GeoJSON FeatureCollection adapter for eligible local unfiltered inputs and the pyogrio Arrow/WKB bridge for explicit container-shaped requests; write via pyogrio.",
     ),
     IOFormat.GDAL_LEGACY: IOSupportEntry(
         format=IOFormat.GDAL_LEGACY,

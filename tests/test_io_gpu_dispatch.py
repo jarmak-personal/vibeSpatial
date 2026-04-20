@@ -20,6 +20,7 @@ from shapely.geometry import LineString, Point, Polygon
 import vibespatial.api as geopandas
 from vibespatial.io.file import _GPU_MIN_FILE_SIZE
 from vibespatial.io.support import IOFormat
+from vibespatial.runtime import ExecutionMode, set_execution_mode
 from vibespatial.runtime._runtime import has_gpu_runtime
 
 needs_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime not available")
@@ -80,6 +81,75 @@ class TestWktGpuDispatch:
         assert len(result) == 2
         assert result.geometry.iloc[0].equals(LineString([(0, 0), (1, 1), (2, 0)]))
         assert result.geometry.iloc[1].equals(LineString([(10, 10), (20, 20)]))
+
+    @needs_gpu
+    def test_geoseries_from_wkt_large_input_uses_gpu(self, monkeypatch) -> None:
+        import vibespatial.api.geometry_array as geometry_array_module
+
+        monkeypatch.setattr(geometry_array_module, "_WKT_GPU_MIN_ROWS", 1)
+
+        geopandas.clear_dispatch_events()
+        result = geopandas.GeoSeries.from_wkt(
+            [
+                "POINT (1 2)",
+                "LINESTRING (0 0, 1 1)",
+            ],
+            crs="EPSG:4326",
+        )
+        events = geopandas.get_dispatch_events(clear=True)
+
+        assert result.iloc[0].equals(Point(1, 2))
+        assert result.iloc[1].equals(LineString([(0, 0), (1, 1)]))
+        assert any(
+            event.implementation == "wkt_gpu_large_array_constructor"
+            for event in events
+        )
+
+    def test_geoseries_from_wkt_large_input_respects_cpu_mode(self, monkeypatch) -> None:
+        import vibespatial.api.geometry_array as geometry_array_module
+
+        monkeypatch.setattr(geometry_array_module, "_WKT_GPU_MIN_ROWS", 1)
+
+        set_execution_mode(ExecutionMode.CPU)
+        try:
+            geopandas.clear_dispatch_events()
+            result = geopandas.GeoSeries.from_wkt(
+                [
+                    "POINT (1 2)",
+                    "LINESTRING (0 0, 1 1)",
+                ],
+                crs="EPSG:4326",
+            )
+            events = geopandas.get_dispatch_events(clear=True)
+        finally:
+            set_execution_mode(None)
+
+        assert result.iloc[0].equals(Point(1, 2))
+        assert result.iloc[1].equals(LineString([(0, 0), (1, 1)]))
+        assert not any(
+            event.implementation == "wkt_gpu_large_array_constructor"
+            for event in events
+        )
+
+    def test_geoseries_from_wkt_multiline_input_stays_on_shapely(self, monkeypatch) -> None:
+        import vibespatial.api.geometry_array as geometry_array_module
+
+        monkeypatch.setattr(geometry_array_module, "_WKT_GPU_MIN_ROWS", 1)
+
+        geopandas.clear_dispatch_events()
+        result = geopandas.GeoSeries.from_wkt(
+            [
+                "LINESTRING (0 0,\n1 1)",
+            ],
+            crs="EPSG:4326",
+        )
+        events = geopandas.get_dispatch_events(clear=True)
+
+        assert result.iloc[0].equals(LineString([(0, 0), (1, 1)]))
+        assert not any(
+            event.implementation == "wkt_gpu_large_array_constructor"
+            for event in events
+        )
 
     @needs_gpu
     def test_read_wkt_mixed_types(self, tmp_path) -> None:
@@ -308,6 +378,112 @@ class TestExistingFormatsUnbroken:
         # geojson_gpu_byte_classify_adapter) for GPU, or the CPU adapter.
         assert any(
             "geojson" in e.implementation for e in events
+        )
+
+    @needs_gpu
+    def test_geojsonseq_uses_gpu_featurecollection_adapter(self, tmp_path) -> None:
+        path = tmp_path / "test.geojsonseq"
+        features = [
+            {
+                "type": "Feature",
+                "properties": {"id": 1},
+                "geometry": {"type": "Point", "coordinates": [0, 0]},
+            },
+            {
+                "type": "Feature",
+                "properties": {"id": 2},
+                "geometry": {"type": "Point", "coordinates": [1, 1]},
+            },
+        ]
+        path.write_text("\n".join(json.dumps(feature) for feature in features) + "\n")
+
+        geopandas.clear_dispatch_events()
+        result = geopandas.read_file(path)
+        events = geopandas.get_dispatch_events(clear=True)
+
+        assert result["id"].tolist() == [1, 2]
+        assert result.geometry.iloc[1].equals(Point(1, 1))
+        assert any(
+            event.implementation == "geojsonseq_gpu_featurecollection_adapter"
+            for event in events
+        )
+
+    @needs_gpu
+    def test_geojsonseq_rs_pretty_records_uses_gpu_featurecollection_adapter(
+        self,
+        tmp_path,
+    ) -> None:
+        path = tmp_path / "pretty.geojsonseq"
+        features = [
+            {
+                "type": "Feature",
+                "properties": {"id": 1},
+                "geometry": {"type": "Point", "coordinates": [0, 0]},
+            },
+            {
+                "type": "Feature",
+                "properties": {"id": 2},
+                "geometry": {"type": "Point", "coordinates": [1, 1]},
+            },
+        ]
+        path.write_text(
+            "".join(
+                "\x1e" + json.dumps(feature, indent=2) + "\n"
+                for feature in features
+            )
+        )
+
+        geopandas.clear_dispatch_events()
+        result = geopandas.read_file(path)
+        events = geopandas.get_dispatch_events(clear=True)
+
+        assert result["id"].tolist() == [1, 2]
+        assert result.geometry.iloc[0].equals(Point(0, 0))
+        assert result.geometry.iloc[1].equals(Point(1, 1))
+        assert any(
+            event.implementation == "geojsonseq_gpu_featurecollection_adapter"
+            for event in events
+        )
+
+    @needs_gpu
+    def test_geojsonseq_streamed_adapter_uses_gpu_featurecollection_path(
+        self,
+        monkeypatch,
+        tmp_path,
+    ) -> None:
+        import vibespatial.io.file as io_file_module
+
+        path = tmp_path / "streamed.geojsonseq"
+        features = [
+            {
+                "type": "Feature",
+                "properties": {"id": 1},
+                "geometry": {"type": "Point", "coordinates": [0, 0]},
+            },
+            {
+                "type": "Feature",
+                "properties": {"id": 2},
+                "geometry": {"type": "Point", "coordinates": [1, 1]},
+            },
+        ]
+        path.write_text(
+            "".join(
+                "\x1e" + json.dumps(feature, indent=2) + "\n"
+                for feature in features
+            )
+        )
+        monkeypatch.setattr(io_file_module, "_GEOJSONSEQ_INLINE_FEATURECOLLECTION_MAX_BYTES", 1)
+
+        geopandas.clear_dispatch_events()
+        result = geopandas.read_file(path)
+        events = geopandas.get_dispatch_events(clear=True)
+
+        assert result["id"].tolist() == [1, 2]
+        assert result.geometry.iloc[0].equals(Point(0, 0))
+        assert result.geometry.iloc[1].equals(Point(1, 1))
+        assert any(
+            event.implementation == "geojsonseq_gpu_featurecollection_adapter"
+            for event in events
         )
 
     @needs_gpu

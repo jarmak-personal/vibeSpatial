@@ -5,7 +5,7 @@ Scope: File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL 
 Read If: You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.
 STOP IF: Your task already has the specific format adapter open and only needs local implementation detail.
 Source Of Truth: File-format IO architecture for GeoJSON, Shapefile, and GDAL legacy adapters.
-Body Budget: 277/280 lines
+Body Budget: 280/280 lines
 Document: docs/architecture/io-files.md
 
 Section Map (Body Lines)
@@ -19,8 +19,8 @@ Section Map (Body Lines)
 | 29-34 | Risks |
 | 35-55 | Decision |
 | 56-64 | Performance Notes |
-| 65-192 | Current Behavior |
-| 193-277 | Measured Local Baseline |
+| 65-195 | Current Behavior |
+| 196-280 | Measured Local Baseline |
 DOC_HEADER:END -->
 
 ## Intent
@@ -114,20 +114,23 @@ keeping GPU-native formats primary and legacy formats explicit.
   Shapefile GPU paths, the GeoJSON byte-classify path after property
   extraction, and the OSM PBF hybrid path after protobuf/tag extraction.
 - The OSM PBF public boundary now uses a bounded, lossless tag projection instead of widening every observed tag key into its own eager object column. Common OSM keys stay first-class and the remainder stay in `other_tags`, avoiding the previous Florida-scale `2843`-column host explosion.
-- Public OSM standard layers (`points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`) now prefer `pyogrio` container reads through the shared native boundary. Those supported-layer scans run in parallel for the default public `read_file("*.osm.pbf")` path, so the user-facing wall time is no longer dominated by five serial OSM driver passes. Layers with native-supported geometry stay on Arrow + GPU WKB; `other_relations` uses an explicit compatibility bridge because real PBF data still carries `GeometryCollection`. The repo-owned hybrid OSM parser remains the path for `layer="all"` and the full-data native contract.
+- Public OSM standard layers (`points`, `lines`, `multilinestrings`, `multipolygons`, `other_relations`) now prefer `pyogrio` container reads through the shared native boundary. Those supported-layer scans run in parallel for the default public `read_file("*.osm.pbf")` path, so the user-facing wall time is no longer dominated by five serial OSM driver passes. Layers with native-supported geometry stay on Arrow + GPU WKB; `other_relations` skips the unsupported owned WKB decode and uses an explicit compatibility bridge because real PBF data still carries `GeometryCollection`. The repo-owned hybrid OSM parser remains the path for `layer="all"` and the full-data native contract.
 - Default public `read_file("*.osm.pbf")` now combines those supported public layers by default instead of forcing the full mixed all-data parser into one eager frame. Small node-only fixtures and other empty supported-layer cases explicitly fall back to the full native parser so data is not lost.
 - OSM PBF native reads now keep tag projection lazy until explicit export. The low-level reader still returns host-resident tag dicts today, but the shared native file boundary no longer eagerly rebuilds a giant pandas object table.
 - Full-data OSM native reads now normalize through an internal partitioned bundle before any public layer projection or `GeoDataFrame` assembly. That keeps parser-shaped node/way/relation output out of the public boundary while preserving a reusable full-data seam for future views.
 - Large geometry-column CSV now prefers a `pylibcudf` / `libcudf` table parse
-  instead of the older whole-file byte-classify path. That keeps the CSV
-  container parse on device, avoids the Florida-scale WKT concatenation memory
-  blowup, and then routes the geometry column into the native GPU WKT/WKB
-  decode path. The byte-classify reader still owns small files and lat/lon
-  layouts.
+  before native GPU WKT/WKB decode. Public `GeoSeries.from_wkt(...)` also uses
+  the GPU WKT parser for large clean arrays, so the common `pd.read_csv` plus
+  WKT constructor idiom no longer stays pure Shapely at Florida scale.
 - FlatGeobuf now defaults to the repo-owned direct FlatBuffer GPU decoder for
   eligible local unfiltered public `read_file(...)` / `read_vector_file_native(...)`
-  calls. Explicit `engine="pyogrio"` and container-shaped requests stay on the
-  shared Arrow + GPU WKB native boundary.
+  calls and uses a typed dense-property extractor for common numeric plus
+  repeated-string schemas. Explicit `engine="pyogrio"` and container-shaped
+  requests stay on the shared Arrow + GPU WKB native boundary.
+- GeoJSONSeq now routes eligible local unfiltered public reads through the GPU
+  GeoJSON parser by rewriting newline-delimited feature records into a
+  FeatureCollection byte payload. Filtered or explicit pyogrio-shaped requests
+  stay on the shared Arrow + GPU WKB native boundary.
 - GeoJSON remains an explicit hybrid compatibility boundary because property
   extraction is still host-side even though geometry decode is GPU-native.
   Public `read_file(...)` now tries that repo-owned GPU path for all eligible

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import tempfile
 import warnings
 from dataclasses import dataclass
 from io import IOBase
@@ -60,6 +61,12 @@ class ShapefileIngestBenchmark:
     rows: int
     elapsed_seconds: float
     rows_per_second: float
+
+
+_GEOJSONSEQ_INLINE_FEATURECOLLECTION_MAX_BYTES = 64 * 1024 * 1024
+_GEOJSONSEQ_STREAM_CHUNK_BYTES = 4 * 1024 * 1024
+_GEOJSONSEQ_FEATURECOLLECTION_PREFIX = b'{"type":"FeatureCollection","features":['
+_GEOJSONSEQ_FEATURECOLLECTION_SUFFIX = b"]}"
 
 
 @dataclass(frozen=True)
@@ -376,6 +383,28 @@ def _read_osm_pbf_pyogrio_layer_native(
         _spatial_to_native_tabular_result,
         native_attribute_table_from_arrow_table,
     )
+
+    if layer == "other_relations" and not geometry_only:
+        record_fallback_event(
+            surface="vibespatial.io.osm_pbf",
+            reason=(
+                "explicit CPU compatibility fallback for the OSM other_relations "
+                "GeometryCollection layer"
+            ),
+            detail="layer='other_relations', geometry_type=GeometryCollection",
+            pipeline="io/read_osm_pbf_pyogrio_layer",
+            d2h_transfer=False,
+        )
+        return _spatial_to_native_tabular_result(
+            _read_osm_pbf_pyogrio_layer_public(
+                filename,
+                layer=layer,
+                target_crs=target_crs,
+                geometry_only=geometry_only,
+                tags=tags,
+                include_element_column=include_element_column,
+            )
+        )
 
     layer_columns = _osm_pyogrio_columns(
         layer=layer,
@@ -1074,6 +1103,119 @@ def read_geojson_native(
     )
 
 
+def _geojsonseq_inline_featurecollection_payload(path: Path) -> bytes:
+    raw = path.read_bytes().strip()
+    if b"\x1e" in raw:
+        records = [
+            record.strip()
+            for record in raw.split(b"\x1e")
+            if record.strip()
+        ]
+    elif raw:
+        records = [
+            record.strip()
+            for record in raw.replace(b"\r\n", b"\n").split(b"\n")
+            if record.strip()
+        ]
+    else:
+        records = []
+    body = b",".join(records)
+    return (
+        _GEOJSONSEQ_FEATURECOLLECTION_PREFIX
+        + body
+        + _GEOJSONSEQ_FEATURECOLLECTION_SUFFIX
+    )
+
+
+def _geojsonseq_uses_record_separator(path: Path) -> bool:
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(8192)
+            if not chunk:
+                return False
+            stripped = chunk.lstrip()
+            if stripped:
+                return stripped.startswith(b"\x1e")
+
+
+def _write_geojsonseq_featurecollection_stream(source: Path, target) -> None:
+    first_record = True
+
+    def write_record(record: bytes) -> None:
+        nonlocal first_record
+        stripped = record.strip()
+        if not stripped:
+            return
+        if first_record:
+            first_record = False
+        else:
+            target.write(b",")
+        target.write(stripped)
+
+    target.write(_GEOJSONSEQ_FEATURECOLLECTION_PREFIX)
+    if _geojsonseq_uses_record_separator(source):
+        pending = b""
+        with source.open("rb") as handle:
+            while True:
+                chunk = handle.read(_GEOJSONSEQ_STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                parts = (pending + chunk).split(b"\x1e")
+                for record in parts[:-1]:
+                    write_record(record)
+                pending = parts[-1]
+        write_record(pending)
+    else:
+        with source.open("rb") as handle:
+            for line in handle:
+                write_record(line)
+    target.write(_GEOJSONSEQ_FEATURECOLLECTION_SUFFIX)
+
+
+def _read_geojsonseq_streamed_native(
+    path: Path,
+    *,
+    target_crs: str | None = None,
+):
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix="vibespatial-geojsonseq-",
+            suffix=".geojson",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            _write_geojsonseq_featurecollection_stream(path, handle)
+        payload = read_geojson_native(
+            temp_path,
+            prefer="gpu-byte-classify",
+            objective="pipeline",
+            target_crs=target_crs,
+        )
+        payload.attributes.to_pandas(copy=False)
+        return payload
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _read_geojsonseq_native(
+    source: str | Path,
+    *,
+    target_crs: str | None = None,
+):
+    path = Path(source)
+    if path.stat().st_size > _GEOJSONSEQ_INLINE_FEATURECOLLECTION_MAX_BYTES:
+        return _read_geojsonseq_streamed_native(path, target_crs=target_crs)
+    feature_collection = _geojsonseq_inline_featurecollection_payload(path)
+    return read_geojson_native(
+        feature_collection,
+        prefer="gpu-byte-classify",
+        objective="pipeline",
+        target_crs=target_crs,
+    )
+
+
 def read_shapefile_owned(
     source: str | Path,
     *,
@@ -1525,8 +1667,13 @@ def plan_vector_file_io(
         reason = "TopoJSON uses pyogrio Arrow container parse with GPU WKB geometry decode."
     elif normalized_driver == "GeoJSONSeq":
         io_format = IOFormat.GEOJSONSEQ
-        implementation = "geojsonseq_pyogrio_arrow_gpu_wkb"
-        reason = "GeoJSON-Seq uses pyogrio Arrow container parse with GPU WKB geometry decode."
+        implementation = "geojsonseq_hybrid_adapter"
+        reason = (
+            "GeoJSON-Seq stays hybrid: eligible local unfiltered reads rewrite "
+            "records into a FeatureCollection byte payload and reuse the "
+            "repo-owned GPU GeoJSON parser, while explicit pyogrio-shaped "
+            "requests stay on the shared Arrow/WKB native boundary."
+        )
     else:
         io_format = IOFormat.GDAL_LEGACY
         implementation = "legacy_gdal_adapter"
@@ -2174,6 +2321,7 @@ def _prefer_pipeline_native_read(plan: VectorFilePlan) -> bool:
     return plan.format in {
         IOFormat.GEOJSON,
         IOFormat.SHAPEFILE,
+        IOFormat.GEOJSONSEQ,
     }
 
 
@@ -2414,25 +2562,38 @@ def _try_gpu_read_file_native(
         and columns is None
         and rows is None
     ):
+        normalized_osm_layer = _normalize_osm_layer(osm_layer)
         payload = _read_osm_pbf_pyogrio_layer_native(
             filename,
-            layer=_normalize_osm_layer(osm_layer),
+            layer=normalized_osm_layer,
             target_crs=target_crs,
             geometry_only=osm_geometry_only,
             tags=osm_tags,
         )
-        record_dispatch_event(
-            surface="geopandas.read_file",
-            operation="read_file",
-            implementation=f"{plan.format.value}_pyogrio_arrow_gpu_wkb",
-            reason=(
+        if normalized_osm_layer == "other_relations" and not osm_geometry_only:
+            implementation = "osm_pbf_pyogrio_geometrycollection_compat_bridge"
+            reason = (
+                "Explicit OSM other_relations reads use the pyogrio "
+                "GeometryCollection compatibility bridge because the owned WKB "
+                "model does not support GeometryCollection rows yet."
+            )
+            selected = ExecutionMode.CPU
+        else:
+            implementation = f"{plan.format.value}_pyogrio_arrow_gpu_wkb"
+            reason = (
                 "GPU-dominant read for a standard OSM public layer through pyogrio "
                 "Arrow container parsing, GPU WKB decode when supported, and "
                 "explicit compatibility bridging for unsupported layer geometry "
                 "families."
-            ),
+            )
+            selected = ExecutionMode.GPU
+        record_dispatch_event(
+            surface="geopandas.read_file",
+            operation="read_file",
+            implementation=implementation,
+            reason=reason,
             detail=dispatch_detail,
-            selected=ExecutionMode.GPU,
+            selected=selected,
         )
         return payload
 
@@ -2590,6 +2751,45 @@ def _try_gpu_read_file_native(
                 selected=selected,
             )
             return payload
+
+        if (
+            plan.format is IOFormat.GEOJSONSEQ
+            and _prefer_pipeline_native_read(plan)
+            and engine is None
+            and bbox is None
+            and columns is None
+            and rows is None
+            and not kwargs
+            and file_path is not None
+        ):
+            try:
+                payload = _read_geojsonseq_native(file_path, target_crs=target_crs)
+            except Exception as exc:
+                record_fallback_event(
+                    surface="geopandas.read_file",
+                    reason=(
+                        "GPU GeoJSONSeq ingest failed; falling back to the "
+                        "pyogrio Arrow/WKB native bridge"
+                    ),
+                    detail=str(exc),
+                    selected=ExecutionMode.CPU,
+                    pipeline="io/read_file",
+                    d2h_transfer=False,
+                )
+            else:
+                record_dispatch_event(
+                    surface="geopandas.read_file",
+                    operation="read_file",
+                    implementation="geojsonseq_gpu_featurecollection_adapter",
+                    reason=(
+                        "Pipeline-oriented GeoJSONSeq ingest rewrites newline-delimited "
+                        "features into a FeatureCollection byte payload and reuses the "
+                        "repo-owned GPU GeoJSON parser."
+                    ),
+                    detail=dispatch_detail,
+                    selected=ExecutionMode.GPU,
+                )
+                return payload
 
         if plan.format is IOFormat.FLATGEOBUF and _supports_direct_flatgeobuf_native_read(
             filename,

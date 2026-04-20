@@ -24,6 +24,13 @@ def test_wkb_geojson_and_shapefile_stay_noncanonical() -> None:
     assert wkb.canonical_gpu is False
 
 
+def test_geojsonseq_support_documents_native_gpu_adapter() -> None:
+    plan = plan_io_support(IOFormat.GEOJSONSEQ, IOOperation.READ)
+
+    assert plan.selected_path is IOPathKind.HYBRID
+    assert "native GPU GeoJSON FeatureCollection adapter" in plan.reason
+
+
 def test_gdal_legacy_stays_explicit_fallback() -> None:
     plan = plan_io_support(IOFormat.GDAL_LEGACY, IOOperation.READ)
 

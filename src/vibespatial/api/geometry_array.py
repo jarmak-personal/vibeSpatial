@@ -47,7 +47,7 @@ from vibespatial.predicates.binary import (
     evaluate_geopandas_binary_predicate,
     supports_binary_predicate,
 )
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.provenance import (
@@ -467,6 +467,70 @@ def from_wkb(
     return GeometryArray(shapely.from_wkb(data, on_invalid=on_invalid), crs=crs)
 
 
+_WKT_GPU_MIN_ROWS = 100_000
+
+
+def _try_large_wkt_gpu_array(
+    data,
+    *,
+    crs: Any | None,
+    on_invalid: Literal["raise", "warn", "ignore"],
+) -> GeometryArray | None:
+    if get_requested_mode() is ExecutionMode.CPU:
+        return None
+    if on_invalid != "raise":
+        return None
+
+    try:
+        values = np.asarray(data, dtype=object)
+    except Exception:
+        return None
+    if values.ndim != 1 or values.size < _WKT_GPU_MIN_ROWS:
+        return None
+
+    items = values.tolist()
+    if any(not isinstance(item, str) or "\n" in item or "\r" in item for item in items):
+        return None
+
+    try:
+        text = "\n".join(items)
+    except TypeError:
+        return None
+    if not text:
+        return None
+
+    try:
+        import cupy as cp
+
+        from vibespatial.io.wkt_gpu import read_wkt_gpu
+
+        host_bytes = np.frombuffer(text.encode("utf-8"), dtype=np.uint8)
+        owned = read_wkt_gpu(cp.asarray(host_bytes))
+    except Exception as exc:
+        record_fallback_event(
+            surface="geopandas.array.from_wkt",
+            reason="GPU WKT constructor failed; falling back to Shapely from_wkt",
+            detail=str(exc),
+            selected=ExecutionMode.CPU,
+            pipeline="io/from_wkt",
+            d2h_transfer=False,
+        )
+        return None
+
+    record_dispatch_event(
+        surface="geopandas.array.from_wkt",
+        operation="from_wkt",
+        implementation="wkt_gpu_large_array_constructor",
+        reason=(
+            "large public GeoSeries.from_wkt input uses the repo-owned GPU WKT "
+            "parser instead of Shapely host parsing"
+        ),
+        detail=f"rows={int(values.size)}, bytes={int(host_bytes.size)}",
+        selected=ExecutionMode.GPU,
+    )
+    return GeometryArray.from_owned(owned, crs=crs)
+
+
 def to_wkb(geoms: GeometryArray, hex: bool = False, **kwargs):
     """Convert GeometryArray to a numpy object array of WKB objects."""
     if (
@@ -508,6 +572,9 @@ def from_wkt(
     """
     if isinstance(data, ExtensionArray):
         data = data.to_numpy(na_value=None)
+    gpu_result = _try_large_wkt_gpu_array(data, crs=crs, on_invalid=on_invalid)
+    if gpu_result is not None:
+        return gpu_result
     return GeometryArray(shapely.from_wkt(data, on_invalid=on_invalid), crs=crs)
 
 
