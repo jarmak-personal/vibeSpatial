@@ -602,6 +602,153 @@ def _relation_join_output_layout(
     return geometry_name, crs, tuple(joined.columns)
 
 
+def _single_index_reset_column_name(
+    df: GeoDataFrame,
+    other_df: GeoDataFrame,
+    *,
+    suffix: str,
+) -> Any | None:
+    """Return the reset-index column name for the common single-index case."""
+    if df.index.nlevels != 1:
+        return None
+    label = df.index.names[0]
+    if label is not None:
+        if label in df.columns:
+            return None
+        return label
+    candidate = f"index_{suffix}0" if "index" in df.columns else f"index_{suffix}"
+    if candidate in df.columns or candidate in other_df.columns:
+        return None
+    return candidate
+
+
+def _has_secondary_geometry_columns(df: GeoDataFrame, geometry_name: str) -> bool:
+    from vibespatial.api.geo_base import _is_geometry_like_dtype
+
+    non_geometry = df.drop(geometry_name, axis=1)
+    if non_geometry.shape[1] == 0:
+        return False
+    return bool(np.asarray(non_geometry.dtypes.map(_is_geometry_like_dtype), dtype=bool).any())
+
+
+def _native_relation_join_parts_fast_pandas_inner(
+    left_df: GeoDataFrame,
+    right_df: GeoDataFrame,
+    indices: tuple[np.ndarray, np.ndarray],
+    distances,
+    *,
+    lsuffix: str,
+    rsuffix: str,
+    on_attribute=None,
+) -> tuple[
+    NativeAttributeTable,
+    GeometryNativeResult,
+    str,
+    Any,
+    tuple[str, ...],
+    tuple[NativeGeometryColumn, ...],
+    np.ndarray | None,
+] | None:
+    """Fast public GeoDataFrame export for simple inner relation joins.
+
+    Arrow/native sinks keep using the general native-tabular path.  This path
+    only removes schema/reset-index work when the caller is already asking for a
+    pandas-backed public GeoDataFrame.
+    """
+    if on_attribute:
+        return None
+    left_geometry_name = left_df.geometry.name
+    right_geometry_name = right_df.geometry.name
+    if _has_secondary_geometry_columns(left_df, left_geometry_name):
+        return None
+    if _has_secondary_geometry_columns(right_df, right_geometry_name):
+        return None
+
+    left_index_name = _single_index_reset_column_name(
+        left_df,
+        right_df,
+        suffix=lsuffix,
+    )
+    right_index_name = _single_index_reset_column_name(
+        right_df,
+        left_df,
+        suffix=rsuffix,
+    )
+    if left_index_name is None or right_index_name is None:
+        return None
+
+    l_idx, r_idx = indices
+    l_take = np.asarray(l_idx, dtype=np.intp)
+    r_take = np.asarray(r_idx, dtype=np.intp)
+    joined_index = left_df.index.take(l_take)
+
+    left_attr_df = left_df.drop(left_geometry_name, axis=1)
+    right_attr_df = right_df.drop(right_geometry_name, axis=1)
+    left_reset_columns = pd.Index([left_index_name, *left_attr_df.columns])
+    right_reset_columns = pd.Index([right_index_name, *right_attr_df.columns])
+    left_columns, right_columns = _process_column_names_with_suffix(
+        left_reset_columns,
+        right_reset_columns,
+        (lsuffix, rsuffix),
+        left_df,
+        right_df,
+    )
+    left_output_columns = list(left_columns[1:])
+    right_output_columns = list(right_columns)
+
+    frames: list[pd.DataFrame] = []
+    if left_attr_df.shape[1] > 0:
+        left_projected = left_attr_df.take(l_take)
+        left_projected.index = joined_index
+        left_projected.columns = left_output_columns
+        frames.append(left_projected)
+
+    right_index_values = right_df.index.take(r_take)
+    frames.append(
+        pd.DataFrame(
+            {right_output_columns[0]: right_index_values},
+            index=joined_index,
+            copy=False,
+        )
+    )
+    if right_attr_df.shape[1] > 0:
+        right_projected = right_attr_df.take(r_take)
+        right_projected.index = joined_index
+        right_projected.columns = right_output_columns[1:]
+        frames.append(right_projected)
+
+    concat_kwargs = {} if PANDAS_GE_30 else {"copy": False}
+    attributes = pd.concat(frames, axis=1, **concat_kwargs)
+    attributes.index.names = left_df.index.names
+
+    geometry_values = left_df.geometry.values.take(l_take)
+    geometry_result = GeometryNativeResult.from_values(
+        geometry_values,
+        crs=left_df.crs,
+        index=joined_index,
+        name=left_geometry_name,
+    )
+
+    left_column_iter = iter(left_output_columns)
+    column_order: list[Any] = []
+    for column_name in left_df.columns:
+        if column_name == left_geometry_name:
+            column_order.append(left_geometry_name)
+        else:
+            column_order.append(next(left_column_iter))
+    column_order.extend(right_output_columns)
+
+    return (
+        NativeAttributeTable(dataframe=attributes),
+        geometry_result,
+        left_geometry_name,
+        left_df.crs,
+        tuple(column_order),
+        (),
+        distances,
+    )
+
+
 def _native_relation_join_parts(
     left_df: GeoDataFrame,
     right_df: GeoDataFrame,
@@ -623,6 +770,19 @@ def _native_relation_join_parts(
     np.ndarray | None,
 ]:
     """Build native relation-join export parts without constructing a joined DataFrame."""
+    if how == "inner" and attribute_storage == "pandas":
+        fast_parts = _native_relation_join_parts_fast_pandas_inner(
+            left_df,
+            right_df,
+            indices,
+            distances,
+            lsuffix=lsuffix,
+            rsuffix=rsuffix,
+            on_attribute=on_attribute,
+        )
+        if fast_parts is not None:
+            return fast_parts
+
     left_geometry_name = left_df.geometry.name
     left_crs = left_df.crs
     right_geometry_name = right_df.geometry.name
@@ -1431,12 +1591,16 @@ def _reorder_concat_positions(
     if concat_row_positions.size <= 1:
         return np.arange(concat_row_positions.size, dtype=np.intp)
     sorter = np.argsort(concat_row_positions, kind="stable")
-    return sorter[
-        np.searchsorted(
-            concat_row_positions[sorter],
-            ordered_row_positions,
-        )
-    ].astype(np.intp, copy=False)
+    sorted_positions = concat_row_positions[sorter]
+    insertion = np.searchsorted(
+        sorted_positions,
+        ordered_row_positions,
+    )
+    valid = insertion < sorted_positions.size
+    if np.any(valid):
+        valid_indices = insertion[valid]
+        valid[valid] = sorted_positions[valid_indices] == ordered_row_positions[valid]
+    return sorter[insertion[valid]].astype(np.intp, copy=False)
 
 
 def _assemble_indexed_owned_parts(index_oga_pairs, row_count: int):
@@ -1704,8 +1868,7 @@ def _clip_constructive_parts_to_native_tabular_result(
         )
         if row_positions.size > 1:
             ordered_rows = np.asarray(ordered_row_positions, dtype=np.intp)
-            sorter = np.argsort(row_positions, kind="stable")
-            reorder = sorter[np.searchsorted(row_positions[sorter], ordered_rows)]
+            reorder = _reorder_concat_positions(row_positions, ordered_rows)
             row_positions = row_positions[reorder]
             geometry_values = geometry_values[reorder]
 

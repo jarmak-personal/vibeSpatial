@@ -86,6 +86,17 @@ def test_spatial_query_spec_exposes_overlap_ratio_parameter() -> None:
     assert any(param["name"] == "overlap_ratio" for param in payload["parameters"])
 
 
+def test_gpu_dissolve_spec_defaults_to_public_coverage_method() -> None:
+    ensure_operations_loaded()
+    spec = get_operation("gpu-dissolve")
+
+    payload = spec.to_dict()
+
+    method = next(param for param in payload["parameters"] if param["name"] == "method")
+    assert method["default"] == "coverage"
+    assert method["choices"] == ["coverage", "unary", "disjoint_subset"]
+
+
 def test_list_operations_hides_internal_diagnostics_by_default() -> None:
     ensure_operations_loaded()
 

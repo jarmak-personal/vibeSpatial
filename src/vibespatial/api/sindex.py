@@ -621,10 +621,32 @@ geometries}
 
         # Route through the owned nearest engine when inputs support it.
         if self._supports_owned_query_input(raw_geometry):
+            def _existing_owned(values):
+                if values is None:
+                    return None
+                owned = getattr(values, "_owned", None)
+                if owned is not None:
+                    return owned
+                if "DeviceGeometryArray" in type(values).__name__ and hasattr(values, "to_owned"):
+                    return values.to_owned()
+                return None
+
+            query_values_obj = None
+            if isinstance(raw_geometry, geoseries.GeoSeries):
+                query_values_obj = raw_geometry.values
+            elif isinstance(raw_geometry, array.GeometryArray | OwnedGeometryArray):
+                query_values_obj = raw_geometry
+            elif "DeviceGeometryArray" in type(raw_geometry).__name__:
+                query_values_obj = raw_geometry
+            tree_owned = _existing_owned(self._geometry_array)
+            query_owned = _existing_owned(query_values_obj)
+
             # Defer STRtree construction: only build it lazily if the
             # nearest engine falls back to the STRtree path.  For GPU-
             # dispatched queries this avoids Shapely materialization.
-            if self.geometries is not None:
+            if tree_owned is not None and query_owned is not None:
+                tree_geoms = None
+            elif self.geometries is not None:
                 tree_geoms = np.asarray(self.geometries, dtype=object)
             elif self._geometry_array is not None and hasattr(self._geometry_array, "_data"):
                 tree_geoms = np.asarray(self._geometry_array._data, dtype=object)
@@ -636,9 +658,12 @@ geometries}
                 self._ensure_strtree()
                 return self._tree.query_nearest(*args, **kwargs)
 
-            query_input = self._as_geometry_array(raw_geometry)
-            if isinstance(query_input, BaseGeometry) or query_input is None:
-                query_input = [query_input] if query_input is not None else query_input
+            if query_owned is not None:
+                query_input = None
+            else:
+                query_input = self._as_geometry_array(raw_geometry)
+                if isinstance(query_input, BaseGeometry) or query_input is None:
+                    query_input = [query_input] if query_input is not None else query_input
 
             result, impl = nearest_spatial_index(
                 tree_geoms,
@@ -648,6 +673,8 @@ geometries}
                 max_distance=max_distance,
                 return_distance=return_distance,
                 exclusive=exclusive,
+                tree_owned=tree_owned if query_owned is not None else None,
+                query_owned=query_owned,
             )
             selected_mode = ExecutionMode.GPU if "gpu" in impl else ExecutionMode.CPU
             record_dispatch_event(

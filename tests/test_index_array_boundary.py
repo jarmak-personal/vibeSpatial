@@ -687,6 +687,45 @@ class TestSpatialNearestReturnsIndexArrays:
         )
         np.testing.assert_allclose(materialized["dist"], wrapped["dist"])
 
+    def test_relation_join_pandas_export_uses_fast_inner_path(self, monkeypatch):
+        left = GeoDataFrame(
+            {"a": [1, 2]},
+            geometry=GeoSeries([Point(0, 0), Point(5, 0)]),
+        )
+        right = GeoDataFrame(
+            {"b": [10, 20]},
+            geometry=GeoSeries([Point(0, 0), Point(10, 0)]),
+        )
+        export_result, _impl, _execution = _sjoin_export_result(
+            left,
+            right,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+        )
+        expected = export_result.materialize()[0]
+
+        def _fail(*_args, **_kwargs):
+            raise AssertionError(
+                "pandas GeoDataFrame export should use the inner-join fast path"
+            )
+
+        monkeypatch.setattr(
+            native_results_module,
+            "_relation_join_output_layout",
+            _fail,
+        )
+        monkeypatch.setattr(
+            native_results_module,
+            "_projected_frames_to_native_tabular_parts",
+            _fail,
+        )
+
+        result = export_result.to_geodataframe()
+        assert_geodataframe_equal(result, expected)
+
     def test_sjoin_nearest_export_result_native_tabular_skips_join_frame_materializer(
         self,
         monkeypatch: pytest.MonkeyPatch,

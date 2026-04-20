@@ -388,6 +388,13 @@ def bench_make_valid(
             description="Number of dissolve groups in the grouped-box fixture",
             default=100,
         ),
+        OperationParameterSpec(
+            name="method",
+            value_type="choice",
+            description="Public GeoDataFrame.dissolve union method",
+            default="coverage",
+            choices=("coverage", "unary", "disjoint_subset"),
+        ),
     ),
     tags=("gpu",),
 )
@@ -409,16 +416,17 @@ def bench_gpu_dissolve(
 
     fmt = InputFormat(input_format)
     groups = kwargs.get("groups", 100)
+    method = str(kwargs.get("method", "coverage"))
     spec, _ = ensure_grouped_boxes_fixture(scale, groups=groups, fmt=fmt)
     frame, read_seconds = load_public_geodataframe(spec, fmt)
 
-    frame.dissolve(by="group")
+    frame.dissolve(by="group", method=method)
 
     times: list[float] = []
     last_result = None
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        last_result = frame.dissolve(by="group")
+        last_result = frame.dissolve(by="group", method=method)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -440,10 +448,14 @@ def bench_gpu_dissolve(
         ]
         shapely_times: list[float] = []
         baseline = None
+        baseline_func = {
+            "coverage": shapely.coverage_union_all,
+            "disjoint_subset": shapely.disjoint_subset_union_all,
+        }.get(method, shapely.union_all)
         for _ in range(max(1, repeat)):
             start = perf_counter()
             baseline = [
-                shapely.union_all(values[positions])
+                baseline_func(values[positions])
                 for positions in group_positions
                 if positions.size > 0
             ]
@@ -453,7 +465,7 @@ def bench_gpu_dissolve(
         if shapely_times:
             baseline_elapsed_seconds = shapely_times[-1]
         baseline_timing = timing_from_samples(shapely_times)
-        baseline_name = "shapely"
+        baseline_name = f"shapely-{method}"
         if timing.median_seconds > 0:
             speedup = baseline_timing.median_seconds / timing.median_seconds
 
@@ -474,6 +486,7 @@ def bench_gpu_dissolve(
         metadata={
             "repeat": repeat,
             "groups": groups,
+            "method": method,
             "public_elapsed_seconds": timing.median_seconds,
             "baseline_elapsed_seconds": baseline_elapsed_seconds,
             "result_rows": int(len(last_result)) if last_result is not None else None,

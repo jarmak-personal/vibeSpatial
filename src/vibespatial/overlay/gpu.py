@@ -252,6 +252,7 @@ def build_gpu_split_events(
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     require_same_row: bool = False,
+    use_same_row_fast_path: bool | None = None,
     right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> SplitEventTable:
     # Delegated to overlay/split.py — this re-export preserves import compatibility.
@@ -262,6 +263,7 @@ def build_gpu_split_events(
         dispatch_mode=dispatch_mode,
         _cached_right_segments=_cached_right_segments,
         require_same_row=require_same_row,
+        use_same_row_fast_path=use_same_row_fast_path,
         right_geometry_source_rows=right_geometry_source_rows,
     )
 
@@ -283,6 +285,7 @@ def _build_overlay_execution_plan(
     dispatch_mode: ExecutionMode = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     _row_isolated: bool = False,
+    _use_same_row_fast_path: bool | None = None,
     _left_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
     _right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> OverlayExecutionPlan:
@@ -293,6 +296,7 @@ def _build_overlay_execution_plan(
             dispatch_mode=dispatch_mode,
             _cached_right_segments=_cached_right_segments,
             require_same_row=_row_isolated,
+            use_same_row_fast_path=_use_same_row_fast_path,
             right_geometry_source_rows=_right_geometry_source_rows,
         )
     except Exception as exc:
@@ -594,6 +598,9 @@ def _overlay_owned(
         dispatch_mode=ExecutionMode.GPU,
         _cached_right_segments=_cached_right_segments,
         _row_isolated=_row_isolated,
+        _use_same_row_fast_path=(
+            True if operation == "intersection" and _row_isolated else None
+        ),
     )
     result, face_assembly_mode = _materialize_overlay_execution_plan(
         plan,

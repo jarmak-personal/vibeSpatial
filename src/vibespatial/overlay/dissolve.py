@@ -1165,7 +1165,10 @@ def execute_grouped_box_union_gpu_owned_codes(
     if cp is None:
         return None
 
-    d_bounds = _owned_rectangle_bounds_device(owned)
+    try:
+        d_bounds = _owned_rectangle_bounds_device(owned)
+    except RuntimeError:
+        return None
     if d_bounds is None:
         return None
 
@@ -1182,36 +1185,86 @@ def execute_grouped_box_union_gpu_owned_codes(
         )
 
     from vibespatial.constructive.envelope import _build_device_boxes_from_bounds
-    from vibespatial.cuda.cccl_primitives import (
-        lower_bound_counting,
-        segmented_reduce_max,
-        segmented_reduce_min,
-        sort_pairs,
-        upper_bound_counting,
-    )
 
-    d_observed_rows = cp.flatnonzero(d_observed_mask).astype(cp.int32)
-    d_observed_codes = d_codes[d_observed_rows]
-    sort_result = sort_pairs(
-        d_observed_codes,
-        d_observed_rows,
-        synchronize=False,
-    )
-    d_sorted_codes = cp.asarray(sort_result.keys).astype(cp.int32, copy=False)
-    d_sorted_rows = cp.asarray(sort_result.values).astype(cp.int32, copy=False)
-    d_starts = lower_bound_counting(d_sorted_codes, 0, group_count, dtype=np.int32).astype(cp.int32, copy=False)
-    d_ends = upper_bound_counting(d_sorted_codes, 0, group_count, dtype=np.int32).astype(cp.int32, copy=False)
-    if not bool(cp.all(d_ends > d_starts)):
+    d_observed_codes = d_codes[d_observed_mask]
+    d_observed_bounds = d_bounds[d_observed_mask]
+    d_counts = cp.bincount(d_observed_codes, minlength=group_count)
+    if not bool(cp.all(d_counts[:group_count] > 0)):
+        return None
+    if d_observed_codes.size > 1 and not bool(cp.all(d_observed_codes[1:] >= d_observed_codes[:-1])):
         return None
 
-    d_sorted_bounds = d_bounds[d_sorted_rows]
-    # CCCL segmented_reduce expects contiguous input vectors; a gathered
-    # bounds matrix is row-major, so column slices are strided views.
-    d_bound_columns = cp.ascontiguousarray(d_sorted_bounds.T)
-    d_xmin = segmented_reduce_min(d_bound_columns[0], d_starts, d_ends, num_segments=group_count).values
-    d_ymin = segmented_reduce_min(d_bound_columns[1], d_starts, d_ends, num_segments=group_count).values
-    d_xmax = segmented_reduce_max(d_bound_columns[2], d_starts, d_ends, num_segments=group_count).values
-    d_ymax = segmented_reduce_max(d_bound_columns[3], d_starts, d_ends, num_segments=group_count).values
+    d_xmin = cp.full(group_count, cp.inf, dtype=cp.float64)
+    d_ymin = cp.full(group_count, cp.inf, dtype=cp.float64)
+    d_xmax = cp.full(group_count, -cp.inf, dtype=cp.float64)
+    d_ymax = cp.full(group_count, -cp.inf, dtype=cp.float64)
+    cp.minimum.at(d_xmin, d_observed_codes, d_observed_bounds[:, 0])
+    cp.minimum.at(d_ymin, d_observed_codes, d_observed_bounds[:, 1])
+    cp.maximum.at(d_xmax, d_observed_codes, d_observed_bounds[:, 2])
+    cp.maximum.at(d_ymax, d_observed_codes, d_observed_bounds[:, 3])
+
+    d_width = d_observed_bounds[:, 2] - d_observed_bounds[:, 0]
+    d_height = d_observed_bounds[:, 3] - d_observed_bounds[:, 1]
+    d_area_sum = cp.zeros(group_count, dtype=cp.float64)
+    cp.add.at(d_area_sum, d_observed_codes, d_width * d_height)
+    d_bbox_area = (d_xmax - d_xmin) * (d_ymax - d_ymin)
+    if not bool(cp.all(cp.isclose(d_area_sum, d_bbox_area, rtol=1.0e-12, atol=SPATIAL_EPSILON))):
+        return None
+
+    d_group_ymin = d_ymin[d_observed_codes]
+    d_group_ymax = d_ymax[d_observed_codes]
+    d_group_xmin = d_xmin[d_observed_codes]
+    d_group_xmax = d_xmax[d_observed_codes]
+    d_full_height = cp.isclose(
+        d_observed_bounds[:, 1],
+        d_group_ymin,
+        rtol=1.0e-12,
+        atol=SPATIAL_EPSILON,
+    ) & cp.isclose(
+        d_observed_bounds[:, 3],
+        d_group_ymax,
+        rtol=1.0e-12,
+        atol=SPATIAL_EPSILON,
+    )
+    d_full_width = cp.isclose(
+        d_observed_bounds[:, 0],
+        d_group_xmin,
+        rtol=1.0e-12,
+        atol=SPATIAL_EPSILON,
+    ) & cp.isclose(
+        d_observed_bounds[:, 2],
+        d_group_xmax,
+        rtol=1.0e-12,
+        atol=SPATIAL_EPSILON,
+    )
+    same_group = d_observed_codes[1:] == d_observed_codes[:-1]
+    x_contiguous = bool(
+        cp.all(
+            (~same_group)
+            | cp.isclose(
+                d_observed_bounds[:-1, 2],
+                d_observed_bounds[1:, 0],
+                rtol=1.0e-12,
+                atol=SPATIAL_EPSILON,
+            )
+        )
+    )
+    y_contiguous = bool(
+        cp.all(
+            (~same_group)
+            | cp.isclose(
+                d_observed_bounds[:-1, 3],
+                d_observed_bounds[1:, 1],
+                rtol=1.0e-12,
+                atol=SPATIAL_EPSILON,
+            )
+        )
+    )
+    horizontal_strip = bool(cp.all(d_full_height)) and x_contiguous
+    vertical_strip = bool(cp.all(d_full_width)) and y_contiguous
+    if not (horizontal_strip or vertical_strip):
+        return None
+
     d_group_bounds = cp.stack((d_xmin, d_ymin, d_xmax, d_ymax), axis=1)
     reduced = _build_device_boxes_from_bounds(d_group_bounds, row_count=group_count)
 
@@ -2001,6 +2054,19 @@ def execute_grouped_union_codes(
         )
 
     if (
+        owned is not None
+        and normalized is DissolveUnionMethod.COVERAGE
+        and grid_size is None
+    ):
+        accelerated = execute_grouped_box_union_gpu_owned_codes(
+            row_group_codes,
+            group_count=group_count,
+            owned=owned,
+        )
+        if accelerated is not None:
+            return accelerated
+
+    if (
         normalized is DissolveUnionMethod.COVERAGE
         and geometry_count >= OVERLAY_GROUPED_BOX_GPU_THRESHOLD
     ):
@@ -2406,6 +2472,8 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
 
     observed_rows = np.flatnonzero(row_group_codes >= 0).astype(np.int64, copy=False)
     if observed_rows.size < OVERLAY_UNION_ALL_GPU_THRESHOLD:
+        return None
+    if observed_rows.size <= _BUFFERED_LINE_EXACT_CPU_MAX_ROWS:
         return None
 
     source_owned = _provenance_source_owned(tag)

@@ -338,6 +338,7 @@ def build_gpu_split_events(
     dispatch_mode: ExecutionMode | str = ExecutionMode.GPU,
     _cached_right_segments: DeviceSegmentTable | None = None,
     require_same_row: bool = False,
+    use_same_row_fast_path: bool | None = None,
     right_geometry_source_rows: cp.ndarray | np.ndarray | None = None,
 ) -> SplitEventTable:
     _require_gpu_arrays()
@@ -396,6 +397,8 @@ def build_gpu_split_events(
             ring_indices=right_segments.ring_indices,
         )
     original_right_segment_rows = cp.asarray(right_segments.row_indices, dtype=cp.int32)
+    if use_same_row_fast_path is None:
+        use_same_row_fast_path = not require_same_row
 
     try:
         with hotpath_stage("overlay.split.classify_intersections", category="refine"):
@@ -405,11 +408,7 @@ def build_gpu_split_events(
                 dispatch_mode=classification_dispatch_mode,
                 _cached_right_device_segments=effective_right_segments,
                 _require_same_row=require_same_row,
-                # Row-isolated overlay plan build prioritizes robustness over the
-                # specialized same-row warp candidate shortcut. Keep the row
-                # filter on GPU, but use the general sort-sweep path so plan
-                # construction cannot be derailed by a planner-local fast path.
-                _use_same_row_fast_path=not require_same_row,
+                _use_same_row_fast_path=use_same_row_fast_path,
             )
     except Exception as exc:
         raise RuntimeError(

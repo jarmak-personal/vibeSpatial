@@ -90,6 +90,30 @@ def test_execute_grouped_union_owned_coverage_avoids_geometry_materialization() 
     assert grouped.owned.row_count == 2
 
 
+@pytest.mark.gpu
+def test_execute_grouped_union_codes_owned_coverage_avoids_geometry_materialization() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    class ExplodingGeometries:
+        def __array__(self, dtype=None):
+            raise AssertionError("owned coverage dissolve codes path materialized geometry objects")
+
+    owned = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+    grouped = dissolve_module.execute_grouped_union_codes(
+        ExplodingGeometries(),
+        np.asarray([0, 1], dtype=np.int32),
+        group_count=2,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.geometries is None
+    assert grouped.owned is not None
+    assert grouped.owned.row_count == 2
+
+
 def test_evaluate_geopandas_dissolve_matches_current_categorical_semantics() -> None:
     frame = geopandas.GeoDataFrame(
         {
@@ -354,6 +378,56 @@ def test_evaluate_geopandas_dissolve_routes_small_buffered_line_unary_to_exact_c
     assert actual.iloc[0]["value"] == expected.iloc[0]["value"]
 
 
+def test_duplicate_two_point_buffered_line_dissolve_prefers_small_cpu_rescue() -> None:
+    lines = [
+        LineString([(0.0, 0.0), (10.0, 0.0)]),
+        LineString([(10.0, 0.0), (0.0, 0.0)]),
+        LineString([(0.0, 5.0), (10.0, 5.0)]),
+        LineString([(10.0, 5.0), (0.0, 5.0)]),
+    ] * 32
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": np.zeros(len(lines), dtype=np.int32),
+            "value": np.arange(len(lines), dtype=np.int32),
+            "geometry": lines,
+        },
+        crs="EPSG:3857",
+    )
+    buffered = frame.copy()
+    buffered["geometry"] = buffered.geometry.buffer(0.5)
+
+    clear_rewrite_events()
+    geopandas.clear_fallback_events()
+    actual = evaluate_geopandas_dissolve(
+        buffered,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+
+    assert not any(
+        event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
+        for event in rewrite_events
+    )
+    assert any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        for event in fallback_events
+    )
+    actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
+    expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+
 def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines_to_exact_gpu_union(
     monkeypatch,
 ) -> None:
@@ -386,6 +460,7 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
     def _fail(*_args, **_kwargs):
         raise AssertionError("duplicate two-point buffered-line dissolve should bypass the generic grouped union path")
 
+    monkeypatch.setattr(dissolve_module, "_BUFFERED_LINE_EXACT_CPU_MAX_ROWS", 1)
     monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
 
     clear_rewrite_events()
@@ -492,6 +567,7 @@ def test_buffered_two_point_line_exact_union_rewrite_accepts_large_deduped_sets(
     def _fail(*_args, **_kwargs):
         raise AssertionError("large deduped buffered-line dissolve should bypass the generic grouped union path")
 
+    monkeypatch.setattr(dissolve_module, "_BUFFERED_LINE_EXACT_CPU_MAX_ROWS", 1)
     monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
 
     clear_rewrite_events()
@@ -1027,22 +1103,52 @@ def test_execute_grouped_box_union_gpu_owned_codes_accepts_fractional_rectangles
     if not has_gpu_runtime():
         return
 
-    frame = _regular_polygons_frame(32)
     geometry_array = GeometryArray.from_owned(
-        from_shapely_geometries(list(frame.geometry))
+        from_shapely_geometries(
+            [
+                box(0.0, 0.0, 0.5, 1.0),
+                box(0.5, 0.0, 1.0, 1.0),
+                box(2.0, 0.0, 2.5, 1.0),
+                box(2.5, 0.0, 3.0, 1.0),
+            ]
+        )
     )
     owned = getattr(geometry_array, "_owned", None)
     assert owned is not None
 
     grouped = dissolve_module.execute_grouped_box_union_gpu_owned_codes(
-        np.arange(len(frame), dtype=np.int32) % 16,
-        group_count=16,
+        np.asarray([0, 0, 1, 1], dtype=np.int32),
+        group_count=2,
         owned=owned,
     )
 
     assert grouped is not None
     assert grouped.owned is not None
     assert grouped.geometries is None
+
+
+def test_execute_grouped_box_union_gpu_owned_codes_rejects_gapped_groups() -> None:
+    if not has_gpu_runtime():
+        return
+
+    geometry_array = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                box(0.0, 0.0, 1.0, 1.0),
+                box(0.0, 2.0, 1.0, 3.0),
+            ]
+        )
+    )
+    owned = getattr(geometry_array, "_owned", None)
+    assert owned is not None
+
+    grouped = dissolve_module.execute_grouped_box_union_gpu_owned_codes(
+        np.asarray([0, 0], dtype=np.int32),
+        group_count=1,
+        owned=owned,
+    )
+
+    assert grouped is None
 
 
 def test_execute_grouped_union_codes_linestrings_skip_owned_segmented_union_fast_path(

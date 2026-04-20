@@ -1049,6 +1049,56 @@ def test_overlay_difference_grouped_plan_avoids_brittle_same_row_fast_path(
         assert shapely.symmetric_difference(got, want).area < 1e-8
 
 
+def test_row_isolated_intersection_uses_same_row_candidate_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    from vibespatial.runtime.hotpath_trace import (
+        reset_hotpath_trace,
+        summarize_hotpath_trace,
+    )
+
+    left = from_shapely_geometries(
+        [
+            box(0, 0, 3, 3),
+            box(10, 0, 13, 3),
+            box(20, 0, 23, 3),
+        ]
+    )
+    right = from_shapely_geometries(
+        [
+            box(1, 1, 4, 4),
+            box(11, 1, 14, 4),
+            box(21, 1, 24, 4),
+        ]
+    )
+
+    monkeypatch.setenv("VIBESPATIAL_HOTPATH_TRACE", "1")
+    reset_hotpath_trace()
+    result = overlay_gpu_module._overlay_owned(
+        left,
+        right,
+        operation="intersection",
+        dispatch_mode=ExecutionMode.GPU,
+        _row_isolated=True,
+    )
+
+    expected = shapely.intersection(
+        np.asarray(left.to_shapely(), dtype=object),
+        np.asarray(right.to_shapely(), dtype=object),
+    )
+    actual = np.asarray(result.to_shapely(), dtype=object)
+
+    assert result.row_count == left.row_count
+    assert all(got.normalize().equals_exact(want.normalize(), tolerance=1e-9) for got, want in zip(actual, expected, strict=True))
+
+    summary = {entry["name"]: entry["calls"] for entry in summarize_hotpath_trace()}
+    assert summary.get("segment.candidates.same_row_fast_path") == 1
+    assert "segment.candidates.binary_search" not in summary
+
+
 def test_grouped_overlay_difference_forces_gpu_segment_classification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3711,6 +3761,60 @@ def test_make_valid_geoseries_uses_seeded_validity_cache_without_recompute(
     )
 
     assert repaired is geometries
+
+
+def test_candidate_rows_all_valid_uses_owned_validity_cache_without_recompute(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+
+    owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(2.0, 2.0, 3.0, 3.0)],
+        residency=Residency.DEVICE if vibespatial.has_gpu_runtime() else Residency.HOST,
+    )
+    owned._cached_is_valid_mask = np.ones(owned.row_count, dtype=bool)
+    geometries = GeoSeries(GeometryArray.from_owned(owned))
+
+    monkeypatch.setattr(
+        validity_module,
+        "is_valid_owned",
+        lambda *args, **kwargs: pytest.fail(
+            "candidate validity gate should use the source owned validity cache"
+        ),
+    )
+
+    assert overlay_module._candidate_rows_all_valid(
+        geometries,
+        np.asarray([1, 0], dtype=np.int32),
+    )
+
+
+def test_candidate_rows_all_valid_skips_recompute_for_device_rectangles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+
+    owned = from_shapely_geometries(
+        [box(0.0, 0.0, 1.0, 1.0), box(2.0, 2.0, 3.0, 3.0)],
+        residency=Residency.DEVICE,
+    )
+    geometries = GeoSeries(GeometryArray.from_owned(owned))
+
+    monkeypatch.setattr(
+        validity_module,
+        "is_valid_owned",
+        lambda *args, **kwargs: pytest.fail(
+            "dense device rectangles are valid without a generic OGC validity scan"
+        ),
+    )
+
+    assert overlay_module._candidate_rows_all_valid(
+        geometries,
+        np.asarray([1, 0], dtype=np.int32),
+    )
 
 
 def test_overlay_intersection_seeds_polygon_validity_cache_on_owned_result() -> None:

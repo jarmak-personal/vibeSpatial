@@ -111,7 +111,7 @@ def _device_dense_point_coords(
 
     global_rows = cp.flatnonzero(valid_mask)
     family_rows = state.family_row_offsets[global_rows]
-    non_empty = ~points.empty_mask[family_rows]
+    non_empty = ~points.empty_mask[family_rows].astype(cp.bool_, copy=False)
     if int(non_empty.sum()) == 0:
         return dense_x, dense_y
 
@@ -2376,7 +2376,7 @@ def _iterative_nearest_gpu(
 # ---------------------------------------------------------------------------
 
 def nearest_spatial_index(
-    tree_geometries: np.ndarray,
+    tree_geometries: np.ndarray | None,
     geometry: Any,
     *,
     tree_query_nearest,
@@ -2384,29 +2384,44 @@ def nearest_spatial_index(
     max_distance: float | None = None,
     return_distance: bool = False,
     exclusive: bool = False,
+    tree_owned: OwnedGeometryArray | None = None,
+    query_owned: OwnedGeometryArray | None = None,
 ) -> tuple[Any, str]:
     """Find nearest tree geometry for each query geometry.
 
     Returns ``(result, implementation)`` where *implementation* is one of
     ``"strtree_host"``, ``"owned_gpu_nearest"``, or ``"owned_cpu_nearest"``.
     """
-    query_values, scalar = _as_geometry_array(geometry)
-    if query_values is None:
+    if query_owned is not None:
+        query_values = None
+        scalar = False
+        n_queries = query_owned.row_count
+    else:
+        query_values, scalar = _as_geometry_array(geometry)
+        n_queries = 0 if query_values is None else len(query_values)
+    if query_values is None and query_owned is None:
         result = _empty_nearest_result(return_distance)
         return result, "owned_cpu_nearest"
 
     # --- NEW: Try zero-copy GPU grid nearest (bypasses _to_owned entirely) ---
-    grid_result = _nearest_grid_gpu(
-        tree_geometries, query_values,
-        return_all=return_all, return_distance=return_distance,
-        exclusive=exclusive, max_distance=max_distance,
-    )
-    if grid_result is not None:
-        return grid_result
+    if tree_owned is None and query_owned is None and tree_geometries is not None:
+        grid_result = _nearest_grid_gpu(
+            tree_geometries, query_values,
+            return_all=return_all, return_distance=return_distance,
+            exclusive=exclusive, max_distance=max_distance,
+        )
+        if grid_result is not None:
+            return grid_result
 
     # --- Convert owned arrays and compute bounds (shared by both paths) ---
-    query_owned = _to_owned(query_values)
-    tree_owned = _to_owned(tree_geometries)
+    if query_owned is None:
+        query_owned = _to_owned(query_values)
+    if tree_owned is None:
+        if tree_geometries is None:
+            raise ValueError("tree_geometries or tree_owned is required for nearest")
+        tree_owned = _to_owned(tree_geometries)
+    n_queries = query_owned.row_count
+    n_tree = tree_owned.row_count
 
     # Try the efficient indexed GPU nearest path for all-Point arrays.
     # Works for both bounded (max_distance != None) and unbounded nearest.
@@ -2465,16 +2480,17 @@ def nearest_spatial_index(
     if max_distance is not None:
         effective_max_distance = float(max_distance)
     else:
-        n_queries = len(query_values)
-        n_tree = len(tree_geometries)
         selection = plan_dispatch_selection(
             kernel_name="nearest_knn_brute",
             kernel_class=KernelClass.COARSE,
             row_count=n_queries * n_tree,
             gpu_available=has_gpu_runtime(),
+            current_residency=combined_residency(query_owned, tree_owned),
         )
         if selection.selected is not ExecutionMode.GPU:
             # Below crossover -- STRtree kNN is more efficient for small data.
+            if query_values is None:
+                query_values = np.asarray(query_owned.to_shapely(), dtype=object)
             result = tree_query_nearest(
                 query_values,
                 max_distance=max_distance,
@@ -2539,7 +2555,7 @@ def nearest_spatial_index(
             left_idx, right_idx = gpu_candidates
             impl = "owned_gpu_nearest"
         else:
-            per_row_distance = np.full(len(query_values), effective_max_distance, dtype=np.float64)
+            per_row_distance = np.full(n_queries, effective_max_distance, dtype=np.float64)
             left_idx, right_idx = _generate_distance_pairs(query_bounds, tree_bounds, per_row_distance)
             impl = "owned_cpu_nearest"
 
@@ -2556,7 +2572,7 @@ def nearest_spatial_index(
         tree_owned,
         left_idx,
         right_idx,
-        len(query_values),
+        n_queries,
         max_distance=effective_max_distance,
         return_all=return_all,
         exclusive=exclusive,
@@ -2576,6 +2592,10 @@ def nearest_spatial_index(
             d2h_transfer=False,
         )
     impl = "owned_cpu_nearest"
+    if query_values is None:
+        query_values = np.asarray(query_owned.to_shapely(), dtype=object)
+    if tree_geometries is None:
+        tree_geometries = np.asarray(tree_owned.to_shapely(), dtype=object)
     left_values = query_values[left_idx]
     right_values = tree_geometries[right_idx]
     distances = shapely.distance(left_values, right_values)
@@ -2589,7 +2609,7 @@ def nearest_spatial_index(
         result = _empty_nearest_result(return_distance)
         return result, impl
 
-    min_distance = np.full(len(query_values), np.inf, dtype=np.float64)
+    min_distance = np.full(n_queries, np.inf, dtype=np.float64)
     np.minimum.at(min_distance, left_idx, distances)
     if return_all:
         keep = np.isclose(distances, min_distance[left_idx])

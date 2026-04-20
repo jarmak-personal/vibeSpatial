@@ -48,7 +48,7 @@ def test_vsbench_shootout_directory_smoke(capsys: pytest.CaptureFixture[str]) ->
     }
     if has_gpu_runtime():
         expected_failures = {
-            "corridor_flood_priority.py",
+            "transit_service_gap.py",
         }
     else:
         expected_failures = {
@@ -168,7 +168,7 @@ def test_strict_native_transit_service_gap_matches_baseline() -> None:
 
 
 @pytest.mark.gpu
-def test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss() -> None:
+def test_strict_native_shootout_handles_nested_launcher_gpu_visibility() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU required")
 
@@ -177,9 +177,8 @@ def test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss() -> None
         "from pathlib import Path; "
         "from vibespatial.bench.shootout import run_shootout; "
         "res = run_shootout("
-        "Path('benchmarks/shootout/network_service_area.py'), "
-        "repeat=1, warmup=False, scale='10k', timeout=300, quiet=True, "
-        "baseline_python='/tmp/gpd_bench/bin/python'"
+        "Path('benchmarks/shootout/nearby_buildings.py'), "
+        "repeat=1, warmup=False, scale='10k', timeout=300, quiet=True"
         "); "
         "print(json.dumps({"
         "'status': res.status, "
@@ -188,8 +187,11 @@ def test_strict_native_shootout_recovers_from_nested_launcher_gpu_loss() -> None
         "'launch': res.metadata.get('vibespatial_launch')"
         "}))"
     )
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv not available")
     proc = subprocess.run(
-        [str(Path(".venv/bin/python")), "-c", code],
+        [uv, "run", "python", "-c", code],
         cwd=Path.cwd(),
         env={
             **os.environ,
@@ -334,6 +336,44 @@ def test_shootout_in_process_retry_keeps_full_precompile(
     assert result.status == "pass"
     assert result.metadata["vibespatial_launch"] == "in_process_retry"
     assert seen["pipeline_warm"] is True
+
+
+def test_run_shootout_baseline_uses_isolated_uv_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "print('SHOOTOUT_FINGERPRINT: rows=1')\n",
+        encoding="utf-8",
+    )
+    calls: list[dict[str, object]] = []
+
+    def _fake_run_harness(**kwargs):
+        calls.append(kwargs)
+        return ShootoutRun(
+            label=kwargs["label"],
+            timing=timing_from_samples([1.0]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._find_uv", lambda: "uv")
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+
+    result = run_shootout(
+        script,
+        repeat=1,
+        warmup=False,
+        quiet=True,
+    )
+
+    assert result.status == "pass"
+    baseline_cmd = calls[0]["python_cmd"]
+    assert baseline_cmd[:4] == ["uv", "run", "--isolated", "--no-project"]
+    assert "--with" in baseline_cmd
+    assert "geopandas" in baseline_cmd
+    assert "pyarrow" in baseline_cmd
 
 
 def test_run_shootout_marks_cold_start_probe_metadata(

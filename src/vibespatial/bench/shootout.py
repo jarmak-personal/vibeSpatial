@@ -235,6 +235,7 @@ _FINGERPRINT_PREFIX = "SHOOTOUT_FINGERPRINT: "
 _NESTED_GPU_LAUNCH_ERRORS = (
     "GPU execution was requested, but no GPU runtime is available",
     "GPU WKB encode unavailable",
+    "strict native mode disallows geopandas fallback: geopandas.read_parquet :: explicit CPU fallback for GeoParquet scan backend selection",
 )
 
 
@@ -560,15 +561,15 @@ def run_shootout(
                 "uv not found. Install uv or use --baseline-python to "
                 "specify a Python interpreter with geopandas installed."
             )
-        deps = ["geopandas"]
+        deps = ["geopandas", "pyarrow"]
         if extra_deps:
-            deps.extend(extra_deps)
+            deps.extend(dep for dep in extra_deps if dep not in deps)
         with_args: list[str] = []
         for dep in deps:
             with_args.extend(["--with", dep])
         py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
         gpd_cmd = [
-            uv, "run", "--no-project",
+            uv, "run", "--isolated", "--no-project",
             "--python", py_ver,
             *with_args,
             "--", "python",

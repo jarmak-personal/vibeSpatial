@@ -620,6 +620,42 @@ def test_nearest_spatial_index_gpu_bounded_point_sweep_avoids_generic_bbox_candi
     assert impl == "owned_gpu_nearest"
 
 
+def test_nearest_spatial_index_uses_device_owned_point_buffers() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device-owned nearest")
+
+    tree = np.asarray([Point(0, 0), Point(2, 0), Point(10, 0)], dtype=object)
+    query = np.asarray([Point(1, 0), Point(20, 0)], dtype=object)
+    tree_owned = from_shapely_geometries(tree)
+    query_owned = from_shapely_geometries(query)
+    tree_owned.move_to(
+        Residency.DEVICE,
+        trigger="explicit-runtime-request",
+        reason="test nearest device-owned tree",
+    )
+    query_owned.move_to(
+        Residency.DEVICE,
+        trigger="explicit-runtime-request",
+        reason="test nearest device-owned query",
+    )
+
+    (indices, distances), impl = nearest_spatial_index(
+        None,
+        None,
+        tree_query_nearest=lambda *args, **kwargs: pytest.fail("device-owned nearest should not hit STRtree"),
+        return_all=True,
+        max_distance=2.0,
+        return_distance=True,
+        exclusive=False,
+        tree_owned=tree_owned,
+        query_owned=query_owned,
+    )
+
+    assert indices.tolist() == [[0, 0], [0, 1]]
+    assert np.allclose(distances, [1.0, 1.0])
+    assert impl == "owned_gpu_nearest"
+
+
 def test_nearest_spatial_index_unbounded_matches_expected_ties_and_distances() -> None:
     tree = np.asarray([Point(0, 0), Point(2, 0), Point(10, 0)], dtype=object)
     query = np.asarray([Point(1, 0), Point(20, 0)], dtype=object)

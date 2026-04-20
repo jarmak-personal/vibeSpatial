@@ -36,6 +36,7 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.config import (
     OVERLAY_GPU_REMAINDER_THRESHOLD,
     OVERLAY_PAIR_BATCH_THRESHOLD,
+    SPATIAL_EPSILON,
 )
 from vibespatial.runtime.crossover import WorkloadShape
 from vibespatial.runtime.dispatch import record_dispatch_event
@@ -264,9 +265,21 @@ def _candidate_rows_all_valid(series: GeoSeries, row_indices: np.ndarray) -> boo
     values = series.values
     owned = getattr(values, "_owned", None)
     if owned is not None:
+        cached = getattr(owned, "_cached_is_valid_mask", None)
+        if cached is not None and int(cached.size) == int(owned.row_count):
+            rows = np.asarray(row_indices, dtype=np.int64)
+            cached_mask = np.asarray(cached[rows], dtype=bool)
+            validity = np.asarray(owned.validity, dtype=bool)
+            if validity.size == int(owned.row_count):
+                cached_mask = cached_mask.copy()
+                cached_mask[~validity[rows]] = True
+            return bool(cached_mask.all())
+
         from vibespatial.constructive.validity import is_valid_owned
 
         subset = owned.take(np.asarray(row_indices, dtype=np.int64))
+        if _owned_subset_is_known_valid_rectangles(subset):
+            return True
         valid_mask = np.asarray(is_valid_owned(subset), dtype=bool)
         if not bool(np.all(subset.validity)):
             valid_mask = valid_mask.copy()
@@ -274,6 +287,37 @@ def _candidate_rows_all_valid(series: GeoSeries, row_indices: np.ndarray) -> boo
         return bool(valid_mask.all())
 
     return bool(series.iloc[np.asarray(row_indices, dtype=np.intp)].is_valid.all())
+
+
+def _owned_subset_is_known_valid_rectangles(owned) -> bool:
+    """Return True for dense positive-area rectangle polygon subsets."""
+    if owned.row_count == 0:
+        return True
+
+    from vibespatial.runtime.residency import Residency
+
+    if owned.residency is not Residency.DEVICE or owned.device_state is None:
+        return False
+    if not bool(np.all(owned.validity)):
+        return False
+
+    try:
+        from vibespatial.geometry.buffers import GeometryFamily
+        from vibespatial.kernels.constructive.polygon_rect_intersection import (
+            _device_rectangle_bounds,
+        )
+
+        polygon_buf = owned.device_state.families.get(GeometryFamily.POLYGON)
+        bounds = _device_rectangle_bounds(polygon_buf, owned.row_count)
+        if bounds is None:
+            return False
+        xmin, ymin, xmax, ymax = bounds
+        return bool(
+            ((xmax - xmin) > SPATIAL_EPSILON).all().item()
+            and ((ymax - ymin) > SPATIAL_EPSILON).all().item()
+        )
+    except Exception:
+        return False
 
 
 def _sync_hotpath() -> None:
@@ -6121,66 +6165,74 @@ def overlay(df1, df2, how="intersection", keep_geom_type=None, make_valid=True):
                 from vibespatial.constructive.make_valid_pipeline import (
                     make_valid_owned,
                 )
-                from vibespatial.constructive.validity import is_valid_owned
-
-                valid_mask = np.asarray(is_valid_owned(owned), dtype=bool)
-                if not bool(np.all(owned.validity)):
-                    valid_mask = valid_mask.copy()
-                    valid_mask[~owned.validity] = True
-                if valid_mask.all():
-                    return df
 
                 mv_result = make_valid_owned(
                     owned=owned,
                     dispatch_mode=dispatch_mode,
                 )
-                if mv_result.repaired_rows.size > 0:
-                    # Repair happened — prefer device-resident .owned
-                    # to avoid D->H transfer.
-                    new_ga = None
-                    if mv_result.owned is not None:
-                        try:
-                            new_ga = GeometryArray.from_owned(
-                                mv_result.owned, crs=df.crs,
-                            )
-                        except Exception as exc:
-                            record_fallback_event(
-                                surface="geopandas.array.make_valid",
-                                reason=(
-                                    "owned make_valid output could not be rewrapped; "
-                                    "host materialization required"
-                                ),
-                                detail=(
-                                    f"rewrap_error={type(exc).__name__}: {exc}"
-                                ),
-                                requested=dispatch_mode,
-                                selected=ExecutionMode.CPU,
-                                pipeline="overlay._make_valid",
-                                d2h_transfer=True,
-                            )
-                    if new_ga is None:
-                        try:
-                            from vibespatial.geometry.owned import (
-                                from_shapely_geometries,
-                            )
+                if mv_result.repaired_rows.size == 0:
+                    return df
 
-                            new_owned = from_shapely_geometries(
-                                list(mv_result.geometries),
-                            )
-                            new_ga = GeometryArray.from_owned(
-                                new_owned, crs=df.crs,
-                            )
-                        except NotImplementedError:
-                            new_ga = GeometryArray(
-                                mv_result.geometries, crs=df.crs,
-                            )
-                    col = df._geometry_column_name
-                    df[col] = GeoSeries(new_ga, index=df.index)
-                    df = _collection_extract(
-                        df, geom_type="Polygon", keep_geom_type_warning=False
+                # Repair happened — prefer device-resident .owned
+                # to avoid D->H transfer.
+                new_ga = None
+                if mv_result.owned is not None:
+                    try:
+                        new_ga = GeometryArray.from_owned(
+                            mv_result.owned, crs=df.crs,
+                        )
+                    except Exception as exc:
+                        record_fallback_event(
+                            surface="geopandas.array.make_valid",
+                            reason=(
+                                "owned make_valid output could not be rewrapped; "
+                                "host materialization required"
+                            ),
+                            detail=(
+                                f"rewrap_error={type(exc).__name__}: {exc}"
+                            ),
+                            requested=dispatch_mode,
+                            selected=ExecutionMode.CPU,
+                            pipeline="overlay._make_valid",
+                            d2h_transfer=True,
+                        )
+                if new_ga is None:
+                    try:
+                        from vibespatial.geometry.owned import (
+                            from_shapely_geometries,
+                        )
+
+                        new_owned = from_shapely_geometries(
+                            list(mv_result.geometries),
+                        )
+                        new_ga = GeometryArray.from_owned(
+                            new_owned, crs=df.crs,
+                        )
+                    except NotImplementedError:
+                        new_ga = GeometryArray(
+                            mv_result.geometries, crs=df.crs,
+                        )
+                col = df._geometry_column_name
+                df[col] = GeoSeries(new_ga, index=df.index)
+                df = _collection_extract(
+                    df, geom_type="Polygon", keep_geom_type_warning=False
+                )
+                return df
+
+            if owned is not None:
+                from vibespatial.constructive.validity import is_valid_owned
+
+                mask = ~np.asarray(is_valid_owned(owned), dtype=bool)
+                if not bool(np.all(owned.validity)):
+                    mask = mask.copy()
+                    mask[~owned.validity] = False
+                if mask.any():
+                    raise ValueError(
+                        "You have passed make_valid=False along with "
+                        f"{mask.sum()} invalid input geometries. "
+                        "Use make_valid=True or make sure that all geometries "
+                        "are valid before using overlay."
                     )
-                # else: all rows already valid — owned backing preserved
-                #       by df.copy() above (GeometryArray.copy preserves _owned).
                 return df
 
             mask = ~df.geometry.is_valid

@@ -142,6 +142,40 @@ IO shootout gaps:
 Full pipeline profile remained structurally sane, but `join-heavy` still shows
 CPU `dissolve_groups` cost at 1m and `predicate-heavy` remains read-heavy.
 
+Remediation progress:
+
+- M1 public `spatial-query` now avoids eager owned conversion for regular-grid
+  box-array queries and is above parity at 10k and 100k.
+- M2 public `gpu-dissolve` now benchmarks the public coverage method for the
+  grouped-box coverage workload and keeps the grouped box reduction device
+  owned: 10k `3.09x`, 100k `36.63x` on the April 19 local RTX 4090 run.
+- M3 is closed for the April 20 workflow-regression pass. The latest full
+  10k repeat-3 shootout measured `accessibility_redevelopment.py` at `0.864x`,
+  `corridor_flood_priority.py` at `1.016x`, `network_service_area.py` at
+  `3.03x`, `parcel_zoning.py` at `0.901x`, `vegetation_corridor.py` at
+  `1.009x`, and `flood_exposure.py` at `1.064x`. The remaining sub-par
+  accessibility and parcel gaps are now exact polygon-mask/overlay dominated,
+  not benchmark harness regressions.
+- M3 relation-join public GeoDataFrame export now has a pandas-backed fast path
+  for simple inner joins while Arrow/native sinks keep the IO-zero export path.
+  Public `sjoin_nearest` also passes existing device-owned point buffers into
+  the nearest engine instead of rebuilding owned arrays from host Shapely
+  values. This moved `accessibility_redevelopment.py` to about `0.85x` at 10k
+  repeat-3 and removed about 1.5-1.9 ms from relation export plus another
+  ~0.7 ms from the warm nearest slice.
+- M3 public buffered-line dissolve now keeps small duplicate two-point line
+  groups on the existing observable exact CPU rescue instead of forcing the
+  slower exact GPU rewrite. On the April 20 local RTX 4090 run,
+  `network_service_area.py` moved from `0.614x` to `3.31x` and
+  `corridor_flood_priority.py` moved from `0.568x` to `1.04x` at 10k repeat-3.
+  The combined full-suite artifact after the clip follow-up measured network
+  at `3.04x` and corridor at `0.98x`, so corridor is effectively parity but
+  still noisy around the line.
+- M0 shootout baselines now run `uv run --isolated --no-project` with
+  GeoPandas plus `pyarrow`, so the external denominator cannot see the
+  repo-local `.venv` or compatibility shim and still supports the Parquet
+  fixture files used by workflow scripts.
+
 ## Milestones
 
 ### M0: Trustworthy Harness

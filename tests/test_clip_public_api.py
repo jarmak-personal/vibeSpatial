@@ -365,6 +365,100 @@ def test_clip_scalar_rectangle_polygon_mask_auto_preserves_device_cleanup_path()
     )
 
 
+def test_clip_scalar_rectangle_simple_polygons_skips_generic_cleanup() -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    gdf = vibespatial.GeoDataFrame(
+        {"parcel_id": [1, 2, 3]},
+        geometry=vibespatial.GeoSeries(
+            [
+                box(0.0, 0.0, 2.0, 2.0),
+                box(2.0, 0.0, 4.0, 2.0),
+                box(5.0, 5.0, 6.0, 6.0),
+            ],
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    mask = box(1.0, -1.0, 3.0, 1.0)
+
+    vibespatial.clear_dispatch_events()
+    result = clip(gdf, mask, sort=False)
+
+    actual = np.asarray(result.geometry.values, dtype=object)
+    expected = np.asarray(
+        [
+            box(1.0, 0.0, 2.0, 1.0),
+            box(2.0, 0.0, 3.0, 1.0),
+        ],
+        dtype=object,
+    )
+    assert list(result["parcel_id"]) == [1, 2]
+    assert len(actual) == len(expected)
+    assert all(any(shapely.equals(geom, candidate) for candidate in expected) for geom in actual)
+    owned = result.geometry.values._owned
+    assert owned._cached_is_valid_mask is not None
+    assert owned._cached_is_valid_mask.tolist() == [True, True]
+
+    cleanup_events = [
+        event
+        for event in vibespatial.get_dispatch_events(clear=True)
+        if event.surface in {"geopandas.array.area", "geopandas.array.length"}
+    ]
+    assert cleanup_events == []
+
+
+def test_clip_polygon_mask_exact_stage_skips_predicate_rejects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    gdf = vibespatial.GeoDataFrame(
+        {"row": [0, 1, 2, 3]},
+        geometry=vibespatial.GeoSeries(
+            [
+                box(0.1, 0.1, 0.9, 0.9),
+                box(0.5, 0.5, 1.5, 1.5),
+                box(2.0, 2.0, 2.5, 2.5),
+                box(3.0, 0.2, 4.0, 0.8),
+            ],
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+            (0.0, 0.0),
+        ]
+    )
+
+    original = clip_module._clip_polygon_area_intersection_owned
+    exact_row_counts: list[int] = []
+
+    def wrapped(left_owned, mask_owned, **kwargs):
+        exact_row_counts.append(left_owned.row_count)
+        return original(left_owned, mask_owned, **kwargs)
+
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_polygon_area_intersection_owned",
+        wrapped,
+    )
+
+    result = clip(gdf, mask, sort=False)
+
+    assert exact_row_counts == [2]
+    assert list(result["row"]) == [0, 1, 3]
+
+
 def test_clip_records_fallback_before_line_make_valid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

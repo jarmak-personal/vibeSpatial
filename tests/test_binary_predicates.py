@@ -90,7 +90,10 @@ def test_binary_predicate_auto_fallback_is_visible(monkeypatch) -> None:
 
     assert bool(result.values[0]) is True
     report = left.diagnostics_report()
-    assert any("point-centric candidate rows" in reason for reason in report["runtime_history"])
+    assert any(
+        "GPU refine currently supports only point-centric and DE-9IM" in reason
+        for reason in report["runtime_history"]
+    )
 
 
 @pytest.mark.gpu
