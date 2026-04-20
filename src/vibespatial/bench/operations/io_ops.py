@@ -30,20 +30,21 @@ def bench_io_arrow(
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    import shapely
+
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
-    from vibespatial.io.wkb import encode_wkb_owned
 
     fmt = InputFormat(input_format)
     spec = resolve_fixture_spec("point", "grid", scale)
-    owned, read_seconds = load_owned(spec, fmt)
+    frame, read_seconds = load_public_geodataframe(spec, fmt)
 
-    encode_wkb_owned(owned)
+    frame.geometry.to_wkb()
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        encode_wkb_owned(owned)
+        frame.geometry.to_wkb()
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -53,10 +54,7 @@ def bench_io_arrow(
     speedup = None
     baseline_name = None
     if compare == "shapely" or compare is None:
-        import shapely
-
-        gdf, _ = load_geodataframe(spec, fmt)
-        geom_arr = gdf.geometry.to_numpy()
+        geom_arr = frame.geometry.to_numpy()
 
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
@@ -82,7 +80,7 @@ def bench_io_arrow(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"repeat": repeat, "format": "wkb-encode"},
+        metadata={"repeat": repeat, "format": "public-wkb-encode"},
     )
 
 
@@ -104,29 +102,69 @@ def bench_io_file(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
+    from time import perf_counter
 
-    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
-    from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
+    import vibespatial.api as geopandas
+    from vibespatial.bench.fixtures import (
+        InputFormat,
+        ensure_fixture_format,
+        resolve_fixture_spec,
+    )
 
     # This benchmark measures the read itself — input_format IS the operation
     fmt = InputFormat(input_format)
     spec = resolve_fixture_spec("point", "grid", scale)
+    path = ensure_fixture_format(spec, fmt)
 
-    # Time the owned (GPU-native) read
-    owned, read_seconds = load_owned(spec, fmt)
+    def _read_public():
+        if fmt == InputFormat.PARQUET:
+            return geopandas.read_parquet(path)
+        return geopandas.read_file(str(path))
 
-    # Time the GeoDataFrame (CPU) read as baseline
+    _read_public()
+
+    times: list[float] = []
+    frame = None
+    for _ in range(max(1, repeat)):
+        start = perf_counter()
+        frame = _read_public()
+        times.append(perf_counter() - start)
+
+    timing = timing_from_samples(times)
+
+    # Time explicit CPU/container readers as a reference denominator. Importing
+    # ``geopandas`` inside this repo resolves to the compatibility shim, so do
+    # not label that as a real GeoPandas baseline.
     baseline_timing = None
     speedup = None
     baseline_name = None
-    if compare is not None or True:  # always compare for IO benchmarks
-        gdf, baseline_read = load_geodataframe(spec, fmt)
-        baseline_timing = timing_from_samples([baseline_read])
-        baseline_name = f"geopandas-{input_format}"
-        if read_seconds > 0:
-            speedup = baseline_read / read_seconds
+    if compare in (None, "geopandas"):
+        try:
+            if fmt == InputFormat.PARQUET:
+                import pyarrow.parquet as pq
 
-    timing = timing_from_samples([read_seconds])
+                def _read_reference():
+                    return pq.read_table(path)
+
+                baseline_name = "pyarrow-parquet"
+            else:
+                import pyogrio
+
+                def _read_reference():
+                    return pyogrio.read_arrow(path)
+
+                baseline_name = f"pyogrio-arrow-{input_format}"
+        except ImportError:
+            baseline_name = None
+        else:
+            baseline_times: list[float] = []
+            for _ in range(max(1, repeat)):
+                start = perf_counter()
+                _read_reference()
+                baseline_times.append(perf_counter() - start)
+            baseline_timing = timing_from_samples(baseline_times)
+            if timing.median_seconds > 0:
+                speedup = baseline_timing.median_seconds / timing.median_seconds
 
     return BenchmarkResult(
         operation="io-file",
@@ -141,8 +179,8 @@ def bench_io_file(
         baseline_timing=baseline_timing,
         speedup=speedup,
         input_format=input_format,
-        read_seconds=read_seconds,
-        metadata={"format": input_format},
+        read_seconds=timing.median_seconds,
+        metadata={"format": input_format, "result_rows": len(frame) if frame is not None else None},
     )
 
 
@@ -154,6 +192,7 @@ def bench_io_file(
     default_scale=100_000,
     tier=1,
     tags=("gpu", "io"),
+    public_api=False,
 )
 def bench_gpu_decode(
     *,
@@ -230,6 +269,7 @@ def bench_gpu_decode(
     default_scale=100_000,
     tier=3,
     tags=("layout",),
+    public_api=False,
 )
 def bench_mixed_layouts(
     *,

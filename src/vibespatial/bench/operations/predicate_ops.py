@@ -38,6 +38,7 @@ from vibespatial.bench.schema import (
         ),
     ),
     tags=("gpu", "compare"),
+    public_api=False,
 )
 def bench_gpu_pip(
     *,
@@ -258,30 +259,29 @@ def bench_binary_predicates(
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import (
         InputFormat,
         ensure_shifted_fixture,
         resolve_fixture_spec,
     )
-    from vibespatial.predicates.binary import evaluate_binary_predicate
 
     fmt = InputFormat(input_format)
     left_spec = resolve_fixture_spec("polygon", "regular-grid", scale)
     right_spec, _ = ensure_shifted_fixture(left_spec, xoff=0.3, yoff=0.3, fmt=fmt)
 
-    left_owned, read_s1 = load_owned(left_spec, fmt)
-    right_owned, read_s2 = load_owned(right_spec, fmt)
+    gdf_left, read_s1 = load_public_geodataframe(left_spec, fmt)
+    gdf_right, read_s2 = load_public_geodataframe(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
     predicate = kwargs.get("predicate", "intersects")
 
-    evaluate_binary_predicate(predicate, left_owned, right_owned)
+    getattr(gdf_left.geometry, predicate)(gdf_right.geometry)
 
     times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        evaluate_binary_predicate(predicate, left_owned, right_owned)
+        getattr(gdf_left.geometry, predicate)(gdf_right.geometry)
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -292,8 +292,6 @@ def bench_binary_predicates(
     if compare == "shapely" or compare is None:
         import shapely
 
-        gdf_left, _ = load_geodataframe(left_spec, fmt)
-        gdf_right, _ = load_geodataframe(right_spec, fmt)
         left_arr = gdf_left.geometry.to_numpy()
         right_arr = gdf_right.geometry.to_numpy()
 
@@ -333,6 +331,7 @@ def bench_binary_predicates(
     default_scale=100_000,
     tier=3,
     tags=("gpu", "compare"),
+    public_api=False,
 )
 def bench_gpu_predicates(
     *,
@@ -414,6 +413,7 @@ def bench_gpu_predicates(
     default_scale=10_000,
     tier=4,
     tags=("gpu", "cpu"),
+    public_api=False,
 )
 def bench_point_predicates(
     *,

@@ -180,50 +180,6 @@ def read_pyogrio_osm_layer(
         raise
 
 
-def frame_from_osm_result(result) -> gpd.GeoDataFrame:
-    from vibespatial.io.geoarrow import geoseries_from_owned
-
-    parts: list[gpd.GeoDataFrame] = []
-    if result.nodes is not None and result.n_nodes > 0:
-        parts.append(
-            gpd.GeoDataFrame(
-                {
-                    "osm_element": pd.Series("node", index=range(result.n_nodes), dtype="object"),
-                },
-                geometry=geoseries_from_owned(result.nodes, crs="EPSG:4326", name="geometry"),
-                crs="EPSG:4326",
-            )
-        )
-    if result.ways is not None and result.n_ways > 0:
-        parts.append(
-            gpd.GeoDataFrame(
-                {
-                    "osm_element": pd.Series("way", index=range(result.n_ways), dtype="object"),
-                },
-                geometry=geoseries_from_owned(result.ways, crs="EPSG:4326", name="geometry"),
-                crs="EPSG:4326",
-            )
-        )
-    if result.relations is not None and result.n_relations > 0:
-        parts.append(
-            gpd.GeoDataFrame(
-                {
-                    "osm_element": pd.Series(
-                        "relation", index=range(result.n_relations), dtype="object"
-                    ),
-                },
-                geometry=geoseries_from_owned(
-                    result.relations, crs="EPSG:4326", name="geometry"
-                ),
-                crs="EPSG:4326",
-            )
-        )
-    if not parts:
-        return _empty_frame()
-    combined = pd.concat(parts, ignore_index=True)
-    return gpd.GeoDataFrame(combined, geometry="geometry", crs="EPSG:4326")
-
-
 def fingerprint(frame: gpd.GeoDataFrame) -> str:
     if frame.empty:
         bounds = (0.0, 0.0, 0.0, 0.0)

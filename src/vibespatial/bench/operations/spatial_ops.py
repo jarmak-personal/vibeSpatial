@@ -30,40 +30,38 @@ def bench_bounds(
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    from vibespatial import ExecutionMode, has_gpu_runtime
-    from vibespatial.bench.fixture_loader import load_owned
+    import shapely
+
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
-    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
 
     spec = resolve_fixture_spec("point", "grid", scale)
-    owned, read_seconds = load_owned(spec, InputFormat(input_format))
+    frame, read_seconds = load_public_geodataframe(spec, InputFormat(input_format))
+    geometry = frame.geometry
 
-    # CPU timing
-    cpu_times: list[float] = []
+    _ = geometry.bounds
+    public_times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.CPU)
-        cpu_times.append(perf_counter() - start)
+        _ = geometry.bounds
+        public_times.append(perf_counter() - start)
 
-    # GPU timing
-    gpu_times: list[float] = []
     speedup = None
     baseline_timing = None
+    baseline_name = None
 
-    if has_gpu_runtime():
-        compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
+    timing = timing_from_samples(public_times)
+    if compare == "shapely" or compare is None:
+        values = geometry.to_numpy()
+        baseline_times: list[float] = []
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            compute_geometry_bounds(owned, dispatch_mode=ExecutionMode.GPU)
-            gpu_times.append(perf_counter() - start)
-
-    if gpu_times:
-        timing = timing_from_samples(gpu_times)
-        baseline_timing = timing_from_samples(cpu_times)
+            shapely.bounds(values)
+            baseline_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(baseline_times)
+        baseline_name = "shapely"
         if timing.median_seconds > 0:
             speedup = baseline_timing.median_seconds / timing.median_seconds
-    else:
-        timing = timing_from_samples(cpu_times)
 
     return BenchmarkResult(
         operation="bounds",
@@ -74,7 +72,7 @@ def bench_bounds(
         status="pass",
         status_reason="ok",
         timing=timing,
-        baseline_name="cpu" if gpu_times else None,
+        baseline_name=baseline_name,
         baseline_timing=baseline_timing,
         speedup=speedup,
         input_format=input_format,
@@ -115,15 +113,12 @@ def bench_spatial_query(
     import shapely
     from shapely.affinity import translate
 
-    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
-    from vibespatial.spatial.indexing import build_flat_spatial_index
-    from vibespatial.spatial.query import query_spatial_index
 
     fmt = InputFormat(input_format)
     spec = resolve_fixture_spec("polygon", "regular-grid", scale)
-    owned, read_seconds = load_owned(spec, fmt)
-    gdf, _ = load_geodataframe(spec, fmt)
+    gdf, read_seconds = load_public_geodataframe(spec, fmt)
 
     overlap_ratio = float(kwargs.get("overlap_ratio", 0.2))
     if not 0.0 <= overlap_ratio <= 1.0:
@@ -151,16 +146,13 @@ def bench_spatial_query(
         tree.query(query_geoms, predicate="intersects")
         shapely_times.append(perf_counter() - start)
 
-    # --- vibeSpatial (construction + query) ---
-    # Warmup
-    flat_index = build_flat_spatial_index(owned)
-    query_spatial_index(owned, flat_index, query_geoms, predicate="intersects")
+    # --- vibeSpatial public API (construction + query) ---
+    gdf.sindex.query(query_geoms, predicate="intersects")
 
     gpu_times: list[float] = []
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        flat_index = build_flat_spatial_index(owned)
-        query_spatial_index(owned, flat_index, query_geoms, predicate="intersects")
+        gdf.sindex.query(query_geoms, predicate="intersects")
         gpu_times.append(perf_counter() - start)
 
     timing = timing_from_samples(gpu_times)
@@ -217,6 +209,7 @@ def bench_spatial_query(
     ),
     tags=("gpu",),
     max_scale=100_000,
+    public_api=False,
 )
 def bench_bounds_pairs(
     *,

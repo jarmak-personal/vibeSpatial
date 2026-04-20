@@ -39,6 +39,9 @@ vsbench run clip-rect --arg kind=polygon --arg rect=100,100,700,700
 Use `vsbench list operations --json` to discover typed operation-specific
 parameters. Operation arguments are passed with repeatable `--arg key=value`
 flags and validated against the operation schema before execution.
+Default operation listings and suites measure public GeoPandas-compatible APIs;
+private owned-array and kernel diagnostics require `--include-internal` or
+`vsbench kernel`.
 
 **Common flags** (shared by `run`, `pipeline`, `suite`, `kernel`):
 
@@ -80,6 +83,11 @@ vsbench suite ci --json --output ci.json  # CI gate
 vsbench suite full --gpu-sparkline        # Full profiling run
 ```
 
+Suites run serially and isolate each benchmark item in a subprocess by default
+so CUDA allocator state, failed kernels, or OOMs do not contaminate later
+items. Use `--in-process` only for local debugging. Use `--item-timeout N` to
+override the default 600 second per-item timeout.
+
 Use `--pipeline <name>` (repeatable) to limit to specific pipelines.
 
 ### `vsbench kernel <name>`
@@ -119,8 +127,9 @@ vsbench report ci.json -o report.html
 Discover what benchmarks are available.
 
 ```bash
-vsbench list operations                # All registered operations
+vsbench list operations                # Public API operations
 vsbench list operations --json         # Includes operation parameter schemas
+vsbench list operations --include-internal  # Include private diagnostics
 vsbench list operations --category io  # Filter by category
 vsbench list pipelines                 # Available pipelines
 vsbench list fixtures                  # Fixture specs and scales

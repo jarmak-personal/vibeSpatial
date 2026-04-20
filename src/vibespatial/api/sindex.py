@@ -16,7 +16,6 @@ from vibespatial.spatial.query import (
     query_spatial_index,
     supports_owned_spatial_input,
 )
-from vibespatial.spatial.query_utils import _to_owned
 
 from . import _compat as compat
 
@@ -335,9 +334,29 @@ class SpatialIndex:
             )
 
         raw_geometry = geometry
-        if predicate in OWNED_QUERY_PREDICATES and self._supports_owned_query_input(raw_geometry):
+        precomputed_query_bounds = None
+        raw_box_array_fast_path = False
+        if (
+            predicate in (None, "intersects")
+            and isinstance(raw_geometry, np.ndarray)
+            and raw_geometry.ndim >= 1
+            and self._supports_owned_tree_input()
+        ):
             tree_owned, flat_index = self._owned_flat_sindex()
-            query_input = self._owned_query_input(raw_geometry)
+            if getattr(flat_index, "regular_grid", None) is not None:
+                from vibespatial.spatial.query_box import _extract_box_query_bounds_shapely
+
+                precomputed_query_bounds = _extract_box_query_bounds_shapely(raw_geometry)
+                raw_box_array_fast_path = precomputed_query_bounds is not None
+        if (
+            raw_box_array_fast_path
+            or (
+                predicate in OWNED_QUERY_PREDICATES
+                and self._supports_owned_query_input(raw_geometry)
+            )
+        ):
+            tree_owned, flat_index = self._owned_flat_sindex()
+            query_input = raw_geometry if raw_box_array_fast_path else self._owned_query_input(raw_geometry)
             # Pass already-materialized Shapely arrays to avoid redundant
             # to_shapely() in predicate refinement.  Only use arrays that
             # are ALREADY cached — never trigger eager materialization here.
@@ -370,6 +389,7 @@ class SpatialIndex:
                 return_device=return_device,
                 tree_shapely=tree_shapely_arr,
                 query_shapely=query_shapely_arr,
+                precomputed_query_bounds=precomputed_query_bounds,
             )
             record_dispatch_event(
                 surface="geopandas.sindex.query",
@@ -443,12 +463,13 @@ class SpatialIndex:
             return self._geometry_array.owned_flat_sindex()
         return build_owned_spatial_index(np.asarray(self.geometries, dtype=object))
 
-    def _supports_owned_query_input(self, geometry) -> bool:
+    def _supports_owned_tree_input(self) -> bool:
         if self._geometry_array is not None and hasattr(self._geometry_array, "supports_owned_spatial_input"):
-            tree_supported = self._geometry_array.supports_owned_spatial_input()
-        else:
-            tree_supported = supports_owned_spatial_input(self.geometries)
-        if not tree_supported:
+            return self._geometry_array.supports_owned_spatial_input()
+        return supports_owned_spatial_input(self.geometries)
+
+    def _supports_owned_query_input(self, geometry) -> bool:
+        if not self._supports_owned_tree_input():
             return False
         # Already-owned input is always supported — no conversion needed.
         if isinstance(geometry, OwnedGeometryArray):
@@ -472,9 +493,10 @@ class SpatialIndex:
         if isinstance(geometry, array.GeometryArray):
             return geometry.to_owned()
         if isinstance(geometry, np.ndarray) and geometry.ndim >= 1:
-            # Use _to_owned which has a vectorized fast-path for all-Point
-            # arrays (~1ms vs ~500ms for 100k points).
-            return _to_owned(geometry)
+            # Keep Shapely arrays as Shapely here. query_spatial_index() has
+            # bounds-only regular-grid and point-tree fast paths that avoid
+            # full owned conversion unless exact refinement needs it.
+            return geometry
         # Scalar BaseGeometry or other types — keep as-is so
         # query_spatial_index() can detect scalar input correctly.
         return geometry

@@ -388,45 +388,21 @@ def _extract_box_query_bounds_shapely(query_values: np.ndarray) -> np.ndarray | 
     if not np.all(interior_counts == 0):
         return None
 
-    # Exactly 5 coordinates per polygon (closed box).
-    coord_counts = _shapely.get_num_coordinates(valid_geoms)
-    if not np.all(coord_counts == 5):
+    valid_bounds = _shapely.bounds(valid_geoms)
+    minx = valid_bounds[:, 0]
+    miny = valid_bounds[:, 1]
+    maxx = valid_bounds[:, 2]
+    maxy = valid_bounds[:, 3]
+    bbox_area = (maxx - minx) * (maxy - miny)
+    if not np.all(bbox_area > 0.0):
         return None
 
-    n_valid = int(valid.sum())
-    coords = _shapely.get_coordinates(valid_geoms)
-    if coords.shape[0] != n_valid * 5:
-        return None
-    all_xy = coords.reshape(n_valid, 5, 2)
-    all_x = all_xy[:, :, 0]
-    all_y = all_xy[:, :, 1]
-
-    minx = all_x.min(axis=1)
-    maxx = all_x.max(axis=1)
-    miny = all_y.min(axis=1)
-    maxy = all_y.max(axis=1)
-
-    tol = 1e-9 * np.maximum(np.maximum(np.abs(maxx - minx), np.abs(maxy - miny)), 1.0)
-
-    # Closed ring check.
-    if not np.all(np.abs(all_x[:, 0] - all_x[:, -1]) <= tol):
-        return None
-    if not np.all(np.abs(all_y[:, 0] - all_y[:, -1]) <= tol):
-        return None
-
-    # All coords must be at min or max x/y.
-    tol_2d = tol[:, None]
-    x_at_min_or_max = (np.abs(all_x - minx[:, None]) <= tol_2d) | (np.abs(all_x - maxx[:, None]) <= tol_2d)
-    y_at_min_or_max = (np.abs(all_y - miny[:, None]) <= tol_2d) | (np.abs(all_y - maxy[:, None]) <= tol_2d)
-    if not np.all(x_at_min_or_max):
-        return None
-    if not np.all(y_at_min_or_max):
-        return None
-
-    # Each edge must be axis-aligned.
-    edge_same_x = np.abs(all_x[:, 1:] - all_x[:, :-1]) <= tol_2d
-    edge_same_y = np.abs(all_y[:, 1:] - all_y[:, :-1]) <= tol_2d
-    if not np.all(np.logical_xor(edge_same_x, edge_same_y)):
+    # For a valid polygon with no holes, area equal to its envelope area means
+    # it covers the whole axis-aligned envelope. This accepts harmless
+    # collinear-vertex boxes while rejecting L-shapes and rotated polygons.
+    area = _shapely.area(valid_geoms)
+    tol = 1e-9 * np.maximum(np.abs(bbox_area), 1.0)
+    if not np.all(np.abs(area - bbox_area) <= tol):
         return None
 
     bounds = np.full((n, 4), np.nan, dtype=np.float64)

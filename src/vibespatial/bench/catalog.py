@@ -151,6 +151,7 @@ class OperationSpec:
     parameters: tuple[OperationParameterSpec, ...] = ()
     tags: tuple[str, ...] = ()
     max_scale: int | None = None
+    public_api: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -168,6 +169,7 @@ class OperationSpec:
             d["parameters"] = [param.to_dict() for param in self.parameters]
         if self.max_scale is not None:
             d["max_scale"] = self.max_scale
+        d["public_api"] = self.public_api
         return d
 
 
@@ -190,6 +192,7 @@ def benchmark_operation(
     parameters: tuple[OperationParameterSpec, ...] = (),
     tags: tuple[str, ...] = (),
     max_scale: int | None = None,
+    public_api: bool = True,
 ):
     """Decorator that registers a benchmark operation for CLI discovery."""
 
@@ -206,6 +209,7 @@ def benchmark_operation(
             parameters=parameters,
             tags=tags,
             max_scale=max_scale,
+            public_api=public_api,
         )
         _OPERATION_REGISTRY[name] = spec
         return func
@@ -227,11 +231,17 @@ def get_operation(name: str) -> OperationSpec:
     return _OPERATION_REGISTRY[name]
 
 
-def list_operations(*, category: str | None = None) -> tuple[OperationSpec, ...]:
+def list_operations(
+    *,
+    category: str | None = None,
+    include_internal: bool = False,
+) -> tuple[OperationSpec, ...]:
     """Return all registered operations, optionally filtered by category."""
     ops = tuple(_OPERATION_REGISTRY.values())
     if category is not None:
         ops = tuple(op for op in ops if op.category == category)
+    if not include_internal:
+        ops = tuple(op for op in ops if op.public_api)
     return ops
 
 

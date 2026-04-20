@@ -32,13 +32,12 @@ def bench_gpu_overlay(
     from time import perf_counter
 
     from vibespatial import has_gpu_runtime
-    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import (
         InputFormat,
         ensure_shifted_fixture,
         resolve_fixture_spec,
     )
-    from vibespatial.overlay.gpu import overlay_intersection_owned
 
     if not has_gpu_runtime():
         return BenchmarkResult(
@@ -69,14 +68,14 @@ def bench_gpu_overlay(
     shift_y = cell_h * 0.3
     right_spec, _ = ensure_shifted_fixture(left_spec, xoff=shift_x, yoff=shift_y, fmt=fmt)
 
-    left_owned, read_s1 = load_owned(left_spec, fmt)
-    right_owned, read_s2 = load_owned(right_spec, fmt)
+    left_frame, read_s1 = load_public_geodataframe(left_spec, fmt)
+    right_frame, read_s2 = load_public_geodataframe(right_spec, fmt)
     read_seconds = read_s1 + read_s2
 
-    # Warmup with error guard: overlay on non-overlapping inputs can
-    # crash deep in the kernel with opaque IndexError / reshape errors.
+    # Public API warmup with error guard: this benchmark is only valid when
+    # the GeoPandas-compatible surface can reach the native overlay path.
     try:
-        overlay_intersection_owned(left_owned, right_owned)
+        left_frame.overlay(right_frame, how="intersection")
     except Exception as exc:
         return BenchmarkResult(
             operation="gpu-overlay",
@@ -92,10 +91,12 @@ def bench_gpu_overlay(
         )
 
     times: list[float] = []
+    result_rows = 0
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        overlay_intersection_owned(left_owned, right_owned)
+        result = left_frame.overlay(right_frame, how="intersection")
         times.append(perf_counter() - start)
+        result_rows = len(result)
 
     timing = timing_from_samples(times)
 
@@ -106,18 +107,21 @@ def bench_gpu_overlay(
     if compare == "shapely" or compare is None:
         import shapely
 
-        gdf_left, _ = load_geodataframe(left_spec, fmt)
-        gdf_right, _ = load_geodataframe(right_spec, fmt)
-        left_arr = gdf_left.geometry.to_numpy()
-        right_arr = gdf_right.geometry.to_numpy()
+        left_arr = left_frame.geometry.to_numpy()
+        right_arr = right_frame.geometry.to_numpy()
 
         shapely_times: list[float] = []
         for _ in range(max(1, repeat)):
             start = perf_counter()
-            shapely.intersection(left_arr, right_arr)
+            tree = shapely.STRtree(left_arr)
+            candidate_pairs = tree.query(right_arr, predicate="intersects")
+            if candidate_pairs.size:
+                right_idx = candidate_pairs[0]
+                left_idx = candidate_pairs[1]
+                shapely.intersection(left_arr[left_idx], right_arr[right_idx])
             shapely_times.append(perf_counter() - start)
         baseline_timing = timing_from_samples(shapely_times)
-        baseline_name = "shapely"
+        baseline_name = "shapely-strtree-intersection"
         if timing.median_seconds > 0:
             speedup = baseline_timing.median_seconds / timing.median_seconds
 
@@ -135,7 +139,7 @@ def bench_gpu_overlay(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"repeat": repeat},
+        metadata={"repeat": repeat, "result_rows": result_rows},
     )
 
 
@@ -155,6 +159,7 @@ def bench_gpu_overlay(
         ),
     ),
     tags=("gpu",),
+    public_api=False,
     max_scale=5_000,
 )
 def bench_segment_filters(
@@ -251,6 +256,7 @@ def bench_segment_filters(
         ),
     ),
     tags=("gpu",),
+    public_api=False,
     max_scale=5_000,
 )
 def bench_segment_intersections(
@@ -386,6 +392,7 @@ def bench_segment_intersections(
         ),
     ),
     tags=("gpu",),
+    public_api=False,
     max_scale=5_000,
 )
 def bench_segment_primitives(

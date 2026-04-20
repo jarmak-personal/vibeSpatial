@@ -226,6 +226,126 @@ class SuiteResult:
         ).decode()
 
 
+def timing_summary_from_dict(payload: dict[str, Any]) -> TimingSummary:
+    """Rehydrate a timing summary from JSON output."""
+    return TimingSummary(
+        mean_seconds=float(payload["mean_seconds"]),
+        median_seconds=float(payload["median_seconds"]),
+        min_seconds=float(payload["min_seconds"]),
+        max_seconds=float(payload["max_seconds"]),
+        stddev_seconds=float(payload["stddev_seconds"]),
+        sample_count=int(payload["sample_count"]),
+    )
+
+
+def transfer_summary_from_dict(payload: dict[str, Any]) -> TransferSummary:
+    """Rehydrate transfer counters from JSON output."""
+    return TransferSummary(
+        d2h_count=int(payload["d2h_count"]),
+        h2d_count=int(payload["h2d_count"]),
+        total_bytes=int(payload["total_bytes"]),
+        total_seconds=float(payload["total_seconds"]),
+        offramps=int(payload["offramps"]),
+    )
+
+
+def gpu_util_summary_from_dict(payload: dict[str, Any]) -> GpuUtilSummary:
+    """Rehydrate GPU-utilization counters from JSON output."""
+    return GpuUtilSummary(
+        device_name=str(payload["device_name"]),
+        sm_utilization_pct_avg=float(payload["sm_utilization_pct_avg"]),
+        sm_utilization_pct_max=float(payload["sm_utilization_pct_max"]),
+        memory_utilization_pct_avg=float(payload["memory_utilization_pct_avg"]),
+        vram_used_bytes_max=int(payload["vram_used_bytes_max"]),
+        vram_total_bytes=int(payload["vram_total_bytes"]),
+        sparkline=payload.get("sparkline"),
+    )
+
+
+def kernel_timing_summary_from_dict(payload: dict[str, Any]) -> KernelTimingSummary:
+    """Rehydrate Tier-2 kernel timing counters from JSON output."""
+    return KernelTimingSummary(
+        gpu_time_seconds=float(payload["gpu_time_seconds"]),
+        cpu_time_seconds=float(payload["cpu_time_seconds"]),
+        bandwidth_gb_per_second=(
+            None
+            if payload.get("bandwidth_gb_per_second") is None
+            else float(payload["bandwidth_gb_per_second"])
+        ),
+        bandwidth_pct_of_peak=(
+            None
+            if payload.get("bandwidth_pct_of_peak") is None
+            else float(payload["bandwidth_pct_of_peak"])
+        ),
+        l2_cache_flushed=bool(payload["l2_cache_flushed"]),
+        throttle_detected=bool(payload["throttle_detected"]),
+        convergence_met=bool(payload["convergence_met"]),
+    )
+
+
+def benchmark_result_from_dict(payload: dict[str, Any]) -> BenchmarkResult:
+    """Rehydrate a benchmark result from the CLI JSON schema."""
+    baseline_timing = None
+    if payload.get("baseline_timing") is not None:
+        baseline_timing = timing_summary_from_dict(payload["baseline_timing"])
+
+    transfers = None
+    if payload.get("transfers") is not None:
+        transfers = transfer_summary_from_dict(payload["transfers"])
+
+    gpu_util = None
+    if payload.get("gpu_util") is not None:
+        gpu_util = gpu_util_summary_from_dict(payload["gpu_util"])
+
+    kernel_timing = None
+    if payload.get("kernel_timing") is not None:
+        kernel_timing = kernel_timing_summary_from_dict(payload["kernel_timing"])
+
+    return BenchmarkResult(
+        operation=str(payload["operation"]),
+        tier=int(payload["tier"]),
+        scale=int(payload["scale"]),
+        geometry_type=str(payload["geometry_type"]),
+        precision=str(payload["precision"]),
+        status=str(payload["status"]),
+        status_reason=str(payload["status_reason"]),
+        timing=timing_summary_from_dict(payload["timing"]),
+        baseline_name=payload.get("baseline_name"),
+        baseline_timing=baseline_timing,
+        speedup=None if payload.get("speedup") is None else float(payload["speedup"]),
+        transfers=transfers,
+        gpu_util=gpu_util,
+        kernel_timing=kernel_timing,
+        tier_gate_threshold=(
+            None
+            if payload.get("tier_gate_threshold") is None
+            else float(payload["tier_gate_threshold"])
+        ),
+        tier_gate_passed=(
+            None
+            if payload.get("tier_gate_passed") is None
+            else bool(payload["tier_gate_passed"])
+        ),
+        input_format=str(payload.get("input_format", "parquet")),
+        read_seconds=(
+            None
+            if payload.get("read_seconds") is None
+            else float(payload["read_seconds"])
+        ),
+        stages=tuple(payload.get("stages", ())),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def suite_result_from_dict(payload: dict[str, Any]) -> SuiteResult:
+    """Rehydrate a suite result from the CLI JSON schema."""
+    return SuiteResult(
+        suite_name=str(payload.get("suite", "unknown")),
+        results=[benchmark_result_from_dict(result) for result in payload.get("results", ())],
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers for building timing summaries from sample lists
 # ---------------------------------------------------------------------------

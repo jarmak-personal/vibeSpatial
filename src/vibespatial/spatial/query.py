@@ -158,6 +158,7 @@ def query_spatial_index(
     return_device: bool = False,
     tree_shapely: np.ndarray | None = None,
     query_shapely: np.ndarray | None = None,
+    precomputed_query_bounds: np.ndarray | None = None,
 ) -> Any:
     execution = SpatialQueryExecution(
         requested=ExecutionMode.AUTO,
@@ -196,7 +197,9 @@ def query_spatial_index(
         and getattr(flat_index, "regular_grid", None) is not None
         and predicate in (None, "intersects")
     ):
-        if predicate is None:
+        if precomputed_query_bounds is not None:
+            _rg_bounds = precomputed_query_bounds
+        elif predicate is None:
             _rg_bounds = shapely_bounds_array(query_values)
         else:
             _rg_bounds = _extract_box_query_bounds_shapely(query_values)

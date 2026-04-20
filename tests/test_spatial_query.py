@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 import vibespatial.spatial.nearest as spatial_nearest_module
 import vibespatial.spatial.query as spatial_query_module
@@ -17,6 +17,7 @@ from vibespatial.spatial.query import (
     nearest_spatial_index,
     query_spatial_index,
 )
+from vibespatial.spatial.query_box import _extract_box_query_bounds_shapely
 
 
 def test_query_spatial_index_matches_expected_pairs_for_intersects() -> None:
@@ -27,6 +28,18 @@ def test_query_spatial_index_matches_expected_pairs_for_intersects() -> None:
     indices = query_spatial_index(owned, flat, query, predicate="intersects", sort=True)
 
     assert indices.tolist() == [[0], [0]]
+
+
+def test_extract_box_query_bounds_shapely_rejects_non_box_polygons() -> None:
+    query = np.asarray(
+        [
+            box(0, 0, 1, 1),
+            Polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2), (0, 0)]),
+        ],
+        dtype=object,
+    )
+
+    assert _extract_box_query_bounds_shapely(query) is None
 
 
 def test_query_spatial_index_supports_dwithin() -> None:

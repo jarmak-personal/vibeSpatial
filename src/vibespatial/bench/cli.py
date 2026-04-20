@@ -55,6 +55,17 @@ def main(argv: list[str] | None = None) -> int:
         dest="pipelines",
         help="Limit to specific pipelines (can repeat)",
     )
+    p_suite.add_argument(
+        "--in-process",
+        action="store_true",
+        help="Run suite items in the current process instead of isolated child processes",
+    )
+    p_suite.add_argument(
+        "--item-timeout",
+        type=int,
+        default=600,
+        help="Per suite item timeout in seconds for isolated runs (default: 600)",
+    )
 
     # --- vsbench kernel <name> ---------------------------------------------
     p_kernel = sub.add_parser("kernel", help="NVBench kernel microbenchmark (Tier 2)")
@@ -82,6 +93,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_list.add_argument("--json", action="store_true", dest="json_output")
     p_list.add_argument("--category", help="Filter operations by category")
+    p_list.add_argument(
+        "--include-internal",
+        action="store_true",
+        help="Include private/kernel diagnostic operations in operation listings",
+    )
 
     # --- vsbench fixtures generate --------------------------------------------
     p_fix = sub.add_parser("fixtures", help="Manage benchmark fixture files")
@@ -281,6 +297,10 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     from .output import render_suite
     from .runner import run_suite
 
+    if args.item_timeout <= 0:
+        print("vsbench suite: --item-timeout must be a positive integer", file=sys.stderr)
+        return 2
+
     suite_result = run_suite(
         args.level,
         repeat=args.repeat,
@@ -291,6 +311,8 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         gpu_sparkline=args.gpu_sparkline,
         trace=args.trace,
         pipelines_filter=args.pipelines,
+        isolated=not args.in_process,
+        item_timeout=args.item_timeout,
     )
 
     text = render_suite(suite_result, mode=_output_mode(args))
@@ -430,7 +452,11 @@ def _cmd_list(args: argparse.Namespace) -> int:
 
     match args.kind:
         case "operations":
-            return _list_operations(mode, category=getattr(args, "category", None))
+            return _list_operations(
+                mode,
+                category=getattr(args, "category", None),
+                include_internal=getattr(args, "include_internal", False),
+            )
         case "pipelines":
             return _list_pipelines(mode)
         case "fixtures":
@@ -440,12 +466,17 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 1
 
 
-def _list_operations(mode: str, *, category: str | None = None) -> int:
+def _list_operations(
+    mode: str,
+    *,
+    category: str | None = None,
+    include_internal: bool = False,
+) -> int:
     from .catalog import ensure_operations_loaded, list_operations
     from .output import render_list
 
     ensure_operations_loaded()
-    ops = list_operations(category=category)
+    ops = list_operations(category=category, include_internal=include_internal)
 
     items = [op.to_dict() for op in ops]
     text = render_list(

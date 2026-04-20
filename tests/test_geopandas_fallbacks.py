@@ -151,6 +151,41 @@ def test_geopandas_sindex_query_scalar_box_avoids_query_owned_conversion(
     assert dispatch_events[-1].selected is geopandas.ExecutionMode.GPU
 
 
+def test_geopandas_sindex_query_box_array_avoids_query_owned_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for the raw box-array fast path")
+
+    import numpy as np
+
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    series = geopandas.GeoSeries(
+        [box(float(index), 0.0, float(index + 1), 1.0) for index in range(2048)]
+    )
+    query = np.asarray(
+        [box(99.5, -1.0, 199.5, 2.0), box(399.5, -1.0, 499.5, 2.0)],
+        dtype=object,
+    )
+
+    def _fail(values):
+        raise AssertionError("public sindex.query box-array path should not normalize query input to owned")
+
+    monkeypatch.setattr(spatial_query_module, "_to_owned", _fail)
+
+    result = series.sindex.query(query, predicate="intersects")
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    events = geopandas.get_fallback_events(clear=True)
+
+    assert result.shape[0] == 2
+    assert result.shape[1] > 0
+    assert set(result[0].tolist()) == {0, 1}
+    assert not events
+    assert dispatch_events[-1].implementation == "owned_gpu_spatial_query"
+    assert dispatch_events[-1].selected is geopandas.ExecutionMode.GPU
+
+
 def test_geopandas_sindex_query_host_fallback_is_observable_for_unsupported_input() -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()

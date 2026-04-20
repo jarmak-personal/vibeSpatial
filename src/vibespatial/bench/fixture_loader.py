@@ -93,3 +93,25 @@ def load_geodataframe(
             frame = geopandas.read_file(str(path))
     read_seconds = perf_counter() - start
     return frame, read_seconds
+
+
+def load_public_geodataframe(
+    spec: BenchmarkFixtureSpec,
+    fmt: InputFormat | str,
+    *,
+    fixture_dir: Path | None = None,
+) -> tuple[geopandas.GeoDataFrame, float]:
+    """Load a fixture through the public GeoPandas-compatible API."""
+    fmt = InputFormat(fmt) if not isinstance(fmt, InputFormat) else fmt
+    path = fixture_path_for_format(spec, fmt, fixture_dir=fixture_dir)
+    if not path.exists():
+        ensure_fixture_format(spec, fmt, fixture_dir=fixture_dir)
+
+    start = perf_counter()
+    match fmt:
+        case InputFormat.PARQUET:
+            frame = geopandas.read_parquet(path)
+        case _:
+            frame = geopandas.read_file(str(path))
+    read_seconds = perf_counter() - start
+    return frame, read_seconds

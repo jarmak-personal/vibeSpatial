@@ -5,7 +5,7 @@ Scope: IO benchmark rail suites, throughput floors, and format-level performance
 Read If: You are adding or verifying IO benchmark rails, throughput floors, or format-specific performance gates.
 STOP IF: Your task already has the benchmark scripts open and only needs local implementation detail.
 Source Of Truth: Phase-6d IO performance rail and floor enforcement workflow.
-Body Budget: 117/220 lines
+Body Budget: 123/220 lines
 Document: docs/testing/io-performance-rails.md
 
 Section Map (Body Lines)
@@ -17,20 +17,20 @@ Section Map (Body Lines)
 | 19-24 | Open First |
 | 25-30 | Verify |
 | 31-36 | Risks |
-| 37-52 | Entry Points |
-| 53-68 | Suites |
-| 69-92 | Result Contract |
-| 93-108 | Current Enforcement |
-| 109-117 | Notes |
+| 37-56 | Entry Points |
+| 57-68 | Suites |
+| 69-98 | Result Contract |
+| 99-114 | Current Enforcement |
+| 115-123 | Notes |
 DOC_HEADER:END -->
 
-This repo now has a standing IO benchmark rail for the accelerated format work in
-Phase 6d.
+This repo has public IO benchmark entry points plus internal component rails for
+the accelerated format work in Phase 6d.
 
 ## Intent
 
-Turn IO performance claims into repeatable suite artifacts with explicit floor
-comparisons, instead of relying on one-off benchmark snippets in commit notes.
+Turn IO performance claims into repeatable suite artifacts without forcing
+private fast paths through user-facing benchmark scripts.
 
 ## Request Signals
 
@@ -60,31 +60,31 @@ comparisons, instead of relying on one-off benchmark snippets in commit notes.
 
 ## Entry Points
 
-Run the Arrow, Parquet, and WKB suite:
+Run the public Arrow/WKB API suite:
 
 ```bash
 uv run python scripts/benchmark_io_arrow.py --suite all
 ```
 
-Run the file-format suite:
+Run the public file-format API suite:
 
 ```bash
 uv run python scripts/benchmark_io_file.py --suite all
 ```
 
-Both entry points also accept `--suite smoke` and `--suite ci`.
+Both entry points also accept `--suite smoke` and `--suite ci`. These script
+suites call the registered public `vsbench` operations only. Low-level
+GeoArrow, WKB, GeoParquet planner/scan, and direct-parser file component rails
+remain internal health surfaces under `src/vibespatial/bench/io_benchmark_rails.py`
+and `tests/test_io_benchmark_rails.py`.
 
 ## Suites
 
-- `smoke`
-  - local verification only
-  - keeps scales to `10K` plus the smallest planner case
-- `ci`
-  - `100K`-class runs intended for pull requests
-- `all`
-  - `10K`, `100K`, and `1M` where practical
-  - polygon-heavy paths use smaller high-cost scales such as `20K`, `100K`,
-    and `250K`
+- `smoke`: local verification at `10K`.
+- `ci`: `100K`-class runs intended for pull requests.
+- `all`: `10K`, `100K`, and `1M` where practical.
+- Internal component rails may use smaller high-cost scales for polygon-heavy
+  paths.
 
 `10M` is still treated as a manual deep-run scale for the cheapest point-heavy
 paths. It is not part of the default `all` suite because the rail is meant to
@@ -92,7 +92,14 @@ run often enough to catch drift, not only on rare manual sweeps.
 
 ## Result Contract
 
-Each case reports:
+Public script cases report the standard `BenchmarkResult` schema:
+
+- operation, scale, geometry type, input format, and status
+- timing summary
+- reference baseline timing and speedup when available
+- operation metadata
+
+Internal component rail cases report:
 
 - `rows_input`
 - `rows_decoded`
@@ -110,13 +117,12 @@ The status vocabulary is:
 - `informational`
 - `unavailable`
 
-`informational` means the case is tracked but not currently enforced. That is
-intentional for GeoJSON and mixed-family watch cases where the fastest measured
-path is still not the target GPU-dominant design.
+`informational` is reserved for internal component cases that are tracked but
+not currently enforced.
 
 ## Current Enforcement
 
-Enforced floors currently cover:
+Internal component floors currently cover:
 
 - GeoArrow aligned import and export
 - native GeoArrow decode and encode

@@ -13193,7 +13193,6 @@
         "normalize_multipolygons_public_frame",
         "read_supported_layers_pyogrio",
         "read_pyogrio_osm_layer",
-        "frame_from_osm_result",
         "fingerprint",
         "_empty_frame",
         "_normalize_simple_layer",
@@ -13219,7 +13218,6 @@
         "pyogrio",
         "read",
         "require",
-        "result",
         "running",
         "shared",
         "shootout",
@@ -13363,24 +13361,6 @@
     },
     {
       "kind": "repo",
-      "path": "benchmarks/shootout/io/osm_pbf_geometry_only.py",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "benchmarks",
-        "florida",
-        "geometry",
-        "io",
-        "only",
-        "osm",
-        "pbf",
-        "py",
-        "read",
-        "shootout"
-      ]
-    },
-    {
-      "kind": "repo",
       "path": "benchmarks/shootout/io/osm_pbf_lines_public.py",
       "referenced_by": [],
       "symbols": [],
@@ -13412,23 +13392,6 @@
         "pbf",
         "public",
         "py",
-        "shootout"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": "benchmarks/shootout/io/osm_pbf_native.py",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "benchmarks",
-        "florida",
-        "io",
-        "native",
-        "osm",
-        "pbf",
-        "py",
-        "read",
         "shootout"
       ]
     },
@@ -15227,6 +15190,21 @@
     },
     {
       "kind": "doc",
+      "path": "docs/testing/public-api-performance-roadmap.md",
+      "referenced_by": [],
+      "symbols": [],
+      "tokens": [
+        "api",
+        "docs",
+        "md",
+        "performance",
+        "public",
+        "roadmap",
+        "testing"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/testing/synthetic-data.md",
       "referenced_by": [
         "docs/testing/synthetic-data.md"
@@ -15800,25 +15778,6 @@
     },
     {
       "kind": "script",
-      "path": "scripts/benchmark_binary_predicates.py",
-      "referenced_by": [],
-      "symbols": [
-        "build_inputs",
-        "main"
-      ],
-      "tokens": [
-        "benchmark",
-        "binary",
-        "build",
-        "inputs",
-        "main",
-        "predicates",
-        "py",
-        "scripts"
-      ]
-    },
-    {
-      "kind": "script",
       "path": "scripts/benchmark_cccl_vs_cupy.py",
       "referenced_by": [],
       "symbols": [
@@ -15901,99 +15860,26 @@
     },
     {
       "kind": "script",
-      "path": "scripts/benchmark_dissolve_pipeline.py",
-      "referenced_by": [],
-      "symbols": [
-        "main",
-        "_build_frame"
-      ],
-      "tokens": [
-        "benchmark",
-        "build",
-        "dissolve",
-        "frame",
-        "main",
-        "pipeline",
-        "py",
-        "scripts"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/benchmark_gpu_constructive.py",
-      "referenced_by": [],
-      "symbols": [
-        "build_point_inputs",
-        "main"
-      ],
-      "tokens": [
-        "benchmark",
-        "build",
-        "constructive",
-        "gpu",
-        "inputs",
-        "main",
-        "point",
-        "py",
-        "scripts"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/benchmark_gpu_decode.py",
-      "referenced_by": [],
-      "symbols": [
-        "main",
-        "_benchmark_wkb_decode_frame",
-        "_benchmark_point_geoarrow_decode",
-        "_benchmark_point_wkb_decode",
-        "_benchmark_linestring_wkb_decode",
-        "_benchmark_mixed_point_linestring_wkb_decode",
-        "_benchmark_decode_primitives",
-        "_benchmark_wkb_header_scan",
-        "_benchmark_wkb_family_select_choices"
-      ],
-      "tokens": [
-        "benchmark",
-        "choices",
-        "decode",
-        "family",
-        "frame",
-        "geoarrow",
-        "gpu",
-        "header",
-        "linestring",
-        "main",
-        "mixed",
-        "point",
-        "primitives",
-        "py",
-        "scan",
-        "scripts",
-        "select",
-        "wkb"
-      ]
-    },
-    {
-      "kind": "script",
       "path": "scripts/benchmark_io_arrow.py",
       "referenced_by": [
         "docs/testing/io-performance-rails.md"
       ],
       "symbols": [
-        "build_covering_summary",
-        "main"
+        "main",
+        "_status_counts",
+        "_suite_payload"
       ],
       "tokens": [
         "arrow",
         "benchmark",
-        "build",
-        "covering",
+        "counts",
         "io",
         "main",
+        "payload",
         "py",
         "scripts",
-        "summary"
+        "status",
+        "suite"
       ]
     },
     {
@@ -16003,14 +15889,20 @@
         "docs/testing/io-performance-rails.md"
       ],
       "symbols": [
-        "main"
+        "main",
+        "_status_counts",
+        "_suite_payload"
       ],
       "tokens": [
         "benchmark",
+        "counts",
         "io",
         "main",
+        "payload",
         "py",
-        "scripts"
+        "scripts",
+        "status",
+        "suite"
       ]
     },
     {
@@ -16111,31 +16003,6 @@
         "time",
         "transfer",
         "usage"
-      ]
-    },
-    {
-      "kind": "script",
-      "path": "scripts/benchmark_spatial_query.py",
-      "referenced_by": [],
-      "symbols": [
-        "build_query_inputs",
-        "build_nearest_inputs",
-        "build_outer_join_frames",
-        "main"
-      ],
-      "tokens": [
-        "benchmark",
-        "build",
-        "frames",
-        "inputs",
-        "join",
-        "main",
-        "nearest",
-        "outer",
-        "py",
-        "query",
-        "scripts",
-        "spatial"
       ]
     },
     {
@@ -19944,6 +19811,7 @@
       "symbols": [
         "load_owned",
         "load_geodataframe",
+        "load_public_geodataframe",
         "_preferred_geoparquet_backend"
       ],
       "tokens": [
@@ -19971,6 +19839,7 @@
         "native",
         "owned",
         "preferred",
+        "public",
         "py",
         "pyogrio",
         "read",
@@ -20515,11 +20384,13 @@
         "bench_make_valid",
         "bench_gpu_dissolve",
         "bench_stroke_kernels",
+        "_clip_rect_from_bounds",
         "_clip_rect_from_owned"
       ],
       "tokens": [
         "bench",
         "benchmarks",
+        "bounds",
         "clip",
         "constructive",
         "dissolve",
@@ -20993,26 +20864,61 @@
         "_extract_gpu_util",
         "_fmt_scale",
         "_fmt_time",
-        "_progress"
+        "_progress",
+        "_scale_flag",
+        "_append_common_child_flags",
+        "_operation_child_command",
+        "_pipeline_child_command",
+        "_kernel_child_command",
+        "_text_tail",
+        "_extract_json_payload",
+        "_gpu_compute_apps",
+        "_release_local_gpu_memory",
+        "_run_child_process",
+        "_with_child_metadata",
+        "_parse_child_results",
+        "_isolated_error_result",
+        "_run_isolated_benchmark_command",
+        "_run_suite_isolated"
       ],
       "tokens": [
+        "append",
+        "apps",
         "bench",
         "benchmark",
+        "child",
+        "command",
+        "common",
+        "compute",
         "convert",
         "entries",
+        "error",
         "extract",
+        "flag",
+        "flags",
         "fmt",
         "gpu",
+        "isolated",
         "iter",
+        "json",
+        "kernel",
+        "local",
         "median",
+        "memory",
+        "metadata",
         "operation",
         "orchestration",
+        "parse",
+        "payload",
         "pipeline",
+        "process",
         "progress",
         "py",
+        "release",
         "repeat",
         "resolve",
         "result",
+        "results",
         "run",
         "runner",
         "scale",
@@ -21020,6 +20926,8 @@
         "src",
         "stage",
         "suite",
+        "tail",
+        "text",
         "time",
         "util",
         "vibespatial",
@@ -21040,6 +20948,12 @@
         "KernelTimingSummary",
         "BenchmarkResult",
         "SuiteResult",
+        "timing_summary_from_dict",
+        "transfer_summary_from_dict",
+        "gpu_util_summary_from_dict",
+        "kernel_timing_summary_from_dict",
+        "benchmark_result_from_dict",
+        "suite_result_from_dict",
         "timing_from_samples"
       ],
       "tokens": [
@@ -21051,6 +20965,8 @@
         "both",
         "cli",
         "dataclass",
+        "dict",
+        "gpu",
         "gpuutilsummary",
         "kernel",
         "kerneltimingsummary",
@@ -21064,13 +20980,17 @@
         "schema",
         "single",
         "src",
+        "suite",
         "suiteresult",
+        "summary",
         "that",
         "tier",
         "timing",
         "timingsummary",
+        "transfer",
         "transfersummary",
         "unified",
+        "util",
         "vibespatial",
         "vsbench",
         "works"
@@ -37253,47 +37173,89 @@
         "test_resolve_operation_args_applies_defaults_and_rejects_unknown_keys",
         "test_operation_spec_to_dict_includes_parameters",
         "test_spatial_query_spec_exposes_overlap_ratio_parameter",
+        "test_list_operations_hides_internal_diagnostics_by_default",
+        "test_vsbench_list_operations_include_internal_flag",
+        "test_predefined_suites_reference_public_operations_only",
+        "test_public_benchmark_operations_do_not_force_private_paths",
+        "test_public_benchmark_scripts_do_not_force_private_paths",
         "test_run_operation_records_operation_args_in_metadata",
         "test_vsbench_run_accepts_generic_operation_args",
         "test_vsbench_list_operations_json_includes_parameter_schema",
-        "test_vsbench_run_accepts_exact_rows_override"
+        "test_vsbench_run_accepts_exact_rows_override",
+        "test_benchmark_result_from_dict_round_trips_optional_sections",
+        "test_vsbench_suite_defaults_to_isolated_subprocesses",
+        "test_vsbench_suite_accepts_in_process_opt_out",
+        "test_isolated_benchmark_command_parses_child_suite",
+        "test_isolated_benchmark_command_reports_timeout"
       ],
       "tokens": [
         "accepts",
         "applies",
         "args",
         "bench",
+        "benchmark",
+        "child",
+        "command",
+        "default",
         "defaults",
+        "diagnostics",
         "dict",
+        "do",
         "exact",
         "exposes",
+        "flag",
+        "force",
         "generic",
+        "hides",
+        "include",
         "includes",
+        "internal",
+        "isolated",
         "json",
         "keys",
         "list",
         "metadata",
+        "not",
+        "only",
         "operation",
         "operations",
+        "opt",
+        "optional",
+        "out",
         "overlap",
         "override",
         "parameter",
         "parameters",
         "parses",
+        "predefined",
+        "private",
+        "process",
+        "public",
         "py",
         "query",
         "ratio",
         "records",
+        "reference",
         "rejects",
+        "reports",
         "resolve",
+        "result",
+        "round",
         "rows",
         "run",
         "schema",
+        "scripts",
+        "sections",
         "spatial",
         "spec",
+        "subprocesses",
+        "suite",
+        "suites",
         "supported",
         "test",
         "tests",
+        "timeout",
+        "trips",
         "types",
         "unknown",
         "vsbench"
@@ -40534,6 +40496,7 @@
         "test_geopandas_sindex_query_selects_gpu_for_boundary_sensitive_box_predicates",
         "test_geopandas_sindex_query_within_uses_owned_dispatch",
         "test_geopandas_sindex_query_scalar_box_avoids_query_owned_conversion",
+        "test_geopandas_sindex_query_box_array_avoids_query_owned_conversion",
         "test_geopandas_sindex_query_host_fallback_is_observable_for_unsupported_input",
         "test_geopandas_geometry_array_sindex_emits_fallback_before_materialization",
         "test_geopandas_sindex_query_multipoint_uses_gpu_dispatch",
@@ -47270,6 +47233,7 @@
       "referenced_by": [],
       "symbols": [
         "test_query_spatial_index_matches_expected_pairs_for_intersects",
+        "test_extract_box_query_bounds_shapely_rejects_non_box_polygons",
         "test_query_spatial_index_supports_dwithin",
         "test_query_spatial_index_scalar_sort_false_preserves_membership_without_sorting",
         "test_query_spatial_index_line_polygon_boundary_overlap_matches_strtree",
@@ -47322,6 +47286,7 @@
         "boundaries",
         "boundary",
         "bounded",
+        "bounds",
         "box",
         "bruteforce",
         "candidate",
@@ -47343,6 +47308,7 @@
         "exact",
         "execution",
         "expected",
+        "extract",
         "extraction",
         "fallback",
         "false",
@@ -47367,6 +47333,7 @@
         "metadata",
         "multi",
         "nearest",
+        "non",
         "noop",
         "numpy",
         "overlap",
@@ -47376,6 +47343,7 @@
         "passthrough",
         "point",
         "polygon",
+        "polygons",
         "predicates",
         "preserves",
         "produces",
@@ -47386,6 +47354,7 @@
         "rectangle",
         "refine",
         "regular",
+        "rejects",
         "reports",
         "resident",
         "result",

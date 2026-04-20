@@ -1,18 +1,32 @@
 from __future__ import annotations
 
+import inspect
 import json
+from pathlib import Path
 
+import vibespatial.bench.runner as runner_module
 from vibespatial.bench.catalog import (
     _OPERATION_REGISTRY,
     OperationParameterSpec,
     benchmark_operation,
     ensure_operations_loaded,
     get_operation,
+    list_operations,
     resolve_operation_args,
 )
 from vibespatial.bench.cli import main as vsbench_main
 from vibespatial.bench.runner import run_operation
-from vibespatial.bench.schema import BenchmarkResult, timing_from_samples
+from vibespatial.bench.schema import (
+    BenchmarkResult,
+    GpuUtilSummary,
+    KernelTimingSummary,
+    SuiteResult,
+    TimingSummary,
+    TransferSummary,
+    benchmark_result_from_dict,
+    timing_from_samples,
+)
+from vibespatial.bench.suites import SUITES
 
 
 def test_operation_parameter_spec_parses_supported_types() -> None:
@@ -60,6 +74,7 @@ def test_operation_spec_to_dict_includes_parameters() -> None:
     assert any(param["name"] == "tile_size" for param in payload["parameters"])
     dataset_param = next(param for param in payload["parameters"] if param["name"] == "dataset")
     assert dataset_param["choices"] == ["uniform", "skewed", "both"]
+    assert payload["public_api"] is False
 
 
 def test_spatial_query_spec_exposes_overlap_ratio_parameter() -> None:
@@ -69,6 +84,130 @@ def test_spatial_query_spec_exposes_overlap_ratio_parameter() -> None:
     payload = spec.to_dict()
 
     assert any(param["name"] == "overlap_ratio" for param in payload["parameters"])
+
+
+def test_list_operations_hides_internal_diagnostics_by_default() -> None:
+    ensure_operations_loaded()
+
+    public_names = {spec.name for spec in list_operations()}
+    all_names = {spec.name for spec in list_operations(include_internal=True)}
+
+    assert "bounds" in public_names
+    assert "gpu-pip" not in public_names
+    assert "bounds-pairs" not in public_names
+    assert "gpu-pip" in all_names
+    assert "bounds-pairs" in all_names
+
+
+def test_vsbench_list_operations_include_internal_flag(capsys) -> None:
+    exit_code = vsbench_main(["list", "operations", "--json"])
+    captured = capsys.readouterr()
+    public_payload = json.loads(captured.out)
+    public_names = {item["name"] for item in public_payload}
+
+    exit_code_internal = vsbench_main(["list", "operations", "--json", "--include-internal"])
+    captured_internal = capsys.readouterr()
+    all_payload = json.loads(captured_internal.out)
+    all_names = {item["name"] for item in all_payload}
+
+    assert exit_code == 0
+    assert exit_code_internal == 0
+    assert "bounds" in public_names
+    assert "gpu-pip" not in public_names
+    assert "gpu-pip" in all_names
+
+
+def test_predefined_suites_reference_public_operations_only() -> None:
+    ensure_operations_loaded()
+
+    private_suite_ops = {
+        op_name
+        for suite in SUITES.values()
+        for op_name in suite.operations
+        if op_name in _OPERATION_REGISTRY and not _OPERATION_REGISTRY[op_name].public_api
+    }
+    stale_suite_ops = {
+        op_name
+        for suite in SUITES.values()
+        for op_name in suite.operations
+        if op_name not in _OPERATION_REGISTRY
+    }
+
+    assert private_suite_ops == set()
+    assert stale_suite_ops == set()
+    assert all(not suite.kernels for suite in SUITES.values())
+
+
+def test_public_benchmark_operations_do_not_force_private_paths() -> None:
+    ensure_operations_loaded()
+
+    forbidden_tokens = (
+        "load_owned(",
+        "decode_wkb_owned",
+        "encode_wkb_owned",
+        "overlay_intersection_owned",
+        "benchmark_bounds_pairs",
+        "benchmark_segment_",
+        "build_flat_spatial_index",
+        "query_spatial_index",
+        "from vibespatial.kernels",
+        "vibespatial.testing.mixed_layouts",
+    )
+    violations: dict[str, list[str]] = {}
+    for spec in list_operations():
+        if not spec.callable.__module__.startswith("vibespatial.bench.operations"):
+            continue
+        source = inspect.getsource(spec.callable)
+        hits = [token for token in forbidden_tokens if token in source]
+        if hits:
+            violations[spec.name] = hits
+
+    assert violations == {}
+
+
+def test_public_benchmark_scripts_do_not_force_private_paths() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    checked = [
+        *(
+            path
+            for path in (repo_root / "benchmarks" / "shootout").rglob("*.py")
+            if not path.name.startswith("_")
+        ),
+        *(
+            path
+            for path in (repo_root / "scripts").glob("benchmark_*.py")
+        ),
+    ]
+    forbidden_tokens = (
+        "read_osm_pbf",
+        "from vibespatial import benchmark_",
+        "vibespatial.bench.io_benchmark_rails",
+        "from vibespatial.spatial",
+        "from vibespatial.predicates",
+        "from vibespatial.constructive",
+        "from vibespatial.overlay",
+        "from vibespatial.kernels",
+        "build_owned_spatial_index",
+        "evaluate_binary_predicate",
+        "_decode_pylibcudf",
+        "_decode_geoparquet",
+        "load_owned(",
+        ".to_owned(",
+        "from_shapely_geometries",
+        "clip_by_rect_owned",
+        "point_buffer_owned",
+        "read_geoparquet_owned",
+        "read_geojson_owned",
+        "read_shapefile_owned",
+    )
+
+    violations = {
+        str(path.relative_to(repo_root)): [token for token in forbidden_tokens if token in path.read_text()]
+        for path in checked
+    }
+    violations = {path: hits for path, hits in violations.items() if hits}
+
+    assert violations == {}
 
 
 def test_run_operation_records_operation_args_in_metadata() -> None:
@@ -242,3 +381,182 @@ def test_vsbench_run_accepts_exact_rows_override(capsys) -> None:
 
     assert exit_code == 0
     assert payload["scale"] == 1234
+
+
+def test_benchmark_result_from_dict_round_trips_optional_sections() -> None:
+    result = BenchmarkResult(
+        operation="test-roundtrip",
+        tier=2,
+        scale=1000,
+        geometry_type="point",
+        precision="fp64",
+        status="pass",
+        status_reason="ok",
+        timing=TimingSummary(
+            mean_seconds=0.1,
+            median_seconds=0.1,
+            min_seconds=0.09,
+            max_seconds=0.11,
+            stddev_seconds=0.01,
+            sample_count=3,
+        ),
+        baseline_name="geopandas",
+        baseline_timing=timing_from_samples([0.3, 0.4, 0.5]),
+        speedup=4.0,
+        transfers=TransferSummary(
+            d2h_count=1,
+            h2d_count=2,
+            total_bytes=128,
+            total_seconds=0.001,
+            offramps=1,
+        ),
+        gpu_util=GpuUtilSummary(
+            device_name="test-gpu",
+            sm_utilization_pct_avg=25.0,
+            sm_utilization_pct_max=50.0,
+            memory_utilization_pct_avg=10.0,
+            vram_used_bytes_max=1024,
+            vram_total_bytes=2048,
+            sparkline="|",
+        ),
+        kernel_timing=KernelTimingSummary(
+            gpu_time_seconds=0.01,
+            cpu_time_seconds=0.02,
+            bandwidth_gb_per_second=123.0,
+            bandwidth_pct_of_peak=12.0,
+            l2_cache_flushed=True,
+            throttle_detected=False,
+            convergence_met=True,
+        ),
+        tier_gate_threshold=1.1,
+        tier_gate_passed=True,
+        input_format="geojson",
+        read_seconds=0.012,
+        stages=({"name": "stage", "device": "gpu"},),
+        metadata={"k": "v"},
+    )
+
+    restored = benchmark_result_from_dict(result.to_dict())
+
+    assert restored == result
+
+
+def test_vsbench_suite_defaults_to_isolated_subprocesses(monkeypatch, capsys) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _fake_run_suite(level: str, **kwargs: object) -> SuiteResult:
+        calls.append({"level": level, **kwargs})
+        return SuiteResult(
+            suite_name=level,
+            results=[
+                BenchmarkResult(
+                    operation="bounds",
+                    tier=1,
+                    scale=1000,
+                    geometry_type="point",
+                    precision="auto",
+                    status="pass",
+                    status_reason="ok",
+                    timing=timing_from_samples([0.001]),
+                )
+            ],
+            metadata={"isolated": kwargs["isolated"]},
+        )
+
+    monkeypatch.setattr(runner_module, "run_suite", _fake_run_suite)
+
+    exit_code = vsbench_main(["suite", "smoke", "--json", "--quiet"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["metadata"]["isolated"] is True
+    assert calls[0]["isolated"] is True
+    assert calls[0]["item_timeout"] == 600
+
+
+def test_vsbench_suite_accepts_in_process_opt_out(monkeypatch, capsys) -> None:
+    calls: list[dict[str, object]] = []
+
+    def _fake_run_suite(level: str, **kwargs: object) -> SuiteResult:
+        calls.append({"level": level, **kwargs})
+        return SuiteResult(suite_name=level, results=[])
+
+    monkeypatch.setattr(runner_module, "run_suite", _fake_run_suite)
+
+    exit_code = vsbench_main(
+        ["suite", "smoke", "--in-process", "--item-timeout", "7", "--json", "--quiet"]
+    )
+
+    capsys.readouterr()
+    assert exit_code == 0
+    assert calls[0]["isolated"] is False
+    assert calls[0]["item_timeout"] == 7
+
+
+def test_isolated_benchmark_command_parses_child_suite(monkeypatch) -> None:
+    child_suite = SuiteResult(
+        suite_name="pipeline:join-heavy",
+        results=[
+            BenchmarkResult(
+                operation="join-heavy",
+                tier=1,
+                scale=1000,
+                geometry_type="mixed",
+                precision="auto",
+                status="pass",
+                status_reason="ok",
+                timing=timing_from_samples([0.001]),
+            )
+        ],
+    )
+
+    monkeypatch.setattr(
+        runner_module,
+        "_run_child_process",
+        lambda command, *, item_timeout: (0, child_suite.to_json(), "", False),
+    )
+    monkeypatch.setattr(runner_module, "_gpu_compute_apps", lambda: [])
+
+    results = runner_module._run_isolated_benchmark_command(
+        ["python", "-m", "vibespatial.bench.cli", "pipeline", "join-heavy"],
+        operation="join-heavy",
+        tier=1,
+        scale=1000,
+        geometry_type="mixed",
+        precision="auto",
+        item_timeout=10,
+    )
+
+    assert len(results) == 1
+    assert results[0].operation == "join-heavy"
+    assert results[0].metadata["isolated_subprocess"] is True
+    assert results[0].metadata["subprocess_returncode"] == 0
+
+
+def test_isolated_benchmark_command_reports_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(
+        runner_module,
+        "_run_child_process",
+        lambda command, *, item_timeout: (None, "", "still running", True),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_gpu_compute_apps",
+        lambda: [{"pid": "123", "process_name": "python", "used_memory_mib": "10"}],
+    )
+
+    results = runner_module._run_isolated_benchmark_command(
+        ["python", "-m", "vibespatial.bench.cli", "run", "bounds"],
+        operation="bounds",
+        tier=1,
+        scale=1000,
+        geometry_type="unknown",
+        precision="auto",
+        item_timeout=1,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "error"
+    assert "timed out" in results[0].status_reason
+    assert results[0].metadata["subprocess_timeout_seconds"] == 1
+    assert results[0].metadata["gpu_compute_apps_after_subprocess"]

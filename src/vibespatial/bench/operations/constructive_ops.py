@@ -11,16 +11,14 @@ from vibespatial.bench.schema import (
 )
 
 
-def _clip_rect_from_owned(owned: Any, fraction: float = 0.6) -> tuple[float, float, float, float]:
-    """Derive a clip rectangle from the actual geometry bounds of an OwnedGeometryArray.
+def _clip_rect_from_bounds(bounds: Any, fraction: float = 0.6) -> tuple[float, float, float, float]:
+    """Derive a clip rectangle from public total-bounds output.
 
     Returns the central ``fraction`` of the total bounding box, guaranteeing
     overlap with the input data.  Falls back to (0, 0, 1000, 1000) inner 60%
     if bounds cannot be computed.
     """
-    from vibespatial.kernels.core.geometry_analysis import compute_total_bounds
-
-    xmin, ymin, xmax, ymax = compute_total_bounds(owned)
+    xmin, ymin, xmax, ymax = (float(value) for value in bounds)
     if math.isnan(xmin) or math.isnan(ymin) or math.isnan(xmax) or math.isnan(ymax):
         # Fallback: use default fixture bounds (0..1000) with the given fraction
         margin = (1.0 - fraction) / 2.0
@@ -29,6 +27,12 @@ def _clip_rect_from_owned(owned: Any, fraction: float = 0.6) -> tuple[float, flo
     dx = (xmax - xmin) * margin
     dy = (ymax - ymin) * margin
     return (xmin + dx, ymin + dy, xmax - dx, ymax - dy)
+
+
+def _clip_rect_from_owned(owned: Any, fraction: float = 0.6) -> tuple[float, float, float, float]:
+    from vibespatial.kernels.core.geometry_analysis import compute_total_bounds
+
+    return _clip_rect_from_bounds(compute_total_bounds(owned), fraction=fraction)
 
 
 @benchmark_operation(
@@ -65,8 +69,11 @@ def bench_clip_rect(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_clip_by_rect
-    from vibespatial.bench.fixture_loader import load_owned
+    from time import perf_counter
+
+    import shapely
+
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
     kind = kwargs.get("kind", "line")
@@ -74,10 +81,10 @@ def bench_clip_rect(
         spec = resolve_fixture_spec("polygon", "regular-grid", scale)
     else:
         spec = resolve_fixture_spec("line", "random-walk", scale)
-    owned, read_seconds = load_owned(spec, InputFormat(input_format))
+    gdf, read_seconds = load_public_geodataframe(spec, InputFormat(input_format))
 
     # Guard: if fixture produced 0 rows, report as error.
-    if owned.row_count == 0:
+    if len(gdf) == 0:
         return BenchmarkResult(
             operation="clip-rect",
             tier=1,
@@ -93,10 +100,10 @@ def bench_clip_rect(
 
     # Derive clip rectangle from actual data bounds (central 60%) to
     # guarantee overlap regardless of scale or fixture distribution.
-    rect = tuple(kwargs["rect"]) if "rect" in kwargs else _clip_rect_from_owned(owned, fraction=0.6)
+    rect = tuple(kwargs["rect"]) if "rect" in kwargs else _clip_rect_from_bounds(gdf.total_bounds, fraction=0.6)
 
     try:
-        result = benchmark_clip_by_rect(owned, *rect, dataset=f"{kind}-{scale}")
+        gdf.geometry.clip_by_rect(*rect)
     except (IndexError, ValueError) as exc:
         return BenchmarkResult(
             operation="clip-rect",
@@ -111,16 +118,28 @@ def bench_clip_rect(
             read_seconds=read_seconds,
         )
 
-    timing = timing_from_samples([result.owned_elapsed_seconds])
+    times: list[float] = []
+    for _ in range(max(1, repeat)):
+        start = perf_counter()
+        clipped = gdf.geometry.clip_by_rect(*rect)
+        times.append(perf_counter() - start)
+
+    timing = timing_from_samples(times)
 
     speedup = None
     baseline_timing = None
     baseline_name = None
-    if result.shapely_elapsed_seconds and result.shapely_elapsed_seconds > 0:
-        baseline_timing = timing_from_samples([result.shapely_elapsed_seconds])
+    if compare == "shapely" or compare is None:
+        values = gdf.geometry.to_numpy()
+        baseline_times: list[float] = []
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.clip_by_rect(values, *rect)
+            baseline_times.append(perf_counter() - start)
+        baseline_timing = timing_from_samples(baseline_times)
         baseline_name = "shapely"
         if timing.median_seconds > 0:
-            speedup = result.shapely_elapsed_seconds / timing.median_seconds
+            speedup = baseline_timing.median_seconds / timing.median_seconds
 
     return BenchmarkResult(
         operation="clip-rect",
@@ -139,9 +158,7 @@ def bench_clip_rect(
         metadata={
             "kind": kind,
             "rect": list(rect),
-            "candidate_rows": result.candidate_rows,
-            "fast_rows": result.fast_rows,
-            "fallback_rows": result.fallback_rows,
+            "result_rows": int(len(clipped)),
         },
     )
 
@@ -154,6 +171,7 @@ def bench_clip_rect(
     default_scale=10_000,
     tier=4,
     tags=("gpu", "compare"),
+    public_api=False,
 )
 def bench_gpu_constructive(
     *,
@@ -304,25 +322,39 @@ def bench_make_valid(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_make_valid
-    from vibespatial.bench.fixture_loader import load_geodataframe, load_owned
+    from time import perf_counter
+
+    import shapely
+
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, ensure_invalids_fixture
 
     fmt = InputFormat(input_format)
     spec, _ = ensure_invalids_fixture(scale, fmt=fmt)
 
-    # Load device-resident owned array via vibespatial IO (the real user path).
-    # Also load the GeoDataFrame for the Shapely baseline comparison.
-    gdf, read_seconds = load_geodataframe(spec, fmt)
-    values = gdf.geometry.tolist()
+    gdf, read_seconds = load_public_geodataframe(spec, fmt)
 
-    owned, _ = load_owned(spec, fmt)
+    gdf.geometry.make_valid()
+    times: list[float] = []
+    for _ in range(max(1, repeat)):
+        start = perf_counter()
+        result = gdf.geometry.make_valid()
+        times.append(perf_counter() - start)
 
-    result = benchmark_make_valid(values, owned=owned)
+    timing = timing_from_samples(times)
 
-    timing = timing_from_samples([result.compact_elapsed_seconds])
-    baseline_timing = timing_from_samples([result.baseline_elapsed_seconds])
-    speedup = result.speedup_vs_baseline
+    baseline_times: list[float] = []
+    values = gdf.geometry.to_numpy()
+    for _ in range(max(1, repeat)):
+        start = perf_counter()
+        shapely.make_valid(values)
+        baseline_times.append(perf_counter() - start)
+    baseline_timing = timing_from_samples(baseline_times)
+    speedup = (
+        baseline_timing.median_seconds / timing.median_seconds
+        if timing.median_seconds > 0
+        else None
+    )
 
     return BenchmarkResult(
         operation="make-valid",
@@ -338,7 +370,7 @@ def bench_make_valid(
         speedup=speedup,
         input_format=input_format,
         read_seconds=read_seconds,
-        metadata={"repaired_rows": result.repaired_rows},
+        metadata={"repaired_rows": int(len(result))},
     )
 
 
@@ -370,49 +402,23 @@ def bench_gpu_dissolve(
 ) -> BenchmarkResult:
     from time import perf_counter
 
-    import numpy as np
     import shapely
 
-    from vibespatial.bench.fixture_loader import load_geodataframe
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, ensure_grouped_boxes_fixture
-    from vibespatial.overlay.dissolve import execute_grouped_box_union_gpu
 
     fmt = InputFormat(input_format)
     groups = kwargs.get("groups", 100)
     spec, _ = ensure_grouped_boxes_fixture(scale, groups=groups, fmt=fmt)
-    frame, read_seconds = load_geodataframe(spec, fmt)
+    frame, read_seconds = load_public_geodataframe(spec, fmt)
 
-    values = np.asarray(frame.geometry.array, dtype=object)
-    grouped = frame.groupby("group", sort=True, observed=False, dropna=True)[
-        frame.geometry.name
-    ]
-    group_positions = [
-        np.asarray(positions, dtype=np.int32)
-        for _, positions in grouped.indices.items()
-    ]
-
-    start = perf_counter()
-    warmup_result = execute_grouped_box_union_gpu(values, group_positions)
-    cold_elapsed_seconds = perf_counter() - start
-    if warmup_result is None:
-        return BenchmarkResult(
-            operation="gpu-dissolve",
-            tier=1,
-            scale=scale,
-            geometry_type="polygon",
-            precision=precision,
-            status="skip",
-            status_reason="GPU runtime not available (CuPy not installed)",
-            timing=timing_from_samples([]),
-            input_format=input_format,
-            read_seconds=read_seconds,
-        )
+    frame.dissolve(by="group")
 
     times: list[float] = []
-    last_result = warmup_result
+    last_result = None
     for _ in range(max(1, repeat)):
         start = perf_counter()
-        last_result = execute_grouped_box_union_gpu(values, group_positions)
+        last_result = frame.dissolve(by="group")
         times.append(perf_counter() - start)
 
     timing = timing_from_samples(times)
@@ -424,6 +430,14 @@ def bench_gpu_dissolve(
     baseline_elapsed_seconds = None
     baseline_rows = None
     if compare == "shapely" or compare is None:
+        values = frame.geometry.to_numpy()
+        grouped = frame.groupby("group", sort=True, observed=False, dropna=True)[
+            frame.geometry.name
+        ]
+        group_positions = [
+            positions
+            for _, positions in grouped.indices.items()
+        ]
         shapely_times: list[float] = []
         baseline = None
         for _ in range(max(1, repeat)):
@@ -460,10 +474,9 @@ def bench_gpu_dissolve(
         metadata={
             "repeat": repeat,
             "groups": groups,
-            "accelerated_cold_elapsed_seconds": cold_elapsed_seconds,
-            "accelerated_warm_elapsed_seconds": timing.median_seconds,
+            "public_elapsed_seconds": timing.median_seconds,
             "baseline_elapsed_seconds": baseline_elapsed_seconds,
-            "result_rows": int(len(last_result.geometries)),
+            "result_rows": int(len(last_result)) if last_result is not None else None,
             "baseline_rows": baseline_rows,
         },
     )
@@ -497,27 +510,54 @@ def bench_stroke_kernels(
     input_format: str = "parquet",
     **kwargs: Any,
 ) -> BenchmarkResult:
-    from vibespatial import benchmark_offset_curve, benchmark_point_buffer
-    from vibespatial.bench.fixture_loader import load_geodataframe
+    from time import perf_counter
+
+    import shapely
+
+    from vibespatial.bench.fixture_loader import load_public_geodataframe
     from vibespatial.bench.fixtures import InputFormat, resolve_fixture_spec
 
     kind = kwargs.get("kind", "point-buffer")
     geometry_type = "point" if kind == "point-buffer" else "line"
     distribution = "grid" if geometry_type == "point" else "random-walk"
     spec = resolve_fixture_spec(geometry_type, distribution, scale)
-    gdf, read_seconds = load_geodataframe(spec, InputFormat(input_format))
-    values = gdf.geometry.tolist()
+    gdf, read_seconds = load_public_geodataframe(spec, InputFormat(input_format))
 
     if kind == "offset-curve":
-        result = benchmark_offset_curve(values, distance=1.0, join_style="mitre")
+        gdf.geometry.offset_curve(1.0, join_style="mitre")
     else:
-        result = benchmark_point_buffer(values, distance=1.0, quad_segs=8)
+        gdf.geometry.buffer(1.0, quad_segs=8)
 
-    timing = timing_from_samples([result.owned_elapsed_seconds])
-    speedup = result.speedup_vs_shapely
-    baseline_timing = None
-    if result.shapely_elapsed_seconds:
-        baseline_timing = timing_from_samples([result.shapely_elapsed_seconds])
+    times: list[float] = []
+    for _ in range(max(1, repeat)):
+        start = perf_counter()
+        if kind == "offset-curve":
+            result = gdf.geometry.offset_curve(1.0, join_style="mitre")
+        else:
+            result = gdf.geometry.buffer(1.0, quad_segs=8)
+        times.append(perf_counter() - start)
+
+    timing = timing_from_samples(times)
+
+    values = gdf.geometry.to_numpy()
+    baseline_times: list[float] = []
+    if kind == "offset-curve":
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.offset_curve(values, distance=1.0, join_style="mitre")
+            baseline_times.append(perf_counter() - start)
+    else:
+        for _ in range(max(1, repeat)):
+            start = perf_counter()
+            shapely.buffer(values, distance=1.0, quad_segs=8)
+            baseline_times.append(perf_counter() - start)
+
+    baseline_timing = timing_from_samples(baseline_times)
+    speedup = (
+        baseline_timing.median_seconds / timing.median_seconds
+        if timing.median_seconds > 0
+        else None
+    )
 
     return BenchmarkResult(
         operation="stroke-kernels",
@@ -535,7 +575,6 @@ def bench_stroke_kernels(
         read_seconds=read_seconds,
         metadata={
             "kind": kind,
-            "fast_rows": result.fast_rows,
-            "fallback_rows": result.fallback_rows,
+            "result_rows": int(len(result)),
         },
     )

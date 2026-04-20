@@ -5,7 +5,7 @@ Scope: End-to-end pipeline benchmark suites, regression thresholds, and CI artif
 Read If: You are changing pipeline benchmarks, regression gates, or CPU/GPU movement profiling in CI.
 STOP IF: You already have the benchmark scripts open and only need a local implementation detail.
 Source Of Truth: Phase-1 pipeline benchmark and regression-gate workflow for end-to-end performance tracking.
-Body Budget: 168/220 lines
+Body Budget: 183/220 lines
 Document: docs/testing/pipeline-benchmarks.md
 
 Section Map (Body Lines)
@@ -17,12 +17,12 @@ Section Map (Body Lines)
 | 30-44 | Open First |
 | 45-54 | Verify |
 | 55-63 | Risks |
-| 64-85 | Entry Points |
-| 86-100 | Pipelines |
-| 101-113 | Suites |
-| 114-122 | Regression Rules |
-| 123-149 | Trace Contract |
-| 150-168 | CI Workflow |
+| 64-95 | Entry Points |
+| 96-110 | Pipelines |
+| 111-128 | Suites |
+| 129-137 | Regression Rules |
+| 138-164 | Trace Contract |
+| 165-183 | CI Workflow |
 DOC_HEADER:END -->
 
 This repo now has a dedicated end-to-end pipeline benchmark rail for regression
@@ -108,6 +108,16 @@ uv run vsbench run clip-rect --arg kind=polygon --arg rect=100,100,700,700
 uv run vsbench run bounds-pairs --rows 20000 --arg dataset=uniform --arg tile_size=256
 ```
 
+Default operation listings and suites are public-API benchmarks only. Internal
+owned-array or kernel diagnostics are hidden from `vsbench list operations` and
+excluded from `vsbench suite`; use `--include-internal` or `vsbench kernel`
+when you explicitly want private-path diagnostics.
+
+`vsbench suite` runs serially and isolates each operation, pipeline, or kernel
+item in a child process by default. That keeps CUDA allocator state and OOM
+failures from bleeding across benchmark items. Use `--in-process` only for
+local debugging when you intentionally want the old single-process behavior.
+
 ## Pipelines
 
 The active benchmarked pipelines are:
@@ -135,6 +145,11 @@ The active benchmarked pipelines are:
 Each pipeline/scale can be repeated with `--repeat N`. Reported wall-clock is
 the median elapsed time across repeats. Device memory and movement counters are
 reported conservatively from the worst observed sample.
+
+The suite CLI enforces per-item timeouts with `--item-timeout N` for isolated
+runs. On timeout it kills only the owned child process group and records any
+remaining non-orchestrator `nvidia-smi` compute apps in result metadata; it
+does not kill unrelated GPU work on the machine.
 
 ## Regression Rules
 
