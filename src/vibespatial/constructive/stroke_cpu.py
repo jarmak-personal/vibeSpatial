@@ -466,6 +466,15 @@ def _non_null_mask(values: np.ndarray) -> np.ndarray:
     return np.asarray([geometry is not None for geometry in values], dtype=bool)
 
 
+def _buffer_style_name(value) -> str:
+    name = getattr(value, "name", None)
+    if name is not None:
+        return str(name).lower()
+    if isinstance(value, int):
+        return {1: "round", 2: "flat", 3: "square"}.get(value, str(value))
+    return str(value).lower()
+
+
 def supports_point_buffer_surface(
     geometries: np.ndarray,
     *,
@@ -473,7 +482,8 @@ def supports_point_buffer_surface(
     join_style,
     single_sided: bool,
 ) -> bool:
-    if single_sided or cap_style != "round" or join_style != "round":
+    del join_style
+    if single_sided or _buffer_style_name(cap_style) != "round":
         return False
     non_null = _non_null_mask(geometries)
     if not np.any(non_null):
@@ -500,7 +510,9 @@ def supports_point_buffer_gpu_surface(
     if quad_segs < 1 or len(geometries) == 0:
         return False
     non_null = _non_null_mask(geometries)
-    return bool(np.all(non_null) and not np.any(shapely.is_empty(geometries)))
+    if not np.any(non_null):
+        return False
+    return bool(not np.any(shapely.is_empty(geometries[non_null])))
 
 
 def supports_linestring_buffer_surface(

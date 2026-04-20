@@ -1188,9 +1188,6 @@ def _clip_polygon_area_intersection_owned(
     The older direct exact path remains the CPU/no-GPU fallback.
     """
     from vibespatial.api.tools.overlay import _many_vs_one_intersection_owned
-    from vibespatial.constructive.binary_constructive import (
-        binary_constructive_owned,
-    )
     from vibespatial.geometry.owned import materialize_broadcast, tile_single_row
     from vibespatial.runtime.residency import Residency
 
@@ -1252,7 +1249,7 @@ def _clip_polygon_area_intersection_owned(
             surface="geopandas.clip",
             reason=(
                 "many-vs-one polygon clip helper failed; "
-                "falling back to generic exact constructive path"
+                "falling back to host exact polygonal area extraction"
             ),
             detail=f"{type(exc).__name__}: {exc}",
             requested=ExecutionMode.AUTO,
@@ -1260,13 +1257,9 @@ def _clip_polygon_area_intersection_owned(
             pipeline="_clip_polygon_area_intersection_owned",
             d2h_transfer=False,
         )
-        return binary_constructive_owned(
-            "intersection",
+        return _host_polygonal_area_intersection_owned(
             left_owned,
             mask_owned,
-            dispatch_mode=ExecutionMode.CPU,
-            _prefer_exact_polygon_intersection=True,
-            _allow_rectangle_intersection_fast_path=allow_rectangle_kernel,
         )
 
 
@@ -1393,6 +1386,36 @@ def _clip_polygon_single_pair_containment_owned(left_owned, mask_owned):
     return None
 
 
+def _host_polygonal_area_intersection_owned(left_owned, right_owned):
+    """Host exact intersection for clip's polygonal area-only contract."""
+    from vibespatial.api.tools.overlay import _strip_non_polygon_collection_parts
+    from vibespatial.geometry.owned import from_shapely_geometries
+
+    left_values = np.asarray(left_owned.to_shapely(), dtype=object)
+    if right_owned.row_count == 1 and left_values.size > 1:
+        right_geom = right_owned.to_shapely()[0]
+        right_values = np.full(left_values.size, right_geom, dtype=object)
+    else:
+        right_values = np.asarray(right_owned.to_shapely(), dtype=object)
+
+    raw = np.asarray(shapely.intersection(left_values, right_values), dtype=object)
+    polygonal = _strip_non_polygon_collection_parts(raw)
+    area_only = np.asarray(
+        [
+            geom
+            if (
+                geom is not None
+                and getattr(geom, "geom_type", None) in POLYGON_GEOM_TYPES
+                and not getattr(geom, "is_empty", False)
+            )
+            else None
+            for geom in polygonal
+        ],
+        dtype=object,
+    )
+    return from_shapely_geometries(area_only.tolist(), residency=left_owned.residency)
+
+
 def _clip_polygon_rectangle_area_intersection_owned(
     left_owned,
     rectangle_bounds: tuple[float, float, float, float],
@@ -1408,7 +1431,6 @@ def _clip_polygon_rectangle_area_intersection_owned(
     """
     from vibespatial.constructive.binary_constructive import (
         _binary_constructive_gpu,
-        binary_constructive_owned,
     )
     from vibespatial.geometry.owned import (
         build_null_owned_array,
@@ -1445,12 +1467,18 @@ def _clip_polygon_rectangle_area_intersection_owned(
                 "after GPU execution was selected"
             )
     else:
-        result = binary_constructive_owned(
-            "intersection",
+        record_fallback_event(
+            surface="geopandas.clip",
+            reason="polygon-rectangle clip used host exact polygonal area extraction",
+            detail=f"rows={left_owned.row_count}",
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.CPU,
+            pipeline="_clip_polygon_rectangle_area_intersection_owned",
+            d2h_transfer=left_owned.residency is Residency.DEVICE,
+        )
+        result = _host_polygonal_area_intersection_owned(
             left_owned,
             rectangle_owned,
-            dispatch_mode=ExecutionMode.CPU,
-            _prefer_exact_polygon_intersection=True,
         )
 
     positive_rows = np.flatnonzero(_owned_nonempty_polygon_mask(result)).astype(
@@ -1746,30 +1774,68 @@ def _clip_polygon_partition_with_rectangle_mask(
         if boundary_rows.size > 0:
             boundary_values = source_values.take(boundary_rows)
             boundary_owned = source_owned.take(boundary_rows)
-            area_owned = _clip_polygon_rectangle_area_intersection_owned(
-                boundary_owned,
-                rectangle_bounds,
-            )
-            area_positive_local = _owned_nonempty_polygon_mask(area_owned)
-            positive_local_rows = np.flatnonzero(area_positive_local).astype(
-                np.intp,
-                copy=False,
-            )
-            if positive_local_rows.size > 0:
-                result_owned = concat_owned_scatter(
-                    result_owned,
-                    area_owned.take(positive_local_rows),
-                    boundary_rows[positive_local_rows],
-                )
-            missing_local_rows = np.flatnonzero(~area_positive_local).astype(
-                np.intp,
-                copy=False,
-            )
-            if missing_local_rows.size > 0:
-                from vibespatial.geometry.buffers import GeometryFamily
-                from vibespatial.geometry.owned import FAMILY_TAGS
+            handled_local_mask = np.zeros(boundary_rows.size, dtype=bool)
+            tags = np.asarray(boundary_owned.tags)
 
-                tags = np.asarray(boundary_owned.tags)
+            from vibespatial.geometry.buffers import GeometryFamily
+            from vibespatial.geometry.owned import FAMILY_TAGS
+
+            multipolygon_local_rows = np.flatnonzero(
+                tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
+            ).astype(np.intp, copy=False)
+            if (
+                boundary_owned.residency is Residency.DEVICE
+                and multipolygon_local_rows.size > 0
+            ):
+                multipolygon_rescue = _clip_multipolygon_rectangle_keep_geom_type_owned(
+                    boundary_owned.take(multipolygon_local_rows),
+                    rectangle_bounds,
+                )
+                if multipolygon_rescue is None:
+                    logger.debug(
+                        "device multipolygon rectangle keep_geom_type rescue unavailable; "
+                        "continuing to generic area path"
+                    )
+                else:
+                    rescued_local_rows = np.flatnonzero(
+                        _owned_nonempty_polygon_mask(multipolygon_rescue)
+                    ).astype(np.intp, copy=False)
+                    if rescued_local_rows.size > 0:
+                        result_owned = concat_owned_scatter(
+                            result_owned,
+                            multipolygon_rescue.take(rescued_local_rows),
+                            boundary_rows[multipolygon_local_rows[rescued_local_rows]],
+                        )
+                    handled_local_mask[multipolygon_local_rows] = True
+
+            remaining_local_rows = np.flatnonzero(~handled_local_mask).astype(
+                np.intp,
+                copy=False,
+            )
+            missing_local_rows = remaining_local_rows
+            if remaining_local_rows.size > 0:
+                area_owned = _clip_polygon_rectangle_area_intersection_owned(
+                    boundary_owned.take(remaining_local_rows),
+                    rectangle_bounds,
+                )
+                area_positive_local = _owned_nonempty_polygon_mask(area_owned)
+                positive_local_rows = np.flatnonzero(area_positive_local).astype(
+                    np.intp,
+                    copy=False,
+                )
+                if positive_local_rows.size > 0:
+                    result_owned = concat_owned_scatter(
+                        result_owned,
+                        area_owned.take(positive_local_rows),
+                        boundary_rows[remaining_local_rows[positive_local_rows]],
+                    )
+                missing_local_rows = remaining_local_rows[
+                    np.flatnonzero(~area_positive_local).astype(
+                        np.intp,
+                        copy=False,
+                    )
+                ]
+            if missing_local_rows.size > 0:
                 multipolygon_local_rows = missing_local_rows[
                     tags[missing_local_rows] == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]
                 ]

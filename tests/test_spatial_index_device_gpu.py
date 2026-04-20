@@ -139,8 +139,8 @@ def test_device_query_matches_cpu_brute_force_medium():
 
 
 @requires_gpu
-def test_device_query_no_candidates_returns_none():
-    """When no bbox overlaps exist, result is None."""
+def test_device_query_no_candidates_returns_empty_device_candidates():
+    """When GPU runs and no bbox overlaps exist, result stays device-resident."""
     tree_geoms = np.asarray([box(0, 0, 1, 1)], dtype=object)
     query_geoms = np.asarray([box(100, 100, 101, 101)], dtype=object)
 
@@ -149,18 +149,25 @@ def test_device_query_no_candidates_returns_none():
     query_bounds = compute_geometry_bounds(query_owned)
 
     cands, execution = spatial_index_device_query(flat_index, query_bounds)
-    assert cands is None
+    assert execution.selected is ExecutionMode.GPU
+    assert cands is not None
+    assert cands.total_pairs == 0
+    gpu_left, gpu_right = cands.to_host()
+    assert gpu_left.size == 0
+    assert gpu_right.size == 0
 
 
 @requires_gpu
 def test_device_query_empty_inputs():
-    """Empty query or tree returns None."""
+    """Empty query inputs preserve the selected GPU path with empty candidates."""
     tree_geoms = np.asarray([box(0, 0, 1, 1)], dtype=object)
     tree_owned, flat_index = build_owned_spatial_index(tree_geoms)
 
     empty_bounds = np.empty((0, 4), dtype=np.float64)
     cands, execution = spatial_index_device_query(flat_index, empty_bounds)
-    assert cands is None
+    assert execution.selected is ExecutionMode.GPU
+    assert cands is not None
+    assert cands.total_pairs == 0
 
 
 @requires_gpu
@@ -406,6 +413,11 @@ def test_device_query_cpu_fallback_when_no_gpu():
         query_bounds = np.array([[0.5, 0.5, 2.5, 2.5]], dtype=np.float64)
 
         cands, execution = spatial_index_device_query(flat_index, query_bounds)
+        assert cands is None
+        assert execution.selected is ExecutionMode.CPU
+
+        empty_bounds = np.empty((0, 4), dtype=np.float64)
+        cands, execution = spatial_index_device_query(flat_index, empty_bounds)
         assert cands is None
         assert execution.selected is ExecutionMode.CPU
 

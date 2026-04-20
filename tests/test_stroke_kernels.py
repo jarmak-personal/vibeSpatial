@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import shapely
 from shapely.geometry import LineString, MultiLineString, Point, Polygon
 
@@ -19,7 +20,7 @@ from vibespatial.api.testing import assert_geoseries_equal
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.fusion import IntermediateDisposition
 
 
@@ -98,6 +99,54 @@ def test_geopandas_buffer_dispatch_claims_point_surface() -> None:
         "DeviceGeometryArray.buffer",
     }
     assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+
+
+def test_geopandas_buffer_cpu_point_surface_claims_non_quad1() -> None:
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    series = GeoSeries([Point(0, 0), Point(2, 2)])
+
+    result = series.buffer(1.0, quad_segs=4)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+    expected = GeoSeries(shapely.buffer(np.asarray(series.values._data, dtype=object), 1.0, quad_segs=4))
+
+    assert all(
+        bool(shapely.equals_exact(left, right, tolerance=1e-12))
+        for left, right in zip(result, expected, strict=True)
+    )
+    assert not fallback_events
+    assert dispatch_events
+    assert dispatch_events[-1].surface in {
+        "geopandas.array.buffer",
+        "DeviceGeometryArray.buffer",
+    }
+    assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+
+
+def test_geopandas_buffer_gpu_preserves_null_point_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    geopandas.clear_dispatch_events()
+    points = [Point(float(index), float(index % 17)) for index in range(600)]
+    values = [None, *points[:300], None, *points[300:], None]
+    series = GeoSeries(values)
+    distances = np.full(len(series), 0.25, dtype=np.float64)
+
+    result = series.buffer(distances, quad_segs=4)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+
+    assert dispatch_events[-1].surface == "geopandas.array.buffer"
+    assert dispatch_events[-1].selected is ExecutionMode.GPU
+    assert result.iloc[0] is None
+    assert result.iloc[301] is None
+    assert result.iloc[-1] is None
+    expected = shapely.buffer(np.asarray(values[1:4], dtype=object), 0.25, quad_segs=4)
+    assert all(
+        bool(shapely.equals_exact(actual, expected_geom, tolerance=1e-12))
+        for actual, expected_geom in zip(result.iloc[1:4], expected, strict=True)
+    )
 
 
 def test_linestring_buffer_owned_gpu_matches_shapely_after_normalize() -> None:

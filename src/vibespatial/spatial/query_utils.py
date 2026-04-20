@@ -420,6 +420,12 @@ def _filter_predicate_pairs_owned(
                     reason="bbox-only query does not invoke exact predicate refinement",
                 ),
             )
+        requested_mode = ExecutionMode.GPU if _has_device else ExecutionMode.CPU
+        reason = (
+            "GPU candidate generation produced no pairs; no exact predicate refinement needed"
+            if _has_device
+            else "no candidate pairs reached exact predicate refinement"
+        )
         return (
             left_indices,
             right_indices,
@@ -427,8 +433,9 @@ def _filter_predicate_pairs_owned(
                 kernel_name="spatial_query_refine",
                 kernel_class=KernelClass.COARSE,
                 row_count=_total,
-                requested_mode=ExecutionMode.CPU,
-                reason="no candidate pairs reached exact predicate refinement",
+                requested_mode=requested_mode,
+                gpu_available=True if _has_device else None,
+                reason=reason,
             ),
         )
 

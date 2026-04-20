@@ -23,7 +23,9 @@ from shapely.geometry import (
     Polygon,
 )
 
+from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime.residency import Residency
 from vibespatial.testing import build_owned as _make_owned
 
 requires_gpu = pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
@@ -286,6 +288,27 @@ def test_cpu_fallback():
     expected = _shapely_equals_exact_tol0(geoms, geoms)
     np.testing.assert_array_equal(result, expected)
     assert result.all()
+
+
+@requires_gpu
+def test_device_resident_small_equals_identical_sticks_to_gpu():
+    """Small AUTO equality stays on GPU after inputs are device-resident."""
+    from vibespatial.geometry.equality import geom_equals_identical_owned
+    from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+
+    geoms = [Point(0, 0), Point(1, 1), Point(2, 2)]
+    left = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    right = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+
+    clear_dispatch_events()
+    result = geom_equals_identical_owned(left, right)
+    events = get_dispatch_events(clear=True)
+
+    np.testing.assert_array_equal(result, np.asarray([True, True, True], dtype=bool))
+    assert any(
+        event.surface == "geom_equals_exact" and event.selected is ExecutionMode.GPU
+        for event in events
+    )
 
 
 # ---------------------------------------------------------------------------

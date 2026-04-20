@@ -26,7 +26,7 @@ def _clean_snapshot_cache():
     [
         ("normalize", KernelClass.COARSE, 500),
         ("point_clip", KernelClass.CONSTRUCTIVE, 10_000),
-        ("point_buffer", KernelClass.CONSTRUCTIVE, 10_000),
+        ("point_buffer", KernelClass.CONSTRUCTIVE, 500),
         ("linestring_buffer", KernelClass.CONSTRUCTIVE, 5_000),
         ("polygon_centroid", KernelClass.METRIC, 500),
         ("polygon_buffer", KernelClass.CONSTRUCTIVE, 50_000),

@@ -87,7 +87,7 @@ DEFAULT_BROADCAST_CROSSOVER_POLICIES: dict[KernelClass, int] = {
 _KERNEL_CROSSOVER_OVERRIDES: dict[str, int] = {
     "normalize": 500,
     "point_clip": 10_000,
-    "point_buffer": 10_000,
+    "point_buffer": 500,
     "linestring_buffer": 5_000,
     "segment_classify": 4_096,
     "flat_index_build": 0,

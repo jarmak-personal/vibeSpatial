@@ -255,7 +255,7 @@ def test_crossover_override_returns_kernel_specific_threshold() -> None:
     assert "kernel-specific" in policy.reason
 
     policy = default_crossover_policy("point_buffer", KernelClass.CONSTRUCTIVE)
-    assert policy.auto_min_rows == 10_000
+    assert policy.auto_min_rows == 500
 
     policy = default_crossover_policy("polygon_centroid", KernelClass.METRIC)
     assert policy.auto_min_rows == 500

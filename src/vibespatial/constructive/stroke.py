@@ -19,7 +19,12 @@ from vibespatial.constructive.stroke_cpu import (
     supports_point_buffer_surface,
     supports_polygon_buffer_gpu_surface,
 )
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.geometry.owned import (
+    NULL_TAG,
+    build_device_resident_owned,
+    concat_owned_scatter,
+    from_shapely_geometries,
+)
 
 if TYPE_CHECKING:
     from vibespatial.geometry.owned import OwnedGeometryArray
@@ -37,6 +42,27 @@ from .point import point_buffer_owned_array
 class StrokeOperation(StrEnum):
     BUFFER = "buffer"
     OFFSET_CURVE = "offset_curve"
+
+
+def _null_preserving_point_buffer_rows(
+    geometries: np.ndarray,
+) -> np.ndarray:
+    """Rows eligible for the point-buffer GPU kernel."""
+    return np.flatnonzero(np.not_equal(geometries, None)).astype(np.int64, copy=False)
+
+
+def _empty_device_buffer_result(row_count: int):
+    """Build an all-null device result for sparse point-buffer scatter."""
+    import cupy as cp
+
+    return build_device_resident_owned(
+        device_families={},
+        row_count=row_count,
+        tags=cp.full(row_count, NULL_TAG, dtype=cp.int8),
+        validity=cp.zeros(row_count, dtype=cp.bool_),
+        family_row_offsets=cp.full(row_count, -1, dtype=cp.int32),
+        execution_mode="gpu",
+    )
 
 
 class StrokePrimitive(StrEnum):
@@ -317,6 +343,7 @@ def evaluate_geopandas_buffer(
             join_style=join_style,
             single_sided=single_sided,
         ):
+            gpu_rows = _null_preserving_point_buffer_rows(geometries)
             gpu_available = has_gpu_runtime() and supports_point_buffer_gpu_surface(
                 geometries,
                 quad_segs=quad_segs,
@@ -327,18 +354,31 @@ def evaluate_geopandas_buffer(
             selection = plan_dispatch_selection(
                 kernel_name="point_buffer",
                 kernel_class=KernelClass.CONSTRUCTIVE,
-                row_count=len(geometries),
+                row_count=int(gpu_rows.size),
                 gpu_available=gpu_available,
                 current_residency=current_residency,
             )
             if selection.selected is ExecutionMode.GPU:
                 owned = prebuilt_owned if prebuilt_owned is not None else from_shapely_geometries(geometries.tolist())
+                active_owned = owned if gpu_rows.size == len(geometries) else owned.take(gpu_rows)
+                active_distance = distance
+                if not np.isscalar(distance):
+                    distance_values = np.asarray(distance, dtype=np.float64)
+                    if distance_values.shape != (len(geometries),):
+                        raise ValueError("distance must be a scalar or length-matched vector")
+                    active_distance = distance_values[gpu_rows]
                 result = point_buffer_owned_array(
-                    owned,
-                    distance,
+                    active_owned,
+                    active_distance,
                     quad_segs=quad_segs,
                     dispatch_mode=ExecutionMode.GPU,
                 )
+                if gpu_rows.size != len(geometries):
+                    result = concat_owned_scatter(
+                        _empty_device_buffer_result(len(geometries)),
+                        result,
+                        gpu_rows,
+                    )
                 return result, ExecutionMode.GPU
 
             result = point_buffer_owned(geometries, distance, quad_segs=quad_segs)

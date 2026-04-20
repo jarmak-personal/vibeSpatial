@@ -8,7 +8,15 @@ import numpy as np
 import pandas as pd
 import pytest
 import shapely
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, Point, Polygon, box
+from shapely.geometry import (
+    GeometryCollection,
+    LineString,
+    MultiLineString,
+    MultiPolygon,
+    Point,
+    Polygon,
+    box,
+)
 
 import vibespatial
 from vibespatial.api._native_results import NativeTabularResult
@@ -365,6 +373,121 @@ def test_clip_scalar_rectangle_polygon_mask_auto_preserves_device_cleanup_path()
     )
 
 
+def test_clip_scalar_rectangle_device_multipolygon_keep_geom_type_stays_off_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    source_geom = MultiPolygon(
+        [
+            box(-1.0, -1.0, 2.0, 2.0),
+            box(4.0, 4.0, 12.0, 12.0),
+        ]
+    )
+    source_owned = from_shapely_geometries([source_geom], residency=Residency.DEVICE)
+    gdf = vibespatial.GeoDataFrame(
+        {
+            "parcel_id": [1],
+            "geometry": DeviceGeometryArray._from_owned(
+                source_owned,
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask = box(0.0, 0.0, 10.0, 10.0)
+
+    monkeypatch.setattr(
+        clip_module,
+        "_host_polygonal_area_intersection_owned",
+        lambda *_args, **_kwargs: pytest.fail(
+            "device multipolygon rectangle keep_geom_type clip should stay off host"
+        ),
+    )
+
+    vibespatial.clear_fallback_events()
+    with strict_native_environment():
+        result = clip(gdf, mask, keep_geom_type=True, sort=False)
+
+    assert len(result) == 1
+    assert result.geom_type.iloc[0] in POLYGON_GEOM_TYPES
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert result.geometry.values._owned.residency is Residency.DEVICE
+    assert shapely.equals(result.geometry.iloc[0], shapely.intersection(source_geom, mask))
+    assert not any(
+        event.surface == "geopandas.clip"
+        and event.pipeline == "_clip_polygon_rectangle_area_intersection_owned"
+        for event in vibespatial.get_fallback_events(clear=True)
+    )
+
+
+def test_clip_scalar_rectangle_device_multipolygon_rescue_failure_uses_generic_device_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    source_geom = MultiPolygon(
+        [
+            box(-1.0, -1.0, 2.0, 2.0),
+            box(4.0, 4.0, 12.0, 12.0),
+        ]
+    )
+    source_owned = from_shapely_geometries([source_geom], residency=Residency.DEVICE)
+    gdf = vibespatial.GeoDataFrame(
+        {
+            "parcel_id": [1],
+            "geometry": DeviceGeometryArray._from_owned(
+                source_owned,
+                crs="EPSG:3857",
+            ),
+        },
+        crs="EPSG:3857",
+    )
+    mask = box(0.0, 0.0, 10.0, 10.0)
+    expected = shapely.intersection(source_geom, mask)
+    calls: list[tuple[str, int]] = []
+
+    def _rescue_unavailable(left_owned, rectangle_bounds):
+        assert left_owned.residency is Residency.DEVICE
+        calls.append(("rescue", left_owned.row_count))
+        return None
+
+    def _generic_area_path(left_owned, rectangle_bounds):
+        assert left_owned.residency is Residency.DEVICE
+        calls.append(("generic", left_owned.row_count))
+        return from_shapely_geometries([expected], residency=Residency.DEVICE)
+
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_multipolygon_rectangle_keep_geom_type_owned",
+        _rescue_unavailable,
+    )
+    monkeypatch.setattr(
+        clip_module,
+        "_clip_polygon_rectangle_area_intersection_owned",
+        _generic_area_path,
+    )
+    monkeypatch.setattr(
+        clip_module,
+        "_host_polygonal_area_intersection_owned",
+        lambda *_args, **_kwargs: pytest.fail(
+            "device multipolygon rescue failure should not use host area cleanup"
+        ),
+    )
+
+    with strict_native_environment():
+        result = clip(gdf, mask, keep_geom_type=True, sort=False)
+
+    assert calls == [("rescue", 1), ("generic", 1)]
+    assert len(result) == 1
+    assert result.geom_type.iloc[0] in POLYGON_GEOM_TYPES
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert result.geometry.values._owned.residency is Residency.DEVICE
+    assert shapely.equals(result.geometry.iloc[0], expected)
+
+
 def test_clip_scalar_rectangle_simple_polygons_skips_generic_cleanup() -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
@@ -534,6 +657,30 @@ def test_clip_polygon_rectangle_mask_donut_preserves_geometry_collection_slivers
     result = clip(multi_poly, mask)
 
     assert result.geom_type.iloc[0] == "GeometryCollection"
+    assert tuple(result.total_bounds) == tuple(mask.total_bounds)
+
+
+def test_clip_polygon_rectangle_mask_donut_keep_geom_type_strips_collection_slivers() -> None:
+    points = vibespatial.GeoDataFrame(
+        {"geometry": [Point(2.0, 2.0), Point(3.0, 4.0), Point(9.0, 8.0), Point(-12.0, -15.0)]},
+        crs="EPSG:3857",
+    )
+    buffered = points.copy()
+    buffered["geometry"] = buffered.buffer(4.0)
+    mask = vibespatial.GeoDataFrame(
+        {"geometry": [box(0.0, 0.0, 10.0, 10.0)]},
+        crs="EPSG:3857",
+    )
+
+    donut = vibespatial.overlay(buffered, mask, how="symmetric_difference")
+    multi_poly = vibespatial.GeoDataFrame(
+        {"geometry": vibespatial.GeoSeries([donut.union_all()], crs="EPSG:3857")},
+        crs="EPSG:3857",
+    )
+
+    result = clip(multi_poly, mask, keep_geom_type=True)
+
+    assert result.geom_type.isin(POLYGON_GEOM_TYPES).all()
     assert tuple(result.total_bounds) == tuple(mask.total_bounds)
 
 
@@ -1418,7 +1565,6 @@ def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_
     monkeypatch,
 ) -> None:
     overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
-    binary_module = importlib.import_module("vibespatial.constructive.binary_constructive")
     left_owned = from_shapely_geometries(
         [box(0.0, 0.0, 2.0, 2.0)],
         residency=Residency.HOST,
@@ -1432,7 +1578,7 @@ def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_
         residency=Residency.HOST,
     )
     fallback_calls: list[dict[str, object]] = []
-    constructive_calls: list[dict[str, object]] = []
+    host_calls: list[tuple[object, object]] = []
 
     def _raise_many_vs_one(*args, **kwargs):
         raise RuntimeError("forced many-vs-one failure")
@@ -1441,15 +1587,8 @@ def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_
         fallback_calls.append(kwargs)
         return None
 
-    def _binary_constructive(op, left, right, **kwargs):
-        constructive_calls.append(
-            {
-                "op": op,
-                "left": left,
-                "right": right,
-                **kwargs,
-            }
-        )
+    def _host_polygonal_area_intersection(left, right):
+        host_calls.append((left, right))
         return expected
 
     monkeypatch.setattr(
@@ -1459,9 +1598,9 @@ def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_
     )
     monkeypatch.setattr(clip_module, "record_fallback_event", _record_fallback)
     monkeypatch.setattr(
-        binary_module,
-        "binary_constructive_owned",
-        _binary_constructive,
+        clip_module,
+        "_host_polygonal_area_intersection_owned",
+        _host_polygonal_area_intersection,
     )
 
     result = clip_module._clip_polygon_area_intersection_owned(left_owned, mask_owned)
@@ -1470,15 +1609,11 @@ def test_clip_polygon_area_intersection_owned_records_fallback_when_many_vs_one_
     assert len(fallback_calls) == 1
     assert fallback_calls[0]["surface"] == "geopandas.clip"
     assert "many-vs-one polygon clip helper failed" in fallback_calls[0]["reason"]
+    assert "host exact polygonal area extraction" in fallback_calls[0]["reason"]
     assert "forced many-vs-one failure" in fallback_calls[0]["detail"]
     assert fallback_calls[0]["selected"].value == "cpu"
     assert fallback_calls[0]["pipeline"] == "_clip_polygon_area_intersection_owned"
-    assert len(constructive_calls) == 1
-    assert constructive_calls[0]["op"] == "intersection"
-    assert constructive_calls[0]["left"] is left_owned
-    assert constructive_calls[0]["right"] is mask_owned
-    assert constructive_calls[0]["_prefer_exact_polygon_intersection"] is True
-    assert constructive_calls[0]["dispatch_mode"].value == "cpu"
+    assert host_calls == [(left_owned, mask_owned)]
 
 
 def test_clip_polygon_area_intersection_owned_uses_direct_exact_gpu_for_tiny_device_batches(

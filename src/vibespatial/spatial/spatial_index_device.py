@@ -78,6 +78,16 @@ def _is_device_array(value) -> bool:
     return hasattr(value, "__cuda_array_interface__")
 
 
+def _empty_device_candidates() -> _DeviceCandidates | None:
+    if cp is None:  # pragma: no cover - exercised on CPU-only installs
+        return None
+    return _DeviceCandidates(
+        d_left=cp.empty(0, dtype=cp.int32),
+        d_right=cp.empty(0, dtype=cp.int32),
+        total_pairs=0,
+    )
+
+
 def _prepare_query_bounds_device(
     bounds,
     runtime,
@@ -124,18 +134,12 @@ def spatial_index_device_query(
     Returns
     -------
     (candidates, execution) : tuple[_DeviceCandidates | None, SpatialQueryExecution]
-        ``candidates`` is None when GPU dispatch is skipped or no pairs
-        are found.  ``execution`` carries the dispatch decision metadata.
+        ``candidates`` is None when GPU dispatch is skipped. When GPU dispatch
+        runs and finds no pairs, ``candidates`` is an empty device-resident
+        result. ``execution`` carries the dispatch decision metadata.
     """
     query_count = int(query_bounds.shape[0])
     tree_count = flat_index.size
-    if query_count == 0 or tree_count == 0:
-        return None, SpatialQueryExecution(
-            requested=ExecutionMode.AUTO,
-            selected=ExecutionMode.GPU,
-            implementation="owned_gpu_spatial_query",
-            reason="empty input; no candidate pairs to generate",
-        )
 
     # This helper is already the GPU-only candidate-generation path.
     # Use the planner for precision/device-profile wiring, but explicitly
@@ -169,6 +173,14 @@ def spatial_index_device_query(
             selected=ExecutionMode.CPU,
             implementation="owned_cpu_spatial_query",
             reason="device spatial index query planner did not resolve a GPU dispatch",
+        )
+
+    if query_count == 0 or tree_count == 0:
+        return _empty_device_candidates(), SpatialQueryExecution(
+            requested=ExecutionMode.AUTO,
+            selected=ExecutionMode.GPU,
+            implementation="owned_gpu_spatial_query",
+            reason="empty input; no candidate pairs to generate",
         )
 
     # Expand bounds for dwithin if distance is provided.
@@ -269,7 +281,7 @@ def _brute_force_scalar(
 ) -> _DeviceCandidates | None:
     """GPU brute-force for Q=1: one thread per tree row."""
     if np.isnan(query_bounds_row).any():
-        return None
+        return _empty_device_candidates()
 
     import cupy as cp
 
@@ -309,7 +321,7 @@ def _brute_force_scalar(
 
         compacted = compact_indices(d_mask)
         if compacted.values.size == 0:
-            return None
+            return _empty_device_candidates()
         d_right = cp.asarray(compacted.values, dtype=cp.int32)
         d_left = cp.zeros(d_right.size, dtype=cp.int32)
         return _DeviceCandidates(
@@ -379,7 +391,7 @@ def _brute_force_multi(
             else 0
         )
         if total_pairs == 0:
-            return None
+            return _empty_device_candidates()
 
         # Pass 1: scatter matching pairs.
         d_left = cp.empty(total_pairs, dtype=cp.int32)
@@ -464,7 +476,7 @@ def _morton_range_query(
     tree_bounds_arr = flat_index.bounds
     valid_tree = tree_bounds_arr[~np.isnan(tree_bounds_arr).any(axis=1)]
     if valid_tree.size == 0:
-        return None
+        return _empty_device_candidates()
     max_half_w = float((valid_tree[:, 2] - valid_tree[:, 0]).max()) / 2.0
     max_half_h = float((valid_tree[:, 3] - valid_tree[:, 1]).max()) / 2.0
 
@@ -581,7 +593,7 @@ def _morton_range_query(
             else 0
         )
         if total_pairs == 0:
-            return None
+            return _empty_device_candidates()
 
         # Step 5: Scatter matching pairs.
         d_left = cp.empty(total_pairs, dtype=cp.int32)

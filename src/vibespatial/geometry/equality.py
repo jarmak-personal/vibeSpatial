@@ -32,9 +32,6 @@ from .owned import (
 
 logger = logging.getLogger(__name__)
 
-_EQUALS_EXACT_GPU_THRESHOLD = 1000
-
-
 def requires_mixed_family_topology_fallback(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -74,7 +71,7 @@ def geom_equals_exact_owned(
         current_residency=combined_residency(left, right),
     )
 
-    if selection.selected is ExecutionMode.GPU and row_count >= _EQUALS_EXACT_GPU_THRESHOLD:
+    if selection.selected is ExecutionMode.GPU:
         try:
             result = _geom_equals_exact_gpu(left, right, tolerance, selection)
             if result is not None:

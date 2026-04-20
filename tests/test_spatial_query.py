@@ -18,6 +18,7 @@ from vibespatial.spatial.query import (
     query_spatial_index,
 )
 from vibespatial.spatial.query_box import _extract_box_query_bounds_shapely
+from vibespatial.spatial.spatial_index_device import spatial_index_device_query
 
 
 def test_query_spatial_index_matches_expected_pairs_for_intersects() -> None:
@@ -218,6 +219,46 @@ class TestDwithinGPU:
         result_set = set(zip(result[0].tolist(), result[1].tolist()))
         assert result_set == expected
         assert execution.selected is ExecutionMode.GPU
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_device_spatial_query_zero_pairs_does_not_signal_cpu_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tree = np.asarray([box(0, 0, 1, 1), box(2, 2, 3, 3)], dtype=object)
+    query_owned = from_shapely_geometries([box(100, 100, 101, 101)], residency=Residency.DEVICE)
+    tree_owned, flat = build_owned_spatial_index(tree)
+    object.__setattr__(flat, "regular_grid", None)
+
+    device_candidates, device_execution = spatial_index_device_query(
+        flat,
+        np.asarray([[100.0, 100.0, 101.0, 101.0]], dtype=np.float64),
+    )
+
+    assert device_execution.selected is ExecutionMode.GPU
+    assert device_candidates is not None
+    assert device_candidates.total_pairs == 0
+
+    def _fail_cpu_candidate_generation(*_args, **_kwargs):
+        raise AssertionError("GPU zero-candidate query should not rerun CPU bounds pairing")
+
+    monkeypatch.setattr(
+        spatial_query_module,
+        "generate_bounds_pairs",
+        _fail_cpu_candidate_generation,
+    )
+
+    result, execution = query_spatial_index(
+        tree_owned,
+        flat,
+        query_owned,
+        predicate="intersects",
+        sort=True,
+        return_metadata=True,
+    )
+
+    assert result.shape == (2, 0)
+    assert execution.selected is ExecutionMode.GPU
 
 
 def test_query_spatial_index_handles_regular_grid_rectangle_boundaries() -> None:

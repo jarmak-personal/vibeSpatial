@@ -33,7 +33,7 @@ from vibespatial.runtime.precision import (
     PrecisionPlan,
     select_precision_plan,
 )
-from vibespatial.runtime.residency import Residency, TransferTrigger
+from vibespatial.runtime.residency import Residency, TransferTrigger, combined_residency
 from vibespatial.runtime.robustness import RobustnessPlan, select_robustness_plan
 
 from .point_relations import (
@@ -233,6 +233,9 @@ def _ensure_registered_kernel(
     predicate: str,
     requested_mode: ExecutionMode,
     row_count: int,
+    *,
+    current_residency: Residency = Residency.HOST,
+    workload_shape: WorkloadShape | None = None,
 ) -> RuntimeSelection:
     plan = plan_dispatch_selection(
         kernel_name=predicate,
@@ -240,6 +243,8 @@ def _ensure_registered_kernel(
         row_count=row_count,
         requested_mode=requested_mode,
         requested_precision=PrecisionMode.AUTO,
+        current_residency=current_residency,
+        workload_shape=workload_shape,
     )
     selection = plan.runtime_selection
     if plan.variant is None:
@@ -1159,7 +1164,13 @@ def evaluate_binary_predicate(
     # the broadcast N-row view lazily when the GPU path needs it.
     _is_broadcast = workload_shape in (WorkloadShape.BROADCAST_RIGHT, WorkloadShape.SCALAR_RIGHT)
 
-    runtime_selection = _ensure_registered_kernel(predicate, requested_mode, row_count)
+    runtime_selection = _ensure_registered_kernel(
+        predicate,
+        requested_mode,
+        row_count,
+        current_residency=combined_residency(left_owned, right_owned),
+        workload_shape=workload_shape,
+    )
     if left_values is None:
         assert left_owned is not None
         left_missing = ~left_owned.validity

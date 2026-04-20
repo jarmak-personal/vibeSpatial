@@ -30,7 +30,7 @@ from vibespatial.geometry.owned import (
     concat_owned_scatter,
     from_shapely_geometries,
 )
-from vibespatial.runtime import has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.residency import Residency
 
@@ -1066,14 +1066,30 @@ class TestBinaryPredicatesOwned:
             assert result.dtype == bool, f"{pred} did not return bool array"
             assert len(result) == len(left_dga), f"{pred} length mismatch"
 
-    def test_predicate_dispatch_event_recorded(self, left_dga, right_dga):
+    def test_device_resident_predicate_dispatch_event_recorded(self):
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+
         from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
+        left_dga = DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [box(0, 0, 2, 2), box(10, 10, 12, 12), box(5, 5, 7, 7)],
+                residency=Residency.DEVICE,
+            )
+        )
+        right_dga = DeviceGeometryArray._from_owned(
+            from_shapely_geometries(
+                [Point(1, 1), Point(20, 20), Point(6, 6)],
+                residency=Residency.DEVICE,
+            )
+        )
         clear_dispatch_events()
         _ = left_dga.intersects(right_dga)
         events = get_dispatch_events(clear=True)
         dga_events = [e for e in events if e.surface == "DeviceGeometryArray.intersects"]
         assert len(dga_events) == 1
-        assert dga_events[0].implementation in {"owned_gpu_predicate", "owned_cpu_predicate"}
+        assert dga_events[0].implementation == "owned_gpu_predicate"
+        assert dga_events[0].selected is ExecutionMode.GPU
 
     def test_predicate_with_scalar_geometry(self, left_dga):
         result = left_dga.contains(Point(1, 1))
