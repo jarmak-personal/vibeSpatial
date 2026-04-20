@@ -26,13 +26,16 @@ def _clean_snapshot_cache():
     [
         ("normalize", KernelClass.COARSE, 500),
         ("point_clip", KernelClass.CONSTRUCTIVE, 10_000),
-        ("point_buffer", KernelClass.CONSTRUCTIVE, 500),
+        ("point_buffer", KernelClass.CONSTRUCTIVE, 0),
         ("linestring_buffer", KernelClass.CONSTRUCTIVE, 5_000),
         ("polygon_centroid", KernelClass.METRIC, 500),
         ("polygon_buffer", KernelClass.CONSTRUCTIVE, 50_000),
         ("segment_classify", KernelClass.CONSTRUCTIVE, 4_096),
-        ("bbox_overlap_candidates", KernelClass.COARSE, 2_048),
+        ("bbox_overlap_candidates", KernelClass.COARSE, 0),
         ("flat_index_build", KernelClass.COARSE, 0),
+        ("intersects", KernelClass.PREDICATE, 0),
+        ("contains", KernelClass.PREDICATE, 0),
+        ("within", KernelClass.PREDICATE, 0),
     ],
 )
 def test_threshold_equivalence(

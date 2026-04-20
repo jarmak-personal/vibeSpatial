@@ -255,7 +255,7 @@ def test_crossover_override_returns_kernel_specific_threshold() -> None:
     assert "kernel-specific" in policy.reason
 
     policy = default_crossover_policy("point_buffer", KernelClass.CONSTRUCTIVE)
-    assert policy.auto_min_rows == 500
+    assert policy.auto_min_rows == 0
 
     policy = default_crossover_policy("polygon_centroid", KernelClass.METRIC)
     assert policy.auto_min_rows == 500
@@ -264,9 +264,12 @@ def test_crossover_override_returns_kernel_specific_threshold() -> None:
     assert policy.auto_min_rows == 4_096
 
     policy = default_crossover_policy("bbox_overlap_candidates", KernelClass.COARSE)
-    assert policy.auto_min_rows == 2_048
+    assert policy.auto_min_rows == 0
 
     policy = default_crossover_policy("flat_index_build", KernelClass.COARSE)
+    assert policy.auto_min_rows == 0
+
+    policy = default_crossover_policy("intersects", KernelClass.PREDICATE)
     assert policy.auto_min_rows == 0
 
 

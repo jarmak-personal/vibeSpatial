@@ -3,7 +3,8 @@
 Computes the topological boundary of each geometry:
 - Point / MultiPoint: boundary is empty (None per Shapely convention).
 - LineString: boundary is the two endpoints as MultiPoint.
-- Polygon: boundary is all rings (exterior + holes) as MultiLineString.
+- Polygon: single-ring boundaries are LineString; polygons with holes are
+  MultiLineString.
 - MultiLineString: boundary is endpoints of all parts as MultiPoint.
 - MultiPolygon: boundary is all rings from all polygons as MultiLineString.
 
@@ -46,24 +47,157 @@ from vibespatial.runtime.precision import KernelClass, PrecisionMode
 # GPU helpers: per-family boundary implementations
 # ---------------------------------------------------------------------------
 
-def _boundary_polygon_gpu(device_buf, geom_count):
-    """Polygon boundary: reinterpret ring offsets as MultiLineString parts.
+def _gather_ranged_coordinates(d_x, d_y, d_starts, d_ends):
+    d_lengths = d_ends - d_starts
+    d_offsets = cp.empty(int(d_lengths.size) + 1, dtype=cp.int32)
+    d_offsets[0] = 0
+    cp.cumsum(d_lengths, out=d_offsets[1:])
+    total_coords = int(d_offsets[-1].item())
+    if total_coords == 0:
+        return (
+            cp.empty(0, dtype=cp.float64),
+            cp.empty(0, dtype=cp.float64),
+            d_offsets,
+        )
 
-    Zero-copy for coordinates -- only offset arrays are relabeled.
-    Polygon's ring_offsets (ring -> coord range) becomes MultiLineString's
-    part_offsets (part -> coord range).  geometry_offsets and coordinates
-    are shared without copy.
-    """
+    d_out_idx = cp.arange(total_coords, dtype=cp.int32)
+    d_range_idx = cp.searchsorted(d_offsets[1:], d_out_idx, side="right")
+    d_src_idx = d_starts[d_range_idx] + (d_out_idx - d_offsets[d_range_idx])
+    return d_x[d_src_idx], d_y[d_src_idx], d_offsets
+
+
+def _polygon_rows_to_linestring_boundary_gpu(device_buf, d_polygon_rows):
+    d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
+    d_ring_offsets = cp.asarray(device_buf.ring_offsets)
+    d_x = cp.asarray(device_buf.x)
+    d_y = cp.asarray(device_buf.y)
+
+    d_ring_idx = d_geom_offsets[d_polygon_rows]
+    d_coord_starts = d_ring_offsets[d_ring_idx]
+    d_coord_ends = d_ring_offsets[d_ring_idx + 1]
+    d_x_out, d_y_out, d_geom_offsets_out = _gather_ranged_coordinates(
+        d_x,
+        d_y,
+        d_coord_starts,
+        d_coord_ends,
+    )
+    d_empty = (d_coord_ends - d_coord_starts) == 0
     return DeviceFamilyGeometryBuffer(
-        family=GeometryFamily.MULTILINESTRING,
-        x=device_buf.x,
-        y=device_buf.y,
-        geometry_offsets=device_buf.geometry_offsets,
-        empty_mask=device_buf.empty_mask,
-        part_offsets=device_buf.ring_offsets,  # rings become parts
+        family=GeometryFamily.LINESTRING,
+        x=d_x_out,
+        y=d_y_out,
+        geometry_offsets=d_geom_offsets_out,
+        empty_mask=d_empty,
+        part_offsets=None,
         ring_offsets=None,
         bounds=None,
     )
+
+
+def _polygon_rows_to_multilinestring_boundary_gpu(device_buf, d_polygon_rows):
+    d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
+    d_ring_offsets = cp.asarray(device_buf.ring_offsets)
+    d_x = cp.asarray(device_buf.x)
+    d_y = cp.asarray(device_buf.y)
+
+    d_ring_starts = d_geom_offsets[d_polygon_rows]
+    d_ring_ends = d_geom_offsets[d_polygon_rows + 1]
+    d_ring_counts = d_ring_ends - d_ring_starts
+
+    d_out_geom_offsets = cp.empty(int(d_polygon_rows.size) + 1, dtype=cp.int32)
+    d_out_geom_offsets[0] = 0
+    cp.cumsum(d_ring_counts, out=d_out_geom_offsets[1:])
+    total_rings = int(d_out_geom_offsets[-1].item())
+    if total_rings == 0:
+        d_part_offsets = cp.empty(1, dtype=cp.int32)
+        d_part_offsets[0] = 0
+        d_x_out = cp.empty(0, dtype=cp.float64)
+        d_y_out = cp.empty(0, dtype=cp.float64)
+    else:
+        d_part_idx = cp.arange(total_rings, dtype=cp.int32)
+        d_geom_idx = cp.searchsorted(d_out_geom_offsets[1:], d_part_idx, side="right")
+        d_source_ring = (
+            d_ring_starts[d_geom_idx]
+            + (d_part_idx - d_out_geom_offsets[d_geom_idx])
+        )
+        d_coord_starts = d_ring_offsets[d_source_ring]
+        d_coord_ends = d_ring_offsets[d_source_ring + 1]
+        d_x_out, d_y_out, d_part_offsets = _gather_ranged_coordinates(
+            d_x,
+            d_y,
+            d_coord_starts,
+            d_coord_ends,
+        )
+
+    return DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTILINESTRING,
+        x=d_x_out,
+        y=d_y_out,
+        geometry_offsets=d_out_geom_offsets,
+        empty_mask=d_ring_counts == 0,
+        part_offsets=d_part_offsets,
+        ring_offsets=None,
+        bounds=None,
+    )
+
+
+def _boundary_polygon_gpu(device_buf, geom_count):
+    """Polygon boundary: row-aware device offset relabeling.
+
+    Single-ring polygons match Shapely's LineString boundary type.  Polygons
+    with holes keep the old MultiLineString mapping where polygon ring offsets
+    become line part offsets.  Homogeneous batches keep the zero-copy mapping;
+    mixed batches compact each output family on device so per-row geometry
+    types remain correct.
+    """
+    d_geom_offsets = cp.asarray(device_buf.geometry_offsets)
+    d_ring_counts = d_geom_offsets[1:] - d_geom_offsets[:-1]
+    if bool(cp.all(d_ring_counts == 1).item()):
+        return {
+            GeometryFamily.LINESTRING: (
+                DeviceFamilyGeometryBuffer(
+                    family=GeometryFamily.LINESTRING,
+                    x=device_buf.x,
+                    y=device_buf.y,
+                    geometry_offsets=device_buf.ring_offsets,
+                    empty_mask=device_buf.empty_mask,
+                    part_offsets=None,
+                    ring_offsets=None,
+                    bounds=None,
+                ),
+                cp.arange(geom_count, dtype=cp.int32),
+            )
+        }
+
+    if bool(cp.all(d_ring_counts != 1).item()):
+        return {
+            GeometryFamily.MULTILINESTRING: (
+                DeviceFamilyGeometryBuffer(
+                    family=GeometryFamily.MULTILINESTRING,
+                    x=device_buf.x,
+                    y=device_buf.y,
+                    geometry_offsets=device_buf.geometry_offsets,
+                    empty_mask=device_buf.empty_mask,
+                    part_offsets=device_buf.ring_offsets,  # rings become parts
+                    ring_offsets=None,
+                    bounds=None,
+                ),
+                cp.arange(geom_count, dtype=cp.int32),
+            )
+        }
+
+    d_single_rows = cp.flatnonzero(d_ring_counts == 1)
+    d_multi_rows = cp.flatnonzero(d_ring_counts != 1)
+    return {
+        GeometryFamily.LINESTRING: (
+            _polygon_rows_to_linestring_boundary_gpu(device_buf, d_single_rows),
+            d_single_rows,
+        ),
+        GeometryFamily.MULTILINESTRING: (
+            _polygon_rows_to_multilinestring_boundary_gpu(device_buf, d_multi_rows),
+            d_multi_rows,
+        )
+    }
 
 
 def _boundary_linestring_gpu(device_buf, geom_count):
@@ -339,7 +473,7 @@ def _merge_multilinestring_buffers(buf_a, buf_b):
 def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     """GPU boundary for all geometry families.
 
-    - Polygon -> MultiLineString: zero-copy offset relabeling.
+    - Polygon -> LineString for single-ring rows; MultiLineString otherwise.
     - MultiPolygon -> MultiLineString: offset composition (zero-copy coords).
     - LineString -> MultiPoint: vectorized CuPy endpoint extraction.
     - MultiLineString -> MultiPoint: vectorized CuPy part-endpoint extraction.
@@ -369,23 +503,25 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
 
         if family is GeometryFamily.POLYGON:
             src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
-            new_buf = _boundary_polygon_gpu(device_buf, geom_count)
-            if GeometryFamily.MULTILINESTRING in new_device_families:
-                new_device_families[GeometryFamily.MULTILINESTRING] = (
-                    _merge_multilinestring_buffers(
-                        new_device_families[GeometryFamily.MULTILINESTRING],
-                        new_buf,
+            boundary_buffers = _boundary_polygon_gpu(device_buf, geom_count)
+            for out_family, (new_buf, local_rows) in boundary_buffers.items():
+                if int(local_rows.size) == 0:
+                    continue
+                if (
+                    out_family is GeometryFamily.MULTILINESTRING
+                    and GeometryFamily.MULTILINESTRING in new_device_families
+                ):
+                    new_device_families[GeometryFamily.MULTILINESTRING] = (
+                        _merge_multilinestring_buffers(
+                            new_device_families[GeometryFamily.MULTILINESTRING],
+                            new_buf,
+                        )
                     )
-                )
-            else:
-                new_device_families[GeometryFamily.MULTILINESTRING] = new_buf
-            family_global_rows_ordered.setdefault(GeometryFamily.MULTILINESTRING, []).append(
-                src_rows,
-            )
-            # Remap tags: Polygon rows -> MultiLineString
-            poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
-            mls_tag = FAMILY_TAGS[GeometryFamily.MULTILINESTRING]
-            out_tags[src_tags == poly_tag] = mls_tag
+                else:
+                    new_device_families[out_family] = new_buf
+                output_rows = src_rows[local_rows]
+                family_global_rows_ordered.setdefault(out_family, []).append(output_rows)
+                out_tags[output_rows] = FAMILY_TAGS[out_family]
 
         elif family is GeometryFamily.MULTIPOLYGON:
             src_rows = cp.flatnonzero(src_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
@@ -454,8 +590,9 @@ def _boundary_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
             out_validity[pt_mask] = False
 
     # Recompute family_row_offsets for the new tag assignments.
-    # Family types changed (Polygon -> MultiLineString, LineString -> MultiPoint,
-    # etc.), so the mapping from global row -> family-local row must be rebuilt.
+    # Family types changed (Polygon -> LineString/MultiLineString,
+    # LineString -> MultiPoint, etc.), so the mapping from global row ->
+    # family-local row must be rebuilt.
     new_family_row_offsets = cp.full(owned.row_count, -1, dtype=cp.int32)
     for row_chunks in family_global_rows_ordered.values():
         ordered_rows = cp.concatenate(row_chunks) if len(row_chunks) > 1 else row_chunks[0]
@@ -488,7 +625,8 @@ def boundary_owned(
     Returns an OwnedGeometryArray whose geometry type depends on the input:
     - Point / MultiPoint rows produce None (empty boundary).
     - LineString rows produce MultiPoint (the two endpoints).
-    - Polygon rows produce MultiLineString (ring boundaries).
+    - Polygon rows produce LineString for single-ring polygons, otherwise
+      MultiLineString.
     - MultiLineString rows produce MultiPoint (endpoints of all parts).
     - MultiPolygon rows produce MultiLineString (all rings as LineStrings).
 

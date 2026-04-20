@@ -46,6 +46,7 @@ from vibespatial.io.file import (
     write_vector_file,
 )
 from vibespatial.io.support import IOOperation, IOPathKind
+from vibespatial.runtime import has_gpu_runtime
 
 
 def _sample_frame() -> geopandas.GeoDataFrame:
@@ -278,6 +279,71 @@ def test_public_explicit_pyogrio_geojson_json_string_keeps_native_gpu_path(
     assert events[-1].implementation == "geojson_gpu_byte_classify_adapter"
     assert "explicit_engine=pyogrio" in events[-1].detail
     assert "source=memory" in events[-1].detail
+
+
+@pytest.mark.gpu
+def test_public_to_parquet_temporarily_promotes_supported_host_geometry(tmp_path) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    path = tmp_path / "promoted.parquet"
+    frame = geopandas.GeoDataFrame(
+        {"value": [1], "geometry": [box(0, 0, 1, 1)]},
+        crs="EPSG:4326",
+    )
+
+    geopandas.clear_dispatch_events()
+    frame.to_parquet(path)
+
+    assert frame.geometry.array._owned is None
+    events = [
+        event for event in geopandas.get_dispatch_events(clear=True)
+        if event.surface == "geopandas.geodataframe.to_parquet"
+    ]
+    assert events
+    assert events[-1].selected is geopandas.ExecutionMode.GPU
+    assert events[-1].implementation == "native_geodataframe_arrow_terminal_export"
+
+
+@pytest.mark.gpu
+def test_public_to_parquet_device_owned_point_geometry_records_gpu_export(tmp_path) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    path = tmp_path / "points.parquet"
+    frame = geopandas.GeoDataFrame(
+        {"value": [1], "geometry": [Point(0, 0)]},
+        crs="EPSG:4326",
+    )
+
+    geopandas.clear_dispatch_events()
+    frame.to_parquet(path)
+
+    assert frame.geometry.array._owned is None
+    events = [
+        event for event in geopandas.get_dispatch_events(clear=True)
+        if event.surface == "geopandas.geodataframe.to_parquet"
+    ]
+    assert events
+    assert events[-1].selected is geopandas.ExecutionMode.GPU
+    assert events[-1].implementation == "native_geodataframe_arrow_device_encoded_export"
+
+
+@pytest.mark.gpu
+def test_public_to_parquet_promotion_failure_restores_prior_host_owned(tmp_path) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    path = tmp_path / "mixed_2d_3d.parquet"
+    frame = geopandas.GeoDataFrame(
+        {"value": [1], "geometry": [Point(0, 0)]},
+        crs="EPSG:4326",
+    )
+    frame["geom_z"] = geopandas.GeoSeries([Point(1, 2, 3)], crs="EPSG:4326")
+
+    frame.to_parquet(path)
+
+    assert frame.geometry.array._owned is None
 
 
 @pytest.mark.gpu
@@ -3121,11 +3187,17 @@ def test_plan_geojson_ingest_auto_selects_best_available() -> None:
     assert plan.uses_native_geometry_assembly is True
 
 
-def test_plan_geojson_ingest_standalone_auto_prefers_fast_json() -> None:
+def test_plan_geojson_ingest_standalone_auto_prefers_gpu_when_available() -> None:
+    from vibespatial.runtime._runtime import has_gpu_runtime
+
     plan = plan_geojson_ingest(objective="standalone")
 
-    assert plan.implementation == "geojson_fast_json_vectorized"
-    assert plan.selected_strategy == "fast-json"
+    if has_gpu_runtime():
+        assert plan.implementation == "geojson_gpu_byte_classify"
+        assert plan.selected_strategy == "gpu-byte-classify"
+    else:
+        assert plan.implementation == "geojson_fast_json_vectorized"
+        assert plan.selected_strategy == "fast-json"
     assert plan.objective == "standalone"
     assert plan.uses_stream_tokenizer is False
     assert plan.uses_native_geometry_assembly is True

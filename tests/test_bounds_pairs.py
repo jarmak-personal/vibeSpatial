@@ -3,6 +3,7 @@ from __future__ import annotations
 from shapely.geometry import LineString, Point, Polygon
 
 from vibespatial import benchmark_bounds_pairs, from_shapely_geometries, generate_bounds_pairs
+from vibespatial.runtime import has_gpu_runtime
 
 
 def test_generate_bounds_pairs_finds_intersections_across_geometry_families() -> None:
@@ -37,6 +38,9 @@ def test_generate_bounds_pairs_ignores_null_and_empty() -> None:
 
     assert pairs.count == 0
     assert pairs.same_input is True
+    if has_gpu_runtime():
+        assert pairs.device_left_indices is not None
+        assert pairs.device_right_indices is not None
 
 
 def test_generate_bounds_pairs_same_input_uses_upper_triangle() -> None:

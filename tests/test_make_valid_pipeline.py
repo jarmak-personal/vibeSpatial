@@ -81,6 +81,26 @@ def test_geopandas_make_valid_uses_compacted_pipeline() -> None:
     assert_geoseries_equal(result, expected, check_geom_type=True)
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime not available")
+def test_geopandas_make_valid_host_supported_values_promotes_to_device_owned() -> None:
+    series = geopandas.GeoSeries([
+        Polygon([(0, 0), (2, 0), (2, 1), (0, 1), (0, 0)]),
+        Polygon([(3, 0), (5, 0), (5, 1), (3, 1), (3, 0)]),
+    ])
+
+    clear_dispatch_events()
+    result = series.make_valid()
+    events = get_dispatch_events(clear=True)
+
+    assert getattr(result.values, "_owned", None) is not None
+    assert result.values._owned.residency is Residency.DEVICE
+    assert any(
+        event.surface == "geopandas.array.make_valid"
+        and event.selected is ExecutionMode.GPU
+        for event in events
+    )
+
+
 def test_make_valid_benchmark_reports_repaired_rows() -> None:
     values = [
         Polygon([(0, 0), (1, 1), (1, 2), (1, 1), (0, 0)]),

@@ -87,11 +87,11 @@ DEFAULT_BROADCAST_CROSSOVER_POLICIES: dict[KernelClass, int] = {
 _KERNEL_CROSSOVER_OVERRIDES: dict[str, int] = {
     "normalize": 500,
     "point_clip": 10_000,
-    "point_buffer": 500,
+    "point_buffer": 0,
     "linestring_buffer": 5_000,
     "segment_classify": 4_096,
     "flat_index_build": 0,
-    "bbox_overlap_candidates": 2_048,
+    "bbox_overlap_candidates": 0,
     "point_regular_grid_candidates": 0,
     "point_box_query": 0,
     "spatial_index_knn": 0,
@@ -99,6 +99,15 @@ _KERNEL_CROSSOVER_OVERRIDES: dict[str, int] = {
     "polygon_centroid": 500,
     "geometry_area": 500,
     "geometry_length": 500,
+    "intersects": 0,
+    "contains": 0,
+    "within": 0,
+    "touches": 0,
+    "covers": 0,
+    "covered_by": 0,
+    "overlaps": 0,
+    "disjoint": 0,
+    "contains_properly": 0,
 }
 
 _BROADCAST_SHAPES = frozenset({WorkloadShape.BROADCAST_RIGHT, WorkloadShape.SCALAR_RIGHT})

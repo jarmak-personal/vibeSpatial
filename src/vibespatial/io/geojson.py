@@ -129,7 +129,7 @@ def plan_geojson_ingest(
     if prefer == "auto":
         from vibespatial.runtime._runtime import has_gpu_runtime
 
-        if has_gpu_runtime() and normalized_objective == "pipeline":
+        if has_gpu_runtime():
             selected_strategy = "gpu-byte-classify"
         else:
             selected_strategy = "fast-json"
@@ -147,19 +147,12 @@ def plan_geojson_ingest(
         "gpu-byte-classify": "geojson_gpu_byte_classify",
     }.get(selected_strategy, "geojson_stream_native")
     if selected_strategy == "fast-json":
-        if prefer == "auto" and normalized_objective == "standalone":
-            reason = (
-                "Standalone GeoJSON ingest defaults to fast-json because the current "
-                "fastest measured isolated read path is orjson-backed vectorized "
-                "assembly rather than GPU byte classification."
-            )
-        else:
-            reason = (
-                "Fast GeoJSON ingest using orjson (if available) for parsing and "
-                "vectorized per-family coordinate extraction directly into numpy arrays. "
-                "Eliminates per-feature geometry assembly loops and span-discovery "
-                "overhead."
-            )
+        reason = (
+            "Fast GeoJSON ingest using orjson (if available) for parsing and "
+            "vectorized per-family coordinate extraction directly into numpy arrays. "
+            "Eliminates per-feature geometry assembly loops and span-discovery "
+            "overhead."
+        )
     elif selected_strategy == "simdjson":
         if not _HAS_SIMDJSON:
             raise RuntimeError(
@@ -184,12 +177,12 @@ def plan_geojson_ingest(
             "structural tokenizer paths remain the GPU-oriented seam for future optimization."
         )
     if selected_strategy == "gpu-byte-classify":
-        if prefer == "auto" and normalized_objective == "pipeline":
+        if prefer == "auto":
             reason = (
-                "Pipeline-oriented GeoJSON ingest prefers GPU byte classification so "
-                "public read_file auto-routing keeps geometry device-resident for the "
-                "first downstream GPU consumer instead of paying an immediate host-to-"
-                "device promotion after read."
+                "Auto GeoJSON ingest prefers GPU byte classification so public "
+                "read_file and direct read_geojson_owned calls keep geometry "
+                "device-resident for the first downstream GPU consumer instead "
+                "of paying an immediate host-to-device promotion after read."
             )
         else:
             reason = (

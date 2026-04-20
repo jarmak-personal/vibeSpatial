@@ -1461,6 +1461,11 @@ def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
             order = np.lexsort((right_idx, left_idx))
             left_idx = left_idx[order]
             right_idx = right_idx[order]
+        selected = (
+            ExecutionMode.GPU
+            if getattr(candidate_pairs, "device_left_indices", None) is not None
+            else ExecutionMode.CPU
+        )
         record_dispatch_event(
             surface="geopandas.overlay.sindex",
             operation="intersects",
@@ -1469,6 +1474,12 @@ def _intersecting_index_pairs(df1, df2, *, left_owned=None, right_owned=None):
                 "owned polygon overlay used direct bbox candidate pairs "
                 f"for {left_owned.row_count}x{right_owned.row_count} rows"
             ),
+            detail=(
+                f"rows={int(getattr(candidate_pairs, 'count', left_idx.size))}, "
+                f"left_rows={left_owned.row_count}, right_rows={right_owned.row_count}"
+            ),
+            requested=ExecutionMode.AUTO,
+            selected=selected,
         )
         return left_idx, right_idx
 

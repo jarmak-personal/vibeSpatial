@@ -79,6 +79,9 @@ def test_geopandas_buffer_mixed_rows_route_to_host_surface() -> None:
 
 
 def test_geopandas_buffer_dispatch_claims_point_surface() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
     series = GeoSeries([Point(0, 0), Point(2, 2)])
@@ -99,9 +102,13 @@ def test_geopandas_buffer_dispatch_claims_point_surface() -> None:
         "DeviceGeometryArray.buffer",
     }
     assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+    assert dispatch_events[-1].selected is ExecutionMode.GPU
 
 
-def test_geopandas_buffer_cpu_point_surface_claims_non_quad1() -> None:
+def test_geopandas_buffer_gpu_point_surface_claims_non_quad1() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
     series = GeoSeries([Point(0, 0), Point(2, 2)])
@@ -122,6 +129,7 @@ def test_geopandas_buffer_cpu_point_surface_claims_non_quad1() -> None:
         "DeviceGeometryArray.buffer",
     }
     assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+    assert dispatch_events[-1].selected is ExecutionMode.GPU
 
 
 def test_geopandas_buffer_gpu_preserves_null_point_rows() -> None:

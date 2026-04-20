@@ -31,7 +31,7 @@ from vibespatial.geometry.owned import (
 from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
-from vibespatial.runtime.residency import Residency
+from vibespatial.runtime.residency import Residency, TransferTrigger
 
 from .geoarrow import (
     _authoritative_geoarrow_host_view,
@@ -235,6 +235,88 @@ def _small_terminal_arrow_export_detail(
         "geometry encoding stays owned/native; "
         f"row_count={row_count} <= {_SMALL_TERMINAL_ARROW_EXPORT_MAX_ROWS}"
     )
+
+
+def _try_promote_geoparquet_geometry_columns_to_device(
+    df,
+    geometry_columns,
+) -> tuple[bool, list]:
+    """Build device-owned geometry columns for public GeoParquet writes."""
+    if not has_gpu_runtime() or geometry_columns.size == 0:
+        return False, []
+    if not df.columns.is_unique:
+        return False, []
+
+    candidates = []
+    snapshots = []
+    try:
+        for column_name in geometry_columns:
+            array = df[column_name].array
+            if isinstance(array, DeviceGeometryArray):
+                owned = array.owned
+            else:
+                original_owned = getattr(array, "_owned", None)
+                original_residency = (
+                    original_owned.residency
+                    if original_owned is not None
+                    else None
+                )
+                snapshots.append((array, original_owned, original_residency))
+                has_z = getattr(array, "has_z", None)
+                if has_z is None:
+                    raise ValueError("geometry array does not expose has_z")
+                if callable(has_z):
+                    has_z = has_z()
+                if bool(np.any(np.asarray(has_z, dtype=bool))):
+                    raise ValueError("3D geometry is not supported by owned GeoParquet promotion")
+                to_owned = getattr(array, "to_owned", None)
+                if not callable(to_owned):
+                    raise ValueError("geometry array does not expose to_owned")
+                owned = to_owned()
+            if owned is None:
+                raise ValueError("geometry column did not produce owned buffers")
+            candidates.append((owned, owned.residency))
+        for owned, _original_residency in candidates:
+            owned.move_to(
+                Residency.DEVICE,
+                trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                reason=(
+                    "GeoParquet public write promotes supported host geometry "
+                    "to device-owned buffers"
+                ),
+            )
+    except (NotImplementedError, TypeError, ValueError):
+        _restore_geoparquet_promoted_geometry_columns(snapshots)
+        return False, []
+    return True, snapshots
+
+
+def _restore_geoparquet_promoted_geometry_columns(snapshots) -> None:
+    for array, original_owned, original_residency in reversed(snapshots):
+        if original_owned is not None and original_residency is not None:
+            if original_owned.residency is not original_residency:
+                original_owned.move_to(
+                    original_residency,
+                    trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+                    reason=(
+                        "GeoParquet public write restores caller geometry "
+                        "residency after temporary device-owned promotion"
+                    ),
+                )
+        array._owned = original_owned
+
+
+def _geometry_columns_are_device_owned(df, geometry_columns) -> bool:
+    if geometry_columns.size == 0:
+        return False
+    for column_name in geometry_columns:
+        array = df[column_name].array
+        owned = array.owned if isinstance(array, DeviceGeometryArray) else getattr(array, "_owned", None)
+        if owned is None:
+            return False
+        if owned.device_state is None and owned.residency is not Residency.DEVICE:
+            return False
+    return True
 
 
 def _write_native_tabular_result_with_arrow(
@@ -2474,13 +2556,10 @@ def write_geoparquet(
             "Please rename to write covering bbox."
         )
 
-    # Check if every geometry column already has owned backing (either via
-    # DeviceGeometryArray or a GeometryArray with _owned populated). When the
-    # full geometry surface is native, use the owned-buffer encoder and avoid
-    # the D→H→Shapely roundtrip. We intentionally do NOT trigger owned
-    # construction here — if any geometry column is still plain Shapely data,
-    # the standard pyarrow path is the compatibility boundary and avoids
-    # partial-native write failures on mixed geometry-column frames.
+    # Check if every geometry column can use owned backing (either already
+    # device-backed or promotable from supported host geometry). When the full
+    # geometry surface is native, use the owned-buffer encoder and avoid the
+    # D→H→Shapely roundtrip.
     geometry_mask = df.dtypes.map(lambda d: d.name in ("geometry", "device_geometry"))
     geometry_columns = df.columns[geometry_mask]
     all_geometry_columns_owned = geometry_columns.size > 0 and all(
@@ -2488,50 +2567,63 @@ def write_geoparquet(
         or getattr(df[col].array, "_owned", None) is not None
         for col in geometry_columns
     )
+    promotion_snapshots = []
+    if not all_geometry_columns_owned:
+        (
+            all_geometry_columns_owned,
+            promotion_snapshots,
+        ) = _try_promote_geoparquet_geometry_columns_to_device(
+            df,
+            geometry_columns,
+        )
 
     if all_geometry_columns_owned:
-        small_write_detail = None
-        terminal_owned = None
-        if geometry_columns.size == 1:
-            terminal_owned = df[geometry_columns[0]].array.to_owned()
-            small_write_detail = _small_terminal_arrow_export_detail(
-                row_count=len(df),
-                polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(terminal_owned),
-            )
-        if small_write_detail is not None:
-            _record_terminal_geoparquet_native_arrow_export(
-                detail=small_write_detail,
-                implementation="native_geodataframe_arrow_terminal_export",
-                row_count=len(df),
-                owned=terminal_owned,
-            )
-            from vibespatial.api._native_results import _spatial_to_native_tabular_result
+        try:
+            small_write_detail = None
+            terminal_owned = None
+            if geometry_columns.size == 1:
+                terminal_owned = df[geometry_columns[0]].array.to_owned()
+                small_write_detail = _small_terminal_arrow_export_detail(
+                    row_count=len(df),
+                    polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(terminal_owned),
+                )
+            if small_write_detail is not None:
+                _record_terminal_geoparquet_native_arrow_export(
+                    detail=small_write_detail,
+                    implementation="native_geodataframe_arrow_terminal_export",
+                    row_count=len(df),
+                    owned=terminal_owned,
+                )
+                from vibespatial.api._native_results import _spatial_to_native_tabular_result
 
-            payload = _spatial_to_native_tabular_result(df)
-            payload = _authoritative_native_tabular_result(payload)
-            _write_native_tabular_result_with_arrow(
-                payload,
+                payload = _spatial_to_native_tabular_result(df)
+                payload = _authoritative_native_tabular_result(payload)
+                _write_native_tabular_result_with_arrow(
+                    payload,
+                    path,
+                    index=index,
+                    compression=compression,
+                    geometry_encoding=geometry_encoding,
+                    schema_version=schema_version,
+                    write_covering_bbox=write_covering_bbox,
+                    **kwargs,
+                )
+                return
+            _write_geoparquet_native(
+                df,
                 path,
                 index=index,
                 compression=compression,
                 geometry_encoding=geometry_encoding,
                 schema_version=schema_version,
                 write_covering_bbox=write_covering_bbox,
+                geometry_columns=geometry_columns,
                 **kwargs,
             )
             return
-        _write_geoparquet_native(
-            df,
-            path,
-            index=index,
-            compression=compression,
-            geometry_encoding=geometry_encoding,
-            schema_version=schema_version,
-            write_covering_bbox=write_covering_bbox,
-            geometry_columns=geometry_columns,
-            **kwargs,
-        )
-        return
+        finally:
+            if promotion_snapshots:
+                _restore_geoparquet_promoted_geometry_columns(promotion_snapshots)
 
     from vibespatial.api.io.arrow import _to_parquet
 
@@ -2626,11 +2718,24 @@ def _write_geoparquet_native(
             row_count=len(df),
         )
     else:
+        selected = (
+            ExecutionMode.GPU
+            if _geometry_columns_are_device_owned(df, geometry_columns)
+            else ExecutionMode.CPU
+        )
         _record_public_geoparquet_dispatch(
-            selected=ExecutionMode.CPU,
-            implementation="native_geodataframe_arrow_export",
+            selected=selected,
+            implementation=(
+                "native_geodataframe_arrow_device_encoded_export"
+                if selected is ExecutionMode.GPU
+                else "native_geodataframe_arrow_export"
+            ),
             reason=(
-                "GeoParquet export used the explicit Arrow writer because the native "
+                "GeoParquet export used the Arrow sink after encoding geometry "
+                "from device-owned buffers because the native device writer was "
+                "unavailable for this public GeoDataFrame"
+                if selected is ExecutionMode.GPU
+                else "GeoParquet export used the explicit Arrow writer because the native "
                 "device writer was unavailable for this public GeoDataFrame"
             ),
             row_count=len(df),

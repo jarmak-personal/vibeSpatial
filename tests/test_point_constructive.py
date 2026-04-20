@@ -5,6 +5,7 @@ import pytest
 import shapely
 from shapely.geometry import Point, Polygon
 
+from vibespatial.constructive.boundary import boundary_owned
 from vibespatial.constructive.point import (
     clip_points_rect_owned,
     point_buffer_owned_array,
@@ -135,6 +136,20 @@ def test_point_buffer_owned_array_gpu_quad16_matches_cpu() -> None:
     assert gpu.residency is Residency.DEVICE
     for i, (g, c) in enumerate(zip(gpu.to_shapely(), cpu.to_shapely())):
         assert shapely.equals_exact(g, c, tolerance=1e-10), f"row {i} GPU/CPU mismatch"
+
+
+@pytest.mark.gpu
+def test_point_buffer_gpu_boundary_single_ring_polygons_are_linestrings() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    points = from_shapely_geometries([Point(0, 0), Point(2, 3)])
+
+    buffered = point_buffer_owned_array(points, 1.0, quad_segs=16, dispatch_mode=ExecutionMode.GPU)
+    boundary = boundary_owned(buffered, dispatch_mode=ExecutionMode.GPU)
+
+    assert boundary.residency is Residency.DEVICE
+    assert [geom.geom_type for geom in boundary.to_shapely()] == ["LineString", "LineString"]
 
 
 @pytest.mark.gpu

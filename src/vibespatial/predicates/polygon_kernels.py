@@ -56,6 +56,86 @@ extern "C" __device__ inline unsigned char de9im_point_in_rings(
   return inside ? 2 : 0;
 }
 
+extern "C" __device__ inline unsigned char de9im_point_in_polygons(
+    double px, double py,
+    const double* x, const double* y,
+    const int* ring_offsets,
+    const int* poly_ring_starts,
+    const int* poly_ring_ends,
+    int n_polys
+) {
+  unsigned char best_loc = 0;
+  for (int p = 0; p < n_polys; ++p) {
+    const unsigned char loc = de9im_point_in_rings(
+        px, py, x, y, ring_offsets, poly_ring_starts[p], poly_ring_ends[p]);
+    if (loc > best_loc) best_loc = loc;
+    if (best_loc == 2) break;
+  }
+  return best_loc;
+}
+
+extern "C" __device__ inline bool de9im_classify_polygon_interior_samples(
+    const double* ax, const double* ay,
+    const int* a_ring_offsets,
+    const int* a_poly_ring_starts,
+    const int* a_poly_ring_ends,
+    int n_a_polys,
+    const double* bx, const double* by,
+    const int* b_ring_offsets,
+    const int* b_poly_ring_starts,
+    const int* b_poly_ring_ends,
+    int n_b_polys,
+    bool* any_inside_b,
+    bool* any_outside_b
+) {
+  bool found_sample = false;
+  *any_inside_b = false;
+  *any_outside_b = false;
+
+  for (int ap = 0; ap < n_a_polys; ++ap) {
+    if (a_poly_ring_starts[ap] >= a_poly_ring_ends[ap]) continue;
+    const int exterior_ring = a_poly_ring_starts[ap];
+    const int acs = a_ring_offsets[exterior_ring];
+    const int ace = a_ring_offsets[exterior_ring + 1];
+    const int nverts = (ace > acs + 1) ? (ace - acs - 1) : (ace - acs);
+    if (nverts < 3) continue;
+
+    for (int local = 0; local < nverts; ++local) {
+      const int i0 = acs + local;
+      const int i1 = acs + ((local + 1) % nverts);
+      const int i2 = acs + ((local + 2) % nverts);
+      const double x0 = ax[i0], y0 = ay[i0];
+      const double x1 = ax[i1], y1 = ay[i1];
+      const double x2 = ax[i2], y2 = ay[i2];
+      const double area2 = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+      const double scale = fabs(x1 - x0) + fabs(y1 - y0)
+                         + fabs(x2 - x1) + fabs(y2 - y1)
+                         + fabs(x0 - x2) + fabs(y0 - y2) + 1.0;
+      if (fabs(area2) <= VS_SPATIAL_EPSILON * scale * scale) continue;
+
+      const double sx = (x0 + x1 + x2) / 3.0;
+      const double sy = (y0 + y1 + y2) / 3.0;
+      const unsigned char in_a = de9im_point_in_rings(
+          sx, sy, ax, ay, a_ring_offsets,
+          a_poly_ring_starts[ap], a_poly_ring_ends[ap]);
+      if (in_a != 2) continue;
+
+      const unsigned char loc = de9im_point_in_polygons(
+          sx, sy, bx, by, b_ring_offsets,
+          b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+      if (loc == 2) {
+        *any_inside_b = true;
+      } else if (loc == 0) {
+        *any_outside_b = true;
+      }
+      found_sample = true;
+      break;
+    }
+  }
+
+  return found_sample;
+}
+
 // ===================================================================
 // DE-9IM bitmask computation for a single polygon × polygon pair.
 // Handles both POLYGON and MULTIPOLYGON via sub-polygon iteration.
@@ -110,6 +190,7 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
 
   // ---- Phase 2: Classify vertices of A w.r.t. B ----
   bool any_a_outside_b = false;
+  bool any_a_vertex_inside_b = false;
   for (int ap = 0; ap < n_a_polys; ++ap) {
     const int ars = a_poly_ring_starts[ap], are = a_poly_ring_ends[ap];
     for (int ar = ars; ar < are; ++ar) {
@@ -120,15 +201,11 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
         const double vx = ax[vi], vy = ay[vi];
         // Check this vertex against ALL sub-polygons of B and take the
         // "deepest" classification (inside > boundary > outside).
-        unsigned char best_loc = 0;
-        for (int bp = 0; bp < n_b_polys; ++bp) {
-          const unsigned char loc = de9im_point_in_rings(
-              vx, vy, bx, by, b_ring_offsets,
-              b_poly_ring_starts[bp], b_poly_ring_ends[bp]);
-          if (loc > best_loc) best_loc = loc;
-          if (best_loc == 2) break;
-        }
+        unsigned char best_loc = de9im_point_in_polygons(
+            vx, vy, bx, by, b_ring_offsets,
+            b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
         if (best_loc == 2) {
+          any_a_vertex_inside_b = true;
           mask |= DE9IM_II | DE9IM_BI;
         } else if (best_loc == 1) {
           mask |= DE9IM_BB;
@@ -142,6 +219,7 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
 
   // ---- Phase 3: Classify vertices of B w.r.t. A (symmetric) ----
   bool any_b_outside_a = false;
+  bool any_b_vertex_inside_a = false;
   for (int bp = 0; bp < n_b_polys; ++bp) {
     const int brs = b_poly_ring_starts[bp], bre = b_poly_ring_ends[bp];
     for (int br = brs; br < bre; ++br) {
@@ -149,15 +227,11 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
       const int vlast = (bce > bcs + 1) ? bce - 1 : bce;
       for (int vi = bcs; vi < vlast; ++vi) {
         const double vx = bx[vi], vy = by[vi];
-        unsigned char best_loc = 0;
-        for (int ap = 0; ap < n_a_polys; ++ap) {
-          const unsigned char loc = de9im_point_in_rings(
-              vx, vy, ax, ay, a_ring_offsets,
-              a_poly_ring_starts[ap], a_poly_ring_ends[ap]);
-          if (loc > best_loc) best_loc = loc;
-          if (best_loc == 2) break;
-        }
+        unsigned char best_loc = de9im_point_in_polygons(
+            vx, vy, ax, ay, a_ring_offsets,
+            a_poly_ring_starts, a_poly_ring_ends, n_a_polys);
         if (best_loc == 2) {
+          any_b_vertex_inside_a = true;
           mask |= DE9IM_II | DE9IM_IB;
         } else if (best_loc == 1) {
           mask |= DE9IM_BB;
@@ -175,10 +249,40 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
   // For a non-degenerate polygon A, Int(A) is non-empty and must overlap
   // Int(B) → II = T.  Symmetric for B ⊂ closure(A).
   if (!any_a_outside_b) {
-    mask |= DE9IM_II;
+    if (any_a_vertex_inside_b) {
+      mask |= DE9IM_II;
+    } else {
+      bool sample_inside_b = false;
+      bool sample_outside_b = false;
+      const bool sampled = de9im_classify_polygon_interior_samples(
+          ax, ay, a_ring_offsets, a_poly_ring_starts, a_poly_ring_ends, n_a_polys,
+          bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys,
+          &sample_inside_b, &sample_outside_b);
+      if (!sampled || sample_inside_b) {
+        mask |= DE9IM_II;
+      }
+      if (sample_outside_b) {
+        mask |= DE9IM_IE;
+      }
+    }
   }
   if (!any_b_outside_a) {
-    mask |= DE9IM_II;
+    if (any_b_vertex_inside_a) {
+      mask |= DE9IM_II;
+    } else {
+      bool sample_inside_a = false;
+      bool sample_outside_a = false;
+      const bool sampled = de9im_classify_polygon_interior_samples(
+          bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys,
+          ax, ay, a_ring_offsets, a_poly_ring_starts, a_poly_ring_ends, n_a_polys,
+          &sample_inside_a, &sample_outside_a);
+      if (!sampled || sample_inside_a) {
+        mask |= DE9IM_II;
+      }
+      if (sample_outside_a) {
+        mask |= DE9IM_EI;
+      }
+    }
   }
 
   return mask;

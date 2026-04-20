@@ -43,6 +43,20 @@ def make_valid_cpu_baseline(geometries, *, method: str, keep_collapsed: bool):
     return shapely.make_valid(geometries, method=method, keep_collapsed=keep_collapsed)
 
 
+_OWNED_MAKE_VALID_TYPE_IDS = frozenset({0, 1, 3, 4, 5, 6})
+
+
+def values_support_owned_make_valid(values) -> bool:
+    geometries = np.asarray(values, dtype=object)
+    if geometries.size == 0:
+        return True
+    type_ids = shapely.get_type_id(geometries)
+    present_type_ids = type_ids[type_ids >= 0]
+    if present_type_ids.size == 0:
+        return True
+    return bool(np.isin(present_type_ids, list(_OWNED_MAKE_VALID_TYPE_IDS)).all())
+
+
 def build_make_valid_warmup_owned():
     """Build a representative device-resident warmup dataset."""
     bowtie = shapely.Polygon([(0, 0), (2, 2), (2, 0), (0, 2), (0, 0)])

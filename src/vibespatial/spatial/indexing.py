@@ -159,7 +159,7 @@ def _generate_bounds_pairs_gpu(
         right_count = int(d_right_valid.size)
 
     if left_count == 0 or right_count == 0:
-        empty = np.asarray([], dtype=np.int32)
+        empty = cp.empty(0, dtype=cp.int32)
         return empty, empty, 0
 
     # --- Extract valid bounds subsets on device ---
@@ -232,7 +232,7 @@ def _generate_bounds_pairs_gpu(
     total_pairs = count_scatter_total(runtime, cp_counts, d_offsets)
 
     if total_pairs == 0:
-        empty = np.asarray([], dtype=np.int32)
+        empty = cp.empty(0, dtype=cp.int32)
         return empty, empty, left_count * right_count
 
     if total_pairs > 2_147_483_647:

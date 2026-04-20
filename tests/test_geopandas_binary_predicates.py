@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
-from shapely.geometry import Point, box
+from shapely.geometry import Point, Polygon, box
 
 import vibespatial.api as geopandas
 from vibespatial import (
@@ -67,3 +67,50 @@ def test_geopandas_binary_predicates_select_gpu_for_large_supported_batches() ->
     events = get_dispatch_events(clear=True)
     assert events[-1].surface == "geopandas.array.contains"
     assert events[-1].implementation == "owned_gpu_predicate"
+
+
+@pytest.mark.gpu
+def test_geopandas_binary_predicates_select_gpu_for_small_supported_batches() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    geopandas.clear_dispatch_events()
+
+    left = geopandas.GeoSeries([box(0, 0, 2, 2), box(10, 10, 11, 11)])
+    right = geopandas.GeoSeries([Point(1, 1), Point(20, 20)])
+
+    result = left.contains(right)
+
+    assert result.tolist() == [True, False]
+    events = get_dispatch_events(clear=True)
+    assert events[-1].surface == "geopandas.array.contains"
+    assert events[-1].implementation == "owned_gpu_predicate"
+
+
+@pytest.mark.gpu
+def test_geopandas_polygon_predicates_respect_hole_boundary_on_gpu() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    hole = [(0.25, 0.25), (0.75, 0.25), (0.75, 0.75), (0.25, 0.75)]
+    inner = Polygon(hole)
+    polygon_with_hole = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)], [hole])
+    left = geopandas.GeoSeries([inner])
+    right = geopandas.GeoSeries([polygon_with_hole])
+
+    geopandas.clear_dispatch_events()
+
+    assert left.within(right).tolist() == [False]
+    assert left.covered_by(right).tolist() == [False]
+    assert left.touches(right).tolist() == [True]
+
+    events = [
+        event for event in get_dispatch_events(clear=True)
+        if event.surface.startswith("geopandas.array.")
+        and event.operation in {"within", "covered_by", "touches"}
+    ]
+    assert [event.implementation for event in events] == [
+        "owned_gpu_predicate",
+        "owned_gpu_predicate",
+        "owned_gpu_predicate",
+    ]

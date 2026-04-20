@@ -11,6 +11,7 @@ from vibespatial.constructive.make_valid_pipeline_cpu import (
     make_valid_cpu_baseline,
     make_valid_cpu_is_valid,
     make_valid_cpu_repair,
+    values_support_owned_make_valid,
 )
 from vibespatial.constructive.make_valid_pipeline_kernels import (
     _VALIDITY_KERNEL_NAMES,
@@ -19,14 +20,23 @@ from vibespatial.constructive.make_valid_pipeline_kernels import (
     _format_validity_kernel_source,
 )
 from vibespatial.cuda.nvrtc_precompile import request_nvrtc_warmup
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, has_gpu_runtime
 from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.runtime.fusion import IntermediateDisposition, PipelineStep, StepKind, plan_fusion
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
-from vibespatial.runtime.residency import combined_residency
+from vibespatial.runtime.residency import Residency, combined_residency
+
+
+def _owned_can_skip_host_make_valid(owned) -> bool:
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    polygonal_families = {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    if not any(family in owned.families for family in polygonal_families):
+        return True
+    return _owned_all_polygon_rectangles(owned)
 
 
 class MakeValidPrimitive(StrEnum):
@@ -837,8 +847,29 @@ def evaluate_geopandas_make_valid(
     from vibespatial.runtime.execution_trace import execution_trace
 
     with execution_trace("make_valid"):
+        owned = prebuilt_owned
+        input_values = values
+        if (
+            owned is None
+            and values is not None
+            and has_gpu_runtime()
+            and values_support_owned_make_valid(values)
+        ):
+            from vibespatial.geometry.owned import from_shapely_geometries
+
+            geometries = np.asarray(values, dtype=object)
+            owned_candidate = from_shapely_geometries(
+                geometries.tolist(),
+                residency=Residency.DEVICE,
+            )
+            if _owned_can_skip_host_make_valid(owned_candidate):
+                owned = owned_candidate
+                input_values = None
         return make_valid_owned(
-            values, method=method, keep_collapsed=keep_collapsed, owned=prebuilt_owned,
+            input_values,
+            method=method,
+            keep_collapsed=keep_collapsed,
+            owned=owned,
         )
 
 

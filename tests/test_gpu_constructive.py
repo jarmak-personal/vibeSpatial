@@ -6,6 +6,7 @@ import shapely
 from shapely.geometry import Point, Polygon
 
 from vibespatial import ExecutionMode, clip_by_rect_owned, from_shapely_geometries, has_gpu_runtime
+from vibespatial.constructive.boundary import boundary_owned
 from vibespatial.constructive.exterior import exterior_owned
 from vibespatial.constructive.normalize import normalize_owned
 from vibespatial.constructive.point import clip_points_rect_owned, point_buffer_owned_array
@@ -202,7 +203,6 @@ def test_boundary_gpu_metadata_stays_device_resident() -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
-    from vibespatial.constructive.boundary import boundary_owned
     from vibespatial.runtime.residency import Residency
 
     geoms = [
@@ -219,6 +219,30 @@ def test_boundary_gpu_metadata_stays_device_resident() -> None:
     assert result._validity is None
     assert result._tags is None
     assert result._family_row_offsets is None
+
+
+@pytest.mark.gpu
+def test_boundary_gpu_mixed_polygon_ring_counts_preserves_row_types() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.runtime.residency import Residency
+
+    single_ring = Polygon([(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)])
+    with_hole = Polygon(
+        [(10, 0), (14, 0), (14, 4), (10, 4), (10, 0)],
+        [[(11, 1), (13, 1), (13, 3), (11, 3), (11, 1)]],
+    )
+    owned = from_shapely_geometries([single_ring, with_hole], residency=Residency.DEVICE)
+
+    result = boundary_owned(owned, dispatch_mode=ExecutionMode.GPU)
+    geometries = result.to_shapely()
+
+    assert result.residency is Residency.DEVICE
+    assert geometries[0].geom_type == "LineString"
+    assert geometries[1].geom_type == "MultiLineString"
+    assert bool(shapely.equals(geometries[0], single_ring.boundary))
+    assert bool(shapely.equals(geometries[1], with_hole.boundary))
 
 
 @pytest.mark.gpu
