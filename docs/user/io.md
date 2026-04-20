@@ -4,12 +4,15 @@
 
 | Format | Read | Write | GPU-accelerated |
 |--------|------|-------|-----------------|
-| GeoParquet | `read_parquet()` | `to_parquet()` | WKB decode/encode, Arrow codec |
-| GeoPackage | `read_file()` | `to_file()` | -- |
-| Shapefile | `read_file()` | `to_file()` | Arrow fast path |
-| GeoJSON | `read_file()` | `to_file()` | GPU byte-classify parser (Point, LineString, Polygon) |
-| Feather | `read_feather()` | `to_feather()` | Arrow codec |
-| PostGIS | `read_postgis()` | `to_postgis()` | -- |
+| GeoParquet | `read_parquet()` | `to_parquet()` | WKB decode/encode, GeoArrow codec, GPU scan where available |
+| GeoArrow / Feather | `read_feather()` | `to_feather()` | Native GeoArrow codec |
+| GeoJSON | `read_file()` | `to_file()` | GPU byte-classify geometry parser plus narrowed host property decode |
+| Shapefile | `read_file()` | `to_file()` | Direct SHP/DBF native path or Arrow + GPU WKB bridge |
+| FlatGeobuf | `read_file()` | `to_file()` | Direct FlatBuffer GPU decode for eligible reads, native Arrow/WKB write boundary |
+| GeoPackage | `read_file()` | `to_file()` | Shared Arrow + GPU WKB native boundary for supported requests |
+| GeoJSONSeq | `read_file()` | `to_file()` | Rewritten to GPU GeoJSON parser for eligible reads |
+| OSM PBF | `read_file()` | driver-dependent fallback | Native full-data path and parallel supported-layer public reads |
+| PostGIS | `read_postgis()` | `to_postgis()` | ADBC/WKB bridge when available |
 
 ## Reading files
 
@@ -47,10 +50,12 @@ GeoParquet reader:
 
 ## GeoJSON GPU acceleration
 
-For GeoJSON files larger than ~10 MB, vibeSpatial uses a GPU byte-classify
-parser (ADR-0038) that parses JSON structure, extracts coordinates, and
-assembles Point, LineString, and Polygon geometries directly on-device.
-Property extraction stays on CPU via orjson.
+For eligible unfiltered GeoJSON reads, vibeSpatial uses a GPU byte-classify
+parser (ADR-0038) whenever CUDA is available. The parser reads file bytes to
+device, classifies JSON structure, detects geometry families, extracts
+coordinates, and assembles Point, LineString, and Polygon geometries directly
+into owned device buffers. Property extraction is narrowed to property-object
+payloads and remains host-side today.
 
 When [kvikio](https://github.com/rapidsai/kvikio) is installed, file-to-device
 transfer uses parallel POSIX I/O with pinned bounce buffers for additional

@@ -24,7 +24,7 @@
   </div>
   <div class="cp-card cp-reveal">
     <h3>GeoPandas Compatible</h3>
-    <p>GeoDataFrame and GeoSeries with the same API you know. Import vibespatial, use the same methods. 98% of the upstream GeoPandas test suite passes natively.</p>
+    <p>GeoDataFrame and GeoSeries with the same API you know. Import vibespatial, use the same methods. Upstream compatibility and strict-native dispatch are checked continuously.</p>
   </div>
   <div class="cp-card cp-reveal">
     <h3>Device-Resident Geometry</h3>
@@ -40,7 +40,7 @@
   </div>
   <div class="cp-card cp-reveal">
     <h3>Native I/O</h3>
-    <p>GeoParquet, GeoArrow, Shapefile, and GeoJSON with GPU-accelerated WKB decode. Zero-copy Arrow paths when available.</p>
+    <p>GeoParquet and GeoArrow are GPU-native. GeoJSON, Shapefile, FlatGeobuf, GeoJSONSeq, and OSM PBF use observable native/hybrid GPU routes where format semantics allow.</p>
   </div>
 </div>
 ```

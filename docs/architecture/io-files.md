@@ -192,8 +192,8 @@ keeping GPU-native formats primary and legacy formats explicit.
     the host only decodes the small property-object payloads instead of
     reparsing full feature JSON.
     Geometry parse: **1.8s** for 2.16 GB / 7.2M polygons (32x vs pyogrio).
-    Total read including properties: **7.1s** (55.2s GeoPandas -> 7.1s
-    vibeSpatial GPU on the latest local Florida run).
+    Total public read including properties: **6.7s** on the April 20, 2026
+    local Florida run.
     File-to-device transfer uses kvikio when installed (parallel POSIX reads
     with pinned bounce buffers, no GDS required), falling back to
     `cp.asarray` otherwise. Thread count is tunable via `KVIKIO_NTHREADS`.
@@ -298,6 +298,6 @@ from "points only" into a broad Shapefile ingest win:
 
 The GPU byte-classification path (ADR-0038) now handles geometry extraction in
 **1.8s** for the 2.16 GB Florida.geojson benchmark, and the staged
-property-object decode keeps the full public Florida read near **6.5s**. The
+property-object decode keeps the full public Florida read near **6.7s**. The
 next acceleration step would be a native columnar property extractor, deferred
 because it changes the pure-Python build story.

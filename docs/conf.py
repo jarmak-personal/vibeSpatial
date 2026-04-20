@@ -1,5 +1,6 @@
 """Sphinx configuration for vibeSpatial documentation."""
 
+import shutil
 from pathlib import Path
 
 project = "vibeSpatial"
@@ -25,6 +26,9 @@ extensions = [
 autoapi_dirs = ["../src/vibespatial"]
 autoapi_type = "python"
 autoapi_root = "autoapi"
+_autoapi_generated_root = Path(__file__).resolve().parent / autoapi_root
+if _autoapi_generated_root.exists():
+    shutil.rmtree(_autoapi_generated_root)
 autoapi_options = [
     "members",
     "undoc-members",

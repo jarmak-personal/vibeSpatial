@@ -8,14 +8,19 @@ compatibility fallback only when the native GPU path is unavailable or
 unsupported.
 
 > [!WARNING]
-> vibeSpatial is very early in development. Operations may be unoptimized or have multiple Host/Device transfers causing reduced performance. [File an issue](https://github.com/jarmak-personal/vibeSpatial/issues) if you hit a problem!
+> vibeSpatial is still early, but the public GPU path is now the design center:
+> the April 20, 2026 local GPU health gate reports **95.09% value-weighted
+> GPU acceleration** across tracked public dispatches. [File an issue](https://github.com/jarmak-personal/vibeSpatial/issues)
+> if you hit a fallback, correctness mismatch, or unexpected host transfer.
 >
 > The repository enforces fallback observability: once a workflow is on device,
 > hidden host exits are treated as bugs, and strict-native tests fail if a path
 > materializes to host without first recording an explicit fallback or
-> compatibility boundary. The maintained warmed `10k` shootout suite under
-> [`benchmarks/shootout/`](benchmarks/shootout/) is currently at or above parity
-> on local RTX 4090 runs.
+> compatibility boundary. The maintained warmed `10k` public shootout suite
+> under [`benchmarks/shootout/`](benchmarks/shootout/) currently passes with
+> matching fingerprints on local RTX 4090 runs; heavier workflows show clear
+> wins while tiny CPU-shaped workflows are treated as crossover signals rather
+> than benchmark theater.
 
 ### Install
 
@@ -72,23 +77,44 @@ nearby.to_crs(epsg=4326).to_parquet("nearby_buildings.parquet")
  nearby.to_crs(epsg=4326).to_parquet("nearby_buildings.parquet")
 ```
 
-**Performance on 7.2M polygons (RTX 4090 vs GeoPandas on i9-13900k):**
+**Performance on 7.2M polygons (GeoPandas CPU baseline vs current public
+vibeSpatial run on local RTX 4090 / i9-13900K):**
 
 | Step | GeoPandas | vibeSpatial | Speedup |
 |---|---|---|---|
-| Read GeoJSON | 57.7 s | 11.7 s | **4.9x** |
-| Reproject to UTM | 8.2 s | 0.4 s | **21x** |
-| Select within 1 km | 0.2 s | 0.5 s | -- |
-| Write GeoParquet | 0.2 s | 0.1 s | 2x |
-| **End-to-end** | **66.3 s** | **12.7 s** | **5.2x** |
+| Read GeoJSON | 57.7 s | 6.7 s | **8.6x** |
+| Reproject to UTM | 8.2 s | 0.1 s | **82x** |
+| Select within 1 km | 0.2 s | 0.2 s | 1.0x |
+| **End-to-end including GeoParquet export** | **66.3 s** | **8.0 s** | **8.3x** |
 
-GeoJSON reading uses GPU byte-classification: 10 NVRTC kernels parse JSON
-structure, extract coordinates, and assemble geometry directly on-device in
-**1.8 s** (32x vs pyogrio); property extraction stays on CPU via orjson.
-Reprojection uses [vibeProj](https://github.com/jarmak-personal/vibeProj)
-fused GPU kernels via `transform_buffers()` -- no host round-trip.
-Spatial queries use device-resident bounding-box prefilter + GPU distance
-kernels.
+The vibeSpatial column is the public
+[`examples/nearby_buildings.py`](examples/nearby_buildings.py) path, not a
+private benchmark hook. GeoJSON reading uses GPU byte-classification: NVRTC
+kernels parse JSON structure, detect geometry families, extract coordinates,
+and assemble geometry into owned device buffers. Property payloads are decoded
+through a narrowed host seam. Reprojection uses
+[vibeProj](https://github.com/jarmak-personal/vibeProj) fused GPU kernels via
+`transform_buffers()` -- no host round-trip. Spatial queries use
+device-resident bounding-box prefilter + GPU distance kernels.
+
+### Current GPU coverage
+
+The April 20, 2026 local GPU health gate reports **95.09% value-weighted
+GPU acceleration** across tracked public dispatches:
+
+| Surface | GPU work coverage |
+|---|---:|
+| I/O write | 99.88% |
+| Query | 95.51% |
+| I/O read | 94.71% |
+| Other public APIs | 94.48% |
+| Constructive | 85.92% |
+| Overlay | 76.14% |
+| Dissolve | 54.43% |
+
+The remaining work is concentrated in exact constructive/overlay/dissolve
+paths and uncommon compatibility boundaries. Silent CPU fallback is not an
+accepted success mode.
 
 ### Tech stack
 
@@ -102,7 +128,7 @@ kernels.
 | GPU Parquet/Arrow | pylibcudf (WKB decode, GeoArrow codec) |
 | CPU compatibility | GeoPandas API (vendored upstream test suite) |
 | JSON parsing | orjson (property extraction) |
-| File I/O | pyogrio (Shapefile, GPKG, small GeoJSON) |
+| File I/O | native GPU/hybrid routes for GeoJSON, Shapefile, FlatGeobuf, GeoJSONSeq, OSM PBF; pyogrio for GDAL compatibility |
 | Packaging | uv, hatchling |
 
 All GPU kernels are **pure Python** — CUDA C source strings compiled at

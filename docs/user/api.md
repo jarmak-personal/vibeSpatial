@@ -274,29 +274,30 @@ docs for parameter details.
 
 ## GPU-Accelerated File Reading
 
-`read_file()` automatically routes to GPU-accelerated parsers when a GPU is
-available. No code changes are required — GPU acceleration is transparent.
+`read_file()` automatically routes eligible requests to GPU-accelerated
+parsers when a GPU is available. No code changes are required; dispatch
+selection is transparent to user code and recorded as an observable event.
 
 ### Supported Formats
 
-| Format | Extension | GPU Condition | Fallback |
-|--------|-----------|---------------|----------|
-| GeoParquet | `.parquet`, `.geoparquet` | Always | pyarrow |
-| Feather/Arrow | `.feather`, `.arrow`, `.ipc` | Always | pyarrow |
-| GeoJSON | `.geojson`, `.json` | File > 10 MB | pyogrio |
-| Shapefile | `.shp` | File > 10 MB | pyogrio |
-| GeoPackage | `.gpkg` | Always | pyogrio |
-| File Geodatabase | `.gdb` | Always | pyogrio |
-| FlatGeobuf | `.fgb` | Always | pyogrio |
-| CSV/TSV | `.csv`, `.tsv` | File > 10 MB | pyogrio |
-| KML | `.kml` | File > 10 MB | pyogrio |
-| GML | `.gml` | Always | pyogrio |
-| GPX | `.gpx` | Always | pyogrio |
-| TopoJSON | `.topojson` | Always | pyogrio |
-| GeoJSON-Seq | `.geojsonl`, `.geojsonseq` | Always | pyogrio |
-| WKT | `.wkt` | Always | None (GPU-only) |
-| OSM PBF | `.pbf`, `.osm.pbf` | Native GPU for `layer="all"` and full-data reads; supported public layers use pyogrio plus the shared native boundary | Default public reads combine `points`, `lines`, `multilinestrings`, `multipolygons`, and `other_relations` through parallel supported-layer scans; `GeometryCollection` relation leftovers use an explicit compatibility bridge |
-| PostGIS | `read_postgis()` | When ADBC installed | Shapely WKB |
+| Format | Extension | Native/GPU route | Compatibility boundary |
+|--------|-----------|------------------|------------------------|
+| GeoParquet | `.parquet`, `.geoparquet` | GeoArrow/WKB decode and GPU scan where available | pyarrow |
+| Feather/Arrow | `.feather`, `.arrow`, `.ipc` | Native GeoArrow codec | pyarrow |
+| GeoJSON | `.geojson`, `.json` | Eligible unfiltered reads use GPU byte-classify geometry parse | pyogrio / fast-json compatibility |
+| Shapefile | `.shp` | Direct SHP/DBF native path or Arrow + GPU WKB bridge | pyogrio |
+| GeoPackage | `.gpkg` | Shared Arrow + GPU WKB native boundary for supported requests | pyogrio |
+| File Geodatabase | `.gdb` | Shared Arrow + GPU WKB native boundary for supported requests | pyogrio |
+| FlatGeobuf | `.fgb` | Direct FlatBuffer GPU decoder for eligible reads | pyogrio |
+| CSV/TSV | `.csv`, `.tsv` | GPU WKT/WKB decode for detected geometry columns | pyogrio / pandas |
+| KML | `.kml` | Direct WKT/native boundary for supported requests | pyogrio |
+| GML | `.gml` | Shared Arrow + GPU WKB native boundary for supported requests | pyogrio |
+| GPX | `.gpx` | Shared Arrow + GPU WKB native boundary for supported requests | pyogrio |
+| TopoJSON | `.topojson` | Shared Arrow + GPU WKB native boundary for supported requests | pyogrio |
+| GeoJSON-Seq | `.geojsonl`, `.geojsonseq` | Rewrites eligible records to the GPU GeoJSON parser | pyogrio |
+| WKT | `.wkt` | GPU WKT parser | none for supported 2D geometry |
+| OSM PBF | `.pbf`, `.osm.pbf` | Native full-data path and parallel supported-layer public reads | pyogrio for unsupported relation leftovers |
+| PostGIS | `read_postgis()` | ADBC/WKB bridge when available | Shapely WKB |
 
 ### CSV Spatial Column Auto-Detection
 

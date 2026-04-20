@@ -22,7 +22,7 @@ The dispatch decision is recorded as an observable event.
 | **Spatial join** | sjoin, sjoin_nearest |
 | **Measurement** | area, length, distance, hausdorff_distance, frechet_distance, dwithin |
 | **Spatial indexing** | flat R-tree, segment MBR extraction and sort-and-sweep pair generation |
-| **I/O** | GeoJSON byte-classify parser (Point, LineString, Polygon), GeoParquet WKB decode/encode, GeoArrow native codec, kvikio parallel file-to-device transfer |
+| **I/O** | GeoJSON byte-classify parser, GeoParquet WKB decode/encode and scan, GeoArrow native codec, Shapefile/FlatGeobuf native routes, GeoJSONSeq rewrite, OSM PBF native/hybrid reads, kvikio parallel file-to-device transfer |
 
 ## Precision modes
 

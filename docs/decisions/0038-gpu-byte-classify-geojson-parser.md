@@ -88,8 +88,10 @@ Peak GPU memory is ~3x file size (~6.5 GB for 2.16 GB file).
 - **`io_geojson.py`** — New `"gpu-byte-classify"` strategy in
   `plan_geojson_ingest()`, routed in `read_geojson_owned()`.
 - **`io_file.py`** — `_try_gpu_read_file()` auto-routes GeoJSON files
-  >10 MB to the GPU path before falling back to pyogrio.
-- **NVRTC warmup** — All 10 kernels registered via
+  to the GPU path for eligible unfiltered public reads whenever a CUDA runtime
+  is available. Filtered/container-shaped requests stay on the explicit
+  compatibility boundary.
+- **NVRTC warmup** — All parser kernels registered via
   `request_nvrtc_warmup()` per ADR-0034.  First-run compilation adds
   ~12s; subsequent runs are cached.
 
@@ -120,6 +122,12 @@ because FeatureCollection adds an extra nesting level.
 
 GPU geometry parse: **1.8s** (32x vs pyogrio).
 CPU property extraction: **9.2s** (lazy, only when accessed).
+
+April 20, 2026 update: the public `read_file(...)` route now selects the GPU
+byte-classify path for eligible unfiltered GeoJSON whenever CUDA is available,
+and staged property-object decode brings the local Florida public read to
+**6.7s**. The original table above is retained as the first accepted ADR result
+for this parser family.
 
 ### Property extraction is the remaining bottleneck
 
