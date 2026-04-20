@@ -17,6 +17,7 @@ from vibespatial import (
 from vibespatial.api import GeoSeries
 from vibespatial.api.testing import assert_geoseries_equal
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
+from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.fusion import IntermediateDisposition
@@ -254,6 +255,63 @@ def test_geopandas_offset_curve_dispatch_claims_linestring_surface() -> None:
     assert dispatch_events
     assert dispatch_events[-1].surface == "geopandas.array.offset_curve"
     assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+
+
+def test_geopandas_offset_curve_partial_fallback_keeps_owned_result() -> None:
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    series = GeoSeries(
+        [
+            LineString([(0, 0), (0, 2), (2, 2)]),
+            LineString([(0, 0), (10, 0), (9, 0.1)]),
+        ]
+    )
+
+    result = series.offset_curve(1.0, join_style="mitre")
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+    expected = GeoSeries(
+        shapely.offset_curve(
+            np.asarray(series.values._data, dtype=object),
+            1.0,
+            join_style="mitre",
+        )
+    )
+
+    assert_geoseries_equal(result, expected)
+    assert fallback_events
+    assert fallback_events[-1].surface == "geopandas.array.offset_curve"
+    assert "fallback_rows=1" in fallback_events[-1].detail
+    assert dispatch_events
+    assert dispatch_events[-1].surface == "geopandas.array.offset_curve"
+    assert dispatch_events[-1].implementation == "owned_stroke_kernel"
+
+
+def test_device_offset_curve_partial_fallback_avoids_full_shapely_dispatch() -> None:
+    geopandas.clear_dispatch_events()
+    geopandas.clear_fallback_events()
+    lines = np.asarray(
+        [
+            LineString([(0, 0), (0, 2), (2, 2)]),
+            LineString([(0, 0), (10, 0), (9, 0.1)]),
+        ],
+        dtype=object,
+    )
+    device_array = DeviceGeometryArray._from_owned(from_shapely_geometries(lines.tolist()))
+
+    result = device_array.offset_curve(1.0, join_style="mitre")
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
+    actual = np.asarray(result, dtype=object)
+    expected = shapely.offset_curve(lines, 1.0, join_style="mitre")
+
+    assert np.all(shapely.equals_exact(actual, expected, tolerance=1e-12))
+    assert fallback_events
+    assert fallback_events[-1].surface == "DeviceGeometryArray.offset_curve"
+    assert "fallback_rows=1" in fallback_events[-1].detail
+    assert dispatch_events
+    assert dispatch_events[-1].surface == "DeviceGeometryArray.offset_curve"
+    assert dispatch_events[-1].implementation == "offset_curve_owned_partial_fallback"
 
 
 def test_stroke_benchmarks_report_row_counts() -> None:

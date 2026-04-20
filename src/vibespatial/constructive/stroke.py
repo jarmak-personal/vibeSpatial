@@ -121,6 +121,7 @@ class OffsetCurveKernelResult:
     row_count: int
     fast_rows: np.ndarray
     fallback_rows: np.ndarray
+    owned_result: OwnedGeometryArray | None = None
 
 
 @dataclass(frozen=True)
@@ -269,7 +270,7 @@ def offset_curve_owned(
     join_style: str = "round",
     mitre_limit: float = 5.0,
 ) -> OffsetCurveKernelResult:
-    result, fast_rows, fallback_rows = offset_curve_owned_cpu(
+    result, fast_rows, fallback_rows, owned_result = offset_curve_owned_cpu(
         values,
         distance,
         quad_segs=quad_segs,
@@ -281,6 +282,7 @@ def offset_curve_owned(
         row_count=len(result),
         fast_rows=fast_rows,
         fallback_rows=fallback_rows,
+        owned_result=owned_result,
     )
 
 
@@ -459,11 +461,11 @@ def evaluate_geopandas_offset_curve(
             return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
         record_fallback_event(
             surface="geopandas.array.offset_curve",
-            reason="repo-owned offset-curve kernel still needs host fallback rows on this input; using explicit CPU fallback",
-            detail=detail,
+            reason="repo-owned offset-curve kernel used explicit host fallback rows on this input",
+            detail=f"{detail}, fallback_rows={int(result.fallback_rows.size)}",
             pipeline="constructive/offset_curve",
         )
-        return None, ExecutionMode.CPU
+        return np.asarray(result.geometries, dtype=object), ExecutionMode.CPU
 
 
 def benchmark_point_buffer(values, *, distance: float, quad_segs: int = 16, dataset: str = "point-buffer") -> StrokeBenchmark:

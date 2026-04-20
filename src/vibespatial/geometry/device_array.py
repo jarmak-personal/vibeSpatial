@@ -930,10 +930,12 @@ class DeviceGeometryArray(ExtensionArray):
                 join_style=join_style,
                 mitre_limit=mitre_limit,
             )
+            if result.owned_result is not None:
+                new_owned = result.owned_result
+            else:
+                result_geometries = np.asarray(result.geometries, dtype=object)
+                new_owned = from_shapely_geometries(result_geometries.tolist())
             if result.fallback_rows.size == 0:
-                new_owned = from_shapely_geometries(
-                    np.asarray(result.geometries, dtype=object).tolist()
-                )
                 record_dispatch_event(
                     surface="DeviceGeometryArray.offset_curve",
                     operation="offset_curve",
@@ -942,6 +944,26 @@ class DeviceGeometryArray(ExtensionArray):
                     detail=f"rows={len(self)}, join_style={join_style}",
                 )
                 return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
+            _record_shapely_fallback_event(
+                surface="DeviceGeometryArray.offset_curve",
+                reason="owned offset-curve kernel used explicit host fallback rows",
+                owned=owned,
+                detail=(
+                    f"rows={len(self)}, join_style={join_style}, "
+                    f"fallback_rows={int(result.fallback_rows.size)}"
+                ),
+                requested=get_requested_mode(),
+                pipeline="constructive/offset_curve",
+            )
+            record_dispatch_event(
+                surface="DeviceGeometryArray.offset_curve",
+                operation="offset_curve",
+                implementation="offset_curve_owned_partial_fallback",
+                reason="DGA offset_curve reused owned stroke result with explicit fallback rows",
+                detail=f"rows={len(self)}, join_style={join_style}",
+                selected=ExecutionMode.CPU,
+            )
+            return DeviceGeometryArray._from_owned(new_owned, crs=self._crs)
 
         # Shapely fallback
         import shapely

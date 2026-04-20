@@ -13,15 +13,16 @@ from vibespatial.cuda._runtime import (
 )
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.geometry_analysis_host import (
+    assemble_cached_bounds,
+    compute_morton_keys_cpu,
+    compute_offset_spans_cpu,
+    compute_total_bounds_from_bounds,
+)
+from vibespatial.geometry.geometry_analysis_host import (
     compute_geometry_bounds_cpu_scalar as _compute_geometry_bounds_cpu_scalar_host,
 )
 from vibespatial.geometry.geometry_analysis_host import (
     compute_geometry_bounds_cpu_vectorized as _compute_geometry_bounds_cpu_vectorized_host,
-)
-from vibespatial.geometry.geometry_analysis_host import (
-    compute_morton_keys_cpu,
-    compute_offset_spans_cpu,
-    compute_total_bounds_from_bounds,
 )
 from vibespatial.geometry.owned import (
     DeviceFamilyGeometryBuffer,
@@ -319,6 +320,10 @@ def _compute_geometry_bounds_gpu_impl(
     ptr = runtime.pointer
     state = geometry_array._ensure_device_state()
     if state.row_bounds is not None:
+        if materialize_host:
+            cached_bounds = assemble_cached_bounds(geometry_array)
+            if cached_bounds is not None:
+                return cached_bounds
         if materialize_host:
             bounds = runtime.copy_device_to_host(state.row_bounds)
             geometry_array.cache_bounds(bounds)

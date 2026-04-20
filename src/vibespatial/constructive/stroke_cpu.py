@@ -7,6 +7,13 @@ import numpy as np
 import shapely
 from shapely.geometry import LineString, Polygon
 
+from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+from vibespatial.geometry.owned import (
+    FAMILY_TAGS,
+    NULL_TAG,
+    FamilyGeometryBuffer,
+    OwnedGeometryArray,
+)
 from vibespatial.runtime.config import SPATIAL_EPSILON
 
 _EPSILON = SPATIAL_EPSILON
@@ -119,7 +126,7 @@ def _batch_mitre_offset_uniform(
     verts_per_line: int,
     *,
     mitre_limit: float,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     n_lines = flat_coords.shape[0] // verts_per_line
     coords = flat_coords.reshape(n_lines, verts_per_line, 2)
     segments = coords[:, 1:, :] - coords[:, :-1, :]
@@ -166,7 +173,65 @@ def _batch_mitre_offset_uniform(
     out_flat = out.reshape(-1, 2)
     line_indices = np.repeat(np.arange(n_lines, dtype=np.intp), verts_per_line)
     lines = shapely.linestrings(out_flat, indices=line_indices)
-    return lines, ok_mask
+    return lines, ok_mask, out
+
+
+def _empty_coords() -> np.ndarray:
+    return np.empty((0, 2), dtype=np.float64)
+
+
+def _build_linestring_owned_from_chunks(
+    coord_chunks: list[np.ndarray | None],
+    validity: np.ndarray,
+) -> OwnedGeometryArray:
+    row_count = int(validity.size)
+    line_rows = np.flatnonzero(validity)
+    tags = np.full(row_count, NULL_TAG, dtype=np.int8)
+    family_row_offsets = np.full(row_count, -1, dtype=np.int32)
+    if line_rows.size == 0:
+        return OwnedGeometryArray(
+            validity=validity.astype(bool, copy=True),
+            tags=tags,
+            family_row_offsets=family_row_offsets,
+            families={},
+        )
+
+    tags[line_rows] = FAMILY_TAGS[GeometryFamily.LINESTRING]
+    family_row_offsets[line_rows] = np.arange(line_rows.size, dtype=np.int32)
+    coord_counts = np.empty(line_rows.size, dtype=np.int32)
+    for output_index, row in enumerate(line_rows):
+        chunk = coord_chunks[int(row)]
+        coord_counts[output_index] = 0 if chunk is None else int(chunk.shape[0])
+    geometry_offsets = np.empty(line_rows.size + 1, dtype=np.int32)
+    geometry_offsets[0] = 0
+    np.cumsum(coord_counts, out=geometry_offsets[1:])
+    non_empty_chunks = [
+        coord_chunks[int(row)]
+        for row in line_rows
+        if coord_chunks[int(row)] is not None and coord_chunks[int(row)].shape[0] > 0
+    ]
+    if non_empty_chunks:
+        coords = np.concatenate(non_empty_chunks, axis=0).astype(np.float64, copy=False)
+        x = np.ascontiguousarray(coords[:, 0])
+        y = np.ascontiguousarray(coords[:, 1])
+    else:
+        x = np.empty(0, dtype=np.float64)
+        y = np.empty(0, dtype=np.float64)
+    buffer = FamilyGeometryBuffer(
+        family=GeometryFamily.LINESTRING,
+        schema=get_geometry_buffer_schema(GeometryFamily.LINESTRING),
+        row_count=int(line_rows.size),
+        x=x,
+        y=y,
+        geometry_offsets=geometry_offsets,
+        empty_mask=coord_counts == 0,
+    )
+    return OwnedGeometryArray(
+        validity=validity.astype(bool, copy=True),
+        tags=tags,
+        family_row_offsets=family_row_offsets,
+        families={GeometryFamily.LINESTRING: buffer},
+    )
 
 
 def _offset_from_coords_mitre(coords: np.ndarray, distance: float, *, mitre_limit: float) -> np.ndarray | None:
@@ -265,11 +330,12 @@ def offset_curve_owned_cpu(
     quad_segs: int = 8,
     join_style: str = "round",
     mitre_limit: float = 5.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, OwnedGeometryArray | None]:
     geometries = np.asarray(values, dtype=object)
     distances = normalize_distances(distance, len(geometries))
     row_count = len(geometries)
     result = np.empty(row_count, dtype=object)
+    coord_chunks: list[np.ndarray | None] = [None] * row_count
 
     non_null_mask = np.array([g is not None for g in geometries], dtype=bool)
     type_ids = np.full(row_count, -1, dtype=np.int32)
@@ -285,6 +351,8 @@ def offset_curve_owned_cpu(
     if np.any(empty_rows_mask):
         empty_idx = np.flatnonzero(empty_rows_mask)
         result[empty_idx] = geometries[empty_idx]
+        for row_index in empty_idx:
+            coord_chunks[int(row_index)] = _empty_coords()
 
     linestring_mask = non_null_mask & ~empty_mask & (type_ids == _LINESTRING_TYPE_ID) & (join_style != "round")
     fallback_mask = non_null_mask & ~empty_mask & ~linestring_mask
@@ -301,14 +369,17 @@ def offset_curve_owned_cpu(
         unique_counts = np.unique(coord_counts)
 
         if unique_counts.size == 1 and unique_counts[0] >= 2:
-            batch_lines, batch_ok = _batch_mitre_offset_uniform(
+            batch_lines, batch_ok, batch_coords = _batch_mitre_offset_uniform(
                 all_coords, line_dists, int(unique_counts[0]), mitre_limit=mitre_limit,
             )
             ok_local = np.flatnonzero(batch_ok)
             fail_local = np.flatnonzero(~batch_ok)
             if ok_local.size > 0:
-                result[linestring_rows[ok_local]] = batch_lines[ok_local]
-                fast_list.extend(linestring_rows[ok_local].tolist())
+                ok_rows = linestring_rows[ok_local]
+                result[ok_rows] = batch_lines[ok_local]
+                fast_list.extend(ok_rows.tolist())
+                for row_index, local_idx in zip(ok_rows, ok_local, strict=True):
+                    coord_chunks[int(row_index)] = batch_coords[int(local_idx)]
             deferred_fallback.extend(linestring_rows[fail_local].tolist())
         else:
             out_coord_list: list[np.ndarray] = []
@@ -332,6 +403,7 @@ def offset_curve_owned_cpu(
                     out_idx += 1
                     succeeded.append(local_idx)
                     fast_list.append(row_index)
+                    coord_chunks[int(row_index)] = offset_coords
             if out_coord_list:
                 flat_out = np.concatenate(out_coord_list, axis=0)
                 flat_indices = np.concatenate(out_indices_list)
@@ -350,21 +422,43 @@ def offset_curve_owned_cpu(
             else:
                 result[row_index] = offset
                 fast_list.append(row_index)
+                if offset.is_empty:
+                    coord_chunks[int(row_index)] = _empty_coords()
+                else:
+                    coord_chunks[int(row_index)] = np.asarray(offset.coords, dtype=np.float64)
 
     fallback_index = np.asarray(deferred_fallback, dtype=np.int32)
     if fallback_index.size > 0:
-        result[fallback_index] = shapely.offset_curve(
+        fallback_result = shapely.offset_curve(
             geometries[fallback_index],
             distances[fallback_index],
             quad_segs=quad_segs,
             join_style=join_style,
             mitre_limit=mitre_limit,
         )
+        result[fallback_index] = fallback_result
+        fallback_counts = np.asarray(shapely.get_num_coordinates(fallback_result), dtype=np.int32)
+        fallback_coords = shapely.get_coordinates(fallback_result)
+        fallback_offsets = np.empty(fallback_counts.size + 1, dtype=np.int64)
+        fallback_offsets[0] = 0
+        np.cumsum(fallback_counts, out=fallback_offsets[1:])
+        for local_idx, row_index in enumerate(fallback_index):
+            start = int(fallback_offsets[local_idx])
+            stop = int(fallback_offsets[local_idx + 1])
+            if stop == start:
+                coord_chunks[int(row_index)] = _empty_coords()
+            else:
+                coord_chunks[int(row_index)] = fallback_coords[start:stop]
+
+    owned_result = None
+    if not np.any(non_null_mask) or np.all(type_ids[non_null_mask] == _LINESTRING_TYPE_ID):
+        owned_result = _build_linestring_owned_from_chunks(coord_chunks, non_null_mask)
 
     return (
         result,
         np.asarray(sorted(fast_list), dtype=np.int32),
         fallback_index,
+        owned_result,
     )
 
 

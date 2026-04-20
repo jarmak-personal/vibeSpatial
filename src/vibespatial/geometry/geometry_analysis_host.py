@@ -62,6 +62,19 @@ def assemble_cached_bounds(geometry_array: OwnedGeometryArray) -> np.ndarray | N
         return np.full((geometry_array.row_count, 4), np.nan, dtype=np.float64)
     if any(buffer.bounds is None for buffer in geometry_array.families.values()):
         return None
+    if len(geometry_array.families) == 1:
+        family, buffer = next(iter(geometry_array.families.items()))
+        if (
+            buffer.bounds is not None
+            and buffer.bounds.shape == (geometry_array.row_count, 4)
+            and bool(np.all(geometry_array.validity))
+            and bool(np.all(geometry_array.tags == FAMILY_TAGS[family]))
+            and np.array_equal(
+                geometry_array.family_row_offsets,
+                np.arange(geometry_array.row_count, dtype=np.int32),
+            )
+        ):
+            return np.array(buffer.bounds, dtype=np.float64, copy=True)
     bounds = np.full((geometry_array.row_count, 4), np.nan, dtype=np.float64)
     for family, buffer in geometry_array.families.items():
         row_indexes = np.flatnonzero(geometry_array.tags == FAMILY_TAGS[family])
@@ -103,7 +116,17 @@ def slice_bounds_vectorized(
 def family_bounds_vectorized(buffer: FamilyGeometryBuffer) -> np.ndarray:
     if buffer.row_count == 0:
         return np.empty((0, 4), dtype=np.float64)
-    if buffer.family in {GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
+    if buffer.family is GeometryFamily.POINT:
+        result = np.full((buffer.row_count, 4), np.nan, dtype=np.float64)
+        non_empty = ~buffer.empty_mask
+        if np.any(non_empty):
+            coord_indexes = buffer.geometry_offsets[:-1][non_empty]
+            result[non_empty, 0] = buffer.x[coord_indexes]
+            result[non_empty, 1] = buffer.y[coord_indexes]
+            result[non_empty, 2] = buffer.x[coord_indexes]
+            result[non_empty, 3] = buffer.y[coord_indexes]
+        return result
+    if buffer.family in {GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT}:
         starts = buffer.geometry_offsets[:-1].astype(np.int64, copy=False)
         ends = buffer.geometry_offsets[1:].astype(np.int64, copy=False)
         return slice_bounds_vectorized(buffer.x, buffer.y, starts, ends, buffer.empty_mask)

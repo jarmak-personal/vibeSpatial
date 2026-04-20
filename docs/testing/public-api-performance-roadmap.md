@@ -187,6 +187,18 @@ Remediation progress:
   now reports a vibeSpatial median of `57.02s` with the expected
   `other=33824` fingerprint while the isolated GeoPandas denominator times
   out at the current 300s limit.
+- M5 secondary public ops are closed for this pass. Public `offset_curve` no longer
+  discards partial repo-owned results when a subset of LineStrings needs
+  explicit fallback rows, and `DeviceGeometryArray.offset_curve` reuses the
+  owned LineString result instead of rebuilding every output row from Shapely.
+  The April 20 local RTX 4090 run moved offset-curve from about `0.43x` to
+  `1.45x` at 1k/10k and `1.42x` at 50k. Public point `bounds` now reuses
+  cached host bounds for host materialization and has point-family plus
+  contiguous-cache host fast paths, moving 100k to `1.46x` and 1m to `1.80x`.
+  The remaining 10k bounds gap is fixed public/DataFrame/event overhead against
+  a raw `shapely.bounds` denominator. Small direct `io-file` reads remain
+  tracked as raw-container-denominator surfaces; do not route around the native
+  public IO path solely to win sub-millisecond pyarrow/pyogrio comparisons.
 
 ## Milestones
 
