@@ -826,7 +826,7 @@ def _repolygonize_from_split_rings(
         return None
 
     # Step 2: Build half-edge graph
-    half_edge_graph = build_gpu_half_edge_graph(atomic_edges)
+    half_edge_graph = build_gpu_half_edge_graph(atomic_edges, isolate_rows=True)
     if half_edge_graph.edge_count == 0:
         return None
 
@@ -865,6 +865,7 @@ def _repolygonize_from_split_rings(
     # Step 5: Assemble output polygons from selected faces
     result = _build_polygon_output_from_faces_gpu(
         half_edge_graph, faces, selected_face_indices,
+        preserve_row_count=polygon_count,
     )
     return result
 
@@ -1405,14 +1406,11 @@ def gpu_repair_invalid_polygons(
     except Exception:
         return None
 
-    # Determine whether we have a device-resident path
-    use_device_path = (
-        owned.device_state is not None
-        and any(
-            GeometryFamily(fn) in owned.device_state.families
-            for fn in polygon_families
-        )
-    )
+    # Determine whether we can repair directly from device buffers.  The host
+    # family buffers on device-resident owned arrays may be metadata stubs until
+    # explicit materialization, so per-family sizing below must read from the
+    # device buffer whenever it exists.
+    device_state = owned.device_state
 
     runtime_sel = _planned_make_valid_runtime_selection(
         kernel_name="make_valid_gpu_batch_repair",
@@ -1427,12 +1425,31 @@ def gpu_repair_invalid_polygons(
     merged_owned = owned
 
     for family_name in polygon_families:
-        buffer = owned.families[family_name]
-        if not hasattr(buffer, "ring_offsets") or buffer.ring_offsets is None:
+        family = GeometryFamily(family_name)
+        buffer = owned.families[family]
+        d_buf = (
+            device_state.families.get(family)
+            if device_state is not None
+            else None
+        )
+        use_device_path = d_buf is not None
+        if use_device_path:
+            if d_buf.ring_offsets is None or d_buf.geometry_offsets is None:
+                continue
+            polygon_count = int(d_buf.geometry_offsets.size) - 1
+        else:
+            if not hasattr(buffer, "ring_offsets") or buffer.ring_offsets is None:
+                continue
+            polygon_count = (
+                int(buffer.geometry_offsets.size) - 1
+                if hasattr(buffer, "geometry_offsets")
+                else 0
+            )
+        if polygon_count <= 0:
             continue
 
         # Map invalid rows to family rows (vectorised, no Python loop)
-        family_tag = FAMILY_TAGS[family_name]
+        family_tag = FAMILY_TAGS[family]
         tag_match = owned.tags == family_tag
         invalid_mask = np.zeros(len(owned.tags), dtype=bool)
         invalid_mask[invalid_rows] = True
@@ -1441,9 +1458,6 @@ def gpu_repair_invalid_polygons(
             continue
 
         fam_row_offsets = owned.family_row_offsets[global_invalid]
-        polygon_count = int(buffer.geometry_offsets.size) - 1 if hasattr(buffer, "geometry_offsets") else 0
-        if polygon_count <= 0:
-            continue
         valid_fro = (fam_row_offsets >= 0) & (fam_row_offsets < polygon_count)
         global_invalid = global_invalid[valid_fro]
         fam_row_offsets = fam_row_offsets[valid_fro]
@@ -1458,10 +1472,6 @@ def gpu_repair_invalid_polygons(
 
         if use_device_path:
             # --- Device-resident path: no D->H transfers ---
-            ds = owned.device_state
-            family = GeometryFamily(family_name)
-            d_buf = ds.families[family]
-
             batch = _extract_batch_coords_device(d_buf, invalid_family_rows)
             if batch is None:
                 continue

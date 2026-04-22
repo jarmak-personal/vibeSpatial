@@ -409,6 +409,7 @@ def build_gpu_split_events(
                 _cached_right_device_segments=effective_right_segments,
                 _require_same_row=require_same_row,
                 _use_same_row_fast_path=use_same_row_fast_path,
+                _collect_ambiguous_rows=False,
             )
     except Exception as exc:
         raise RuntimeError(
@@ -624,6 +625,7 @@ def build_gpu_split_events(
                             _cached_right_device_segments=effective_right_segments,
                             _require_same_row=True,
                             _use_same_row_fast_path=False,
+                            _collect_ambiguous_rows=False,
                         )
                     if right_right.runtime_selection.selected is not ExecutionMode.GPU:
                         raise RuntimeError(
@@ -635,10 +637,18 @@ def build_gpu_split_events(
                         with hotpath_stage("overlay.split.filter_right_right_pairs", category="filter"):
                             d_rr_left_lookup = cp.asarray(rr_state.left_lookup, dtype=cp.int32)
                             d_rr_right_lookup = cp.asarray(rr_state.right_lookup, dtype=cp.int32)
-                            d_rr_left_rows = original_right_segment_rows[d_rr_left_lookup]
-                            d_rr_right_rows = original_right_segment_rows[d_rr_right_lookup]
+                            d_rr_left_group_rows = cp.asarray(rr_state.left_rows, dtype=cp.int32)
+                            d_rr_right_group_rows = cp.asarray(rr_state.right_rows, dtype=cp.int32)
+                            d_rr_left_original_rows = original_right_segment_rows[d_rr_left_lookup]
+                            d_rr_right_original_rows = original_right_segment_rows[d_rr_right_lookup]
+                            # Same-row classification is over remapped group ids.
+                            # Original right rows are used only to drop self-pairs
+                            # and mirrored duplicates inside one grouped output row.
                             rr_keep = compact_indices(
-                                (d_rr_left_rows < d_rr_right_rows).astype(cp.uint8, copy=False)
+                                (
+                                    (d_rr_left_group_rows == d_rr_right_group_rows)
+                                    & (d_rr_left_original_rows < d_rr_right_original_rows)
+                                ).astype(cp.uint8, copy=False)
                             ).values
                             _sync_hotpath(runtime)
                     if rr_keep is not None and int(rr_keep.size) > 0:

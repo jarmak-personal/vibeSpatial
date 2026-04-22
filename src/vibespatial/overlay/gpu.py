@@ -1191,16 +1191,16 @@ def spatial_overlay_owned(
                 # right before the per-group Python loop.  This is the
                 # only D2H for these arrays; all upstream filtering
                 # (containment bypass, SH bypass) operated on device.
-                if _pairs_on_device and _n_groups > 0:
-                    _h_group_starts = cp.asnumpy(group_starts)
-                    _h_group_ends = cp.asnumpy(group_ends)
-                else:
-                    _h_group_starts = group_starts
-                    _h_group_ends = group_ends
+                def _host_group_boundaries(values):
+                    if cp is not None and hasattr(values, "__cuda_array_interface__"):
+                        host_values = cp.asnumpy(cp.asarray(values))  # zcopy:ok(small metadata for per-group overlay loop)
+                        return np.asarray(host_values, dtype=np.int64).tolist()
+                    return np.asarray(values, dtype=np.int64).tolist()
+
                 _group_ranges = list(
                     zip(
-                        np.asarray(_h_group_starts).tolist(),
-                        np.asarray(_h_group_ends).tolist(),
+                        _host_group_boundaries(group_starts),
+                        _host_group_boundaries(group_ends),
                     )
                 )
 

@@ -1126,6 +1126,232 @@ def _fused_gpu_binary_predicate(
     return out
 
 
+def _evaluate_binary_predicates_fused_gpu(
+    predicates: Sequence[str],
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> dict[str, np.ndarray] | None:
+    """Evaluate multiple DE-9IM predicates with one exact GPU pass.
+
+    Mask-clip physical plans often need both ``intersects`` and
+    ``covered_by`` for the same pairwise inputs.  Computing the DE-9IM mask
+    once and deriving both boolean predicates avoids duplicate polygon
+    relation kernels while keeping the public result as ordinary NumPy masks.
+    """
+    predicate_names = tuple(dict.fromkeys(predicates))
+    if not predicate_names or any(predicate not in _DE9IM_PREDICATES for predicate in predicate_names):
+        return None
+    if left.row_count != right.row_count:
+        return None
+    from vibespatial.runtime import has_gpu_runtime
+    if not has_gpu_runtime():
+        return None
+
+    def _record_success() -> None:
+        detail = (
+            f"predicates={','.join(predicate_names)}; "
+            f"row_count={left.row_count}; workload_shape=vector_vector"
+        )
+        for predicate in predicate_names:
+            record_dispatch_event(
+                surface="vibespatial.predicates.binary",
+                operation=predicate,
+                requested=ExecutionMode.GPU,
+                selected=ExecutionMode.GPU,
+                implementation="fused_multi_predicate_gpu",
+                reason="device-resident DE-9IM multi-predicate evaluation",
+                detail=detail,
+            )
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="fused GPU multi-predicate: left geometry",
+    )
+    right.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="fused GPU multi-predicate: right geometry",
+    )
+
+    import cupy as cp
+
+    for arr, state_ref in ((left, "left"), (right, "right")):
+        state = arr._ensure_device_state()
+        if state.row_bounds is None:
+            compute_geometry_bounds_device(arr)
+            state = arr._ensure_device_state()
+            if state.row_bounds is None:
+                record_fallback_event(
+                    surface="vibespatial.predicates.binary._evaluate_binary_predicates_fused_gpu",
+                    reason=f"GPU bounds kernel unavailable for {state_ref}; using individual predicate path",
+                    d2h_transfer=False,
+                )
+                return None
+
+    left_state = left._ensure_device_state()
+    right_state = right._ensure_device_state()
+    n = left.row_count
+    d_lb = cp.asarray(left_state.row_bounds).reshape(n, 4)
+    d_rb = cp.asarray(right_state.row_bounds).reshape(n, 4)
+    d_valid = cp.asarray(left_state.validity) & cp.asarray(right_state.validity)
+    d_bbox_hit = (
+        (d_lb[:, 0] <= d_rb[:, 2])
+        & (d_lb[:, 2] >= d_rb[:, 0])
+        & (d_lb[:, 1] <= d_rb[:, 3])
+        & (d_lb[:, 3] >= d_rb[:, 1])
+    )
+    d_cand_rows = cp.flatnonzero(d_bbox_hit & d_valid).astype(cp.int32)
+    if int(d_cand_rows.size) == 0:
+        outputs = {
+            predicate: np.ones(n, dtype=bool) if predicate == "disjoint" else np.zeros(n, dtype=bool)
+            for predicate in predicate_names
+        }
+        _record_success()
+        return outputs
+
+    d_tags_l = cp.asarray(left_state.tags)
+    d_tags_r = cp.asarray(right_state.tags)
+    d_cand_ltags = d_tags_l[d_cand_rows]
+    d_cand_rtags = d_tags_r[d_cand_rows]
+    point_tags = {
+        FAMILY_TAGS[GeometryFamily.POINT],
+        FAMILY_TAGS[GeometryFamily.MULTIPOINT],
+    }
+    tag_pairs = unique_tag_pairs(d_cand_ltags, d_cand_rtags)
+    if any(lt in point_tags or rt in point_tags for lt, rt in tag_pairs):
+        return None
+
+    from .polygon import compute_polygon_de9im_gpu
+
+    cand_count = int(d_cand_rows.size)
+    d_de9im_masks = cp.zeros(cand_count, dtype=cp.uint16)
+    single_tag_pair = len(tag_pairs) == 1
+    for lt, rt in tag_pairs:
+        lf = TAG_FAMILIES[lt] if lt in TAG_FAMILIES else None
+        rf = TAG_FAMILIES[rt] if rt in TAG_FAMILIES else None
+        if lf is None or rf is None:
+            return None
+        if single_tag_pair:
+            d_sub_idx = None
+            d_sub_cand = d_cand_rows
+        else:
+            d_sub_mask = (d_cand_ltags == lt) & (d_cand_rtags == rt)
+            d_sub_idx = cp.flatnonzero(d_sub_mask)
+            if d_sub_idx.size == 0:
+                continue
+            d_sub_cand = d_cand_rows[d_sub_idx]
+        d_sub_result = compute_polygon_de9im_gpu(
+            left,
+            right,
+            query_family=lf,
+            tree_family=rf,
+            d_left=d_sub_cand,
+            d_right=d_sub_cand,
+            return_device=True,
+        )
+        if d_sub_result is None:
+            return None
+        if d_sub_idx is None:
+            d_de9im_masks = d_sub_result.astype(cp.uint16, copy=False)
+        else:
+            d_de9im_masks[d_sub_idx] = d_sub_result
+
+    d_predicate_results = [
+        _evaluate_de9im_device(d_de9im_masks, predicate)
+        for predicate in predicate_names
+    ]
+    h_predicate_results = cp.asnumpy(cp.stack(d_predicate_results, axis=0))
+    cand_rows = cp.asnumpy(d_cand_rows)
+    outputs: dict[str, np.ndarray] = {}
+    for predicate_index, predicate in enumerate(predicate_names):
+        out = np.ones(n, dtype=bool) if predicate == "disjoint" else np.zeros(n, dtype=bool)
+        out[cand_rows] = h_predicate_results[predicate_index]
+        outputs[predicate] = out
+    _record_success()
+    return outputs
+
+
+def _evaluate_covered_by_single_polygonal_mask_gpu(
+    left: OwnedGeometryArray,
+    mask: OwnedGeometryArray,
+) -> np.ndarray | None:
+    """Exact ``covered_by`` for many polygonal rows against one polygonal mask.
+
+    This supports the mask-clip physical shape where a bbox-filtered polygon
+    partition is frequently already fully covered by a dissolved polygonal
+    mask. The kernel uses the convex-mask proof when legal and otherwise
+    falls through to exact polygon DE-9IM on device.
+    """
+    if mask.row_count != 1:
+        return None
+    from vibespatial.runtime import has_gpu_runtime
+    if not has_gpu_runtime():
+        return None
+
+    left.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="covered_by single-mask GPU probe: left geometry",
+    )
+    mask.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="covered_by single-mask GPU probe: mask geometry",
+    )
+
+    import cupy as cp
+
+    left_state = left._ensure_device_state()
+    mask_state = mask._ensure_device_state()
+    mask_families = [
+        family
+        for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON)
+        if family in mask_state.families
+    ]
+    if len(mask_families) != 1:
+        return None
+    mask_family = mask_families[0]
+
+    left_polygon_families = (
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    )
+    active_left_families = [
+        family for family in left_polygon_families
+        if family in left_state.families
+    ]
+    if not active_left_families:
+        return None
+    active_tags = {FAMILY_TAGS[family] for family in active_left_families}
+    left_tags = cp.asarray(left_state.tags)
+    d_valid = cp.asarray(left_state.validity)
+    supported_tag_mask = cp.isin(left_tags, cp.asarray(tuple(active_tags), dtype=cp.int8))
+    if bool(cp.any((~supported_tag_mask) & d_valid)):
+        return None
+
+    from .polygon import compute_polygonal_covered_by_single_mask_no_holes_gpu
+
+    d_out = cp.zeros(left.row_count, dtype=cp.bool_)
+    for family in active_left_families:
+        tag = FAMILY_TAGS[family]
+        d_rows = cp.flatnonzero((left_tags == tag) & d_valid).astype(cp.int32, copy=False)
+        if d_rows.size == 0:
+            continue
+        d_family_result = compute_polygonal_covered_by_single_mask_no_holes_gpu(
+            left,
+            mask,
+            query_family=family,
+            mask_family=mask_family,
+            d_left=d_rows,
+            return_device=True,
+        )
+        if d_family_result is None:
+            return None
+        d_out[d_rows] = d_family_result
+    return cp.asnumpy(d_out).astype(bool, copy=False)
+
+
 def evaluate_binary_predicate(
     predicate: str,
     left: PredicateInput,

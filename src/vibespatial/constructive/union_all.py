@@ -79,6 +79,7 @@ _MERGE_TARGETS: dict[GeometryFamily, GeometryFamily] = {
     GeometryFamily.POLYGON: GeometryFamily.MULTIPOLYGON,
     GeometryFamily.MULTIPOLYGON: GeometryFamily.MULTIPOLYGON,
 }
+_SPATIAL_LOCALIZE_MIN_ROWS = 128
 
 
 def _polygon_assembly_result_is_invalid(result: OwnedGeometryArray) -> bool:
@@ -272,7 +273,11 @@ def _spatially_localize_polygon_union_inputs(
     the first reduction rounds local, which substantially reduces downstream
     overlay complexity on corridor/network workloads.
     """
-    if cp is None or owned.row_count <= 2 or not _polygonal_family_only(owned):
+    if (
+        cp is None
+        or owned.row_count < _SPATIAL_LOCALIZE_MIN_ROWS
+        or not _polygonal_family_only(owned)
+    ):
         return owned
 
     try:
@@ -387,6 +392,7 @@ def disjoint_subset_union_all_owned(
         try:
             result = _disjoint_subset_union_all_gpu(owned)
             if result is not None:
+                implementation = "disjoint_subset_union_all_gpu"
                 if _polygon_assembly_result_is_invalid(result):
                     from vibespatial.constructive.make_valid_gpu import (
                         gpu_repair_invalid_polygons,
@@ -403,20 +409,38 @@ def disjoint_subset_union_all_owned(
                     ):
                         result = repair.repaired_owned
                 if _polygon_assembly_result_is_invalid(result):
-                    _gpu_fallback_reason = "GPU disjoint-subset assembly produced invalid polygon topology"
-                    result = None
+                    try:
+                        result = _tree_reduce_global(owned, "union")
+                        implementation = (
+                            "exact_union_for_invalid_disjoint_subset_assembly_gpu"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "exact GPU union for invalid disjoint-subset assembly failed",
+                            exc_info=True,
+                        )
+                        _gpu_fallback_reason = (
+                            "GPU disjoint-subset assembly produced invalid polygon topology"
+                        )
+                        result = None
                 if result is not None:
-                    record_dispatch_event(
-                        surface="constructive.disjoint_subset_union_all",
-                        operation="disjoint_subset_union_all",
-                        implementation="disjoint_subset_union_all_gpu",
-                        reason=selection.reason,
-                        requested=dispatch_mode,
-                        selected=ExecutionMode.GPU,
-                    )
-                    return result
-                # Invalid assembled polygon topology needs an exact GEOS path,
-                # not the host-side assembly fallback below.
+                    if _polygon_assembly_result_is_invalid(result):
+                        _gpu_fallback_reason = (
+                            "GPU exact union produced invalid polygon topology"
+                        )
+                        result = None
+                    else:
+                        record_dispatch_event(
+                            surface="constructive.disjoint_subset_union_all",
+                            operation="disjoint_subset_union_all",
+                            implementation=implementation,
+                            reason=selection.reason,
+                            requested=dispatch_mode,
+                            selected=ExecutionMode.GPU,
+                        )
+                        return result
+                # Invalid assembled polygon topology needs an exact path, not
+                # the host-side assembly fallback below.
                 record_fallback_event(
                     surface="constructive.disjoint_subset_union_all",
                     reason=_gpu_fallback_reason,
@@ -1119,6 +1143,7 @@ def _tree_reduce_global(
     op: str,
     *,
     early_termination_on_empty: bool = False,
+    skip_polygon_contraction: bool = False,
 ) -> OwnedGeometryArray:
     """Binary-tree reduction of all rows in *owned* via overlay pipeline.
 
@@ -1175,6 +1200,7 @@ def _tree_reduce_global(
                     left_batch,
                     right_batch,
                     dispatch_mode=ExecutionMode.GPU,
+                    _skip_polygon_contraction=skip_polygon_contraction,
                 )
                 gpu_ok = True
                 consecutive_gpu_failures = 0
@@ -1296,6 +1322,7 @@ def union_all_gpu_owned(
     grid_size: float | None = None,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _skip_polygon_contraction: bool = False,
 ) -> OwnedGeometryArray:
     """GPU tree-reduction global union of all rows into a single geometry.
 
@@ -1399,7 +1426,11 @@ def union_all_gpu_owned(
                     selected=ExecutionMode.GPU,
                 )
                 return result
-            result = _tree_reduce_global(owned, "union")
+            result = _tree_reduce_global(
+                owned,
+                "union",
+                skip_polygon_contraction=_skip_polygon_contraction,
+            )
             record_dispatch_event(
                 surface="constructive.union_all_gpu",
                 operation="union_all",

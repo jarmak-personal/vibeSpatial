@@ -5,7 +5,7 @@ Scope: Execution plan for the next GPU performance push, including milestone seq
 Read If: You are planning or executing the next GPU performance remediation campaign.
 STOP IF: You already have the active milestone surface open and only need local implementation detail.
 Source Of Truth: Program plan for fixing structural GPU performance issues found in the audit.
-Body Budget: 460/520 lines
+Body Budget: 505/520 lines
 Document: docs/testing/gpu-performance-remediation-plan.md
 
 Section Map (Body Lines)
@@ -17,15 +17,15 @@ Section Map (Body Lines)
 | 22-30 | Open First |
 | 31-37 | Verify |
 | 38-50 | Risks |
-| 51-65 | Mission |
-| 66-82 | Baseline Snapshot |
-| 83-98 | Non-Goals |
-| 99-110 | Working Principles |
-| 111-125 | Program Structure |
-| 126-161 | Milestone M0: Baseline And Guardrails |
-| 162-200 | Milestone M1: Residency And Metadata Ownership |
-| 201-237 | Milestone M2: CCCL And Synchronization Contract |
-| ... | (9 additional sections omitted; open document body for full map) |
+| 51-67 | Mission |
+| 68-84 | Baseline Snapshot |
+| 85-100 | Non-Goals |
+| 101-112 | Working Principles |
+| 113-128 | Program Structure |
+| 129-164 | Milestone M0: Baseline And Guardrails |
+| 165-203 | Milestone M1: Residency And Metadata Ownership |
+| 204-240 | Milestone M2: CCCL And Synchronization Contract |
+| ... | (10 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 ## Intent
@@ -89,6 +89,8 @@ The push is successful only if it achieves all of the following:
 - profiling rails begin selecting GPU for important benchmark surfaces at
   meaningful scales
 - end-to-end pipeline profiles show less CPU-dominated orchestration
+- real-world public workflows improve through reusable physical-plan shapes,
+  not one-off benchmark patches
 - GPU acceleration coverage improves materially from the April 7, 2026 baseline
 
 ## Baseline Snapshot
@@ -150,6 +152,7 @@ device-native decode are still structurally wrong.
 | M3 | Device-Native Decode And Compaction | WKB and related count-scatter paths | Removes host-driven nested decode loops |
 | M4 | Predicate And Query Execution Shape | PIP, candidate assembly, work estimation | Fixes a core refine primitive and query path |
 | M5 | Overlay And Constructive De-Hosting | grouped overlay, microcells, contraction, union-all | Fixes the highest-value structural CPU orchestration |
+| M6 | Public Physical-Plan Coverage | shootouts, semijoins, anti-joins, mask clip, grouped reduce | Proves performance generalizes beyond focused workflows |
 
 ## Milestone M0: Baseline And Guardrails
 
@@ -402,6 +405,45 @@ After M1 through M5 land, do a sweep for smaller but repeated anti-patterns.
 - [ ] collapse repeated small D2H reads into one batched transfer where host
   reads remain necessary
 
+## Milestone M6: Public Physical-Plan Coverage
+
+### Goal
+
+Make real-world public workflow performance generalize through reusable
+physical execution shapes.
+
+### Primary Surfaces
+
+- `src/vibespatial/bench/shootout.py`
+- `src/vibespatial/bench/profile_rails.py`
+- public `sjoin`, `clip`, `overlay`, `dissolve`, and buffer chains
+- real-world shootouts under `benchmarks/shootout`
+
+### Known Problems To Fix
+
+- new real-world shootouts can be correct while still 4x to 65x slower than
+  GeoPandas at 10K
+- end-to-end shootout timings do not yet explain stage time, actual backend,
+  fallback events, transfers, materialization, or hotpath stage dominance
+- semijoin, anti-semijoin, many-few overlay, mask clip, grouped geometry reduce,
+  and area-filter-after-overlay are not tracked as first-class shapes
+
+### Checklist
+
+- [ ] Extend shootout artifacts with physical-plan stage evidence.
+- [ ] Tag public workflow canaries by reusable physical shape.
+- [ ] Profile emergency response catchments and retail trade-area screening
+  before touching workflow code.
+- [ ] Add shape-level benchmarks or profiler rails for the slowest common
+  patterns.
+- [ ] Fix shared execution shapes before applying workflow-specific changes.
+
+### Exit Criteria
+
+- each real-world shootout has a physical-plan breakdown
+- sub-par workflow results name the reusable shape that explains the cost
+- remediation improves a shared shape or documents an external-bound limit
+
 ## Measurement Gates
 
 Every milestone must report:
@@ -459,7 +501,8 @@ Use this order unless measurement proves otherwise:
 4. M3 device-native decode and compaction
 5. M4 predicate and query execution shape
 6. M5 overlay and constructive de-hosting
-7. cross-cutting cleanup sweep
+7. M6 public physical-plan coverage
+8. cross-cutting cleanup sweep
 
 The ordering matters because:
 
@@ -467,6 +510,8 @@ The ordering matters because:
 - M2 makes later stream and composition work possible
 - M3 and M4 fix shared primitives used by many higher-level paths
 - M5 is the hardest and should start after the foundations stop fighting back
+- M6 validates that the lower-level fixes generalize to public workflows instead
+  of only improving focused benchmark surfaces
 
 ## Session Checklist
 

@@ -5,7 +5,7 @@ Scope: Detailed GPU performance audit workflow, anti-pattern checklist, and repo
 Read If: You are auditing GPU performance, reviewing CuPy or CCCL usage, or checking whether a path is still CPU-shaped.
 STOP IF: You already have the specific hot path open and only need a local implementation detail.
 Source Of Truth: Repo-specific GPU performance audit checklist and prioritization guide.
-Body Budget: 422/460 lines
+Body Budget: 447/460 lines
 Document: docs/testing/gpu-performance-checklist.md
 
 Section Map (Body Lines)
@@ -22,10 +22,10 @@ Section Map (Body Lines)
 | 94-111 | Baseline Evidence |
 | 112-129 | Severity Model |
 | 130-145 | Audit Workflow |
-| 146-164 | Fast Triage Commands |
-| 165-166 | Checklist |
-| 167-187 | Runtime And Dispatch |
-| ... | (13 additional sections omitted; open document body for full map) |
+| 146-168 | Physical Plan Review |
+| 169-187 | Fast Triage Commands |
+| 188-189 | Checklist |
+| ... | (14 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 ## Intent
@@ -170,6 +170,29 @@ Run the audit in this order:
 
 If a path fails an earlier step, do not waste time micro-optimizing later
 steps first.
+
+## Physical Plan Review
+
+Use this review for changes touching public dispatch, joins, overlay, dissolve,
+IO, constructive operations, `vsbench`, or workflow shootouts.
+
+- [ ] Name the reusable physical shape that changed, such as semijoin,
+  anti-semijoin, many-few overlay, mask clip, grouped geometry reduce, or
+  area-filter-after-overlay.
+- [ ] Confirm the evidence reports actual backend, not only planner intent.
+- [ ] Confirm already-device-resident data stays on device until an explicit
+  materialization or fallback boundary.
+- [ ] Confirm semijoin, anti-join, groupby, dissolve, and materialization steps
+  are visible in benchmark or profiler output.
+- [ ] Confirm the change improves a real workflow canary or adds a shape-level
+  benchmark that can catch regressions.
+
+Mark as `BLOCKING` if:
+
+- the change only makes one workflow faster by adding a benchmark-specific
+  shortcut
+- host materialization remains hidden behind pandas convenience operations
+- the result cannot explain which reusable shape got faster or slower
 
 ## Fast Triage Commands
 
@@ -442,6 +465,8 @@ Before closing a performance audit, confirm all of the following:
   scale.
 - [ ] I recorded whether the result supports or disproves the "CPU-shaped GPU
   code" hypothesis for the audited surface.
+- [ ] I answered the physical-plan review questions when the audited surface
+  touched public workflow performance.
 
 The audit is complete only when the final note answers two questions:
 

@@ -320,6 +320,7 @@ def _build_device_backed_polygon_output(
                 empty_mask=d_empty_mask,
                 ring_offsets=d_ring_offsets,
                 bounds=None if bounds is None else runtime.from_host(bounds),
+                dense_single_ring_width=verts_per_ring,
             )
         },
         row_count=row_count,

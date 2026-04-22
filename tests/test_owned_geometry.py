@@ -43,6 +43,67 @@ def _sample_geometries() -> list[object | None]:
     ]
 
 
+def test_unique_tag_pairs_numpy_uses_geometry_tag_pairs() -> None:
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS, unique_tag_pairs
+
+    left = np.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=np.int8,
+    )
+    right = np.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+        ],
+        dtype=np.int8,
+    )
+
+    assert unique_tag_pairs(left, right) == [
+        (FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]),
+        (FAMILY_TAGS[GeometryFamily.MULTIPOLYGON], FAMILY_TAGS[GeometryFamily.POLYGON]),
+    ]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU not available")
+def test_unique_tag_pairs_cupy_avoids_heavy_unique(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cupy as cp
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS, unique_tag_pairs
+
+    def _fail_unique(*_args, **_kwargs):
+        raise AssertionError("fixed-domain tag pairs should not dispatch cp.unique")
+
+    monkeypatch.setattr(cp, "unique", _fail_unique)
+    left = cp.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=cp.int8,
+    )
+    right = cp.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+        ],
+        dtype=cp.int8,
+    )
+
+    assert unique_tag_pairs(left, right) == [
+        (FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]),
+        (FAMILY_TAGS[GeometryFamily.MULTIPOLYGON], FAMILY_TAGS[GeometryFamily.POLYGON]),
+    ]
+
+
 def test_shapely_round_trip_preserves_null_and_empty() -> None:
     owned = from_shapely_geometries(_sample_geometries())
     restored = owned.to_shapely()
@@ -514,6 +575,106 @@ class TestDeviceResidentConcat:
         assert len(calls) == 0, (
             "_ensure_host_state was called during device-resident concat"
         )
+
+    def test_device_geometry_copy_no_metadata_d2h(self) -> None:
+        """Copying a device-only geometry column must not materialize host metadata."""
+        from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+        from vibespatial.geometry.device_array import DeviceGeometryArray
+
+        owned = _make_device_resident([
+            Point(0, 0),
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 0)]),
+        ])
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+        with assert_zero_d2h_transfers():
+            copied = DeviceGeometryArray._from_owned(owned).copy()
+
+        assert copied._owned.residency is Residency.DEVICE
+        assert copied._owned.row_count == 2
+        assert copied._owned._validity is None
+        assert copied._owned._tags is None
+        assert copied._owned._family_row_offsets is None
+
+    def test_dense_polygon_device_take_no_d2h(self) -> None:
+        """Fixed-width one-ring polygon takes should stay fully device-side."""
+        import cupy as cp
+
+        from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+        owned = from_shapely_geometries([
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+            Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
+            Polygon([(4, 0), (5, 0), (5, 1), (4, 1), (4, 0)]),
+        ], residency=Residency.DEVICE)
+
+        with assert_zero_d2h_transfers():
+            result = owned.device_take(cp.asarray([2, 0], dtype=cp.int64))
+
+        assert result.residency is Residency.DEVICE
+        assert result.row_count == 2
+        assert result.device_state is not None
+        polygon_buffer = result.device_state.families[next(iter(result.device_state.families))]
+        assert int(polygon_buffer.x.size) == 10
+
+    def test_single_family_device_take_uses_family_row_offsets(self) -> None:
+        """Single-family device takes must respect reordered family buffers."""
+        import cupy as cp
+
+        from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+        from vibespatial.geometry.buffers import GeometryFamily, get_geometry_buffer_schema
+        from vibespatial.geometry.owned import (
+            FAMILY_TAGS,
+            FamilyGeometryBuffer,
+            OwnedGeometryArray,
+            OwnedGeometryDeviceState,
+        )
+
+        logical = [
+            Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)]),
+            Polygon([(2, 0), (3, 0), (3, 1), (2, 1), (2, 0)]),
+            Polygon([(4, 0), (5, 0), (5, 1), (4, 1), (4, 0)]),
+        ]
+        physical = from_shapely_geometries(
+            [logical[2], logical[0], logical[1]],
+            residency=Residency.DEVICE,
+        )
+        family = GeometryFamily.POLYGON
+        schema = get_geometry_buffer_schema(family)
+        owned = OwnedGeometryArray(
+            validity=None,
+            tags=None,
+            family_row_offsets=None,
+            families={
+                family: FamilyGeometryBuffer(
+                    family=family,
+                    schema=schema,
+                    row_count=3,
+                    x=np.empty(0, dtype=np.float64),
+                    y=np.empty(0, dtype=np.float64),
+                    geometry_offsets=np.empty(0, dtype=np.int32),
+                    empty_mask=np.empty(0, dtype=np.bool_),
+                    host_materialized=False,
+                )
+            },
+            residency=Residency.DEVICE,
+            device_state=OwnedGeometryDeviceState(
+                validity=cp.ones(3, dtype=cp.bool_),
+                tags=cp.full(3, FAMILY_TAGS[family], dtype=cp.int8),
+                family_row_offsets=cp.asarray([1, 2, 0], dtype=cp.int32),
+                families=physical.device_state.families,
+            ),
+            _row_count=3,
+        )
+
+        with assert_zero_d2h_transfers():
+            result = owned.device_take(cp.asarray([0, 2], dtype=cp.int64))
+
+        restored = result.to_shapely()
+        assert restored[0].equals(logical[0])
+        assert restored[1].equals(logical[2])
 
     def test_concat_host_fallback_when_mixed_residency(self) -> None:
         """When some inputs are host-resident, falls back to host concat."""

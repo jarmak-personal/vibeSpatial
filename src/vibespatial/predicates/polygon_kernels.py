@@ -74,6 +74,57 @@ extern "C" __device__ inline unsigned char de9im_point_in_polygons(
   return best_loc;
 }
 
+extern "C" __device__ inline bool polygonal_mask_is_single_convex_no_holes(
+    const double* x, const double* y,
+    const int* ring_offsets,
+    const int* poly_ring_starts,
+    const int* poly_ring_ends,
+    int n_polys
+) {
+  if (n_polys != 1) return false;
+  if (poly_ring_ends[0] - poly_ring_starts[0] != 1) return false;
+
+  const int ring = poly_ring_starts[0];
+  const int cs = ring_offsets[ring];
+  const int ce = ring_offsets[ring + 1];
+  if (ce - cs < 4) return false;
+
+  int last = ce - 1;
+  if (fabs(x[cs] - x[last]) > VS_SPATIAL_EPSILON
+      || fabs(y[cs] - y[last]) > VS_SPATIAL_EPSILON) {
+    last = ce;
+  }
+  const int nverts = last - cs;
+  if (nverts < 3) return false;
+
+  int sign = 0;
+  for (int local = 0; local < nverts; ++local) {
+    const int i0 = cs + local;
+    const int i1 = cs + ((local + 1) % nverts);
+    const int i2 = cs + ((local + 2) % nverts);
+    const double x0 = x[i0], y0 = y[i0];
+    const double x1 = x[i1], y1 = y[i1];
+    const double x2 = x[i2], y2 = y[i2];
+    const double cross = (x1 - x0) * (y2 - y1) - (y1 - y0) * (x2 - x1);
+    const double scale = fabs(x1 - x0) + fabs(y1 - y0)
+                       + fabs(x2 - x1) + fabs(y2 - y1) + 1.0;
+    if (fabs(cross) <= VS_SPATIAL_EPSILON * scale * scale) continue;
+    const int current_sign = cross > 0.0 ? 1 : -1;
+    if (sign == 0) {
+      sign = current_sign;
+    } else if (current_sign != sign) {
+      return false;
+    }
+  }
+  return sign != 0;
+}
+
+extern "C" __device__ inline unsigned char de9im_mask_is_covered_by(unsigned short mask) {
+  const bool has_contact = (mask & (DE9IM_II | DE9IM_IB | DE9IM_BI | DE9IM_BB)) != 0;
+  const bool left_outside_right = (mask & (DE9IM_IE | DE9IM_BE)) != 0;
+  return (has_contact && !left_outside_right) ? 1 : 0;
+}
+
 extern "C" __device__ inline bool de9im_classify_polygon_interior_samples(
     const double* ax, const double* ay,
     const int* a_ring_offsets,
@@ -288,6 +339,101 @@ extern "C" __device__ inline unsigned short de9im_polygon_polygon(
   return mask;
 }
 
+// Exact covered_by probe for polygonal A against a single polygonal B.
+//
+// Convex no-hole masks use the cheaper one-sided proof. Concave, multipart,
+// and hole-bearing masks stay on device and fall through to full DE-9IM.
+extern "C" __device__ inline unsigned char polygonal_covered_by_no_holes_mask(
+    const double* ax, const double* ay,
+    const int* a_ring_offsets,
+    const int* a_poly_ring_starts,
+    const int* a_poly_ring_ends,
+    int n_a_polys,
+    const double* bx, const double* by,
+    const int* b_ring_offsets,
+    const int* b_poly_ring_starts,
+    const int* b_poly_ring_ends,
+    int n_b_polys
+) {
+  if (!polygonal_mask_is_single_convex_no_holes(
+          bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys)) {
+    const unsigned short mask = de9im_polygon_polygon(
+        ax, ay, a_ring_offsets, a_poly_ring_starts, a_poly_ring_ends, n_a_polys,
+        bx, by, b_ring_offsets, b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+    return de9im_mask_is_covered_by(mask);
+  }
+
+  bool any_contact = false;
+
+  // Boundary of A must not properly cross boundary of B.  Touches and
+  // collinear boundary overlaps are allowed for covered_by.
+  for (int ap = 0; ap < n_a_polys; ++ap) {
+    const int ars = a_poly_ring_starts[ap], are = a_poly_ring_ends[ap];
+    for (int ar = ars; ar < are; ++ar) {
+      const int acs = a_ring_offsets[ar], ace = a_ring_offsets[ar + 1];
+      for (int ai = acs + 1; ai < ace; ++ai) {
+        const double a1x = ax[ai - 1], a1y = ay[ai - 1];
+        const double a2x = ax[ai],     a2y = ay[ai];
+        const double aminx = a1x < a2x ? a1x : a2x;
+        const double amaxx = a1x > a2x ? a1x : a2x;
+        const double aminy = a1y < a2y ? a1y : a2y;
+        const double amaxy = a1y > a2y ? a1y : a2y;
+        for (int bp = 0; bp < n_b_polys; ++bp) {
+          const int brs = b_poly_ring_starts[bp], bre = b_poly_ring_ends[bp];
+          for (int br = brs; br < bre; ++br) {
+            const int bcs = b_ring_offsets[br], bce = b_ring_offsets[br + 1];
+            for (int bi = bcs + 1; bi < bce; ++bi) {
+              const double b1x = bx[bi - 1], b1y = by[bi - 1];
+              const double b2x = bx[bi],     b2y = by[bi];
+              const double bminx = b1x < b2x ? b1x : b2x;
+              const double bmaxx = b1x > b2x ? b1x : b2x;
+              const double bminy = b1y < b2y ? b1y : b2y;
+              const double bmaxy = b1y > b2y ? b1y : b2y;
+              if (amaxx < bminx || bmaxx < aminx || amaxy < bminy || bmaxy < aminy) {
+                continue;
+              }
+              if (vs_segments_properly_cross(
+                      a1x, a1y, a2x, a2y,
+                      b1x, b1y, b2x, b2y)) {
+                return 0;
+              }
+            }
+          }
+        }
+
+        // Endpoint-only boundary contacts can hide an outside chord across a
+        // concavity.  Classifying the segment midpoint catches that case while
+        // proper crossings catch interior boundary exits/re-entries.
+        const double mx = (a1x + a2x) * 0.5;
+        const double my = (a1y + a2y) * 0.5;
+        const unsigned char mid_loc = de9im_point_in_polygons(
+            mx, my, bx, by, b_ring_offsets,
+            b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+        if (mid_loc == 0) return 0;
+        any_contact = true;
+      }
+    }
+  }
+
+  // Every boundary vertex of A must lie in the interior or boundary of B.
+  for (int ap = 0; ap < n_a_polys; ++ap) {
+    const int ars = a_poly_ring_starts[ap], are = a_poly_ring_ends[ap];
+    for (int ar = ars; ar < are; ++ar) {
+      const int acs = a_ring_offsets[ar], ace = a_ring_offsets[ar + 1];
+      const int vlast = (ace > acs + 1) ? ace - 1 : ace;
+      for (int vi = acs; vi < vlast; ++vi) {
+        const unsigned char loc = de9im_point_in_polygons(
+            ax[vi], ay[vi], bx, by, b_ring_offsets,
+            b_poly_ring_starts, b_poly_ring_ends, n_b_polys);
+        if (loc == 0) return 0;
+        any_contact = true;
+      }
+    }
+  }
+
+  return any_contact ? 1 : 0;
+}
+
 // ===================================================================
 // Global kernels
 // ===================================================================
@@ -449,6 +595,178 @@ extern "C" __global__ void polygon_multipolygon_de9im_from_owned(
   out_mask[i] = de9im_polygon_polygon(
       left_x, left_y, left_ro, &l_ring_start, &l_ring_end, 1,
       right_x, right_y, right_ro, r_ring_starts, r_ring_ends, nr_capped);
+}
+
+// ---- Polygon × single Polygon mask covered_by probe ----
+extern "C" __global__ void polygon_polygon_covered_by_mask_no_holes(
+    const unsigned char* left_validity,
+    const signed char*   left_tags,
+    const int*           left_fro,
+    const int*           left_go,
+    const int*           left_ro,
+    const unsigned char* left_em,
+    const double*        left_x,
+    const double*        left_y,
+    int                  left_tag,
+    const unsigned char* right_validity,
+    const signed char*   right_tags,
+    const int*           right_fro,
+    const int*           right_go,
+    const int*           right_ro,
+    const unsigned char* right_em,
+    const double*        right_x,
+    const double*        right_y,
+    int                  right_tag,
+    const int*           left_idx,
+    unsigned char*       out,
+    int                  pair_count,
+    int                  right_row
+) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pair_count) return;
+
+  const int li = left_idx[i];
+  if (!left_validity[li] || !right_validity[right_row]) { out[i] = 0; return; }
+  if (left_tags[li] != left_tag || right_tags[right_row] != right_tag) { out[i] = 0; return; }
+  const int lr = left_fro[li], rr = right_fro[right_row];
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+
+  const int l_ring_start = left_go[lr], l_ring_end = left_go[lr + 1];
+  const int r_ring_start = right_go[rr], r_ring_end = right_go[rr + 1];
+  out[i] = polygonal_covered_by_no_holes_mask(
+      left_x, left_y, left_ro, &l_ring_start, &l_ring_end, 1,
+      right_x, right_y, right_ro, &r_ring_start, &r_ring_end, 1);
+}
+
+// ---- MultiPolygon × single Polygon mask covered_by probe ----
+extern "C" __global__ void multipolygon_polygon_covered_by_mask_no_holes(
+    const unsigned char* left_validity,
+    const signed char*   left_tags,
+    const int*           left_fro,
+    const int*           left_go,
+    const int*           left_po,
+    const int*           left_ro,
+    const unsigned char* left_em,
+    const double*        left_x,
+    const double*        left_y,
+    int                  left_tag,
+    const unsigned char* right_validity,
+    const signed char*   right_tags,
+    const int*           right_fro,
+    const int*           right_go,
+    const int*           right_ro,
+    const unsigned char* right_em,
+    const double*        right_x,
+    const double*        right_y,
+    int                  right_tag,
+    const int*           left_idx,
+    unsigned char*       out,
+    int                  pair_count,
+    int                  right_row
+) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pair_count) return;
+
+  const int li = left_idx[i];
+  if (!left_validity[li] || !right_validity[right_row]) { out[i] = 0; return; }
+  if (left_tags[li] != left_tag || right_tags[right_row] != right_tag) { out[i] = 0; return; }
+  const int lr = left_fro[li], rr = right_fro[right_row];
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+
+  const int l_poly_start = left_go[lr], l_poly_end = left_go[lr + 1];
+  const int r_ring_start = right_go[rr], r_ring_end = right_go[rr + 1];
+  out[i] = polygonal_covered_by_no_holes_mask(
+      left_x, left_y, left_ro,
+      left_po + l_poly_start, left_po + l_poly_start + 1, l_poly_end - l_poly_start,
+      right_x, right_y, right_ro, &r_ring_start, &r_ring_end, 1);
+}
+
+// ---- Polygon × single MultiPolygon mask covered_by probe ----
+extern "C" __global__ void polygon_multipolygon_covered_by_mask_no_holes(
+    const unsigned char* left_validity,
+    const signed char*   left_tags,
+    const int*           left_fro,
+    const int*           left_go,
+    const int*           left_ro,
+    const unsigned char* left_em,
+    const double*        left_x,
+    const double*        left_y,
+    int                  left_tag,
+    const unsigned char* right_validity,
+    const signed char*   right_tags,
+    const int*           right_fro,
+    const int*           right_go,
+    const int*           right_po,
+    const int*           right_ro,
+    const unsigned char* right_em,
+    const double*        right_x,
+    const double*        right_y,
+    int                  right_tag,
+    const int*           left_idx,
+    unsigned char*       out,
+    int                  pair_count,
+    int                  right_row
+) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pair_count) return;
+
+  const int li = left_idx[i];
+  if (!left_validity[li] || !right_validity[right_row]) { out[i] = 0; return; }
+  if (left_tags[li] != left_tag || right_tags[right_row] != right_tag) { out[i] = 0; return; }
+  const int lr = left_fro[li], rr = right_fro[right_row];
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+
+  const int l_ring_start = left_go[lr], l_ring_end = left_go[lr + 1];
+  const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
+  out[i] = polygonal_covered_by_no_holes_mask(
+      left_x, left_y, left_ro, &l_ring_start, &l_ring_end, 1,
+      right_x, right_y, right_ro,
+      right_po + r_poly_start, right_po + r_poly_start + 1, r_poly_end - r_poly_start);
+}
+
+// ---- MultiPolygon × single MultiPolygon mask covered_by probe ----
+extern "C" __global__ void multipolygon_multipolygon_covered_by_mask_no_holes(
+    const unsigned char* left_validity,
+    const signed char*   left_tags,
+    const int*           left_fro,
+    const int*           left_go,
+    const int*           left_po,
+    const int*           left_ro,
+    const unsigned char* left_em,
+    const double*        left_x,
+    const double*        left_y,
+    int                  left_tag,
+    const unsigned char* right_validity,
+    const signed char*   right_tags,
+    const int*           right_fro,
+    const int*           right_go,
+    const int*           right_po,
+    const int*           right_ro,
+    const unsigned char* right_em,
+    const double*        right_x,
+    const double*        right_y,
+    int                  right_tag,
+    const int*           left_idx,
+    unsigned char*       out,
+    int                  pair_count,
+    int                  right_row
+) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= pair_count) return;
+
+  const int li = left_idx[i];
+  if (!left_validity[li] || !right_validity[right_row]) { out[i] = 0; return; }
+  if (left_tags[li] != left_tag || right_tags[right_row] != right_tag) { out[i] = 0; return; }
+  const int lr = left_fro[li], rr = right_fro[right_row];
+  if (lr < 0 || rr < 0 || left_em[lr] || right_em[rr]) { out[i] = 0; return; }
+
+  const int l_poly_start = left_go[lr], l_poly_end = left_go[lr + 1];
+  const int r_poly_start = right_go[rr], r_poly_end = right_go[rr + 1];
+  out[i] = polygonal_covered_by_no_holes_mask(
+      left_x, left_y, left_ro,
+      left_po + l_poly_start, left_po + l_poly_start + 1, l_poly_end - l_poly_start,
+      right_x, right_y, right_ro,
+      right_po + r_poly_start, right_po + r_poly_start + 1, r_poly_end - r_poly_start);
 }
 
 // ===================================================================
@@ -901,6 +1219,10 @@ _POLYGON_PREDICATES_KERNEL_NAMES = (
     "polygon_polygon_de9im_from_owned",
     "multipolygon_multipolygon_de9im_from_owned",
     "polygon_multipolygon_de9im_from_owned",
+    "polygon_polygon_covered_by_mask_no_holes",
+    "multipolygon_polygon_covered_by_mask_no_holes",
+    "polygon_multipolygon_covered_by_mask_no_holes",
+    "multipolygon_multipolygon_covered_by_mask_no_holes",
     "ls_ls_de9im_from_owned",
     "ls_mls_de9im_from_owned",
     "mls_mls_de9im_from_owned",

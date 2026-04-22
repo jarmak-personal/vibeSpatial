@@ -239,6 +239,52 @@ def test_shootout_postamble_runs_without_strict_native_env(tmp_path: Path) -> No
     assert "TIMED=1;POST=None" in run.stdout
 
 
+def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: Path) -> None:
+    script = tmp_path / "profile_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "# --- timed work starts here ---",
+                "from vibespatial.runtime.execution_trace import notify_dispatch, notify_transfer",
+                "from vibespatial.runtime.fallbacks import record_fallback_event",
+                "from vibespatial.runtime.hotpath_trace import hotpath_stage",
+                "notify_dispatch(surface='probe', operation='gpu_step', selected='gpu', implementation='probe_gpu')",
+                "notify_transfer(direction='d2h', trigger='probe', reason='profile probe')",
+                "with hotpath_stage('shootout.profile_probe', category='refine'):",
+                "    value = sum(range(8))",
+                "record_fallback_event(surface='probe.fallback', reason='profile fallback')",
+                "print(f'SHOOTOUT_FINGERPRINT: rows={value // 28}')",
+                "# --- timed work ends here ---",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    run = _run_harness(
+        label="vibespatial",
+        python_cmd=[sys.executable],
+        script=script,
+        repeat=1,
+        warmup=False,
+        pipeline_warm=True,
+        env={**os.environ, "UV_CACHE_DIR": "/tmp/uv-cache"},
+        timeout=60,
+        quiet=True,
+        profile=True,
+    )
+
+    assert run.error is None
+    assert run.profile is not None
+    assert run.profile["available"] is True
+    assert run.profile["fallback_event_count"] == 1
+    assert run.profile["trace_summary"]["gpu_steps"] >= 1
+    assert run.profile["trace_summary"]["d2h_transfers"] == 1
+    assert run.profile["trace_summary"]["offramps"] >= 1
+    assert run.profile["trace_transfers"][0]["reason"] == "profile probe"
+    assert run.profile["fallback_events"][0]["surface"] == "probe.fallback"
+    assert run.profile["top_hotpath"][0]["name"] == "shootout.profile_probe"
+
+
 @pytest.mark.gpu
 def test_vibespatial_harness_pipeline_warm_drains_deferred_cache(
     tmp_path: Path,
@@ -374,6 +420,57 @@ def test_run_shootout_baseline_uses_isolated_uv_env(
     assert "--with" in baseline_cmd
     assert "geopandas" in baseline_cmd
     assert "pyarrow" in baseline_cmd
+
+
+def test_run_shootout_metadata_tags_public_physical_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "shape_probe.py"
+    script.write_text(
+        "\n".join(
+            [
+                "import geopandas as gpd",
+                "# --- timed work starts here ---",
+                "hits = gpd.sjoin(left, right, predicate='intersects')",
+                "kept = left.loc[hits.index.unique()]",
+                "safe = kept.loc[~kept.index.isin(hits.index.unique())]",
+                "mask = gpd.clip(safe, right)",
+                "overlay = gpd.overlay(safe, right, how='intersection')",
+                "overlay['area'] = overlay.geometry.area",
+                "summary = overlay.dissolve(by='group')",
+                "# --- timed work ends here ---",
+                "print('SHOOTOUT_FINGERPRINT: rows=1')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    def _fake_run_harness(**kwargs):
+        return ShootoutRun(
+            label=kwargs["label"],
+            timing=timing_from_samples([1.0]),
+            stdout="SHOOTOUT_FINGERPRINT: rows=1\n",
+        )
+
+    monkeypatch.setattr("vibespatial.bench.shootout._run_harness", _fake_run_harness)
+    monkeypatch.setattr("vibespatial.runtime.has_gpu_runtime", lambda: False)
+
+    result = run_shootout(
+        script,
+        repeat=1,
+        warmup=False,
+        quiet=True,
+        baseline_python=sys.executable,
+    )
+
+    assert set(result.metadata["physical_shapes"]) >= {
+        "semijoin",
+        "anti_semijoin",
+        "many_few_overlay",
+        "grouped_geometry_reduce",
+        "area_filter_after_overlay",
+    }
 
 
 def test_run_shootout_marks_cold_start_probe_metadata(

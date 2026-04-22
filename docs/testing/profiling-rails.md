@@ -5,7 +5,7 @@ Scope: Stage-timed profiling entrypoints, NVTX guidance, and trace interpretatio
 Read If: You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
 STOP IF: You already have the profiling script open and only need a local implementation detail.
 Source Of Truth: Stage-level profiling workflow for join and overlay kernel development.
-Body Budget: 123/220 lines
+Body Budget: 148/220 lines
 Document: docs/testing/profiling-rails.md
 
 Section Map (Body Lines)
@@ -20,7 +20,8 @@ Section Map (Body Lines)
 | 42-64 | Entry Point |
 | 65-98 | Stage Contracts |
 | 99-109 | Trace Interpretation |
-| 110-123 | NVTX |
+| 110-124 | NVTX |
+| 125-148 | Shootout Physical Plans |
 DOC_HEADER:END -->
 
 This repo now has a dedicated profiling rail for join and overlay kernel work.
@@ -144,3 +145,28 @@ nsys profile --trace=cuda,nvtx uv run python scripts/profile_kernels.py --kernel
 
 The JSON trace remains the source of truth inside the repo. NVTX is an external
 augmentation, not a replacement.
+
+## Shootout Physical Plans
+
+Public shootouts should expose physical-plan evidence when they are used for
+performance decisions. Whole-script medians are not enough once correctness is
+already passing.
+
+Shootout artifacts should report:
+
+- actual backend by stage
+- fallback events and reasons
+- host materialization and transfer counts
+- top hotpath stages by elapsed time
+- row-flow counts through joins, overlays, filters, and grouped reductions
+- physical shape tags such as semijoin, anti-semijoin, many-few overlay, mask
+  clip, grouped geometry reduce, and area-filter-after-overlay
+
+Interpretation rules:
+
+- a passing fingerprint is correctness evidence, not performance evidence
+- a fast individual kernel does not prove the public workflow shape is fast
+- workflow fixes should improve a named reusable shape or document a measured
+  external-bound limit
+- operation-vs-operation floor checks should accompany workflow analysis so
+  stage-floor gaps are not confused with composition overhead

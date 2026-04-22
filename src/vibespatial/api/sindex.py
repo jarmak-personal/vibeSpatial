@@ -8,8 +8,9 @@ from vibespatial.api import geometry_array as array
 from vibespatial.api import geoseries
 from vibespatial.geometry.api_registry import register_device_spatial_index_factory
 from vibespatial.geometry.owned import OwnedGeometryArray
-from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime import ExecutionMode, get_requested_mode
 from vibespatial.runtime.dispatch import record_dispatch_event
+from vibespatial.runtime.fallbacks import record_fallback_event
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
@@ -65,6 +66,20 @@ class SpatialIndex:
         """Lazily build the STRtree when a fallback path needs it."""
         if self._tree is not None:
             return
+        if (
+            self._geometry_array is not None
+            and getattr(self._geometry_array, "_owned", None) is not None
+            and getattr(self._geometry_array, "_shapely_data", None) is None
+        ):
+            record_fallback_event(
+                surface="geopandas.array.sindex",
+                requested=get_requested_mode(),
+                selected=ExecutionMode.CPU,
+                reason="owned-backed GeometryArray.sindex materializes a host STRtree",
+                detail=f"rows={len(self._geometry_array)}",
+                pipeline="spatial_index",
+                d2h_transfer=True,
+            )
         geometry = np.asarray(self._geometry_array._data, dtype=object)
         non_empty = geometry.copy()
         non_empty[shapely.is_empty(non_empty)] = None

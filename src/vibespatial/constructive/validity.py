@@ -41,6 +41,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from vibespatial.constructive.validity_kernels import (
     _HOLES_IN_SHELL_FP64,
     _HOLES_IN_SHELL_KERNEL_NAMES,
+    _IS_SIMPLE_SEGMENTS_EXACT_FP64,
     _IS_SIMPLE_SEGMENTS_FP64,
     _IS_SIMPLE_SEGMENTS_KERNEL_NAMES,
     _IS_VALID_RINGS_FP64,
@@ -74,6 +75,11 @@ from vibespatial.runtime.residency import combined_residency
 request_nvrtc_warmup([
     ("is-valid-rings-fp64", _IS_VALID_RINGS_FP64, _IS_VALID_RINGS_KERNEL_NAMES),
     ("is-simple-segments-fp64", _IS_SIMPLE_SEGMENTS_FP64, _IS_SIMPLE_SEGMENTS_KERNEL_NAMES),
+    (
+        "is-simple-segments-exact-fp64",
+        _IS_SIMPLE_SEGMENTS_EXACT_FP64,
+        _IS_SIMPLE_SEGMENTS_KERNEL_NAMES,
+    ),
     ("holes-in-shell-fp64", _HOLES_IN_SHELL_FP64, _HOLES_IN_SHELL_KERNEL_NAMES),
     ("ring-pair-interaction-fp64", _RING_PAIR_INTERACTION_FP64, _RING_PAIR_INTERACTION_KERNEL_NAMES),
 ])
@@ -578,6 +584,20 @@ def _endpoints_coincide(
     )
 
 
+def _point_strictly_on_segment_cpu(
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> bool:
+    """Return True when a point lies in a segment interior, not its endpoints."""
+    if (px == ax and py == ay) or (px == bx and py == by):
+        return False
+    return _point_on_segment_cpu(px, py, ax, ay, bx, by)
+
+
 def _linestring_self_intersects(
     x: np.ndarray, y: np.ndarray, start: int, end: int,
     *, is_ring: bool = False,
@@ -618,6 +638,16 @@ def _linestring_self_intersects(
 
             # Check proper interior crossing
             if _segments_cross(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1):
+                return True
+
+            # GEOS treats a non-adjacent vertex touching another segment's
+            # interior as ring self-intersection, even without a crossing.
+            if (
+                _point_strictly_on_segment_cpu(ax0, ay0, bx0, by0, bx1, by1)
+                or _point_strictly_on_segment_cpu(ax1, ay1, bx0, by0, bx1, by1)
+                or _point_strictly_on_segment_cpu(bx0, by0, ax0, ay0, ax1, ay1)
+                or _point_strictly_on_segment_cpu(bx1, by1, ax0, ay0, ax1, ay1)
+            ):
                 return True
 
             # Check endpoint coincidence (e.g. figure-8 patterns where a
@@ -1095,7 +1125,14 @@ def _launch_ring_pair_interaction_kernel(runtime, d_buf, d_poly_ring_starts,
     return d_poly_valid
 
 
-def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
+def _is_valid_gpu_polygons(
+    d_buf,
+    family_rows,
+    result,
+    global_rows,
+    *,
+    exact_collinearity: bool = False,
+):
     """Polygon validity via NVRTC kernels + CuPy reduction.
 
     OGC validity for polygon rings requires:
@@ -1136,7 +1173,13 @@ def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
 
         # Step 2: ring simplicity (no self-intersection) via is_simple_segments
         d_ring_simple = _launch_is_simple_kernel(
-            runtime, d_buf.x, d_buf.y, d_buf.ring_offsets, ring_count, is_ring=1,
+            runtime,
+            d_buf.x,
+            d_buf.y,
+            d_buf.ring_offsets,
+            ring_count,
+            is_ring=1,
+            exact_collinearity=exact_collinearity,
         )
 
         # Combine: ring is valid only if structurally valid AND simple
@@ -1216,7 +1259,14 @@ def _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows):
         runtime.free(d_ring_valid)
 
 
-def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
+def _is_valid_gpu_multipolygons(
+    d_buf,
+    family_rows,
+    result,
+    global_rows,
+    *,
+    exact_collinearity: bool = False,
+):
     """MultiPolygon validity via NVRTC kernels + CuPy reduction.
 
     MultiPolygon uses part_offsets to reach rings. OGC validity requires:
@@ -1256,7 +1306,13 @@ def _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows):
 
         # Step 2: ring simplicity (no self-intersection) via is_simple_segments
         d_ring_simple = _launch_is_simple_kernel(
-            runtime, d_buf.x, d_buf.y, d_buf.ring_offsets, ring_count, is_ring=1,
+            runtime,
+            d_buf.x,
+            d_buf.y,
+            d_buf.ring_offsets,
+            ring_count,
+            is_ring=1,
+            exact_collinearity=exact_collinearity,
         )
 
         # Combine: ring is valid only if structurally valid AND simple
@@ -1378,11 +1434,26 @@ def _is_simple_gpu_multipoints(d_buf, result, global_rows):
     result[global_rows] = True
 
 
-def _launch_is_simple_kernel(runtime, d_buf_x, d_buf_y, d_span_offsets, span_count, is_ring):
+def _launch_is_simple_kernel(
+    runtime,
+    d_buf_x,
+    d_buf_y,
+    d_span_offsets,
+    span_count,
+    is_ring,
+    *,
+    exact_collinearity: bool = False,
+):
     """Launch the is_simple_segments kernel and return the device result array."""
     kernels = compile_kernel_group(
-        "is-simple-segments-fp64",
-        _IS_SIMPLE_SEGMENTS_FP64,
+        (
+            "is-simple-segments-exact-fp64"
+            if exact_collinearity
+            else "is-simple-segments-fp64"
+        ),
+        _IS_SIMPLE_SEGMENTS_EXACT_FP64
+        if exact_collinearity
+        else _IS_SIMPLE_SEGMENTS_FP64,
         _IS_SIMPLE_SEGMENTS_KERNEL_NAMES,
     )
     kernel = kernels["is_simple_segments"]
@@ -1694,6 +1765,7 @@ def is_valid_owned(
     *,
     dispatch_mode: ExecutionMode | str = ExecutionMode.AUTO,
     precision: PrecisionMode | str = PrecisionMode.AUTO,
+    _exact_collinearity: bool = False,
 ) -> np.ndarray:
     """Check OGC validity of each geometry in an OwnedGeometryArray.
 
@@ -1725,12 +1797,17 @@ def is_valid_owned(
     if row_count == 0:
         return np.array([], dtype=bool)
 
-    cached_result = getattr(owned, "_cached_is_valid_mask", None)
+    cache_attr = (
+        "_cached_is_valid_exact_collinearity_mask"
+        if _exact_collinearity
+        else "_cached_is_valid_mask"
+    )
+    cached_result = getattr(owned, cache_attr, None)
     if cached_result is not None and int(cached_result.size) == row_count:
         return cached_result
 
     if owned.is_indexed_view and owned._base is not None:
-        base_cached = getattr(owned._base, "_cached_is_valid_mask", None)
+        base_cached = getattr(owned._base, cache_attr, None)
         index_map = owned._index_map
         if base_cached is not None and index_map is not None:
             if hasattr(index_map, "get"):
@@ -1739,7 +1816,7 @@ def is_valid_owned(
                 base_cached[np.asarray(index_map, dtype=np.int64)],
                 dtype=bool,
             )
-            owned._cached_is_valid_mask = cached_result
+            setattr(owned, cache_attr, cached_result)
             return cached_result
 
     selection = plan_dispatch_selection(
@@ -1792,10 +1869,22 @@ def is_valid_owned(
                     _is_valid_gpu_multilinestrings(d_buf, family_rows, result, global_rows)
 
                 elif family is GeometryFamily.POLYGON:
-                    _is_valid_gpu_polygons(d_buf, family_rows, result, global_rows)
+                    _is_valid_gpu_polygons(
+                        d_buf,
+                        family_rows,
+                        result,
+                        global_rows,
+                        exact_collinearity=_exact_collinearity,
+                    )
 
                 elif family is GeometryFamily.MULTIPOLYGON:
-                    _is_valid_gpu_multipolygons(d_buf, family_rows, result, global_rows)
+                    _is_valid_gpu_multipolygons(
+                        d_buf,
+                        family_rows,
+                        result,
+                        global_rows,
+                        exact_collinearity=_exact_collinearity,
+                    )
 
                 actually_used_gpu = True
                 continue  # skip CPU fallback
@@ -1820,7 +1909,7 @@ def is_valid_owned(
 
     # Null geometries are valid (Shapely convention)
     # Already True by default; no action needed for nulls.
-    owned._cached_is_valid_mask = result
+    setattr(owned, cache_attr, result)
     return result
 
 

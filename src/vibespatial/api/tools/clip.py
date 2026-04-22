@@ -17,6 +17,7 @@ from vibespatial.api._native_results import (
     LeftConstructiveResult,
     NativeTabularResult,
     _clip_constructive_parts_to_native_tabular_result,
+    _spatial_to_native_tabular_result,
 )
 from vibespatial.api.geometry_array import (
     LINE_GEOM_TYPES,
@@ -37,6 +38,7 @@ from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_m
 from vibespatial.runtime.residency import Residency
 
 _POLYGON_MASK_DIRECT_EXACT_MAX_ROWS = 8
+_POLYGON_MASK_RECT_VALIDATED_MIN_ROWS = 128
 _POLYGON_MASK_HOST_INTERSECTS_REPAIR_MAX_ROWS = 256
 _DEVICE_CLIP_GEOM_TYPES = POINT_GEOM_TYPES | LINE_GEOM_TYPES | POLYGON_GEOM_TYPES
 logger = logging.getLogger(__name__)
@@ -48,7 +50,12 @@ def _maybe_seed_polygon_validity_cache(spatial) -> None:
     owned = getattr(values, "_owned", None)
     if owned is None:
         return
-    if not bool(geometry.geom_type.isin(POLYGON_GEOM_TYPES).all()):
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    if not set(owned.families).issubset(
+        {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    ):
         return
 
     from vibespatial.geometry.owned import seed_all_validity_cache
@@ -347,7 +354,17 @@ def _take_spatial_rows(spatial, keep_mask):
     if owned is None:
         return filtered
 
-    taken_owned = owned.take(keep_rows)
+    if owned.residency is Residency.DEVICE and has_gpu_runtime():
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+            cp = None
+        if cp is not None:
+            taken_owned = owned.device_take(cp.asarray(keep_rows, dtype=cp.int64))
+        else:
+            taken_owned = owned.take(keep_rows)
+    else:
+        taken_owned = owned.take(keep_rows)
     taken_values = _geometry_values_from_owned(
         taken_owned,
         crs=getattr(spatial, "crs", None),
@@ -1208,9 +1225,7 @@ def _clip_polygon_area_intersection_owned(
             return _clip_polygon_area_intersection_gpu_owned(
                 left_owned,
                 mask_owned,
-                allow_rectangle_kernel=(
-                    allow_rectangle_kernel or not strict_native_mode_enabled()
-                ),
+                allow_rectangle_kernel=allow_rectangle_kernel,
             )
 
         tiled_mask = (
@@ -1221,6 +1236,15 @@ def _clip_polygon_area_intersection_owned(
             )
         )
         if allow_rectangle_kernel and polygon_rect_intersection_can_handle(
+            left_owned,
+            tiled_mask,
+        ):
+            return polygon_rect_intersection(
+                left_owned,
+                tiled_mask,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+        if allow_rectangle_kernel and polygon_rect_intersection_can_handle(
             tiled_mask,
             left_owned,
         ):
@@ -1229,6 +1253,20 @@ def _clip_polygon_area_intersection_owned(
                 left_owned,
                 dispatch_mode=ExecutionMode.GPU,
             )
+        if (
+            left_owned.row_count >= _POLYGON_MASK_RECT_VALIDATED_MIN_ROWS
+            and (
+                polygon_rect_intersection_can_handle(left_owned, tiled_mask)
+                or polygon_rect_intersection_can_handle(tiled_mask, left_owned)
+            )
+        ):
+            validated = _clip_validated_polygon_rect_mask_intersection_owned(
+                left_owned,
+                mask_owned,
+                tiled_mask,
+            )
+            if validated is not None:
+                return validated
 
         return _many_vs_one_intersection_owned(
             left_owned,
@@ -1263,6 +1301,167 @@ def _clip_polygon_area_intersection_owned(
         )
 
 
+def _clip_validated_polygon_rect_mask_intersection_owned(
+    left_owned,
+    mask_owned,
+    tiled_mask_owned,
+):
+    """Use the rectangle kernel for scalar mask clips, repairing unsafe rows.
+
+    The rectangle kernel is exact for rows where clipping the scalar polygon by
+    the source rectangle yields a single valid polygon. Concave masks can yield
+    disconnected output; those rows become invalid single-ring polygons, so they
+    are detected with the GPU validity checker and replaced with the exact GPU
+    many-vs-one intersection. This keeps the reusable rectangular-cell mask
+    clip shape on device without broadening the unsafe fast path.
+    """
+    if left_owned.row_count == 0:
+        return None
+    if mask_owned.row_count != 1 or tiled_mask_owned.row_count != left_owned.row_count:
+        return None
+    if not has_gpu_runtime() or left_owned.residency is not Residency.DEVICE:
+        return None
+
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover
+        return None
+
+    from vibespatial.constructive.make_valid_pipeline import make_valid_owned
+    from vibespatial.constructive.validity import is_valid_owned
+    from vibespatial.geometry.owned import device_concat_owned_scatter
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection,
+        polygon_rect_intersection_can_handle,
+        polygon_rect_split_boundary_components,
+    )
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.dispatch import record_dispatch_event
+
+    if polygon_rect_intersection_can_handle(left_owned, tiled_mask_owned):
+        polygon_owned = left_owned
+        rect_owned = tiled_mask_owned
+        physical_shape = "mask_rectangle"
+    elif polygon_rect_intersection_can_handle(tiled_mask_owned, left_owned):
+        polygon_owned = tiled_mask_owned
+        rect_owned = left_owned
+        physical_shape = "source_rectangle"
+    else:
+        return None
+
+    fast_owned = polygon_rect_intersection(
+        polygon_owned,
+        rect_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    if fast_owned.row_count != left_owned.row_count:
+        return None
+
+    valid_mask = np.asarray(
+        is_valid_owned(fast_owned, dispatch_mode=ExecutionMode.GPU),
+        dtype=bool,
+    )
+    if valid_mask.size != fast_owned.row_count:
+        return None
+    boundary_overlap = getattr(fast_owned, "_polygon_rect_boundary_overlap", None)
+    boundary_repair_mask = None
+    if boundary_overlap is not None:
+        boundary_repair_mask = (
+            boundary_overlap.get()
+            if hasattr(boundary_overlap, "get")
+            else np.asarray(boundary_overlap, dtype=bool)
+        )
+        boundary_repair_mask = np.asarray(boundary_repair_mask, dtype=bool)
+        if boundary_repair_mask.size != fast_owned.row_count:
+            boundary_repair_mask = None
+
+    nonempty_mask = np.asarray(fast_owned.validity, dtype=bool)
+    if nonempty_mask.size != fast_owned.row_count:
+        return None
+
+    repair_mask = nonempty_mask & ~valid_mask
+    if boundary_repair_mask is not None:
+        repair_mask = repair_mask | (nonempty_mask & boundary_repair_mask)
+    repair_rows = np.flatnonzero(repair_mask).astype(np.intp, copy=False)
+    if repair_rows.size == 0:
+        record_dispatch_event(
+            surface="geopandas.clip",
+            operation="validated_polygon_rect_mask_clip",
+            implementation="polygon_rect_intersection_validated_gpu",
+            reason="rectangular-cell mask clip stayed on GPU with all rows validated",
+            detail=(
+                f"rows={left_owned.row_count}; repair_rows=0; "
+                f"physical_shape={physical_shape}"
+            ),
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+        )
+        return fast_owned
+
+    d_repair_rows = cp.asarray(repair_rows, dtype=cp.int64)
+    repair_fast_owned = fast_owned.device_take(d_repair_rows)
+    repair_rect_owned = rect_owned.device_take(d_repair_rows)
+    repair_owned = polygon_rect_split_boundary_components(
+        repair_fast_owned,
+        repair_rect_owned,
+    )
+    repair_impl = "polygon_rect_boundary_split_gpu"
+    if repair_owned is not None and repair_owned.row_count == repair_rows.size:
+        repair_valid = np.asarray(
+            is_valid_owned(repair_owned, dispatch_mode=ExecutionMode.GPU),
+            dtype=bool,
+        )
+        if repair_valid.size != repair_rows.size or not bool(repair_valid.all()):
+            repair_owned = None
+
+    if repair_owned is None or repair_owned.row_count != repair_rows.size:
+        repair_result = make_valid_owned(
+            owned=repair_fast_owned,
+            method="structure",
+            keep_collapsed=True,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        repair_owned = repair_result.owned
+        repair_impl = "gpu_make_valid_structure_repair"
+        if (
+            repair_result.selected is not ExecutionMode.GPU
+            or repair_owned is None
+            or repair_owned.row_count != repair_rows.size
+        ):
+            return None
+
+    result = device_concat_owned_scatter(
+        fast_owned,
+        repair_owned,
+        d_repair_rows,
+    )
+
+    if boundary_overlap is not None:
+        if hasattr(boundary_overlap, "copy"):
+            boundary_overlap = boundary_overlap.copy()
+        if hasattr(boundary_overlap, "__setitem__"):
+            boundary_overlap[d_repair_rows if hasattr(boundary_overlap, "get") else repair_rows] = False
+        result._polygon_rect_boundary_overlap = boundary_overlap
+
+    record_dispatch_event(
+        surface="geopandas.clip",
+        operation="validated_polygon_rect_mask_clip",
+        implementation="polygon_rect_intersection_validated_gpu",
+        reason=(
+            "rectangular-cell mask clip used GPU rectangle kernel and repaired "
+            "unsafe rows without leaving the device"
+        ),
+        detail=(
+            f"rows={left_owned.row_count}; repair_rows={repair_rows.size}; "
+            f"repair_impl={repair_impl}; "
+            f"physical_shape={physical_shape}"
+        ),
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return result
+
+
 def _clip_polygon_area_intersection_gpu_owned(
     left_owned,
     mask_owned,
@@ -1279,11 +1478,21 @@ def _clip_polygon_area_intersection_gpu_owned(
     from vibespatial.runtime import ExecutionMode
     from vibespatial.runtime.dispatch import record_dispatch_event
 
+    scalar_mask_owned = mask_owned
     if left_owned.row_count > 1:
         mask_owned = materialize_broadcast(
             tile_single_row(mask_owned, left_owned.row_count),
         )
 
+    if allow_rectangle_kernel and polygon_rect_intersection_can_handle(
+        left_owned,
+        mask_owned,
+    ):
+        return polygon_rect_intersection(
+            left_owned,
+            mask_owned,
+            dispatch_mode=ExecutionMode.GPU,
+        )
     if allow_rectangle_kernel and polygon_rect_intersection_can_handle(
         mask_owned,
         left_owned,
@@ -1293,6 +1502,20 @@ def _clip_polygon_area_intersection_gpu_owned(
             left_owned,
             dispatch_mode=ExecutionMode.GPU,
         )
+    if (
+        left_owned.row_count >= _POLYGON_MASK_RECT_VALIDATED_MIN_ROWS
+        and (
+            polygon_rect_intersection_can_handle(left_owned, mask_owned)
+            or polygon_rect_intersection_can_handle(mask_owned, left_owned)
+        )
+    ):
+        validated = _clip_validated_polygon_rect_mask_intersection_owned(
+            left_owned,
+            scalar_mask_owned,
+            mask_owned,
+        )
+        if validated is not None:
+            return validated
 
     result = _binary_constructive_gpu(
         "intersection",
@@ -1363,21 +1586,29 @@ def _clip_polygon_single_pair_containment_owned(left_owned, mask_owned):
             )
             return left_inside_mask
 
-        mask_inside_left, mask_remainder = _containment_bypass_gpu(
-            mask_owned,
-            left_owned,
-            "intersection",
+        from vibespatial.kernels.constructive.polygon_rect_intersection import (
+            polygon_rect_intersection_can_handle,
         )
-        if mask_inside_left is not None and mask_remainder is None:
-            record_dispatch_event(
-                surface="geopandas.clip",
-                operation="intersection",
-                implementation="clip_polygon_single_pair_containment_bypass",
-                reason="single-row polygon clip returned the mask polygon via GPU containment bypass",
-                detail="mask_inside_left",
-                selected=ExecutionMode.GPU,
+
+        if polygon_rect_intersection_can_handle(mask_owned, left_owned):
+            mask_inside_left, mask_remainder = _containment_bypass_gpu(
+                mask_owned,
+                left_owned,
+                "intersection",
             )
-            return mask_inside_left
+            if mask_inside_left is not None and mask_remainder is None:
+                record_dispatch_event(
+                    surface="geopandas.clip",
+                    operation="intersection",
+                    implementation="clip_polygon_single_pair_containment_bypass",
+                    reason=(
+                        "single-row polygon clip returned the mask polygon via "
+                        "GPU containment bypass against a rectangular source"
+                    ),
+                    detail="mask_inside_rectangular_left",
+                    selected=ExecutionMode.GPU,
+                )
+                return mask_inside_left
     except Exception:
         logger.debug(
             "single-row polygon clip containment bypass failed; continuing to exact constructive path",
@@ -1628,39 +1859,51 @@ def _clip_polygon_boundary_touch_mask(
 
 def _owned_nonempty_polygon_mask(owned) -> np.ndarray:
     """Return rows backed by polygonal output with strictly positive area."""
-    from vibespatial.constructive.measurement import area_owned
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.geometry.owned import FAMILY_TAGS
+
+    if owned.residency is Residency.DEVICE and has_gpu_runtime():
+        try:
+            import cupy as cp
+        except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+            cp = None
+        if cp is not None:
+            from vibespatial.constructive.measurement import _area_gpu_device_fp64
+            from vibespatial.cuda._runtime import get_cuda_runtime
+
+            device_state = owned._ensure_device_state()
+            d_tags = cp.asarray(device_state.tags)
+            d_validity = cp.asarray(device_state.validity)
+            d_polygonal_mask = (
+                (d_tags == FAMILY_TAGS[GeometryFamily.POLYGON])
+                | (d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+            )
+            d_areas = _area_gpu_device_fp64(owned)
+            d_keep = d_validity & d_polygonal_mask & cp.isfinite(d_areas) & (d_areas > 0.0)
+            return np.asarray(get_cuda_runtime().copy_device_to_host(d_keep), dtype=bool)
+
+    from vibespatial.constructive.measurement import area_owned
 
     validity = np.asarray(owned.validity, dtype=bool)
     if not validity.any():
         return validity
 
     tags = np.asarray(owned.tags)
-    row_offsets = np.asarray(owned.family_row_offsets)
-    keep_mask = np.zeros(len(tags), dtype=bool)
+    polygon_tags = np.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=tags.dtype if tags.size else np.int8,
+    )
+    polygonal_mask = validity & np.isin(tags, polygon_tags)
+    if not polygonal_mask.any():
+        return np.zeros(len(tags), dtype=bool)
 
-    for family in (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON):
-        family_tag = FAMILY_TAGS[family]
-        family_mask = validity & (tags == family_tag)
-        if not family_mask.any():
-            continue
-        owned._ensure_host_family_structure(family)
-        family_indices = np.flatnonzero(family_mask)
-        family_rows = row_offsets[family_mask]
-        empty_mask = np.asarray(owned.families[family].empty_mask, dtype=bool)
-        if empty_mask.size == 0 or np.any((family_rows < 0) | (family_rows >= empty_mask.size)):
-            candidate_rows = family_indices
-        else:
-            candidate_rows = family_indices[~empty_mask[family_rows]]
-        if candidate_rows.size == 0:
-            continue
-        keep_mask[candidate_rows] = np.asarray(
-            area_owned(owned.take(candidate_rows)),
-            dtype=np.float64,
-        ) > 0.0
-
-    return keep_mask
+    areas = np.asarray(area_owned(owned), dtype=np.float64)
+    if areas.size != len(tags):
+        return np.zeros(len(tags), dtype=bool)
+    return polygonal_mask & np.isfinite(areas) & (areas > 0.0)
 
 
 def _exact_polygon_clip_boundary_rows(
@@ -2116,56 +2359,150 @@ def _clip_polygon_partition_with_polygon_mask(
     # intersection for those rows dominates 10K-scale workflows.
     if has_gpu_runtime() and left_owned.residency is Residency.DEVICE:
         from vibespatial.geometry.owned import materialize_broadcast, tile_single_row
-        from vibespatial.predicates.binary import evaluate_binary_predicate
+        from vibespatial.predicates.binary import (
+            _evaluate_binary_predicates_fused_gpu,
+            _evaluate_covered_by_single_polygonal_mask_gpu,
+            evaluate_binary_predicate,
+        )
         from vibespatial.runtime import ExecutionMode
 
         def _take_owned_rows(owned, rows: np.ndarray):
             if rows.size == 0:
                 return owned.take(rows)
+            if (
+                rows.size == owned.row_count
+                and np.array_equal(rows, np.arange(owned.row_count, dtype=rows.dtype))
+            ):
+                return owned
             if owned.residency is Residency.DEVICE:
                 import cupy as cp
 
                 return owned.device_take(cp.asarray(rows, dtype=cp.int64))
             return owned.take(rows)
 
+        def _all_candidate_bounds_within_single_mask_bounds() -> bool:
+            import cupy as cp
+
+            from vibespatial.kernels.core.geometry_analysis import (
+                compute_geometry_bounds_device,
+            )
+
+            left_bounds = cp.asarray(
+                compute_geometry_bounds_device(left_owned),
+                dtype=cp.float64,
+            ).reshape(left_owned.row_count, 4)
+            mask_bounds = cp.asarray(
+                compute_geometry_bounds_device(mask_owned),
+                dtype=cp.float64,
+            ).reshape(1, 4)[0]
+            left_valid = cp.asarray(left_owned._ensure_device_state().validity)
+            within_bounds = (
+                (left_bounds[:, 0] >= mask_bounds[0])
+                & (left_bounds[:, 2] <= mask_bounds[2])
+                & (left_bounds[:, 1] >= mask_bounds[1])
+                & (left_bounds[:, 3] <= mask_bounds[3])
+            )
+            return bool(cp.all(within_bounds | ~left_valid))
+
         inside_rows = np.asarray([], dtype=np.intp)
         exact_rows = np.asarray([], dtype=np.intp)
         if left_owned.row_count == 1 and not source_missing[0] and not strict_native:
             exact_rows = np.asarray([0], dtype=np.intp)
         else:
-            intersects_mask = np.asarray(
-                evaluate_binary_predicate(
-                    "intersects",
-                    left_owned,
-                    mask,
-                    dispatch_mode=ExecutionMode.GPU,
-                ).values,
-                dtype=bool,
+            single_mask_covered_by = (
+                _evaluate_covered_by_single_polygonal_mask_gpu(left_owned, mask_owned)
+                if _all_candidate_bounds_within_single_mask_bounds()
+                else None
             )
-            hit_rows = np.flatnonzero(~source_missing & intersects_mask).astype(
-                np.intp,
-                copy=False,
-            )
-            if hit_rows.size > 0:
-                hit_owned = _take_owned_rows(left_owned, hit_rows)
-                broadcast_mask = (
+            if single_mask_covered_by is not None:
+                covered_mask = np.asarray(single_mask_covered_by, dtype=bool)
+                valid_source_mask = ~source_missing
+                inside_rows = np.flatnonzero(valid_source_mask & covered_mask).astype(
+                    np.intp,
+                    copy=False,
+                )
+                remaining_rows = np.flatnonzero(valid_source_mask & ~covered_mask).astype(
+                    np.intp,
+                    copy=False,
+                )
+                if remaining_rows.size > 0:
+                    remaining_owned = _take_owned_rows(left_owned, remaining_rows)
+                    broadcast_remaining_mask = (
+                        mask_owned
+                        if remaining_owned.row_count == 1
+                        else materialize_broadcast(
+                            tile_single_row(mask_owned, remaining_owned.row_count),
+                        )
+                    )
+                    remaining_intersects = np.asarray(
+                        evaluate_binary_predicate(
+                            "intersects",
+                            remaining_owned,
+                            broadcast_remaining_mask,
+                            dispatch_mode=ExecutionMode.GPU,
+                        ).values,
+                        dtype=bool,
+                    )
+                    exact_rows = remaining_rows[remaining_intersects]
+            else:
+                broadcast_all_mask = (
                     mask_owned
-                    if hit_owned.row_count == 1
+                    if left_owned.row_count == 1
                     else materialize_broadcast(
-                        tile_single_row(mask_owned, hit_owned.row_count),
+                        tile_single_row(mask_owned, left_owned.row_count),
                     )
                 )
-                inside_hits = np.asarray(
-                    evaluate_binary_predicate(
-                        "covered_by",
-                        hit_owned,
-                        broadcast_mask,
-                        dispatch_mode=ExecutionMode.GPU,
-                    ).values,
-                    dtype=bool,
+                fused_masks = _evaluate_binary_predicates_fused_gpu(
+                    ("intersects", "covered_by"),
+                    left_owned,
+                    broadcast_all_mask,
                 )
-                inside_rows = hit_rows[inside_hits]
-                exact_rows = hit_rows[~inside_hits]
+                if fused_masks is not None:
+                    intersects_mask = np.asarray(fused_masks["intersects"], dtype=bool)
+                    inside_mask = np.asarray(fused_masks["covered_by"], dtype=bool)
+                    hit_mask = ~source_missing & intersects_mask
+                    inside_rows = np.flatnonzero(hit_mask & inside_mask).astype(
+                        np.intp,
+                        copy=False,
+                    )
+                    exact_rows = np.flatnonzero(hit_mask & ~inside_mask).astype(
+                        np.intp,
+                        copy=False,
+                    )
+                else:
+                    intersects_mask = np.asarray(
+                        evaluate_binary_predicate(
+                            "intersects",
+                            left_owned,
+                            mask,
+                            dispatch_mode=ExecutionMode.GPU,
+                        ).values,
+                        dtype=bool,
+                    )
+                    hit_rows = np.flatnonzero(~source_missing & intersects_mask).astype(
+                        np.intp,
+                        copy=False,
+                    )
+                    if hit_rows.size > 0:
+                        hit_owned = _take_owned_rows(left_owned, hit_rows)
+                        broadcast_mask = (
+                            mask_owned
+                            if hit_owned.row_count == 1
+                            else materialize_broadcast(
+                                tile_single_row(mask_owned, hit_owned.row_count),
+                            )
+                        )
+                        inside_hits = np.asarray(
+                            evaluate_binary_predicate(
+                                "covered_by",
+                                hit_owned,
+                                broadcast_mask,
+                                dispatch_mode=ExecutionMode.GPU,
+                            ).values,
+                            dtype=bool,
+                        )
+                        inside_rows = hit_rows[inside_hits]
+                        exact_rows = hit_rows[~inside_hits]
 
         exact_area_owned = None
         exact_area_values = None
@@ -2217,15 +2554,14 @@ def _clip_polygon_partition_with_polygon_mask(
                     from vibespatial.constructive.measurement import area_owned
                     from vibespatial.geometry.device_array import _compute_bounds_from_owned
 
-                    positive_owned = _take_owned_rows(exact_area_owned, positive_local_rows)
                     positive_bounds = np.asarray(
-                        _compute_bounds_from_owned(positive_owned),
+                        _compute_bounds_from_owned(exact_area_owned),
                         dtype=np.float64,
-                    ).reshape(-1, 4)
+                    ).reshape(-1, 4)[positive_local_rows]
                     positive_area = np.asarray(
-                        area_owned(positive_owned),
+                        area_owned(exact_area_owned),
                         dtype=np.float64,
-                    )
+                    )[positive_local_rows]
                     collapsed_positive = (
                         (np.abs(positive_bounds[:, 2] - positive_bounds[:, 0]) <= SPATIAL_EPSILON)
                         | (np.abs(positive_bounds[:, 3] - positive_bounds[:, 1]) <= SPATIAL_EPSILON)
@@ -2463,23 +2799,6 @@ def _clip_polygon_partition_with_polygon_mask(
             assembled[boundary_rows] = assembled_boundary
             return _as_geometry_values(assembled, crs=partition.crs)
         if not contains_collection:
-            result_owned = build_null_owned_array(
-                len(partition),
-                residency=left_owned.residency,
-            )
-            if inside_rows.size > 0:
-                result_owned = concat_owned_scatter(
-                    result_owned,
-                    _take_owned_rows(left_owned, inside_rows),
-                    inside_rows,
-                )
-            if positive_local_rows.size > 0 and exact_area_owned is not None:
-                result_owned = concat_owned_scatter(
-                    result_owned,
-                    _take_owned_rows(exact_area_owned, positive_local_rows),
-                    positive_rows,
-                )
-
             preserve_mask = np.zeros(boundary_rows.size, dtype=bool)
             changed_mask = np.zeros(boundary_rows.size, dtype=bool)
             for row_index, (assembled_geom, area_geom) in enumerate(
@@ -2494,25 +2813,29 @@ def _clip_polygon_partition_with_polygon_mask(
                     changed_mask[row_index] = True
             preserved_local_rows = boundary_local_rows[preserve_mask]
             preserved_rows = boundary_rows[preserve_mask]
+            extra_parts = []
             if preserved_local_rows.size > 0 and exact_area_owned is not None:
-                result_owned = concat_owned_scatter(
-                    result_owned,
-                    _take_owned_rows(exact_area_owned, preserved_local_rows),
+                extra_parts.append((
                     preserved_rows,
-                )
+                    _take_owned_rows(exact_area_owned, preserved_local_rows),
+                ))
             changed_rows = boundary_rows[changed_mask]
             if changed_rows.size > 0:
                 replacement_owned = from_shapely_geometries(
                     assembled_boundary[changed_mask].tolist(),
-                    residency=result_owned.residency,
+                    residency=left_owned.residency,
                 )
-                result_owned = concat_owned_scatter(
-                    result_owned,
-                    replacement_owned,
-                    changed_rows,
-                )
+                extra_parts.append((changed_rows, replacement_owned))
 
-            return _geometry_values_from_owned(result_owned, crs=partition.crs)
+            return _build_sparse_owned_clip_output(
+                partition_crs=partition.crs,
+                left_owned=left_owned,
+                inside_rows=inside_rows,
+                exact_area_owned=exact_area_owned,
+                positive_local_rows=positive_local_rows,
+                positive_rows=positive_rows,
+                extra_owned_parts=tuple(extra_parts),
+            )
 
         assembled = np.empty(len(partition), dtype=object)
         assembled[:] = None
@@ -2718,6 +3041,91 @@ def _clip_point_partition_with_polygon_mask(partition, mask):
     )
 
 
+def _clip_homogeneous_polygon_candidates_native(
+    source,
+    mask,
+    candidate_rows: np.ndarray,
+    *,
+    clipping_by_rectangle: bool,
+    rectangle_bounds,
+    keep_geom_type: bool,
+) -> NativeTabularResult | None:
+    """Clip polygon-only candidate rows without building a candidate frame."""
+    if (
+        clipping_by_rectangle
+        or rectangle_bounds is not None
+        or not isinstance(mask, Polygon | MultiPolygon)
+        or candidate_rows.size == 0
+        or not has_gpu_runtime()
+    ):
+        return None
+
+    geometry = source.geometry if isinstance(source, GeoDataFrame) else source
+    values = geometry.values
+    owned = getattr(values, "_owned", None)
+    if owned is None or owned.residency is not Residency.DEVICE:
+        return None
+
+    from vibespatial.geometry.buffers import GeometryFamily
+
+    if not set(owned.families).issubset(
+        {GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON}
+    ):
+        return None
+
+    try:
+        import cupy as cp
+    except ModuleNotFoundError:  # pragma: no cover - guarded by GPU runtime
+        return None
+
+    rows = np.asarray(candidate_rows, dtype=np.intp)
+    if (
+        rows.size == owned.row_count
+        and np.array_equal(rows, np.arange(owned.row_count, dtype=rows.dtype))
+    ):
+        candidate_owned = owned
+    else:
+        candidate_owned = owned.device_take(cp.asarray(rows, dtype=cp.int64))
+
+    candidate_values = DeviceGeometryArray._from_owned(candidate_owned, crs=geometry.crs)
+    partition = _geometry_series_from_values(
+        candidate_values,
+        index=geometry.index.take(rows),
+        crs=geometry.crs,
+        name=getattr(geometry, "name", None),
+    )
+    geometry_values = _clip_polygon_partition_with_polygon_mask(
+        partition,
+        mask,
+        keep_geom_type_only=keep_geom_type,
+    )
+    parts_tuple = (
+        _build_clip_partition_result(
+            source,
+            rows,
+            geometry_values,
+        ),
+    )
+    ordered_rows = rows.astype(np.intp, copy=False)
+    return _clip_constructive_parts_to_native_tabular_result(
+        source=source,
+        parts=parts_tuple,
+        ordered_row_positions=ordered_rows,
+        clipping_by_rectangle=False,
+        has_non_point_candidates=True,
+        keep_geom_type=keep_geom_type,
+        spatial_materializer=lambda: ClipNativeResult(
+            source=source,
+            parts=parts_tuple,
+            ordered_index=geometry.index.take(ordered_rows),
+            ordered_row_positions=ordered_rows,
+            clipping_by_rectangle=False,
+            has_non_point_candidates=True,
+            keep_geom_type=keep_geom_type,
+        ).to_spatial(),
+    )
+
+
 def _clip_gdf_with_mask_native(
     gdf,
     mask,
@@ -2775,20 +3183,32 @@ def _clip_gdf_with_mask_native(
         )
         candidate_rows = candidate_rows[order].astype(np.int32, copy=False)
     ordered_row_positions = candidate_rows.astype(np.intp, copy=False)
+    direct_polygon_result = _clip_homogeneous_polygon_candidates_native(
+        gdf,
+        intersection_polygon,
+        ordered_row_positions,
+        clipping_by_rectangle=clipping_by_rectangle,
+        rectangle_bounds=rectangle_bounds,
+        keep_geom_type=keep_geom_type,
+    )
+    if direct_polygon_result is not None:
+        return direct_polygon_result
+
     gdf_sub = gdf.iloc[candidate_rows]
 
-    point_mask = gdf_sub.geom_type == "Point"
+    geom_types = gdf_sub.geom_type
+    point_mask = geom_types == "Point"
     non_point_mask = ~point_mask
-    line_mask = gdf_sub.geom_type.isin(LINE_GEOM_TYPES)
-    multiline_mask = gdf_sub.geom_type == "MultiLineString"
+    line_mask = geom_types.isin(LINE_GEOM_TYPES)
+    multiline_mask = geom_types == "MultiLineString"
     simple_line_mask = line_mask & ~multiline_mask
-    polygon_mask = gdf_sub.geom_type.isin(POLYGON_GEOM_TYPES)
+    polygon_mask = geom_types.isin(POLYGON_GEOM_TYPES)
     generic_mask = non_point_mask & ~(simple_line_mask | multiline_mask | polygon_mask)
     rectangle_cleanup_safe = bool(
         rectangle_bounds is not None
         and (
             clipping_by_rectangle
-            or (len(gdf_sub) > 0 and (gdf_sub.geom_type == "Polygon").all())
+            or (len(gdf_sub) > 0 and (geom_types == "Polygon").all())
         )
     )
 
@@ -2858,7 +3278,12 @@ def _clip_gdf_with_mask_native(
         if not selection_mask.any():
             return
         local_mask = np.asarray(selection_mask, dtype=bool)
-        partition = gdf_sub[local_mask]
+        if local_mask.size == len(gdf_sub) and bool(local_mask.all()):
+            partition = gdf_sub
+            row_positions = candidate_rows
+        else:
+            partition = gdf_sub[local_mask]
+            row_positions = candidate_rows[local_mask]
         if (
             has_gpu_runtime()
             and _clip_partition_supports_device_promotion(partition)
@@ -2872,7 +3297,6 @@ def _clip_gdf_with_mask_native(
                 partition,
                 reason="clip selected candidate-limited GPU-native partition execution",
             )
-        row_positions = candidate_rows[local_mask]
         geometry_values = (
             partition.geometry.values if isinstance(partition, GeoDataFrame) else partition.values
         ) if passthrough else _clip_partition_values(
@@ -2925,6 +3349,94 @@ def _clip_gdf_with_mask_native(
     )
 
 
+def _clip_source_bounds_geometry(bounds):
+    bounds = tuple(float(value) for value in bounds)
+    if not np.all(np.isfinite(bounds)):
+        return None
+    xmin, ymin, xmax, ymax = bounds
+    if abs(xmax - xmin) <= SPATIAL_EPSILON and abs(ymax - ymin) <= SPATIAL_EPSILON:
+        return Point(xmin, ymin)
+    if abs(xmax - xmin) <= SPATIAL_EPSILON:
+        return LineString([(xmin, ymin), (xmax, ymax)])
+    if abs(ymax - ymin) <= SPATIAL_EPSILON:
+        return LineString([(xmin, ymin), (xmax, ymax)])
+    return box(xmin, ymin, xmax, ymax)
+
+
+def _clip_mask_covers_source_bounds(mask, source_bounds) -> bool:
+    source_extent = _clip_source_bounds_geometry(source_bounds)
+    if source_extent is None:
+        return False
+
+    if _mask_is_list_like_rectangle(mask):
+        try:
+            xmin, ymin, xmax, ymax = (float(value) for value in mask)
+        except (TypeError, ValueError):
+            return False
+        if not np.all(np.isfinite((xmin, ymin, xmax, ymax))):
+            return False
+        sxmin, symin, sxmax, symax = (float(value) for value in source_bounds)
+        return bool(
+            xmin <= sxmin + SPATIAL_EPSILON
+            and ymin <= symin + SPATIAL_EPSILON
+            and xmax + SPATIAL_EPSILON >= sxmax
+            and ymax + SPATIAL_EPSILON >= symax
+        )
+
+    if not isinstance(mask, Polygon | MultiPolygon) or mask.is_empty:
+        return False
+    try:
+        return bool(shapely.covers(mask, source_extent))
+    except Exception:
+        logger.debug(
+            "clip mask source-bounds coverage probe failed; continuing with exact clip",
+            exc_info=True,
+        )
+        return False
+
+
+def _clip_mask_covers_source_bounds_passthrough_native(
+    source,
+    mask,
+    source_bounds,
+) -> NativeTabularResult | None:
+    if not _clip_mask_covers_source_bounds(mask, source_bounds):
+        return None
+
+    geometry = source.geometry if isinstance(source, GeoDataFrame) else source
+    keep_mask = ~(
+        np.asarray(geometry.isna(), dtype=bool)
+        | np.asarray(geometry.is_empty, dtype=bool)
+    )
+    passthrough = _take_spatial_rows(source, keep_mask)
+    values = passthrough.geometry.values if isinstance(passthrough, GeoDataFrame) else passthrough.values
+    owned = getattr(values, "_owned", None)
+    selected = (
+        ExecutionMode.GPU
+        if owned is not None and owned.residency is Residency.DEVICE
+        else ExecutionMode.CPU
+    )
+
+    from vibespatial.runtime.dispatch import record_dispatch_event
+
+    record_dispatch_event(
+        surface="geopandas.clip",
+        operation="clip",
+        implementation="mask_covers_source_bounds_passthrough",
+        reason=(
+            "mask clip physical shape reduced to source passthrough because the "
+            "mask covers the source total-bounds extent"
+        ),
+        detail=(
+            f"rows={len(source)}; kept_rows={int(np.count_nonzero(keep_mask))}; "
+            "physical_shape=mask_clip"
+        ),
+        requested=ExecutionMode.AUTO,
+        selected=selected,
+    )
+    return _spatial_to_native_tabular_result(passthrough)
+
+
 def _clip_native_tabular_to_spatial(
     result: NativeTabularResult,
     *,
@@ -2953,15 +3465,37 @@ def _build_sparse_owned_clip_output(
     exact_area_owned,
     positive_local_rows: np.ndarray,
     positive_rows: np.ndarray,
+    extra_owned_parts=(),
 ):
     from vibespatial.geometry.owned import OwnedGeometryArray, build_null_owned_array
+    from vibespatial.runtime.residency import Residency
 
-    kept_local_rows = np.concatenate(
-        [
-            np.asarray(inside_rows, dtype=np.intp),
-            np.asarray(positive_rows, dtype=np.intp),
-        ]
-    )
+    extra_owned_parts = tuple(extra_owned_parts)
+
+    def _take_owned_part(owned, rows: np.ndarray):
+        rows = np.asarray(rows, dtype=np.intp)
+        if rows.size == 0:
+            return owned.take(rows)
+        if (
+            rows.size == owned.row_count
+            and np.array_equal(rows, np.arange(owned.row_count, dtype=rows.dtype))
+        ):
+            return owned
+        if owned.residency is Residency.DEVICE and has_gpu_runtime():
+            try:
+                import cupy as cp
+            except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+                cp = None
+            if cp is not None:
+                return owned.device_take(cp.asarray(rows, dtype=cp.int64))
+        return owned.take(rows)
+
+    row_parts = [
+        np.asarray(inside_rows, dtype=np.intp),
+        np.asarray(positive_rows, dtype=np.intp),
+        *[np.asarray(rows, dtype=np.intp) for rows, _owned in extra_owned_parts],
+    ]
+    kept_local_rows = np.concatenate(row_parts)
     if kept_local_rows.size == 0:
         return _ClipPartitionOutput(
             geometry_values=_geometry_values_from_owned(
@@ -2973,16 +3507,20 @@ def _build_sparse_owned_clip_output(
 
     owned_parts = []
     if inside_rows.size > 0:
-        owned_parts.append(left_owned.take(np.asarray(inside_rows, dtype=np.intp)))
+        owned_parts.append(_take_owned_part(left_owned, np.asarray(inside_rows, dtype=np.intp)))
     if positive_local_rows.size > 0:
-        owned_parts.append(exact_area_owned.take(np.asarray(positive_local_rows, dtype=np.intp)))
+        owned_parts.append(
+            _take_owned_part(exact_area_owned, np.asarray(positive_local_rows, dtype=np.intp))
+        )
+    owned_parts.extend(owned for _rows, owned in extra_owned_parts)
 
     result_owned = OwnedGeometryArray.concat(owned_parts)
     ordered_local_rows = kept_local_rows
     if np.any(ordered_local_rows[1:] < ordered_local_rows[:-1]):
         reorder = np.argsort(ordered_local_rows, kind="stable").astype(np.intp, copy=False)
-        result_owned = result_owned.take(reorder)
+        result_owned = _take_owned_part(result_owned, reorder)
         ordered_local_rows = ordered_local_rows[reorder]
+    result_owned._clip_semantically_clean = True
 
     return _ClipPartitionOutput(
         geometry_values=_geometry_values_from_owned(result_owned, crs=partition_crs),
@@ -3115,6 +3653,14 @@ def evaluate_geopandas_clip_native(
             combined_mask = mask.geometry.union_all()
     else:
         combined_mask = mask
+
+    passthrough_result = _clip_mask_covers_source_bounds_passthrough_native(
+        gdf,
+        combined_mask,
+        box_gdf,
+    )
+    if passthrough_result is not None:
+        return passthrough_result
 
     return _clip_gdf_with_mask_native(
         gdf,

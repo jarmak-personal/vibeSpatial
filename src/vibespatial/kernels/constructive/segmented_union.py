@@ -27,6 +27,8 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from vibespatial.constructive import segmented_union_cpu as _segmented_union_cpu_module
 from vibespatial.constructive.segmented_union_host import (
     concat_owned_arrays,
@@ -65,6 +67,10 @@ except ModuleNotFoundError:  # pragma: no cover
 _get_empty_owned = _segmented_union_cpu_module.get_empty_owned
 _segmented_union_cpu = _segmented_union_cpu_module.segmented_union_cpu
 _segmented_union_pair_cpu = _segmented_union_cpu_module.segmented_union_pair_cpu
+_SEGMENTED_UNION_SERIAL_SMALL_MAX_GROUP_SIZE = 8
+_SEGMENTED_UNION_ROBUST_SNAP_GRID = 1.0e-9
+_SEGMENTED_UNION_ROBUST_SNAP_PRE_MAX_COORDS = 4096
+_SEGMENTED_UNION_ROBUST_SNAP_RETRY_MAX_PARTS = 128
 
 
 def _empty_group_owned_like(source: OwnedGeometryArray) -> OwnedGeometryArray:
@@ -76,6 +82,87 @@ def _empty_group_owned_like(source: OwnedGeometryArray) -> OwnedGeometryArray:
             reason="segmented union empty group matches device-resident input",
         )
     return empty
+
+
+def _robust_snap_segmented_union_inputs_gpu(
+    geometries: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+    *,
+    record: bool,
+) -> OwnedGeometryArray | None:
+    """Snap grouped-union inputs to a sub-nanometer device grid.
+
+    Grouped dissolves often feed overlay results whose shared seams differ by
+    floating-point dust after several constructive stages.  Snap-rounding the
+    inputs before reduction closes only those sub-grid seams; the subsequent
+    union still does the topology work.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if geometries.row_count == 0:
+        return geometries
+    if int(np.diff(group_offsets).max(initial=0)) <= 1:
+        return geometries
+
+    from vibespatial.constructive.set_precision import _set_precision_gpu
+
+    try:
+        snapped = _set_precision_gpu(
+            geometries,
+            _SEGMENTED_UNION_ROBUST_SNAP_GRID,
+            "pointwise",
+        )
+    except Exception:
+        return None
+
+    if record:
+        record_dispatch_event(
+            surface="segmented_union_all",
+            operation="segmented_union_all_precision_snap",
+            implementation="gpu_cupy_pointwise_snap",
+            reason="robust grouped union seam snap",
+            detail=(
+                f"rows={geometries.row_count}, grid_size="
+                f"{_SEGMENTED_UNION_ROBUST_SNAP_GRID}"
+            ),
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+        )
+    return snapped
+
+
+def _owned_coordinate_count(owned: OwnedGeometryArray) -> int:
+    if owned.device_state is not None:
+        return sum(int(buf.x.size) for buf in owned.device_state.families.values())
+    return sum(int(buf.x.size) for buf in owned.families.values())
+
+
+def _should_pre_snap_segmented_union_inputs(
+    geometries: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+) -> bool:
+    if geometries.row_count == 0:
+        return False
+    if int(np.diff(group_offsets).max(initial=0)) <= 1:
+        return False
+    return _owned_coordinate_count(geometries) <= _SEGMENTED_UNION_ROBUST_SNAP_PRE_MAX_COORDS
+
+
+def _polygon_exploded_part_count_gpu(result: OwnedGeometryArray) -> int:
+    """Return the number of polygonal parts an explode would expose."""
+    if result.device_state is None:
+        return 0
+    count = 0
+    d_state = result.device_state
+    polygon_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    if GeometryFamily.POLYGON in d_state.families:
+        count += int(cp.count_nonzero(d_state.tags == polygon_tag).item())
+    if GeometryFamily.MULTIPOLYGON not in d_state.families:
+        return count
+    d_buf = d_state.families[GeometryFamily.MULTIPOLYGON]
+    if d_buf.part_offsets is not None:
+        count += int(d_buf.part_offsets.size) - 1
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -241,20 +328,81 @@ def _segmented_union_gpu(
     ADR-0002: CONSTRUCTIVE class, fp64 (segment intersection precision).
     ADR-0033: Inherits overlay pipeline tiers (NVRTC + CCCL + CuPy).
     """
-    from vibespatial.constructive.union_all import union_all_gpu_owned
-
     # Validate: GPU overlay requires polygon-family geometries.
     polygon_tags = {FAMILY_TAGS[GeometryFamily.POLYGON], FAMILY_TAGS[GeometryFamily.MULTIPOLYGON]}
     if not group_has_only_polygon_families(geometries, polygon_tags):
         # Non-polygon geometry present: fall back to CPU.
         return None
 
+    working_geometries = geometries
+    pre_snapped = False
+    if _should_pre_snap_segmented_union_inputs(geometries, group_offsets):
+        snapped = _robust_snap_segmented_union_inputs_gpu(
+            geometries,
+            group_offsets,
+            record=True,
+        )
+        if snapped is not None:
+            working_geometries = snapped
+            pre_snapped = True
+
+    result = _segmented_union_gpu_impl(
+        working_geometries,
+        group_offsets,
+        n_groups=n_groups,
+        precision_plan=precision_plan,
+    )
+    original_part_count = _polygon_exploded_part_count_gpu(result) if result is not None else 0
+    if (
+        not pre_snapped
+        and 1 < original_part_count <= _SEGMENTED_UNION_ROBUST_SNAP_RETRY_MAX_PARTS
+    ):
+        snapped = _robust_snap_segmented_union_inputs_gpu(
+            geometries,
+            group_offsets,
+            record=False,
+        )
+        if snapped is not None:
+            retry = _segmented_union_gpu_impl(
+                snapped,
+                group_offsets,
+                n_groups=n_groups,
+                precision_plan=precision_plan,
+            )
+            if (
+                retry is not None
+                and _polygon_exploded_part_count_gpu(retry) < original_part_count
+            ):
+                record_dispatch_event(
+                    surface="segmented_union_all",
+                    operation="segmented_union_all_precision_snap",
+                    implementation="gpu_cupy_pointwise_snap",
+                    reason="robust grouped union seam snap reduced exploded parts",
+                    detail=(
+                        f"rows={geometries.row_count}, grid_size="
+                        f"{_SEGMENTED_UNION_ROBUST_SNAP_GRID}, "
+                        f"parts={original_part_count}->{_polygon_exploded_part_count_gpu(retry)}"
+                    ),
+                    requested=ExecutionMode.GPU,
+                    selected=ExecutionMode.GPU,
+                )
+                return retry
+    return result
+
+
+def _segmented_union_gpu_impl(
+    geometries: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+    *,
+    n_groups: int,
+    precision_plan: PrecisionPlan,
+) -> OwnedGeometryArray | None:
+    from vibespatial.constructive.union_all import union_all_gpu_owned
+
     # Single-group dissolve is common in workflow benchmarks and should not
     # route through the legacy per-row Python reduction. Reuse the global
     # batched GPU tree-reduce path so each round processes whole batches.
     if n_groups == 1:
-        from vibespatial.constructive.union_all import union_all_gpu_owned
-
         keep = valid_row_indices(geometries)
         if keep.size == 0:
             return _empty_group_owned_like(geometries)
@@ -271,11 +419,52 @@ def _segmented_union_gpu(
         except Exception:
             return None
 
+    if int(np.diff(group_offsets).max(initial=0)) <= _SEGMENTED_UNION_SERIAL_SMALL_MAX_GROUP_SIZE:
+        return _segmented_union_serial_gpu(
+            geometries,
+            group_offsets,
+            n_groups=n_groups,
+            precision_plan=precision_plan,
+        )
+
+    grouped = _segmented_union_grouped_overlay_gpu(
+        geometries,
+        group_offsets,
+        n_groups=n_groups,
+        precision_plan=precision_plan,
+    )
+    if grouped is not None:
+        return grouped
+
+    return _segmented_union_batched_gpu(
+        geometries,
+        group_offsets,
+        n_groups=n_groups,
+        precision_plan=precision_plan,
+    )
+
+
+def _segmented_union_serial_gpu(
+    geometries: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+    *,
+    n_groups: int,
+    precision_plan: PrecisionPlan,
+) -> OwnedGeometryArray | None:
+    """Compatibility path for tiny groups.
+
+    Standalone ``union_all`` has observable MultiPolygon component ordering for
+    small public dissolves.  Keep those cases on the existing per-group GPU
+    reducer; batched reduction is for the larger workflow shape where launch
+    amortization dominates.
+    """
+    from vibespatial.constructive.union_all import union_all_gpu_owned
+
     group_results: list[OwnedGeometryArray] = []
 
-    for g in range(n_groups):
-        start = int(group_offsets[g])
-        end = int(group_offsets[g + 1])
+    for group_index in range(n_groups):
+        start = int(group_offsets[group_index])
+        end = int(group_offsets[group_index + 1])
         group_size = end - start
 
         if group_size == 0:
@@ -290,11 +479,7 @@ def _segmented_union_gpu(
                 group_results.append(single)
             continue
 
-        # Extract this group's geometries.
-        indices = group_indices(start, end)
-        group_owned = geometries.take(indices)
-
-        # Filter out invalid/empty rows (vectorized, not Python loop).
+        group_owned = geometries.take(group_indices(start, end))
         keep = valid_row_indices(group_owned)
         if keep.size == 0:
             group_results.append(_empty_group_owned_like(geometries))
@@ -314,11 +499,238 @@ def _segmented_union_gpu(
             )
             group_results.append(reduced)
         except Exception:
-            # Fall back to CPU for this group on any GPU overlay failure.
             return None
 
-    # Buffer-level concatenation: no Shapely round-trip (zero-copy).
     return concat_owned_arrays(group_results)
+
+
+def _segmented_union_grouped_overlay_gpu(
+    geometries: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+    *,
+    n_groups: int,
+    precision_plan: PrecisionPlan,
+) -> OwnedGeometryArray | None:
+    """Union all groups with one row-isolated grouped overlay plan.
+
+    This is the grouped geometry-reduce physical shape: one seed row per
+    output group, all remaining rows mapped back to that group, and a single
+    overlay union materialization instead of log2(N) pairwise union rounds.
+    """
+    del precision_plan
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+
+    from vibespatial.constructive.binary_constructive import (
+        _regroup_intersection_parts_with_grouped_union_gpu,
+    )
+    from vibespatial.constructive.union_all import (
+        _SPATIAL_LOCALIZE_MIN_ROWS,
+        _spatially_localize_polygon_union_inputs,
+    )
+
+    group_offsets_arr = np.asarray(group_offsets, dtype=np.int64)
+    max_group_size = int(np.diff(group_offsets_arr).max(initial=0))
+    if max_group_size < _SPATIAL_LOCALIZE_MIN_ROWS:
+        total_rows = int(group_offsets_arr[-1]) if group_offsets_arr.size else 0
+        if total_rows != geometries.row_count:
+            return None
+        if total_rows == 0:
+            return concat_owned_arrays([_empty_group_owned_like(geometries) for _ in range(n_groups)])
+
+        d_group_offsets = cp.asarray(group_offsets_arr, dtype=cp.int64)
+        d_positions = cp.arange(total_rows, dtype=cp.int64)
+        d_source_rows = cp.searchsorted(
+            d_group_offsets[1:],
+            d_positions,
+            side="right",
+        ).astype(cp.int64, copy=False)
+
+        state = geometries._ensure_device_state()
+        d_valid = state.validity[:total_rows].astype(cp.bool_, copy=False)
+        valid_count = int(cp.count_nonzero(d_valid).item())
+        if valid_count == 0:
+            return concat_owned_arrays([_empty_group_owned_like(geometries) for _ in range(n_groups)])
+        if valid_count == total_rows:
+            valid_geometries = geometries
+            d_valid_source_rows = d_source_rows
+        else:
+            d_valid_positions = cp.flatnonzero(d_valid).astype(cp.int64, copy=False)
+            valid_geometries = geometries.take(d_valid_positions)
+            d_valid_source_rows = d_source_rows[d_valid_positions]
+
+        try:
+            return _regroup_intersection_parts_with_grouped_union_gpu(
+                valid_geometries,
+                d_valid_source_rows,
+                output_row_count=n_groups,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+        except Exception:
+            return None
+
+    group_pieces: list[OwnedGeometryArray] = []
+    source_rows: list[Any] = []
+
+    for group_index in range(n_groups):
+        start = int(group_offsets[group_index])
+        end = int(group_offsets[group_index + 1])
+        if end <= start:
+            continue
+
+        group_owned = geometries.take(group_indices(start, end))
+        keep = valid_row_indices(group_owned)
+        if keep.size == 0:
+            continue
+        if keep.size < group_owned.row_count:
+            group_owned = group_owned.take(keep)
+        if group_owned.row_count > 2:
+            group_owned = _spatially_localize_polygon_union_inputs(group_owned)
+
+        group_pieces.append(group_owned)
+        source_rows.append(
+            cp.full(group_owned.row_count, group_index, dtype=cp.int32)
+        )
+
+    if not group_pieces:
+        return concat_owned_arrays([_empty_group_owned_like(geometries) for _ in range(n_groups)])
+
+    try:
+        return _regroup_intersection_parts_with_grouped_union_gpu(
+            concat_owned_arrays(group_pieces),
+            cp.concatenate(source_rows),
+            output_row_count=n_groups,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+    except Exception:
+        return None
+
+
+def _segmented_union_batched_gpu(
+    geometries: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+    *,
+    n_groups: int,
+    precision_plan: PrecisionPlan,
+) -> OwnedGeometryArray | None:
+    """Reduce all dissolve groups level-by-level instead of group-by-group.
+
+    Each tree level batches pairwise unions for every active group into one
+    binary constructive dispatch.  Group boundaries are preserved by carrying
+    odd rows and rebuilding CSR offsets between rounds.
+    """
+    from vibespatial.constructive.binary_constructive import binary_constructive_owned
+    from vibespatial.constructive.union_all import _spatially_localize_polygon_union_inputs
+
+    group_pieces: list[OwnedGeometryArray] = []
+    group_sizes = np.zeros(n_groups, dtype=np.int64)
+    empty_group = _empty_group_owned_like(geometries)
+
+    for group_index in range(n_groups):
+        start = int(group_offsets[group_index])
+        end = int(group_offsets[group_index + 1])
+        if end <= start:
+            group_pieces.append(empty_group)
+            group_sizes[group_index] = 1
+            continue
+
+        group_owned = geometries.take(group_indices(start, end))
+        keep = valid_row_indices(group_owned)
+        if keep.size == 0:
+            group_pieces.append(empty_group)
+            group_sizes[group_index] = 1
+            continue
+        if keep.size < group_owned.row_count:
+            group_owned = group_owned.take(keep)
+        if group_owned.row_count > 2:
+            group_owned = _spatially_localize_polygon_union_inputs(group_owned)
+
+        group_pieces.append(group_owned)
+        group_sizes[group_index] = group_owned.row_count
+
+    current = concat_owned_arrays(group_pieces)
+    current_offsets = np.concatenate(
+        [
+            np.asarray([0], dtype=np.int64),
+            np.cumsum(group_sizes, dtype=np.int64),
+        ]
+    )
+
+    rounds = 0
+    max_group_size = int(group_sizes.max(initial=1))
+    max_rounds = int(math.ceil(math.log2(max(max_group_size, 2)))) + 2
+    while rounds < max_rounds:
+        group_sizes = np.diff(current_offsets)
+        if not bool(np.any(group_sizes > 1)):
+            return current
+
+        pair_counts = group_sizes // 2
+        pair_count = int(pair_counts.sum())
+        if pair_count == 0:
+            return current
+
+        left_parts: list[np.ndarray] = []
+        right_parts: list[np.ndarray] = []
+        carry_parts: list[int] = []
+        next_order_parts: list[np.ndarray] = []
+        pair_cursor = 0
+        carry_cursor = pair_count
+        next_sizes = (pair_counts + (group_sizes % 2)).astype(np.int64, copy=False)
+
+        for start, size, group_pair_count in zip(
+            current_offsets[:-1], group_sizes, pair_counts, strict=True
+        ):
+            start = int(start)
+            size = int(size)
+            group_pair_count = int(group_pair_count)
+            if group_pair_count:
+                left = start + (np.arange(group_pair_count, dtype=np.int64) * 2)
+                left_parts.append(left)
+                right_parts.append(left + 1)
+                next_order_parts.append(
+                    np.arange(pair_cursor, pair_cursor + group_pair_count, dtype=np.int64)
+                )
+                pair_cursor += group_pair_count
+            if size % 2:
+                carry_parts.append(start + size - 1)
+                next_order_parts.append(np.asarray([carry_cursor], dtype=np.int64))
+                carry_cursor += 1
+
+        left_indices = np.concatenate(left_parts) if left_parts else np.asarray([], dtype=np.int64)
+        right_indices = np.concatenate(right_parts) if right_parts else np.asarray([], dtype=np.int64)
+        try:
+            next_round = binary_constructive_owned(
+                "union",
+                current.take(left_indices),
+                current.take(right_indices),
+                dispatch_mode=ExecutionMode.GPU,
+                precision=precision_plan.compute_precision,
+                _skip_polygon_contraction=True,
+            )
+        except Exception:
+            return None
+
+        if carry_parts:
+            carry_rows = current.take(np.asarray(carry_parts, dtype=np.int64))
+            combined = concat_owned_arrays([next_round, carry_rows])
+        else:
+            combined = next_round
+
+        next_order = (
+            np.concatenate(next_order_parts)
+            if next_order_parts
+            else np.asarray([], dtype=np.int64)
+        )
+        current = combined.take(next_order) if next_order.size else combined
+        current_offsets = np.concatenate(
+            [
+                np.asarray([0], dtype=np.int64),
+                np.cumsum(next_sizes, dtype=np.int64),
+            ]
+        )
+        rounds += 1
+
+    return None
 
 
 def _tree_reduce_group(group_owned: OwnedGeometryArray) -> OwnedGeometryArray:

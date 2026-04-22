@@ -1630,6 +1630,10 @@ def _clip_owned_geometry_native_result(result, *, crs):
 
     row_parts = [np.asarray(part.row_positions, dtype=np.intp) for part in result.parts]
     owned_parts = [part.geometry.owned for part in result.parts]
+    semantic_cleanup_done = all(
+        bool(getattr(owned, "_clip_semantically_clean", False))
+        for owned in owned_parts
+    )
     row_positions = np.concatenate(row_parts) if row_parts else np.empty(0, dtype=np.intp)
     combined_owned = (
         owned_parts[0]
@@ -1638,27 +1642,69 @@ def _clip_owned_geometry_native_result(result, *, crs):
     )
     initial_residency = combined_owned.residency
 
+    def _take_owned_rows(owned, rows: np.ndarray):
+        rows = np.asarray(rows, dtype=np.intp)
+        if rows.size == owned.row_count and np.array_equal(
+            rows,
+            np.arange(owned.row_count, dtype=rows.dtype),
+        ):
+            return owned
+        if owned.residency is Residency.DEVICE:
+            try:
+                import cupy as cp
+            except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+                cp = None
+            if cp is not None:
+                return owned.device_take(cp.asarray(rows, dtype=cp.int64))
+        return owned.take(rows)
+
+    def _valid_nonempty_mask(owned) -> np.ndarray:
+        if owned.residency is Residency.DEVICE and owned.device_state is not None:
+            try:
+                import cupy as cp
+            except ModuleNotFoundError:  # pragma: no cover - guarded by residency
+                cp = None
+            if cp is not None:
+                d_state = owned.device_state
+                d_keep = d_state.validity.astype(cp.bool_, copy=True)
+                for family, d_buf in d_state.families.items():
+                    d_family_rows = cp.flatnonzero(
+                        d_keep & (d_state.tags == FAMILY_TAGS[family])
+                    ).astype(cp.int64, copy=False)
+                    if int(d_family_rows.size) == 0:
+                        continue
+                    d_local_rows = d_state.family_row_offsets[d_family_rows]
+                    d_keep[d_family_rows] &= ~d_buf.empty_mask[
+                        d_local_rows.astype(cp.int64, copy=False)
+                    ].astype(cp.bool_, copy=False)
+                return cp.asnumpy(d_keep).astype(bool, copy=False)
+
+        geometry_array = GeometryArray.from_owned(owned, crs=crs)
+        return np.asarray(owned.validity, dtype=bool) & ~np.asarray(
+            geometry_array.is_empty,
+            dtype=bool,
+        )
+
     if row_positions.size > 1:
         reorder = _reorder_concat_positions(
             row_positions,
             np.asarray(result.ordered_row_positions, dtype=np.intp),
         )
-        row_positions = row_positions[reorder]
-        combined_owned = combined_owned.take(reorder)
+        if not np.array_equal(reorder, np.arange(reorder.size, dtype=reorder.dtype)):
+            row_positions = row_positions[reorder]
+            combined_owned = _take_owned_rows(combined_owned, reorder)
 
-    geometry_array = GeometryArray.from_owned(combined_owned, crs=crs)
-    keep = np.asarray(combined_owned.validity, dtype=bool) & ~np.asarray(
-        geometry_array.is_empty,
-        dtype=bool,
-    )
+    geometry_array = None
+    keep = _valid_nonempty_mask(combined_owned)
     if not keep.all():
         keep_rows = np.flatnonzero(keep).astype(np.intp, copy=False)
         row_positions = row_positions[keep_rows]
-        combined_owned = combined_owned.take(keep_rows)
-        geometry_array = GeometryArray.from_owned(combined_owned, crs=crs)
+        combined_owned = _take_owned_rows(combined_owned, keep_rows)
+        geometry_array = None
 
     if (
-        not result.clipping_by_rectangle
+        not semantic_cleanup_done
+        and not result.clipping_by_rectangle
         and result.has_non_point_candidates
         and combined_owned.row_count > 0
     ):
@@ -1672,16 +1718,21 @@ def _clip_owned_geometry_native_result(result, *, crs):
         )
         if np.any(polygon_mask):
             keep = np.ones(combined_owned.row_count, dtype=bool)
+            polygon_rows = np.flatnonzero(polygon_mask).astype(np.intp, copy=False)
+            polygon_owned = _take_owned_rows(combined_owned, polygon_rows)
+            from vibespatial.constructive.measurement import area_owned
+            from vibespatial.geometry.device_array import _compute_bounds_from_owned
+
             nonpositive_area = ~(
                 np.asarray(
-                    geometry_array.area[polygon_mask],
+                    area_owned(polygon_owned),
                     dtype=np.float64,
                 ) > 0.0
             )
             polygon_bounds = np.asarray(
-                geometry_array.bounds,
+                _compute_bounds_from_owned(polygon_owned),
                 dtype=np.float64,
-            )[polygon_mask]
+            ).reshape(-1, 4)
             pointlike_zero_area = (
                 nonpositive_area
                 & (np.abs(polygon_bounds[:, 2] - polygon_bounds[:, 0]) <= SPATIAL_EPSILON)
@@ -1691,8 +1742,8 @@ def _clip_owned_geometry_native_result(result, *, crs):
             if not keep.all():
                 keep_rows = np.flatnonzero(keep).astype(np.intp, copy=False)
                 row_positions = row_positions[keep_rows]
-                combined_owned = combined_owned.take(keep_rows)
-                geometry_array = GeometryArray.from_owned(combined_owned, crs=crs)
+                combined_owned = _take_owned_rows(combined_owned, keep_rows)
+                geometry_array = None
                 tags = np.asarray(combined_owned.tags, dtype=np.int8)
 
         line_mask = np.isin(
@@ -1703,6 +1754,8 @@ def _clip_owned_geometry_native_result(result, *, crs):
             ],
         )
         if np.any(line_mask):
+            if geometry_array is None:
+                geometry_array = GeometryArray.from_owned(combined_owned, crs=crs)
             degenerate = line_mask & (
                 np.asarray(geometry_array.length, dtype=np.float64) == 0.0
             )
@@ -1715,7 +1768,7 @@ def _clip_owned_geometry_native_result(result, *, crs):
                 keep_rows = np.flatnonzero(~degenerate).astype(np.intp, copy=False)
                 index_oga_pairs = []
                 if keep_rows.size:
-                    index_oga_pairs.append((keep_rows, combined_owned.take(keep_rows)))
+                    index_oga_pairs.append((keep_rows, _take_owned_rows(combined_owned, keep_rows)))
                 index_oga_pairs.append((degenerate_rows, repaired_owned))
                 combined_owned = _assemble_indexed_owned_parts(
                     index_oga_pairs,

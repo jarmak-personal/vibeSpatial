@@ -104,6 +104,7 @@ _NUMPY_ALLOWLIST: dict[str, str] = {
     # cuda/ — dtype constants and memory protocol
     "cuda/_runtime.py": "RMM allocator setup, dtype for memory protocol",
     "cuda/cccl_primitives.py": "dtype definitions for CCCL primitive wrappers",
+    "kernels/constructive/segmented_union.py": "Host CSR group-offset orchestration for segmented union wrapper",
     # geometry/ — host↔device boundary
     "geometry/device_array.py": "Pandas ExtensionArray: dtype, array protocol",
     "geometry/owned.py": "Coordinate arrays, struct packing, cumsum for offsets",

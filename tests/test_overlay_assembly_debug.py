@@ -24,6 +24,7 @@ from vibespatial.overlay.graph import build_gpu_half_edge_graph
 from vibespatial.overlay.host_fallback import _build_polygon_output_from_faces
 from vibespatial.overlay.split import build_gpu_atomic_edges, build_gpu_split_events
 from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 
 
 def _river_lines(count: int, *, seed: int, vertices: int = 12) -> list[LineString]:
@@ -253,6 +254,37 @@ def test_row_isolated_difference_preserves_sparse_multipolygon_rows() -> None:
     assert got[2] is not None
     assert got[2].geom_type == "MultiPolygon"
     assert got[2].normalize().equals_exact(expected[2].normalize(), tolerance=1e-6)
+
+
+@pytest.mark.gpu
+def test_multipolygon_polygon_intersection_packs_disjoint_fragments_on_gpu() -> None:
+    left_geom = shapely.MultiPolygon([
+        shapely.box(0.0, 0.0, 2.0, 2.0),
+        shapely.box(4.0, 0.0, 6.0, 2.0),
+    ])
+    right_geom = shapely.box(1.0, -1.0, 5.0, 3.0)
+    left = from_shapely_geometries([left_geom])
+    right = from_shapely_geometries([right_geom])
+
+    clear_dispatch_events()
+    result = binary_constructive_owned(
+        "intersection",
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        _prefer_exact_polygon_intersection=True,
+    )
+
+    got = result.to_shapely()[0]
+    expected = shapely.intersection(left_geom, right_geom)
+
+    assert got is not None
+    assert got.geom_type == "MultiPolygon"
+    assert got.normalize().equals_exact(expected.normalize(), tolerance=1e-9)
+    assert any(
+        event.implementation == "direct_multipart_intersection_pack_gpu"
+        for event in get_dispatch_events(clear=True)
+    )
 
 
 @pytest.mark.gpu

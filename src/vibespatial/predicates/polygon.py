@@ -154,6 +154,15 @@ _KERNEL_MAP: dict[tuple[GeometryFamily, GeometryFamily], str] = {
     (GeometryFamily.MULTIPOLYGON, GeometryFamily.MULTILINESTRING): "mls_mpg_de9im_from_owned",
 }
 
+_COVERED_BY_SINGLE_MASK_NO_HOLES_KERNEL_MAP: dict[tuple[GeometryFamily, GeometryFamily], str] = {
+    (GeometryFamily.POLYGON, GeometryFamily.POLYGON): "polygon_polygon_covered_by_mask_no_holes",
+    (GeometryFamily.MULTIPOLYGON, GeometryFamily.POLYGON): "multipolygon_polygon_covered_by_mask_no_holes",
+    (GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON): "polygon_multipolygon_covered_by_mask_no_holes",
+    (GeometryFamily.MULTIPOLYGON, GeometryFamily.MULTIPOLYGON): (
+        "multipolygon_multipolygon_covered_by_mask_no_holes"
+    ),
+}
+
 
 _LINE_FAMILIES = frozenset({GeometryFamily.LINESTRING, GeometryFamily.MULTILINESTRING})
 _POLYGON_FAMILIES = frozenset({GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON})
@@ -207,6 +216,96 @@ def _build_side_args(ptr, state, buf, family):
     args.extend([ptr(buf.empty_mask), ptr(buf.x), ptr(buf.y), FAMILY_TAGS[family]])
     types.extend([P, P, P, I32])
     return args, types
+
+
+def compute_polygonal_covered_by_single_mask_no_holes_gpu(
+    query_owned: OwnedGeometryArray,
+    mask_owned: OwnedGeometryArray,
+    left_indices: np.ndarray | None = None,
+    *,
+    query_family: GeometryFamily,
+    mask_family: GeometryFamily,
+    d_left: object | None = None,
+    return_device: bool = False,
+) -> np.ndarray | None:
+    """Evaluate ``query covered_by mask`` for one polygonal mask on device.
+
+    Convex no-hole masks use a cheaper one-sided proof in the kernel.
+    Concave, multipart, and hole-bearing masks fall through to the exact
+    polygon DE-9IM device path instead of a host-side capability branch.
+    """
+    kernel_name = _COVERED_BY_SINGLE_MASK_NO_HOLES_KERNEL_MAP.get((query_family, mask_family))
+    if kernel_name is None:
+        return None
+
+    from vibespatial.runtime.residency import Residency, TransferTrigger
+
+    query_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"covered_by no-hole mask GPU: query {query_family.name}",
+    )
+    mask_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason=f"covered_by no-hole mask GPU: mask {mask_family.name}",
+    )
+
+    query_state = query_owned._ensure_device_state()
+    mask_state = mask_owned._ensure_device_state()
+    query_buf = query_state.families[query_family]
+    mask_buf = mask_state.families[mask_family]
+
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    if d_left is not None:
+        pair_count = int(d_left.shape[0])
+    elif left_indices is not None:
+        pair_count = int(left_indices.size)
+    else:
+        raise ValueError(
+            "compute_polygonal_covered_by_single_mask_no_holes_gpu requires "
+            "either d_left or left_indices"
+        )
+
+    own_d_left = d_left is None
+    if own_d_left:
+        d_left = runtime.from_host(np.ascontiguousarray(left_indices, dtype=np.int32))
+    d_out = runtime.allocate((pair_count,), np.bool_)
+
+    try:
+        kernels = _polygon_predicates_kernels()
+        P = KERNEL_PARAM_PTR
+        I32 = KERNEL_PARAM_I32
+        left_args, left_types = _build_side_args(ptr, query_state, query_buf, query_family)
+        right_args, right_types = _build_side_args(ptr, mask_state, mask_buf, mask_family)
+        tail_args = [ptr(d_left), ptr(d_out), pair_count, 0]
+        tail_types = [P, P, I32, I32]
+        all_args = tuple(left_args + right_args + tail_args)
+        all_types = tuple(left_types + right_types + tail_types)
+        if kernel_name.endswith("_coop"):
+            block_size = runtime.optimal_block_size(kernels[kernel_name])
+            grid, block = (pair_count, 1, 1), (block_size, 1, 1)
+        else:
+            grid, block = runtime.launch_config(kernels[kernel_name], pair_count)
+        runtime.launch(
+            kernels[kernel_name],
+            grid=grid,
+            block=block,
+            params=(all_args, all_types),
+        )
+        if return_device:
+            return d_out
+
+        runtime.synchronize()
+        h_out = np.empty(pair_count, dtype=np.bool_)
+        runtime.copy_device_to_host(d_out, h_out)
+        return h_out
+    finally:
+        if own_d_left:
+            runtime.free(d_left)
+        if not return_device:
+            runtime.free(d_out)
 
 
 def compute_polygon_de9im_gpu(

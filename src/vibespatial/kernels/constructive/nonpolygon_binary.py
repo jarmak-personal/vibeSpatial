@@ -749,8 +749,20 @@ def _linestring_polygon_constructive(
         d_geom_offsets[:n] = d_offsets_cp
         d_geom_offsets[n] = total_verts
 
-        d_point_rows = cp.flatnonzero(d_counts_cp == 1).astype(cp.int64, copy=False)
-        d_line_rows = cp.flatnonzero(d_counts_cp >= 2).astype(cp.int64, copy=False)
+        d_degenerate_line_mask = cp.zeros(n, dtype=cp.bool_)
+        d_two_coord_rows = cp.flatnonzero(d_counts_cp == 2).astype(cp.int64, copy=False)
+        if d_two_coord_rows.size > 0:
+            d_two_coord_starts = d_geom_offsets[d_two_coord_rows]
+            d_dx = d_out_x[d_two_coord_starts + 1] - d_out_x[d_two_coord_starts]
+            d_dy = d_out_y[d_two_coord_starts + 1] - d_out_y[d_two_coord_starts]
+            d_degenerate_line_mask[d_two_coord_rows] = (d_dx * d_dx + d_dy * d_dy) <= 1e-18
+
+        d_point_rows = cp.flatnonzero(
+            (d_counts_cp == 1) | d_degenerate_line_mask,
+        ).astype(cp.int64, copy=False)
+        d_line_rows = cp.flatnonzero(
+            (d_counts_cp >= 2) & ~d_degenerate_line_mask,
+        ).astype(cp.int64, copy=False)
         point_count = int(d_point_rows.size)
         line_count = int(d_line_rows.size)
 

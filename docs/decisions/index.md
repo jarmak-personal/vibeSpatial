@@ -5,7 +5,7 @@ Scope: Architecture decision log and index of accepted or superseded ADRs.
 Read If: You are resolving, revisiting, or querying a design decision.
 STOP IF: You already have the specific ADR open and do not need the index.
 Source Of Truth: Decision log for architecture choices.
-Body Budget: 83/220 lines
+Body Budget: 84/220 lines
 Document: docs/decisions/index.md
 
 Section Map (Body Lines)
@@ -17,7 +17,7 @@ Section Map (Body Lines)
 | 17-25 | Open First |
 | 26-30 | Verify |
 | 31-35 | Risks |
-| 36-83 | Decisions |
+| 36-84 | Decisions |
 DOC_HEADER:END -->
 
 Use this index to find accepted architecture decisions.
@@ -101,3 +101,4 @@ See also [adr-index.md](adr-index.md) for the Sphinx toctree listing.
 | `ADR-0040` | accepted | 2026-03-25 | [ADR-0040: Tiered GPU Memory Pool (RMM)](docs/decisions/0040-tiered-gpu-memory-pool.md) |
 | `ADR-0041` | accepted | 2026-03-26 | [ADR-0041: GPU Text Parsing Framework](docs/decisions/0041-gpu-text-parsing-framework.md) |
 | `ADR-0042` | accepted | 2026-04-08 | [Device-Native Result Boundary And Explicit Compatibility Export](docs/decisions/0042-device-native-result-boundary.md) |
+| `ADR-0043` | accepted | 2026-04-21 | [Public API Physical Plan Coverage](docs/decisions/0043-public-api-physical-plan-coverage.md) |

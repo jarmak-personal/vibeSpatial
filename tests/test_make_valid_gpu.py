@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import MultiPolygon, Polygon
+from shapely.geometry import MultiPolygon, Polygon, box
 
 from vibespatial import from_shapely_geometries, has_gpu_runtime
 from vibespatial.constructive.make_valid_pipeline import (
@@ -456,3 +456,52 @@ def test_gpu_repair_invalid_polygons_keeps_public_result_metadata_lazy(strict_de
     assert result.repaired_owned._validity is None
     assert result.repaired_owned._tags is None
     assert result.repaired_owned._family_row_offsets is None
+
+
+@requires_gpu
+def test_make_valid_repairs_device_only_polygon_output_without_host_materialization(strict_device_guard):
+    """Device-only polygon buffers must not need host metadata before repair."""
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import materialize_broadcast, tile_single_row
+    from vibespatial.kernels.constructive.polygon_rect_intersection import (
+        polygon_rect_intersection,
+    )
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    mask = Polygon(
+        [
+            (0.0, 0.0),
+            (4.0, 0.0),
+            (4.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 3.0),
+            (4.0, 3.0),
+            (4.0, 4.0),
+            (0.0, 4.0),
+            (0.0, 0.0),
+        ]
+    )
+    cell = box(1.5, 0.25, 3.5, 3.75)
+    left_owned = from_shapely_geometries([cell], residency=Residency.DEVICE)
+    mask_owned = from_shapely_geometries([mask], residency=Residency.DEVICE)
+    tiled_mask = materialize_broadcast(tile_single_row(mask_owned, left_owned.row_count))
+    fast_owned = polygon_rect_intersection(
+        tiled_mask,
+        left_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert not fast_owned.families[GeometryFamily.POLYGON].host_materialized
+
+    result = make_valid_owned(
+        owned=fast_owned,
+        method="structure",
+        keep_collapsed=True,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    repaired = np.asarray(result.owned.to_shapely(), dtype=object)
+
+    assert result.selected is ExecutionMode.GPU
+    assert repaired[0].geom_type == "MultiPolygon"
+    assert shapely.is_valid(repaired[0])

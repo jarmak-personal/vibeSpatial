@@ -302,6 +302,7 @@ def _extract_properties_from_object_spans_cpu(
 ) -> list[dict[str, object]]:
     from .geojson import _fast_json_loads
 
+    raw = host_bytes.tobytes()
     result: list[dict[str, object]] = []
     for start, end in zip(property_starts, property_ends, strict=True):
         start_i = int(start)
@@ -310,7 +311,7 @@ def _extract_properties_from_object_spans_cpu(
             result.append({})
             continue
         try:
-            props = _fast_json_loads(host_bytes[start_i:end_i].tobytes())
+            props = _fast_json_loads(raw[start_i:end_i])
             result.append(dict(props) if isinstance(props, dict) else {})
         except Exception:
             result.append({})

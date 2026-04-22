@@ -180,6 +180,34 @@ def test_gpu_atomic_edges_collapse_duplicate_overlap_segments() -> None:
     assert np.unique(np.round(forward_segments, 12), axis=0).shape[0] == forward_segments.shape[0]
 
 
+@pytest.mark.gpu
+def test_grouped_right_right_split_events_use_original_right_rows() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    left = from_shapely_geometries([box(0, 0, 10, 10)])
+    right = from_shapely_geometries([box(2, 2, 7, 7), box(5, 0, 9, 9)])
+
+    split_events = build_gpu_split_events(
+        left,
+        right,
+        dispatch_mode=ExecutionMode.GPU,
+        require_same_row=True,
+        use_same_row_fast_path=False,
+        right_geometry_source_rows=np.asarray([0, 0], dtype=np.int32),
+    )
+
+    base_endpoint_count = 2 * (split_events.left_segment_count + split_events.right_segment_count)
+    right_extra = (
+        (split_events.source_side == 2)
+        & (split_events.t > 0.0)
+        & (split_events.t < 1.0)
+    )
+
+    assert split_events.count > base_endpoint_count
+    assert right_extra.any()
+
+
 def test_face_metrics_kernel_block_size_rounds_down_to_power_of_two() -> None:
     assert _largest_power_of_two_block_size(256) == 256
     assert _largest_power_of_two_block_size(224) == 128

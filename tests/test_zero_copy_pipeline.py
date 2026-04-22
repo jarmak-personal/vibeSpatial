@@ -488,6 +488,25 @@ class TestConvexHull:
         assert result.residency == Residency.DEVICE
         assert shapely.normalize(got).equals_exact(shapely.normalize(expected), 1e-7)
 
+    def test_convex_hull_gpu_handles_equal_x_ties(self, strict_device_guard):
+        """X-sorted coordinate ties must not drop vertical hull edges."""
+        if not has_gpu_runtime():
+            pytest.skip("CUDA runtime not available")
+        from vibespatial.constructive.convex_hull import convex_hull_owned
+
+        mp = MultiPolygon([
+            shapely.box(float(i) * 1.2, 0.0, float(i) * 1.2 + 1.0, 1.0)
+            for i in range(12)
+        ])
+        owned = from_shapely_geometries([mp], residency=Residency.DEVICE)
+
+        result = convex_hull_owned(owned, dispatch_mode=ExecutionMode.GPU)
+        got = result.to_shapely()[0]
+        expected = shapely.convex_hull(mp)
+
+        assert result.residency == Residency.DEVICE
+        assert shapely.area(shapely.symmetric_difference(got, expected)) == 0.0
+
     def test_convex_hull_multipolygon_strict_auto_uses_gpu(self):
         """Strict-native mode must not take the CPU crossover on multipolygon hulls."""
         if not has_gpu_runtime():

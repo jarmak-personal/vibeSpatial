@@ -97,10 +97,27 @@ _POLYGON_CONTRACTION_MIN_ROWS = 32
 # exact overlay across the aligned batch.
 _MIXED_POLYGON_INTERSECTION_ROWWISE_MAX = 16
 
+# For aligned polygon intersections, the direct Sutherland-Hodgman kernel is
+# much cheaper than full topology overlay, but the legacy dispatch was
+# all-or-nothing for the entire batch. Partition only when there is enough
+# eligible work to amortize the scatter and remainder overlay.
+_PARTITIONED_SH_INTERSECTION_MIN_ROWS = 32
+
+# Direct multipart intersection packing is only exact when fragments from the
+# same source row cannot overlap or touch.  Keep the proof cheap and bounded; if
+# a group needs a larger pairwise disjointness probe, use the exact union plan.
+_DIRECT_MULTIPART_PACK_MAX_PAIR_PROBE = 512
+
 # Exact polygon union rescue is intentionally a tiny-batch fallback.  Larger
 # aligned batches must use the batched partition/coverage path so union does
 # not devolve into one topology graph per row.
 _POLYGON_UNION_EXACT_ROW_FALLBACK_MAX = 8
+
+# Overlay can emit sub-microscopic near-collinear polygons that are valid but
+# have no material area contribution at projected-coordinate scale.  If exact
+# partition union cannot produce polygon pieces for such a pair, preserve the
+# dominant area operand instead of fragmenting the dissolve with a sliver part.
+_POLYGON_UNION_DEGENERATE_AREA_RTOL = 1.0e-9
 
 
 def _sync_hotpath() -> None:
@@ -246,6 +263,109 @@ def _host_rectangle_polygon_mask(owned: OwnedGeometryArray) -> np.ndarray | None
     return rect_mask
 
 
+def _host_single_ring_and_rectangle_polygon_masks(
+    owned: OwnedGeometryArray,
+    *,
+    max_input_vertices: int = 256,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Classify polygon rows inside pure or mixed polygonal owned batches.
+
+    The public overlay planner often carries mixed ``Polygon``/``MultiPolygon``
+    batches after an earlier clip.  Rectangle fast paths should still peel off
+    the plain polygon rows instead of forcing the whole batch through exact
+    overlay.
+    """
+    if GeometryFamily.POLYGON not in owned.families:
+        empty = np.zeros(owned.row_count, dtype=bool)
+        return empty, empty.copy()
+    if set(owned.families) == {GeometryFamily.POLYGON}:
+        simple = _host_single_ring_polygon_mask(
+            owned,
+            max_input_vertices=max_input_vertices,
+        )
+        if simple is None:
+            return None
+        rect = _host_rectangle_polygon_mask(owned)
+        if rect is None:
+            rect = np.zeros(owned.row_count, dtype=bool)
+        return simple, rect
+
+    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    tags = np.asarray(owned.tags)
+    validity = np.asarray(owned.validity, dtype=bool)
+    polygon_rows = np.flatnonzero((tags == poly_tag) & validity).astype(
+        np.intp,
+        copy=False,
+    )
+    simple = np.zeros(owned.row_count, dtype=bool)
+    rect = np.zeros(owned.row_count, dtype=bool)
+    if polygon_rows.size == 0:
+        return simple, rect
+
+    polygon_owned = owned.take(polygon_rows)
+    if set(polygon_owned.families) != {GeometryFamily.POLYGON}:
+        return simple, rect
+    polygon_owned._ensure_host_state()
+    polygon_buf = polygon_owned.families[GeometryFamily.POLYGON]
+    if (
+        polygon_buf.row_count != polygon_owned.row_count
+        or polygon_buf.ring_offsets is None
+        or len(polygon_buf.geometry_offsets) != polygon_owned.row_count + 1
+    ):
+        return None
+
+    geom_offsets = np.asarray(polygon_buf.geometry_offsets, dtype=np.int64)
+    ring_offsets = np.asarray(polygon_buf.ring_offsets, dtype=np.int64)
+    x = np.asarray(polygon_buf.x, dtype=np.float64)
+    y = np.asarray(polygon_buf.y, dtype=np.float64)
+
+    for local_row, global_row in enumerate(polygon_rows):
+        ring_start = int(geom_offsets[local_row])
+        ring_end = int(geom_offsets[local_row + 1])
+        if ring_end - ring_start != 1:
+            continue
+        start = int(ring_offsets[ring_start])
+        end = int(ring_offsets[ring_start + 1])
+        coords_x = x[start:end]
+        coords_y = y[start:end]
+        if coords_x.size > 1:
+            dx = float(coords_x[0] - coords_x[-1])
+            dy = float(coords_y[0] - coords_y[-1])
+            if (dx * dx + dy * dy) <= 1e-24:
+                coords_x = coords_x[:-1]
+                coords_y = coords_y[:-1]
+        if 3 <= coords_x.size <= max_input_vertices:
+            simple[int(global_row)] = True
+        if coords_x.size != 4:
+            continue
+        xmin = float(np.min(coords_x))
+        xmax = float(np.max(coords_x))
+        ymin = float(np.min(coords_y))
+        ymax = float(np.max(coords_y))
+        if not (xmin < xmax and ymin < ymax):
+            continue
+        row_points = list(zip(coords_x.tolist(), coords_y.tolist(), strict=True))
+        row_corners = {(float(px), float(py)) for px, py in row_points}
+        corners = {
+            (xmin, ymin),
+            (xmin, ymax),
+            (xmax, ymin),
+            (xmax, ymax),
+        }
+        if row_corners != corners:
+            continue
+        is_axis_aligned = True
+        for index, (x0, y0) in enumerate(row_points):
+            x1, y1 = row_points[(index + 1) % len(row_points)]
+            same_x = abs(float(x0) - float(x1)) <= 1e-12
+            same_y = abs(float(y0) - float(y1)) <= 1e-12
+            if same_x == same_y:
+                is_axis_aligned = False
+                break
+        rect[int(global_row)] = is_axis_aligned
+    return simple, rect
+
+
 def _dispatch_mixed_polygon_rect_intersection_gpu(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -261,17 +381,12 @@ def _dispatch_mixed_polygon_rect_intersection_gpu(
     left = _resolve_indexed_polygon_fast_path_candidate(left)
     right = _resolve_indexed_polygon_fast_path_candidate(right)
 
-    left_simple = _host_single_ring_polygon_mask(left)
-    right_simple = _host_single_ring_polygon_mask(right)
-    left_rect = _host_rectangle_polygon_mask(left)
-    right_rect = _host_rectangle_polygon_mask(right)
-    if (
-        left_simple is None
-        or right_simple is None
-        or left_rect is None
-        or right_rect is None
-    ):
+    left_masks = _host_single_ring_and_rectangle_polygon_masks(left)
+    right_masks = _host_single_ring_and_rectangle_polygon_masks(right)
+    if left_masks is None or right_masks is None:
         return None
+    left_simple, left_rect = left_masks
+    right_simple, right_rect = right_masks
 
     right_rect_rows = left_simple & right_rect
     left_rect_rows = right_simple & left_rect & ~right_rect_rows
@@ -462,6 +577,225 @@ def _sh_kernel_can_handle(left: OwnedGeometryArray, right: OwnedGeometryArray) -
                 return False
 
     return True
+
+
+def _aligned_sh_eligible_polygon_rows(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> np.ndarray:
+    """Return aligned row positions safe for the direct SH intersection kernel."""
+    from vibespatial.kernels.constructive.polygon_intersection import (
+        _MAX_CLIP_VERTS,
+    )
+    from vibespatial.overlay.bypass import _is_convex_ring_xy
+
+    if left.row_count != right.row_count or left.row_count == 0:
+        return np.empty(0, dtype=np.int64)
+    if (
+        GeometryFamily.POLYGON not in left.families
+        or GeometryFamily.POLYGON not in right.families
+    ):
+        return np.empty(0, dtype=np.int64)
+
+    left._ensure_host_family_structure(GeometryFamily.POLYGON)
+    right._ensure_host_family_structure(GeometryFamily.POLYGON)
+    left_buf = left.families[GeometryFamily.POLYGON]
+    right_buf = right.families[GeometryFamily.POLYGON]
+    if left_buf.row_count == 0 or right_buf.row_count == 0:
+        return np.empty(0, dtype=np.int64)
+
+    poly_tag = FAMILY_TAGS[GeometryFamily.POLYGON]
+    valid = np.asarray(left.validity, dtype=bool) & np.asarray(right.validity, dtype=bool)
+    candidate_mask = (
+        valid
+        & (np.asarray(left.tags) == poly_tag)
+        & (np.asarray(right.tags) == poly_tag)
+    )
+    candidate_rows = np.flatnonzero(candidate_mask).astype(np.int64, copy=False)
+    if candidate_rows.size == 0:
+        return candidate_rows
+
+    left_fro = np.asarray(left.family_row_offsets, dtype=np.int64)[candidate_rows]
+    right_fro = np.asarray(right.family_row_offsets, dtype=np.int64)[candidate_rows]
+    if (
+        np.any(left_fro < 0)
+        or np.any(right_fro < 0)
+        or np.any(left_fro >= left_buf.row_count)
+        or np.any(right_fro >= right_buf.row_count)
+    ):
+        return np.empty(0, dtype=np.int64)
+
+    left_geom_offsets = np.asarray(left_buf.geometry_offsets, dtype=np.int64)
+    right_geom_offsets = np.asarray(right_buf.geometry_offsets, dtype=np.int64)
+    left_ring_offsets = np.asarray(left_buf.ring_offsets, dtype=np.int64)
+    right_ring_offsets = np.asarray(right_buf.ring_offsets, dtype=np.int64)
+    left_rings_per_row = np.diff(left_geom_offsets)
+    right_rings_per_row = np.diff(right_geom_offsets)
+
+    left_single_ring = left_rings_per_row[left_fro] == 1
+    right_single_ring = right_rings_per_row[right_fro] == 1
+    single_ring = left_single_ring & right_single_ring
+    if not bool(np.any(single_ring)):
+        return np.empty(0, dtype=np.int64)
+
+    left_first_ring = left_geom_offsets[left_fro]
+    right_first_ring = right_geom_offsets[right_fro]
+    left_vertex_counts = (
+        left_ring_offsets[left_first_ring + 1] - left_ring_offsets[left_first_ring]
+    )
+    right_vertex_counts = (
+        right_ring_offsets[right_first_ring + 1] - right_ring_offsets[right_first_ring]
+    )
+    workspace_ok = (left_vertex_counts + right_vertex_counts) <= _MAX_CLIP_VERTS
+    local_mask = single_ring & workspace_ok
+    if not bool(np.any(local_mask)):
+        return np.empty(0, dtype=np.int64)
+
+    convex_right = np.zeros(candidate_rows.size, dtype=bool)
+    unique_right_rows = np.unique(right_fro[local_mask])
+    right_convex_cache: dict[int, bool] = {}
+    right_x = np.asarray(right_buf.x, dtype=np.float64)
+    right_y = np.asarray(right_buf.y, dtype=np.float64)
+    for right_row in unique_right_rows:
+        right_row_int = int(right_row)
+        ring_idx = int(right_geom_offsets[right_row_int])
+        start = int(right_ring_offsets[ring_idx])
+        end = int(right_ring_offsets[ring_idx + 1])
+        right_convex_cache[right_row_int] = _is_convex_ring_xy(
+            right_x,
+            right_y,
+            start,
+            end,
+        )
+    for right_row, is_convex in right_convex_cache.items():
+        if is_convex:
+            convex_right[right_fro == right_row] = True
+
+    eligible = local_mask & convex_right
+    return candidate_rows[eligible].astype(np.int64, copy=False)
+
+
+def _dispatch_partitioned_polygon_intersection_sh_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Run SH-eligible aligned rows through the direct kernel, overlay the rest."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count or left.row_count < _PARTITIONED_SH_INTERSECTION_MIN_ROWS:
+        return None
+
+    sh_rows = _aligned_sh_eligible_polygon_rows(left, right)
+    sh_count = int(sh_rows.size)
+    if (
+        sh_count < _PARTITIONED_SH_INTERSECTION_MIN_ROWS
+        or sh_count == left.row_count
+    ):
+        return None
+
+    valid_rows = np.flatnonzero(
+        np.asarray(left.validity, dtype=bool) & np.asarray(right.validity, dtype=bool)
+    ).astype(np.int64, copy=False)
+    remainder_rows = np.setdiff1d(valid_rows, sh_rows, assume_unique=True)
+
+    try:
+        from vibespatial.kernels.constructive.polygon_intersection import (
+            polygon_intersection,
+        )
+
+        out = _empty_device_constructive_output(left.row_count)
+        d_sh_rows = cp.asarray(sh_rows, dtype=cp.int64)
+        sh_result = polygon_intersection(
+            left.take(d_sh_rows),
+            right.take(d_sh_rows),
+            dispatch_mode=dispatch_mode,
+        )
+        if sh_result.row_count != sh_count:
+            return None
+        out = device_concat_owned_scatter(out, sh_result, d_sh_rows)
+
+        if remainder_rows.size > 0:
+            d_remainder_rows = cp.asarray(remainder_rows, dtype=cp.int64)
+            remainder = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+                left.take(d_remainder_rows),
+                right.take(d_remainder_rows),
+                dispatch_mode=dispatch_mode,
+                _cached_right_segments=None,
+            )
+            if remainder is None or remainder.row_count != int(remainder_rows.size):
+                return None
+            out = device_concat_owned_scatter(out, remainder, d_remainder_rows)
+
+        record_dispatch_event(
+            surface="vibespatial.constructive.binary_constructive",
+            operation="intersection",
+            implementation="partitioned_sh_plus_overlay_gpu",
+            reason=(
+                "aligned polygon intersection partitioned SH-eligible rows "
+                "from complex overlay rows"
+            ),
+            detail=(
+                f"rows={left.row_count}, sh_rows={sh_count}, "
+                f"overlay_rows={int(remainder_rows.size)}"
+            ),
+            requested=dispatch_mode,
+            selected=ExecutionMode.GPU,
+        )
+        return out
+    except Exception:
+        logger.debug(
+            "partitioned SH polygon intersection GPU path failed; "
+            "falling back to existing exact overlay path",
+            exc_info=True,
+        )
+        return None
+
+
+def _dispatch_polygon_intersection_sh_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+    *,
+    dispatch_mode: ExecutionMode = ExecutionMode.GPU,
+) -> OwnedGeometryArray | None:
+    """Run the direct SH kernel, swapping operands when the clip side is convex."""
+    try:
+        from vibespatial.kernels.constructive.polygon_intersection import (
+            polygon_intersection,
+        )
+
+        if _sh_kernel_can_handle(left, right):
+            result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
+            if result.row_count == left.row_count:
+                return result
+
+        # Intersection is commutative. Sutherland-Hodgman only requires the
+        # clip operand to be convex, so mask-clip workloads with convex source
+        # rows and one concave mask can still use the direct kernel by swapping.
+        if _sh_kernel_can_handle(right, left):
+            result = polygon_intersection(right, left, dispatch_mode=dispatch_mode)
+            if result.row_count == left.row_count:
+                record_dispatch_event(
+                    surface="vibespatial.constructive.binary_constructive",
+                    operation="intersection",
+                    implementation="swapped_sh_polygon_intersection_gpu",
+                    reason=(
+                        "polygon intersection used commutative SH dispatch "
+                        "because the original left side was the convex clip operand"
+                    ),
+                    detail=f"rows={left.row_count}",
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.GPU,
+                )
+                return result
+    except Exception:
+        logger.debug(
+            "direct SH polygon intersection GPU path failed; "
+            "falling back to exact overlay",
+            exc_info=True,
+        )
+    return None
 
 
 def _build_point_polygon_result(
@@ -1364,12 +1698,73 @@ def _dispatch_multipolygon_polygon_intersection_gpu(
         return _empty_device_constructive_output(left.row_count)
 
     exploded_right = right.take(d_source_rows)
-    part_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+    try:
+        from vibespatial.kernels.constructive.polygon_rect_intersection import (
+            polygon_rect_intersection,
+            polygon_rect_intersection_can_handle,
+        )
+
+        if polygon_rect_intersection_can_handle(exploded_left, exploded_right):
+            part_result = polygon_rect_intersection(
+                exploded_left,
+                exploded_right,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            if part_result is not None and part_result.row_count == exploded_left.row_count:
+                d_valid_parts = cp.flatnonzero(
+                    part_result._ensure_device_state().validity,
+                ).astype(cp.int64, copy=False)
+                if int(d_valid_parts.size) == 0:
+                    return _empty_device_constructive_output(left.row_count)
+                return _regroup_intersection_parts_with_grouped_union_gpu(
+                    part_result.take(d_valid_parts),
+                    d_source_rows[d_valid_parts].astype(cp.int64, copy=False),
+                    output_row_count=left.row_count,
+                    dispatch_mode=dispatch_mode,
+                )
+
+        if polygon_rect_intersection_can_handle(exploded_right, exploded_left):
+            part_result = polygon_rect_intersection(
+                exploded_right,
+                exploded_left,
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            if part_result is not None and part_result.row_count == exploded_left.row_count:
+                d_valid_parts = cp.flatnonzero(
+                    part_result._ensure_device_state().validity,
+                ).astype(cp.int64, copy=False)
+                if int(d_valid_parts.size) == 0:
+                    return _empty_device_constructive_output(left.row_count)
+                return _regroup_intersection_parts_with_grouped_union_gpu(
+                    part_result.take(d_valid_parts),
+                    d_source_rows[d_valid_parts].astype(cp.int64, copy=False),
+                    output_row_count=left.row_count,
+                    dispatch_mode=dispatch_mode,
+                )
+    except Exception:
+        logger.debug(
+            "multipart-polygon rectangle intersection GPU rescue failed",
+            exc_info=True,
+        )
+
+    part_result = _dispatch_polygon_intersection_sh_gpu(
         exploded_left,
         exploded_right,
         dispatch_mode=dispatch_mode,
-        _cached_right_segments=None,
     )
+    if part_result is None:
+        part_result = _dispatch_partitioned_polygon_intersection_sh_gpu(
+            exploded_left,
+            exploded_right,
+            dispatch_mode=dispatch_mode,
+        )
+    if part_result is None:
+        part_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+            exploded_left,
+            exploded_right,
+            dispatch_mode=dispatch_mode,
+            _cached_right_segments=None,
+        )
     if part_result is None or part_result.row_count != exploded_left.row_count:
         return None
 
@@ -1410,6 +1805,14 @@ def _regroup_intersection_parts_with_grouped_union_gpu(
     """
     if cp is None:  # pragma: no cover - exercised only on CPU-only installs
         return None
+
+    direct = _pack_disjoint_multipart_intersection_parts_gpu(
+        valid_parts,
+        d_valid_source_rows,
+        output_row_count=output_row_count,
+    )
+    if direct is not None:
+        return direct
 
     from vibespatial.kernels.constructive.segmented_union import segmented_union_all
     from vibespatial.overlay.gpu import (
@@ -1498,6 +1901,243 @@ def _regroup_intersection_parts_with_grouped_union_gpu(
         _empty_device_constructive_output(output_row_count),
         compact,
         d_nonempty_rows,
+    )
+
+
+def _pack_disjoint_multipart_intersection_parts_gpu(
+    valid_parts: OwnedGeometryArray,
+    d_valid_source_rows: DeviceArray,
+    *,
+    output_row_count: int,
+) -> OwnedGeometryArray | None:
+    """Regroup disjoint polygonal intersection fragments without overlay union.
+
+    ``valid_parts`` comes from intersecting each exploded MultiPolygon part
+    against the aligned mask polygon. Source MultiPolygon parts are disjoint by
+    geometry semantics, and clipping them cannot introduce overlap, so regrouping
+    only needs to pack fragments back into Polygon/MultiPolygon rows. Reopening
+    the overlay union planner here adds topology work without changing area.
+    """
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if valid_parts.row_count == 0:
+        return _empty_device_constructive_output(output_row_count)
+    if not _is_family_only(valid_parts, _POLYGONAL_FAMILIES):
+        return None
+
+    exploded = _explode_polygonal_rows_to_polygons_gpu(valid_parts)
+    if exploded is None:
+        return None
+    polygon_parts, d_part_source_rows = exploded
+    if polygon_parts.row_count == 0:
+        return _empty_device_constructive_output(output_row_count)
+
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_direct_pack.group", category="setup"):
+        d_source_rows = d_valid_source_rows[
+            cp.asarray(d_part_source_rows, dtype=cp.int64)
+        ].astype(cp.int64, copy=False)
+        part_count = int(d_source_rows.size)
+        if part_count != polygon_parts.row_count:
+            return None
+        d_order_key = (
+            d_source_rows * np.int64(max(part_count, 1))
+            + cp.arange(part_count, dtype=cp.int64)
+        )
+        d_order = cp.argsort(d_order_key).astype(cp.int64, copy=False)
+        d_sorted_source_rows = d_source_rows[d_order]
+        d_counts = cp.bincount(
+            d_sorted_source_rows,
+            minlength=output_row_count,
+        ).astype(cp.int32, copy=False)
+        d_nonempty_rows = cp.flatnonzero(d_counts > 0).astype(cp.int64, copy=False)
+        if int(d_nonempty_rows.size) == 0:
+            return _empty_device_constructive_output(output_row_count)
+        d_group_counts = d_counts[d_nonempty_rows].astype(cp.int32, copy=False)
+        d_group_starts = cp.cumsum(d_group_counts, dtype=cp.int64) - d_group_counts
+        d_single_compact_rows = cp.flatnonzero(d_group_counts == 1).astype(
+            cp.int64, copy=False,
+        )
+        d_multi_compact_rows = cp.flatnonzero(d_group_counts > 1).astype(
+            cp.int64, copy=False,
+        )
+
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_direct_pack.parts", category="emit"):
+        sorted_parts = polygon_parts.take(d_order)
+        sorted_state = sorted_parts._ensure_device_state()
+        polygon_buffer = sorted_state.families.get(GeometryFamily.POLYGON)
+        if polygon_buffer is None:
+            return None
+        if not _sorted_polygon_parts_have_strictly_disjoint_group_bounds(
+            sorted_parts,
+            d_sorted_source_rows,
+        ):
+            return None
+
+        compact_family_row_offsets = cp.full(
+            int(d_nonempty_rows.size),
+            -1,
+            dtype=cp.int32,
+        )
+        compact_tags = cp.full(
+            int(d_nonempty_rows.size),
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+            dtype=cp.int8,
+        )
+        compact_tags[d_single_compact_rows] = FAMILY_TAGS[GeometryFamily.POLYGON]
+        device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
+
+        if int(d_single_compact_rows.size) > 0:
+            d_single_part_rows = d_group_starts[d_single_compact_rows].astype(
+                cp.int64, copy=False,
+            )
+            single_buffer = _device_take_polygon_family_rows(
+                polygon_buffer,
+                d_single_part_rows,
+            )
+            device_families[GeometryFamily.POLYGON] = single_buffer
+            compact_family_row_offsets[d_single_compact_rows] = cp.arange(
+                int(d_single_compact_rows.size),
+                dtype=cp.int32,
+            )
+
+        if int(d_multi_compact_rows.size) > 0:
+            d_multi_counts = d_group_counts[d_multi_compact_rows].astype(
+                cp.int32, copy=False,
+            )
+            d_multi_offsets = cp.empty(int(d_multi_counts.size) + 1, dtype=cp.int32)
+            d_multi_offsets[0] = 0
+            cp.cumsum(d_multi_counts, out=d_multi_offsets[1:])
+            multi_part_total = int(d_multi_offsets[-1])
+            d_multi_positions = cp.arange(multi_part_total, dtype=cp.int64)
+            d_multi_group_ids = (
+                cp.searchsorted(d_multi_offsets, d_multi_positions, side="right")
+                .astype(cp.int64, copy=False)
+                - 1
+            )
+            d_multi_part_rows = (
+                d_multi_positions
+                - d_multi_offsets[d_multi_group_ids].astype(cp.int64, copy=False)
+                + d_group_starts[d_multi_compact_rows][d_multi_group_ids].astype(
+                    cp.int64,
+                    copy=False,
+                )
+            )
+            multi_piece_buffer = _device_take_polygon_family_rows(
+                polygon_buffer,
+                d_multi_part_rows.astype(cp.int64, copy=False),
+            )
+            device_families[GeometryFamily.MULTIPOLYGON] = DeviceFamilyGeometryBuffer(
+                family=GeometryFamily.MULTIPOLYGON,
+                x=multi_piece_buffer.x,
+                y=multi_piece_buffer.y,
+                geometry_offsets=d_multi_offsets,
+                empty_mask=cp.zeros(int(d_multi_counts.size), dtype=cp.bool_),
+                part_offsets=multi_piece_buffer.geometry_offsets,
+                ring_offsets=multi_piece_buffer.ring_offsets,
+                bounds=None,
+            )
+            compact_family_row_offsets[d_multi_compact_rows] = cp.arange(
+                int(d_multi_compact_rows.size),
+                dtype=cp.int32,
+            )
+
+        compact = build_device_resident_owned(
+            device_families=device_families,
+            row_count=int(d_nonempty_rows.size),
+            tags=compact_tags,
+            validity=cp.ones(int(d_nonempty_rows.size), dtype=cp.bool_),
+            family_row_offsets=compact_family_row_offsets,
+            execution_mode="gpu",
+        )
+
+    _sync_hotpath()
+    with hotpath_stage("constructive.intersection.multipart_direct_pack.scatter", category="emit"):
+        result = device_concat_owned_scatter(
+            _empty_device_constructive_output(output_row_count),
+            compact,
+            d_nonempty_rows,
+        )
+    _sync_hotpath()
+    record_dispatch_event(
+        surface="vibespatial.constructive.binary_constructive",
+        operation="intersection",
+        implementation="direct_multipart_intersection_pack_gpu",
+        reason=(
+            "multipart polygon intersection regrouped disjoint fragments "
+            "without reopening overlay union topology"
+        ),
+        detail=(
+            f"parts={valid_parts.row_count}, rows={output_row_count}, "
+            f"nonempty_rows={int(d_nonempty_rows.size)}"
+        ),
+        requested=ExecutionMode.GPU,
+        selected=ExecutionMode.GPU,
+    )
+    return result
+
+
+def _sorted_polygon_parts_have_strictly_disjoint_group_bounds(
+    sorted_parts: OwnedGeometryArray,
+    d_sorted_source_rows: DeviceArray,
+) -> bool:
+    """Return True when same-source polygon fragments are bbox-disjoint."""
+    part_count = sorted_parts.row_count
+    if part_count <= 1:
+        return True
+    if part_count > _DIRECT_MULTIPART_PACK_MAX_PAIR_PROBE:
+        return False
+
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+    d_pair_i, d_pair_j = cp.triu_indices(part_count, k=1)
+    d_same_source = d_sorted_source_rows[d_pair_i] == d_sorted_source_rows[d_pair_j]
+    if not bool(cp.any(d_same_source)):
+        return True
+
+    d_bounds = cp.asarray(compute_geometry_bounds_device(sorted_parts), dtype=cp.float64)
+    d_left = d_bounds[d_pair_i]
+    d_right = d_bounds[d_pair_j]
+    d_strictly_separated = (
+        (d_left[:, 2] < d_right[:, 0])
+        | (d_right[:, 2] < d_left[:, 0])
+        | (d_left[:, 3] < d_right[:, 1])
+        | (d_right[:, 3] < d_left[:, 1])
+    )
+    return not bool(cp.any(d_same_source & ~d_strictly_separated))
+
+
+def _device_take_polygon_family_rows(
+    buffer: DeviceFamilyGeometryBuffer,
+    family_rows: DeviceArray,
+) -> DeviceFamilyGeometryBuffer:
+    """Gather polygon family rows from a device buffer."""
+    d_ring_space = cp.arange(buffer.ring_offsets.size, dtype=cp.int32)
+    d_ring_indices, d_geom_offsets = _device_gather_offset_slices(
+        d_ring_space,
+        buffer.geometry_offsets,
+        family_rows,
+    )
+    d_ring_indices = d_ring_indices.astype(cp.int64, copy=False)
+    d_coords = (
+        cp.column_stack([buffer.x, buffer.y])
+        if int(buffer.x.size) > 0
+        else cp.empty((0, 2), dtype=cp.float64)
+    )
+    d_gathered, d_ring_offsets = _device_gather_offset_slices(
+        d_coords,
+        buffer.ring_offsets,
+        d_ring_indices,
+    )
+    return DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.POLYGON,
+        x=d_gathered[:, 0].copy() if int(d_gathered.size) else cp.empty(0, dtype=cp.float64),
+        y=d_gathered[:, 1].copy() if int(d_gathered.size) else cp.empty(0, dtype=cp.float64),
+        geometry_offsets=d_geom_offsets,
+        empty_mask=buffer.empty_mask[family_rows],
+        ring_offsets=d_ring_offsets,
+        bounds=None,
     )
 
 
@@ -2095,18 +2735,66 @@ def _dispatch_single_row_polygon_partition_union_gpu(
         dispatch_mode=ExecutionMode.GPU,
     )
     try:
+        overlap = None
+        try:
+            direct_union, _ = _materialize_overlay_execution_plan(
+                plan,
+                operation="union",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=1,
+            )
+            if (
+                direct_union.row_count == 1
+                and _is_polygon_only(direct_union)
+                and bool(np.asarray(direct_union.validity, dtype=bool).all())
+            ):
+                overlap, _ = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="intersection",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=1,
+                )
+                from vibespatial.constructive.measurement import _area_gpu_device_fp64
+                from vibespatial.constructive.validity import is_valid_owned
+
+                left_area = _area_gpu_device_fp64(left)[0]
+                right_area = _area_gpu_device_fp64(right)[0]
+                overlap_area = _area_gpu_device_fp64(overlap)[0]
+                direct_area = _area_gpu_device_fp64(direct_union)[0]
+                expected_area = left_area + right_area - overlap_area
+                area_scale = cp.maximum(cp.maximum(cp.abs(expected_area), cp.abs(direct_area)), 1.0)
+                area_matches = bool(
+                    (
+                        cp.abs(direct_area - expected_area)
+                        <= (area_scale * 1.0e-8 + 1.0e-6)
+                    ).item()
+                )
+                valid_direct = is_valid_owned(
+                    direct_union,
+                    dispatch_mode=ExecutionMode.GPU,
+                )
+                if area_matches and bool(np.asarray(valid_direct, dtype=bool).all()):
+                    return direct_union
+        except Exception:
+            logger.debug(
+                "direct single-row polygon union materialization failed; "
+                "falling back to partition union",
+                exc_info=True,
+            )
+
         left_only, _ = _materialize_overlay_execution_plan(
             plan,
             operation="difference",
             requested=ExecutionMode.GPU,
             preserve_row_count=1,
         )
-        overlap, _ = _materialize_overlay_execution_plan(
-            plan,
-            operation="intersection",
-            requested=ExecutionMode.GPU,
-            preserve_row_count=1,
-        )
+        if overlap is None:
+            overlap, _ = _materialize_overlay_execution_plan(
+                plan,
+                operation="intersection",
+                requested=ExecutionMode.GPU,
+                preserve_row_count=1,
+            )
         right_only, _ = _materialize_overlay_execution_plan(
             plan,
             operation="right_difference",
@@ -2125,7 +2813,25 @@ def _dispatch_single_row_polygon_partition_union_gpu(
 
     piece_candidates = [piece for piece in (left_only, overlap, right_only) if bool(piece.validity[0])]
     if not piece_candidates:
-        return _empty_device_constructive_output(1)
+        dominant_rescue = _dominant_tiny_area_polygon_union_rows_gpu(
+            left,
+            right,
+        )
+        if dominant_rescue is not None and bool(dominant_rescue.validity[0]):
+            record_dispatch_event(
+                surface="geopandas.array.union",
+                operation="union",
+                implementation="single_row_partition_union_degenerate_rescue_gpu",
+                reason=(
+                    "exact partition union produced no polygon pieces; "
+                    "rescued tiny-area polygon pair by preserving the dominant operand"
+                ),
+                detail="rows=1",
+                requested=dispatch_mode,
+                selected=ExecutionMode.GPU,
+            )
+            return dominant_rescue
+        return None
     if len(piece_candidates) == 1:
         return piece_candidates[0]
 
@@ -2142,7 +2848,13 @@ def _dispatch_single_row_polygon_partition_union_gpu(
         if merged is None or merged.row_count != 1:
             return None
         if not bool(merged.validity[0]):
-            return next_piece
+            dominant_rescue = _dominant_tiny_area_polygon_union_rows_gpu(
+                left,
+                right,
+            )
+            if dominant_rescue is not None and bool(dominant_rescue.validity[0]):
+                return dominant_rescue
+            return None
         if not _is_polygon_only(merged):
             return None
 
@@ -2347,39 +3059,94 @@ def _dispatch_polygon_partition_union_gpu(
             _row_isolated=True,
         )
         try:
-            left_only, _ = _materialize_overlay_execution_plan(
-                plan,
-                operation="difference",
-                requested=ExecutionMode.GPU,
-                preserve_row_count=sub_left.row_count,
-            )
-            overlap, _ = _materialize_overlay_execution_plan(
-                plan,
-                operation="intersection",
-                requested=ExecutionMode.GPU,
-                preserve_row_count=sub_left.row_count,
-            )
-            right_only, _ = _materialize_overlay_execution_plan(
-                plan,
-                operation="right_difference",
-                requested=ExecutionMode.GPU,
-                preserve_row_count=sub_left.row_count,
-            )
+            merged = None
+            try:
+                direct_union, _ = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="union",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=sub_left.row_count,
+                )
+                if direct_union.row_count == sub_left.row_count and _is_polygon_only(direct_union):
+                    merged = direct_union
+            except Exception:
+                logger.debug(
+                    "direct row-aligned polygon union materialization failed; "
+                    "falling back to exact partition union",
+                    exc_info=True,
+                )
+
+            if merged is None:
+                left_only, _ = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="difference",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=sub_left.row_count,
+                )
+                overlap, _ = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="intersection",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=sub_left.row_count,
+                )
+                right_only, _ = _materialize_overlay_execution_plan(
+                    plan,
+                    operation="right_difference",
+                    requested=ExecutionMode.GPU,
+                    preserve_row_count=sub_left.row_count,
+                )
+
+                merged = _merge_row_aligned_polygon_piece_batches_gpu(
+                    left_only,
+                    overlap,
+                    dispatch_mode=dispatch_mode,
+                )
+                if merged is None or merged.row_count != sub_left.row_count:
+                    return None
+                merged = _merge_row_aligned_polygon_piece_batches_gpu(
+                    merged,
+                    right_only,
+                    dispatch_mode=dispatch_mode,
+                )
+                if merged is None or merged.row_count != sub_left.row_count:
+                    return None
+
+            invalid_local_rows = np.flatnonzero(
+                ~np.asarray(merged.validity, dtype=bool)
+            ).astype(np.int64, copy=False)
+            if invalid_local_rows.size:
+                exact_rescue = _dispatch_exact_rowwise_polygon_union_rows_gpu(
+                    sub_left,
+                    sub_right,
+                    invalid_local_rows,
+                    dispatch_mode=dispatch_mode,
+                )
+                if (
+                    exact_rescue is None
+                    or exact_rescue.row_count != invalid_local_rows.size
+                    or not bool(np.asarray(exact_rescue.validity, dtype=bool).all())
+                ):
+                    return None
+                merged = device_concat_owned_scatter(
+                    merged,
+                    exact_rescue,
+                    cp.asarray(invalid_local_rows, dtype=cp.int64),
+                )
+                record_dispatch_event(
+                    surface="geopandas.array.union",
+                    operation="union",
+                    implementation="row_aligned_union_invalid_row_rescue_gpu",
+                    reason=(
+                        "row-aligned union produced invalid rows; "
+                        "rescued them with exact single-row GPU union"
+                    ),
+                    detail=f"rows={sub_left.row_count}, rescued={invalid_local_rows.size}",
+                    requested=dispatch_mode,
+                    selected=ExecutionMode.GPU,
+                )
         finally:
             del plan
 
-        merged = _merge_row_aligned_polygon_piece_batches_gpu(
-            left_only,
-            overlap,
-            dispatch_mode=dispatch_mode,
-        )
-        if merged is None or merged.row_count != sub_left.row_count:
-            return None
-        merged = _merge_row_aligned_polygon_piece_batches_gpu(
-            merged,
-            right_only,
-            dispatch_mode=dispatch_mode,
-        )
         if merged is None or merged.row_count != sub_left.row_count:
             return None
         out = device_concat_owned_scatter(
@@ -2857,6 +3624,164 @@ def _empty_device_constructive_output(row_count: int) -> OwnedGeometryArray:
     )
 
 
+def _dominant_tiny_area_polygon_union_rows_gpu(
+    left: OwnedGeometryArray,
+    right: OwnedGeometryArray,
+) -> OwnedGeometryArray | None:
+    """Return the dominant operand for rows with a degenerate partner."""
+    if cp is None:  # pragma: no cover - exercised only on CPU-only installs
+        return None
+    if left.row_count != right.row_count:
+        return None
+    if left.row_count == 0:
+        return _empty_device_constructive_output(0)
+    if not (
+        bool(np.asarray(left.validity, dtype=bool).all())
+        and bool(np.asarray(right.validity, dtype=bool).all())
+    ):
+        return None
+
+    from vibespatial.constructive.measurement import area_owned
+
+    left_area = np.abs(np.asarray(area_owned(left), dtype=np.float64))
+    right_area = np.abs(np.asarray(area_owned(right), dtype=np.float64))
+    if left_area.size != left.row_count or right_area.size != right.row_count:
+        return None
+    max_area = np.maximum(left_area, right_area)
+    min_area = np.minimum(left_area, right_area)
+    finite = np.isfinite(max_area) & np.isfinite(min_area)
+    tiny_partner = finite & (
+        min_area <= np.maximum(max_area * _POLYGON_UNION_DEGENERATE_AREA_RTOL, 0.0)
+    )
+    if not bool(tiny_partner.all()):
+        return None
+
+    dominant_left = left_area >= right_area
+    out = _empty_device_constructive_output(left.row_count)
+    tiny = _empty_device_constructive_output(left.row_count)
+    left_rows = np.flatnonzero(dominant_left).astype(np.int64, copy=False)
+    right_rows = np.flatnonzero(~dominant_left).astype(np.int64, copy=False)
+    if left_rows.size:
+        out = device_concat_owned_scatter(
+            out,
+            left.take(left_rows),
+            cp.asarray(left_rows, dtype=cp.int64),
+        )
+        tiny = device_concat_owned_scatter(
+            tiny,
+            right.take(left_rows),
+            cp.asarray(left_rows, dtype=cp.int64),
+        )
+    if right_rows.size:
+        out = device_concat_owned_scatter(
+            out,
+            right.take(right_rows),
+            cp.asarray(right_rows, dtype=cp.int64),
+        )
+        tiny = device_concat_owned_scatter(
+            tiny,
+            left.take(right_rows),
+            cp.asarray(right_rows, dtype=cp.int64),
+        )
+
+    try:
+        from vibespatial.predicates.binary import (
+            NullBehavior,
+            evaluate_binary_predicate,
+        )
+
+        coverage = evaluate_binary_predicate(
+            "covers",
+            out,
+            tiny,
+            dispatch_mode=ExecutionMode.GPU,
+            null_behavior=NullBehavior.FALSE,
+        )
+    except Exception:
+        logger.debug(
+            "tiny-area polygon union rescue coverage proof failed",
+            exc_info=True,
+        )
+        return None
+    if coverage.runtime_selection.selected is not ExecutionMode.GPU:
+        return None
+    coverage_mask = np.asarray(coverage.values, dtype=bool)
+    if coverage_mask.size != left.row_count:
+        return None
+    if bool(coverage_mask.all()):
+        return out
+
+    try:
+        contact = evaluate_binary_predicate(
+            "intersects",
+            tiny,
+            out,
+            dispatch_mode=ExecutionMode.GPU,
+            null_behavior=NullBehavior.FALSE,
+        )
+    except Exception:
+        logger.debug(
+            "tiny-area polygon union rescue contact proof failed",
+            exc_info=True,
+        )
+        return None
+    if contact.runtime_selection.selected is not ExecutionMode.GPU:
+        return None
+    contact_mask = np.asarray(contact.values, dtype=bool)
+    if contact_mask.size != left.row_count:
+        return None
+    tolerance_mask = _dominant_tiny_area_bounds_within_fp_tolerance(out, tiny)
+    if tolerance_mask.size != left.row_count:
+        return None
+    accepted = coverage_mask | (contact_mask & tolerance_mask)
+    if not bool(accepted.all()):
+        return None
+    return out
+
+
+def _dominant_tiny_area_bounds_within_fp_tolerance(
+    dominant: OwnedGeometryArray,
+    tiny: OwnedGeometryArray,
+) -> np.ndarray:
+    """Return rows where tiny bounds only escape dominant by fp-scale noise."""
+    if dominant.row_count != tiny.row_count:
+        return np.zeros(0, dtype=bool)
+    try:
+        from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds
+
+        dominant_bounds = np.asarray(
+            compute_geometry_bounds(dominant, dispatch_mode=ExecutionMode.GPU),
+            dtype=np.float64,
+        )
+        tiny_bounds = np.asarray(
+            compute_geometry_bounds(tiny, dispatch_mode=ExecutionMode.GPU),
+            dtype=np.float64,
+        )
+    except Exception:
+        logger.debug(
+            "tiny-area polygon union rescue bounds proof failed",
+            exc_info=True,
+        )
+        return np.zeros(dominant.row_count, dtype=bool)
+    if dominant_bounds.shape != (dominant.row_count, 4) or tiny_bounds.shape != (
+        tiny.row_count,
+        4,
+    ):
+        return np.zeros(dominant.row_count, dtype=bool)
+
+    coord_scale = np.maximum(
+        np.maximum(np.max(np.abs(dominant_bounds), axis=1), np.max(np.abs(tiny_bounds), axis=1)),
+        1.0,
+    )
+    tol = np.maximum(coord_scale * 1.0e-12, 1.0e-12)
+    return (
+        (tiny_bounds[:, 0] >= dominant_bounds[:, 0] - tol)
+        & (tiny_bounds[:, 1] >= dominant_bounds[:, 1] - tol)
+        & (tiny_bounds[:, 2] <= dominant_bounds[:, 2] + tol)
+        & (tiny_bounds[:, 3] <= dominant_bounds[:, 3] + tol)
+    )
+
+
 def _single_row_polygon_difference_exact_correction(
     left: OwnedGeometryArray,
     right: OwnedGeometryArray,
@@ -3026,6 +3951,7 @@ def _binary_constructive_gpu(
     _prefer_rowwise_polygon_difference_overlay: bool = False,
     _skip_single_row_polygon_difference_exact_correction: bool = False,
     _allow_rectangle_intersection_fast_path: bool = True,
+    _skip_polygon_contraction: bool = False,
 ) -> OwnedGeometryArray | None:
     """GPU binary constructive for all family combinations.
 
@@ -3151,7 +4077,11 @@ def _binary_constructive_gpu(
                     right,
                     dispatch_mode=dispatch_mode,
                 )
-                if exact_partition_union is not None and exact_partition_union.row_count == left.row_count:
+                if (
+                    exact_partition_union is not None
+                    and exact_partition_union.row_count == left.row_count
+                    and bool(np.asarray(exact_partition_union.validity, dtype=bool).all())
+                ):
                     return exact_partition_union
             except Exception:
                 logger.debug(
@@ -3171,62 +4101,25 @@ def _binary_constructive_gpu(
                     "multipart-polygon exact union GPU rescue failed",
                     exc_info=True,
                 )
-
-        valid_mask = left.validity & right.validity
-        polygon_pair_count = (
-            len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask]))
-            if valid_mask.any()
-            else 0
-        )
-        if op == "intersection" and polygon_pair_count > 1:
-            if left.row_count <= _MIXED_POLYGON_INTERSECTION_ROWWISE_MAX:
+            if left.row_count == 1:
                 try:
-                    tiny_mixed_rowwise = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+                    repaired_union = _dispatch_polygon_union_repair_gpu(
                         left,
                         right,
                         dispatch_mode=dispatch_mode,
                         _cached_right_segments=_cached_right_segments,
                     )
                     if (
-                        tiny_mixed_rowwise is not None
-                        and tiny_mixed_rowwise.row_count == left.row_count
+                        repaired_union is not None
+                        and repaired_union.row_count == left.row_count
+                        and bool(np.asarray(repaired_union.validity, dtype=bool).all())
                     ):
-                        return tiny_mixed_rowwise
+                        return repaired_union
                 except Exception:
                     logger.debug(
-                        "tiny mixed polygonal GPU intersection rowwise shortcut failed",
+                        "single-row polygon union repair GPU rescue failed",
                         exc_info=True,
                     )
-            try:
-                mixed_polygonal = _dispatch_mixed_binary_constructive_gpu(
-                    op,
-                    left,
-                    right,
-                    dispatch_mode=dispatch_mode,
-                    _cached_right_segments=_cached_right_segments,
-                )
-                if mixed_polygonal is not None and mixed_polygonal.row_count == left.row_count:
-                    return mixed_polygonal
-            except Exception:
-                logger.debug(
-                    "mixed polygonal GPU intersection dispatch failed",
-                    exc_info=True,
-                )
-
-        if op == "intersection":
-            try:
-                multipart_result = _dispatch_multipolygon_polygon_intersection_gpu(
-                    left,
-                    right,
-                    dispatch_mode=dispatch_mode,
-                )
-                if multipart_result is not None and multipart_result.row_count == left.row_count:
-                    return multipart_result
-            except Exception:
-                logger.debug(
-                    "multipart-polygon exact intersection GPU rescue failed",
-                    exc_info=True,
-                )
 
         def _try_polygon_rect_intersection():
             try:
@@ -3278,26 +4171,84 @@ def _binary_constructive_gpu(
                 )
             return None
 
+        valid_mask = left.validity & right.validity
+        polygon_pair_count = (
+            len(unique_tag_pairs(left.tags[valid_mask], right.tags[valid_mask]))
+            if valid_mask.any()
+            else 0
+        )
+        if op == "intersection" and polygon_pair_count > 1:
+            if left.row_count <= _MIXED_POLYGON_INTERSECTION_ROWWISE_MAX:
+                try:
+                    tiny_mixed_rowwise = _dispatch_polygon_intersection_overlay_rowwise_gpu(
+                        left,
+                        right,
+                        dispatch_mode=dispatch_mode,
+                        _cached_right_segments=_cached_right_segments,
+                    )
+                    if (
+                        tiny_mixed_rowwise is not None
+                        and tiny_mixed_rowwise.row_count == left.row_count
+                    ):
+                        return tiny_mixed_rowwise
+                except Exception:
+                    logger.debug(
+                        "tiny mixed polygonal GPU intersection rowwise shortcut failed",
+                        exc_info=True,
+                    )
+
         if op == "intersection" and _allow_rectangle_intersection_fast_path:
             rect_result = _try_polygon_rect_intersection()
             if rect_result is not None:
                 return rect_result
 
-        if op == "intersection" and _prefer_exact_polygon_intersection:
-            if _sh_kernel_can_handle(left, right):
-                try:
-                    from vibespatial.kernels.constructive.polygon_intersection import (
-                        polygon_intersection,
-                    )
+        if op == "intersection" and polygon_pair_count > 1:
+            try:
+                mixed_polygonal = _dispatch_mixed_binary_constructive_gpu(
+                    op,
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                    _cached_right_segments=_cached_right_segments,
+                )
+                if mixed_polygonal is not None and mixed_polygonal.row_count == left.row_count:
+                    return mixed_polygonal
+            except Exception:
+                logger.debug(
+                    "mixed polygonal GPU intersection dispatch failed",
+                    exc_info=True,
+                )
 
-                    result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
-                    if result.row_count == left.row_count:
-                        return result
-                except Exception:
-                    logger.debug(
-                        "preferred exact polygon_intersection GPU kernel failed; escalating to rowwise overlay",
-                        exc_info=True,
-                    )
+        if op == "intersection":
+            try:
+                multipart_result = _dispatch_multipolygon_polygon_intersection_gpu(
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                )
+                if multipart_result is not None and multipart_result.row_count == left.row_count:
+                    return multipart_result
+            except Exception:
+                logger.debug(
+                    "multipart-polygon exact intersection GPU rescue failed",
+                    exc_info=True,
+                )
+
+        if op == "intersection" and _prefer_exact_polygon_intersection:
+            sh_result = _dispatch_polygon_intersection_sh_gpu(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+            )
+            if sh_result is not None and sh_result.row_count == left.row_count:
+                return sh_result
+            partitioned_sh = _dispatch_partitioned_polygon_intersection_sh_gpu(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+            )
+            if partitioned_sh is not None and partitioned_sh.row_count == left.row_count:
+                return partitioned_sh
             try:
                 rowwise_result = _dispatch_polygon_intersection_overlay_rowwise_gpu(
                     left,
@@ -3348,21 +4299,21 @@ def _binary_constructive_gpu(
             # GPU overlay pipeline which handles arbitrarily complex polygons
             # (multi-ring, holes, high vertex counts) via 8-stage topology
             # reconstruction.
-            if _sh_kernel_can_handle(left, right):
-                try:
-                    from vibespatial.kernels.constructive.polygon_intersection import (
-                        polygon_intersection,
-                    )
-
-                    result = polygon_intersection(left, right, dispatch_mode=dispatch_mode)
-                    if result.row_count == left.row_count:
-                        return result
-                except Exception:
-                    logger.debug(
-                        "polygon_intersection GPU kernel failed, trying overlay pipeline",
-                        exc_info=True,
-                    )
-            else:
+            sh_result = _dispatch_polygon_intersection_sh_gpu(
+                left,
+                right,
+                dispatch_mode=dispatch_mode,
+            )
+            if sh_result is not None and sh_result.row_count == left.row_count:
+                return sh_result
+            if sh_result is None:
+                partitioned_sh = _dispatch_partitioned_polygon_intersection_sh_gpu(
+                    left,
+                    right,
+                    dispatch_mode=dispatch_mode,
+                )
+                if partitioned_sh is not None and partitioned_sh.row_count == left.row_count:
+                    return partitioned_sh
                 logger.debug(
                     "polygon_intersection SH kernel skipped: input exceeds "
                     "kernel capabilities (holes or vertex count), falling "
@@ -3387,9 +4338,8 @@ def _binary_constructive_gpu(
         if prefer_rowwise_overlay:
             try:
                 contraction_result = None
-                if not (
-                    op == "difference"
-                    and _prefer_rowwise_polygon_difference_overlay
+                if not _skip_polygon_contraction and not (
+                    op == "difference" and _prefer_rowwise_polygon_difference_overlay
                 ):
                     contraction_result = _dispatch_polygon_contraction_gpu(
                         op,
@@ -3645,6 +4595,7 @@ def binary_constructive_owned(
     _prefer_rowwise_polygon_difference_overlay: bool = False,
     _skip_single_row_polygon_difference_exact_correction: bool = False,
     _allow_rectangle_intersection_fast_path: bool = True,
+    _skip_polygon_contraction: bool = False,
 ) -> OwnedGeometryArray:
     """Element-wise binary constructive operation on owned arrays.
 
@@ -3745,6 +4696,7 @@ def binary_constructive_owned(
                 _skip_single_row_polygon_difference_exact_correction
             ),
             _allow_rectangle_intersection_fast_path=_allow_rectangle_intersection_fast_path,
+            _skip_polygon_contraction=_skip_polygon_contraction,
         )
         if result is not None:
             record_dispatch_event(

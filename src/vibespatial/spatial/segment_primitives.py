@@ -2130,6 +2130,7 @@ def _classify_segment_intersections_gpu(
     _cached_right_device_segments: DeviceSegmentTable | None = None,
     _require_same_row: bool = False,
     _use_same_row_fast_path: bool = True,
+    _collect_ambiguous_rows: bool = True,
 ) -> SegmentIntersectionResult:
     """Full GPU-native segment intersection pipeline.
 
@@ -2291,69 +2292,72 @@ def _classify_segment_intersections_gpu(
                 f"segment classify kernel launch failed: {type(exc).__name__}: {exc}"
             ) from exc
 
-    # Preserve the CPU-visible ambiguous-row contract on device: rows whose
-    # fast orientation filter was numerically ambiguous or degenerate still
-    # count as ambiguous even though exact refinement happens fully on GPU.
-    d_left_lookup = cp.asarray(d_candidates.left_lookup)
-    d_right_lookup = cp.asarray(d_candidates.right_lookup)
-    ax = cp.asarray(d_left_segs.x0)[d_left_lookup]
-    ay = cp.asarray(d_left_segs.y0)[d_left_lookup]
-    bx = cp.asarray(d_left_segs.x1)[d_left_lookup]
-    by = cp.asarray(d_left_segs.y1)[d_left_lookup]
-    cx = cp.asarray(d_right_segs.x0)[d_right_lookup]
-    cy = cp.asarray(d_right_segs.y0)[d_right_lookup]
-    dx = cp.asarray(d_right_segs.x1)[d_right_lookup]
-    dy = cp.asarray(d_right_segs.y1)[d_right_lookup]
+    if _collect_ambiguous_rows:
+        # Preserve the CPU-visible ambiguous-row contract on device: rows whose
+        # fast orientation filter was numerically ambiguous or degenerate still
+        # count as ambiguous even though exact refinement happens fully on GPU.
+        d_left_lookup = cp.asarray(d_candidates.left_lookup)
+        d_right_lookup = cp.asarray(d_candidates.right_lookup)
+        ax = cp.asarray(d_left_segs.x0)[d_left_lookup]
+        ay = cp.asarray(d_left_segs.y0)[d_left_lookup]
+        bx = cp.asarray(d_left_segs.x1)[d_left_lookup]
+        by = cp.asarray(d_left_segs.y1)[d_left_lookup]
+        cx = cp.asarray(d_right_segs.x0)[d_right_lookup]
+        cy = cp.asarray(d_right_segs.y0)[d_right_lookup]
+        dx = cp.asarray(d_right_segs.x1)[d_right_lookup]
+        dy = cp.asarray(d_right_segs.y1)[d_right_lookup]
 
-    def _orient2d_fast_device(
-        ax,
-        ay,
-        bx,
-        by,
-        cx,
-        cy,
-    ):
-        abx = bx - ax
-        aby = by - ay
-        acx = cx - ax
-        acy = cy - ay
-        term1 = abx * acy
-        term2 = aby * acx
-        det = term1 - term2
-        errbound = _ORIENTATION_ERRBOUND * (cp.abs(term1) + cp.abs(term2))
-        return det, cp.abs(det) <= errbound
+        def _orient2d_fast_device(
+            ax,
+            ay,
+            bx,
+            by,
+            cx,
+            cy,
+        ):
+            abx = bx - ax
+            aby = by - ay
+            acx = cx - ax
+            acy = cy - ay
+            term1 = abx * acy
+            term2 = aby * acx
+            det = term1 - term2
+            errbound = _ORIENTATION_ERRBOUND * (cp.abs(term1) + cp.abs(term2))
+            return det, cp.abs(det) <= errbound
 
-    with hotpath_stage("segment.classify.ambiguous_rows", category="refine"):
-        try:
-            o1, a1 = _orient2d_fast_device(ax, ay, bx, by, cx, cy)
-            o2, a2 = _orient2d_fast_device(ax, ay, bx, by, dx, dy)
-            o3, a3 = _orient2d_fast_device(cx, cy, dx, dy, ax, ay)
-            o4, a4 = _orient2d_fast_device(cx, cy, dx, dy, bx, by)
+        with hotpath_stage("segment.classify.ambiguous_rows", category="refine"):
+            try:
+                o1, a1 = _orient2d_fast_device(ax, ay, bx, by, cx, cy)
+                o2, a2 = _orient2d_fast_device(ax, ay, bx, by, dx, dy)
+                o3, a3 = _orient2d_fast_device(cx, cy, dx, dy, ax, ay)
+                o4, a4 = _orient2d_fast_device(cx, cy, dx, dy, bx, by)
 
-            zero_left = (ax == bx) & (ay == by)
-            zero_right = (cx == dx) & (cy == dy)
-            sign1 = cp.sign(o1).astype(cp.int8, copy=False)
-            sign2 = cp.sign(o2).astype(cp.int8, copy=False)
-            sign3 = cp.sign(o3).astype(cp.int8, copy=False)
-            sign4 = cp.sign(o4).astype(cp.int8, copy=False)
+                zero_left = (ax == bx) & (ay == by)
+                zero_right = (cx == dx) & (cy == dy)
+                sign1 = cp.sign(o1).astype(cp.int8, copy=False)
+                sign2 = cp.sign(o2).astype(cp.int8, copy=False)
+                sign3 = cp.sign(o3).astype(cp.int8, copy=False)
+                sign4 = cp.sign(o4).astype(cp.int8, copy=False)
 
-            ambiguous_mask = (
-                a1
-                | a2
-                | a3
-                | a4
-                | zero_left
-                | zero_right
-                | (sign1 == 0)
-                | (sign2 == 0)
-                | (sign3 == 0)
-                | (sign4 == 0)
-            )
-            d_ambiguous_rows = compact_indices(ambiguous_mask.astype(cp.uint8)).values
-        except Exception as exc:
-            raise RuntimeError(
-                f"segment ambiguous-row detection failed: {type(exc).__name__}: {exc}"
-            ) from exc
+                ambiguous_mask = (
+                    a1
+                    | a2
+                    | a3
+                    | a4
+                    | zero_left
+                    | zero_right
+                    | (sign1 == 0)
+                    | (sign2 == 0)
+                    | (sign3 == 0)
+                    | (sign4 == 0)
+                )
+                d_ambiguous_rows = compact_indices(ambiguous_mask.astype(cp.uint8)).values
+            except Exception as exc:
+                raise RuntimeError(
+                    f"segment ambiguous-row detection failed: {type(exc).__name__}: {exc}"
+                ) from exc
+    else:
+        d_ambiguous_rows = runtime.allocate((0,), np.int32)
 
     # Sync GPU before returning device-primary result.
     with hotpath_stage("segment.classify.synchronize", category="emit"):
@@ -2566,6 +2570,7 @@ def classify_segment_intersections(
     _cached_right_device_segments: DeviceSegmentTable | None = None,
     _require_same_row: bool = False,
     _use_same_row_fast_path: bool = True,
+    _collect_ambiguous_rows: bool = True,
 ) -> SegmentIntersectionResult:
     """Classify all segment-segment intersections between two geometry arrays.
 
@@ -2646,6 +2651,7 @@ def classify_segment_intersections(
                 _cached_right_device_segments=_cached_right_device_segments,
                 _require_same_row=_require_same_row,
                 _use_same_row_fast_path=_use_same_row_fast_path,
+                _collect_ambiguous_rows=_collect_ambiguous_rows,
             )
 
         stage = "cpu_dispatch"

@@ -44,6 +44,7 @@ repeat = int(sys.argv[3])
 do_warmup = sys.argv[4] == "1"
 do_pipeline_warm = sys.argv[5] == "1"
 dump_after = int(sys.argv[6])
+do_profile = sys.argv[7] == "1"
 
 if dump_after > 0:
     faulthandler.dump_traceback_later(dump_after, repeat=False)
@@ -84,6 +85,136 @@ def _run_timed_sections(script_path, sections, *, run_name):
         if strict_native is not None:
             os.environ["VIBESPATIAL_STRICT_NATIVE"] = strict_native
     return elapsed
+
+
+def _as_dict_event(event):
+    to_dict = getattr(event, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return {
+        key: value
+        for key, value in getattr(event, "__dict__", {}).items()
+        if not key.startswith("_")
+    }
+
+
+def _trace_step_to_dict(step):
+    selected = getattr(step, "selected", "")
+    return {
+        "surface": getattr(step, "surface", ""),
+        "operation": getattr(step, "operation", ""),
+        "selected": getattr(selected, "value", str(selected)),
+        "implementation": getattr(step, "implementation", ""),
+    }
+
+
+def _trace_transfer_to_dict(transfer):
+    return {
+        "direction": getattr(transfer, "direction", ""),
+        "trigger": getattr(transfer, "trigger", ""),
+        "reason": getattr(transfer, "reason", ""),
+    }
+
+
+def _profile_timed_sections(script_path, sections):
+    profile = {
+        "available": False,
+        "backend": "vibespatial",
+        "mode": "post_timing_profile",
+    }
+    old_stdout = sys.stdout
+    old_hotpath = os.environ.get("VIBESPATIAL_HOTPATH_TRACE")
+    try:
+        from vibespatial.bench.pipeline import _OwnedAudit
+        from vibespatial.runtime.execution_trace import execution_trace
+        from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
+        from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+        try:
+            from vibespatial.cuda._runtime import get_d2h_transfer_count, reset_d2h_transfer_count
+        except Exception:
+            get_d2h_transfer_count = None
+            reset_d2h_transfer_count = None
+
+        os.environ["VIBESPATIAL_HOTPATH_TRACE"] = "1"
+        clear_fallback_events()
+        reset_hotpath_trace()
+        if reset_d2h_transfer_count is not None:
+            reset_d2h_transfer_count()
+
+        audit = _OwnedAudit()
+        globals_dict = {
+            "__name__": "__profile__",
+            "__file__": script_path,
+            "__package__": None,
+            "__cached__": None,
+        }
+        capture = io.StringIO()
+        sys.stdout = capture
+        error = None
+        trace = None
+        try:
+            if sections is None:
+                start = time.perf_counter()
+                with execution_trace("shootout") as trace:
+                    globals_dict = runpy.run_path(script_path, run_name="__profile__")
+                elapsed = time.perf_counter() - start
+            else:
+                preamble_code, timed_code, _postamble_code = sections
+                exec(preamble_code, globals_dict)
+                clear_fallback_events()
+                reset_hotpath_trace()
+                if reset_d2h_transfer_count is not None:
+                    reset_d2h_transfer_count()
+                start = time.perf_counter()
+                with execution_trace("shootout") as trace:
+                    exec(timed_code, globals_dict)
+                elapsed = time.perf_counter() - start
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            elapsed = 0.0
+        audit.observe(*globals_dict.values())
+        fallback_events = [_as_dict_event(event) for event in get_fallback_events(clear=True)]
+        hotpath_summary = summarize_hotpath_trace()[:40]
+        trace_summary = trace.summary() if trace is not None else {}
+        trace_steps = [_trace_step_to_dict(step) for step in getattr(trace, "steps", [])[:80]]
+        trace_transfers = [
+            _trace_transfer_to_dict(transfer)
+            for transfer in getattr(trace, "transfers", [])[:80]
+        ]
+        d2h_transfer_count = (
+            int(get_d2h_transfer_count())
+            if get_d2h_transfer_count is not None
+            else None
+        )
+        profile.update({
+            "available": True,
+            "elapsed_seconds": elapsed,
+            "stdout": capture.getvalue(),
+            "fallback_event_count": len(fallback_events),
+            "fallback_events": fallback_events[:40],
+            "trace_summary": trace_summary,
+            "trace_steps": trace_steps,
+            "trace_transfers": trace_transfers,
+            "hotpath": hotpath_summary,
+            "top_hotpath": hotpath_summary[:10],
+            "transfer_count": audit.transfer_count,
+            "materialization_count": audit.materialization_count,
+            "transfer_seconds": audit.transfer_seconds,
+            "transfer_bytes": audit.transfer_bytes,
+        })
+        if d2h_transfer_count is not None:
+            profile["d2h_transfer_count"] = d2h_transfer_count
+        if error is not None:
+            profile["error"] = error
+    except Exception as exc:
+        profile["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        sys.stdout = old_stdout
+        if old_hotpath is None:
+            os.environ.pop("VIBESPATIAL_HOTPATH_TRACE", None)
+        else:
+            os.environ["VIBESPATIAL_HOTPATH_TRACE"] = old_hotpath
+    return profile
 
 os.chdir(os.path.dirname(os.path.abspath(script)))
 sections = _load_script_sections(script)
@@ -130,8 +261,12 @@ for i in range(repeat):
         captured_stdout = capture.getvalue()
     samples.append({"elapsed": elapsed, "error": error})
 
+profile = None
+if do_pipeline_warm and do_profile:
+    profile = _profile_timed_sections(script, sections)
+
 with open(result_path, "w") as f:
-    json.dump({"samples": samples, "stdout": captured_stdout}, f)
+    json.dump({"samples": samples, "stdout": captured_stdout, "profile": profile}, f)
 """
 
 
@@ -147,6 +282,7 @@ class ShootoutRun:
     timing: TimingSummary
     error: str | None = None
     stdout: str = ""
+    profile: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -157,6 +293,8 @@ class ShootoutRun:
             d["error"] = self.error
         if self.stdout:
             d["stdout"] = self.stdout
+        if self.profile is not None:
+            d["profile"] = self.profile
         return d
 
 
@@ -220,6 +358,7 @@ def _build_run_from_result(label: str, raw: dict[str, Any]) -> ShootoutRun:
         timing=timing_from_samples(times),
         error=errors[0] if errors else None,
         stdout=raw.get("stdout", ""),
+        profile=raw.get("profile"),
     )
 
 
@@ -325,6 +464,36 @@ def _fingerprints_match(fp_a: str, fp_b: str, *, rtol: float = 1e-3) -> bool:
     return True
 
 
+def _infer_physical_shapes(script: Path) -> list[str]:
+    """Best-effort physical-plan tags for public shootout scripts."""
+    try:
+        text = script.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    tags: list[str] = []
+
+    def add(tag: str) -> None:
+        if tag not in tags:
+            tags.append(tag)
+
+    if "gpd.sjoin(" in text and ".index.unique()" in text:
+        add("semijoin")
+    if "gpd.sjoin(" in text and ".index.isin(" in text and "~" in text:
+        add("anti_semijoin")
+    if "gpd.overlay(" in text:
+        add("many_few_overlay")
+    if "gpd.clip(" in text and (".buffer(" in text or ".dissolve(" in text):
+        add("mask_clip")
+    if ".dissolve(" in text:
+        add("grouped_geometry_reduce")
+    if ".area" in text and "gpd.overlay(" in text:
+        add("area_filter_after_overlay")
+    if ".buffer(" in text and ".dissolve(" in text:
+        add("mask_construction")
+    return tags
+
+
 # ---------------------------------------------------------------------------
 # Harness runner
 # ---------------------------------------------------------------------------
@@ -340,6 +509,7 @@ def _run_harness(
     env: dict[str, str] | None = None,
     timeout: int = 300,
     quiet: bool = False,
+    profile: bool = False,
 ) -> ShootoutRun:
     """Run the timing harness in a subprocess and return results."""
     harness_fd, harness_path = tempfile.mkstemp(suffix=".py", prefix="vsbench_harness_")
@@ -358,6 +528,7 @@ def _run_harness(
             "1" if warmup else "0",
             "1" if pipeline_warm else "0",
             str(max(timeout - 5, 1)),
+            "1" if profile else "0",
         ]
 
         if not quiet:
@@ -426,6 +597,7 @@ def _run_harness_in_process(
     warmup: bool,
     pipeline_warm: bool = False,
     env: dict[str, str] | None = None,
+    profile: bool = False,
 ) -> ShootoutRun:
     """Run the timing harness in-process.
 
@@ -536,6 +708,7 @@ def run_shootout(
     timeout: int = 300,
     quiet: bool = False,
     scale: str | None = None,
+    profile: bool = False,
 ) -> ShootoutResult:
     """Run a user script with geopandas and vibespatial, return comparison."""
     from vibespatial.runtime import has_gpu_runtime
@@ -589,6 +762,7 @@ def run_shootout(
         env=gpd_env,
         timeout=timeout,
         quiet=quiet,
+        profile=False,
     )
 
     # --- vibespatial ---
@@ -611,6 +785,7 @@ def run_shootout(
         env=vs_env,
         timeout=timeout,
         quiet=quiet,
+        profile=profile,
     )
     launch_mode = "subprocess"
     if (
@@ -625,6 +800,7 @@ def run_shootout(
             warmup=warmup,
             pipeline_warm=True,
             env=vs_env,
+            profile=profile,
         )
         launch_mode = "in_process_retry"
 
@@ -653,7 +829,11 @@ def run_shootout(
                 errors.append(f"fingerprint mismatch: geopandas={gpd_fp} vibespatial={vs_fp}")
                 has_error = True
 
-    meta: dict[str, Any] = {"repeat": repeat, "warmup": warmup}
+    meta: dict[str, Any] = {
+        "repeat": repeat,
+        "warmup": warmup,
+        "physical_shapes": _infer_physical_shapes(script),
+    }
     if not warmup and repeat < 3:
         meta["measurement_mode"] = "cold_start_probe"
         meta["measurement_note"] = (

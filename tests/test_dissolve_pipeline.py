@@ -196,6 +196,111 @@ def test_evaluate_geopandas_dissolve_can_use_dense_group_codes_without_group_pos
     assert_geodataframe_equal(result, expected)
 
 
+@pytest.mark.gpu
+def test_unary_dissolve_rewrites_certified_polygon_coverage_to_coverage() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    geoms = [
+        box(float(i), float(group) * 10.0, float(i) + 1.0, float(group) * 10.0 + 1.0)
+        for group in range(3)
+        for i in range(20)
+    ]
+    groups = np.repeat(np.arange(3, dtype=np.int32), 20)
+    frame = geopandas.GeoDataFrame(
+        {"group": groups, "value": np.arange(len(geoms), dtype=np.int32)},
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    clear_rewrite_events()
+    actual = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    expected = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="coverage",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    assert any(
+        event.rule_name == "R11_dissolve_unary_polygon_coverage_to_coverage"
+        for event in rewrite_events
+    )
+    assert_geodataframe_equal(actual, expected)
+
+
+@pytest.mark.gpu
+def test_unary_dissolve_does_not_rewrite_overlapping_polygon_groups() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    geoms = [
+        box(float(i) * 0.5, 0.0, float(i) * 0.5 + 1.0, 1.0)
+        for i in range(50)
+    ]
+    frame = geopandas.GeoDataFrame(
+        {"group": np.zeros(len(geoms), dtype=np.int32), "value": np.arange(len(geoms), dtype=np.int32)},
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(geoms, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    clear_rewrite_events()
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    rewrite_events = get_rewrite_events(clear=True)
+
+    assert not any(
+        event.rule_name == "R11_dissolve_unary_polygon_coverage_to_coverage"
+        for event in rewrite_events
+    )
+    actual_geom = np.asarray(result.geometry.array, dtype=object)[0]
+    expected_geom = shapely.union_all(np.asarray(frame.geometry.array, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
+
+
 def test_evaluate_geopandas_dissolve_preserves_owned_backing_through_reset_index() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime not available")
@@ -297,6 +402,119 @@ def test_execute_grouped_union_codes_avoids_geometry_array_materialization_for_o
     assert grouped.non_empty_groups == 1
     assert grouped.owned is not None
     assert grouped.geometries is None
+
+
+@pytest.mark.gpu
+def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.constructive.binary_constructive as binary_constructive_module
+    import vibespatial.constructive.union_all as union_all_module
+
+    def _fail_serial_union_all(*_args, **_kwargs):
+        raise AssertionError("multi-group unary dissolve should not run serial union_all per group")
+
+    monkeypatch.setattr(union_all_module, "union_all_gpu_owned", _fail_serial_union_all)
+    real_binary_constructive_owned = binary_constructive_module.binary_constructive_owned
+    skip_contraction_flags = []
+
+    def _record_binary_constructive_owned(*args, **kwargs):
+        skip_contraction_flags.append(kwargs.get("_skip_polygon_contraction"))
+        return real_binary_constructive_owned(*args, **kwargs)
+
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "binary_constructive_owned",
+        _record_binary_constructive_owned,
+    )
+
+    values = [
+        *[box(float(i) * 0.5, 0, float(i) * 0.5 + 1.0, 1.0) for i in range(12)],
+        *[box(20.0 + float(i) * 0.5, 0, 21.0 + float(i) * 0.5, 1.0) for i in range(12)],
+    ]
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    class ExplodingGeometries:
+        def __array__(self, dtype=None):
+            raise AssertionError("owned unary grouped union should not materialize geometry objects")
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        ExplodingGeometries(),
+        np.repeat(np.asarray([0, 1], dtype=np.int32), 12),
+        group_count=2,
+        method="unary",
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.geometries is None
+    assert grouped.owned is not None
+    assert grouped.owned.row_count == 2
+    assert all(flag is True for flag in skip_contraction_flags)
+
+    actual = np.asarray(grouped.owned.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(np.asarray(values[:12], dtype=object)),
+        shapely.union_all(np.asarray(values[12:], dtype=object)),
+    ]
+    assert bool(shapely.equals(actual[0], expected[0]))
+    assert bool(shapely.equals(actual[1], expected[1]))
+
+
+@pytest.mark.gpu
+def test_public_dissolve_then_convex_hull_uses_grouped_hull_rewrite() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    values = [
+        *[box(float(i) * 0.55, 0.0, float(i) * 0.55 + 1.0, 1.0) for i in range(12)],
+        *[box(20.0 + float(i) * 0.55, 0.0, 21.0 + float(i) * 0.55, 1.0) for i in range(12)],
+    ]
+    groups = np.repeat(np.asarray([0, 1], dtype=np.int32), 12)
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": groups,
+            "value": np.arange(len(values), dtype=np.int32),
+        },
+        geometry=geopandas.GeoSeries(
+            DeviceGeometryArray._from_owned(
+                from_shapely_geometries(values, residency=Residency.DEVICE),
+                crs="EPSG:3857",
+            ),
+            crs="EPSG:3857",
+        ),
+        crs="EPSG:3857",
+    )
+
+    geopandas.clear_dispatch_events()
+    clear_rewrite_events()
+    dissolved = frame.dissolve(
+        by="group",
+        aggfunc={"value": "sum"},
+        method="unary",
+    ).reset_index()
+    actual = np.asarray(dissolved.geometry.convex_hull.array, dtype=object)
+    dispatch_events = geopandas.get_dispatch_events(clear=True)
+    rewrite_events = get_rewrite_events(clear=True)
+
+    expected = [
+        shapely.convex_hull(shapely.union_all(np.asarray(values[:12], dtype=object))),
+        shapely.convex_hull(shapely.union_all(np.asarray(values[12:], dtype=object))),
+    ]
+
+    assert any(
+        event.implementation == "grouped_dissolve_convex_hull_gpu"
+        for event in dispatch_events
+    )
+    assert any(
+        event.rule_name == "R12_dissolve_grouped_union_to_grouped_convex_hull"
+        for event in rewrite_events
+    )
+    assert shapely.area(shapely.symmetric_difference(actual[0], expected[0])) == 0.0
+    assert shapely.area(shapely.symmetric_difference(actual[1], expected[1])) == 0.0
 
 
 def test_public_dissolve_matches_public_union_all_component_order_for_nybb_fixture() -> None:
@@ -460,10 +678,10 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
     def _fail(*_args, **_kwargs):
         raise AssertionError("duplicate two-point buffered-line dissolve should bypass the generic grouped union path")
 
-    monkeypatch.setattr(dissolve_module, "_BUFFERED_LINE_EXACT_CPU_MAX_ROWS", 1)
     monkeypatch.setattr(dissolve_module, "execute_grouped_union_codes", _fail)
 
     clear_rewrite_events()
+    geopandas.clear_fallback_events()
     actual = evaluate_geopandas_dissolve(
         buffered,
         by="group",
@@ -478,6 +696,7 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
         agg_kwargs={},
     )
     rewrite_events = get_rewrite_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
 
     expected = geopandas.GeoDataFrame(
         {
@@ -492,6 +711,11 @@ def test_evaluate_geopandas_dissolve_rewrites_duplicate_two_point_buffered_lines
     assert any(
         event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
         for event in rewrite_events
+    )
+    assert not any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        for event in fallback_events
     )
     actual_geom = np.asarray(actual.geometry.array, dtype=object)[0]
     expected_geom = np.asarray(expected.geometry.array, dtype=object)[0]
@@ -779,19 +1003,21 @@ def test_device_backed_buffered_line_dissolve_preserves_owned_backing() -> None:
     assert isinstance(result.geometry.values, DeviceGeometryArray)
     assert getattr(result.geometry.values, "_owned", None) is not None
     assert any(
-        event.surface == "geopandas.geodataframe.dissolve"
-        and "small buffered-line dissolve" in event.reason
-        and event.d2h_transfer
-        for event in fallback_events
-    )
-    assert not any(
-        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+        event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
         for event in rewrite_events
     )
+    assert not any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        for event in fallback_events
+    )
+    actual_geom = np.asarray(result.geometry.array, dtype=object)[0]
+    expected_geom = shapely.union_all(np.asarray(buffered.geometry.array, dtype=object))
+    assert shapely.area(shapely.symmetric_difference(actual_geom, expected_geom)) == 0.0
 
 
 @pytest.mark.gpu
-def test_device_backed_buffered_line_dissolve_strict_native_rejects_cpu_rescue() -> None:
+def test_device_backed_buffered_line_dissolve_strict_native_uses_exact_gpu_rewrite() -> None:
     lines = [
         LineString([(float(i), 0.0), (float(i), 10.0)])
         for i in range(64)
@@ -816,26 +1042,33 @@ def test_device_backed_buffered_line_dissolve_strict_native_rejects_cpu_rescue()
     assert getattr(buffered.geometry.values, "_provenance", None) is not None
 
     clear_rewrite_events()
+    geopandas.clear_fallback_events()
     with strict_native_environment():
-        with pytest.raises(StrictNativeFallbackError):
-            evaluate_geopandas_dissolve(
-                buffered,
-                by="group",
-                aggfunc="first",
-                as_index=True,
-                level=None,
-                sort=True,
-                observed=False,
-                dropna=True,
-                method="unary",
-                grid_size=None,
-                agg_kwargs={},
-            )
+        result = evaluate_geopandas_dissolve(
+            buffered,
+            by="group",
+            aggfunc="first",
+            as_index=True,
+            level=None,
+            sort=True,
+            observed=False,
+            dropna=True,
+            method="unary",
+            grid_size=None,
+            agg_kwargs={},
+        )
     rewrite_events = get_rewrite_events(clear=True)
+    fallback_events = geopandas.get_fallback_events(clear=True)
 
-    assert not any(
-        event.rule_name == "R8_dissolve_buffered_lines_to_disjoint_subset"
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert any(
+        event.rule_name == "R9_dissolve_buffered_two_point_lines_exact_union"
         for event in rewrite_events
+    )
+    assert not any(
+        event.surface == "geopandas.geodataframe.dissolve"
+        and "small buffered-line dissolve" in event.reason
+        for event in fallback_events
     )
 
 

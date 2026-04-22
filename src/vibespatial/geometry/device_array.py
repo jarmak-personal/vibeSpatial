@@ -260,6 +260,10 @@ class DeviceGeometryArray(ExtensionArray):
         Uses vectorized numpy indexing instead of per-element Python loop
         (VPAT001 compliance).
         """
+        if self._owned._tags is None and self._owned.device_state is not None:
+            self._owned._tags = get_cuda_runtime().copy_device_to_host(
+                self._owned.device_state.tags
+            )
         tags = self._owned.tags
         result = np.empty(len(tags), dtype=object)
         for tag_value, name in _TAG_TO_GEOM_TYPE_NAME.items():
@@ -2121,18 +2125,24 @@ def _copy_device_family_buffer(device_buf: DeviceFamilyGeometryBuffer) -> Device
         part_offsets=None if device_buf.part_offsets is None else cp.copy(device_buf.part_offsets),
         ring_offsets=None if device_buf.ring_offsets is None else cp.copy(device_buf.ring_offsets),
         bounds=None if device_buf.bounds is None else cp.copy(device_buf.bounds),
+        dense_single_ring_width=device_buf.dense_single_ring_width,
     )
 
 
 def _copy_owned_array(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     new_owned = OwnedGeometryArray(
-        validity=owned.validity.copy(),
-        tags=owned.tags.copy(),
-        family_row_offsets=owned.family_row_offsets.copy(),
+        validity=None if owned._validity is None else owned._validity.copy(),
+        tags=None if owned._tags is None else owned._tags.copy(),
+        family_row_offsets=(
+            None
+            if owned._family_row_offsets is None
+            else owned._family_row_offsets.copy()
+        ),
         families={family: _copy_family_buffer(buf) for family, buf in owned.families.items()},
         residency=owned.residency,
         geoarrow_backed=owned.geoarrow_backed,
         shares_geoarrow_memory=False,
+        _row_count=owned.row_count,
     )
     if owned.device_state is not None:
         new_owned.device_state = OwnedGeometryDeviceState(
@@ -2152,6 +2162,8 @@ def _copy_owned_array(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     cached_validity = owned._current_cached_validity_mask()
     if cached_validity is not None:
         new_owned._cached_is_valid_mask = cached_validity.copy()
+    if hasattr(owned, "_grouped_convex_hull_source"):
+        new_owned._grouped_convex_hull_source = owned._grouped_convex_hull_source
     return new_owned
 
 

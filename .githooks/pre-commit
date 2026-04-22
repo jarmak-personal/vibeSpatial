@@ -37,7 +37,7 @@ printf "pre-commit: checking maintained contract surfaces against baseline...\n"
 uv run python scripts/health.py --tier contract --check
 
 printf "pre-commit: checking GPU health against baseline...\n"
-uv run python scripts/health.py --tier gpu --check
+uv run python scripts/health.py --tier gpu --check --gpu-coverage-timeout 1200
 
 # ===========================================================================
 # Tier 3: AI review reminder

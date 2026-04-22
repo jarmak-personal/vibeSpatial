@@ -610,6 +610,7 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
             timeout=args.timeout,
             quiet=args.quiet,
             scale=args.scale,
+            profile=args.json_output,
         )
         texts.append(render_shootout(result, mode=mode))
         if result.status != "pass":

@@ -55,6 +55,7 @@ from vibespatial.runtime.dispatch import record_dispatch_event
 from vibespatial.runtime.fallbacks import record_fallback_event, strict_native_mode_enabled
 from vibespatial.runtime.kernel_registry import register_kernel_variant
 from vibespatial.runtime.precision import KernelClass, PrecisionMode
+from vibespatial.runtime.provenance import provenance_rewrites_enabled, record_rewrite_event
 from vibespatial.runtime.residency import Residency
 
 if TYPE_CHECKING:
@@ -627,6 +628,132 @@ def _convex_hull_gpu(owned: OwnedGeometryArray) -> OwnedGeometryArray:
     )
 
 
+def _grouped_convex_hull_from_source_owned(
+    source_owned: OwnedGeometryArray,
+    group_offsets: np.ndarray,
+) -> OwnedGeometryArray | None:
+    """Compute hulls for dissolve groups without materializing group unions.
+
+    The physical shape is ``dissolve(...).geometry.convex_hull``.  The hull of
+    a union is exactly the hull of every coordinate that participated in that
+    union, so the exact grouped-union geometry does not need to be reopened.
+    """
+    if cp is None or source_owned.residency is not Residency.DEVICE:
+        return None
+
+    offsets = np.asarray(group_offsets, dtype=np.int64)
+    if offsets.ndim != 1 or offsets.size < 2:
+        return None
+    if int(offsets[0]) != 0 or int(offsets[-1]) != int(source_owned.row_count):
+        return None
+    group_count = int(offsets.size - 1)
+    if group_count <= 0 or np.any(offsets[1:] < offsets[:-1]):
+        return None
+
+    try:
+        from vibespatial.constructive.binary_constructive import (
+            _explode_polygonal_rows_to_polygons_gpu,
+        )
+
+        exploded = _explode_polygonal_rows_to_polygons_gpu(source_owned)
+        if exploded is None:
+            return None
+        polygon_parts, d_part_source_rows = exploded
+        if polygon_parts.row_count == 0:
+            return None
+
+        d_offsets = cp.asarray(offsets, dtype=cp.int64)
+        d_part_source_rows = cp.asarray(d_part_source_rows, dtype=cp.int64)
+        d_group_ids = (
+            cp.searchsorted(d_offsets, d_part_source_rows, side="right").astype(
+                cp.int64,
+                copy=False,
+            )
+            - 1
+        )
+        valid_group_ids = (d_group_ids >= 0) & (d_group_ids < group_count)
+        if not bool(cp.all(valid_group_ids)):
+            return None
+
+        part_count = int(d_group_ids.size)
+        d_order = cp.argsort(
+            d_group_ids * np.int64(max(part_count, 1))
+            + cp.arange(part_count, dtype=cp.int64),
+        ).astype(cp.int64, copy=False)
+        sorted_parts = polygon_parts.take(d_order)
+        d_sorted_group_ids = d_group_ids[d_order]
+        d_group_counts = cp.bincount(
+            d_sorted_group_ids,
+            minlength=group_count,
+        ).astype(cp.int32, copy=False)
+        if bool(cp.any(d_group_counts == 0)):
+            return None
+
+        d_group_offsets = cp.empty(group_count + 1, dtype=cp.int32)
+        d_group_offsets[0] = 0
+        cp.cumsum(d_group_counts, out=d_group_offsets[1:])
+
+        sorted_state = sorted_parts._ensure_device_state()
+        polygon_buffer = sorted_state.families.get(GeometryFamily.POLYGON)
+        if polygon_buffer is None:
+            return None
+
+        grouped_buffer = DeviceFamilyGeometryBuffer(
+            family=GeometryFamily.MULTIPOLYGON,
+            x=polygon_buffer.x,
+            y=polygon_buffer.y,
+            geometry_offsets=d_group_offsets,
+            empty_mask=cp.zeros(group_count, dtype=cp.bool_),
+            part_offsets=polygon_buffer.geometry_offsets,
+            ring_offsets=polygon_buffer.ring_offsets,
+            bounds=None,
+        )
+        grouped_owned = build_device_resident_owned(
+            device_families={GeometryFamily.MULTIPOLYGON: grouped_buffer},
+            row_count=group_count,
+            tags=cp.full(
+                group_count,
+                FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+                dtype=cp.int8,
+            ),
+            validity=cp.ones(group_count, dtype=cp.bool_),
+            family_row_offsets=cp.arange(group_count, dtype=cp.int32),
+            execution_mode="gpu",
+        )
+        result = _convex_hull_gpu(grouped_owned)
+    except Exception:
+        logger.debug(
+            "grouped dissolve convex-hull rewrite failed; using regular hull",
+            exc_info=True,
+        )
+        return None
+
+    record_rewrite_event(
+        rule_name="R12_dissolve_grouped_union_to_grouped_convex_hull",
+        surface="geopandas.array.convex_hull",
+        original_operation="convex_hull(dissolve(method=unary))",
+        rewritten_operation="grouped_convex_hull",
+        reason=(
+            "convex_hull(union(group)) is equivalent to convex_hull over the "
+            "original grouped member coordinates"
+        ),
+        detail=f"groups={group_count}, source_rows={source_owned.row_count}",
+    )
+    record_dispatch_event(
+        surface="geopandas.array.convex_hull",
+        operation="convex_hull",
+        requested=ExecutionMode.AUTO,
+        selected=ExecutionMode.GPU,
+        implementation="grouped_dissolve_convex_hull_gpu",
+        reason="dissolve grouped-union provenance avoided exact-union hull input",
+        detail=(
+            f"groups={group_count}, source_rows={source_owned.row_count}, "
+            f"polygon_parts={polygon_parts.row_count}"
+        ),
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public dispatch API
 # ---------------------------------------------------------------------------
@@ -664,6 +791,22 @@ def convex_hull_owned(
         from vibespatial.geometry.owned import from_shapely_geometries
 
         return from_shapely_geometries([])
+
+    requested_mode = (
+        dispatch_mode
+        if isinstance(dispatch_mode, ExecutionMode)
+        else ExecutionMode(dispatch_mode)
+    )
+    if (
+        requested_mode is not ExecutionMode.CPU
+        and provenance_rewrites_enabled()
+        and (grouped_source := getattr(owned, "_grouped_convex_hull_source", None))
+        is not None
+    ):
+        source_owned, group_offsets = grouped_source
+        result = _grouped_convex_hull_from_source_owned(source_owned, group_offsets)
+        if result is not None:
+            return result
 
     selection = plan_dispatch_selection(
         kernel_name="convex_hull",

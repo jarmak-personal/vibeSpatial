@@ -15,8 +15,10 @@ import shapely
 from shapely.geometry import box
 
 import geopandas
+import vibespatial
 from tests.upstream.geopandas.tests.util import _NATURALEARTH_LOWRES
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
+from vibespatial.runtime.residency import Residency
 
 # ---------------------------------------------------------------------------
 # GPU availability check
@@ -285,6 +287,81 @@ class TestUnionAllGPU:
 
         assert bool(shapely.is_valid(result_geom))
         assert _geom_equiv(result_geom, expected)
+
+    def test_single_row_union_preserves_enclosed_hole(self):
+        """Single-row union must not fill holes created by coverage boundaries."""
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+        parts = np.asarray(
+            [
+                box(-25.0, -25.0, 1025.0, 25.0),
+                box(-25.0, -25.0, 25.0, 1025.0),
+                box(-25.0, 175.0, 1025.0, 225.0),
+                box(175.0, -25.0, 225.0, 1025.0),
+            ],
+            dtype=object,
+        )
+        left_poly = shapely.union(parts[0], parts[1])
+        right_poly = shapely.union(parts[2], parts[3])
+
+        result = binary_constructive_owned(
+            "union",
+            from_shapely_geometries([left_poly]),
+            from_shapely_geometries([right_poly]),
+            dispatch_mode="gpu",
+        )
+        result_geom = _to_shapely(result)
+        expected = shapely.union_all(parts)
+
+        assert bool(shapely.is_valid(result_geom))
+        assert len(getattr(result_geom, "interiors", [])) == 1
+        assert _geom_equiv(result_geom, expected)
+
+    def test_single_row_tiny_degenerate_partner_union_preserves_dominant_polygon(self):
+        """Near-collinear sliver partners should not invalidate GPU union."""
+        from vibespatial.constructive.binary_constructive import binary_constructive_owned
+
+        left_poly = shapely.from_wkt(
+            "POLYGON ((360533.11793419765 3077767.725309121, "
+            "360483.9865379098 3077624.8725980986, "
+            "360531.4637954387 3077624.324575401, "
+            "360533.11793419765 3077767.725309121))"
+        )
+        right_poly = shapely.from_wkt(
+            "POLYGON ((360531.46379543876 3077624.3245754014, "
+            "360531.4637954393 3077624.3245754014, "
+            "360531.4637954401 3077624.324575401, "
+            "360533.11793419905 3077767.725309125, "
+            "360533.11793419765 3077767.7253091214, "
+            "360531.46379543876 3077624.3245754014))"
+        )
+
+        left = from_shapely_geometries([left_poly])
+        right = from_shapely_geometries([right_poly])
+        vibespatial.clear_fallback_events()
+        result = binary_constructive_owned("union", left, right, dispatch_mode="gpu")
+        fallback_events = vibespatial.get_fallback_events(clear=True)
+        result_geom = _to_shapely(result)
+        expected = shapely.union(left_poly, right_poly)
+
+        assert fallback_events == []
+        assert bool(shapely.is_valid(result_geom))
+        assert _geom_equiv(result_geom, expected, tolerance=1.0e-5)
+
+    def test_tiny_union_rescue_rejects_intersecting_exterior_sliver(self):
+        """The dominant rescue must not drop tiny area outside the dominant polygon."""
+        from vibespatial.constructive.binary_constructive import (
+            _dominant_tiny_area_polygon_union_rows_gpu,
+        )
+
+        dominant = box(0.0, 0.0, 10.0, 10.0)
+        exterior_sliver = box(10.0 - 1.0e-9, 4.0, 10.0 + 1.0e-9, 4.0 + 1.0e-9)
+        left = from_shapely_geometries([dominant], residency=Residency.DEVICE)
+        right = from_shapely_geometries([exterior_sliver], residency=Residency.DEVICE)
+
+        result = _dominant_tiny_area_polygon_union_rows_gpu(left, right)
+
+        assert result is None
 
     def test_multi_row_union_uses_batched_partition_not_per_row_exact(self, monkeypatch):
         """Aligned batches must not fall back to one exact overlay graph per row."""

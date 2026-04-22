@@ -372,6 +372,156 @@ def _area_gpu(
     return result
 
 
+def _area_gpu_device_fp64(owned: OwnedGeometryArray):
+    """Compute owned geometry areas into a device-resident float64 array.
+
+    This is an internal residency-preserving helper for GPU assembly paths
+    that need a boolean area filter, not a public GeoPandas/NumPy result.
+    Public ``area_owned`` keeps the precision-planned host-return contract.
+    """
+    if owned.row_count == 0:
+        runtime = get_cuda_runtime()
+        return runtime.allocate((0,), np.float64)
+
+    try:
+        import cupy as cp
+    except ModuleNotFoundError as exc:  # pragma: no cover - GPU guard
+        raise RuntimeError("CuPy is required for device-resident area") from exc
+
+    runtime = get_cuda_runtime()
+    device_state = owned._ensure_device_state()
+    d_result = cp.zeros(owned.row_count, dtype=cp.float64)
+    d_tags = cp.asarray(device_state.tags)
+    d_family_row_offsets = cp.asarray(device_state.family_row_offsets)
+    center_x, center_y = _fp32_center_coords(owned)
+
+    if GeometryFamily.POLYGON in device_state.families:
+        ds = device_state.families[GeometryFamily.POLYGON]
+        n = int(ds.empty_mask.size)
+        if n > 0:
+            avg_verts = int(ds.x.size) / max(n, 1)
+            use_cooperative = avg_verts >= 64
+            if use_cooperative:
+                kernels = _compile_kernel(
+                    "polygon-area-cooperative",
+                    _POLYGON_AREA_COOPERATIVE_FP64,
+                    _POLYGON_AREA_COOPERATIVE_FP32,
+                    _POLYGON_AREA_COOPERATIVE_NAMES,
+                    "double",
+                )
+                kernel = kernels["polygon_area_cooperative"]
+            else:
+                kernels = _compile_kernel(
+                    "polygon-area",
+                    _POLYGON_AREA_FP64,
+                    _POLYGON_AREA_FP32,
+                    _POLYGON_AREA_NAMES,
+                    "double",
+                )
+                kernel = kernels["polygon_area"]
+
+            d_out = runtime.allocate((n,), np.float64)
+            try:
+                ptr = runtime.pointer
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.ring_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_out),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+                if use_cooperative:
+                    grid = (n, 1, 1)
+                    block = (256, 1, 1)
+                else:
+                    grid, block = runtime.launch_config(kernel, n)
+                runtime.launch(kernel, grid=grid, block=block, params=params)
+
+                global_rows = cp.flatnonzero(
+                    d_tags == FAMILY_TAGS[GeometryFamily.POLYGON],
+                ).astype(cp.int64, copy=False)
+                if int(global_rows.size) > 0:
+                    family_rows = d_family_row_offsets[global_rows].astype(
+                        cp.int64,
+                        copy=False,
+                    )
+                    d_result[global_rows] = d_out[family_rows]
+            finally:
+                runtime.free(d_out)
+
+    if GeometryFamily.MULTIPOLYGON in device_state.families:
+        ds = device_state.families[GeometryFamily.MULTIPOLYGON]
+        n = int(ds.empty_mask.size)
+        if n > 0:
+            kernels = _compile_kernel(
+                "multipolygon-area",
+                _MULTIPOLYGON_AREA_FP64,
+                _MULTIPOLYGON_AREA_FP32,
+                _MULTIPOLYGON_AREA_NAMES,
+                "double",
+            )
+            kernel = kernels["multipolygon_area"]
+            d_out = runtime.allocate((n,), np.float64)
+            try:
+                ptr = runtime.pointer
+                params = (
+                    (
+                        ptr(ds.x),
+                        ptr(ds.y),
+                        ptr(ds.ring_offsets),
+                        ptr(ds.part_offsets),
+                        ptr(ds.geometry_offsets),
+                        ptr(d_out),
+                        center_x,
+                        center_y,
+                        n,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_F64,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+                grid, block = runtime.launch_config(kernel, n)
+                runtime.launch(kernel, grid=grid, block=block, params=params)
+
+                global_rows = cp.flatnonzero(
+                    d_tags == FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+                ).astype(cp.int64, copy=False)
+                if int(global_rows.size) > 0:
+                    family_rows = d_family_row_offsets[global_rows].astype(
+                        cp.int64,
+                        copy=False,
+                    )
+                    d_result[global_rows] = d_out[family_rows]
+            finally:
+                runtime.free(d_out)
+
+    d_result[~cp.asarray(device_state.validity)] = cp.nan
+    return d_result
+
+
 # ---------------------------------------------------------------------------
 # GPU implementation: Length
 # ---------------------------------------------------------------------------

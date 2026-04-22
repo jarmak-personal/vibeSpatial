@@ -52,6 +52,128 @@ def _sync_hotpath(runtime) -> None:
         runtime.synchronize()
 
 
+def _ring_segment_signatures_gpu(
+    *,
+    kernels,
+    runtime,
+    d_all_coord_offsets: cp.ndarray,
+    d_all_edge_counts: cp.ndarray,
+    d_all_x: cp.ndarray,
+    d_all_y: cp.ndarray,
+    total_ring_count: int,
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Compute orientation-independent ring segment signatures on device."""
+    d_hash_sum = cp.empty(total_ring_count, dtype=cp.uint64)
+    d_hash_xor = cp.empty(total_ring_count, dtype=cp.uint64)
+    grid, block = runtime.launch_config(
+        kernels["compute_ring_segment_signatures"],
+        total_ring_count,
+    )
+    runtime.launch(
+        kernels["compute_ring_segment_signatures"],
+        grid=grid,
+        block=block,
+        params=(
+            (
+                runtime.pointer(d_all_coord_offsets),
+                runtime.pointer(d_all_edge_counts),
+                runtime.pointer(d_all_x),
+                runtime.pointer(d_all_y),
+                runtime.pointer(d_hash_sum),
+                runtime.pointer(d_hash_xor),
+                total_ring_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        ),
+    )
+    _sync_hotpath(runtime)
+    return d_hash_sum, d_hash_xor
+
+
+def _filter_duplicate_output_holes_gpu(
+    *,
+    kernels,
+    runtime,
+    d_output_ring_ids: cp.ndarray,
+    d_out_ext_id: cp.ndarray,
+    d_out_source_row: cp.ndarray,
+    d_out_is_ext: cp.ndarray,
+    d_all_coord_offsets: cp.ndarray,
+    d_all_edge_counts: cp.ndarray,
+    d_all_x: cp.ndarray,
+    d_all_y: cp.ndarray,
+    boundary_ring_count: int,
+    total_ring_count: int,
+) -> cp.ndarray:
+    """Drop duplicate hole rings emitted by both boundary and hole walks.
+
+    Overlay union can expose the same hole boundary twice: once as a selected
+    boundary cycle and once as the unselected bounded face. Prefer the
+    extracted unselected-face ring per (row, exterior, undirected segment set)
+    because it carries hole semantics even when the boundary copy has positive
+    orientation.
+    """
+    if d_output_ring_ids.size <= 1:
+        return d_output_ring_ids
+
+    d_hole_positions = cp.flatnonzero(d_out_is_ext == 0).astype(cp.int32, copy=False)
+    if int(d_hole_positions.size) <= 1:
+        return d_output_ring_ids
+
+    d_hash_sum, d_hash_xor = _ring_segment_signatures_gpu(
+        kernels=kernels,
+        runtime=runtime,
+        d_all_coord_offsets=d_all_coord_offsets,
+        d_all_edge_counts=d_all_edge_counts,
+        d_all_x=d_all_x,
+        d_all_y=d_all_y,
+        total_ring_count=total_ring_count,
+    )
+
+    d_hole_ring_ids = d_output_ring_ids[d_hole_positions]
+    d_is_extracted = (d_hole_ring_ids >= boundary_ring_count).astype(cp.int32, copy=False)
+    d_extracted_first = 1 - d_is_extracted
+    d_sort_order = cp.lexsort(
+        cp.stack((
+            d_extracted_first,
+            d_hash_xor[d_hole_ring_ids],
+            d_hash_sum[d_hole_ring_ids],
+            d_all_edge_counts[d_hole_ring_ids].astype(cp.int64, copy=False),
+            d_out_ext_id[d_hole_positions].astype(cp.int64, copy=False),
+            d_out_source_row[d_hole_positions].astype(cp.int64, copy=False),
+        ))
+    )
+    if int(d_sort_order.size) <= 1:
+        return d_output_ring_ids
+
+    d_sorted_positions = d_hole_positions[d_sort_order]
+    d_sorted_rings = d_output_ring_ids[d_sorted_positions]
+    d_same_previous = cp.zeros(int(d_sort_order.size), dtype=cp.bool_)
+    d_same_previous[1:] = (
+        (d_out_source_row[d_sorted_positions[1:]] == d_out_source_row[d_sorted_positions[:-1]])
+        & (d_out_ext_id[d_sorted_positions[1:]] == d_out_ext_id[d_sorted_positions[:-1]])
+        & (d_all_edge_counts[d_sorted_rings[1:]] == d_all_edge_counts[d_sorted_rings[:-1]])
+        & (d_hash_sum[d_sorted_rings[1:]] == d_hash_sum[d_sorted_rings[:-1]])
+        & (d_hash_xor[d_sorted_rings[1:]] == d_hash_xor[d_sorted_rings[:-1]])
+    )
+
+    d_duplicate_positions = d_sorted_positions[d_same_previous]
+    if int(d_duplicate_positions.size) == 0:
+        return d_output_ring_ids
+
+    d_keep = cp.ones(int(d_output_ring_ids.size), dtype=cp.bool_)
+    d_keep[d_duplicate_positions] = False
+    return d_output_ring_ids[d_keep]
+
+
 def _has_polygonal_families(geom: OwnedGeometryArray) -> bool:
     """Return True if the geometry array has POLYGON or MULTIPOLYGON families."""
     return (
@@ -733,6 +855,10 @@ def _build_polygon_output_from_faces_gpu(
 
     # Check if there are any holes assigned
     d_is_hole = (d_exterior_id >= 0) & (d_exterior_id != cp.arange(total_ring_count, dtype=cp.int32))
+    d_can_be_hole = cp.ones(total_ring_count, dtype=cp.int8)
+    d_can_be_hole[:boundary_ring_count] = (
+        d_all_area[:boundary_ring_count] <= 0.0
+    ).astype(cp.int8, copy=False)
     n_assigned_holes = int(
         cp.flatnonzero(d_is_hole).astype(cp.int32, copy=False).size
     )
@@ -747,11 +873,11 @@ def _build_polygon_output_from_faces_gpu(
             grid=sibling_depth_grid, block=sibling_depth_block,
             params=(
                 (ptr(d_ring_sample_x), ptr(d_ring_sample_y), ptr(d_all_area),
-                 ptr(d_exterior_id), ptr(d_all_coord_offsets),
+                 ptr(d_exterior_id), ptr(d_can_be_hole), ptr(d_all_coord_offsets),
                  ptr(d_all_edge_counts), ptr(d_all_x), ptr(d_all_y),
                  ptr(d_sibling_depth), total_ring_count),
                 (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                  KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
                  KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
             ),
@@ -762,7 +888,7 @@ def _build_polygon_output_from_faces_gpu(
         # --- Step 10: Device-resident output assembly ---
         # Build GeoArrow-format polygon output entirely on device.
         # Valid holes: assigned to an exterior AND even sibling depth.
-        d_valid_hole_mask = d_is_hole & ((d_sibling_depth % 2) == 0)
+        d_valid_hole_mask = d_is_hole & (d_can_be_hole != 0) & ((d_sibling_depth % 2) == 0)
 
         # Also filter: only keep holes whose assigned exterior is a true exterior
         d_ext_is_valid = d_exterior_mask_full[d_exterior_id.clip(0, total_ring_count - 1)]
@@ -787,6 +913,33 @@ def _build_polygon_output_from_faces_gpu(
                 row_count=preserve_row_count or 0,
             )
 
+        d_out_ext_id = cp.where(
+            d_exterior_mask_full[d_output_ring_ids],
+            d_output_ring_ids,
+            d_exterior_id[d_output_ring_ids],
+        )
+        d_out_source_row = d_all_source_rows[d_output_ring_ids]
+        d_out_is_ext = d_exterior_mask_full[d_output_ring_ids].astype(cp.int32)
+        d_output_ring_ids = _filter_duplicate_output_holes_gpu(
+            kernels=kernels,
+            runtime=runtime,
+            d_output_ring_ids=d_output_ring_ids,
+            d_out_ext_id=d_out_ext_id,
+            d_out_source_row=d_out_source_row,
+            d_out_is_ext=d_out_is_ext,
+            d_all_coord_offsets=d_all_coord_offsets,
+            d_all_edge_counts=d_all_edge_counts,
+            d_all_x=d_all_x,
+            d_all_y=d_all_y,
+            boundary_ring_count=boundary_ring_count,
+            total_ring_count=total_ring_count,
+        )
+        n_output_rings = int(d_output_ring_ids.size)
+        if n_output_rings == 0:
+            return _empty_polygon_output(
+                faces.runtime_selection,
+                row_count=preserve_row_count or 0,
+            )
         d_out_ext_id = cp.where(
             d_exterior_mask_full[d_output_ring_ids],
             d_output_ring_ids,

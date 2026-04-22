@@ -1029,22 +1029,22 @@ def test_multipolygon_polygon_intersection_regroups_with_grouped_union_plan(
         [
             MultiPolygon(
                 [
-                    box(0, 0, 2, 2),
-                    box(4, 0, 6, 2),
+                    Polygon([(0, 0), (3, 0), (0, 3), (0, 0)]),
+                    Polygon([(4, 4), (1, 4), (4, 1), (4, 4)]),
                 ]
             ),
             MultiPolygon(
                 [
-                    box(10, 0, 12, 2),
-                    box(14, 0, 16, 2),
+                    Polygon([(10, 0), (13, 0), (10, 3), (10, 0)]),
+                    Polygon([(14, 4), (11, 4), (14, 1), (14, 4)]),
                 ]
             ),
         ]
     )
     right = from_shapely_geometries(
         [
-            box(1, 0, 5, 2),
-            box(11, 0, 12, 2),
+            box(-1, -1, 5, 5),
+            box(9, -1, 15, 5),
         ]
     )
 

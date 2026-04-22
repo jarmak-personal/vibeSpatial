@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 import shapely
-from shapely.geometry import LineString, Point, box
+from shapely.geometry import LineString, Point, Polygon, box
 
 import vibespatial as geopandas
 from tests.upstream.geopandas.tests.util import (
@@ -134,6 +134,86 @@ def test_binary_predicate_gpu_intersects_matches_host_for_scalar_polygon_regress
 
     np.testing.assert_array_equal(np.asarray(gpu.values, dtype=bool), expected)
     assert bool(gpu.values[62]) is True
+
+
+@pytest.mark.gpu
+def test_single_mask_covered_by_gpu_probe_matches_shapely_for_no_hole_mask() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.predicates.binary import _evaluate_covered_by_single_polygonal_mask_gpu
+
+    left_geoms = [
+        box(1, 1, 2, 2),
+        box(8, 8, 12, 12),
+        Polygon([(0, 5), (5, 5), (5, 8), (0, 8), (0, 5)]),
+        None,
+    ]
+    mask_geom = box(0, 0, 10, 10)
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([mask_geom], residency=Residency.DEVICE)
+
+    result = _evaluate_covered_by_single_polygonal_mask_gpu(left, mask)
+
+    assert result is not None
+    expected = [
+        False if geom is None else bool(geom.covered_by(mask_geom))
+        for geom in left_geoms
+    ]
+    assert result.tolist() == expected
+
+
+@pytest.mark.gpu
+def test_single_mask_covered_by_gpu_probe_matches_shapely_for_hole_mask() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.predicates.binary import _evaluate_covered_by_single_polygonal_mask_gpu
+
+    mask_geom = Polygon(
+        [(0, 0), (10, 0), (10, 10), (0, 10), (0, 0)],
+        holes=[[(4, 4), (6, 4), (6, 6), (4, 6), (4, 4)]],
+    )
+    left_geoms = [box(1, 1, 2, 2), box(4.25, 4.25, 5.75, 5.75)]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([mask_geom], residency=Residency.DEVICE)
+
+    result = _evaluate_covered_by_single_polygonal_mask_gpu(left, mask)
+
+    assert result is not None
+    expected = [bool(geom.covered_by(mask_geom)) for geom in left_geoms]
+    assert result.tolist() == expected
+
+
+@pytest.mark.gpu
+def test_single_mask_covered_by_gpu_probe_matches_shapely_for_concave_mask() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    from vibespatial.predicates.binary import _evaluate_covered_by_single_polygonal_mask_gpu
+
+    mask_geom = Polygon(
+        [
+            (0, 0),
+            (5, 0),
+            (5, 5),
+            (3, 5),
+            (3, 2),
+            (2, 2),
+            (2, 5),
+            (0, 5),
+            (0, 0),
+        ],
+    )
+    left_geoms = [box(0.5, 0.5, 1.5, 1.5), box(2.25, 3.0, 2.75, 4.0)]
+    left = from_shapely_geometries(left_geoms, residency=Residency.DEVICE)
+    mask = from_shapely_geometries([mask_geom], residency=Residency.DEVICE)
+
+    result = _evaluate_covered_by_single_polygonal_mask_gpu(left, mask)
+
+    assert result is not None
+    expected = [bool(geom.covered_by(mask_geom)) for geom in left_geoms]
+    assert result.tolist() == expected
 
 
 def test_binary_predicate_explicit_gpu_request_fails_for_unsupported_candidate_pairs(monkeypatch) -> None:

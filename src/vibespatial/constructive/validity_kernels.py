@@ -64,6 +64,31 @@ _IS_VALID_RINGS_FP64 = _IS_VALID_RINGS_KERNEL_SOURCE.format(compute_type="double
 # ---------------------------------------------------------------------------
 
 _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE = PRECISION_PREAMBLE + r"""
+__device__ inline int point_strictly_on_segment_validity(
+    const double px,
+    const double py,
+    const double ax,
+    const double ay,
+    const double bx,
+    const double by
+) {{
+    if ((px == ax && py == ay) || (px == bx && py == by)) {{
+        return 0;
+    }}
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    const double cross = (px - ax) * dy - (py - ay) * dx;
+    const double scale = fabs(dx) + fabs(dy) + 1.0;
+    if (fabs(cross) > VS_SPATIAL_EPSILON * scale) {{
+        return 0;
+    }}
+    const double minx = fmin(ax, bx) - VS_SPATIAL_EPSILON;
+    const double maxx = fmax(ax, bx) + VS_SPATIAL_EPSILON;
+    const double miny = fmin(ay, by) - VS_SPATIAL_EPSILON;
+    const double maxy = fmax(ay, by) + VS_SPATIAL_EPSILON;
+    return px >= minx && px <= maxx && py >= miny && py <= maxy;
+}}
+
 extern "C" __global__ __launch_bounds__(256, 4)
 void is_simple_segments(
     const double* __restrict__ x,
@@ -148,6 +173,16 @@ void is_simple_segments(
                     atomicExch(&found_crossing, 1);
                 }}
             }}
+
+            /* Check 3: non-adjacent vertex on another segment's interior.
+               GEOS reports these self-touches as ring self-intersections even
+               when the segment pair has no proper crossing. */
+            if (point_strictly_on_segment_validity(ax0, ay0, bx0, by0, bx1, by1) ||
+                point_strictly_on_segment_validity(ax1, ay1, bx0, by0, bx1, by1) ||
+                point_strictly_on_segment_validity(bx0, by0, ax0, ay0, ax1, ay1) ||
+                point_strictly_on_segment_validity(bx1, by1, ax0, ay0, ax1, ay1)) {{
+                atomicExch(&found_crossing, 1);
+            }}
         }}
     }}
 
@@ -159,6 +194,58 @@ void is_simple_segments(
 """
 _IS_SIMPLE_SEGMENTS_KERNEL_NAMES = ("is_simple_segments",)
 _IS_SIMPLE_SEGMENTS_FP64 = _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE.format(
+    compute_type="double",
+)
+_IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE = (
+    PRECISION_PREAMBLE
+    + ORIENT2D_DEVICE
+    + SEGMENT_CROSSING_DEVICE
+    + _IS_SIMPLE_SEGMENTS_KERNEL_SOURCE[len(PRECISION_PREAMBLE):]
+)
+_IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE = _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE.replace(
+    """    const double dx = bx - ax;
+    const double dy = by - ay;
+    const double cross = (px - ax) * dy - (py - ay) * dx;
+    const double scale = fabs(dx) + fabs(dy) + 1.0;
+    if (fabs(cross) > VS_SPATIAL_EPSILON * scale) {{
+        return 0;
+    }}
+    const double minx = fmin(ax, bx) - VS_SPATIAL_EPSILON;
+    const double maxx = fmax(ax, bx) + VS_SPATIAL_EPSILON;
+    const double miny = fmin(ay, by) - VS_SPATIAL_EPSILON;
+    const double maxy = fmax(ay, by) + VS_SPATIAL_EPSILON;
+    return px >= minx && px <= maxx && py >= miny && py <= maxy;
+""",
+    """    if (vs_orient2d(ax, ay, bx, by, px, py) != 0) {{
+        return 0;
+    }}
+    return vs_point_on_segment_collinear(px, py, ax, ay, bx, by);
+""",
+)
+_IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE = _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE.replace(
+    """            const double dx_b = bx1 - bx0;
+            const double dy_b = by1 - by0;
+            const double denom = dx_a * dy_b - dy_a * dx_b;
+
+            if (fabs(denom) > 1e-15) {{
+                const double dx_ab = bx0 - ax0;
+                const double dy_ab = by0 - ay0;
+                const double t = (dx_ab * dy_b - dy_ab * dx_b) / denom;
+                const double u = (dx_ab * dy_a - dy_ab * dx_a) / denom;
+                if (t > VS_SPATIAL_EPSILON && t < (1.0 - VS_SPATIAL_EPSILON) &&
+                    u > VS_SPATIAL_EPSILON && u < (1.0 - VS_SPATIAL_EPSILON)) {{
+                    atomicExch(&found_crossing, 1);
+                }}
+            }}
+""",
+    """            if (vs_segments_properly_cross(
+                    ax0, ay0, ax1, ay1,
+                    bx0, by0, bx1, by1)) {{
+                atomicExch(&found_crossing, 1);
+            }}
+""",
+)
+_IS_SIMPLE_SEGMENTS_EXACT_FP64 = _IS_SIMPLE_SEGMENTS_EXACT_KERNEL_SOURCE.format(
     compute_type="double",
 )
 # ---------------------------------------------------------------------------

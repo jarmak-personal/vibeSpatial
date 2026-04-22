@@ -99,6 +99,27 @@ class TestRingSelfIntersection:
         expected = np.array([shapely.is_valid(fig8)])
         np.testing.assert_array_equal(result, expected)
 
+    def test_non_adjacent_vertex_on_segment_self_touch_is_invalid(self, dispatch_mode):
+        """A non-adjacent vertex on a segment interior is a ring self-intersection."""
+        self_touch = Polygon(
+            [
+                (1.5, 0.25),
+                (3.5, 0.25),
+                (3.5, 1.0),
+                (1.5, 1.0),
+                (1.5, 3.0),
+                (3.5, 3.0),
+                (3.5, 3.75),
+                (1.5, 3.75),
+                (1.5, 0.25),
+            ]
+        )
+        owned, geoms = _build_owned(self_touch)
+        result = is_valid_owned(owned, dispatch_mode=dispatch_mode)
+        expected = np.array([shapely.is_valid(self_touch)])
+        np.testing.assert_array_equal(result, expected)
+        assert result[0] is np.bool_(False)
+
     def test_mixed_valid_invalid_batch(self, dispatch_mode):
         """Batch with valid and invalid polygons."""
         valid = Polygon([(0, 0), (1, 0), (1, 1), (0, 1), (0, 0)])

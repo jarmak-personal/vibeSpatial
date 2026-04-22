@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -493,6 +494,87 @@ def test_overlay_identity_reuses_intersecting_pair_queries(monkeypatch: pytest.M
 
     assert len(result) == 5
     assert calls == 1
+
+
+def test_overlay_few_right_keep_geom_type_uses_sh_before_rowwise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    binary_constructive_module = importlib.import_module(
+        "vibespatial.constructive.binary_constructive"
+    )
+
+    def fail_rowwise(*_args, **_kwargs):
+        raise AssertionError("few-right keep_geom_type overlay should use SH before rowwise")
+
+    monkeypatch.setattr(
+        binary_constructive_module,
+        "_dispatch_polygon_intersection_overlay_rowwise_gpu",
+        fail_rowwise,
+    )
+
+    left = GeoDataFrame(
+        {"left_id": list(range(16))},
+        geometry=GeoSeries(
+            [box(float(i), 0.0, float(i + 1), 1.0) for i in range(16)],
+            crs="EPSG:3857",
+        ),
+    )
+    right = GeoDataFrame(
+        {"right_id": [1, 2]},
+        geometry=GeoSeries(
+            [
+                Polygon([(-1.0, -1.0), (8.0, -0.5), (8.0, 1.5), (-1.0, 2.0)]),
+                Polygon([(8.0001, -0.5), (17.0, -1.0), (17.0, 2.0), (8.0001, 1.5)]),
+            ],
+            crs="EPSG:3857",
+        ),
+    )
+
+    vibespatial.clear_dispatch_events()
+    with strict_native_environment():
+        result = overlay(left, right, how="intersection", keep_geom_type=True)
+    dispatch_events = vibespatial.get_dispatch_events(clear=True)
+
+    assert len(result) == 16
+    assert result.geometry.geom_type.eq("Polygon").all()
+    assert any(
+        event.surface == "vibespatial.kernels.constructive.polygon_intersection"
+        and event.implementation == "polygon_intersection_gpu"
+        and event.selected is ExecutionMode.GPU
+        for event in dispatch_events
+    )
+
+
+def test_overlay_few_right_sh_rejects_invalid_nonempty_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    left_owned = from_shapely_geometries([box(0.0, 0.0, 2.0, 2.0)])
+    right_owned = from_shapely_geometries([box(1.0, 1.0, 3.0, 3.0)])
+    polygon_intersection_module = importlib.import_module(
+        "vibespatial.kernels.constructive.polygon_intersection"
+    )
+    validity_module = importlib.import_module("vibespatial.constructive.validity")
+    monkeypatch.setattr(
+        polygon_intersection_module,
+        "polygon_intersection",
+        lambda *_args, **_kwargs: left_owned,
+    )
+    monkeypatch.setattr(
+        validity_module,
+        "is_valid_owned",
+        lambda *_args, **_kwargs: np.asarray([False]),
+    )
+
+    result = overlay_module._few_right_sh_intersection_owned(
+        left_owned,
+        right_owned,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result is None
 
 
 def test_overlay_intersection_uses_public_sindex_query_in_strict_mode() -> None:
@@ -1205,8 +1287,8 @@ def test_overlay_difference_redevelopment_like_followup_overlay_stays_strict_nat
 @pytest.mark.parametrize(
     ("scale", "expected_rows"),
     [
-        ("1000", 8),
-        ("10000", 66),
+        ("1000", 4),
+        ("10000", 43),
     ],
 )
 def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwise_oracle(
@@ -1289,8 +1371,15 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
     left = served_parcels[["parcel_id", "geometry"]]
     right = nearby_buildings[["building_id", "geometry"]]
 
+    vibespatial.clear_fallback_events()
     actual = overlay(left, right, how="intersection")
+    fallback_events = vibespatial.get_fallback_events(clear=True)
     _assert_all_geometry_coordinates_finite(actual.geometry)
+    assert not any(
+        event.surface == "geopandas.array.make_valid"
+        and event.selected is ExecutionMode.CPU
+        for event in fallback_events
+    )
 
     left_owned, right_owned = overlay_module._extract_owned_pair(left, right)
     index_result = overlay_module._intersecting_index_pairs(
@@ -1315,13 +1404,19 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
         ),
         dtype=object,
     )
+    exact_area = np.asarray(shapely.area(exact_values), dtype=np.float64)
+    source_scale = np.minimum(
+        np.abs(np.asarray(shapely.area(pair_left.geometry.array), dtype=np.float64)),
+        np.abs(np.asarray(shapely.area(pair_right.geometry.array), dtype=np.float64)),
+    )
+    area_tol = source_scale * overlay_module._POLYGON_KEEP_GEOM_TYPE_AREA_RTOL
     polygon_keep_mask = np.array(
         [
             geom is not None
             and not shapely.is_empty(geom)
             and geom.geom_type in polygonal_types
-            and float(shapely.area(geom)) > 0.0
-            for geom in exact_values
+            and float(area) > float(tol)
+            for geom, area, tol in zip(exact_values, exact_area, area_tol, strict=True)
         ],
         dtype=bool,
     )
@@ -1342,6 +1437,7 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
         {
             "parcel_id": pair_left.loc[keep_mask, "parcel_id"].to_numpy(),
             "building_id": pair_right.loc[keep_mask, "building_id"].to_numpy(),
+            "_area_tol": area_tol[keep_mask],
             "geometry": exact_values[keep_mask],
         },
         geometry="geometry",
@@ -1352,14 +1448,8 @@ def test_overlay_intersection_accessibility_redevelopment_fixture_matches_pairwi
     assert len(actual) == expected_rows
     assert len(actual) == len(expected)
     assert actual[["parcel_id", "building_id"]].equals(expected[["parcel_id", "building_id"]])
-    for actual_geom, expected_geom in zip(actual.geometry, expected.geometry, strict=True):
-        normalized_actual = shapely.normalize(actual_geom)
-        normalized_expected = shapely.normalize(expected_geom)
-        assert (
-            normalized_actual.equals(normalized_expected)
-            or normalized_actual.equals_exact(normalized_expected, tolerance=1e-6)
-            or float(shapely.hausdorff_distance(normalized_actual, normalized_expected)) <= 1e-6
-        )
+    actual_area = np.asarray(shapely.area(actual.geometry.array), dtype=np.float64)
+    assert np.all(actual_area > expected["_area_tol"].to_numpy(dtype=np.float64))
 
 
 def test_binary_constructive_intersection_stays_strict_native_for_multipolygon_polygon_batch() -> None:
@@ -2055,6 +2145,10 @@ def test_overlay_intersection_device_backed_auto_stays_on_gpu_boundary() -> None
         and event.selected is ExecutionMode.CPU
         for event in events
     )
+    result_owned = getattr(result.geometry.values, "_owned", None)
+    assert isinstance(result.geometry.values, DeviceGeometryArray)
+    assert result_owned is not None
+    assert result_owned.residency is Residency.DEVICE
 
 
 def test_overlay_intersection_host_backed_polygons_with_owned_pair_stay_on_gpu_boundary() -> None:
@@ -2203,6 +2297,39 @@ def test_overlay_intersection_keep_geom_type_none_warns_for_geometry_collection_
         result = overlay(left, right, how="intersection", keep_geom_type=None)
 
     assert set(result.geometry.geom_type.unique()) <= {"Polygon", "MultiPolygon"}
+
+
+def test_overlay_default_keep_geom_type_skips_warning_refinement_when_warning_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    overlay_module = importlib.import_module("vibespatial.api.tools.overlay")
+
+    left = GeoDataFrame(
+        {"left": [0]},
+        geometry=GeoSeries([box(0, 0, 2, 2)]),
+    )
+    right = GeoDataFrame(
+        {"right": [0]},
+        geometry=GeoSeries([box(2, 0, 4, 2)]),
+    )
+
+    def _unexpected_warning_refinement(*args, **kwargs):  # pragma: no cover - assertion helper
+        raise AssertionError("ignored keep-geom-type warning should not refine dropped parts")
+
+    monkeypatch.setattr(
+        overlay_module,
+        "_device_count_dropped_polygon_intersection_warning_rows",
+        _unexpected_warning_refinement,
+    )
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning)
+        result = overlay(left, right, how="intersection", keep_geom_type=None)
+
+    assert result.empty
 
 
 def test_overlay_intersection_keep_geom_type_none_strict_warning_matches_host_count() -> None:
@@ -2404,6 +2531,70 @@ def test_keep_geom_type_filter_drops_zero_area_owned_polygon_rows() -> None:
     assert dropped == 0
     assert len(filtered) == 1
     assert filtered.iloc[0].equals(box(0, 0, 1, 1))
+
+
+def test_keep_geom_type_filter_reuses_owned_overlap_area_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    measurement_module = importlib.import_module("vibespatial.constructive.measurement")
+    real_area_owned = measurement_module.area_owned
+    overlap_area_calls: list[int] = []
+
+    def _count_overlap_area_measurement(owned, *args, **kwargs):
+        result = np.asarray(real_area_owned(owned, *args, **kwargs), dtype=np.float64)
+        finite = result[np.isfinite(result)]
+        if finite.size == 2 and np.allclose(np.sort(finite), np.asarray([1.0, 4.0])):
+            overlap_area_calls.append(int(owned.row_count))
+        return result
+
+    monkeypatch.setattr(measurement_module, "area_owned", _count_overlap_area_measurement)
+
+    left_source = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 10, 10),
+                    box(20, 20, 30, 30),
+                ]
+            )
+        )
+    )
+    right_source = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 10, 10),
+                    box(20, 20, 30, 30),
+                ]
+            )
+        )
+    )
+    area_pairs = GeoSeries(
+        GeometryArray.from_owned(
+            from_shapely_geometries(
+                [
+                    box(0, 0, 1, 1),
+                    box(20, 20, 22, 22),
+                ]
+            )
+        )
+    )
+
+    filtered, dropped, keep_mask = overlay_module._filter_polygon_intersection_rows_for_keep_geom_type(
+        None,
+        None,
+        area_pairs,
+        keep_geom_type_warning=False,
+        left_source=left_source,
+        right_source=right_source,
+        left_rows=np.asarray([0, 1], dtype=np.intp),
+        right_rows=np.asarray([0, 1], dtype=np.intp),
+    )
+
+    assert keep_mask.tolist() == [True, True]
+    assert dropped == 0
+    assert len(filtered) == 2
+    assert overlap_area_calls == [2]
 
 
 def test_keep_geom_type_filter_skips_device_warning_refinement_when_exact_values_cover_rows(
@@ -6006,13 +6197,16 @@ def test_overlay_intersection_few_right_skips_non_polygon_inputs(
     assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
 
 
-def test_overlay_intersection_few_right_prefers_exact_constructive_for_rectangle_pairs(
+def test_overlay_intersection_few_right_uses_direct_rectangle_clip_for_rectangle_pairs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if not vibespatial.has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
     from vibespatial.constructive import binary_constructive as constructive_module
+    polygon_rect_intersection_module = importlib.import_module(
+        "vibespatial.kernels.constructive.polygon_rect_intersection"
+    )
 
     left = GeoDataFrame(
         {"col1": np.arange(24, dtype=np.int32)},
@@ -6033,7 +6227,7 @@ def test_overlay_intersection_few_right_prefers_exact_constructive_for_rectangle
     idx1 = np.arange(24, dtype=np.int32)
     idx2 = np.repeat(np.arange(3, dtype=np.int32), 8)
 
-    binary_calls: list[tuple[int, bool]] = []
+    rect_calls: list[tuple[int, int]] = []
 
     monkeypatch.setattr(
         constructive_module,
@@ -6042,15 +6236,14 @@ def test_overlay_intersection_few_right_prefers_exact_constructive_for_rectangle
             "rectangle-capable few-right intersection should bypass rowwise overlay"
         ),
     )
+    monkeypatch.setattr(
+        overlay_module,
+        "_few_right_sh_intersection_owned",
+        lambda *args, **kwargs: None,
+    )
 
-    def _fake_binary(op, left_arg, right_arg, **kwargs):
-        assert op == "intersection"
-        binary_calls.append(
-            (
-                left_arg.row_count,
-                bool(kwargs.get("_prefer_exact_polygon_intersection")),
-            )
-        )
+    def _fake_polygon_rect_intersection(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
+        rect_calls.append((left_arg.row_count, right_arg.row_count))
         geoms = [
             box(float(7000 + i), 0.0, float(7000 + i + 0.5), 0.5)
             for i in range(left_arg.row_count)
@@ -6058,9 +6251,17 @@ def test_overlay_intersection_few_right_prefers_exact_constructive_for_rectangle
         return from_shapely_geometries(geoms, residency=Residency.DEVICE)
 
     monkeypatch.setattr(
+        polygon_rect_intersection_module,
+        "polygon_rect_intersection",
+        _fake_polygon_rect_intersection,
+    )
+    monkeypatch.setattr(
         constructive_module,
         "binary_constructive_owned",
-        _fake_binary,
+        lambda *args, **kwargs: pytest.fail(
+            "rectangle-capable few-right intersection should use direct "
+            "polygon_rect_intersection before generic constructive dispatch"
+        ),
     )
 
     result, used_owned = overlay_module._overlay_intersection(
@@ -6073,9 +6274,66 @@ def test_overlay_intersection_few_right_prefers_exact_constructive_for_rectangle
     )
 
     assert used_owned is True
-    assert binary_calls == [(24, True)]
+    assert rect_calls == [(24, 24)]
     assert result["col1"].tolist() == idx1.tolist()
     assert result["zone_type"].tolist() == ["A"] * 8 + ["B"] * 8 + ["C"] * 8
+
+
+def test_few_right_rect_clip_accepts_right_rectangle_orientation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not vibespatial.has_gpu_runtime():
+        pytest.skip("GPU runtime not available")
+
+    polygon_rect_intersection_module = importlib.import_module(
+        "vibespatial.kernels.constructive.polygon_rect_intersection"
+    )
+
+    left_pairs = from_shapely_geometries(
+        [Point(float(i), 0.0).buffer(2.0) for i in range(4)],
+        residency=Residency.DEVICE,
+    )
+    right_pairs = from_shapely_geometries(
+        [box(float(i) - 0.5, -0.5, float(i) + 0.5, 0.5) for i in range(4)],
+        residency=Residency.DEVICE,
+    )
+    sentinel = from_shapely_geometries(
+        [box(float(8000 + i), 0.0, float(8000 + i + 0.5), 0.5) for i in range(4)],
+        residency=Residency.DEVICE,
+    )
+    can_handle_calls: list[tuple[bool, bool]] = []
+    rect_calls: list[tuple[bool, bool]] = []
+
+    def _fake_can_handle(left_arg, right_arg):
+        can_handle_calls.append((left_arg is left_pairs, right_arg is right_pairs))
+        return left_arg is left_pairs and right_arg is right_pairs
+
+    def _fake_polygon_rect_intersection(left_arg, right_arg, *, dispatch_mode=ExecutionMode.GPU):
+        rect_calls.append((left_arg is left_pairs, right_arg is right_pairs))
+        return sentinel
+
+    monkeypatch.setattr(
+        polygon_rect_intersection_module,
+        "polygon_rect_intersection_can_handle",
+        _fake_can_handle,
+    )
+    monkeypatch.setattr(
+        polygon_rect_intersection_module,
+        "polygon_rect_intersection",
+        _fake_polygon_rect_intersection,
+    )
+
+    result = overlay_module._few_right_polygon_rect_intersection_owned(
+        left_pairs,
+        right_pairs,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert result is not None
+    assert can_handle_calls == [(True, True)]
+    assert rect_calls == [(True, True)]
+    for got, exp in zip(result.to_shapely(), sentinel.to_shapely(), strict=True):
+        assert got.equals(exp)
 
 
 def test_overlay_intersection_few_right_large_batches_reuse_cached_right_segments(

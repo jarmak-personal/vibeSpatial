@@ -709,18 +709,9 @@ class GeometryArray(ExtensionArray):
         """Spatial index for the geometries in this array."""
         if self._sindex is None:
             if self._owned is not None and self._shapely_data is None:
-                from vibespatial.runtime import get_requested_mode
-
-                record_fallback_event(
-                    surface="geopandas.array.sindex",
-                    requested=get_requested_mode(),
-                    selected=ExecutionMode.CPU,
-                    reason="owned-backed GeometryArray.sindex materializes a host STRtree",
-                    detail=f"rows={len(self)}",
-                    pipeline="spatial_index",
-                    d2h_transfer=True,
-                )
-            self._sindex = SpatialIndex(self._data, geometry_array=self)
+                self._sindex = SpatialIndex._from_device_geometry_array(self)
+            else:
+                self._sindex = SpatialIndex(self._data, geometry_array=self)
         return self._sindex
 
     @property
@@ -2655,7 +2646,22 @@ class GeometryArray(ExtensionArray):
             # the owned fast path to preserve GPU dispatch capability.
             needs_fill = allow_fill and int(idx_arr.size) > 0 and bool(np.any(idx_arr < 0))
             if not needs_fill:
-                result_owned = self._owned.take(idx_arr)
+                from vibespatial.runtime._runtime import has_gpu_runtime
+                from vibespatial.runtime.residency import Residency
+
+                if self._owned.residency is Residency.DEVICE and has_gpu_runtime():
+                    try:
+                        import cupy as cp
+                    except ModuleNotFoundError:  # pragma: no cover - guarded by runtime
+                        cp = None
+                    if cp is not None:
+                        result_owned = self._owned.device_take(
+                            cp.asarray(idx_arr, dtype=cp.int64),
+                        )
+                    else:
+                        result_owned = self._owned.take(idx_arr)
+                else:
+                    result_owned = self._owned.take(idx_arr)
                 return GeometryArray.from_owned(result_owned, crs=self.crs)
 
         result = take(self._data, indices, allow_fill=allow_fill, fill_value=fill_value)

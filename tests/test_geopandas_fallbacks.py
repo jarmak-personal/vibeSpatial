@@ -203,32 +203,31 @@ def test_geopandas_sindex_query_host_fallback_is_observable_for_unsupported_inpu
     assert dispatch_events[-1].selected is geopandas.ExecutionMode.CPU
 
 
-def test_geopandas_geometry_array_sindex_emits_fallback_before_materialization(
+def test_geopandas_geometry_array_sindex_owned_backing_stays_lazy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import vibespatial.api.geometry_array as geometry_array_module
     from vibespatial.api.geometry_array import GeometryArray
+    from vibespatial.testing import strict_native_environment
 
     geopandas.clear_fallback_events()
     series = geopandas.GeoSeries([Point(0, 0), Point(10, 10)])
     values = GeometryArray.from_owned(series.values.to_owned(), crs=series.crs)
 
-    original = geometry_array_module.owned_to_shapely
+    def _fail_materialization(*args, **kwargs):
+        raise AssertionError("owned-backed GeometryArray.sindex should not materialize Shapely")
 
-    def spy(owned, *args, **kwargs):
-        events = geopandas.get_fallback_events()
-        assert events, "expected an explicit fallback event before host materialization"
-        assert events[-1].surface == "geopandas.array.sindex"
-        return original(owned, *args, **kwargs)
+    monkeypatch.setattr(geometry_array_module, "owned_to_shapely", _fail_materialization)
 
-    monkeypatch.setattr(geometry_array_module, "owned_to_shapely", spy)
-
-    sindex = values.sindex
+    with strict_native_environment():
+        sindex = values.sindex
+        result = sindex.query(box(-1, -1, 1, 1), predicate="intersects")
 
     assert sindex is not None
+    assert sindex._tree is None
+    assert result.tolist() == [0]
     events = geopandas.get_fallback_events(clear=True)
-    assert events[-1].surface == "geopandas.array.sindex"
-    assert events[-1].selected is geopandas.ExecutionMode.CPU
+    assert not events
 
 
 def test_geopandas_sindex_query_multipoint_uses_gpu_dispatch() -> None:

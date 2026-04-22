@@ -311,6 +311,12 @@ def _decode_polygon_family(
     total_rings = int(geometry_offsets[-1]) if n > 0 else 0
     coord_offsets = exclusive_sum(total_coords_per, synchronize=False) if n > 0 else cp.zeros(0, dtype=cp.int32)
     total_coords = int(coord_offsets[-1] + total_coords_per[-1]) if n > 0 else 0
+    dense_single_ring_width = None
+    if n > 0 and total_coords > 0 and total_coords % n == 0:
+        candidate_width = total_coords // n
+        dense = cp.all(total_rings_per == 1) & cp.all(total_coords_per == candidate_width)
+        if bool(dense.item()):
+            dense_single_ring_width = int(candidate_width)
 
     # Allocate output
     ring_offsets_out = cp.empty(total_rings + 1, dtype=cp.int32)
@@ -350,6 +356,7 @@ def _decode_polygon_family(
         empty_mask=total_rings_per == 0,
         ring_offsets=ring_offsets_out,
         bounds=None,
+        dense_single_ring_width=dense_single_ring_width,
     )
 
 
@@ -608,6 +615,7 @@ def _assemble_single_family(
         empty_mask_device=family_buffer.empty_mask,
         part_offsets_device=family_buffer.part_offsets,
         ring_offsets_device=family_buffer.ring_offsets,
+        dense_single_ring_width=family_buffer.dense_single_ring_width,
         detail="created device-resident owned geometry array from GPU WKB decode kernel pipeline",
     )
 

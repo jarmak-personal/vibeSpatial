@@ -86,6 +86,8 @@ surface.
   medians and saved artifacts are the minimum comparison unit.
 - Small synthetic wins can hide real workflow regressions if shootouts and full
   pipeline sparklines are skipped.
+- API coverage can look healthy while reusable physical-plan shapes such as
+  semijoin, anti-join, many-few overlay, and grouped dissolve remain slow.
 
 ## Working Rules
 
@@ -163,14 +165,13 @@ Remediation progress:
   values. This moved `accessibility_redevelopment.py` to about `0.85x` at 10k
   repeat-3 and removed about 1.5-1.9 ms from relation export plus another
   ~0.7 ms from the warm nearest slice.
-- M3 public buffered-line dissolve now keeps small duplicate two-point line
-  groups on the existing observable exact CPU rescue instead of forcing the
-  slower exact GPU rewrite. On the April 20 local RTX 4090 run,
-  `network_service_area.py` moved from `0.614x` to `3.31x` and
-  `corridor_flood_priority.py` moved from `0.568x` to `1.04x` at 10k repeat-3.
-  The combined full-suite artifact after the clip follow-up measured network
-  at `3.04x` and corridor at `0.98x`, so corridor is effectively parity but
-  still noisy around the line.
+- M3 public buffered-line dissolve now treats device-resident two-point line
+  buffers as a GPU physical shape: rebuild buffers from source lines on device,
+  reduce with exact GPU union, and do not route through the small exact CPU
+  rescue. Multi-vertex line-buffer dissolve remains on the observable exact
+  CPU rescue at 10k scale because the current pairwise GPU reducer is slower;
+  the real GPU gap is an n-ary corridor-union physical operator, not another
+  workflow-specific route.
 - M0 shootout baselines now run `uv run --isolated --no-project` with
   GeoPandas plus `pyarrow`, so the external denominator cannot see the
   repo-local `.venv` or compatibility shim and still supports the Parquet
@@ -199,6 +200,12 @@ Remediation progress:
   a raw `shapely.bounds` denominator. Small direct `io-file` reads remain
   tracked as raw-container-denominator surfaces; do not route around the native
   public IO path solely to win sub-millisecond pyarrow/pyogrio comparisons.
+- M6 starts from the April 21 physical-plan audit. Four new real-world public
+  shootouts matched GeoPandas fingerprints at 10k repeat-3, so correctness
+  generalized. Performance did not: emergency response catchments measured
+  `0.015x`, retail trade-area screening `0.060x`, insurance flood screening
+  `0.273x`, and habitat compliance `0.229x`. Treat these as canaries for
+  reusable physical shapes, not as workflow-specific optimization targets.
 
 ## Milestones
 
@@ -246,6 +253,21 @@ Remediation progress:
 - Do not optimize a small synthetic case in a way that hurts shootouts or full
   pipeline profiles.
 
+### M6: Real-World Physical Plan Coverage
+
+- Wire `vsbench shootout` artifacts to expose stage timing, actual backend,
+  fallback events, materialization/transfer counts, and top hotpath stages.
+- Tag real-world shootouts by physical shapes: semijoin, anti-semijoin,
+  many-few overlay, mask clip, grouped geometry reduce, and
+  area-filter-after-overlay.
+- Add operation-vs-operation floor checks for each dominant workflow stage so
+  regressions can be separated into stage-floor gaps versus composition
+  overhead.
+- Profile emergency response and retail trade-area first because they expose
+  the largest reusable shape gaps.
+- Fix shared physical shapes before workflow-specific scripts. A workflow fix
+  is incomplete unless it improves or explains the named reusable shape.
+
 ## Completion Gate
 
 This push is complete only when:
@@ -255,4 +277,6 @@ This push is complete only when:
 - no public benchmark uses private owned-array shortcuts
 - top workflow shootouts are at parity or better, except explicitly documented
   external-bound surfaces
+- real-world shootouts have physical-plan artifacts that explain every
+  sub-par result by reusable shape
 - full pipeline 1m sparklines have no unexplained CPU-heavy stages

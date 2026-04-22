@@ -47,4 +47,5 @@ context, the decision made, consequences, and alternatives considered.
 0040-tiered-gpu-memory-pool
 0041-gpu-text-parsing-framework
 0042-device-native-result-boundary
+0043-public-api-physical-plan-coverage
 ```

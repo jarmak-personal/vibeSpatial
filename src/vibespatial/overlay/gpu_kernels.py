@@ -305,6 +305,40 @@ _OVERLAY_FACE_WALK_KERNEL_SOURCE = SPATIAL_TOLERANCE_PREAMBLE + r"""
 // Phase 1: GPU Face Walk via Pointer Jumping
 // -------------------------------------------------------------------
 
+static __device__ __forceinline__ bool
+vs_face_contains_point(
+    double px,
+    double py,
+    const double* __restrict__ src_x,
+    const double* __restrict__ src_y,
+    const long long* __restrict__ next_edge_ids,
+    const int* __restrict__ face_edge_ids,
+    int start,
+    int end,
+    int total_edge_count
+) {
+  bool inside = false;
+  for (int k = start; k < end; ++k) {
+    const int eid = face_edge_ids[k];
+    if (eid < 0 || eid >= total_edge_count) continue;
+    const int next_eid = (int)next_edge_ids[eid];
+    if (next_eid < 0 || next_eid >= total_edge_count) continue;
+    const double x0 = src_x[eid];
+    const double y0 = src_y[eid];
+    const double x1 = src_x[next_eid];
+    const double y1 = src_y[next_eid];
+    const bool crosses = (y1 > py) != (y0 > py);
+    if (crosses) {
+      const double denom = y0 - y1;
+      if (denom != 0.0) {
+        const double x_intersection = ((x0 - x1) * (py - y1) / denom) + x1;
+        if (px < x_intersection) inside = !inside;
+      }
+    }
+  }
+  return inside;
+}
+
 // Compute per-face area and centroid in one pass over the face edge span.
 // Each block handles one face; threads cooperatively walk the sorted edge ids
 // for that face and reduce:
@@ -468,9 +502,17 @@ compute_face_sample_points(
     const double dy = y1 - y0;
     const double length = sqrt(dx * dx + dy * dy);
     if (length <= 0.0) continue;
-    best_lx = (x0 + x1) * 0.5 - (dy / length) * epsilon;
-    best_ly = (y0 + y1) * 0.5 + (dx / length) * epsilon;
-    break;
+    const double candidate_x = (x0 + x1) * 0.5 - (dy / length) * epsilon;
+    const double candidate_y = (y0 + y1) * 0.5 + (dx / length) * epsilon;
+    best_lx = candidate_x;
+    best_ly = candidate_y;
+    if (vs_face_contains_point(
+        candidate_x, candidate_y, src_x, src_y, next_edge_ids,
+        face_edge_ids, start, end, total_edge_count)) {
+      out_label_x[f] = candidate_x;
+      out_label_y[f] = candidate_y;
+      return;
+    }
   }
 
   out_label_x[f] = best_lx;
@@ -790,7 +832,8 @@ _OVERLAY_FACE_LABEL_KERNEL_NAMES = (
 # Kernels: compute_boundary_edges, compute_boundary_next,
 #          scatter_ring_coordinates, compute_ring_sample_points,
 #          assign_holes_to_exteriors,
-#          count_boundary_nesting_depth, count_sibling_hole_depth
+#          count_boundary_nesting_depth, count_sibling_hole_depth,
+#          compute_ring_segment_signatures
 
 _OVERLAY_FACE_ASSEMBLY_KERNEL_SOURCE = POINT_IN_RING_DEVICE + r"""
 // Identify boundary edges: edges where the face on this side is selected
@@ -1087,6 +1130,7 @@ count_sibling_hole_depth(
     const double* __restrict__ sample_y,
     const double* __restrict__ ring_area,
     const int* __restrict__ exterior_id,
+    const signed char* __restrict__ can_be_hole,
     const int* __restrict__ coord_offsets,
     const int* __restrict__ edge_counts,
     const double* __restrict__ all_x,
@@ -1099,7 +1143,7 @@ count_sibling_hole_depth(
 
   const int ext_r = exterior_id[r];
   // Not a hole: either unassigned or self-assigned (exterior)
-  if (ext_r < 0 || ext_r == r) {
+  if (ext_r < 0 || ext_r == r || can_be_hole[r] == 0) {
     out_depth[r] = 0;
     return;
   }
@@ -1111,6 +1155,7 @@ count_sibling_hole_depth(
 
   for (int c = 0; c < ring_count; ++c) {
     if (c == r) continue;
+    if (can_be_hole[c] == 0) continue;
     if (exterior_id[c] != ext_r) continue;  // same exterior
     if (exterior_id[c] == c) continue;       // c is the exterior itself
     // c must have strictly larger |area|
@@ -1124,6 +1169,68 @@ count_sibling_hole_depth(
   }
   out_depth[r] = depth;
 }
+
+static __device__ __forceinline__ unsigned long long
+vs_mix_u64(unsigned long long x) {
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+static __device__ __forceinline__ unsigned long long
+vs_double_key(double value) {
+  if (value == 0.0) value = 0.0;  // canonicalize -0.0
+  return (unsigned long long)__double_as_longlong(value);
+}
+
+static __device__ __forceinline__ unsigned long long
+vs_segment_hash(double ax, double ay, double bx, double by) {
+  bool swap = (ax > bx) || (ax == bx && ay > by);
+  const double x0 = swap ? bx : ax;
+  const double y0 = swap ? by : ay;
+  const double x1 = swap ? ax : bx;
+  const double y1 = swap ? ay : by;
+
+  unsigned long long h = 1469598103934665603ULL;
+  h ^= vs_mix_u64(vs_double_key(x0)); h *= 1099511628211ULL;
+  h ^= vs_mix_u64(vs_double_key(y0)); h *= 1099511628211ULL;
+  h ^= vs_mix_u64(vs_double_key(x1)); h *= 1099511628211ULL;
+  h ^= vs_mix_u64(vs_double_key(y1)); h *= 1099511628211ULL;
+  return vs_mix_u64(h);
+}
+
+// Orientation- and rotation-independent ring signature built from its
+// undirected segment set. Used only as a duplicate-output-hole filter; the
+// geometry-producing constructive path remains fp64 per ADR-0002.
+extern "C" __global__ void __launch_bounds__(256, 4)
+compute_ring_segment_signatures(
+    const int* __restrict__ ring_coord_offsets,
+    const int* __restrict__ ring_edge_counts,
+    const double* __restrict__ all_x,
+    const double* __restrict__ all_y,
+    unsigned long long* __restrict__ out_hash_sum,
+    unsigned long long* __restrict__ out_hash_xor,
+    int ring_count
+) {
+  const int r = blockIdx.x * blockDim.x + threadIdx.x;
+  if (r >= ring_count) return;
+
+  const int start = ring_coord_offsets[r];
+  const int n_edges = ring_edge_counts[r];
+  unsigned long long hash_sum = 0ULL;
+  unsigned long long hash_xor = 0ULL;
+  for (int i = 0; i < n_edges; ++i) {
+    const int a = start + i;
+    const int b = start + i + 1;
+    const unsigned long long edge_hash = vs_segment_hash(
+        all_x[a], all_y[a], all_x[b], all_y[b]);
+    hash_sum += edge_hash;
+    hash_xor ^= edge_hash;
+  }
+  out_hash_sum[r] = hash_sum;
+  out_hash_xor[r] = hash_xor;
+}
 """
 
 _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
@@ -1134,6 +1241,7 @@ _OVERLAY_FACE_ASSEMBLY_KERNEL_NAMES = (
     "assign_holes_to_exteriors",
     "count_boundary_nesting_depth",
     "count_sibling_hole_depth",
+    "compute_ring_segment_signatures",
 )
 
 # ---------------------------------------------------------------------------

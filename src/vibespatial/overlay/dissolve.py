@@ -49,6 +49,8 @@ _EMPTY = GeometryCollection()
 _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS = 256
 _BUFFERED_TWO_POINT_SMALL_PARTIAL_UNION_MAX_ROWS = 2
 _BUFFERED_LINE_EXACT_CPU_MAX_ROWS = 2_048
+_COVERAGE_REWRITE_MAX_CANDIDATE_PAIRS = 250_000
+_COVERAGE_REWRITE_NEGATIVE_PROBE_PAIRS = 1
 logger = logging.getLogger(__name__)
 
 
@@ -763,6 +765,28 @@ def _group_non_empty_counts(row_group_codes: np.ndarray, group_count: int) -> tu
     return non_empty, int(group_count - non_empty)
 
 
+def _tag_grouped_convex_hull_source(
+    reduced: OwnedGeometryArray,
+    *,
+    ordered_owned: OwnedGeometryArray,
+    offsets: np.ndarray,
+) -> None:
+    """Attach source groups for the dissolve -> convex_hull physical rewrite."""
+    if not provenance_rewrites_enabled():
+        return
+    try:
+        from vibespatial.runtime.residency import Residency
+
+        if ordered_owned.residency is not Residency.DEVICE:
+            return
+        reduced._grouped_convex_hull_source = (
+            ordered_owned,
+            np.asarray(offsets, dtype=np.int64).copy(),
+        )
+    except Exception:
+        logger.debug("failed to tag grouped convex-hull provenance", exc_info=True)
+
+
 def _group_positions_from_codes(row_group_codes: np.ndarray, group_count: int) -> list[np.ndarray]:
     return [
         np.flatnonzero(row_group_codes == group_index).astype(np.int32, copy=False)
@@ -1030,6 +1054,7 @@ def _union_small_partial_rows_gpu(partials: Sequence[OwnedGeometryArray]) -> Own
                         current[i],
                         current[i + 1],
                         dispatch_mode=ExecutionMode.GPU,
+                        _skip_polygon_contraction=True,
                     )
                 )
             if len(current) % 2:
@@ -1061,7 +1086,7 @@ def _reduce_partial_rows_gpu(partials: Sequence[OwnedGeometryArray]) -> OwnedGeo
     merged = OwnedGeometryArray.concat(list(partials))
     if merged.row_count <= 8:
         try:
-            return _tree_reduce_global(merged, "union")
+            return _tree_reduce_global(merged, "union", skip_polygon_contraction=True)
         except Exception:
             logger.debug(
                 "tiny partial tree reduction failed; falling back to generic union_all",
@@ -1070,6 +1095,31 @@ def _reduce_partial_rows_gpu(partials: Sequence[OwnedGeometryArray]) -> OwnedGeo
     return union_all_gpu_owned(
         merged,
         dispatch_mode=ExecutionMode.GPU,
+        _skip_polygon_contraction=True,
+    )
+
+
+def _reduce_buffered_line_polygons_gpu(buffered: OwnedGeometryArray) -> OwnedGeometryArray:
+    """Reduce line-buffer polygons without the generic union_all heuristics.
+
+    Buffered-line dissolve has already proven the physical shape: one
+    device-resident source-line group reduced into one corridor. The generic
+    union_all entrypoint spends extra time on bbox decomposition/color probes
+    and may choose the contraction overlay path, both of which are poor fits
+    for small dense corridor masks.
+    """
+    from vibespatial.constructive.union_all import (
+        _spatially_localize_polygon_union_inputs,
+        _tree_reduce_global,
+    )
+
+    if buffered.row_count <= 1:
+        return buffered
+    buffered = _spatially_localize_polygon_union_inputs(buffered)
+    return _tree_reduce_global(
+        buffered,
+        "union",
+        skip_polygon_contraction=True,
     )
 
 
@@ -2032,6 +2082,11 @@ def execute_grouped_union_codes(
             unique_codes,
             np.arange(group_count, dtype=unique_codes.dtype),
         ):
+            _tag_grouped_convex_hull_source(
+                reduced,
+                ordered_owned=ordered_owned,
+                offsets=offsets,
+            )
             non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
             return GroupedUnionResult(
                 geometries=None,
@@ -2295,6 +2350,192 @@ def _max_group_size(
     return max((int(len(positions)) for positions in group_positions), default=0)
 
 
+def _owned_supports_polygonal_coverage_certification(owned: OwnedGeometryArray) -> bool:
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import FAMILY_TAGS
+
+    valid_tags = owned.tags[owned.validity]
+    if valid_tags.size == 0:
+        return False
+    polygon_tags = np.asarray(
+        [
+            FAMILY_TAGS[GeometryFamily.POLYGON],
+            FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
+        ],
+        dtype=valid_tags.dtype,
+    )
+    return bool(np.all(np.isin(valid_tags, polygon_tags)))
+
+
+def _certify_grouped_polygon_coverage_gpu(
+    owned: OwnedGeometryArray,
+    row_group_codes: np.ndarray,
+    *,
+    group_count: int,
+) -> bool | None:
+    """Return True when GPU evidence proves unary dissolve can use coverage.
+
+    Coverage union is equivalent to unary union only when members in each
+    dissolve group have no positive-area overlap.  This certification keeps
+    candidate generation and pair gathering on device, then uses row-wise GPU
+    intersections for same-group candidate pairs.  A ``None`` result means the
+    certifier could not prove safety cheaply, so callers must keep exact unary.
+    """
+    if cp is None:
+        return None
+    from vibespatial.runtime import has_gpu_runtime
+    from vibespatial.runtime.residency import Residency
+
+    if (
+        not has_gpu_runtime()
+        or owned.row_count != row_group_codes.size
+        or owned.residency is not Residency.DEVICE
+        or not _owned_supports_polygonal_coverage_certification(owned)
+    ):
+        return None
+
+    observed_mask = row_group_codes >= 0
+    if not bool(np.any(observed_mask)):
+        return True
+    if _max_group_size(row_group_codes, [], group_count) <= 1:
+        return True
+
+    try:
+        from vibespatial.spatial.indexing import build_flat_spatial_index
+        from vibespatial.spatial.query import query_spatial_index
+
+        flat_index = build_flat_spatial_index(owned)
+        query_result, execution = query_spatial_index(
+            owned,
+            flat_index,
+            owned,
+            predicate=None,
+            sort=False,
+            output_format="indices",
+            return_metadata=True,
+            return_device=True,
+        )
+        if execution.selected is not ExecutionMode.GPU:
+            return None
+
+        if hasattr(query_result, "d_left_idx"):
+            d_left = query_result.d_left_idx
+            d_right = query_result.d_right_idx
+        else:
+            indices = np.asarray(query_result, dtype=np.int64)
+            if indices.size == 0:
+                return True
+            if indices.ndim != 2 or indices.shape[0] != 2:
+                return None
+            d_left = cp.asarray(indices[0], dtype=cp.int32)
+            d_right = cp.asarray(indices[1], dtype=cp.int32)
+
+        if int(d_left.size) == 0:
+            return True
+
+        d_codes = cp.asarray(row_group_codes, dtype=cp.int32)
+        d_left_codes = d_codes[d_left]
+        d_right_codes = d_codes[d_right]
+        same_group = (
+            (d_left < d_right)
+            & (d_left_codes >= 0)
+            & (d_left_codes == d_right_codes)
+        )
+        candidate_count = int(cp.count_nonzero(same_group).item())
+        if candidate_count == 0:
+            return True
+        if candidate_count > _COVERAGE_REWRITE_MAX_CANDIDATE_PAIRS:
+            return None
+
+        candidate_left = d_left[same_group].astype(cp.int64, copy=False)
+        candidate_right = d_right[same_group].astype(cp.int64, copy=False)
+
+        from vibespatial.constructive.binary_constructive import _binary_constructive_gpu
+        from vibespatial.constructive.measurement import area_owned
+
+        def _has_positive_overlap(
+            left_rows,
+            right_rows,
+        ) -> bool | None:
+            intersections = _binary_constructive_gpu(
+                "intersection",
+                owned.take(left_rows),
+                owned.take(right_rows),
+                dispatch_mode=ExecutionMode.GPU,
+            )
+            if intersections is None:
+                return None
+            overlap_areas = np.asarray(
+                area_owned(intersections, dispatch_mode=ExecutionMode.GPU),
+                dtype=np.float64,
+            )
+            finite_areas = overlap_areas[np.isfinite(overlap_areas)]
+            if finite_areas.size == 0:
+                return False
+            return bool(np.any(finite_areas > SPATIAL_EPSILON))
+
+        if candidate_count > _COVERAGE_REWRITE_NEGATIVE_PROBE_PAIRS:
+            probe_positions = cp.linspace(
+                0,
+                candidate_count - 1,
+                _COVERAGE_REWRITE_NEGATIVE_PROBE_PAIRS,
+                dtype=cp.int64,
+            )
+            probe_result = _has_positive_overlap(
+                candidate_left[probe_positions],
+                candidate_right[probe_positions],
+            )
+            if probe_result is None:
+                return None
+            if probe_result:
+                return False
+
+        overlap_result = _has_positive_overlap(candidate_left, candidate_right)
+        if overlap_result is None:
+            return None
+        return not overlap_result
+    except Exception:
+        logger.debug("grouped polygon coverage certification failed", exc_info=True)
+        return None
+
+
+def _maybe_rewrite_grouped_polygon_coverage_dissolve_method(
+    *,
+    normalized_method: DissolveUnionMethod,
+    grid_size: float | None,
+    row_group_codes: np.ndarray | None,
+    group_count: int,
+    owned: OwnedGeometryArray | None,
+) -> DissolveUnionMethod:
+    if (
+        normalized_method is not DissolveUnionMethod.UNARY
+        or grid_size is not None
+        or row_group_codes is None
+        or owned is None
+        or int(row_group_codes.size) < OVERLAY_UNION_ALL_GPU_THRESHOLD
+        or not provenance_rewrites_enabled()
+    ):
+        return normalized_method
+
+    certified = _certify_grouped_polygon_coverage_gpu(
+        owned,
+        row_group_codes,
+        group_count=group_count,
+    )
+    if certified is not True:
+        return normalized_method
+
+    record_rewrite_event(
+        rule_name="R11_dissolve_unary_polygon_coverage_to_coverage",
+        surface="geopandas.geodataframe.dissolve",
+        original_operation="dissolve(method=unary)",
+        rewritten_operation="dissolve(method=coverage)",
+        reason="GPU certification proved grouped polygon inputs have no same-group positive-area overlaps",
+        detail=f"rows={row_group_codes.size}, groups={group_count}",
+    )
+    return DissolveUnionMethod.COVERAGE
+
+
 def _provenance_source_owned(tag) -> OwnedGeometryArray | None:
     if tag is None:
         return None
@@ -2473,11 +2714,13 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
     observed_rows = np.flatnonzero(row_group_codes >= 0).astype(np.int64, copy=False)
     if observed_rows.size < OVERLAY_UNION_ALL_GPU_THRESHOLD:
         return None
-    if observed_rows.size <= _BUFFERED_LINE_EXACT_CPU_MAX_ROWS:
-        return None
 
     source_owned = _provenance_source_owned(tag)
     if source_owned is None:
+        return None
+    from vibespatial.runtime.residency import Residency
+
+    if source_owned.residency is not Residency.DEVICE:
         return None
     if observed_rows.size != source_owned.row_count:
         source_owned = source_owned.take(observed_rows)
@@ -2486,10 +2729,7 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         linestring_buffer_owned_array,
         supports_two_point_linestring_buffer_fast_path,
     )
-    from vibespatial.constructive.union_all import (
-        disjoint_subset_union_all_owned,
-        union_all_gpu_owned,
-    )
+    from vibespatial.constructive.union_all import disjoint_subset_union_all_owned
     from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
 
     quad_segs_param = tag.get_param("quad_segs", 16)
@@ -2508,21 +2748,21 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         return None
 
     unique_rows = _dedupe_two_point_linestring_rows_gpu(source_owned)
-    if unique_rows is None or unique_rows.size == 0 or unique_rows.size >= source_owned.row_count:
-        return None
-    # Keep the exact rewrite for materially deduped groups while capping the
-    # reduced exact-union size. Corridor-style networks often collapse far
-    # below the original row count but still land just above the generic
-    # grouped-union crossover.
-    if unique_rows.size > _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS:
-        return None
-    # This rewrite only pays off when deduplication is material; otherwise the
-    # exact GPU union can lose to the disjoint-subset host engine on lightly
-    # duplicated groups.
-    if unique_rows.size * 4 > source_owned.row_count:
+    if unique_rows is None or unique_rows.size == 0:
         return None
 
-    unique_owned = source_owned.take(unique_rows.astype(np.int64, copy=False))
+    deduped = unique_rows.size < source_owned.row_count
+    unique_owned = (
+        source_owned.take(unique_rows.astype(np.int64, copy=False))
+        if deduped
+        else source_owned
+    )
+    # This rewrite is the device-resident exact dissolve path for simple line
+    # buffers. Cap the reduced union size directly instead of routing small
+    # device-backed groups through an exact host rescue.
+    if unique_owned.row_count > _BUFFERED_TWO_POINT_EXACT_UNION_MAX_UNIQUE_ROWS:
+        return None
+
     expanded_bounds = np.asarray(
         cp.asnumpy(cp.asarray(compute_geometry_bounds_device(unique_owned), dtype=cp.float64)),
         dtype=np.float64,
@@ -2582,10 +2822,7 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
                 join_style=join_style,
                 dispatch_mode=ExecutionMode.GPU,
             )
-            reduced = union_all_gpu_owned(
-                buffered_unique,
-                dispatch_mode=ExecutionMode.GPU,
-            )
+            reduced = _reduce_buffered_line_polygons_gpu(buffered_unique)
     else:
         buffered_unique = linestring_buffer_owned_array(
             unique_owned,
@@ -2595,19 +2832,17 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
             join_style=join_style,
             dispatch_mode=ExecutionMode.GPU,
         )
-        reduced = union_all_gpu_owned(
-            buffered_unique,
-            dispatch_mode=ExecutionMode.GPU,
-        )
+        reduced = _reduce_buffered_line_polygons_gpu(buffered_unique)
 
     record_rewrite_event(
         rule_name="R9_dissolve_buffered_two_point_lines_exact_union",
         surface="geopandas.geodataframe.dissolve",
         original_operation="dissolve(method=unary)",
-        rewritten_operation="buffer(unique(two_point_lines)).union_all_gpu",
-        reason="single-group buffered two-point lines dissolve rewrites to deduped source-line buffering plus exact GPU union",
+        rewritten_operation="buffer(device_two_point_lines).union_all_gpu",
+        reason="device-resident single-group buffered two-point lines dissolve rewrites to source-line buffering plus exact GPU union",
         detail=(
-            f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"rows={source_owned.row_count}, unique_rows={unique_owned.row_count}, "
+            f"deduped={deduped}, "
             f"color_subsets={max(color_count, 0)}, "
             f"buffer_distance={distance_value}, quad_segs={quad_segs}"
         ),
@@ -2616,9 +2851,10 @@ def _maybe_execute_buffered_two_point_line_exact_union_rewrite(
         surface="geopandas.geodataframe.dissolve",
         operation="dissolve",
         implementation="buffered_two_point_line_exact_union_gpu",
-        reason="deduped single-group buffered-line dissolve rewrite",
+        reason="device-resident single-group buffered-line dissolve rewrite",
         detail=(
-            f"rows={source_owned.row_count}, unique_rows={unique_rows.size}, "
+            f"rows={source_owned.row_count}, unique_rows={unique_owned.row_count}, "
+            f"deduped={deduped}, "
             f"color_subsets={max(color_count, 0)}, "
             f"buffer_distance={distance_value}"
         ),
@@ -2770,8 +3006,42 @@ def _maybe_execute_buffered_line_exact_cpu_rewrite(
     ):
         return None
 
-    geometry_owned = getattr(frame.geometry.values, "_owned", None)
     from vibespatial.runtime.residency import Residency
+
+    geometry_owned = getattr(frame.geometry.values, "_owned", None)
+    source_owned = _provenance_source_owned(tag)
+    if (
+        source_owned is not None
+        and source_owned.residency is Residency.DEVICE
+        and source_types == frozenset({"linestring"})
+        and cp is not None
+    ):
+        try:
+            from vibespatial.constructive.linestring import (
+                supports_two_point_linestring_buffer_fast_path,
+            )
+
+            quad_segs_param = tag.get_param("quad_segs", 16)
+            quad_segs = 16 if quad_segs_param is None else int(quad_segs_param)
+            cap_style_param = tag.get_param("cap_style", "round")
+            join_style_param = tag.get_param("join_style", "round")
+            cap_style = "round" if cap_style_param is None else str(cap_style_param)
+            join_style = "round" if join_style_param is None else str(join_style_param)
+            candidate_owned = (
+                source_owned.take(observed_rows)
+                if observed_rows.size != source_owned.row_count
+                else source_owned
+            )
+            if supports_two_point_linestring_buffer_fast_path(
+                candidate_owned,
+                quad_segs=quad_segs,
+                cap_style=cap_style,
+                join_style=join_style,
+                single_sided=False,
+            ):
+                return None
+        except Exception:
+            return None
 
     result_residency = (
         Residency.DEVICE
@@ -2804,7 +3074,6 @@ def _maybe_execute_buffered_line_exact_cpu_rewrite(
     join_style = "round" if join_style_param is None else str(join_style_param)
 
     merged = None
-    source_owned = _provenance_source_owned(tag)
     if source_owned is not None:
         if observed_rows.size != source_owned.row_count:
             source_owned = source_owned.take(observed_rows)
@@ -2846,9 +3115,13 @@ def _maybe_execute_buffered_line_exact_cpu_rewrite(
     if merged is not None and not shapely.is_valid(merged):
         merged = _canonicalize_polygonal_make_valid_geometry(shapely.make_valid(merged))
 
-    from vibespatial.geometry.owned import from_shapely_geometries
+    from vibespatial.geometry.owned import from_shapely_geometries, seed_all_validity_cache
 
     owned = from_shapely_geometries([merged], residency=result_residency)
+    # The exact GEOS path above already canonicalizes invalid or collection
+    # output before re-entering owned storage; avoid immediately re-running the
+    # full OGC validity kernel in the grouped result wrapper.
+    seed_all_validity_cache(owned)
     record_dispatch_event(
         surface="geopandas.geodataframe.dissolve",
         operation="dissolve",
@@ -3000,6 +3273,14 @@ def evaluate_geopandas_dissolve_native(
                 row_group_codes=row_group_codes,
                 group_count=len(aggregated_data.index),
                 tag=provenance_tag,
+            )
+        if grouped_union is None:
+            normalized_method = _maybe_rewrite_grouped_polygon_coverage_dissolve_method(
+                normalized_method=normalized_method,
+                grid_size=grid_size,
+                row_group_codes=row_group_codes,
+                group_count=len(aggregated_data.index),
+                owned=owned,
             )
         if grouped_union is None and row_group_codes is not None:
             grouped_union = execute_grouped_union_codes(

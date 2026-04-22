@@ -1417,6 +1417,7 @@ _NVRTC_CONSUMER_MODULES: tuple[str, ...] = (
     "vibespatial.spatial.indexing",
     "vibespatial.io.geojson_gpu",
     "vibespatial.io.wkb",
+    "vibespatial.kernels.owned_take",
     "vibespatial.kernels.core.geometry_analysis",
     "vibespatial.kernels.core.spatial_query_kernels",
     "vibespatial.kernels.core.wkb_decode",
