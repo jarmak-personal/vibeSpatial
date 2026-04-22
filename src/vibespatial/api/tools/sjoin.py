@@ -10,7 +10,6 @@ from vibespatial.api.geometry_array import _check_crs, _crs_mismatch_warn
 from vibespatial.api.tools._pair_cache import cache_intersection_pairs
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.dispatch import record_dispatch_event
-from vibespatial.runtime.fallbacks import strict_native_mode_enabled
 from vibespatial.runtime.provenance import (
     _r1_preconditions_met,
     provenance_rewrites_enabled,
@@ -21,10 +20,6 @@ from vibespatial.spatial.query import (
     query_spatial_index,
     supports_owned_spatial_input,
 )
-
-_SMALL_HOST_STRTREE_QUERY_MIN_ROWS = 512
-_SMALL_HOST_STRTREE_TREE_MAX_ROWS = 128
-
 
 def sjoin(
     left_df,
@@ -313,16 +308,6 @@ def _basic_checks(left_df, right_df, how, lsuffix, rsuffix, on_attribute=None, a
 def _query_with_owned_spatial_index(left_df, right_df, predicate, distance):
     tree_geometry = right_df.geometry
     query_geometry = left_df.geometry
-    if (
-        not strict_native_mode_enabled()
-        and predicate == "intersects"
-        and distance is None
-        and len(left_df) >= _SMALL_HOST_STRTREE_QUERY_MIN_ROWS
-        and len(right_df) <= _SMALL_HOST_STRTREE_TREE_MAX_ROWS
-        and getattr(getattr(query_geometry, "values", None), "_owned", None) is not None
-        and getattr(getattr(tree_geometry, "values", None), "_owned", None) is not None
-    ):
-        return None
     if hasattr(tree_geometry, "values") and hasattr(tree_geometry.values, "supports_owned_spatial_input"):
         tree_supported = tree_geometry.values.supports_owned_spatial_input()
     else:

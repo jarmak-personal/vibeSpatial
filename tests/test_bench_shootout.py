@@ -283,6 +283,17 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
     assert run.profile["trace_transfers"][0]["reason"] == "profile probe"
     assert run.profile["fallback_events"][0]["surface"] == "probe.fallback"
     assert run.profile["top_hotpath"][0]["name"] == "shootout.profile_probe"
+    assert run.profile["hotpath_total_seconds"] > 0
+    assert run.profile["composition_overhead_seconds"] >= 0
+    assert run.profile["composition_overhead_ratio"] is not None
+    assert run.profile["timed_stages"]
+    assert run.profile["stage_total_seconds"] > 0
+    assert run.profile["stage_totals_by_tag"]["hotpath"] > 0
+    assert run.profile["stage_totals_by_backend"]["gpu"] > 0
+    assert any(
+        stage["fallback_event_count"] == 1
+        for stage in run.profile["timed_stages"]
+    )
 
 
 @pytest.mark.gpu

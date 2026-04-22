@@ -54,7 +54,7 @@ def test_geometry_array_owned_spatial_index_is_cached_for_outer_sjoin() -> None:
     assert flat1 is flat2
 
 
-def test_large_left_tiny_right_intersects_prefers_host_strtree_dispatch() -> None:
+def test_large_left_tiny_right_intersects_stays_on_owned_dispatch() -> None:
     geopandas.clear_dispatch_events()
     geopandas.clear_fallback_events()
     left = geopandas.GeoDataFrame(
@@ -74,4 +74,4 @@ def test_large_left_tiny_right_intersects_prefers_host_strtree_dispatch() -> Non
     assert len(result) == 1
     assert result["left"].tolist() == [0]
     assert dispatch_events
-    assert dispatch_events[-1].implementation == "strtree_host"
+    assert dispatch_events[-1].implementation == "owned_spatial_query"

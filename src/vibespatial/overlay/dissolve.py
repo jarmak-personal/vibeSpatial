@@ -2517,6 +2517,16 @@ def _maybe_rewrite_grouped_polygon_coverage_dissolve_method(
     ):
         return normalized_method
 
+    from vibespatial.runtime.residency import Residency
+
+    if (
+        owned.residency is Residency.DEVICE
+        and int(row_group_codes.size) < OVERLAY_GROUPED_BOX_GPU_THRESHOLD
+    ):
+        # The small certified-coverage fallback is host-backed today; keep
+        # device-resident unary dissolves on the exact segmented GPU path.
+        return normalized_method
+
     certified = _certify_grouped_polygon_coverage_gpu(
         owned,
         row_group_codes,

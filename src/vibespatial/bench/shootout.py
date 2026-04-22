@@ -26,6 +26,7 @@ _TIMED_END_MARKER = "# --- timed work ends here ---"
 # ---------------------------------------------------------------------------
 
 _HARNESS_CODE = """\
+import ast
 import faulthandler
 import io
 import json
@@ -59,15 +60,20 @@ def _load_script_sections(script_path):
     end = text.find(TIMED_END_MARKER)
     if start == -1 or end == -1 or end < start:
         return None
+    timed_start = start + len(TIMED_START_MARKER)
+    timed_source = text[timed_start:end]
+    timed_line_offset = text[:timed_start].count("\\n") + 1
     return (
         compile(text[:start], script_path, "exec"),
-        compile(text[start + len(TIMED_START_MARKER):end], script_path, "exec"),
+        compile(timed_source, script_path, "exec"),
         compile(text[end + len(TIMED_END_MARKER):], script_path, "exec"),
+        timed_source,
+        timed_line_offset,
     )
 
 
 def _run_timed_sections(script_path, sections, *, run_name):
-    preamble_code, timed_code, postamble_code = sections
+    preamble_code, timed_code, postamble_code, _timed_source, _timed_line_offset = sections
     globals_dict = {
         "__name__": run_name,
         "__file__": script_path,
@@ -116,6 +122,167 @@ def _trace_transfer_to_dict(transfer):
     }
 
 
+def _statement_tags(source):
+    lower = source.lower()
+    tags = []
+
+    def add(tag):
+        if tag not in tags:
+            tags.append(tag)
+
+    if "read_parquet(" in lower or "read_file(" in lower or "read_feather(" in lower:
+        add("io_read")
+    if "to_parquet(" in lower or "to_file(" in lower or "to_feather(" in lower:
+        add("io_write")
+    if "gpd.clip(" in lower or ".clip(" in lower:
+        add("mask_clip")
+    if ".buffer(" in lower:
+        add("buffer")
+        add("mask_construction")
+    if "gpd.sjoin(" in lower or ".sjoin(" in lower:
+        add("spatial_join")
+    if "gpd.overlay(" in lower or ".overlay(" in lower:
+        add("many_few_overlay")
+    if ".dissolve(" in lower:
+        add("grouped_geometry_reduce")
+    if ".area" in lower:
+        add("area_filter_after_overlay")
+    if ".convex_hull" in lower:
+        add("convex_hull")
+    if ".geom_type" in lower or ".isin(" in lower or ".loc[" in lower or ".iloc[" in lower:
+        add("tabular_filter")
+    if ".copy(" in lower:
+        add("copy")
+    if "notify_dispatch(" in lower:
+        add("trace_dispatch")
+    if "notify_transfer(" in lower:
+        add("trace_transfer")
+    if "record_fallback_event(" in lower:
+        add("fallback")
+    if "hotpath_stage(" in lower:
+        add("hotpath")
+    if not tags:
+        add("python")
+    return tags
+
+
+def _compile_timed_statements(script_path, timed_source, timed_line_offset):
+    try:
+        tree = ast.parse(timed_source, filename=script_path, mode="exec")
+    except SyntaxError:
+        return []
+    lines = timed_source.splitlines()
+    compiled = []
+    for index, stmt in enumerate(tree.body):
+        line_start = timed_line_offset + getattr(stmt, "lineno", 1) - 1
+        line_end = timed_line_offset + getattr(stmt, "end_lineno", getattr(stmt, "lineno", 1)) - 1
+        source = ast.get_source_segment(timed_source, stmt)
+        if source is None:
+            local_start = max(getattr(stmt, "lineno", 1) - 1, 0)
+            local_end = max(getattr(stmt, "end_lineno", getattr(stmt, "lineno", 1)), local_start + 1)
+            source = "\\n".join(lines[local_start:local_end])
+        module = ast.Module(body=[stmt], type_ignores=[])
+        ast.fix_missing_locations(module)
+        compiled.append({
+            "index": index,
+            "line_start": line_start,
+            "line_end": line_end,
+            "source": source.strip(),
+            "tags": _statement_tags(source),
+            "code": compile(module, script_path, "exec"),
+        })
+    return compiled
+
+
+def _summarize_statement_profile(stages):
+    totals_by_tag = {}
+    totals_by_backend = {}
+    for stage in stages:
+        elapsed = float(stage.get("elapsed_seconds", 0.0))
+        backend = stage.get("actual_backend", "unknown")
+        totals_by_backend[backend] = totals_by_backend.get(backend, 0.0) + elapsed
+        for tag in stage.get("tags", []):
+            totals_by_tag[tag] = totals_by_tag.get(tag, 0.0) + elapsed
+    return {
+        "stage_total_seconds": sum(float(stage.get("elapsed_seconds", 0.0)) for stage in stages),
+        "stage_totals_by_tag": dict(sorted(totals_by_tag.items(), key=lambda item: (-item[1], item[0]))),
+        "stage_totals_by_backend": dict(sorted(totals_by_backend.items(), key=lambda item: (-item[1], item[0]))),
+    }
+
+
+def _profile_execution_deltas(trace, before_steps, before_transfers):
+    steps = list(getattr(trace, "steps", []))[before_steps:]
+    transfers = list(getattr(trace, "transfers", []))[before_transfers:]
+    gpu_steps = sum(1 for step in steps if str(getattr(getattr(step, "selected", ""), "value", "")) == "gpu")
+    cpu_steps = sum(1 for step in steps if str(getattr(getattr(step, "selected", ""), "value", "")) == "cpu")
+    if gpu_steps and cpu_steps:
+        backend = "mixed"
+    elif gpu_steps:
+        backend = "gpu"
+    elif cpu_steps:
+        backend = "cpu"
+    else:
+        backend = "python"
+    return {
+        "actual_backend": backend,
+        "trace_steps": len(steps),
+        "gpu_steps": gpu_steps,
+        "cpu_steps": cpu_steps,
+        "d2h_transfers": sum(1 for transfer in transfers if getattr(transfer, "direction", "") == "d2h"),
+        "h2d_transfers": sum(1 for transfer in transfers if getattr(transfer, "direction", "") == "h2d"),
+    }
+
+
+def _execute_profiled_timed_sections(
+    script_path,
+    sections,
+    globals_dict,
+    trace,
+    *,
+    get_fallback_events,
+    get_d2h_transfer_count,
+):
+    _preamble_code, timed_code, _postamble_code, timed_source, timed_line_offset = sections
+    statements = _compile_timed_statements(script_path, timed_source, timed_line_offset)
+    if not statements:
+        start = time.perf_counter()
+        exec(timed_code, globals_dict)
+        return time.perf_counter() - start, []
+
+    stages = []
+    total_start = time.perf_counter()
+    for stmt in statements:
+        before_steps = len(getattr(trace, "steps", []))
+        before_transfers = len(getattr(trace, "transfers", []))
+        before_fallbacks = len(get_fallback_events(clear=False))
+        before_d2h = (
+            int(get_d2h_transfer_count())
+            if get_d2h_transfer_count is not None
+            else None
+        )
+        start = time.perf_counter()
+        exec(stmt["code"], globals_dict)
+        elapsed = time.perf_counter() - start
+        after_fallbacks = len(get_fallback_events(clear=False))
+        after_d2h = (
+            int(get_d2h_transfer_count())
+            if get_d2h_transfer_count is not None
+            else None
+        )
+        stage = {
+            key: value
+            for key, value in stmt.items()
+            if key != "code"
+        }
+        stage.update(_profile_execution_deltas(trace, before_steps, before_transfers))
+        stage["elapsed_seconds"] = elapsed
+        stage["fallback_event_count"] = max(after_fallbacks - before_fallbacks, 0)
+        if before_d2h is not None and after_d2h is not None:
+            stage["d2h_transfer_count_delta"] = max(after_d2h - before_d2h, 0)
+        stages.append(stage)
+    return time.perf_counter() - total_start, stages
+
+
 def _profile_timed_sections(script_path, sections):
     profile = {
         "available": False,
@@ -152,6 +319,7 @@ def _profile_timed_sections(script_path, sections):
         sys.stdout = capture
         error = None
         trace = None
+        timed_stages = []
         try:
             if sections is None:
                 start = time.perf_counter()
@@ -159,22 +327,28 @@ def _profile_timed_sections(script_path, sections):
                     globals_dict = runpy.run_path(script_path, run_name="__profile__")
                 elapsed = time.perf_counter() - start
             else:
-                preamble_code, timed_code, _postamble_code = sections
+                preamble_code, _timed_code, _postamble_code, _timed_source, _timed_line_offset = sections
                 exec(preamble_code, globals_dict)
                 clear_fallback_events()
                 reset_hotpath_trace()
                 if reset_d2h_transfer_count is not None:
                     reset_d2h_transfer_count()
-                start = time.perf_counter()
                 with execution_trace("shootout") as trace:
-                    exec(timed_code, globals_dict)
-                elapsed = time.perf_counter() - start
+                    elapsed, timed_stages = _execute_profiled_timed_sections(
+                        script_path,
+                        sections,
+                        globals_dict,
+                        trace,
+                        get_fallback_events=get_fallback_events,
+                        get_d2h_transfer_count=get_d2h_transfer_count,
+                    )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             elapsed = 0.0
         audit.observe(*globals_dict.values())
         fallback_events = [_as_dict_event(event) for event in get_fallback_events(clear=True)]
         hotpath_summary = summarize_hotpath_trace()[:40]
+        hotpath_total_seconds = sum(float(stage["elapsed_seconds"]) for stage in hotpath_summary)
         trace_summary = trace.summary() if trace is not None else {}
         trace_steps = [_trace_step_to_dict(step) for step in getattr(trace, "steps", [])[:80]]
         trace_transfers = [
@@ -201,7 +375,17 @@ def _profile_timed_sections(script_path, sections):
             "materialization_count": audit.materialization_count,
             "transfer_seconds": audit.transfer_seconds,
             "transfer_bytes": audit.transfer_bytes,
+            "hotpath_total_seconds": hotpath_total_seconds,
+            "composition_overhead_seconds": max(elapsed - hotpath_total_seconds, 0.0),
+            "composition_overhead_ratio": (
+                max(elapsed - hotpath_total_seconds, 0.0) / elapsed
+                if elapsed > 0
+                else None
+            ),
         })
+        if timed_stages:
+            profile["timed_stages"] = timed_stages[:80]
+            profile.update(_summarize_statement_profile(timed_stages))
         if d2h_transfer_count is not None:
             profile["d2h_transfer_count"] = d2h_transfer_count
         if error is not None:
@@ -386,28 +570,33 @@ def _extract_fingerprint(stdout: str) -> str | None:
     return None
 
 
-def _load_script_sections(script: Path) -> tuple[object, object, object] | None:
+def _load_script_sections(script: Path) -> tuple[object, object, object, str, int] | None:
     """Split a shootout script into preamble, timed body, and postamble."""
     text = script.read_text(encoding="utf-8")
     start = text.find(_TIMED_START_MARKER)
     end = text.find(_TIMED_END_MARKER)
     if start == -1 or end == -1 or end < start:
         return None
+    timed_start = start + len(_TIMED_START_MARKER)
+    timed_source = text[timed_start:end]
+    timed_line_offset = text[:timed_start].count("\n") + 1
     return (
         compile(text[:start], str(script), "exec"),
-        compile(text[start + len(_TIMED_START_MARKER):end], str(script), "exec"),
+        compile(timed_source, str(script), "exec"),
         compile(text[end + len(_TIMED_END_MARKER):], str(script), "exec"),
+        timed_source,
+        timed_line_offset,
     )
 
 
 def _run_timed_script_sections(
     script: Path,
-    sections: tuple[object, object, object],
+    sections: tuple[object, object, object, str, int],
     *,
     run_name: str,
 ) -> tuple[float, str]:
     """Run a marker-delimited script and time only its body."""
-    preamble_code, timed_code, postamble_code = sections
+    preamble_code, timed_code, postamble_code, _timed_source, _timed_line_offset = sections
     original_stdout = sys.stdout
     capture = io.StringIO()
     globals_dict = {

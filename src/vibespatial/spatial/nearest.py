@@ -2015,7 +2015,22 @@ def _compute_mixed_distances_gpu_device(
 
     point_family = GeometryFamily.POINT
 
-    for lt, rt in unique_tag_pairs(left_tags, right_tags):
+    if (
+        hasattr(left_tags, "__cuda_array_interface__")
+        and hasattr(right_tags, "__cuda_array_interface__")
+    ):
+        # Device-return paths must not summarize tags via host copies.  The
+        # family domain is tiny, so probe every possible pair on device and
+        # skip empty masks below.
+        tag_pairs = (
+            (lt, rt)
+            for lt in range(len(FAMILY_TAGS))
+            for rt in range(len(FAMILY_TAGS))
+        )
+    else:
+        tag_pairs = unique_tag_pairs(left_tags, right_tags)
+
+    for lt, rt in tag_pairs:
         lf = TAG_FAMILIES.get(lt)
         rf = TAG_FAMILIES.get(rt)
 

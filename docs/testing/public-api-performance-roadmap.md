@@ -206,6 +206,17 @@ Remediation progress:
   `0.015x`, retail trade-area screening `0.060x`, insurance flood screening
   `0.273x`, and habitat compliance `0.229x`. Treat these as canaries for
   reusable physical shapes, not as workflow-specific optimization targets.
+- M6 artifacts now include statement-level `timed_stages`,
+  `stage_totals_by_tag`, `stage_totals_by_backend`, `hotpath_total_seconds`,
+  and `composition_overhead_seconds`. The April 22 10k repeat-3 canaries
+  confirmed the expected shape after removing two residency-breaking dispatch
+  heuristics: emergency response improved to `0.646x` with `52.6ms` hotpath
+  inside `151.0ms` profile time, and retail trade-area screening held `2.12x`
+  with `90.2ms` hotpath inside `295.8ms` profile time. Both canaries now show
+  all-GPU execution traces with zero fallbacks and zero offramps. The next
+  remediation target is reducing public composition/materialization overhead
+  for reusable grouped-reduce, spatial-join, clip, and many-few-overlay shapes,
+  not IO or hidden CPU fallback.
 
 ## Milestones
 
@@ -267,6 +278,10 @@ Remediation progress:
   the largest reusable shape gaps.
 - Fix shared physical shapes before workflow-specific scripts. A workflow fix
   is incomplete unless it improves or explains the named reusable shape.
+- Treat high `composition_overhead_ratio` with GPU-only `trace_summary` as a
+  first-class regression signal. It means kernels are not the limiting factor;
+  public API statement composition, scalar synchronization, host-visible
+  indexing, or geometry-frame assembly is.
 
 ## Completion Gate
 

@@ -197,7 +197,7 @@ def test_evaluate_geopandas_dissolve_can_use_dense_group_codes_without_group_pos
 
 
 @pytest.mark.gpu
-def test_unary_dissolve_rewrites_certified_polygon_coverage_to_coverage() -> None:
+def test_unary_dissolve_keeps_small_device_coverage_on_exact_gpu_path() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime not available")
 
@@ -248,11 +248,19 @@ def test_unary_dissolve_rewrites_certified_polygon_coverage_to_coverage() -> Non
         grid_size=None,
         agg_kwargs={},
     )
-    assert any(
+    assert not any(
         event.rule_name == "R11_dissolve_unary_polygon_coverage_to_coverage"
         for event in rewrite_events
     )
-    assert_geodataframe_equal(actual, expected)
+    assert actual.geometry.dtype.name == "device_geometry"
+    assert type(actual.geometry.values).__name__ == "DeviceGeometryArray"
+    assert actual["value"].tolist() == expected["value"].tolist()
+    actual_geoms = np.asarray(actual.geometry.array, dtype=object)
+    expected_geoms = np.asarray(expected.geometry.array, dtype=object)
+    assert all(
+        bool(shapely.equals(actual_geom, expected_geom))
+        for actual_geom, expected_geom in zip(actual_geoms, expected_geoms, strict=True)
+    )
 
 
 @pytest.mark.gpu

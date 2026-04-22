@@ -5,7 +5,7 @@ Scope: Stage-timed profiling entrypoints, NVTX guidance, and trace interpretatio
 Read If: You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
 STOP IF: You already have the profiling script open and only need a local implementation detail.
 Source Of Truth: Stage-level profiling workflow for join and overlay kernel development.
-Body Budget: 148/220 lines
+Body Budget: 155/220 lines
 Document: docs/testing/profiling-rails.md
 
 Section Map (Body Lines)
@@ -21,7 +21,7 @@ Section Map (Body Lines)
 | 65-98 | Stage Contracts |
 | 99-109 | Trace Interpretation |
 | 110-124 | NVTX |
-| 125-148 | Shootout Physical Plans |
+| 125-155 | Shootout Physical Plans |
 DOC_HEADER:END -->
 
 This repo now has a dedicated profiling rail for join and overlay kernel work.
@@ -158,6 +158,10 @@ Shootout artifacts should report:
 - fallback events and reasons
 - host materialization and transfer counts
 - top hotpath stages by elapsed time
+- statement-level `timed_stages` with source line spans and physical-shape tags
+- `stage_totals_by_tag` and `stage_totals_by_backend`
+- `hotpath_total_seconds`, `composition_overhead_seconds`, and
+  `composition_overhead_ratio`
 - row-flow counts through joins, overlays, filters, and grouped reductions
 - physical shape tags such as semijoin, anti-semijoin, many-few overlay, mask
   clip, grouped geometry reduce, and area-filter-after-overlay
@@ -166,6 +170,9 @@ Interpretation rules:
 
 - a passing fingerprint is correctness evidence, not performance evidence
 - a fast individual kernel does not prove the public workflow shape is fast
+- a GPU-only execution trace with high composition overhead points at public API
+  orchestration, scalar synchronization, or frame assembly rather than kernel
+  throughput
 - workflow fixes should improve a named reusable shape or document a measured
   external-bound limit
 - operation-vs-operation floor checks should accompany workflow analysis so
