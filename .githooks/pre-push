@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+
+# Heavy contract/GPU health is intentionally a push-time gate. Pre-commit stays
+# fast enough for local checkpoint commits; this hook still blocks code from
+# leaving the workstation unless the ratchets pass.
+
+export VIBESPATIAL_GPU_COVERAGE_WORKERS="${VIBESPATIAL_GPU_COVERAGE_WORKERS:-auto}"
+
+uv run python scripts/gpu_health_gate.py --pre-push

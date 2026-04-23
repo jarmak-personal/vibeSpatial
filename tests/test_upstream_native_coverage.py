@@ -6,6 +6,7 @@ from scripts.upstream_native_coverage import (
     compute_native_pass_rates,
     discover_group_targets,
     parse_pytest_summary,
+    pytest_worker_args,
 )
 
 
@@ -32,6 +33,17 @@ def test_compute_native_pass_rates_excludes_skips_from_native_rate() -> None:
 
     assert native_rate == 80.0
     assert suite_rate == 40.0
+
+
+def test_pytest_worker_args_are_env_controlled(monkeypatch) -> None:
+    monkeypatch.delenv("VIBESPATIAL_GPU_COVERAGE_WORKERS", raising=False)
+    assert pytest_worker_args() == []
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_COVERAGE_WORKERS", "auto")
+    assert pytest_worker_args() == ["-n", "auto"]
+
+    monkeypatch.setenv("VIBESPATIAL_GPU_COVERAGE_WORKERS", "1")
+    assert pytest_worker_args() == []
 
 
 def test_discover_group_targets_splits_upstream_tree_by_top_level_area() -> None:

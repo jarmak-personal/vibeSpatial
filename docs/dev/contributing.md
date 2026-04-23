@@ -39,12 +39,16 @@ uv run pytest tests/test_pipeline_benchmarks.py -q
 # Doc changes
 uv run python scripts/check_docs.py --check
 
-# Full pre-commit suite (what the hook runs)
+# Full deterministic pre-commit suite
 uv run ruff check
 uv run python scripts/check_architecture_lints.py --all
 uv run python scripts/check_zero_copy.py --all
 uv run python scripts/check_perf_patterns.py --all
 uv run python scripts/check_maintainability.py --all
+
+# Push-time heavy gate
+uv run python scripts/health.py --tier contract --check
+uv run python scripts/health.py --tier gpu --check
 ```
 
 ## Release process

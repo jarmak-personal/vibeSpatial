@@ -35,32 +35,59 @@ layers, each operating at a different level of the stack:
 uv run python scripts/install_githooks.py
 ```
 
-That's it. The git hook runs deterministic checks plus blocking health gates on
-every commit, then prints a reminder about the AI review skills. The hook
-layer is configured via `.claude/settings.json`; repo-local Codex skills live
-in `.agents/skills/`.
+That's it. The git hooks classify the staged or pushed diff first. Pre-commit
+runs the fast deterministic gate. Pre-push runs the expensive contract and GPU
+health gate, with a cache keyed to the pushed ref update so a retry of the same
+push does not rerun the full GPU sweep. The hook layer is configured via
+`.claude/settings.json`; repo-local Codex skills live in `.agents/skills/`.
 
 ## Layer 1: Deterministic Checks (git pre-commit hook)
 
-Runs on every commit for all contributors. No network, no AI. The full gate is
-designed around a visible NVIDIA runtime because the commit path now includes
-the GPU health tier; without one, that tier reports `skipped-no-gpu` instead
-of protecting against GPU regressions. Total runtime is no longer "fast lint
-only"; it includes full contract and GPU health ratchets. Enforced by
-`.githooks/pre-commit`.
+Runs on every commit for all contributors. No network, no AI. The hook starts
+with `scripts/precommit_plan.py`, which inspects staged paths and chooses one
+of two scopes:
+
+- `docs-only`: staged paths are Markdown, `docs/` assets, or generated docs
+  index artifacts. The hook refreshes and validates generated docs, then skips
+  ruff, architecture, zero-copy, performance, and import-guard checks.
+  Maintainability still runs so ADR/index drift stays visible.
+- `full`: any staged code, tests, scripts, hooks, project configuration, or
+  unknown file type. The hook runs the deterministic gate.
+
+Pre-commit does not run contract or GPU health by default. Set
+`VIBESPATIAL_PRECOMMIT_FORCE_GPU=1` to run the cached heavy gate before a local
+commit attempt.
 
 | Order | Check | Script | Rules |
 |-------|-------|--------|-------|
-| 1 | Ruff lint | `ruff check` | E, F, W, I, UP, B, PERF, RUF |
+| 0 | Staged path plan | `precommit_plan.py --scope` | Select docs-only or full gate |
+| 1 | Ruff lint | `ruff check` | Full gate only; E, F, W, I, UP, B, PERF, RUF |
 | 2 | Doc refresh | `check_docs.py --refresh` | Auto-refresh generated headers |
 | 3 | Doc validate | `check_docs.py --check` | Header budgets, routing sections |
-| 4 | Architecture | `check_architecture_lints.py --all` | ARCH001-006 |
-| 5 | Zero-copy | `check_zero_copy.py --all` | ZCOPY001-003 (add `--detail` for per-violation breakdown during debt paydown) |
-| 6 | Performance | `check_perf_patterns.py --all` | VPAT001-004 |
-| 7 | Maintainability | `check_maintainability.py --all` | MAINT001-003 |
-| 8 | Import guards | `check_import_guard.py --all` | IGRD001-002 |
-| 9 | Contract health | `health.py --tier contract --check` | Ratcheted maintained-surface regressions |
-| 10 | GPU health | `health.py --tier gpu --check` | Ratcheted GPU acceleration / fallback regressions |
+| 4 | Architecture | `check_architecture_lints.py --all` | Full gate only; ARCH001-006 |
+| 5 | Zero-copy | `check_zero_copy.py --all` | Full gate only; ZCOPY001-003 (add `--detail` for per-violation breakdown during debt paydown) |
+| 6 | Performance | `check_perf_patterns.py --all` | Full gate only; VPAT001-004 |
+| 7 | Maintainability | `check_maintainability.py --all` | Docs-only and full gates; MAINT001-003 |
+| 8 | Import guards | `check_import_guard.py --all` | Full gate only; IGRD001-002 |
+| 9 | Forced heavy gate | `gpu_health_gate.py --staged --force` | Only when `VIBESPATIAL_PRECOMMIT_FORCE_GPU=1` |
+
+### Pre-Push Heavy Gate
+
+The pre-push hook (`.githooks/pre-push`) runs the expensive ratchets before
+code leaves the local workstation:
+
+| Order | Check | Script | Rules |
+|-------|-------|--------|-------|
+| 1 | Contract health | `health.py --tier contract --check` | Cached per pushed ref update |
+| 2 | GPU health | `health.py --tier gpu --check` | Cached per pushed ref update |
+
+Docs-only pushes skip the heavy gate unless `VIBESPATIAL_PUSH_FORCE_GPU=1` is
+set. Successful heavy-gate runs are cached under `.git/` for 24 hours. Set
+`VIBESPATIAL_GPU_GATE_IGNORE_CACHE=1` to force a rerun for the same diff, or
+`VIBESPATIAL_GPU_GATE_CACHE_TTL_SECONDS=0` to disable cache hits.
+The pre-push hook defaults `VIBESPATIAL_GPU_COVERAGE_WORKERS=auto` so the
+upstream GPU coverage sweeps use `pytest-xdist`; set it to `1` if parallel GPU
+workers cause local contention.
 
 After checks pass, a non-blocking reminder prints the AI review commands.
 This works in terminals, VS Code git output, and CI alike.

@@ -5,7 +5,7 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 259/260 lines
+Body Budget: 260/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
@@ -24,7 +24,7 @@ Section Map (Body Lines)
 | 105-135 | Property Convergence |
 | 136-147 | Test Strategy |
 | 148-156 | Build And Tooling |
-| 157-183 | Verification |
+| 157-184 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -180,13 +180,14 @@ The pre-commit hook enforces all property checks automatically. The
 - Put GPU-specific dependencies behind focused dependency groups.
 - If adopting CCCL Python, prefer a first-class refactor to native
   CCCL-compatible device arrays rather than layering a temporary adapter.
-- Pre-commit hook installs via `uv run python scripts/install_githooks.py`
+- Pre-commit/pre-push hooks install via `uv run python scripts/install_githooks.py`
 
 ## Verification
 
 The pre-commit hook runs all deterministic checks automatically:
 ruff, doc refresh/validation, ARCH, ZCOPY, VPAT, MAINT, IGRD.
 You do not need to run these manually.
+The pre-push hook runs cached contract/GPU health before code leaves the workstation.
 
 For targeted verification during development:
 

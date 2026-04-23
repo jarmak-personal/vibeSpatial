@@ -17389,6 +17389,83 @@
     },
     {
       "kind": "script",
+      "path": "scripts/gpu_health_gate.py",
+      "referenced_by": [],
+      "symbols": [
+        "RefUpdate",
+        "GatePlan",
+        "repo_root",
+        "parse_pre_push_updates",
+        "changed_paths_for_updates",
+        "staged_changed_paths",
+        "cache_key_for_updates",
+        "staged_cache_key",
+        "plan_for_paths",
+        "git_dir",
+        "cache_path",
+        "load_cache",
+        "write_cache_entry",
+        "cache_hit",
+        "cache_ttl_seconds",
+        "run_health_commands",
+        "run_gate",
+        "main",
+        "_normalize_path",
+        "_is_zero_oid",
+        "_run_git_bytes",
+        "_run_git_text",
+        "_split_nul_paths",
+        "_paths_for_update",
+        "_pre_push_plan",
+        "_staged_plan"
+      ],
+      "tokens": [
+        "bytes",
+        "cache",
+        "cached",
+        "changed",
+        "commands",
+        "commit",
+        "contract",
+        "dir",
+        "entry",
+        "forced",
+        "gate",
+        "gateplan",
+        "git",
+        "gpu",
+        "health",
+        "hit",
+        "key",
+        "load",
+        "main",
+        "normalize",
+        "nul",
+        "oid",
+        "parse",
+        "plan",
+        "pre",
+        "push",
+        "py",
+        "refupdate",
+        "repo",
+        "root",
+        "run",
+        "runs",
+        "scripts",
+        "seconds",
+        "split",
+        "staged",
+        "text",
+        "ttl",
+        "update",
+        "updates",
+        "write",
+        "zero"
+      ]
+    },
+    {
+      "kind": "script",
       "path": "scripts/health.py",
       "referenced_by": [],
       "symbols": [
@@ -17662,6 +17739,37 @@
         "signal",
         "status",
         "test"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/precommit_plan.py",
+      "referenced_by": [],
+      "symbols": [
+        "PrecommitPlan",
+        "is_docs_only_path",
+        "classify_paths",
+        "staged_paths",
+        "main",
+        "_normalize_path"
+      ],
+      "tokens": [
+        "classify",
+        "commit",
+        "commits",
+        "docs",
+        "fast",
+        "main",
+        "normalize",
+        "only",
+        "plan",
+        "planner",
+        "pre",
+        "precommit",
+        "precommitplan",
+        "py",
+        "scripts",
+        "staged"
       ]
     },
     {
@@ -17944,6 +18052,7 @@
         "GroupedNativeCoverageReport",
         "parse_pytest_summary",
         "compute_native_pass_rates",
+        "pytest_worker_args",
         "discover_group_targets",
         "run_native_coverage",
         "run_grouped_native_coverage",
@@ -17954,6 +18063,7 @@
         "_run_command_capture"
       ],
       "tokens": [
+        "args",
         "capture",
         "command",
         "compute",
@@ -17978,7 +18088,8 @@
         "scripts",
         "summary",
         "targets",
-        "upstream"
+        "upstream",
+        "worker"
       ]
     },
     {
@@ -41465,6 +41576,42 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_gpu_health_gate.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_parse_pre_push_updates",
+        "test_plan_skips_docs_only_paths",
+        "test_plan_runs_for_code_paths",
+        "test_plan_force_overrides_docs_only_paths",
+        "test_cache_hit_honors_ttl"
+      ],
+      "tokens": [
+        "cache",
+        "code",
+        "docs",
+        "force",
+        "gate",
+        "gpu",
+        "health",
+        "hit",
+        "honors",
+        "only",
+        "overrides",
+        "parse",
+        "plan",
+        "pre",
+        "push",
+        "py",
+        "runs",
+        "skips",
+        "test",
+        "tests",
+        "ttl",
+        "updates"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_gpu_memory_pool.py",
       "referenced_by": [],
       "symbols": [
@@ -46079,6 +46226,43 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_precommit_plan.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_docs_only_paths_use_fast_path",
+        "test_docs_assets_use_fast_path",
+        "test_code_paths_require_full_checks",
+        "test_requirements_txt_requires_full_checks",
+        "test_empty_path_set_requires_full_checks",
+        "test_force_full_env_var_overrides_docs_only"
+      ],
+      "tokens": [
+        "assets",
+        "checks",
+        "code",
+        "docs",
+        "empty",
+        "env",
+        "fast",
+        "force",
+        "full",
+        "only",
+        "overrides",
+        "plan",
+        "precommit",
+        "py",
+        "require",
+        "requirements",
+        "requires",
+        "set",
+        "test",
+        "tests",
+        "txt",
+        "var"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_profiling_rails.py",
       "referenced_by": [],
       "symbols": [
@@ -48293,15 +48477,20 @@
       "symbols": [
         "test_parse_pytest_summary_extracts_counts_and_failures",
         "test_compute_native_pass_rates_excludes_skips_from_native_rate",
+        "test_pytest_worker_args_are_env_controlled",
         "test_discover_group_targets_splits_upstream_tree_by_top_level_area",
         "test_discover_group_targets_splits_upstream_tree_by_test_file"
       ],
       "tokens": [
+        "are",
         "area",
+        "args",
         "compute",
+        "controlled",
         "counts",
         "coverage",
         "discover",
+        "env",
         "excludes",
         "extracts",
         "failures",
@@ -48322,7 +48511,8 @@
         "tests",
         "top",
         "tree",
-        "upstream"
+        "upstream",
+        "worker"
       ]
     },
     {

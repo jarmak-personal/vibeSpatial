@@ -16,6 +16,7 @@ try:
         DEFAULT_TARGETS,
         NativeCoverageReport,
         parse_pytest_summary,
+        pytest_worker_args,
         run_native_coverage,
     )
 except ImportError:
@@ -23,6 +24,7 @@ except ImportError:
         DEFAULT_TARGETS,
         NativeCoverageReport,
         parse_pytest_summary,
+        pytest_worker_args,
         run_native_coverage,
     )
 from vibespatial import STRICT_NATIVE_ENV_VAR
@@ -536,7 +538,7 @@ def run_dispatch_observation(targets: tuple[str, ...], *, cwd: Path, timeout: in
         event_log_path = Path(temp_dir) / "dispatch-events.jsonl"
         env[EVENT_LOG_ENV_VAR] = str(event_log_path)
         for target_set in target_sets:
-            command = ["uv", "run", "pytest", "-q", *target_set]
+            command = ["uv", "run", "pytest", "-q", *pytest_worker_args(), *target_set]
             commands.append(" ".join(command))
             completed = subprocess.run(
                 command,

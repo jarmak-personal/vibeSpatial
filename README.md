@@ -1,36 +1,33 @@
 # vibeSpatial
 
-vibeSpatial is a **GPU-first spatial analytics library** for Python.  Change
-one import line and your existing GeoPandas code runs on CUDA — binary
-predicates, buffer, overlay, dissolve, make-valid, spatial joins, and I/O all
-dispatch to GPU kernels automatically, with **explicit, observable** CPU
-compatibility fallback only when the native GPU path is unavailable or
-unsupported.
+vibeSpatial is an early **GPU-first spatial analytics library** for Python. It
+keeps GeoPandas-style workflows on CUDA where native paths exist, and makes CPU
+compatibility fallback explicit when they do not.
+
+The strongest paths today are bulk I/O, CRS transforms, device-backed geometry
+buffers, predicates, selected constructive/overlay/dissolve workloads, and
+Arrow/Parquet export. Performance is workload-dependent: some public workflows
+are already faster than GeoPandas, while others are still limited by
+compatibility boundaries, composition overhead, or missing physical operators.
 
 > [!WARNING]
-> vibeSpatial is still early, but the public GPU path is now the design center:
-> the April 20, 2026 local GPU health gate reports **95.09% value-weighted
-> GPU acceleration** across tracked public dispatches. [File an issue](https://github.com/jarmak-personal/vibeSpatial/issues)
-> if you hit a fallback, correctness mismatch, or unexpected host transfer.
+> vibeSpatial is still under active development. Public API compatibility and
+> GPU residency are improving quickly, but GPU coverage is not the same thing
+> as end-to-end speed on every GeoPandas workload.
 >
-> The repository enforces fallback observability: once a workflow is on device,
-> hidden host exits are treated as bugs, and strict-native tests fail if a path
-> materializes to host without first recording an explicit fallback or
-> compatibility boundary. The maintained warmed `10k` public shootout suite
-> under [`benchmarks/shootout/`](benchmarks/shootout/) currently passes with
-> matching fingerprints on local RTX 4090 runs; heavier workflows show clear
-> wins while tiny CPU-shaped workflows are treated as crossover signals rather
-> than benchmark theater.
+> Fallbacks should be observable. If a workflow silently leaves the GPU path,
+> produces a correctness mismatch, or loses badly where the shape should be
+> accelerated, please [file an issue](https://github.com/jarmak-personal/vibeSpatial/issues).
 
 ### Install
 
 ```bash
-pip install vibespatial              # CPU-only (GeoPandas drop-in)
+pip install vibespatial              # CPU-only GeoPandas-compatible API
 pip install vibespatial[cu12]        # CUDA 12 GPU acceleration
 pip install vibespatial[cu13]        # CUDA 13 GPU acceleration
 ```
 
-### Quick start
+### Quick Start
 
 ```python
 import vibespatial as gpd
@@ -41,7 +38,7 @@ joined = gpd.sjoin(gdf, buffered)
 gdf.to_parquet("out.parquet")
 ```
 
-### Real-world example: 7.2 million buildings
+### Example: 7.2 Million Buildings
 
 Load every building footprint in Florida, reproject to UTM, find all buildings
 within 1 km of a random pick, and export to GeoParquet.  The full script is
@@ -49,6 +46,7 @@ at [`examples/nearby_buildings.py`](examples/nearby_buildings.py).
 
 ```python
 import vibespatial as gpd
+import random
 
 # Read 7.2M buildings from Microsoft US Building Footprints
 gdf = gpd.read_file("Florida.geojson")
@@ -64,7 +62,7 @@ nearby = gdf_utm[gdf_utm.geometry.dwithin(seed.centroid, 1_000)]
 nearby.to_crs(epsg=4326).to_parquet("nearby_buildings.parquet")
 ```
 
-**vibeSpatial is a drop-in replacement for GeoPandas.** Here is the only diff:
+For compatible workflows, code can often stay close to GeoPandas:
 
 ```diff
 -import geopandas as gpd
@@ -77,46 +75,33 @@ nearby.to_crs(epsg=4326).to_parquet("nearby_buildings.parquet")
  nearby.to_crs(epsg=4326).to_parquet("nearby_buildings.parquet")
 ```
 
-**Performance on 7.2M polygons (GeoPandas CPU baseline vs current public
-vibeSpatial run on local RTX 4090 / i9-13900K):**
+This public example is currently I/O and reprojection dominated, which is where
+vibeSpatial is strongest. On a local RTX 4090 / i9-13900K run:
 
 | Step | GeoPandas | vibeSpatial | Speedup |
 |---|---|---|---|
 | Read GeoJSON | 57.7 s | 6.7 s | **8.6x** |
 | Reproject to UTM | 8.2 s | 0.1 s | **82x** |
 | Select within 1 km | 0.2 s | 0.2 s | 1.0x |
-| **End-to-end including GeoParquet export** | **66.3 s** | **8.0 s** | **8.3x** |
+| End-to-end including GeoParquet export | 66.3 s | 8.0 s | 8.3x |
 
-The vibeSpatial column is the public
-[`examples/nearby_buildings.py`](examples/nearby_buildings.py) path, not a
-private benchmark hook. GeoJSON reading uses GPU byte-classification: NVRTC
-kernels parse JSON structure, detect geometry families, extract coordinates,
-and assemble geometry into owned device buffers. Property payloads are decoded
-through a narrowed host seam. Reprojection uses
-[vibeProj](https://github.com/jarmak-personal/vibeProj) fused GPU kernels via
-`transform_buffers()` -- no host round-trip. Spatial queries use
-device-resident bounding-box prefilter + GPU distance kernels.
+This is one representative public path, not a blanket performance claim. The
+maintained shootout workflows in [`benchmarks/shootout/`](benchmarks/shootout/)
+are used to track where performance generalizes and where more physical-plan
+work is still needed.
 
-### Current GPU coverage
+### Current Focus
 
-The April 20, 2026 local GPU health gate reports **95.09% value-weighted
-GPU acceleration** across tracked public dispatches:
+- Keep geometry device-resident across public workflows instead of repeatedly
+  materializing pandas/Shapely intermediates.
+- Expand reusable physical shapes such as semijoins, anti-semijoins,
+  many-few overlay, mask clip, and grouped geometry reduction.
+- Preserve GeoPandas compatibility while making CPU fallback and host/device
+  transfers visible.
+- Use vendored GeoPandas tests and public workflow shootouts as the correctness
+  and performance contract.
 
-| Surface | GPU work coverage |
-|---|---:|
-| I/O write | 99.88% |
-| Query | 95.51% |
-| I/O read | 94.71% |
-| Other public APIs | 94.48% |
-| Constructive | 85.92% |
-| Overlay | 76.14% |
-| Dissolve | 54.43% |
-
-The remaining work is concentrated in exact constructive/overlay/dissolve
-paths and uncommon compatibility boundaries. Silent CPU fallback is not an
-accepted success mode.
-
-### Tech stack
+### Tech Stack
 
 | Layer | Technology |
 |---|---|
@@ -128,14 +113,12 @@ accepted success mode.
 | GPU Parquet/Arrow | pylibcudf (WKB decode, GeoArrow codec) |
 | CPU compatibility | GeoPandas API (vendored upstream test suite) |
 | JSON parsing | orjson (property extraction) |
-| File I/O | native GPU/hybrid routes for GeoJSON, Shapefile, FlatGeobuf, GeoJSONSeq, OSM PBF; pyogrio for GDAL compatibility |
+| File I/O | Native GPU/hybrid routes for GeoJSON, Shapefile, FlatGeobuf, GeoJSONSeq, and OSM PBF; pyogrio for GDAL compatibility |
 | Packaging | uv, hatchling |
 
-All GPU kernels are **pure Python** — CUDA C source strings compiled at
-runtime via NVRTC with background warmup (ADR-0034).  Compiled CUBINs are
-cached on disk so the JIT cost is paid only once per install.  No compiled
-extensions, no `nvcc` build step.  The entire suite ships as pure-Python
-wheels:
+GPU kernels are shipped as Python source strings and compiled at runtime with
+NVRTC. Compiled CUBINs are cached on disk, so the JIT cost is paid once per
+install. No compiled extensions or `nvcc` build step are required.
 
 | Package | Wheel size |
 |---|---|

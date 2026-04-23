@@ -16,6 +16,7 @@ from vibespatial import STRICT_NATIVE_ENV_VAR
 
 DEFAULT_TARGETS = ("tests/upstream/geopandas",)
 DEFAULT_GROUP_NAMES = ("tests", "io", "tools")
+PYTEST_WORKERS_ENV_VAR = "VIBESPATIAL_GPU_COVERAGE_WORKERS"
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,13 @@ def compute_native_pass_rates(counts: dict[str, int]) -> tuple[float, float]:
     native_pass_rate = 0.0 if executed_total == 0 else 100.0 * counts["passed"] / executed_total
     suite_pass_rate = 0.0 if collected_total == 0 else 100.0 * counts["passed"] / collected_total
     return native_pass_rate, suite_pass_rate
+
+
+def pytest_worker_args() -> list[str]:
+    workers = os.environ.get(PYTEST_WORKERS_ENV_VAR, "").strip()
+    if not workers or workers in {"0", "1", "false", "False", "none", "None"}:
+        return []
+    return ["-n", workers]
 
 
 def discover_group_targets(
@@ -201,7 +209,7 @@ def run_native_coverage(
     progress: bool = True,
     heartbeat_seconds: int = 30,
 ) -> NativeCoverageReport:
-    command = ["uv", "run", "pytest", "-q", *targets]
+    command = ["uv", "run", "pytest", "-q", *pytest_worker_args(), *targets]
     env = dict(os.environ)
     env[STRICT_NATIVE_ENV_VAR] = "1"
     completed = _run_command_capture(

@@ -23,8 +23,7 @@ def append_event_record(event_type: str, payload: dict[str, Any]) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True))
-            handle.write("\n")
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
     except OSError:
         return
 

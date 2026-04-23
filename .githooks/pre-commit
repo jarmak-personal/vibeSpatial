@@ -5,14 +5,53 @@ set -e
 # Tier 1: Deterministic checks (fast, all contributors)
 # ===========================================================================
 
+run_docs_checks() {
+    printf "pre-commit: refreshing generated docs and intake index...\n"
+    uv run python scripts/check_docs.py --refresh --stage-generated
+
+    printf "pre-commit: validating docs and intake index...\n"
+    uv run python scripts/check_docs.py --check
+}
+
+run_maintainability_checks() {
+    printf "pre-commit: checking maintainability...\n"
+    uv run python scripts/check_maintainability.py --all
+}
+
+run_forced_gpu_gate() {
+    if [ "${VIBESPATIAL_PRECOMMIT_FORCE_GPU:-0}" = "1" ]; then
+        printf "pre-commit: running forced cached contract/GPU health gate...\n"
+        uv run python scripts/gpu_health_gate.py --staged --force
+    else
+        printf "pre-commit: contract/GPU health deferred to pre-push. Set VIBESPATIAL_PRECOMMIT_FORCE_GPU=1 to run it now.\n"
+    fi
+}
+
+print_ai_review_reminder() {
+    if [ "${VIBESPATIAL_SKIP_AI_REMINDER:-0}" = "0" ]; then
+        printf "\n"
+        printf "%s\n" "Reminder: run $pre-land-review in Codex before landing."
+        printf "  $pre-land-review  deterministic checks + AI review gate\n"
+        printf "  $gpu-code-review  targeted GPU review when kernel code changes\n"
+    fi
+}
+
+precommit_scope="$(uv run python scripts/precommit_plan.py --scope)"
+printf "pre-commit: staged change scope: %s\n" "$precommit_scope"
+
+if [ "$precommit_scope" = "docs-only" ]; then
+    run_docs_checks
+    run_maintainability_checks
+    printf "pre-commit: docs-only staged changes; skipping ruff, architecture, zero-copy, performance, and import guards.\n"
+    run_forced_gpu_gate
+    print_ai_review_reminder
+    exit 0
+fi
+
 printf "pre-commit: linting with ruff...\n"
 uv run ruff check
 
-printf "pre-commit: refreshing generated docs and intake index...\n"
-uv run python scripts/check_docs.py --refresh --stage-generated
-
-printf "pre-commit: validating docs and intake index...\n"
-uv run python scripts/check_docs.py --check
+run_docs_checks
 
 printf "pre-commit: checking architecture constraints...\n"
 uv run python scripts/check_architecture_lints.py --all
@@ -23,24 +62,15 @@ uv run python scripts/check_zero_copy.py --all
 printf "pre-commit: checking performance patterns...\n"
 uv run python scripts/check_perf_patterns.py --all
 
-printf "pre-commit: checking maintainability...\n"
-uv run python scripts/check_maintainability.py --all
+run_maintainability_checks
 
 printf "pre-commit: checking import guards (numpy/shapely in GPU paths)...\n"
 uv run python scripts/check_import_guard.py --all
 
-# ===========================================================================
-# Tier 2: Health gates (blocking, local NVIDIA workstation)
-# ===========================================================================
-
-printf "pre-commit: checking maintained contract surfaces against baseline...\n"
-uv run python scripts/health.py --tier contract --check
-
-printf "pre-commit: checking GPU health against baseline...\n"
-uv run python scripts/health.py --tier gpu --check --gpu-coverage-timeout 1200
+run_forced_gpu_gate
 
 # ===========================================================================
-# Tier 3: AI review reminder
+# Tier 2: AI review reminder
 #
 # The AI review skills ($gpu-code-review, $pre-land-review) are designed
 # for interactive agent sessions, not automated pre-commit runs.
@@ -49,9 +79,4 @@ uv run python scripts/health.py --tier gpu --check --gpu-coverage-timeout 1200
 # git output alike.  Suppress with VIBESPATIAL_SKIP_AI_REMINDER=1.
 # ===========================================================================
 
-if [ "${VIBESPATIAL_SKIP_AI_REMINDER:-0}" = "0" ]; then
-    printf "\n"
-    printf "%s\n" "Reminder: run $pre-land-review in Codex before landing."
-    printf "  $pre-land-review  deterministic checks + AI review gate\n"
-    printf "  $gpu-code-review  targeted GPU review when kernel code changes\n"
-fi
+print_ai_review_reminder
