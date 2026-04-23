@@ -5,39 +5,38 @@ Scope: Repository-wide agent workflow, intake usage, and verification expectatio
 Read If: You are starting, routing, or landing work in this repository.
 STOP IF: You only need a narrow API detail already covered by a routed doc.
 Source Of Truth: Agent workflow and handoff policy for vibeSpatial.
-Body Budget: 260/260 lines
+Body Budget: 243/260 lines
 Document: AGENTS.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-6 | Preamble |
-| 7-13 | Intent |
-| 14-22 | Request Signals |
-| 23-29 | Open First |
-| 30-34 | Verify |
-| 35-40 | Risks |
-| 41-58 | Mission |
-| 59-71 | Startup |
+| 1-5 | Preamble |
+| 6-12 | Intent |
+| 13-21 | Request Signals |
+| 22-28 | Open First |
+| 29-33 | Verify |
+| 34-39 | Risks |
+| 40-57 | Mission |
+| 58-71 | Startup |
 | 72-85 | Routing |
 | 86-104 | Execution Model |
-| 105-135 | Property Convergence |
-| 136-147 | Test Strategy |
-| 148-156 | Build And Tooling |
-| 157-184 | Verification |
+| 105-118 | Repo Health |
+| 119-130 | Test Strategy |
+| 131-139 | Build And Tooling |
+| 140-167 | Verification |
 | ... | (3 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
-GPU-first spatial analytics library. All agent work is measured by
-advancement of codebase properties, not task completion. Performance is
-the design center. Silent CPU fallbacks are unacceptable.
+GPU-first spatial analytics library. Performance is the design center.
+Silent CPU fallbacks are unacceptable.
 
 ## Intent
 
 Define the agent workflow for routing requests, verifying changes, and
 landing work. This document covers mindset and policy. For file discovery,
 use intake routing. For enforcement, trust the pre-commit hook and
-property dashboard.
+health checks.
 
 ## Request Signals
 
@@ -90,7 +89,8 @@ Build a new NVIDIA GPU-accelerated spatial analytics library from scratch.
 2. Open only the routed files/docs first.
 3. Read relevant ADRs from `docs/decisions/index.md` when the task reopens
    a design decision.
-4. Make the smallest coherent change that advances target properties.
+4. Make the smallest coherent change that solves the user's problem
+   without regressing repo health.
 5. Run the narrowest meaningful verification before expanding scope.
 6. Refresh generated docs with `uv run python scripts/check_docs.py --refresh` when doc metadata changes.
 7. If the user provides a PRD or tasklist, treat it as the mandate and execute end-to-end without confirmation loops.
@@ -130,36 +130,19 @@ Hard blocks in GPU code paths (pre-commit hook enforced):
 - **Object-dtype arrays** — use typed columnar arrays.
 - **Python for-loops over geometry objects** — use vectorized GPU operations.
 
-## Property Convergence
+## Repo Health
 
-Agent work is measured by the **property dashboard**, not task completion.
+Use the property dashboard as a repo-health summary, not as a mandatory
+task-framing layer:
 
 ```bash
-uv run python scripts/property_dashboard.py        # human-readable
-uv run python scripts/property_dashboard.py --json  # machine-readable
+uv run python scripts/property_dashboard.py
+uv run python scripts/property_dashboard.py --json
 ```
 
-The dashboard aggregates all check scripts into a unified view. Each
-property has a distance metric (0.0 = satisfied, >1.0 = regressed).
-Ratchet baselines track known debt; new code must not increase it.
-
-**Before starting work:** snapshot the dashboard with
-`uv run python scripts/property_dashboard.py --json` if the task is broad
-enough that a property baseline will help.
-
-**After completing work:** re-run the dashboard. Your changes are successful
-when:
-1. At least one target property distance decreased
-2. No property distance increased
-3. The user's stated goal is achieved
-
-What does NOT count as success:
-- A fix that passes tests but advances no property (workaround)
-- A change that advances one property but regresses another
-- A change that adds new violations to any ratchet baseline
-
-The pre-commit hook enforces all property checks automatically. The
-`$pre-land-review` skill validates before commit.
+It is useful for broad work, ratchet debugging, and health regressions.
+Do not force every task into a property brief. Local verification, the
+user's goal, and the deterministic checks still drive the work.
 
 ## Test Strategy
 

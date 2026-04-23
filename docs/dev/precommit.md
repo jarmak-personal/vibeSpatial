@@ -5,7 +5,7 @@ Scope: Pre-commit hook architecture, enforcement layers, and AI review workflow.
 Read If: You are setting up the repo, debugging a pre-commit failure, or extending the enforcement system.
 STOP IF: You only need to run a single lint check (see Verification in AGENTS.md).
 Source Of Truth: Pre-commit enforcement policy and AI review workflow.
-Body Budget: 386/390 lines
+Body Budget: 387/390 lines
 Document: docs/dev/precommit.md
 
 Section Map (Body Lines)
@@ -19,12 +19,12 @@ Section Map (Body Lines)
 | 45-50 | Risks |
 | 51-62 | Quick Start |
 | 63-153 | Layer 1: Deterministic Checks (git pre-commit hook) |
-| 154-191 | Layer 2: Pre-Land Review Skill (Codex, proactive) |
-| 192-243 | Layer 3: PreToolUse Hooks (legacy Claude Code, mechanical) |
-| 244-261 | Layer 4: commit-msg Gate (Content-Addressable Marker) |
-| 262-293 | How The Layers Interact |
-| 294-322 | Ratchet Baseline System |
-| 323-342 | Adding New Checks |
+| 154-192 | Layer 2: Pre-Land Review Skill (Codex, proactive) |
+| 193-244 | Layer 3: PreToolUse Hooks (legacy Claude Code, mechanical) |
+| 245-262 | Layer 4: commit-msg Gate (Content-Addressable Marker) |
+| 263-294 | How The Layers Interact |
+| 295-323 | Ratchet Baseline System |
+| 324-343 | Adding New Checks |
 | ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -195,7 +195,8 @@ context, regardless of how long the conversation has been running.
 
 1. Make your changes in a Codex session
 2. When you're ready to land, say "commit" or "let's land this"
-3. The skill fires automatically and runs the full checklist
+3. The skill fires automatically and runs the full checklist, including a
+   repo-native learning review when the task exposed reusable lessons
 4. If verdict is LAND, the skill writes `.agents/.review-completed` marker
 5. `git commit` -- deterministic checks run, `commit-msg` hook verifies marker
 6. Commit completes

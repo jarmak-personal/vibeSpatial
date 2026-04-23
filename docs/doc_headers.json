@@ -29,6 +29,20 @@
       "sourceOfTruth": "Pre-commit enforcement policy and AI review workflow.",
       "maxBodyLines": 390
     },
+    "docs/dev/agent-runs.md": {
+      "scope": "Visible local agent run capsules, hypothesis ledgers, and repo-native learning loop workflow.",
+      "readIf": "You are starting a long-running agent task, debugging mid-task reasoning, or closing work with durable learnings.",
+      "stopIf": "You only need the normal intake route for a short one-command task.",
+      "sourceOfTruth": "Agent run state and repo-native learning workflow.",
+      "maxBodyLines": 220
+    },
+    "docs/dev/subagents.md": {
+      "scope": "Repo-managed Codex custom-agent source files and validation workflow.",
+      "readIf": "You are wiring, editing, or validating repo-specific Codex subagents.",
+      "stopIf": "You only need normal skills or built-in `worker` / `explorer` roles.",
+      "sourceOfTruth": "Project-scoped custom-agent files in `.codex/agents/`.",
+      "maxBodyLines": 220
+    },
     "docs/dev/constructive-result-unification-execution-plan.md": {
       "scope": "Execution plan for unifying constructive results across overlay, clip, dissolve, and planner-selected fused execution families.",
       "readIf": "You are planning or executing the constructive-result refactor, overlay architecture rewrite, or planner-driven fusion work.",

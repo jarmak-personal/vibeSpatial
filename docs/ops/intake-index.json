@@ -36,7 +36,7 @@
         "Landing",
         "Mission",
         "Open First",
-        "Property Convergence",
+        "Repo Health",
         "Request Signals",
         "Risks",
         "Routing",
@@ -54,7 +54,6 @@
         "are",
         "autonomous",
         "build",
-        "convergence",
         "covered",
         "detail",
         "doc",
@@ -65,6 +64,7 @@
         "first",
         "gate",
         "handoff",
+        "health",
         "instructions",
         "intake",
         "intent",
@@ -81,7 +81,6 @@
         "policy",
         "prd",
         "profile",
-        "property",
         "repo",
         "repository",
         "request",
@@ -2949,6 +2948,105 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 220,
+        "readIf": "You are starting a long-running agent task, debugging mid-task reasoning, or closing work with durable learnings.",
+        "scope": "Visible local agent run capsules, hypothesis ledgers, and repo-native learning loop workflow.",
+        "sourceOfTruth": "Agent run state and repo-native learning workflow.",
+        "stopIf": "You only need the normal intake route for a short one-command task."
+      },
+      "open_first": [
+        "docs/dev/agent-runs.md",
+        "scripts/agent_run.py",
+        "docs/ops/intake.md",
+        "docs/dev/precommit.md",
+        ".agents/skills/pre-land-review/SKILL.md",
+        ".agents/skills/commit/SKILL.md"
+      ],
+      "path": "docs/dev/agent-runs.md",
+      "request_signals": [
+        "problem capsule",
+        "hypothesis ledger",
+        "learning loop",
+        "agent run",
+        "closeout",
+        "execution state",
+        "repo-native learning",
+        "task handoff",
+        "agent workflow"
+      ],
+      "risks": [
+        "Treating `.agents/runs/` as durable knowledge recreates hidden memory debt.",
+        "Closing a run without converting lessons into tests, docs, lints, benchmarks,",
+        "Over-instrumenting small tasks makes agents spend more time bookkeeping than"
+      ],
+      "sections": [
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Storage Contract",
+        "Verify",
+        "Workflow"
+      ],
+      "title": "Agent Run State",
+      "tokens": [
+        "agent",
+        "are",
+        "capsule",
+        "capsules",
+        "closeout",
+        "closing",
+        "command",
+        "contract",
+        "debugging",
+        "durable",
+        "execution",
+        "first",
+        "handoff",
+        "hypothesis",
+        "intake",
+        "intent",
+        "learning",
+        "learnings",
+        "ledger",
+        "ledgers",
+        "local",
+        "long",
+        "loop",
+        "mid",
+        "native",
+        "need",
+        "normal",
+        "one",
+        "only",
+        "open",
+        "problem",
+        "reasoning",
+        "repo",
+        "request",
+        "risks",
+        "route",
+        "run",
+        "running",
+        "short",
+        "signals",
+        "starting",
+        "state",
+        "storage",
+        "task",
+        "verify",
+        "visible",
+        "work",
+        "workflow",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_agent_run.py -q",
+        "uv run python scripts/check_docs.py --check"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 900,
         "readIf": "You are planning or executing the constructive-result refactor, overlay architecture rewrite, or planner-driven fusion work.",
         "scope": "Execution plan for unifying constructive results across overlay, clip, dissolve, and planner-selected fused execution families.",
@@ -3425,6 +3523,90 @@
         "uv run pytest tests/test_precommit_plan.py -q",
         "uv run python scripts/check_docs.py --check",
         "uv run python scripts/check_maintainability.py --all"
+      ]
+    },
+    {
+      "metadata": {
+        "maxBodyLines": 220,
+        "readIf": "You are wiring, editing, or validating repo-specific Codex subagents.",
+        "scope": "Repo-managed Codex custom-agent source files and validation workflow.",
+        "sourceOfTruth": "Project-scoped custom-agent files in `.codex/agents/`.",
+        "stopIf": "You only need normal skills or built-in `worker` / `explorer` roles."
+      },
+      "open_first": [
+        "docs/dev/subagents.md",
+        ".codex/agents/cuda-engineer.toml",
+        ".codex/agents/python-engineer.toml",
+        "AGENTS.md"
+      ],
+      "path": "docs/dev/subagents.md",
+      "request_signals": [
+        "codex subagent",
+        "custom agent",
+        "cuda-engineer",
+        "python-engineer",
+        "fresh set of eyes",
+        "repo-managed agent"
+      ],
+      "risks": [
+        "Letting agent instructions sprawl turns fresh eyes into prompt debt.",
+        "Project-local `.codex` trees are often globally gitignored; keep",
+        "If a workstation overlays repo `.codex` with a separate mount, Codex may need"
+      ],
+      "sections": [
+        "Intent",
+        "Open First",
+        "Request Signals",
+        "Risks",
+        "Verify",
+        "Workflow"
+      ],
+      "title": "Codex Subagents",
+      "tokens": [
+        "agent",
+        "agents",
+        "are",
+        "built",
+        "codex",
+        "cuda",
+        "custom",
+        "editing",
+        "engineer",
+        "explorer",
+        "eyes",
+        "first",
+        "fresh",
+        "intent",
+        "managed",
+        "need",
+        "normal",
+        "only",
+        "open",
+        "project",
+        "python",
+        "repo",
+        "request",
+        "risks",
+        "roles",
+        "scoped",
+        "set",
+        "signals",
+        "skills",
+        "source",
+        "specific",
+        "subagent",
+        "subagents",
+        "validating",
+        "validation",
+        "verify",
+        "wiring",
+        "worker",
+        "workflow",
+        "you"
+      ],
+      "verify": [
+        "uv run pytest tests/test_codex_subagents.py -q",
+        "uv run python scripts/check_docs.py --check"
       ]
     },
     {
@@ -5143,7 +5325,9 @@
     {
       "kind": "repo",
       "path": ".agents/skills/commit/SKILL.md",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/agent-runs.md"
+      ],
       "symbols": [],
       "tokens": [
         "agents",
@@ -5369,7 +5553,9 @@
     {
       "kind": "repo",
       "path": ".agents/skills/pre-land-review/SKILL.md",
-      "referenced_by": [],
+      "referenced_by": [
+        "docs/dev/agent-runs.md"
+      ],
       "symbols": [],
       "tokens": [
         "agents",
@@ -5455,18 +5641,6 @@
         "beads",
         "json",
         "metadata"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".claude/.property-before.json",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "before",
-        "claude",
-        "json",
-        "property"
       ]
     },
     {
@@ -5772,16 +5946,32 @@
     },
     {
       "kind": "repo",
-      "path": ".claude/skills/property-framing/SKILL.md",
-      "referenced_by": [],
+      "path": ".codex/agents/cuda-engineer.toml",
+      "referenced_by": [
+        "docs/dev/subagents.md"
+      ],
       "symbols": [],
       "tokens": [
-        "claude",
-        "framing",
-        "md",
-        "property",
-        "skill",
-        "skills"
+        "agents",
+        "codex",
+        "cuda",
+        "engineer",
+        "toml"
+      ]
+    },
+    {
+      "kind": "repo",
+      "path": ".codex/agents/python-engineer.toml",
+      "referenced_by": [
+        "docs/dev/subagents.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "agents",
+        "codex",
+        "engineer",
+        "python",
+        "toml"
       ]
     },
     {
@@ -5852,6 +6042,7 @@
       "path": "AGENTS.md",
       "referenced_by": [
         "AGENTS.md",
+        "docs/dev/subagents.md",
         "docs/ops/intake.md"
       ],
       "symbols": [],
@@ -7999,6 +8190,21 @@
     },
     {
       "kind": "doc",
+      "path": "docs/dev/agent-runs.md",
+      "referenced_by": [
+        "docs/dev/agent-runs.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "agent",
+        "dev",
+        "docs",
+        "md",
+        "runs"
+      ]
+    },
+    {
+      "kind": "doc",
       "path": "docs/dev/architecture.md",
       "referenced_by": [],
       "symbols": [],
@@ -8098,6 +8304,7 @@
       "kind": "doc",
       "path": "docs/dev/precommit.md",
       "referenced_by": [
+        "docs/dev/agent-runs.md",
         "docs/dev/precommit.md"
       ],
       "symbols": [],
@@ -8106,6 +8313,20 @@
         "docs",
         "md",
         "precommit"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/dev/subagents.md",
+      "referenced_by": [
+        "docs/dev/subagents.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "dev",
+        "docs",
+        "md",
+        "subagents"
       ]
     },
     {
@@ -8148,6 +8369,7 @@
       "path": "docs/ops/intake.md",
       "referenced_by": [
         "AGENTS.md",
+        "docs/dev/agent-runs.md",
         "docs/ops/intake.md"
       ],
       "symbols": [],
@@ -8938,6 +9160,115 @@
         "py",
         "repository",
         "scripts"
+      ]
+    },
+    {
+      "kind": "script",
+      "path": "scripts/agent_run.py",
+      "referenced_by": [
+        "docs/dev/agent-runs.md"
+      ],
+      "symbols": [
+        "RunPaths",
+        "start_run",
+        "hypothesis_add",
+        "hypothesis_resolve",
+        "evidence_add",
+        "command_add",
+        "learning_add",
+        "learning_review",
+        "status_run",
+        "close_run",
+        "build_parser",
+        "main",
+        "_now",
+        "_slugify",
+        "_run_paths",
+        "_active_run_id",
+        "_resolve_paths",
+        "_write_json",
+        "_append_jsonl",
+        "_load_json",
+        "_read_jsonl",
+        "_next_id",
+        "_git_status",
+        "_infer_intent",
+        "_target_properties",
+        "_intake_plan",
+        "_write_active",
+        "_hypothesis_states",
+        "_learning_rows",
+        "_summary",
+        "_add_common_args"
+      ],
+      "tokens": [
+        "active",
+        "add",
+        "agent",
+        "agentic",
+        "append",
+        "are",
+        "args",
+        "artifacts",
+        "become",
+        "before",
+        "benchmarks",
+        "build",
+        "close",
+        "command",
+        "common",
+        "docs",
+        "durable",
+        "evidence",
+        "execution",
+        "git",
+        "hypothesis",
+        "id",
+        "infer",
+        "intake",
+        "intent",
+        "intentionally",
+        "json",
+        "jsonl",
+        "knowledge",
+        "landing",
+        "learning",
+        "learnings",
+        "lints",
+        "load",
+        "local",
+        "main",
+        "next",
+        "not",
+        "now",
+        "parser",
+        "plan",
+        "project",
+        "properties",
+        "py",
+        "read",
+        "resolve",
+        "review",
+        "rows",
+        "run",
+        "runpaths",
+        "script",
+        "scripts",
+        "should",
+        "signals",
+        "skills",
+        "slugify",
+        "start",
+        "state",
+        "states",
+        "status",
+        "summary",
+        "target",
+        "tests",
+        "visible",
+        "work",
+        "write",
+        "written"
       ]
     },
     {
@@ -30513,6 +30844,49 @@
     },
     {
       "kind": "test",
+      "path": "tests/test_agent_run.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_start_run_creates_problem_capsule_and_active_pointer",
+        "test_hypothesis_evidence_learning_and_close_flow",
+        "test_status_json_reports_current_run",
+        "test_learning_add_requires_none_reason",
+        "test_intake_index_ignores_local_agent_runs"
+      ],
+      "tokens": [
+        "active",
+        "add",
+        "agent",
+        "capsule",
+        "close",
+        "creates",
+        "current",
+        "evidence",
+        "flow",
+        "hypothesis",
+        "ignores",
+        "index",
+        "intake",
+        "json",
+        "learning",
+        "local",
+        "none",
+        "pointer",
+        "problem",
+        "py",
+        "reason",
+        "reports",
+        "requires",
+        "run",
+        "runs",
+        "start",
+        "status",
+        "test",
+        "tests"
+      ]
+    },
+    {
+      "kind": "test",
       "path": "tests/test_api_surface.py",
       "referenced_by": [],
       "symbols": [
@@ -32237,6 +32611,31 @@
         "uses",
         "when",
         "without"
+      ]
+    },
+    {
+      "kind": "test",
+      "path": "tests/test_codex_subagents.py",
+      "referenced_by": [],
+      "symbols": [
+        "test_repo_subagent_files_are_valid",
+        "test_repo_subagents_use_expected_fields",
+        "_collect_repo_agents"
+      ],
+      "tokens": [
+        "agents",
+        "are",
+        "codex",
+        "collect",
+        "expected",
+        "fields",
+        "py",
+        "repo",
+        "subagent",
+        "subagents",
+        "test",
+        "tests",
+        "valid"
       ]
     },
     {
@@ -35580,26 +35979,32 @@
         "test_upstream_request_prioritizes_vendored_tests",
         "test_precompile_request_routes_to_cccl_precompile_surface",
         "test_overlay_keep_geom_type_request_routes_to_public_overlay_surface",
-        "test_generated_docs_are_current"
+        "test_generated_docs_are_current",
+        "test_generated_intake_index_excludes_claude_property_snapshot"
       ],
       "tokens": [
         "are",
         "cccl",
+        "claude",
         "current",
         "doc",
         "docs",
+        "excludes",
         "generated",
         "geom",
+        "index",
         "intake",
         "keep",
         "overlay",
         "precompile",
         "prioritizes",
+        "property",
         "public",
         "py",
         "request",
         "routes",
         "runtime",
+        "snapshot",
         "surface",
         "test",
         "tests",

@@ -13,10 +13,14 @@ __pycache__/
 .claude/.review-completed
 .claude/.property-before.json
 .agents/.review-completed
+.agents/runs/
 .claude/projects/
 .brainstorm/
 .beads/
-.codex
+.codex/*
+!.codex/agents/
+.codex/agents/*
+!.codex/agents/*.toml
 
 # Dolt database files (added by bd init)
 .dolt/

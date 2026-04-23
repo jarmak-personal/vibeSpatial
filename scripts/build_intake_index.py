@@ -23,6 +23,9 @@ EXCLUDED_DIRS = {
     "__pycache__",
     "benchmark_results",
 }
+EXCLUDED_FILES = {
+    ".claude/.property-before.json",
+}
 STOPWORDS = {
     "a",
     "all",
@@ -181,6 +184,10 @@ def should_index_file(path: Path, root: Path) -> bool:
 
     relative_path = path.relative_to(root).as_posix()
     if relative_path == INDEX_OUTPUT.as_posix():
+        return False
+    if relative_path in EXCLUDED_FILES:
+        return False
+    if relative_path.startswith(".agents/runs/"):
         return False
     if "/data/" in relative_path and path.suffix != ".md":
         return False

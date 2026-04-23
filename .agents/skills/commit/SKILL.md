@@ -15,6 +15,7 @@ Invoke the `pre-land-review` skill. This runs:
   perf patterns, maintainability)
 - AI-powered review (GPU code, zero-copy, performance, maintainability,
   diff shape) via a single consolidated review agent
+- Repo-native learning review when the task exposed reusable lessons
 
 If the review finds BLOCKING issues, **stop here**. Fix them and re-run
 `$commit`. Do not proceed to Step 2 with blocking findings. NEVER descope
@@ -29,6 +30,9 @@ After the review passes with verdict LAND:
 3. Stage the appropriate files. Prefer staging specific files by name over
    `git add -A`. Never stage `.env`, credentials, or large binaries.
 4. If the user specified which files to commit, stage only those.
+5. If `.agents/runs/ACTIVE` exists, make sure any recorded learning items now
+   point at tracked repo artifacts or an explicit no-artifact reason before
+   staging the final set of files.
 
 ## Step 3: Write the review marker
 

@@ -6,8 +6,9 @@ description: "The review gate that must pass before any commit lands. Called aut
 # Pre-Land Review Checklist
 
 This skill is the landing gate for vibeSpatial. Every commit must pass
-through it. The checklist has two tiers: deterministic checks (enforced by
-the pre-commit hook) and AI-powered analysis (run as a single review agent).
+through it. The checklist has three tiers: deterministic checks (enforced by
+the pre-commit hook), AI-powered analysis (run as a single review agent), and
+a repo-native learning loop.
 
 ## Tier 1: Deterministic Checks
 
@@ -78,6 +79,38 @@ this prompt. If you do not spawn a sub-agent, perform the same review locally.
 
 Wait for the agent to complete, then report its findings.
 
+## Tier 3: Repo-Native Learning Loop
+
+Before writing the review marker, check whether the task exposed anything the
+repo should now know. Ask these questions:
+
+- Did the task expose an intake misroute or missing discovery signal?
+- Did the task reveal missing or stale docs?
+- Did the task reveal a repeated bug pattern that should become a lint,
+  hygiene check, benchmark, or test?
+- Did the task expose weak verification or a missing regression fixture?
+- Did the task require an unexplained workaround or local-only assumption?
+
+For each "yes", either land a tracked repo artifact or record why no artifact
+is appropriate:
+
+- test or fixture
+- doc or intake signal
+- lint, hygiene check, or ratchet
+- benchmark or profile rail
+- skill/workflow instruction
+- explicit `none` reason in `.agents/runs/<id>/learning.jsonl`
+
+If an active run exists, use:
+
+```bash
+uv run python scripts/agent_run.py learning review --require-resolved
+```
+
+This does not replace engineering judgment. It verifies that captured
+learnings point at tracked repo artifacts or have an explicit no-artifact
+reason.
+
 ## Report Format
 
 ```
@@ -105,6 +138,9 @@ Wait for the agent to complete, then report its findings.
 
 #### Diff Shape: [CLEAN / findings]
 [findings or "N/A"]
+
+#### Learning Loop: [CAPTURED / NO NEW LEARNINGS / GAPS]
+[repo artifacts added, active-run learning summary, or "N/A — no active run and no new learnings"]
 
 ### Overall Verdict
 [LAND / FIX REQUIRED]
