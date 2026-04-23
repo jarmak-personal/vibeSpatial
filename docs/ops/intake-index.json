@@ -5612,39 +5612,6 @@
     },
     {
       "kind": "repo",
-      "path": ".beads/README.md",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "beads",
-        "md",
-        "readme"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".beads/config.yaml",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "beads",
-        "config",
-        "yaml"
-      ]
-    },
-    {
-      "kind": "repo",
-      "path": ".beads/metadata.json",
-      "referenced_by": [],
-      "symbols": [],
-      "tokens": [
-        "beads",
-        "json",
-        "metadata"
-      ]
-    },
-    {
-      "kind": "repo",
       "path": ".claude/agents/Explore.md",
       "referenced_by": [],
       "symbols": [],
