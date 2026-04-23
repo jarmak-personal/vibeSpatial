@@ -54,3 +54,9 @@ def test_cache_hit_honors_ttl(tmp_path: Path, monkeypatch) -> None:
 
     assert gpu_health_gate.cache_hit(path, key="abc", now=150.0, ttl_seconds=100)
     assert not gpu_health_gate.cache_hit(path, key="abc", now=250.0, ttl_seconds=100)
+
+
+def test_pre_push_hook_defaults_gpu_coverage_workers_to_one() -> None:
+    hook = Path(".githooks/pre-push").read_text(encoding="utf-8")
+
+    assert 'VIBESPATIAL_GPU_COVERAGE_WORKERS="${VIBESPATIAL_GPU_COVERAGE_WORKERS:-1}"' in hook

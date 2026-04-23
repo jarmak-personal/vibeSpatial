@@ -34974,11 +34974,14 @@
         "test_plan_skips_docs_only_paths",
         "test_plan_runs_for_code_paths",
         "test_plan_force_overrides_docs_only_paths",
-        "test_cache_hit_honors_ttl"
+        "test_cache_hit_honors_ttl",
+        "test_pre_push_hook_defaults_gpu_coverage_workers_to_one"
       ],
       "tokens": [
         "cache",
         "code",
+        "coverage",
+        "defaults",
         "docs",
         "force",
         "gate",
@@ -34986,6 +34989,8 @@
         "health",
         "hit",
         "honors",
+        "hook",
+        "one",
         "only",
         "overrides",
         "parse",
@@ -34998,7 +35003,8 @@
         "test",
         "tests",
         "ttl",
-        "updates"
+        "updates",
+        "workers"
       ]
     },
     {

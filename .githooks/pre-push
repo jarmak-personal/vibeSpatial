@@ -5,6 +5,6 @@ set -e
 # fast enough for local checkpoint commits; this hook still blocks code from
 # leaving the workstation unless the ratchets pass.
 
-export VIBESPATIAL_GPU_COVERAGE_WORKERS="${VIBESPATIAL_GPU_COVERAGE_WORKERS:-auto}"
+export VIBESPATIAL_GPU_COVERAGE_WORKERS="${VIBESPATIAL_GPU_COVERAGE_WORKERS:-1}"
 
 uv run python scripts/gpu_health_gate.py --pre-push

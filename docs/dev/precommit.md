@@ -5,7 +5,7 @@ Scope: Pre-commit hook architecture, enforcement layers, and AI review workflow.
 Read If: You are setting up the repo, debugging a pre-commit failure, or extending the enforcement system.
 STOP IF: You only need to run a single lint check (see Verification in AGENTS.md).
 Source Of Truth: Pre-commit enforcement policy and AI review workflow.
-Body Budget: 387/390 lines
+Body Budget: 389/390 lines
 Document: docs/dev/precommit.md
 
 Section Map (Body Lines)
@@ -18,13 +18,13 @@ Section Map (Body Lines)
 | 39-44 | Verify |
 | 45-50 | Risks |
 | 51-62 | Quick Start |
-| 63-153 | Layer 1: Deterministic Checks (git pre-commit hook) |
-| 154-192 | Layer 2: Pre-Land Review Skill (Codex, proactive) |
-| 193-244 | Layer 3: PreToolUse Hooks (legacy Claude Code, mechanical) |
-| 245-262 | Layer 4: commit-msg Gate (Content-Addressable Marker) |
-| 263-294 | How The Layers Interact |
-| 295-323 | Ratchet Baseline System |
-| 324-343 | Adding New Checks |
+| 63-155 | Layer 1: Deterministic Checks (git pre-commit hook) |
+| 156-194 | Layer 2: Pre-Land Review Skill (Codex, proactive) |
+| 195-246 | Layer 3: PreToolUse Hooks (legacy Claude Code, mechanical) |
+| 247-264 | Layer 4: commit-msg Gate (Content-Addressable Marker) |
+| 265-296 | How The Layers Interact |
+| 297-325 | Ratchet Baseline System |
+| 326-345 | Adding New Checks |
 | ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -132,9 +132,11 @@ Docs-only pushes skip the heavy gate unless `VIBESPATIAL_PUSH_FORCE_GPU=1` is
 set. Successful heavy-gate runs are cached under `.git/` for 24 hours. Set
 `VIBESPATIAL_GPU_GATE_IGNORE_CACHE=1` to force a rerun for the same diff, or
 `VIBESPATIAL_GPU_GATE_CACHE_TTL_SECONDS=0` to disable cache hits.
-The pre-push hook defaults `VIBESPATIAL_GPU_COVERAGE_WORKERS=auto` so the
-upstream GPU coverage sweeps use `pytest-xdist`; set it to `1` if parallel GPU
-workers cause local contention.
+The pre-push hook defaults `VIBESPATIAL_GPU_COVERAGE_WORKERS=1` so the
+upstream GPU coverage sweeps run serially by default. The full upstream GPU
+gate compiles kernels and exercises heavy device-memory paths; local `xdist`
+workers can turn a healthy repo into an OOM or worker-crash false negative.
+Raise it manually if your workstation proves stable under parallel GPU sweeps.
 
 After checks pass, a non-blocking reminder prints the AI review commands.
 This works in terminals, VS Code git output, and CI alike.
