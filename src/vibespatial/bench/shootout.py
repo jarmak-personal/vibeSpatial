@@ -119,6 +119,10 @@ def _trace_transfer_to_dict(transfer):
         "direction": getattr(transfer, "direction", ""),
         "trigger": getattr(transfer, "trigger", ""),
         "reason": getattr(transfer, "reason", ""),
+        "source": getattr(transfer, "source", "semantic"),
+        "item_count": int(getattr(transfer, "item_count", 0) or 0),
+        "bytes_transferred": int(getattr(transfer, "bytes_transferred", 0) or 0),
+        "elapsed_seconds": float(getattr(transfer, "elapsed_seconds", 0.0) or 0.0),
     }
 
 
@@ -215,6 +219,22 @@ def _profile_execution_deltas(trace, before_steps, before_transfers):
     transfers = list(getattr(trace, "transfers", []))[before_transfers:]
     gpu_steps = sum(1 for step in steps if str(getattr(getattr(step, "selected", ""), "value", "")) == "gpu")
     cpu_steps = sum(1 for step in steps if str(getattr(getattr(step, "selected", ""), "value", "")) == "cpu")
+    d2h_transfers = [
+        transfer for transfer in transfers
+        if getattr(transfer, "direction", "") == "d2h"
+    ]
+    h2d_transfers = [
+        transfer for transfer in transfers
+        if getattr(transfer, "direction", "") == "h2d"
+    ]
+    runtime_d2h = [
+        transfer for transfer in d2h_transfers
+        if getattr(transfer, "source", "semantic") == "cuda_runtime"
+    ]
+    runtime_h2d = [
+        transfer for transfer in h2d_transfers
+        if getattr(transfer, "source", "semantic") == "cuda_runtime"
+    ]
     if gpu_steps and cpu_steps:
         backend = "mixed"
     elif gpu_steps:
@@ -228,9 +248,55 @@ def _profile_execution_deltas(trace, before_steps, before_transfers):
         "trace_steps": len(steps),
         "gpu_steps": gpu_steps,
         "cpu_steps": cpu_steps,
-        "d2h_transfers": sum(1 for transfer in transfers if getattr(transfer, "direction", "") == "d2h"),
-        "h2d_transfers": sum(1 for transfer in transfers if getattr(transfer, "direction", "") == "h2d"),
+        "d2h_transfers": len(d2h_transfers),
+        "h2d_transfers": len(h2d_transfers),
+        "d2h_transfer_bytes": sum(
+            int(getattr(transfer, "bytes_transferred", 0) or 0)
+            for transfer in d2h_transfers
+        ),
+        "h2d_transfer_bytes": sum(
+            int(getattr(transfer, "bytes_transferred", 0) or 0)
+            for transfer in h2d_transfers
+        ),
+        "d2h_transfer_seconds": sum(
+            float(getattr(transfer, "elapsed_seconds", 0.0) or 0.0)
+            for transfer in d2h_transfers
+        ),
+        "h2d_transfer_seconds": sum(
+            float(getattr(transfer, "elapsed_seconds", 0.0) or 0.0)
+            for transfer in h2d_transfers
+        ),
+        "runtime_d2h_transfers": len(runtime_d2h),
+        "runtime_h2d_transfers": len(runtime_h2d),
+        "runtime_d2h_transfer_bytes": sum(
+            int(getattr(transfer, "bytes_transferred", 0) or 0)
+            for transfer in runtime_d2h
+        ),
+        "runtime_h2d_transfer_bytes": sum(
+            int(getattr(transfer, "bytes_transferred", 0) or 0)
+            for transfer in runtime_h2d
+        ),
+        "runtime_d2h_transfer_seconds": sum(
+            float(getattr(transfer, "elapsed_seconds", 0.0) or 0.0)
+            for transfer in runtime_d2h
+        ),
+        "runtime_h2d_transfer_seconds": sum(
+            float(getattr(transfer, "elapsed_seconds", 0.0) or 0.0)
+            for transfer in runtime_h2d
+        ),
     }
+
+
+def _read_d2h_transfer_stats(get_d2h_transfer_stats):
+    if get_d2h_transfer_stats is None:
+        return None, None, None
+    stats = get_d2h_transfer_stats()
+    if len(stats) >= 3:
+        count, bytes_transferred, seconds = stats[:3]
+    else:
+        count, bytes_transferred = stats
+        seconds = 0.0
+    return int(count), int(bytes_transferred), float(seconds)
 
 
 def _execute_profiled_timed_sections(
@@ -240,7 +306,7 @@ def _execute_profiled_timed_sections(
     trace,
     *,
     get_fallback_events,
-    get_d2h_transfer_count,
+    get_d2h_transfer_stats,
 ):
     _preamble_code, timed_code, _postamble_code, timed_source, timed_line_offset = sections
     statements = _compile_timed_statements(script_path, timed_source, timed_line_offset)
@@ -255,19 +321,15 @@ def _execute_profiled_timed_sections(
         before_steps = len(getattr(trace, "steps", []))
         before_transfers = len(getattr(trace, "transfers", []))
         before_fallbacks = len(get_fallback_events(clear=False))
-        before_d2h = (
-            int(get_d2h_transfer_count())
-            if get_d2h_transfer_count is not None
-            else None
+        before_d2h, before_d2h_bytes, before_d2h_seconds = _read_d2h_transfer_stats(
+            get_d2h_transfer_stats
         )
         start = time.perf_counter()
         exec(stmt["code"], globals_dict)
         elapsed = time.perf_counter() - start
         after_fallbacks = len(get_fallback_events(clear=False))
-        after_d2h = (
-            int(get_d2h_transfer_count())
-            if get_d2h_transfer_count is not None
-            else None
+        after_d2h, after_d2h_bytes, after_d2h_seconds = _read_d2h_transfer_stats(
+            get_d2h_transfer_stats
         )
         stage = {
             key: value
@@ -279,6 +341,17 @@ def _execute_profiled_timed_sections(
         stage["fallback_event_count"] = max(after_fallbacks - before_fallbacks, 0)
         if before_d2h is not None and after_d2h is not None:
             stage["d2h_transfer_count_delta"] = max(after_d2h - before_d2h, 0)
+            stage["runtime_d2h_transfer_count_delta"] = stage["d2h_transfer_count_delta"]
+        if before_d2h_bytes is not None and after_d2h_bytes is not None:
+            stage["d2h_transfer_bytes_delta"] = max(
+                after_d2h_bytes - before_d2h_bytes, 0
+            )
+            stage["runtime_d2h_transfer_bytes_delta"] = stage["d2h_transfer_bytes_delta"]
+        if before_d2h_seconds is not None and after_d2h_seconds is not None:
+            stage["d2h_transfer_seconds_delta"] = max(
+                after_d2h_seconds - before_d2h_seconds, 0.0
+            )
+            stage["runtime_d2h_transfer_seconds_delta"] = stage["d2h_transfer_seconds_delta"]
         stages.append(stage)
     return time.perf_counter() - total_start, stages
 
@@ -297,10 +370,13 @@ def _profile_timed_sections(script_path, sections):
         from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
         from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
         try:
-            from vibespatial.cuda._runtime import get_d2h_transfer_count, reset_d2h_transfer_count
+            from vibespatial.cuda._runtime import get_d2h_transfer_profile as get_d2h_transfer_stats, reset_d2h_transfer_count
         except Exception:
-            get_d2h_transfer_count = None
-            reset_d2h_transfer_count = None
+            try:
+                from vibespatial.cuda._runtime import get_d2h_transfer_stats, reset_d2h_transfer_count
+            except Exception:
+                get_d2h_transfer_stats = None
+                reset_d2h_transfer_count = None
 
         os.environ["VIBESPATIAL_HOTPATH_TRACE"] = "1"
         clear_fallback_events()
@@ -340,7 +416,7 @@ def _profile_timed_sections(script_path, sections):
                         globals_dict,
                         trace,
                         get_fallback_events=get_fallback_events,
-                        get_d2h_transfer_count=get_d2h_transfer_count,
+                        get_d2h_transfer_stats=get_d2h_transfer_stats,
                     )
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -355,10 +431,8 @@ def _profile_timed_sections(script_path, sections):
             _trace_transfer_to_dict(transfer)
             for transfer in getattr(trace, "transfers", [])[:80]
         ]
-        d2h_transfer_count = (
-            int(get_d2h_transfer_count())
-            if get_d2h_transfer_count is not None
-            else None
+        d2h_transfer_count, d2h_transfer_bytes, d2h_transfer_seconds = _read_d2h_transfer_stats(
+            get_d2h_transfer_stats
         )
         profile.update({
             "available": True,
@@ -371,10 +445,26 @@ def _profile_timed_sections(script_path, sections):
             "trace_transfers": trace_transfers,
             "hotpath": hotpath_summary,
             "top_hotpath": hotpath_summary[:10],
-            "transfer_count": audit.transfer_count,
+            "transfer_count": (
+                d2h_transfer_count
+                if d2h_transfer_count is not None
+                else audit.transfer_count
+            ),
+            "owned_transfer_count": audit.transfer_count,
             "materialization_count": audit.materialization_count,
             "transfer_seconds": audit.transfer_seconds,
-            "transfer_bytes": audit.transfer_bytes,
+            "owned_transfer_seconds": audit.transfer_seconds,
+            "runtime_d2h_transfer_seconds": (
+                d2h_transfer_seconds
+                if d2h_transfer_seconds is not None
+                else 0.0
+            ),
+            "transfer_bytes": (
+                d2h_transfer_bytes
+                if d2h_transfer_bytes is not None
+                else audit.transfer_bytes
+            ),
+            "owned_transfer_bytes": audit.transfer_bytes,
             "hotpath_total_seconds": hotpath_total_seconds,
             "composition_overhead_seconds": max(elapsed - hotpath_total_seconds, 0.0),
             "composition_overhead_ratio": (
@@ -388,6 +478,12 @@ def _profile_timed_sections(script_path, sections):
             profile.update(_summarize_statement_profile(timed_stages))
         if d2h_transfer_count is not None:
             profile["d2h_transfer_count"] = d2h_transfer_count
+            profile["runtime_d2h_transfer_count"] = d2h_transfer_count
+        if d2h_transfer_bytes is not None:
+            profile["runtime_d2h_transfer_bytes"] = d2h_transfer_bytes
+        if d2h_transfer_seconds is not None:
+            profile["transfer_seconds"] = d2h_transfer_seconds
+            profile["runtime_d2h_transfer_seconds"] = d2h_transfer_seconds
         if error is not None:
             profile["error"] = error
     except Exception as exc:

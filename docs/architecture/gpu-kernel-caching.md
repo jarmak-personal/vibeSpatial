@@ -5,46 +5,65 @@ Scope: CCCL and NVRTC CUBIN on-disk caching, precompilation, ctypes replay, and 
 Read If: You are changing kernel compilation, caching, precompilation, JIT warmup, or CCCL/NVRTC integration.
 STOP IF: Your task is docs-only or limited to vendored test maintenance.
 Source Of Truth: Disk caching architecture for CCCL algorithm CUBINs and NVRTC kernel CUBINs.
-Body Budget: 220/260 lines
+Body Budget: 325/340 lines
 Document: docs/architecture/gpu-kernel-caching.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-4 | Preamble |
-| 5-10 | Request Signals |
-| 11-15 | Open First |
-| 16-18 | Verify |
-| 19-22 | Risks |
-| 23-40 | Two-tier caching architecture |
-| 41-54 | Timing summary |
-| 55-80 | CCCL CUBIN disk cache (how it works) |
-| 81-90 | Why ctypes replay |
-| 91-100 | CUBIN normalization |
-| 101-115 | Cache key format and contents |
-| 116-130 | Struct definitions |
-| 131-142 | Families not cached |
-| 143-155 | NVRTC CUBIN disk cache |
-| 156-170 | Environment variables |
-| 171-185 | Pre-compilation API |
-| 186-195 | Cache management and source files |
+| 1-2 | Preamble |
+| 3-7 | Intent |
+| 8-20 | Request Signals |
+| 21-27 | Open First |
+| 28-33 | Verify |
+| 34-50 | Risks |
+| 51-83 | Two-tier caching architecture |
+| 84-208 | CCCL CUBIN disk cache |
+| 209-220 | NVRTC CUBIN disk cache |
+| 221-245 | Lazy warmup for disk-cached specs |
+| 246-257 | Environment variables |
+| 258-281 | Pre-compilation API |
+| 282-296 | Cache management |
+| 297-314 | Key risks and mitigations |
+| ... | (1 additional sections omitted; open document body for full map) |
+DOC_HEADER:END -->
 
-Request Signals: kernel caching, CUBIN cache, precompile, warmup, JIT, CCCL cache, NVRTC cache, disk cache, precompile_all, startup latency
+## Intent
 
-Open First:
+Document the CCCL and NVRTC compilation cache layers that keep startup and
+first-use latency from dominating GPU execution.
+
+## Request Signals
+
+- kernel caching
+- CUBIN cache
+- precompile
+- warmup
+- JIT
+- CCCL cache
+- NVRTC cache
+- disk cache
+- precompile_all
+- startup latency
+
+## Open First
+
 - docs/architecture/gpu-kernel-caching.md
 - src/vibespatial/cuda/cccl_cubin_cache.py
 - src/vibespatial/cuda/cccl_precompile.py
+- src/vibespatial/cuda/nvrtc_precompile.py
 
-Verify:
-- uv run pytest tests/test_cccl_cubin_cache.py tests/test_cccl_precompile.py -q
-- uv run python -c "from vibespatial.cuda.cccl_cubin_cache import cache_stats; print(cache_stats())"
+## Verify
 
-Risks:
-- ctypes struct layout mismatch if CCCL changes C ABI without version bump
-- runtime_policy bytes may be invalid if policy format changes within a CCCL version
-- cache file format uses JSON + raw bytes (no pickle / no executable deserialization)
-DOC_HEADER:END -->
+- `uv run pytest tests/test_cccl_cubin_cache.py tests/test_cccl_precompile.py -q`
+- `uv run python -c "from vibespatial.cuda.cccl_cubin_cache import cache_stats; print(cache_stats())"`
+- `uv run python scripts/check_docs.py --check`
+
+## Risks
+
+- ctypes struct layout mismatch if CCCL changes C ABI without version bump.
+- runtime_policy bytes may be invalid if policy format changes within a CCCL version.
+- cache files must stay JSON plus raw bytes; never deserialize executable Python objects.
 
 vibeSpatial JIT-compiles two families of GPU code at runtime:
 

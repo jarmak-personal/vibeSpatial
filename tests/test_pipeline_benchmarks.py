@@ -31,17 +31,106 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
     assert by_name[("join-heavy", 1000)].status == "ok"
     assert by_name[("constructive", 1000)].output_rows >= 0
     assert by_name[("predicate-heavy", 1000)].selected_runtime in {"cpu", "hybrid", "gpu"}
-    assert by_name[("zero-transfer", 1000)].status in {"ok", "deferred"}
-    if by_name[("zero-transfer", 1000)].status == "ok":
-        assert by_name[("zero-transfer", 1000)].transfer_count == 0
-        assert by_name[("zero-transfer", 1000)].materialization_count == 0
+    zero_transfer = by_name[("zero-transfer", 1000)]
+    assert zero_transfer.status in {"ok", "deferred", "failed"}
+    if zero_transfer.status == "ok":
+        assert zero_transfer.transfer_count == 0
+        assert zero_transfer.materialization_count == 0
+    elif zero_transfer.status == "failed":
+        assert (zero_transfer.runtime_d2h_transfer_count or 0) > 0
+        assert zero_transfer.owned_transfer_count == 0
+        stage_d2h = sum(
+            stage["metadata"].get("runtime_d2h_transfer_count_delta", 0)
+            for stage in zero_transfer.stages[0]["stages"]
+        )
+        assert stage_d2h == zero_transfer.runtime_d2h_transfer_count
+        stage_d2h_seconds = sum(
+            stage["metadata"].get("runtime_d2h_transfer_seconds_delta", 0.0)
+            for stage in zero_transfer.stages[0]["stages"]
+        )
+        assert stage_d2h_seconds == pytest.approx(
+            zero_transfer.runtime_d2h_transfer_seconds or 0.0
+        )
     stage_trace = by_name[("join-heavy", 1000)].stages[0]
     stage = stage_trace["stages"][0]
     assert "transfer_count_total" in stage["metadata"]
+    assert "owned_transfer_count_total" in stage["metadata"]
+    assert "runtime_d2h_transfer_count_total" in stage["metadata"]
+    assert "runtime_d2h_transfer_seconds_total" in stage["metadata"]
+    assert "gpu_device_name" not in stage["metadata"]
+    assert "gpu_event_elapsed_seconds" not in stage["metadata"]
     assert "materialization_count_total" in stage["metadata"]
     payload = json.loads(suite_to_json(results, suite="smoke", repeat=1))
     assert payload["metadata"]["suite"] == "smoke"
     assert payload["metadata"]["repeat"] == 1
+    assert payload["metadata"]["profile_mode"] == "lean"
+    result_payload = {
+        (item["pipeline"], item["scale"]): item
+        for item in payload["results"]
+    }
+    join_payload = result_payload[("join-heavy", 1000)]
+    assert "owned_transfer_count" in join_payload
+    assert "runtime_d2h_transfer_count" in join_payload
+    assert "runtime_d2h_transfer_seconds" in join_payload
+    assert join_payload["profile_mode"] == "lean"
+
+
+def test_pipeline_profile_mode_controls_expensive_gpu_monitors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict] = []
+
+    class _FakeProfiler:
+        def __init__(self, **kwargs) -> None:
+            captured.append(kwargs)
+
+    monkeypatch.setattr(pipeline_module, "StageProfiler", _FakeProfiler)
+
+    previous = pipeline_module._set_pipeline_profile_mode("lean")
+    try:
+        pipeline_module._stage_profiler(
+            operation="pipeline.test",
+            dataset="smoke",
+            requested_runtime="gpu",
+            selected_runtime="gpu",
+            retain_gpu_trace=False,
+            include_gpu_sparklines=False,
+        )
+    finally:
+        pipeline_module._set_pipeline_profile_mode(previous)
+
+    lean_kwargs = captured[-1]
+    assert lean_kwargs["gpu_sampler"].available is False
+    assert lean_kwargs["gpu_event_timer_factory"] is pipeline_module._NoopGpuEventTimer
+    assert lean_kwargs["retain_gpu_trace"] is False
+    assert lean_kwargs["include_gpu_sparklines"] is False
+
+    previous = pipeline_module._set_pipeline_profile_mode("audit")
+    try:
+        pipeline_module._stage_profiler(
+            operation="pipeline.test",
+            dataset="smoke",
+            requested_runtime="gpu",
+            selected_runtime="gpu",
+            retain_gpu_trace=True,
+            include_gpu_sparklines=True,
+        )
+    finally:
+        pipeline_module._set_pipeline_profile_mode(previous)
+
+    audit_kwargs = captured[-1]
+    assert "gpu_sampler" not in audit_kwargs
+    assert "gpu_event_timer_factory" not in audit_kwargs
+    assert audit_kwargs["retain_gpu_trace"] is True
+    assert audit_kwargs["include_gpu_sparklines"] is True
+    assert pipeline_module._resolve_pipeline_profile_mode(
+        "lean",
+        include_gpu_sparklines=True,
+    ) == "audit"
+    assert (
+        pipeline_module._deferred_raster_pipeline(1000, profile_mode="audit").profile_mode
+        == "audit"
+    )
 
 
 def test_benchmark_pipeline_suite_precompiles_full_stack(

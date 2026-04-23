@@ -277,6 +277,16 @@ def _maybe_nvtx_context(label: str, category: str, *, enabled: bool):
     return nvtx.annotate(label, color=color)
 
 
+def _runtime_d2h_transfer_stats() -> tuple[int, int, float]:
+    try:
+        from vibespatial.cuda._runtime import get_d2h_transfer_profile
+
+        count, bytes_transferred, seconds = get_d2h_transfer_profile()
+        return int(count), int(bytes_transferred), float(seconds)
+    except Exception:
+        return 0, 0, 0.0
+
+
 class StageProfiler:
     def __init__(
         self,
@@ -336,10 +346,20 @@ class StageProfiler:
         gpu_collector.start()
         if track_gpu_events:
             gpu_event_timer.start()
+        (
+            runtime_d2h_start,
+            runtime_d2h_bytes_start,
+            runtime_d2h_seconds_start,
+        ) = _runtime_d2h_transfer_stats()
         started = perf_counter()
         with _maybe_nvtx_context(label, category, enabled=self.enable_nvtx):
             yield measurement
         elapsed = perf_counter() - started
+        (
+            runtime_d2h_end,
+            runtime_d2h_bytes_end,
+            runtime_d2h_seconds_end,
+        ) = _runtime_d2h_transfer_stats()
         gpu_collector.stop()
         if track_gpu_events:
             gpu_event_timer.stop()
@@ -349,6 +369,18 @@ class StageProfiler:
             else str(measurement.device or selected_device)
         )
         measurement.metadata["elapsed_display"] = _format_elapsed_compact(elapsed)
+        measurement.metadata["runtime_d2h_transfer_count_delta"] = max(
+            runtime_d2h_end - runtime_d2h_start,
+            0,
+        )
+        measurement.metadata["runtime_d2h_transfer_bytes_delta"] = max(
+            runtime_d2h_bytes_end - runtime_d2h_bytes_start,
+            0,
+        )
+        measurement.metadata["runtime_d2h_transfer_seconds_delta"] = max(
+            runtime_d2h_seconds_end - runtime_d2h_seconds_start,
+            0.0,
+        )
         measurement.metadata.update(gpu_collector.summarize())
         if resolved_device == ExecutionMode.GPU.value:
             gpu_event_summary = gpu_event_timer.summarize()

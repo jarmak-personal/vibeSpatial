@@ -69,12 +69,16 @@ The router returns a structured plan with:
 
 ## How It Works
 
-The router uses `docs/ops/intake-index.json` (auto-generated from doc headers)
-to score your request against:
+The router builds a fresh in-memory index from the current repo files and doc
+header config, then scores your request against:
 - **Request signals** (keywords in docs, weight 8x) — highest priority
 - **Metadata** (scope, readIf, sourceOfTruth, weight 4x)
 - **Titles** (weight 3x)
 - **File paths and symbols** (weight 2x)
+
+`docs/ops/intake-index.json` is the generated artifact used by docs checks,
+maintainability checks, and review visibility. It must match the live-built
+index, but it is not the source used by the CLI at runtime.
 
 It returns the best matches without you needing to know the repo structure.
 

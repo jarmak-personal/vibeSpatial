@@ -89,12 +89,22 @@ def _stage_detail_rows(stages: list[dict], total: float) -> str:
             meta_bits.append(f'{s["rows_in"]:,} → {s.get("rows_out", "?"):,} rows')
         md = s.get("metadata", {})
         # Transfer cost breakdown
-        xfer_secs = md.get("transfer_seconds_delta", 0.0)
-        xfer_bytes = md.get("transfer_bytes_delta", 0)
-        if xfer_secs > 0 or xfer_bytes > 0:
+        xfer_secs = md.get(
+            "runtime_d2h_transfer_seconds_delta",
+            md.get("transfer_seconds_delta", 0.0),
+        )
+        xfer_bytes = md.get(
+            "runtime_d2h_transfer_bytes_delta",
+            md.get("transfer_bytes_delta", 0),
+        )
+        xfer_count = md.get(
+            "runtime_d2h_transfer_count_delta",
+            md.get("transfer_count_delta", 0),
+        )
+        if xfer_secs > 0 or xfer_bytes > 0 or xfer_count > 0:
             xfer_pct = _pct_of(xfer_secs, s["elapsed_seconds"]) if s["elapsed_seconds"] > 0 else 0
             meta_bits.append(
-                f'<span class="xfer-tag">transfer: {_fmt_time(xfer_secs)} '
+                f'<span class="xfer-tag">transfer: {xfer_count} copies, {_fmt_time(xfer_secs)} '
                 f'({_fmt_bytes(xfer_bytes)}, {xfer_pct:.0f}% of stage)</span>'
             )
         if md.get("gpu_substage_timings"):
@@ -271,9 +281,18 @@ def _transfer_summary(stages: list[dict]) -> str:
     total_count = 0
     for s in stages:
         md = s.get("metadata", {})
-        total_secs += md.get("transfer_seconds_delta", 0.0)
-        total_bytes += md.get("transfer_bytes_delta", 0)
-        total_count += md.get("transfer_count_delta", 0)
+        total_secs += md.get(
+            "runtime_d2h_transfer_seconds_delta",
+            md.get("transfer_seconds_delta", 0.0),
+        )
+        total_bytes += md.get(
+            "runtime_d2h_transfer_bytes_delta",
+            md.get("transfer_bytes_delta", 0),
+        )
+        total_count += md.get(
+            "runtime_d2h_transfer_count_delta",
+            md.get("transfer_count_delta", 0),
+        )
     if total_count == 0:
         return ""
     return f"\u2194 {total_count} transfers: {_fmt_time(total_secs)} / {_fmt_bytes(total_bytes)}"

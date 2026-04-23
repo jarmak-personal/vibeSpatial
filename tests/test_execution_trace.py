@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import warnings
 
+import numpy as np
 import pytest
 
 from vibespatial.runtime import ExecutionMode
@@ -173,8 +174,58 @@ def test_summary_counts() -> None:
         "cpu_steps": 1,
         "d2h_transfers": 1,
         "h2d_transfers": 1,
+        "d2h_transfer_bytes": 0,
+        "h2d_transfer_bytes": 0,
+        "d2h_transfer_seconds": 0.0,
+        "h2d_transfer_seconds": 0.0,
+        "runtime_d2h_transfers": 0,
+        "runtime_h2d_transfers": 0,
+        "runtime_d2h_transfer_bytes": 0,
+        "runtime_h2d_transfer_bytes": 0,
+        "runtime_d2h_transfer_seconds": 0.0,
+        "runtime_h2d_transfer_seconds": 0.0,
         "offramps": 1,
     }
+
+
+@pytest.mark.gpu
+def test_cuda_runtime_d2h_copy_records_trace_event() -> None:
+    from vibespatial.runtime import has_gpu_runtime
+
+    if not has_gpu_runtime():
+        pytest.skip("GPU required")
+
+    pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        get_cuda_runtime,
+        get_d2h_transfer_profile,
+        reset_d2h_transfer_count,
+    )
+
+    runtime = get_cuda_runtime()
+    device = runtime.from_host(np.arange(4, dtype=np.int32))
+    reset_d2h_transfer_count()
+
+    with execution_trace("runtime_copy") as ctx:
+        host = runtime.copy_device_to_host(device)
+
+    assert host.tolist() == [0, 1, 2, 3]
+    assert len(ctx.transfers) == 1
+    transfer = ctx.transfers[0]
+    assert transfer.direction == "d2h"
+    assert transfer.source == "cuda_runtime"
+    assert transfer.item_count == 4
+    assert transfer.bytes_transferred == 16
+    assert transfer.elapsed_seconds >= 0.0
+    summary = ctx.summary()
+    assert summary["d2h_transfers"] == 1
+    assert summary["runtime_d2h_transfers"] == 1
+    assert summary["runtime_d2h_transfer_bytes"] == 16
+    assert summary["runtime_d2h_transfer_seconds"] >= 0.0
+    count, bytes_transferred, seconds = get_d2h_transfer_profile()
+    assert count == 1
+    assert bytes_transferred == 16
+    assert seconds >= 0.0
 
 
 def test_env_var_suppresses_trace_warnings(monkeypatch: pytest.MonkeyPatch) -> None:

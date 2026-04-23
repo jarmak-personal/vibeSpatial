@@ -38,6 +38,7 @@ def main(argv: list[str] | None = None) -> int:
     p_pipe = sub.add_parser("pipeline", help="Run a named pipeline benchmark")
     p_pipe.add_argument("name", help="Pipeline name (see 'vsbench list pipelines')")
     _add_common_flags(p_pipe)
+    _add_pipeline_profile_flags(p_pipe)
     p_pipe.add_argument(
         "--suite-level",
         choices=("smoke", "ci", "full"),
@@ -49,6 +50,7 @@ def main(argv: list[str] | None = None) -> int:
     p_suite = sub.add_parser("suite", help="Run a predefined benchmark suite")
     p_suite.add_argument("level", choices=("smoke", "ci", "full"))
     _add_common_flags(p_suite)
+    _add_pipeline_profile_flags(p_suite)
     p_suite.add_argument(
         "--pipeline",
         action="append",
@@ -180,6 +182,19 @@ def _add_common_flags(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", type=Path, default=None, help="Write results to file")
 
 
+def _add_pipeline_profile_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--profile-mode",
+        choices=("lean", "audit"),
+        default="lean",
+        help=(
+            "Pipeline instrumentation mode: lean keeps wall-clock and transfer "
+            "counters only; audit also enables NVML sampling and CUDA event "
+            "stage timing. --gpu-sparkline and --trace imply audit."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -280,6 +295,7 @@ def _cmd_pipeline(args: argparse.Namespace) -> int:
         nvtx=args.nvtx,
         gpu_sparkline=args.gpu_sparkline,
         trace=args.trace,
+        profile_mode=args.profile_mode,
     )
 
     mode = _output_mode(args)
@@ -310,6 +326,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         nvtx=args.nvtx,
         gpu_sparkline=args.gpu_sparkline,
         trace=args.trace,
+        profile_mode=args.profile_mode,
         pipelines_filter=args.pipelines,
         isolated=not args.in_process,
         item_timeout=args.item_timeout,

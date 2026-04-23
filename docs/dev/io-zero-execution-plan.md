@@ -5,32 +5,27 @@ Scope: Execution plan for removing avoidable host-side churn from public read pa
 Read If: You are planning or executing the next IO read push, public read_file acceleration work, or GPU-first ingest cleanup.
 STOP IF: You already have the active IO surface open and only need local implementation detail.
 Source Of Truth: Program plan for making public read surfaces GPU-first and reducing hybrid IO to explicit compatibility boundaries.
-Body Budget: 0/520 lines
+Body Budget: 635/700 lines
 Document: docs/dev/io-zero-execution-plan.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-10 | Intent |
-| 11-24 | Request Signals |
-| 25-37 | Open First |
-| 38-49 | Verify |
-| 50-66 | Risks |
-| 67-89 | Mission |
-| 90-125 | What IO-Zero Means |
-| 126-169 | Baseline Snapshot |
-| 170-247 | Current Debt By Surface |
-| 248-280 | Non-Goals |
-| 281-309 | Working Principles |
-| 310-346 | Program Structure |
-| 347-388 | Milestone M0 |
-| 389-440 | Milestone M1 |
-| 441-492 | Milestone M2 |
-| 493-544 | Milestone M3 |
-| 545-588 | Milestone M4 |
-| 589-632 | Milestone M5 |
-| 633-671 | Exit Criteria |
+| 3-15 | Intent |
+| 16-32 | Request Signals |
+| 33-47 | Open First |
+| 48-59 | Verify |
+| 60-78 | Risks |
+| 79-104 | Mission |
+| 105-144 | What IO-Zero Means |
+| 145-187 | Baseline Snapshot |
+| 188-379 | Current Debt By Surface |
+| 380-393 | Non-Goals |
+| 394-407 | Working Principles |
+| 408-428 | Program Structure |
+| 429-455 | Milestone M0: Metrics And Read Taxonomy |
+| ... | (6 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 ## Intent

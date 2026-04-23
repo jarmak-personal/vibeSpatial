@@ -23,6 +23,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gpu-trace", action="store_true", help="Retain raw per-stage NVML GPU samples in the JSON artifact.")
     parser.add_argument("--gpu-sparkline", action="store_true", help="Embed GPU sparkline summaries in stage metadata and print a human-readable summary to stderr.")
     parser.add_argument(
+        "--profile-mode",
+        choices=("lean", "audit"),
+        default="lean",
+        help=(
+            "Instrumentation mode. lean records wall-clock plus transfer "
+            "counters only; audit also enables NVML sampling and CUDA event "
+            "stage timing. --gpu-trace and --gpu-sparkline imply audit."
+        ),
+    )
+    parser.add_argument(
         "--pipeline",
         action="append",
         choices=PIPELINE_DEFINITIONS,
@@ -44,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         enable_nvtx=args.nvtx,
         retain_gpu_trace=args.gpu_trace,
         include_gpu_sparklines=args.gpu_sparkline,
+        profile_mode=args.profile_mode,
     )
     if args.gpu_sparkline:
         report = render_gpu_sparkline_report(results)

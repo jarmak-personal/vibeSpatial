@@ -5,7 +5,7 @@ Scope: Device residency defaults, transfer visibility rules, and zero-copy inter
 Read If: You are designing buffer movement, interop adapters, or host/device materialization behavior.
 STOP IF: Your task already has a settled residency contract and only needs implementation detail.
 Source Of Truth: Phase-1 residency and transfer policy before owned geometry buffers land.
-Body Budget: 96/240 lines
+Body Budget: 99/240 lines
 Document: docs/architecture/residency.md
 
 Section Map (Body Lines)
@@ -21,7 +21,7 @@ Section Map (Body Lines)
 | 59-64 | Transfer Rules |
 | 65-71 | Zero-Copy Rule |
 | 72-84 | Pipeline Rule |
-| 85-96 | Diagnostics Surface |
+| 85-99 | Diagnostics Surface |
 DOC_HEADER:END -->
 
 Owned geometry buffers are lazy-resident and move only at explicit boundaries.
@@ -117,4 +117,7 @@ Owned geometry arrays should make the following visible:
 - runtime selection or fallback reasons recorded at the buffer boundary
 
 The bootstrap implementation exposes this through an event log on the owned
-array object instead of a separate daemon or profiler surface.
+array object instead of a separate daemon or profiler surface. Runtime-level
+CUDA D2H copies are also counted and synchronously timed separately, because
+owned-array residency events are semantic boundaries and do not cover every
+internal device-to-host copy.

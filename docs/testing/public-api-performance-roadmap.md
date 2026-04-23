@@ -5,22 +5,22 @@ Scope: Public API benchmark performance roadmap, isolated suite policy, and reme
 Read If: You are auditing or fixing public API performance regressions after benchmark cleanup.
 STOP IF: You only need a narrow operation implementation detail already routed by intake.
 Source Of Truth: Current execution plan for public benchmark parity and IO-zero cleanup.
-Body Budget: 155/220 lines
+Body Budget: 274/300 lines
 Document: docs/testing/public-api-performance-roadmap.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-5 | Preamble |
-| 6-13 | Intent |
-| 14-26 | Request Signals |
-| 27-40 | Open First |
-| 41-55 | Verify |
-| 56-67 | Risks |
-| 68-82 | Working Rules |
-| 83-106 | Baseline Snapshot |
-| 107-142 | Milestones |
-| 143-155 | Completion Gate |
+| 1-6 | Preamble |
+| 7-16 | Intent |
+| 17-29 | Request Signals |
+| 30-43 | Open First |
+| 44-53 | Verify |
+| 54-68 | Risks |
+| 69-85 | Working Rules |
+| 86-197 | Baseline Snapshot |
+| 198-262 | Milestones |
+| 263-274 | Completion Gate |
 DOC_HEADER:END -->
 
 This roadmap starts from the April 19, 2026 public benchmark audit. The audit

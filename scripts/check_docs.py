@@ -7,13 +7,42 @@ from typing import Any
 
 try:
     from .build_intake_index import build_intake_index, evaluate_intake_index
-    from .update_doc_headers import evaluate_doc_headers, get_repo_root
+    from .update_doc_headers import HEADER_START, evaluate_doc_headers, get_repo_root, load_config
 except ImportError:  # pragma: no cover - script execution path
     from build_intake_index import build_intake_index, evaluate_intake_index
-    from update_doc_headers import evaluate_doc_headers, get_repo_root
+    from update_doc_headers import HEADER_START, evaluate_doc_headers, get_repo_root, load_config
 
 
 REQUIRED_ROUTING_SECTIONS = ("Intent", "Request Signals", "Open First", "Verify", "Risks")
+HEADER_SCAN_EXCLUDED_DIRS = {".git", ".venv", "docs/_build"}
+
+
+def _is_header_scan_excluded(relative_path: str) -> bool:
+    parts = set(Path(relative_path).parts)
+    if parts & {".git", ".venv"}:
+        return True
+    return relative_path.startswith("docs/_build/")
+
+
+def collect_unregistered_header_docs(root: Path | None = None) -> list[str]:
+    repo_root = root or get_repo_root()
+    configured = set(load_config(repo_root)["files"])
+    missing: list[str] = []
+
+    for path in sorted(repo_root.rglob("*.md")):
+        relative_path = path.relative_to(repo_root).as_posix()
+        if _is_header_scan_excluded(relative_path):
+            continue
+        if relative_path in configured:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if HEADER_START in content:
+            missing.append(relative_path)
+
+    return missing
 
 
 def collect_doc_contract_errors(root: Path | None = None) -> list[str]:
@@ -61,6 +90,8 @@ def check_docs(root: Path) -> list[str]:
     header_report = evaluate_doc_headers(root, write=False)
     index_report = evaluate_intake_index(root, write=False)
     errors = collect_doc_contract_errors(root)
+    for path in collect_unregistered_header_docs(root):
+        errors.append(f"{path} has a generated doc header but is missing from docs/doc_headers.json")
 
     for path in header_report["outdated"]:
         errors.append(f"{path} has an outdated generated header")

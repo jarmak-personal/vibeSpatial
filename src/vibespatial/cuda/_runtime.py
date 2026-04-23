@@ -9,6 +9,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
+from time import perf_counter
 from typing import Any, TypeAlias
 
 import numpy as np
@@ -122,13 +123,65 @@ DeviceArray: TypeAlias = Any
 
 _d2h_transfer_lock = threading.Lock()
 _d2h_transfer_count: int = 0
+_d2h_transfer_bytes: int = 0
+_d2h_transfer_seconds: float = 0.0
 
 
-def _increment_d2h_transfer_count() -> None:
+def _device_array_size(device_array: Any) -> int:
+    size = getattr(device_array, "size", 0)
+    try:
+        return int(size)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _device_array_nbytes(device_array: Any, host_array: np.ndarray | None = None) -> int:
+    if host_array is not None:
+        return int(host_array.nbytes)
+    nbytes = getattr(device_array, "nbytes", 0)
+    try:
+        return int(nbytes)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _increment_d2h_transfer_count(
+    bytes_transferred: int = 0,
+    elapsed_seconds: float = 0.0,
+) -> None:
     """Increment the global D2H transfer counter (thread-safe)."""
-    global _d2h_transfer_count
+    global _d2h_transfer_count, _d2h_transfer_bytes, _d2h_transfer_seconds
     with _d2h_transfer_lock:
         _d2h_transfer_count += 1
+        _d2h_transfer_bytes += max(int(bytes_transferred), 0)
+        _d2h_transfer_seconds += max(float(elapsed_seconds), 0.0)
+
+
+def _notify_runtime_d2h_transfer(
+    device_array: Any,
+    *,
+    host_array: np.ndarray | None = None,
+    trigger: str,
+    reason: str,
+    elapsed_seconds: float = 0.0,
+) -> None:
+    bytes_transferred = _device_array_nbytes(device_array, host_array)
+    _increment_d2h_transfer_count(bytes_transferred, elapsed_seconds)
+    try:
+        from vibespatial.runtime.execution_trace import notify_transfer
+
+        notify_transfer(
+            direction="d2h",
+            trigger=trigger,
+            reason=reason,
+            source="cuda_runtime",
+            item_count=_device_array_size(device_array),
+            bytes_transferred=bytes_transferred,
+            elapsed_seconds=elapsed_seconds,
+        )
+    except Exception:
+        # Transfer accounting must never make a production copy fail.
+        pass
 
 
 def get_d2h_transfer_count() -> int:
@@ -137,11 +190,37 @@ def get_d2h_transfer_count() -> int:
         return _d2h_transfer_count
 
 
+def get_d2h_transfer_bytes() -> int:
+    """Return bytes copied from device to host through the CUDA runtime."""
+    with _d2h_transfer_lock:
+        return _d2h_transfer_bytes
+
+
+def get_d2h_transfer_seconds() -> float:
+    """Return wall time spent in synchronous CUDA-runtime D2H copies."""
+    with _d2h_transfer_lock:
+        return _d2h_transfer_seconds
+
+
+def get_d2h_transfer_stats() -> tuple[int, int]:
+    """Return ``(count, bytes)`` for CUDA-runtime D2H copies."""
+    with _d2h_transfer_lock:
+        return _d2h_transfer_count, _d2h_transfer_bytes
+
+
+def get_d2h_transfer_profile() -> tuple[int, int, float]:
+    """Return ``(count, bytes, seconds)`` for CUDA-runtime D2H copies."""
+    with _d2h_transfer_lock:
+        return _d2h_transfer_count, _d2h_transfer_bytes, _d2h_transfer_seconds
+
+
 def reset_d2h_transfer_count() -> None:
     """Reset the D2H transfer counter to zero."""
-    global _d2h_transfer_count
+    global _d2h_transfer_count, _d2h_transfer_bytes, _d2h_transfer_seconds
     with _d2h_transfer_lock:
         _d2h_transfer_count = 0
+        _d2h_transfer_bytes = 0
+        _d2h_transfer_seconds = 0.0
 
 
 @contextmanager
@@ -651,9 +730,17 @@ class CudaDriverRuntime:
 
     def copy_device_to_host(self, device_array: DeviceArray, host_array: np.ndarray | None = None) -> np.ndarray:
         _require_gpu_arrays()
-        _increment_d2h_transfer_count()
+        started = perf_counter()
         with self.activate():
             host = cp.asnumpy(device_array)
+        elapsed = perf_counter() - started
+        _notify_runtime_d2h_transfer(
+            device_array,
+            host_array=host if host_array is None else host_array,
+            trigger="cuda-runtime-copy",
+            reason="CudaRuntime.copy_device_to_host",
+            elapsed_seconds=elapsed,
+        )
         if host_array is None:
             return host
         host_array[...] = host
@@ -739,7 +826,6 @@ class CudaDriverRuntime:
         returned array.
         """
         _require_gpu_arrays()
-        _increment_d2h_transfer_count()
         stream_handle = _normalize_stream_handle(stream)
         with self.activate():
             if host_array is None:
@@ -748,6 +834,12 @@ class CudaDriverRuntime:
             _check_driver(cu.cuMemcpyDtoHAsync(
                 host_array.ctypes.data, int(device_array.data.ptr), nbytes, stream_handle,
             ))
+        _notify_runtime_d2h_transfer(
+            device_array,
+            host_array=host_array,
+            trigger="cuda-runtime-copy-async",
+            reason="CudaRuntime.copy_device_to_host_async",
+        )
         return host_array
 
     def copy_host_to_device_async(

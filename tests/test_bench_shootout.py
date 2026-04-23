@@ -281,6 +281,13 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
     assert run.profile["trace_summary"]["d2h_transfers"] == 1
     assert run.profile["trace_summary"]["offramps"] >= 1
     assert run.profile["trace_transfers"][0]["reason"] == "profile probe"
+    assert run.profile["trace_transfers"][0]["source"] == "semantic"
+    assert run.profile["trace_transfers"][0]["bytes_transferred"] == 0
+    assert run.profile["trace_transfers"][0]["elapsed_seconds"] == 0.0
+    assert run.profile["runtime_d2h_transfer_count"] == 0
+    assert run.profile["runtime_d2h_transfer_bytes"] == 0
+    assert run.profile["runtime_d2h_transfer_seconds"] == 0.0
+    assert run.profile["owned_transfer_count"] == 0
     assert run.profile["fallback_events"][0]["surface"] == "probe.fallback"
     assert run.profile["top_hotpath"][0]["name"] == "shootout.profile_probe"
     assert run.profile["hotpath_total_seconds"] > 0
@@ -290,6 +297,10 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
     assert run.profile["stage_total_seconds"] > 0
     assert run.profile["stage_totals_by_tag"]["hotpath"] > 0
     assert run.profile["stage_totals_by_backend"]["gpu"] > 0
+    assert all(
+        stage.get("runtime_d2h_transfer_seconds_delta", 0.0) == 0.0
+        for stage in run.profile["timed_stages"]
+    )
     assert any(
         stage["fallback_event_count"] == 1
         for stage in run.profile["timed_stages"]

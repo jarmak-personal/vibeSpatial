@@ -38,6 +38,19 @@ def resolve_scale(scale_str: str | None, *, default: int = 100_000) -> int:
     return SCALE_MAP.get(scale_str.lower(), default)
 
 
+def _resolve_pipeline_profile_mode(
+    profile_mode: str,
+    *,
+    gpu_sparkline: bool = False,
+    trace: bool = False,
+) -> str:
+    if profile_mode not in {"lean", "audit"}:
+        raise ValueError("profile_mode must be 'lean' or 'audit'")
+    if gpu_sparkline or trace:
+        return "audit"
+    return profile_mode
+
+
 # ---------------------------------------------------------------------------
 # Operation runner
 # ---------------------------------------------------------------------------
@@ -127,11 +140,17 @@ def run_pipeline(
     nvtx: bool = False,
     gpu_sparkline: bool = False,
     trace: bool = False,
+    profile_mode: str = "lean",
 ) -> list[BenchmarkResult]:
     """Run a named pipeline benchmark, returning results per scale."""
     from .pipeline import (
         PIPELINE_DEFINITIONS,
         benchmark_pipeline_suite,
+    )
+    effective_profile_mode = _resolve_pipeline_profile_mode(
+        profile_mode,
+        gpu_sparkline=gpu_sparkline,
+        trace=trace,
     )
 
     if name not in PIPELINE_DEFINITIONS:
@@ -145,6 +164,7 @@ def run_pipeline(
         enable_nvtx=nvtx,
         retain_gpu_trace=trace,
         include_gpu_sparklines=gpu_sparkline,
+        profile_mode=effective_profile_mode,
     )
     return [_convert_pipeline_result(r) for r in results]
 
@@ -162,11 +182,14 @@ def _convert_pipeline_result(pr: Any) -> BenchmarkResult:
         sample_count=1,
     )
 
+    runtime_d2h_count = getattr(pr, "runtime_d2h_transfer_count", None)
     transfers = TransferSummary(
-        d2h_count=pr.transfer_count,
+        d2h_count=(
+            pr.transfer_count if runtime_d2h_count is None else runtime_d2h_count
+        ),
         h2d_count=0,
-        total_bytes=0,
-        total_seconds=0.0,
+        total_bytes=int(getattr(pr, "runtime_d2h_transfer_bytes", 0) or 0),
+        total_seconds=float(getattr(pr, "runtime_d2h_transfer_seconds", 0.0) or 0.0),
         offramps=0,
     )
 
@@ -212,6 +235,7 @@ def _convert_pipeline_result(pr: Any) -> BenchmarkResult:
             "fallback_event_count": pr.fallback_event_count,
             "peak_device_memory_bytes": peak_mem,
             "rewrite_event_count": pr.rewrite_event_count,
+            "profile_mode": getattr(pr, "profile_mode", "lean"),
         },
     )
 
@@ -375,6 +399,7 @@ def _pipeline_child_command(
     nvtx: bool,
     gpu_sparkline: bool,
     trace: bool,
+    profile_mode: str,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -395,6 +420,8 @@ def _pipeline_child_command(
         command.append("--gpu-sparkline")
     if trace:
         command.append("--trace")
+    if profile_mode != "lean":
+        command.extend(["--profile-mode", profile_mode])
     return command
 
 
@@ -664,6 +691,7 @@ def run_suite(
     nvtx: bool = False,
     gpu_sparkline: bool = False,
     trace: bool = False,
+    profile_mode: str = "lean",
     pipelines_filter: list[str] | None = None,
     isolated: bool = True,
     item_timeout: int = 600,
@@ -679,6 +707,11 @@ def run_suite(
     active_pipelines = suite_def.pipelines
     if pipelines_filter:
         active_pipelines = tuple(p for p in active_pipelines if p in pipelines_filter)
+    effective_profile_mode = _resolve_pipeline_profile_mode(
+        profile_mode,
+        gpu_sparkline=gpu_sparkline,
+        trace=trace,
+    )
 
     if isolated:
         registered_ops = list(suite_def.operations)
@@ -706,6 +739,7 @@ def run_suite(
             nvtx=nvtx,
             gpu_sparkline=gpu_sparkline,
             trace=trace,
+            profile_mode=effective_profile_mode,
             active_pipelines=active_pipelines,
             registered_ops=registered_ops,
             total_items=total_items,
@@ -768,6 +802,7 @@ def run_suite(
                 nvtx=nvtx,
                 gpu_sparkline=gpu_sparkline,
                 trace=trace,
+                profile_mode=effective_profile_mode,
             )
             # Filter: only keep results for the requested pipeline (pipeline.py
             # may return raster-to-vector deferred results mixed in)
@@ -841,6 +876,7 @@ def run_suite(
             "repeat": repeat,
             "precision": precision,
             "input_format": input_format,
+            "profile_mode": effective_profile_mode,
             "isolated": False,
         },
     )
@@ -856,6 +892,7 @@ def _run_suite_isolated(
     nvtx: bool,
     gpu_sparkline: bool,
     trace: bool,
+    profile_mode: str,
     active_pipelines: tuple[str, ...],
     registered_ops: list[str],
     total_items: int,
@@ -914,6 +951,7 @@ def _run_suite_isolated(
             nvtx=nvtx,
             gpu_sparkline=gpu_sparkline,
             trace=trace,
+            profile_mode=profile_mode,
         )
         item_results = _run_isolated_benchmark_command(
             command,
@@ -976,6 +1014,7 @@ def _run_suite_isolated(
             "repeat": repeat,
             "precision": precision,
             "input_format": input_format,
+            "profile_mode": profile_mode,
             "isolated": True,
             "item_timeout_seconds": item_timeout,
             "cleanup_policy": "child-process-exit plus owned-process-group kill on timeout",

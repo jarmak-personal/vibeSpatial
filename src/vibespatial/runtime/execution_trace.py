@@ -31,6 +31,10 @@ class TraceTransfer:
     direction: str  # "d2h" or "h2d"
     trigger: str
     reason: str
+    source: str = "semantic"
+    item_count: int = 0
+    bytes_transferred: int = 0
+    elapsed_seconds: float = 0.0
 
 
 @dataclass
@@ -98,6 +102,8 @@ class ExecutionTraceContext:
         cpu_steps = [s for s in self.steps if s.selected is ExecutionMode.CPU]
         d2h = [t for t in self.transfers if t.direction == "d2h"]
         h2d = [t for t in self.transfers if t.direction == "h2d"]
+        runtime_d2h = [t for t in d2h if t.source == "cuda_runtime"]
+        runtime_h2d = [t for t in h2d if t.source == "cuda_runtime"]
         offramps = 0
         prev_gpu = False
         for s in self.steps:
@@ -111,6 +117,24 @@ class ExecutionTraceContext:
             "cpu_steps": len(cpu_steps),
             "d2h_transfers": len(d2h),
             "h2d_transfers": len(h2d),
+            "d2h_transfer_bytes": sum(t.bytes_transferred for t in d2h),
+            "h2d_transfer_bytes": sum(t.bytes_transferred for t in h2d),
+            "d2h_transfer_seconds": sum(t.elapsed_seconds for t in d2h),
+            "h2d_transfer_seconds": sum(t.elapsed_seconds for t in h2d),
+            "runtime_d2h_transfers": len(runtime_d2h),
+            "runtime_h2d_transfers": len(runtime_h2d),
+            "runtime_d2h_transfer_bytes": sum(
+                t.bytes_transferred for t in runtime_d2h
+            ),
+            "runtime_h2d_transfer_bytes": sum(
+                t.bytes_transferred for t in runtime_h2d
+            ),
+            "runtime_d2h_transfer_seconds": sum(
+                t.elapsed_seconds for t in runtime_d2h
+            ),
+            "runtime_h2d_transfer_seconds": sum(
+                t.elapsed_seconds for t in runtime_h2d
+            ),
             "offramps": offramps,
         }
 
@@ -157,6 +181,10 @@ def notify_transfer(
     direction: str,
     trigger: str,
     reason: str,
+    source: str = "semantic",
+    item_count: int = 0,
+    bytes_transferred: int = 0,
+    elapsed_seconds: float = 0.0,
 ) -> None:
     ctx = get_active_trace()
     if ctx is None:
@@ -165,6 +193,10 @@ def notify_transfer(
         direction=direction,
         trigger=trigger,
         reason=reason,
+        source=source,
+        item_count=int(item_count),
+        bytes_transferred=int(bytes_transferred),
+        elapsed_seconds=max(float(elapsed_seconds), 0.0),
     ))
 
 

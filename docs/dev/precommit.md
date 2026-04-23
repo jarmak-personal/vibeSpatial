@@ -5,21 +5,27 @@ Scope: Pre-commit hook architecture, enforcement layers, and AI review workflow.
 Read If: You are setting up the repo, debugging a pre-commit failure, or extending the enforcement system.
 STOP IF: You only need to run a single lint check (see Verification in AGENTS.md).
 Source Of Truth: Pre-commit enforcement policy and AI review workflow.
-Body Budget: 200/220 lines
+Body Budget: 386/390 lines
 Document: docs/dev/precommit.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
-| 1-6 | Overview |
-| 7-12 | Quick Start |
-| 13-41 | Layer 1 Deterministic Checks |
-| 42-78 | Layer 2 AI Review Skill |
-| 79-93 | Layer 3 PreToolUse Hook |
-| 94-105 | How The Layers Interact |
-| 106-137 | Ratchet Baseline System |
-| 138-163 | Adding New Checks |
-| 164-200 | Troubleshooting |
+| 1-9 | Preamble |
+| 10-14 | Intent |
+| 15-27 | Request Signals |
+| 28-38 | Open First |
+| 39-44 | Verify |
+| 45-50 | Risks |
+| 51-62 | Quick Start |
+| 63-153 | Layer 1: Deterministic Checks (git pre-commit hook) |
+| 154-191 | Layer 2: Pre-Land Review Skill (Codex, proactive) |
+| 192-243 | Layer 3: PreToolUse Hooks (legacy Claude Code, mechanical) |
+| 244-261 | Layer 4: commit-msg Gate (Content-Addressable Marker) |
+| 262-293 | How The Layers Interact |
+| 294-322 | Ratchet Baseline System |
+| 323-342 | Adding New Checks |
+| ... | (1 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 The pre-commit system enforces three core principles through three defense
@@ -28,6 +34,47 @@ layers, each operating at a different level of the stack:
 1. **Performance is king** -- no regressions in GPU-first execution
 2. **Zero-copy by default** -- data stays on device until explicit materialization
 3. **Agent-first discoverability** -- all code is routable through the intake system
+
+## Intent
+
+Describe how local git hooks, deterministic checks, and review gates protect
+the repo before code is committed or pushed.
+
+## Request Signals
+
+- precommit
+- pre-commit
+- git hook
+- pre-push
+- commit-msg
+- deterministic gate
+- ratchet baseline
+- maintainability check
+- doc refresh
+- AI review
+
+## Open First
+
+- docs/dev/precommit.md
+- .githooks/pre-commit
+- .githooks/pre-push
+- .githooks/commit-msg
+- scripts/precommit_plan.py
+- scripts/install_githooks.py
+- scripts/check_docs.py
+- scripts/check_maintainability.py
+
+## Verify
+
+- `uv run pytest tests/test_precommit_plan.py -q`
+- `uv run python scripts/check_docs.py --check`
+- `uv run python scripts/check_maintainability.py --all`
+
+## Risks
+
+- Hook behavior that is not documented becomes invisible to agents during landing.
+- Docs-only staging rules can accidentally skip checks if path classification drifts.
+- Ratchet baselines lose value if generated docs or intake artifacts are stale.
 
 ## Quick Start
 

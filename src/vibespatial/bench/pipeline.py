@@ -87,6 +87,8 @@ PIPELINE_DEFINITIONS = (
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".benchmark_fixtures"
 _BENCHMARK_OUTPUT_COMPRESSION = None
+_PIPELINE_PROFILE_MODE = "lean"
+_PIPELINE_PROFILE_MODES = frozenset({"lean", "audit"})
 _SUPPORTED_COLLECTION_GEOM_TYPES = {
     "Point",
     "LineString",
@@ -184,8 +186,33 @@ class PipelineBenchmarkResult:
     stages: tuple[ProfileTrace | dict, ...] = field(default_factory=tuple)
     notes: str = ""
     rewrite_event_count: int = 0
+    owned_transfer_count: int | None = None
+    runtime_d2h_transfer_count: int | None = None
+    runtime_d2h_transfer_bytes: int | None = None
+    runtime_d2h_transfer_seconds: float | None = None
+    profile_mode: str = "lean"
 
     def to_dict(self) -> dict:
+        owned_transfer_count = (
+            self.transfer_count
+            if self.owned_transfer_count is None
+            else self.owned_transfer_count
+        )
+        runtime_d2h_transfer_count = (
+            self.transfer_count
+            if self.runtime_d2h_transfer_count is None
+            else self.runtime_d2h_transfer_count
+        )
+        runtime_d2h_transfer_bytes = (
+            0
+            if self.runtime_d2h_transfer_bytes is None
+            else self.runtime_d2h_transfer_bytes
+        )
+        runtime_d2h_transfer_seconds = (
+            0.0
+            if self.runtime_d2h_transfer_seconds is None
+            else self.runtime_d2h_transfer_seconds
+        )
         return {
             "pipeline": self.pipeline,
             "scale": self.scale,
@@ -194,7 +221,12 @@ class PipelineBenchmarkResult:
             "selected_runtime": self.selected_runtime,
             "planner_selected_runtime": self.planner_selected_runtime,
             "output_rows": self.output_rows,
-            "transfer_count": self.transfer_count,
+            "transfer_count": runtime_d2h_transfer_count,
+            "owned_transfer_count": owned_transfer_count,
+            "runtime_d2h_transfer_count": runtime_d2h_transfer_count,
+            "runtime_d2h_transfer_bytes": runtime_d2h_transfer_bytes,
+            "runtime_d2h_transfer_seconds": runtime_d2h_transfer_seconds,
+            "profile_mode": self.profile_mode,
             "materialization_count": self.materialization_count,
             "fallback_event_count": self.fallback_event_count,
             "peak_device_memory_bytes": self.peak_device_memory_bytes,
@@ -244,6 +276,11 @@ class _OwnedAudit:
         self.materialization_count = 0
         self.transfer_seconds = 0.0
         self.transfer_bytes = 0
+        (
+            self._runtime_start_count,
+            self._runtime_start_bytes,
+            self._runtime_start_seconds,
+        ) = _runtime_d2h_transfer_stats()
 
     def observe(self, *values) -> None:
         for array in values:
@@ -261,6 +298,99 @@ class _OwnedAudit:
 
     def snapshot(self) -> tuple[int, int, float, int]:
         return self.transfer_count, self.materialization_count, self.transfer_seconds, self.transfer_bytes
+
+    @property
+    def runtime_d2h_transfer_count(self) -> int:
+        count, _bytes, _seconds = _runtime_d2h_transfer_stats()
+        return max(count - self._runtime_start_count, 0)
+
+    @property
+    def runtime_d2h_transfer_bytes(self) -> int:
+        _count, bytes_transferred, _seconds = _runtime_d2h_transfer_stats()
+        return max(bytes_transferred - self._runtime_start_bytes, 0)
+
+    @property
+    def runtime_d2h_transfer_seconds(self) -> float:
+        _count, _bytes_transferred, seconds = _runtime_d2h_transfer_stats()
+        return max(seconds - self._runtime_start_seconds, 0.0)
+
+    def runtime_snapshot(self) -> tuple[int, int, float]:
+        return (
+            self.runtime_d2h_transfer_count,
+            self.runtime_d2h_transfer_bytes,
+            self.runtime_d2h_transfer_seconds,
+        )
+
+    def reset_runtime_baseline(self) -> None:
+        (
+            self._runtime_start_count,
+            self._runtime_start_bytes,
+            self._runtime_start_seconds,
+        ) = _runtime_d2h_transfer_stats()
+
+
+def _runtime_d2h_transfer_stats() -> tuple[int, int, float]:
+    try:
+        from vibespatial.cuda._runtime import get_d2h_transfer_profile
+
+        count, bytes_transferred, seconds = get_d2h_transfer_profile()
+        return int(count), int(bytes_transferred), float(seconds)
+    except Exception:
+        return 0, 0, 0.0
+
+
+class _UnavailableGpuSampler:
+    available = False
+
+
+class _NoopGpuEventTimer:
+    def start(self) -> None:
+        return
+
+    def stop(self) -> None:
+        return
+
+    def summarize(self) -> dict:
+        return {}
+
+
+_UNAVAILABLE_GPU_SAMPLER = _UnavailableGpuSampler()
+
+
+def _resolve_pipeline_profile_mode(
+    profile_mode: str,
+    *,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> str:
+    if profile_mode not in _PIPELINE_PROFILE_MODES:
+        raise ValueError(
+            f"profile_mode must be one of {sorted(_PIPELINE_PROFILE_MODES)!r}"
+        )
+    if retain_gpu_trace or include_gpu_sparklines:
+        return "audit"
+    return profile_mode
+
+
+def _set_pipeline_profile_mode(profile_mode: str) -> str:
+    global _PIPELINE_PROFILE_MODE
+    previous = _PIPELINE_PROFILE_MODE
+    _PIPELINE_PROFILE_MODE = profile_mode
+    return previous
+
+
+def _stage_profiler(**kwargs) -> StageProfiler:
+    profile_mode = _resolve_pipeline_profile_mode(
+        _PIPELINE_PROFILE_MODE,
+        retain_gpu_trace=bool(kwargs.get("retain_gpu_trace", False)),
+        include_gpu_sparklines=bool(kwargs.get("include_gpu_sparklines", False)),
+    )
+    if profile_mode == "lean":
+        kwargs["gpu_sampler"] = _UNAVAILABLE_GPU_SAMPLER
+        kwargs["gpu_event_timer_factory"] = _NoopGpuEventTimer
+        kwargs["retain_gpu_trace"] = False
+        kwargs["include_gpu_sparklines"] = False
+    return StageProfiler(**kwargs)
 
 
 class _DeviceMemoryMonitor:
@@ -377,17 +507,39 @@ def _trace_to_stage_dict(trace: ProfileTrace) -> dict:
 
 def _record_stage_overheads(stage, audit: _OwnedAudit, memory: _DeviceMemoryMonitor, *values) -> None:
     transfer_before, materialization_before, seconds_before, bytes_before = audit.snapshot()
+    runtime_count_before, runtime_bytes_before, runtime_seconds_before = (
+        audit.runtime_snapshot()
+    )
     audit.observe(*values)
     memory.update()
     transfer_after, materialization_after, seconds_after, bytes_after = audit.snapshot()
+    runtime_count_after, runtime_bytes_after, runtime_seconds_after = (
+        audit.runtime_snapshot()
+    )
     stage.metadata["transfer_count_delta"] = transfer_after - transfer_before
     stage.metadata["transfer_count_total"] = transfer_after
+    stage.metadata["owned_transfer_count_delta"] = transfer_after - transfer_before
+    stage.metadata["owned_transfer_count_total"] = transfer_after
+    stage.metadata["runtime_d2h_transfer_count_delta"] = (
+        runtime_count_after - runtime_count_before
+    )
+    stage.metadata["runtime_d2h_transfer_count_total"] = runtime_count_after
+    stage.metadata["runtime_d2h_transfer_seconds_delta"] = (
+        runtime_seconds_after - runtime_seconds_before
+    )
+    stage.metadata["runtime_d2h_transfer_seconds_total"] = runtime_seconds_after
     stage.metadata["materialization_count_delta"] = materialization_after - materialization_before
     stage.metadata["materialization_count_total"] = materialization_after
     stage.metadata["transfer_seconds_delta"] = seconds_after - seconds_before
     stage.metadata["transfer_seconds_total"] = seconds_after
     stage.metadata["transfer_bytes_delta"] = bytes_after - bytes_before
     stage.metadata["transfer_bytes_total"] = bytes_after
+    stage.metadata["owned_transfer_bytes_delta"] = bytes_after - bytes_before
+    stage.metadata["owned_transfer_bytes_total"] = bytes_after
+    stage.metadata["runtime_d2h_transfer_bytes_delta"] = (
+        runtime_bytes_after - runtime_bytes_before
+    )
+    stage.metadata["runtime_d2h_transfer_bytes_total"] = runtime_bytes_after
     if memory.peak_bytes is not None:
         stage.metadata["peak_device_memory_bytes"] = memory.peak_bytes
 
@@ -592,7 +744,8 @@ def _profile_join_pipeline(
         _regular_points_frame(scale).to_parquet(left_path, geometry_encoding="geoarrow")
         _regular_polygons_frame(polygon_rows).to_parquet(right_path, geometry_encoding="geoarrow")
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.join-heavy",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -764,6 +917,10 @@ def _profile_join_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=(trace.metadata["dispatch_events"] and int(len(dissolved.attributes))) or int(len(dissolved.attributes)),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -791,7 +948,8 @@ def _profile_constructive_pipeline(
         source_path = root / "constructive.parquet"
         _regular_points_frame(scale).to_parquet(source_path, geometry_encoding="geoarrow")
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.constructive",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -912,6 +1070,10 @@ def _profile_constructive_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(output.row_count),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -945,7 +1107,8 @@ def _profile_predicate_pipeline(
         # byte-classify parser can consume it directly.
         source_path.write_bytes(source_bytes)
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.predicate-heavy",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -1053,6 +1216,10 @@ def _profile_predicate_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(output.row_count),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -1080,7 +1247,7 @@ def _profile_predicate_geopandas_pipeline(
         frame = _regular_points_frame(scale)
         frame.to_file(source_path, driver="GeoJSON")
 
-        profiler = StageProfiler(
+        profiler = _stage_profiler(
             operation="pipeline.predicate-heavy-geopandas",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.CPU,
@@ -1205,7 +1372,8 @@ def _profile_zero_transfer_pipeline(
         output_path = root / "zero-transfer-output.parquet"
         _regular_points_frame(scale).to_parquet(source_path, geometry_encoding="geoarrow")
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.zero-transfer",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.GPU,
@@ -1272,7 +1440,8 @@ def _profile_zero_transfer_pipeline(
             stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
             _record_stage_overheads(stage, audit, memory, filtered)
 
-    transfer_count = audit.transfer_count
+    owned_transfer_count = audit.transfer_count
+    transfer_count = audit.runtime_d2h_transfer_count
     materialization_count = audit.materialization_count
     status = "ok" if transfer_count == 0 and materialization_count == 0 else "failed"
     stage_devices = [stage.device for stage in profiler._stages]
@@ -1296,6 +1465,10 @@ def _profile_zero_transfer_pipeline(
         planner_selected_runtime=planner_selected_runtime,
         output_rows=int(len(filtered)),
         transfer_count=transfer_count,
+        owned_transfer_count=owned_transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -1581,7 +1754,8 @@ def _profile_vegetation_corridor_pipeline(
         _vegetation_patches_frame(polygon_count).to_parquet(polygons_path, geometry_encoding="geoarrow")
         _utility_poles_frame(point_count).to_file(points_path, driver="GeoJSON")
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.vegetation-corridor",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -1799,6 +1973,10 @@ def _profile_vegetation_corridor_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(len(output)),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -1832,7 +2010,7 @@ def _profile_vegetation_corridor_geopandas_pipeline(
         _vegetation_patches_frame(polygon_count).to_parquet(polygons_path, geometry_encoding="geoarrow")
         _utility_poles_frame(point_count).to_file(points_path, driver="GeoJSON")
 
-        profiler = StageProfiler(
+        profiler = _stage_profiler(
             operation="pipeline.vegetation-corridor-geopandas",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.CPU,
@@ -1972,7 +2150,8 @@ def _profile_parcel_zoning_pipeline(
         dy = (bounds[3] - bounds[1]) * 0.2
         clip_rect = (bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.parcel-zoning",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -2118,6 +2297,10 @@ def _profile_parcel_zoning_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(len(output)),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -2154,7 +2337,7 @@ def _profile_parcel_zoning_geopandas_pipeline(
         dy = (bounds[3] - bounds[1]) * 0.2
         clip_box = box(bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
 
-        profiler = StageProfiler(
+        profiler = _stage_profiler(
             operation="pipeline.parcel-zoning-geopandas",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.CPU,
@@ -2251,7 +2434,8 @@ def _profile_flood_exposure_pipeline(
         _buildings_frame(building_count).to_parquet(buildings_path, geometry_encoding="geoarrow")
         _flood_zones_frame(flood_count).to_file(flood_path, driver="GeoJSON")
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.flood-exposure",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -2433,6 +2617,10 @@ def _profile_flood_exposure_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(len(output)),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -2463,7 +2651,7 @@ def _profile_flood_exposure_geopandas_pipeline(
         _buildings_frame(building_count).to_parquet(buildings_path, geometry_encoding="geoarrow")
         _flood_zones_frame(flood_count).to_file(flood_path, driver="GeoJSON")
 
-        profiler = StageProfiler(
+        profiler = _stage_profiler(
             operation="pipeline.flood-exposure-geopandas",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.CPU,
@@ -2564,7 +2752,8 @@ def _profile_network_service_area_pipeline(
         _network_lines_frame(network_count).to_parquet(network_path, geometry_encoding="geoarrow")
         _admin_boundary_frame().to_parquet(admin_path, geometry_encoding="geoarrow")
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.network-service-area",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -2673,6 +2862,10 @@ def _profile_network_service_area_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(len(output)),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -2702,7 +2895,7 @@ def _profile_network_service_area_geopandas_pipeline(
         _network_lines_frame(network_count).to_parquet(network_path, geometry_encoding="geoarrow")
         _admin_boundary_frame().to_parquet(admin_path, geometry_encoding="geoarrow")
 
-        profiler = StageProfiler(
+        profiler = _stage_profiler(
             operation="pipeline.network-service-area-geopandas",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.CPU,
@@ -2805,7 +2998,8 @@ def _profile_site_suitability_pipeline(
         dy = (bounds[3] - bounds[1]) * 0.2
         clip_rect = (bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
 
-        profiler = StageProfiler(
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
             operation="pipeline.site-suitability",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.AUTO,
@@ -2991,6 +3185,10 @@ def _profile_site_suitability_pipeline(
         planner_selected_runtime=planner_runtime.value,
         output_rows=int(len(output)),
         transfer_count=audit.transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
         materialization_count=audit.materialization_count,
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
@@ -3030,7 +3228,7 @@ def _profile_site_suitability_geopandas_pipeline(
         dy = (bounds[3] - bounds[1]) * 0.2
         clip_box = box(bounds[0] + dx, bounds[1] + dy, bounds[2] - dx, bounds[3] - dy)
 
-        profiler = StageProfiler(
+        profiler = _stage_profiler(
             operation="pipeline.site-suitability-geopandas",
             dataset=f"scale-{scale}",
             requested_runtime=ExecutionMode.CPU,
@@ -3104,7 +3302,9 @@ def _profile_site_suitability_geopandas_pipeline(
     )
 
 
-def _deferred_raster_pipeline(scale: int) -> PipelineBenchmarkResult:
+def _deferred_raster_pipeline(
+    scale: int, *, profile_mode: str = "lean"
+) -> PipelineBenchmarkResult:
     return PipelineBenchmarkResult(
         pipeline="raster-to-vector",
         scale=scale,
@@ -3119,6 +3319,7 @@ def _deferred_raster_pipeline(scale: int) -> PipelineBenchmarkResult:
         peak_device_memory_bytes=None,
         stages=tuple(),
         notes="Deferred until Phase 8 raster polygonize work lands.",
+        profile_mode=profile_mode,
     )
 
 
@@ -3158,7 +3359,7 @@ def _profile_provenance_rewrite_pipeline(
     clear_fallback_events()
     clear_rewrite_events()
 
-    profiler = StageProfiler(
+    profiler = _stage_profiler(
         operation="pipeline.provenance-rewrite",
         dataset=f"scale-{scale}",
         requested_runtime=ExecutionMode.AUTO,
@@ -3277,207 +3478,270 @@ def benchmark_pipeline_suite(
     enable_nvtx: bool = False,
     retain_gpu_trace: bool = False,
     include_gpu_sparklines: bool = False,
+    profile_mode: str = "lean",
 ) -> list[PipelineBenchmarkResult]:
     if repeat < 1:
         raise ValueError("repeat must be >= 1")
+    effective_profile_mode = _resolve_pipeline_profile_mode(
+        profile_mode,
+        retain_gpu_trace=retain_gpu_trace,
+        include_gpu_sparklines=include_gpu_sparklines,
+    )
     # Benchmark timings should measure kernels and data movement, not first-use
     # compilation. Front-load the full CCCL/NVRTC benchmark stack once before
     # any pipeline sample starts so fresh-process suite runs are comparable.
     from vibespatial.cuda.cccl_precompile import precompile_all
     precompile_all(timeout=120.0)
     results: list[PipelineBenchmarkResult] = []
-    for scale in pipeline_scales(suite):
-        for pipeline in pipelines:
-            samples: list[PipelineBenchmarkResult] = []
-            for _ in range(repeat):
-                if pipeline == "join-heavy":
-                    samples.append(
-                        _profile_join_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+    previous_profile_mode = _set_pipeline_profile_mode(effective_profile_mode)
+    try:
+        for scale in pipeline_scales(suite):
+            for pipeline in pipelines:
+                samples: list[PipelineBenchmarkResult] = []
+                for _ in range(repeat):
+                    if pipeline == "join-heavy":
+                        samples.append(
+                            _profile_join_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "constructive":
-                    samples.append(
-                        _profile_constructive_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "constructive":
+                        samples.append(
+                            _profile_constructive_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "predicate-heavy":
-                    samples.append(
-                        _profile_predicate_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "predicate-heavy":
+                        samples.append(
+                            _profile_predicate_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "predicate-heavy-geopandas":
-                    samples.append(
-                        _profile_predicate_geopandas_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "predicate-heavy-geopandas":
+                        samples.append(
+                            _profile_predicate_geopandas_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "zero-transfer":
-                    samples.append(
-                        _profile_zero_transfer_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "zero-transfer":
+                        samples.append(
+                            _profile_zero_transfer_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "raster-to-vector":
-                    samples.append(_deferred_raster_pipeline(scale))
-                elif pipeline == "vegetation-corridor":
-                    samples.append(
-                        _profile_vegetation_corridor_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "raster-to-vector":
+                        samples.append(
+                            _deferred_raster_pipeline(
+                                scale,
+                                profile_mode=effective_profile_mode,
+                            )
                         )
-                    )
-                elif pipeline == "vegetation-corridor-geopandas":
-                    samples.append(
-                        _profile_vegetation_corridor_geopandas_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "vegetation-corridor":
+                        samples.append(
+                            _profile_vegetation_corridor_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "parcel-zoning":
-                    samples.append(
-                        _profile_parcel_zoning_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "vegetation-corridor-geopandas":
+                        samples.append(
+                            _profile_vegetation_corridor_geopandas_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "parcel-zoning-geopandas":
-                    samples.append(
-                        _profile_parcel_zoning_geopandas_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "parcel-zoning":
+                        samples.append(
+                            _profile_parcel_zoning_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "flood-exposure":
-                    samples.append(
-                        _profile_flood_exposure_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "parcel-zoning-geopandas":
+                        samples.append(
+                            _profile_parcel_zoning_geopandas_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "flood-exposure-geopandas":
-                    samples.append(
-                        _profile_flood_exposure_geopandas_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "flood-exposure":
+                        samples.append(
+                            _profile_flood_exposure_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "network-service-area":
-                    samples.append(
-                        _profile_network_service_area_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "flood-exposure-geopandas":
+                        samples.append(
+                            _profile_flood_exposure_geopandas_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "network-service-area-geopandas":
-                    samples.append(
-                        _profile_network_service_area_geopandas_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "network-service-area":
+                        samples.append(
+                            _profile_network_service_area_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "site-suitability":
-                    samples.append(
-                        _profile_site_suitability_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "network-service-area-geopandas":
+                        samples.append(
+                            _profile_network_service_area_geopandas_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "site-suitability-geopandas":
-                    samples.append(
-                        _profile_site_suitability_geopandas_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "site-suitability":
+                        samples.append(
+                            _profile_site_suitability_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
-                    )
-                elif pipeline == "provenance-rewrite":
-                    samples.append(
-                        _profile_provenance_rewrite_pipeline(
-                            scale,
-                            enable_nvtx=enable_nvtx,
-                            retain_gpu_trace=retain_gpu_trace,
-                            include_gpu_sparklines=include_gpu_sparklines,
+                    elif pipeline == "site-suitability-geopandas":
+                        samples.append(
+                            _profile_site_suitability_geopandas_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
                         )
+                    elif pipeline == "provenance-rewrite":
+                        samples.append(
+                            _profile_provenance_rewrite_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
+                        )
+                    else:
+                        raise ValueError(f"Unsupported pipeline: {pipeline}")
+                # Release GPU pool memory between pipelines to prevent OOM
+                # from accumulated device allocations across pipeline runs.
+                _free_gpu_pool_memory()
+                if pipeline == "raster-to-vector":
+                    results.append(samples[0])
+                    continue
+                median_elapsed = median(sample.elapsed_seconds for sample in samples)
+                median_sample = min(samples, key=lambda sample: abs(sample.elapsed_seconds - median_elapsed))
+                results.append(
+                    PipelineBenchmarkResult(
+                        pipeline=median_sample.pipeline,
+                        scale=median_sample.scale,
+                        status=median_sample.status,
+                        elapsed_seconds=float(median_elapsed),
+                        selected_runtime=median_sample.selected_runtime,
+                        planner_selected_runtime=median_sample.planner_selected_runtime,
+                        output_rows=median_sample.output_rows,
+                        transfer_count=max(
+                            (
+                                sample.runtime_d2h_transfer_count
+                                if sample.runtime_d2h_transfer_count is not None
+                                else sample.transfer_count
+                            )
+                            for sample in samples
+                        ),
+                        owned_transfer_count=max(
+                            (
+                                sample.owned_transfer_count
+                                if sample.owned_transfer_count is not None
+                                else sample.transfer_count
+                            )
+                            for sample in samples
+                        ),
+                        runtime_d2h_transfer_count=max(
+                            (
+                                sample.runtime_d2h_transfer_count
+                                if sample.runtime_d2h_transfer_count is not None
+                                else sample.transfer_count
+                            )
+                            for sample in samples
+                        ),
+                        runtime_d2h_transfer_bytes=max(
+                            sample.runtime_d2h_transfer_bytes or 0
+                            for sample in samples
+                        ),
+                        runtime_d2h_transfer_seconds=max(
+                            sample.runtime_d2h_transfer_seconds or 0.0
+                            for sample in samples
+                        ),
+                        materialization_count=max(sample.materialization_count for sample in samples),
+                        fallback_event_count=max(sample.fallback_event_count for sample in samples),
+                        peak_device_memory_bytes=max(
+                            (sample.peak_device_memory_bytes for sample in samples if sample.peak_device_memory_bytes is not None),
+                            default=None,
+                        ),
+                        stages=median_sample.stages,
+                        notes=median_sample.notes,
+                        rewrite_event_count=median_sample.rewrite_event_count,
+                        profile_mode=effective_profile_mode,
                     )
-                else:
-                    raise ValueError(f"Unsupported pipeline: {pipeline}")
-            # Release GPU pool memory between pipelines to prevent OOM
-            # from accumulated device allocations across pipeline runs.
-            _free_gpu_pool_memory()
-            if pipeline == "raster-to-vector":
-                results.append(samples[0])
-                continue
-            median_elapsed = median(sample.elapsed_seconds for sample in samples)
-            median_sample = min(samples, key=lambda sample: abs(sample.elapsed_seconds - median_elapsed))
-            results.append(
-                PipelineBenchmarkResult(
-                    pipeline=median_sample.pipeline,
-                    scale=median_sample.scale,
-                    status=median_sample.status,
-                    elapsed_seconds=float(median_elapsed),
-                    selected_runtime=median_sample.selected_runtime,
-                    planner_selected_runtime=median_sample.planner_selected_runtime,
-                    output_rows=median_sample.output_rows,
-                    transfer_count=max(sample.transfer_count for sample in samples),
-                    materialization_count=max(sample.materialization_count for sample in samples),
-                    fallback_event_count=max(sample.fallback_event_count for sample in samples),
-                    peak_device_memory_bytes=max(
-                        (sample.peak_device_memory_bytes for sample in samples if sample.peak_device_memory_bytes is not None),
-                        default=None,
-                    ),
-                    stages=median_sample.stages,
-                    notes=median_sample.notes,
-                    rewrite_event_count=median_sample.rewrite_event_count,
                 )
-            )
+    finally:
+        _set_pipeline_profile_mode(previous_profile_mode)
     if suite == "full":
-        results.append(_deferred_raster_pipeline(100_000))
-        results.append(_deferred_raster_pipeline(1_000_000))
+        results.append(
+            _deferred_raster_pipeline(
+                100_000,
+                profile_mode=effective_profile_mode,
+            )
+        )
+        results.append(
+            _deferred_raster_pipeline(
+                1_000_000,
+                profile_mode=effective_profile_mode,
+            )
+        )
     return results
 
 
 def suite_to_json(results: list[PipelineBenchmarkResult], *, suite: str | None = None, repeat: int = 1) -> str:
+    profile_modes = {result.profile_mode for result in results}
     payload = {
         "results": [result.to_dict() for result in results],
         "metadata": {
             "repeat": repeat,
+            "profile_mode": (
+                next(iter(profile_modes))
+                if len(profile_modes) == 1
+                else sorted(profile_modes)
+            ),
         },
     }
     if suite is not None:

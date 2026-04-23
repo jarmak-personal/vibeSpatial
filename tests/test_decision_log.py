@@ -21,4 +21,5 @@ def test_intake_routes_mixed_geometry_request_to_adr() -> None:
     file_paths = [entry["path"] for entry in plan["files"]]
 
     assert "docs/decisions/index.md" in doc_paths
-    assert "docs/decisions/0001-mixed-geometries.md" in file_paths
+    assert "docs/decisions/0001-mixed-geometries.md" in doc_paths
+    assert "docs/decisions/0001-mixed-geometries.md" not in file_paths

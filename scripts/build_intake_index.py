@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - script execution path
 INDEX_OUTPUT = Path("docs/ops/intake-index.json")
 TEXT_SUFFIXES = {".md", ".py", ".toml", ".json", ".yaml", ".yml"}
 EXCLUDED_DIRS = {
+    ".brainstorm",
     ".git",
     ".venv",
     ".pytest_cache",
@@ -24,6 +25,7 @@ EXCLUDED_DIRS = {
 }
 STOPWORDS = {
     "a",
+    "all",
     "an",
     "and",
     "as",

@@ -5,7 +5,7 @@ Scope: Operational intake workflow and request-to-doc routing policy.
 Read If: You received a task request and need to decide what to open first.
 STOP IF: You already have a confirmed work plan and relevant docs open.
 Source Of Truth: Intake workflow and routing rules for agents in this repo.
-Body Budget: 59/220 lines
+Body Budget: 67/220 lines
 Document: docs/ops/intake.md
 
 Section Map (Body Lines)
@@ -14,12 +14,13 @@ Section Map (Body Lines)
 | 1-4 | Preamble |
 | 5-9 | Intent |
 | 10-19 | Request Signals |
-| 20-26 | Open First |
-| 27-31 | Verify |
-| 32-37 | Risks |
-| 38-47 | Route Families |
-| 48-54 | How It Works |
-| 55-59 | Notes |
+| 20-29 | Open First |
+| 30-34 | Verify |
+| 35-40 | Risks |
+| 41-50 | Route Families |
+| 51-57 | How It Works |
+| 58-62 | CLI Options |
+| 63-67 | Notes |
 DOC_HEADER:END -->
 
 Use this file to classify requests before opening more of the repository.
@@ -43,6 +44,9 @@ without maintaining a large static route table.
 
 - docs/ops/intake.md
 - AGENTS.md
+- scripts/intake.py
+- scripts/build_intake_index.py
+- scripts/check_docs.py
 - README.md
 - pyproject.toml
 
@@ -73,6 +77,11 @@ without maintaining a large static route table.
 2. The intake script builds a routing index from those docs and the current repo file tree.
 3. `Request Signals`, `Open First`, `Verify`, and `Risks` sections become machine-readable input.
 4. New files enter the file index automatically; only docs need updates when workflow changes.
+
+## CLI Options
+
+- `--json` emits the full routing plan as structured JSON for tests and tools.
+- `--explain` includes score contributions so weak routes can be debugged.
 
 ## Notes
 

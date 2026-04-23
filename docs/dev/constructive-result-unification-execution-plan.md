@@ -5,32 +5,27 @@ Scope: Execution plan for unifying constructive results across overlay, clip, di
 Read If: You are planning or executing the constructive-result refactor, overlay architecture rewrite, or planner-driven fusion work.
 STOP IF: You already have the active milestone open and only need local implementation detail.
 Source Of Truth: Program plan for making NativeTabularResult the canonical constructive boundary and using planner-selected workload families for acceleration.
-Body Budget: 0/520 lines
+Body Budget: 884/900 lines
 Document: docs/dev/constructive-result-unification-execution-plan.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-8 | Intent |
-| 9-21 | Request Signals |
-| 22-34 | Open First |
-| 35-47 | Verify |
-| 48-62 | Risks |
-| 63-84 | Mission |
-| 85-122 | Target Shape |
-| 123-141 | Non-Goals |
-| 142-164 | Working Principles |
-| 165-182 | Tracking |
-| 183-217 | Milestone M0 |
-| 218-258 | Milestone M1 |
-| 259-296 | Milestone M2 |
-| 297-339 | Milestone M3 |
-| 340-373 | Milestone M4 |
-| 374-406 | Milestone M5 |
-| 407-446 | Milestone M6 |
-| 447-486 | Milestone M7 |
-| 487-518 | Milestone M8 |
+| 3-13 | Intent |
+| 14-29 | Request Signals |
+| 30-45 | Open First |
+| 46-56 | Verify |
+| 57-75 | Risks |
+| 76-107 | Mission |
+| 108-156 | Target Shape |
+| 157-175 | Non-Goals |
+| 176-192 | Working Principles |
+| 193-204 | Tracking |
+| 205-320 | Milestone M0: Baseline, Contract Freeze, And Deletion Inventory |
+| 321-376 | Milestone M1: Shared Result Core And Canonical Contract Extraction |
+| 377-454 | Milestone M2: Explicit Export Boundary Rewrite |
+| ... | (6 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
 ## Intent

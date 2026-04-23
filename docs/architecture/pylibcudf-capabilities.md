@@ -5,8 +5,21 @@ Scope: Confirmed pylibcudf/libcudf/KvikIO Parquet source and scan capabilities u
 Read If: You are changing GeoParquet transport policy, SourceInfo wiring, or backend capability gates.
 STOP IF: The routed GeoParquet adapter files are already open and you only need a local implementation detail.
 Source Of Truth: Checked-in capability matrix for what the current pylibcudf Parquet reader actually supports in this repo.
-Body Budget: 0/260 lines
+Body Budget: 83/260 lines
 Document: docs/architecture/pylibcudf-capabilities.md
+
+Section Map (Body Lines)
+| Body Lines | Section |
+|---|---|
+| 1-2 | Preamble |
+| 3-8 | Intent |
+| 9-16 | Request Signals |
+| 17-23 | Open First |
+| 24-29 | Verify |
+| 30-39 | Risks |
+| 40-56 | Confirmed Parquet Read Capabilities |
+| 57-65 | Confirmed URI And Transport Behavior |
+| 66-83 | Repo Policy Versus Backend Gaps |
 DOC_HEADER:END -->
 
 ## Intent

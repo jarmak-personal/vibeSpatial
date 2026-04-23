@@ -5,7 +5,7 @@ Scope: Stage-timed profiling entrypoints, NVTX guidance, and trace interpretatio
 Read If: You are profiling join or overlay kernels, adding benchmark rails, or trying to explain where time is going.
 STOP IF: You already have the profiling script open and only need a local implementation detail.
 Source Of Truth: Stage-level profiling workflow for join and overlay kernel development.
-Body Budget: 155/220 lines
+Body Budget: 156/220 lines
 Document: docs/testing/profiling-rails.md
 
 Section Map (Body Lines)
@@ -21,7 +21,7 @@ Section Map (Body Lines)
 | 65-98 | Stage Contracts |
 | 99-109 | Trace Interpretation |
 | 110-124 | NVTX |
-| 125-155 | Shootout Physical Plans |
+| 125-156 | Shootout Physical Plans |
 DOC_HEADER:END -->
 
 This repo now has a dedicated profiling rail for join and overlay kernel work.
@@ -156,7 +156,8 @@ Shootout artifacts should report:
 
 - actual backend by stage
 - fallback events and reasons
-- host materialization and transfer counts
+- host materialization counts, owned transfer-boundary counts, and runtime D2H
+  copy counts/bytes/synchronous seconds
 - top hotpath stages by elapsed time
 - statement-level `timed_stages` with source line spans and physical-shape tags
 - `stage_totals_by_tag` and `stage_totals_by_backend`

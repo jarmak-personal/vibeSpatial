@@ -129,9 +129,20 @@ def _compare_v1(baseline: dict, current: dict) -> list[RegressionFinding]:
                 detail=f"wall-clock regression exceeds {WALL_CLOCK_THRESHOLD:.0%}",
             ))
 
-        # Transfer count increase
-        base_transfers = int(base.get("transfer_count", 0))
-        cur_transfers = int(cur.get("transfer_count", 0))
+        # Transfer count increase. Prefer runtime-layer copy accounting when
+        # present; older artifacts only have the owned-array diagnostic count.
+        base_transfers = int(
+            base.get(
+                "runtime_d2h_transfer_count",
+                base.get("transfer_count", 0),
+            )
+        )
+        cur_transfers = int(
+            cur.get(
+                "runtime_d2h_transfer_count",
+                cur.get("transfer_count", 0),
+            )
+        )
         if cur_transfers > base_transfers:
             findings.append(RegressionFinding(
                 pipeline=pipeline,

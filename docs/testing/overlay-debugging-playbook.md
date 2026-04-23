@@ -5,24 +5,24 @@ Scope: Repeatable workflow for debugging exact GPU overlay and dissolve correctn
 Read If: You are investigating a union, intersection, dissolve, face-selection, split-event, or half-edge graph bug in the GPU overlay stack.
 STOP IF: You already have the exact failing stage pinned and only need local implementation detail in that module.
 Source Of Truth: Repo playbook for exact GPU overlay debugging and regression lock-in.
-Body Budget: 145/220 lines
+Body Budget: 179/220 lines
 Document: docs/testing/overlay-debugging-playbook.md
 
 Section Map (Body Lines)
 | Body Lines | Section |
 |---|---|
 | 1-2 | Preamble |
-| 3-8 | Intent |
-| 9-24 | Request Signals |
-| 25-34 | Open First |
-| 35-42 | Verify |
-| 43-49 | Risks |
-| 50-63 | Core Rules |
-| 64-79 | Debugging Workflow |
-| 80-100 | Stage-Isolation Ladder |
-| 101-116 | Structural Smells |
-| 117-130 | Regression Lock-In |
-| 131-145 | Session Lessons |
+| 3-15 | Intent |
+| 16-34 | Request Signals |
+| 35-46 | Open First |
+| 47-54 | Verify |
+| 55-62 | Risks |
+| 63-80 | Core Rules |
+| 81-97 | Debugging Workflow |
+| 98-130 | Stage-Isolation Ladder |
+| 131-149 | Structural Smells |
+| 150-165 | Regression Lock-In |
+| 166-179 | Session Lessons |
 DOC_HEADER:END -->
 
 ## Intent

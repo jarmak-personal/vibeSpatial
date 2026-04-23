@@ -22,6 +22,27 @@
       "sourceOfTruth": "Intake workflow and routing rules for agents in this repo.",
       "maxBodyLines": 220
     },
+    "docs/dev/precommit.md": {
+      "scope": "Pre-commit hook architecture, enforcement layers, and AI review workflow.",
+      "readIf": "You are setting up the repo, debugging a pre-commit failure, or extending the enforcement system.",
+      "stopIf": "You only need to run a single lint check (see Verification in AGENTS.md).",
+      "sourceOfTruth": "Pre-commit enforcement policy and AI review workflow.",
+      "maxBodyLines": 390
+    },
+    "docs/dev/constructive-result-unification-execution-plan.md": {
+      "scope": "Execution plan for unifying constructive results across overlay, clip, dissolve, and planner-selected fused execution families.",
+      "readIf": "You are planning or executing the constructive-result refactor, overlay architecture rewrite, or planner-driven fusion work.",
+      "stopIf": "You already have the active milestone open and only need local implementation detail.",
+      "sourceOfTruth": "Program plan for making NativeTabularResult the canonical constructive boundary and using planner-selected workload families for acceleration.",
+      "maxBodyLines": 900
+    },
+    "docs/dev/io-zero-execution-plan.md": {
+      "scope": "Execution plan for removing avoidable host-side churn from public read paths and making GPU-first IO the default shape.",
+      "readIf": "You are planning or executing the next IO read push, public read_file acceleration work, or GPU-first ingest cleanup.",
+      "stopIf": "You already have the active IO surface open and only need local implementation detail.",
+      "sourceOfTruth": "Program plan for making public read surfaces GPU-first and reducing hybrid IO to explicit compatibility boundaries.",
+      "maxBodyLines": 700
+    },
     "docs/testing/upstream-inventory.md": {
       "scope": "Ranked upstream GeoPandas contract slices, dependencies, and runtime weight.",
       "readIf": "You are choosing which vendored test groups to promote or implement next.",
@@ -141,6 +162,13 @@
       "sourceOfTruth": "Phase-1 adaptive runtime policy before broader kernel work lands.",
       "maxBodyLines": 240
     },
+    "docs/architecture/gpu-kernel-caching.md": {
+      "scope": "CCCL and NVRTC CUBIN on-disk caching, precompilation, ctypes replay, and cache management.",
+      "readIf": "You are changing kernel compilation, caching, precompilation, JIT warmup, or CCCL/NVRTC integration.",
+      "stopIf": "Your task is docs-only or limited to vendored test maintenance.",
+      "sourceOfTruth": "Disk caching architecture for CCCL algorithm CUBINs and NVRTC kernel CUBINs.",
+      "maxBodyLines": 340
+    },
     "docs/architecture/io-acceleration.md": {
       "scope": "Post-Phase-6b GPU-native IO execution model, staged decode policy, and format-level speed targets.",
       "readIf": "You are changing GeoArrow, GeoParquet, WKB, GeoJSON, or Shapefile performance strategy or decode architecture.",
@@ -246,6 +274,13 @@
       "sourceOfTruth": "IO architecture for Arrow, GeoParquet, and WKB owned-buffer bridges.",
       "maxBodyLines": 260
     },
+    "docs/architecture/pylibcudf-capabilities.md": {
+      "scope": "Confirmed pylibcudf/libcudf/KvikIO Parquet source and scan capabilities used by vibeSpatial IO.",
+      "readIf": "You are changing GeoParquet transport policy, SourceInfo wiring, or backend capability gates.",
+      "stopIf": "The routed GeoParquet adapter files are already open and you only need a local implementation detail.",
+      "sourceOfTruth": "Checked-in capability matrix for what the current pylibcudf Parquet reader actually supports in this repo.",
+      "maxBodyLines": 260
+    },
     "docs/architecture/io-files.md": {
       "scope": "File-based vector format routing for GeoJSON, Shapefile, and legacy GDAL adapters.",
       "readIf": "You are changing read_file, to_file, GeoJSON ingest, Shapefile ingest, or file-format routing.",
@@ -294,6 +329,20 @@
       "stopIf": "Your task already has the coverage script open and only needs the command.",
       "sourceOfTruth": "Native coverage metric definition for upstream GeoPandas compatibility.",
       "maxBodyLines": 220
+    },
+    "docs/testing/overlay-debugging-playbook.md": {
+      "scope": "Repeatable workflow for debugging exact GPU overlay and dissolve correctness bugs without losing the real performance target.",
+      "readIf": "You are investigating a union, intersection, dissolve, face-selection, split-event, or half-edge graph bug in the GPU overlay stack.",
+      "stopIf": "You already have the exact failing stage pinned and only need local implementation detail in that module.",
+      "sourceOfTruth": "Repo playbook for exact GPU overlay debugging and regression lock-in.",
+      "maxBodyLines": 220
+    },
+    "docs/testing/public-api-performance-roadmap.md": {
+      "scope": "Public API benchmark performance roadmap, isolated suite policy, and remediation priorities.",
+      "readIf": "You are auditing or fixing public API performance regressions after benchmark cleanup.",
+      "stopIf": "You only need a narrow operation implementation detail already routed by intake.",
+      "sourceOfTruth": "Current execution plan for public benchmark parity and IO-zero cleanup.",
+      "maxBodyLines": 300
     }
   }
 }
