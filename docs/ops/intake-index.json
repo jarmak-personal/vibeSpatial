@@ -3944,6 +3944,112 @@
     },
     {
       "metadata": {
+        "maxBodyLines": 180,
+        "readIf": "You are comparing public workflow speed, operation-level speed, or transient D2H health after the ADR0044 native substrate checkpoint.",
+        "scope": "Post-ADR0044/0045 performance baseline for non-IO workflows, operations, and pipelines.",
+        "sourceOfTruth": "Measurement checkpoint for committed SHA 0ff2a07 on 2026-04-25.",
+        "stopIf": "You need IO shootout baselines; this baseline intentionally excludes the shootout IO directory."
+      },
+      "open_first": [
+        "docs/testing/adr0044-rich-baseline-2026-04-25.md",
+        "docs/testing/pipeline-benchmarks.md",
+        "docs/testing/performance-tiers.md",
+        "docs/dev/private-native-execution-substrate-plan.md"
+      ],
+      "path": "docs/testing/adr0044-rich-baseline-2026-04-25.md",
+      "request_signals": [
+        "adr0044 baseline",
+        "rich baseline",
+        "workflow shootout",
+        "operation benchmark",
+        "transient D2H"
+      ],
+      "risks": [
+        "Raw artifacts live under ignored `benchmark_results/working/` and are not",
+        "Sandbox GPU visibility can make timings meaningless; rerun performance",
+        "Workflow wins are canaries only; do not overfit implementation strategy to"
+      ],
+      "sections": [
+        "Commands",
+        "Environment",
+        "Intent",
+        "Interpretation",
+        "Open First",
+        "Operation Baselines",
+        "Pipeline Baselines",
+        "Profile Gate",
+        "Request Signals",
+        "Risks",
+        "Summary",
+        "Verify",
+        "Workflow Shootouts"
+      ],
+      "title": "ADR0044 Rich Baseline 2026-04-25",
+      "tokens": [
+        "0045",
+        "04",
+        "0ff2a07",
+        "2026",
+        "25",
+        "adr0044",
+        "after",
+        "are",
+        "baseline",
+        "baselines",
+        "benchmark",
+        "checkpoint",
+        "commands",
+        "committed",
+        "comparing",
+        "d2h",
+        "directory",
+        "environment",
+        "excludes",
+        "first",
+        "gate",
+        "health",
+        "intent",
+        "intentionally",
+        "interpretation",
+        "io",
+        "level",
+        "measurement",
+        "native",
+        "need",
+        "non",
+        "open",
+        "operation",
+        "operations",
+        "performance",
+        "pipeline",
+        "pipelines",
+        "post",
+        "profile",
+        "public",
+        "request",
+        "rich",
+        "risks",
+        "sha",
+        "shootout",
+        "shootouts",
+        "signals",
+        "speed",
+        "substrate",
+        "summary",
+        "transient",
+        "verify",
+        "workflow",
+        "workflows",
+        "you"
+      ],
+      "verify": [
+        "uv run python scripts/check_docs.py --check",
+        "uv run vsbench shootout benchmarks/shootout --scale 10k --repeat 3",
+        "uv run python scripts/benchmark_pipelines.py --suite full --repeat 1 --gpu-sparkline"
+      ]
+    },
+    {
+      "metadata": {
         "maxBodyLines": 260,
         "readIf": "You are promoting, inspecting, or verifying upstream contract test groups.",
         "scope": "Upstream GeoPandas contract promotion gates, test-group ordering, and promotion workflow.",
@@ -8576,7 +8682,8 @@
       "kind": "doc",
       "path": "docs/dev/private-native-execution-substrate-plan.md",
       "referenced_by": [
-        "docs/dev/private-native-execution-substrate-plan.md"
+        "docs/dev/private-native-execution-substrate-plan.md",
+        "docs/testing/adr0044-rich-baseline-2026-04-25.md"
       ],
       "symbols": [],
       "tokens": [
@@ -8653,6 +8760,25 @@
         "intake",
         "md",
         "ops"
+      ]
+    },
+    {
+      "kind": "doc",
+      "path": "docs/testing/adr0044-rich-baseline-2026-04-25.md",
+      "referenced_by": [
+        "docs/testing/adr0044-rich-baseline-2026-04-25.md"
+      ],
+      "symbols": [],
+      "tokens": [
+        "04",
+        "2026",
+        "25",
+        "adr0044",
+        "baseline",
+        "docs",
+        "md",
+        "rich",
+        "testing"
       ]
     },
     {
@@ -8798,6 +8924,7 @@
       "kind": "doc",
       "path": "docs/testing/performance-tiers.md",
       "referenced_by": [
+        "docs/testing/adr0044-rich-baseline-2026-04-25.md",
         "docs/testing/gpu-performance-checklist.md",
         "docs/testing/gpu-performance-remediation-plan.md",
         "docs/testing/kernel-inventory.md",
@@ -8817,6 +8944,7 @@
       "kind": "doc",
       "path": "docs/testing/pipeline-benchmarks.md",
       "referenced_by": [
+        "docs/testing/adr0044-rich-baseline-2026-04-25.md",
         "docs/testing/pipeline-benchmarks.md",
         "docs/testing/public-api-performance-roadmap.md"
       ],

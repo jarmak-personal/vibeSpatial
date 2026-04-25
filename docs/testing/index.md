@@ -17,4 +17,5 @@ degeneracy-corpus
 io-performance-rails
 pipeline-benchmarks
 profiling-rails
+adr0044-rich-baseline-2026-04-25
 ```
