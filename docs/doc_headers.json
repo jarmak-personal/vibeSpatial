@@ -110,7 +110,7 @@
       "scope": "Post-ADR0044/0045 performance baseline for non-IO workflows, operations, and pipelines.",
       "readIf": "You are comparing public workflow speed, operation-level speed, or transient D2H health after the ADR0044 native substrate checkpoint.",
       "stopIf": "You need IO shootout baselines; this baseline intentionally excludes the shootout IO directory.",
-      "sourceOfTruth": "Measurement checkpoint for committed SHA 0ff2a07 on 2026-04-25.",
+      "sourceOfTruth": "Measurement checkpoint for committed SHA bae6767 on 2026-04-25.",
       "maxBodyLines": 180
     },
     "docs/testing/synthetic-data.md": {
