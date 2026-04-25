@@ -273,6 +273,58 @@ def test_run_operation_records_operation_args_in_metadata() -> None:
     assert result.metadata["operation_args"] == {"tile_size": 128}
 
 
+def test_run_operation_aggregates_repeat_samples() -> None:
+    samples = iter((0.0005, 0.003, 0.001, 0.002))
+    baseline_samples = iter((0.005, 0.030, 0.010, 0.020))
+
+    @benchmark_operation(
+        name="test-repeat-runner",
+        description="test helper",
+        category="misc",
+    )
+    def _bench(
+        *,
+        scale: int,
+        repeat: int,
+        compare: str | None,
+        precision: str,
+        input_format: str,
+        nvtx: bool,
+        gpu_sparkline: bool,
+        trace: bool,
+    ) -> BenchmarkResult:
+        elapsed = next(samples)
+        baseline_elapsed = next(baseline_samples)
+        return BenchmarkResult(
+            operation="test-repeat-runner",
+            tier=1,
+            scale=scale,
+            geometry_type="point",
+            precision=precision,
+            status="pass",
+            status_reason="ok",
+            timing=timing_from_samples([elapsed]),
+            baseline_name="baseline",
+            baseline_timing=timing_from_samples([baseline_elapsed]),
+            speedup=baseline_elapsed / elapsed,
+        )
+
+    try:
+        result = run_operation("test-repeat-runner", scale=10, repeat=3)
+    finally:
+        _OPERATION_REGISTRY.pop("test-repeat-runner", None)
+
+    assert result.timing.sample_count == 3
+    assert result.timing.median_seconds == 0.002
+    assert result.baseline_timing is not None
+    assert result.baseline_timing.sample_count == 3
+    assert result.baseline_timing.median_seconds == 0.020
+    assert result.speedup == 10.0
+    assert result.metadata["repeat"] == 3
+    assert result.metadata["sample_seconds"] == [0.003, 0.001, 0.002]
+    assert result.metadata["baseline_sample_seconds"] == [0.030, 0.010, 0.020]
+
+
 def test_vsbench_run_accepts_generic_operation_args(capsys) -> None:
     @benchmark_operation(
         name="test-opargs-cli",

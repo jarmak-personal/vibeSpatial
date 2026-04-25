@@ -596,6 +596,8 @@ def _list_kernels(mode: str) -> int:
 
 
 def _cmd_shootout(args: argparse.Namespace) -> int:
+    import orjson
+
     from .output import render_shootout
     from .shootout import run_shootout
 
@@ -615,7 +617,7 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
 
     mode = _output_mode(args)
     all_failed = 0
-    texts: list[str] = []
+    results = []
 
     for script in scripts:
         result = run_shootout(
@@ -629,12 +631,32 @@ def _cmd_shootout(args: argparse.Namespace) -> int:
             scale=args.scale,
             profile=args.json_output,
         )
-        texts.append(render_shootout(result, mode=mode))
+        results.append(result)
         if result.status != "pass":
             all_failed += 1
 
-    separator = "\n" if mode == "json" else "\n\n"
-    text = separator.join(texts)
+    if len(results) > 1 and mode == "json":
+        text = orjson.dumps(
+            {
+                "schema_version": 2,
+                "type": "shootout_suite",
+                "script": str(target),
+                "metadata": {
+                    "repeat": args.repeat,
+                    "warmup": not args.no_warmup,
+                    "scale": args.scale,
+                    "script_count": len(results),
+                    "passed": len(results) - all_failed,
+                    "failed": all_failed,
+                },
+                "results": [result.to_dict() for result in results],
+            },
+            option=orjson.OPT_INDENT_2 | orjson.OPT_SERIALIZE_NUMPY,
+        ).decode()
+    else:
+        texts = [render_shootout(result, mode=mode) for result in results]
+        separator = "\n\n"
+        text = separator.join(texts)
 
     if len(scripts) > 1 and mode == "human":
         text += f"\n\n{'─' * 60}\n{len(scripts)} scripts, {len(scripts) - all_failed} passed, {all_failed} failed"

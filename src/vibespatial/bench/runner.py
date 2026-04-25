@@ -108,12 +108,49 @@ def run_operation(
         )
         samples.append(result)
 
-    result = _select_median(samples)
-    if not resolved_operation_args:
-        return result
+    result = _aggregate_operation_samples(samples)
     metadata = dict(result.metadata)
+    metadata["repeat"] = len(samples)
+    metadata["sample_seconds"] = [
+        sample.timing.median_seconds for sample in samples
+    ]
+    if all(sample.baseline_timing is not None for sample in samples):
+        metadata["baseline_sample_seconds"] = [
+            sample.baseline_timing.median_seconds  # type: ignore[union-attr]
+            for sample in samples
+        ]
+    if not resolved_operation_args:
+        return replace(result, metadata=metadata)
     metadata["operation_args"] = resolved_operation_args
     return replace(result, metadata=metadata)
+
+
+def _aggregate_operation_samples(samples: list[BenchmarkResult]) -> BenchmarkResult:
+    """Return the median sample with repeat timing summaries attached."""
+    result = _select_median(samples)
+    if len(samples) == 1:
+        return result
+
+    timing = timing_from_samples(
+        [sample.timing.median_seconds for sample in samples]
+    )
+    baseline_timing = result.baseline_timing
+    if all(sample.baseline_timing is not None for sample in samples):
+        baseline_timing = timing_from_samples(
+            [
+                sample.baseline_timing.median_seconds  # type: ignore[union-attr]
+                for sample in samples
+            ]
+        )
+    speedup = result.speedup
+    if baseline_timing is not None and timing.median_seconds > 0:
+        speedup = baseline_timing.median_seconds / timing.median_seconds
+    return replace(
+        result,
+        timing=timing,
+        baseline_timing=baseline_timing,
+        speedup=speedup,
+    )
 
 
 def _select_median(samples: list[BenchmarkResult]) -> BenchmarkResult:
