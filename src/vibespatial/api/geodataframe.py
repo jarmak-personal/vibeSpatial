@@ -84,6 +84,67 @@ def _ensure_geometry_respecting_device_preference(
         return host_geometry
 
 
+def _current_public_geometry_crs(frame, column_name: Any, fallback: Any):
+    if column_name not in frame.columns:
+        return fallback
+    try:
+        series = frame[column_name]
+    except Exception:
+        return fallback
+    if hasattr(series, "crs"):
+        return series.crs
+    values = getattr(series, "values", None)
+    if hasattr(values, "crs"):
+        return values.crs
+    return fallback
+
+
+def _native_tabular_result_with_public_metadata(frame, native_state):
+    """Keep private buffers but honor current public metadata at export time."""
+    from vibespatial.api._native_result_core import (
+        NativeGeometryColumn,
+        NativeTabularResult,
+    )
+
+    result = native_state.to_native_tabular_result()
+    geometry = result.geometry.with_crs(
+        _current_public_geometry_crs(
+            frame,
+            result.geometry_name,
+            result.geometry.crs,
+        )
+    )
+    secondary_geometry = tuple(
+        NativeGeometryColumn(
+            column.name,
+            column.geometry.with_crs(
+                _current_public_geometry_crs(
+                    frame,
+                    column.name,
+                    column.geometry.crs,
+                )
+            ),
+        )
+        for column in result.secondary_geometry
+    )
+    attrs = frame.attrs.copy() or None
+    if (
+        geometry is result.geometry
+        and secondary_geometry == result.secondary_geometry
+        and attrs == result.attrs
+    ):
+        return result
+    return NativeTabularResult(
+        attributes=result.attributes,
+        geometry=geometry,
+        geometry_name=result.geometry_name,
+        column_order=result.column_order,
+        attrs=attrs,
+        secondary_geometry=secondary_geometry,
+        provenance=result.provenance,
+    )
+
+
 def _ensure_geometry(
     data,
     crs: Any | None = None,
@@ -1889,7 +1950,11 @@ properties': {'col1': 'name1'}, 'geometry': {'type': 'Point', 'coordinates': (1.
 
         native_state = get_native_state(self)
         if native_state is not None:
-            return native_state.to_native_tabular_result().to_arrow(
+            native_result = _native_tabular_result_with_public_metadata(
+                self,
+                native_state,
+            )
+            return native_result.to_arrow(
                 index=index,
                 geometry_encoding=geometry_encoding,
                 interleaved=interleaved,
@@ -1982,7 +2047,11 @@ default 'snappy'
 
         native_state = get_native_state(self)
         if native_state is not None:
-            native_state.to_native_tabular_result().to_parquet(
+            native_result = _native_tabular_result_with_public_metadata(
+                self,
+                native_state,
+            )
+            native_result.to_parquet(
                 path,
                 compression=compression,
                 geometry_encoding=geometry_encoding,
@@ -2054,7 +2123,11 @@ default 'snappy'
 
         native_state = get_native_state(self)
         if native_state is not None:
-            native_state.to_native_tabular_result().to_feather(
+            native_result = _native_tabular_result_with_public_metadata(
+                self,
+                native_state,
+            )
+            native_result.to_feather(
                 path,
                 index=index,
                 compression=compression,

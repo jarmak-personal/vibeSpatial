@@ -1108,6 +1108,36 @@ def test_read_geoparquet_attaches_private_native_state(tmp_path, monkeypatch) ->
     assert "geometry" in table.column_names
 
 
+def test_native_state_arrow_writers_respect_public_crs_none(tmp_path) -> None:
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    source_path = tmp_path / "source.parquet"
+    source.to_parquet(source_path, geometry_encoding="geoarrow")
+    native_backed = read_geoparquet(source_path)
+
+    assert get_native_state(native_backed) is not None
+    native_backed.geometry.array.crs = None
+    assert native_backed.crs is None
+
+    parquet_path = tmp_path / "cleared-crs.parquet"
+    native_backed.to_parquet(parquet_path)
+    parquet_result = geopandas.read_parquet(parquet_path)
+    assert parquet_result.crs is None
+    assert_geodataframe_equal(native_backed, parquet_result, check_crs=True)
+
+    feather_path = tmp_path / "cleared-crs.feather"
+    native_backed.to_feather(feather_path)
+    feather_result = geopandas.read_feather(feather_path)
+    assert feather_result.crs is None
+    assert_geodataframe_equal(native_backed, feather_result, check_crs=True)
+
+
 def test_read_geoparquet_owned_gpu_backend_uses_shared_capability_gate(monkeypatch) -> None:
     monkeypatch.setattr(io_geoparquet, "has_pyarrow_support", lambda: True)
     monkeypatch.setattr(io_geoparquet, "has_pylibcudf_support", lambda: True)

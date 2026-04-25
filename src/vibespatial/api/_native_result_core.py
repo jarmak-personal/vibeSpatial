@@ -1041,6 +1041,11 @@ class GeometryNativeResult:
     def from_owned(cls, owned, *, crs) -> GeometryNativeResult:
         return cls(crs=crs, owned=owned)
 
+    def with_crs(self, crs) -> GeometryNativeResult:
+        if self.crs == crs:
+            return self
+        return type(self)(crs=crs, owned=self.owned, series=self.series)
+
     @classmethod
     def from_geoseries(cls, series: GeoSeries) -> GeometryNativeResult:
         owned = getattr(series.values, "_owned", None)
