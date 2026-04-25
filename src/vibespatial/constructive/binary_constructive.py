@@ -1897,6 +1897,9 @@ def _regroup_intersection_parts_with_grouped_union_gpu(
     if compact is None or compact.row_count != int(d_nonempty_rows.size):
         return None
 
+    if compact.row_count == output_row_count and int(d_nonempty_rows.size) == output_row_count:
+        return compact
+
     return device_concat_owned_scatter(
         _empty_device_constructive_output(output_row_count),
         compact,
@@ -2054,11 +2057,14 @@ def _pack_disjoint_multipart_intersection_parts_gpu(
 
     _sync_hotpath()
     with hotpath_stage("constructive.intersection.multipart_direct_pack.scatter", category="emit"):
-        result = device_concat_owned_scatter(
-            _empty_device_constructive_output(output_row_count),
-            compact,
-            d_nonempty_rows,
-        )
+        if compact.row_count == output_row_count and int(d_nonempty_rows.size) == output_row_count:
+            result = compact
+        else:
+            result = device_concat_owned_scatter(
+                _empty_device_constructive_output(output_row_count),
+                compact,
+                d_nonempty_rows,
+            )
     _sync_hotpath()
     record_dispatch_event(
         surface="vibespatial.constructive.binary_constructive",

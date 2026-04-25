@@ -8,13 +8,28 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pandas as pd
 
+from vibespatial.runtime.materialization import (
+    MaterializationBoundary,
+    record_materialization_event,
+)
+
 if TYPE_CHECKING:
     from vibespatial.api.geodataframe import GeoDataFrame
     from vibespatial.api.geoseries import GeoSeries
 
 
 def _host_array(values: Any, *, dtype) -> np.ndarray:
-    host_values = values.get() if hasattr(values, "get") else values
+    if hasattr(values, "get"):
+        record_materialization_event(
+            surface="vibespatial.api._native_result_core._host_array",
+            boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+            operation="array_to_host",
+            reason="device-like array exposed a get() host materialization path",
+            d2h_transfer=True,
+        )
+        host_values = values.get()
+    else:
+        host_values = values
     return np.asarray(host_values, dtype=dtype)
 
 
@@ -38,8 +53,145 @@ def _host_row_positions(row_positions) -> np.ndarray:
     if hasattr(normalized, "__cuda_array_interface__"):
         import cupy as cp
 
+        item_count = int(getattr(normalized, "size", len(normalized)))
+        itemsize = int(getattr(getattr(normalized, "dtype", None), "itemsize", 0))
+        record_materialization_event(
+            surface="vibespatial.api._native_result_core._host_row_positions",
+            boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+            operation="row_positions_to_host",
+            reason="device row positions were normalized on host",
+            detail=f"rows={item_count}, bytes={item_count * itemsize}",
+            d2h_transfer=True,
+        )
         return cp.asnumpy(normalized)
     return np.asarray(normalized, dtype=np.int64)
+
+
+def _attribute_storage_label(attributes: NativeAttributeTable | pd.DataFrame) -> str:
+    table = NativeAttributeTable.from_value(attributes)
+    if table.dataframe is not None:
+        return "pandas"
+    if table.arrow_table is not None:
+        return "arrow"
+    if table.device_table is not None:
+        return "device"
+    if table.loader is not None:
+        return "loader"
+    return "unknown"
+
+
+def _geometry_storage_label(geometry: GeometryNativeResult) -> str:
+    owned = getattr(geometry, "owned", None)
+    if owned is not None:
+        residency = getattr(getattr(owned, "residency", None), "value", None)
+        return f"owned:{residency or 'unknown'}"
+    return "geoseries"
+
+
+def _device_table_row_count(table: Any) -> int:
+    num_rows = getattr(table, "num_rows", None)
+    if callable(num_rows):
+        return int(num_rows())
+    if num_rows is not None:
+        return int(num_rows)
+    shape = getattr(table, "shape", None)
+    if shape is not None:
+        return int(shape[0])
+    raise TypeError("device attribute table does not expose a row count")
+
+
+def _rename_device_arrow_table(table: Any, column_override, *, schema) -> Any:
+    import pyarrow as pa
+
+    names = [str(name) for name in (column_override or table.column_names)]
+    if schema is None:
+        return pa.Table.from_arrays(
+            [table.column(index) for index in range(table.num_columns)],
+            names=names,
+            metadata=table.schema.metadata,
+        )
+    fields = []
+    for index, name in enumerate(names):
+        try:
+            fields.append(schema.field(name))
+        except KeyError:
+            fields.append(pa.field(name, table.column(index).type))
+    return pa.Table.from_arrays(
+        [table.column(index) for index in range(table.num_columns)],
+        schema=pa.schema(fields, metadata=schema.metadata),
+    )
+
+
+def _rename_schema_fields(schema: Any, old_names, new_names) -> Any:
+    if schema is None:
+        return None
+
+    import pyarrow as pa
+
+    fields = []
+    for index, (old_name, new_name) in enumerate(
+        zip(tuple(old_names), tuple(new_names), strict=True)
+    ):
+        try:
+            field = schema.field(str(old_name))
+        except KeyError:
+            field = schema.field(index)
+        fields.append(
+            pa.field(
+                str(new_name),
+                field.type,
+                nullable=field.nullable,
+                metadata=field.metadata,
+            )
+        )
+    return pa.schema(fields, metadata=schema.metadata)
+
+
+def _renamed_pandas_columns_like(columns: pd.Index, renamed_logical) -> pd.Index:
+    if isinstance(columns, pd.MultiIndex):
+        return pd.MultiIndex.from_tuples(renamed_logical, names=columns.names)
+    return pd.Index(renamed_logical, name=columns.name)
+
+
+def _is_admissible_pandas_numeric_series(series: pd.Series) -> bool:
+    dtype = series.dtype
+    return bool(
+        not series.hasnans
+        and (
+            pd.api.types.is_numeric_dtype(dtype)
+            or pd.api.types.is_bool_dtype(dtype)
+        )
+    )
+
+
+def _is_admissible_arrow_numeric_type(dtype) -> bool:
+    import pyarrow as pa
+
+    return bool(
+        pa.types.is_integer(dtype)
+        or pa.types.is_floating(dtype)
+        or pa.types.is_boolean(dtype)
+    )
+
+
+def _column_position_map(columns) -> dict[Any, int] | None:
+    names = tuple(columns)
+    if len(set(names)) != len(names):
+        return None
+    return {name: index for index, name in enumerate(names)}
+
+
+def _pylibcudf_numeric_column_view(column):
+    if column.offset() != 0 or column.null_count() != 0:
+        return None
+    arrow_type = column.type().to_arrow()
+    if not _is_admissible_arrow_numeric_type(arrow_type):
+        return None
+
+    import cupy as cp
+
+    dtype = np.dtype(column.type().typestr)
+    return cp.asarray(column.data()).view(dtype)[: int(column.size())]
 
 
 @dataclass(frozen=True)
@@ -48,18 +200,27 @@ class NativeAttributeTable:
 
     dataframe: pd.DataFrame | None = None
     arrow_table: Any | None = None
+    device_table: Any | None = None
     loader: Callable[[], pd.DataFrame] | None = None
     index_override: pd.Index | None = None
     column_override: tuple[Any, ...] | None = None
+    schema_override: Any | None = None
     to_pandas_kwargs: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         provided = sum(
-            value is not None for value in (self.dataframe, self.arrow_table, self.loader)
+            value is not None
+            for value in (
+                self.dataframe,
+                self.arrow_table,
+                self.device_table,
+                self.loader,
+            )
         )
         if provided != 1:
             raise ValueError(
-                "NativeAttributeTable requires exactly one of dataframe, arrow_table, or loader"
+                "NativeAttributeTable requires exactly one of dataframe, arrow_table, "
+                "device_table, or loader"
             )
         if self.to_pandas_kwargs is None:
             object.__setattr__(self, "to_pandas_kwargs", {})
@@ -71,6 +232,20 @@ class NativeAttributeTable:
             )
         if self.arrow_table is not None and self.column_override is None:
             object.__setattr__(self, "column_override", tuple(self.arrow_table.column_names))
+        if self.arrow_table is not None and self.schema_override is None:
+            object.__setattr__(self, "schema_override", self.arrow_table.schema)
+        if self.device_table is not None:
+            row_count = _device_table_row_count(self.device_table)
+            if self.index_override is None:
+                object.__setattr__(self, "index_override", pd.RangeIndex(row_count))
+            if self.column_override is None:
+                schema = self.schema_override
+                if schema is None:
+                    raise ValueError(
+                        "NativeAttributeTable device_table requires column_override "
+                        "or schema_override"
+                    )
+                object.__setattr__(self, "column_override", tuple(schema.names))
         if self.loader is not None:
             if self.index_override is None:
                 raise ValueError("NativeAttributeTable loader requires index_override")
@@ -153,11 +328,98 @@ class NativeAttributeTable:
         object.__setattr__(self, "column_override", tuple(frame.columns))
         return frame
 
+    def numeric_column_arrays(self, columns) -> dict[Any, Any] | None:
+        """Return all-valid numeric columns without crossing an export boundary."""
+        requested = tuple(dict.fromkeys(columns))
+        column_positions = _column_position_map(self.columns)
+        if column_positions is None or any(
+            column not in column_positions for column in requested
+        ):
+            return None
+        if self.loader is not None:
+            return None
+
+        if self.dataframe is not None:
+            out: dict[Any, Any] = {}
+            for column in requested:
+                series = self.dataframe[column]
+                if not isinstance(series, pd.Series):
+                    return None
+                if not _is_admissible_pandas_numeric_series(series):
+                    return None
+                values = series.to_numpy(copy=False)
+                if not np.issubdtype(values.dtype, np.number) and not np.issubdtype(
+                    values.dtype,
+                    np.bool_,
+                ):
+                    return None
+                out[column] = values
+            return out
+
+        if self.arrow_table is not None:
+            arrow = self.to_arrow(index=False, columns=requested)
+            out = {}
+            for logical_name, physical_name in zip(
+                requested,
+                arrow.column_names,
+                strict=True,
+            ):
+                chunked = arrow.column(physical_name)
+                if chunked.null_count or not _is_admissible_arrow_numeric_type(
+                    chunked.type
+                ):
+                    return None
+                out[logical_name] = chunked.combine_chunks().to_numpy(
+                    zero_copy_only=False
+                )
+            return out
+
+        if self.device_table is not None:
+            source_columns = self.device_table.columns()
+            out = {}
+            for column in requested:
+                values = _pylibcudf_numeric_column_view(
+                    source_columns[column_positions[column]]
+                )
+                if values is None:
+                    return None
+                out[column] = values
+            return out
+
+        return None
+
+    def host_column_series(self, columns) -> dict[Any, pd.Series] | None:
+        """Return host pandas columns without crossing an export boundary."""
+        requested = tuple(dict.fromkeys(columns))
+        column_positions = _column_position_map(self.columns)
+        if column_positions is None or any(
+            column not in column_positions for column in requested
+        ):
+            return None
+        if self.loader is not None or self.dataframe is None:
+            return None
+
+        out: dict[Any, pd.Series] = {}
+        for column in requested:
+            series = self.dataframe[column]
+            if not isinstance(series, pd.Series):
+                return None
+            out[column] = series
+        return out
+
     def to_pandas(self, *, copy: bool = False, **kwargs) -> pd.DataFrame:
         if self.dataframe is not None:
             return self.dataframe.copy(deep=copy) if copy else self.dataframe
         if self.loader is not None:
             frame = self._materialize_loaded_frame()
+            return frame.copy(deep=copy) if copy else frame
+        if self.device_table is not None:
+            frame = self.to_arrow(index=False).to_pandas(
+                **{**(self.to_pandas_kwargs or {}), **kwargs}
+            )
+            frame.index = self.index
+            if self.column_override is not None:
+                frame.columns = pd.Index(self.column_override)
             return frame.copy(deep=copy) if copy else frame
 
         to_pandas_kwargs = dict(self.to_pandas_kwargs or {})
@@ -179,6 +441,32 @@ class NativeAttributeTable:
             return pa.Table.from_pandas(frame, preserve_index=index)
 
         requested_columns = None if columns is None else list(columns)
+        if self.device_table is not None:
+            if index not in (None, False):
+                frame = self.to_pandas(copy=False)
+                if requested_columns is not None:
+                    frame = frame.loc[:, requested_columns]
+                return pa.Table.from_pandas(frame, preserve_index=index)
+            record_materialization_event(
+                surface="vibespatial.api.NativeAttributeTable.to_arrow",
+                boundary=MaterializationBoundary.USER_EXPORT,
+                operation="device_attributes_to_arrow",
+                reason="device attribute table exported to host Arrow",
+                detail=(
+                    f"rows={len(self)}, columns={len(self.columns)}, "
+                    f"bytes=unknown"
+                ),
+                d2h_transfer=True,
+            )
+            table = self.device_table.to_arrow()
+            table = _rename_device_arrow_table(
+                table,
+                self.column_override,
+                schema=self.schema_override,
+            )
+            if requested_columns is not None:
+                table = table.select([str(column) for column in requested_columns])
+            return table
         can_skip_index = (
             index is False
             or (
@@ -199,6 +487,40 @@ class NativeAttributeTable:
         if requested_columns is not None:
             frame = frame.loc[:, requested_columns]
         return pa.Table.from_pandas(frame, preserve_index=index)
+
+    def to_pylibcudf_columns(self, columns) -> list[Any]:
+        import pylibcudf as plc
+
+        requested_columns = list(columns)
+        if self.device_table is None:
+            table = plc.Table.from_arrow(
+                self.to_arrow(index=False, columns=requested_columns)
+            )
+            return table.columns()
+
+        source_columns = self.device_table.columns()
+        by_name = {
+            column_name: source_columns[index]
+            for index, column_name in enumerate(self.column_override or ())
+        }
+        return [by_name[column] for column in requested_columns]
+
+    def arrow_schema_for_columns(self, columns):
+        import pyarrow as pa
+
+        requested_columns = [str(column) for column in columns]
+        schema = self.schema_override
+        if schema is None and self.arrow_table is not None:
+            schema = self.arrow_table.schema
+        if schema is None:
+            return pa.schema([pa.field(column, pa.null()) for column in requested_columns])
+        fields = []
+        for column in requested_columns:
+            try:
+                fields.append(schema.field(column))
+            except KeyError:
+                fields.append(pa.field(column, pa.null()))
+        return pa.schema(fields, metadata=schema.metadata)
 
     def with_column(self, name: str, values) -> NativeAttributeTable:
         if self.loader is not None:
@@ -232,47 +554,210 @@ class NativeAttributeTable:
         frame[name] = values
         return type(self)(dataframe=frame)
 
-    def rename_columns(self, mapping: dict[Any, Any]) -> NativeAttributeTable:
-        if not mapping:
+    def assign_columns(
+        self,
+        values_by_name: dict[Any, Any],
+        *,
+        columns: tuple[Any, ...],
+    ) -> NativeAttributeTable | None:
+        """Return attributes with assigned columns and exact logical order."""
+        requested = tuple(columns)
+        if len(set(requested)) != len(requested):
+            return None
+        assigned = {
+            name: values
+            for name, values in values_by_name.items()
+            if name in requested
+        }
+        known = set(self.columns)
+        if any(name not in known and name not in assigned for name in requested):
+            return None
+        if not assigned and requested == tuple(self.columns):
             return self
+
         if self.loader is not None:
-            declared_columns = tuple(
-                mapping.get(name, name) for name in (self.column_override or ())
-            )
             parent = self
 
             def _load() -> pd.DataFrame:
-                return parent.to_pandas(copy=False).rename(columns=mapping)
+                frame = parent.to_pandas(copy=False).copy(deep=False)
+                for name, values in assigned.items():
+                    frame[name] = values
+                return frame.loc[:, list(requested)]
 
             return type(self).from_loader(
                 _load,
                 index_override=self.index,
-                columns=declared_columns,
+                columns=requested,
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
+
+        if self.arrow_table is not None:
+            import pyarrow as pa
+
+            source = {
+                name: self.arrow_table.column(position)
+                for position, name in enumerate(self.column_override or ())
+            }
+            arrays = []
+            for name in requested:
+                if name in assigned:
+                    arrays.append(pa.array(assigned[name]))
+                elif name in source:
+                    arrays.append(source[name])
+                else:
+                    return None
+            return type(self)(
+                arrow_table=pa.Table.from_arrays(
+                    arrays,
+                    names=[str(name) for name in requested],
+                    metadata=self.arrow_table.schema.metadata,
+                ),
+                index_override=self.index,
+                column_override=requested,
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
+
+        if self.device_table is not None:
+            return None
+
+        frame = self.dataframe.copy(deep=False)
+        for name, values in assigned.items():
+            frame[name] = values
+        return type(self)(dataframe=frame.loc[:, list(requested)])
+
+    def with_index(self, index: pd.Index) -> NativeAttributeTable:
+        """Return the same attribute payload with a compatibility index."""
+        if self.index.equals(index):
+            return self
+        if self.dataframe is not None:
+            frame = self.dataframe.copy(deep=False)
+            frame.index = index
+            return type(self)(dataframe=frame)
+        if self.loader is not None:
+            return type(self).from_loader(
+                self.loader,
+                index_override=index,
+                columns=self.column_override,
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
+        return type(self)(
+            arrow_table=self.arrow_table,
+            device_table=self.device_table,
+            index_override=index,
+            column_override=self.column_override,
+            schema_override=self.schema_override,
+            to_pandas_kwargs=self.to_pandas_kwargs,
+        )
+
+    def reset_index_deferred(
+        self,
+    ) -> tuple[NativeAttributeTable, tuple[Any, ...], tuple[Any, ...]]:
+        """Return ``reset_index()`` attributes without forcing eager export.
+
+        The zero-row prototype preserves pandas' column naming and conflict
+        checks while avoiding materializing full grouped reducer payloads.
+        """
+        prototype = pd.DataFrame(columns=self.columns, index=self.index[:0])
+        reset_columns = tuple(prototype.reset_index().columns)
+        leading_count = len(reset_columns) - len(self.columns)
+        leading_columns = reset_columns[:leading_count]
+        trailing_columns = reset_columns[leading_count:]
+
+        if self.dataframe is not None:
+            return (
+                type(self)(dataframe=self.dataframe.reset_index()),
+                leading_columns,
+                trailing_columns,
+            )
+
+        parent = self
+
+        def _load() -> pd.DataFrame:
+            return parent.to_pandas(copy=False).reset_index()
+
+        return (
+            type(self).from_loader(
+                _load,
+                index_override=pd.RangeIndex(len(self)),
+                columns=reset_columns,
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            ),
+            leading_columns,
+            trailing_columns,
+        )
+
+    def rename_columns(self, mapping: dict[Any, Any]) -> NativeAttributeTable:
+        if not mapping:
+            return self
+        renamed_logical = tuple(mapping.get(name, name) for name in self.columns)
+        if self.loader is not None:
+            parent = self
+
+            def _load() -> pd.DataFrame:
+                frame = parent.to_pandas(copy=False).copy(deep=False)
+                frame.columns = _renamed_pandas_columns_like(
+                    parent.columns,
+                    renamed_logical,
+                )
+                return frame
+
+            return type(self).from_loader(
+                _load,
+                index_override=self.index,
+                columns=renamed_logical,
                 to_pandas_kwargs=self.to_pandas_kwargs,
             )
         if self.arrow_table is not None:
-            renamed_logical = tuple(
-                mapping.get(name, name) for name in (self.column_override or self.arrow_table.column_names)
-            )
             return type(self)(
                 arrow_table=self.arrow_table.rename_columns([str(name) for name in renamed_logical]),
                 index_override=self.index,
                 column_override=renamed_logical,
                 to_pandas_kwargs=self.to_pandas_kwargs,
             )
-        return type(self)(dataframe=self.dataframe.rename(columns=mapping, copy=False))
+        if self.device_table is not None:
+            return type(self)(
+                device_table=self.device_table,
+                index_override=self.index,
+                column_override=renamed_logical,
+                schema_override=_rename_schema_fields(
+                    self.schema_override,
+                    self.columns,
+                    renamed_logical,
+                ),
+                to_pandas_kwargs=self.to_pandas_kwargs,
+            )
+        frame = self.dataframe.copy(deep=False)
+        frame.columns = _renamed_pandas_columns_like(
+            self.dataframe.columns,
+            renamed_logical,
+        )
+        return type(self)(dataframe=frame)
 
-    def take(self, row_positions) -> NativeAttributeTable:
-        host_positions = _host_row_positions(row_positions)
+    def take(self, row_positions, *, preserve_index: bool = True) -> NativeAttributeTable:
+        normalized = _normalize_row_selection(row_positions)
+        if hasattr(normalized, "__cuda_array_interface__"):
+            device_taken = self._device_take(normalized, preserve_index=preserve_index)
+            if device_taken is not None:
+                return device_taken
+        host_positions = _host_row_positions(normalized)
+        index_override = (
+            self.index.take(host_positions)
+            if preserve_index
+            else pd.RangeIndex(int(host_positions.size))
+        )
         if self.loader is not None:
             parent = self
 
             def _load() -> pd.DataFrame:
-                return parent.to_pandas(copy=False).take(host_positions)
+                frame = parent.to_pandas(copy=False).take(host_positions)
+                if not preserve_index:
+                    frame = frame.copy(deep=False)
+                    frame.index = index_override
+                return frame
 
             return type(self).from_loader(
                 _load,
-                index_override=self.index.take(host_positions),
+                index_override=index_override,
                 columns=self.column_override,
                 to_pandas_kwargs=self.to_pandas_kwargs,
             )
@@ -281,11 +766,54 @@ class NativeAttributeTable:
 
             return type(self)(
                 arrow_table=self.arrow_table.take(pa.array(host_positions, type=pa.int64())),
-                index_override=self.index.take(host_positions),
+                index_override=index_override,
                 column_override=self.column_override,
                 to_pandas_kwargs=self.to_pandas_kwargs,
             )
-        return type(self)(dataframe=self.dataframe.take(host_positions))
+        frame = self.to_pandas(copy=False).take(host_positions)
+        if not preserve_index:
+            frame = frame.copy(deep=False)
+            frame.index = index_override
+        return type(self)(dataframe=frame)
+
+    def _device_take(
+        self,
+        row_positions,
+        *,
+        preserve_index: bool,
+    ) -> NativeAttributeTable | None:
+        if preserve_index:
+            return None
+        try:
+            import cupy as cp
+            import pylibcudf as plc
+        except ModuleNotFoundError:
+            return None
+        if self.device_table is not None:
+            source = self.device_table
+            schema = self.schema_override
+        elif self.arrow_table is not None:
+            source = plc.Table.from_arrow(self.to_arrow(index=False))
+            schema = self.arrow_table.schema
+        else:
+            return None
+        d_positions = cp.asarray(row_positions)
+        target_dtype = cp.int32 if len(self) <= np.iinfo(np.int32).max else cp.int64
+        gather_map = plc.Column.from_cuda_array_interface(
+            d_positions.astype(target_dtype, copy=False)
+        )
+        gathered = plc.copying.gather(
+            source,
+            gather_map,
+            plc.copying.OutOfBoundsPolicy.DONT_CHECK,
+        )
+        return type(self)(
+            device_table=gathered,
+            index_override=pd.RangeIndex(len(row_positions)),
+            column_override=self.column_override,
+            schema_override=schema,
+            to_pandas_kwargs=self.to_pandas_kwargs,
+        )
 
     @classmethod
     def concat(
@@ -674,14 +1202,30 @@ class NativeTabularResult:
         return tuple(ordered)
 
     def to_geodataframe(self) -> GeoDataFrame:
+        attributes = NativeAttributeTable.from_value(self.attributes)
+        record_materialization_event(
+            surface="vibespatial.api.NativeTabularResult.to_geodataframe",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="native_tabular_to_geodataframe",
+            reason="native tabular result exported to GeoDataFrame compatibility surface",
+            detail=(
+                f"rows={len(attributes)}, attribute_columns={len(attributes.columns)}, "
+                f"attribute_storage={_attribute_storage_label(attributes)}, "
+                f"geometry_storage={_geometry_storage_label(self.geometry)}, "
+                f"secondary_geometry={len(self.secondary_geometry)}"
+            ),
+        )
         frame = _materialize_attribute_geometry_frame(
-            self.attributes,
+            attributes,
             self.geometry_columns,
             geometry_name=self.geometry_name,
             column_order=self.resolved_column_order,
         )
         if self.attrs:
             frame.attrs.update(self.attrs)
+        from vibespatial.api._native_state import attach_native_state_from_native_tabular_result
+
+        attach_native_state_from_native_tabular_result(frame, self)
         return frame
 
     def to_arrow(
@@ -750,10 +1294,10 @@ class NativeTabularResult:
             **kwargs,
         )
 
-    def take(self, row_positions) -> NativeTabularResult:
+    def take(self, row_positions, *, preserve_index: bool = True) -> NativeTabularResult:
         normalized = _normalize_row_selection(row_positions)
         return type(self)(
-            attributes=self.attributes.take(normalized),
+            attributes=self.attributes.take(normalized, preserve_index=preserve_index),
             geometry=self.geometry.take(normalized),
             geometry_name=self.geometry_name,
             column_order=self.column_order,

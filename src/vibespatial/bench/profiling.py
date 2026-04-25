@@ -287,6 +287,24 @@ def _runtime_d2h_transfer_stats() -> tuple[int, int, float]:
         return 0, 0, 0.0
 
 
+def _runtime_d2h_transfer_events() -> list[Any]:
+    try:
+        from vibespatial.cuda._runtime import get_d2h_transfer_events
+
+        return get_d2h_transfer_events()
+    except Exception:
+        return []
+
+
+def _materialization_events() -> list[Any]:
+    try:
+        from vibespatial.runtime.materialization import get_materialization_events
+
+        return get_materialization_events()
+    except Exception:
+        return []
+
+
 class StageProfiler:
     def __init__(
         self,
@@ -351,8 +369,20 @@ class StageProfiler:
             runtime_d2h_bytes_start,
             runtime_d2h_seconds_start,
         ) = _runtime_d2h_transfer_stats()
+        runtime_d2h_event_start_count = len(_runtime_d2h_transfer_events())
+        materialization_start_count = len(_materialization_events())
         started = perf_counter()
-        with _maybe_nvtx_context(label, category, enabled=self.enable_nvtx):
+        from vibespatial.runtime.materialization import materialization_context
+
+        with (
+            _maybe_nvtx_context(label, category, enabled=self.enable_nvtx),
+            materialization_context(
+                pipeline=self.operation,
+                dataset=self.dataset,
+                stage=name,
+                stage_category=category,
+            ),
+        ):
             yield measurement
         elapsed = perf_counter() - started
         (
@@ -360,6 +390,12 @@ class StageProfiler:
             runtime_d2h_bytes_end,
             runtime_d2h_seconds_end,
         ) = _runtime_d2h_transfer_stats()
+        runtime_d2h_delta_events = _runtime_d2h_transfer_events()[
+            runtime_d2h_event_start_count:
+        ]
+        materialization_delta_events = _materialization_events()[
+            materialization_start_count:
+        ]
         gpu_collector.stop()
         if track_gpu_events:
             gpu_event_timer.stop()
@@ -381,6 +417,17 @@ class StageProfiler:
             runtime_d2h_seconds_end - runtime_d2h_seconds_start,
             0.0,
         )
+        if runtime_d2h_delta_events:
+            measurement.metadata["runtime_d2h_transfer_events"] = [
+                event.to_dict() for event in runtime_d2h_delta_events
+            ]
+        if materialization_delta_events:
+            measurement.metadata["materialization_count_delta"] = len(
+                materialization_delta_events
+            )
+            measurement.metadata["materialization_events"] = [
+                event.to_dict() for event in materialization_delta_events
+            ]
         measurement.metadata.update(gpu_collector.summarize())
         if resolved_device == ExecutionMode.GPU.value:
             gpu_event_summary = gpu_event_timer.summarize()

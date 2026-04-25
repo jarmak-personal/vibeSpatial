@@ -364,6 +364,7 @@ def _filter_predicate_pairs_owned(
     query_shapely: np.ndarray | None = None,
     tree_shapely: np.ndarray | None = None,
     device_candidates: object | None = None,
+    return_device: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, RuntimeSelection]:
     """Exact predicate refinement using indexed access into original arrays.
 
@@ -553,6 +554,39 @@ def _filter_predicate_pairs_owned(
     # Fast path: ALL pairs support GPU predicate evaluation.
     # Uses indexed access into original owned arrays — no take() buffer copy.
     if all_gpu and has_gpu_runtime():
+        if _has_device and return_device:
+            has_multipoint = bool(
+                _cp.any((d_left_tags == mp_tag) | (d_right_tags == mp_tag))
+            )
+            if not has_multipoint:
+                from vibespatial.predicates.point_relations import (
+                    classify_point_predicates_indexed_device,
+                )
+
+                keep = classify_point_predicates_indexed_device(
+                    predicate,
+                    query_owned,
+                    tree_owned,
+                    _dc.d_left,
+                    _dc.d_right,
+                    left_tags=d_left_tags,
+                    right_tags=d_right_tags,
+                )
+                return (
+                    _dc.d_left[keep],
+                    _dc.d_right[keep],
+                    _planned_query_runtime_selection(
+                        kernel_name="predicate_refine",
+                        kernel_class=KernelClass.PREDICATE,
+                        row_count=_total,
+                        requested_mode=ExecutionMode.GPU,
+                        gpu_available=True,
+                        reason=(
+                            f"GPU indexed point-family {predicate} refinement "
+                            "with device-resident pairs"
+                        ),
+                    ),
+                )
         _ensure_host_indices()  # only indices needed — no D→H for tags (hitlist #18)
         from vibespatial.predicates.point_relations import classify_point_predicates_indexed
         keep = classify_point_predicates_indexed(

@@ -42,6 +42,28 @@ The failed experiment is the important lesson: the repo needs physical-plan
 coverage, but not an unbounded planner that rewrites public execution before
 the relevant shapes have explicit semantic contracts.
 
+## How To Read This ADR
+
+This ADR is a warning and measurement guardrail, not a prescription to build a
+broad public lazy planner.
+
+Do not cite this decision as authority for eager-chain interception, whole-frame
+lazy execution, or speculative pandas operation rewriting. The planner
+experiment described above is the cautionary example: it improved a narrow
+performance signal while breaking public workflow correctness.
+
+The positive mandate is narrower:
+
+- classify slow public workflows by reusable physical shape
+- require explicit semantic contracts before native lowering expands
+- measure composition overhead and export overhead as first-class regressions
+- prefer local admissible lowering over broad cross-method rewrites
+- decline safely when a workflow falls outside the declared contract
+
+ADR-0044 defines the follow-up architecture: private native execution state
+under exact public GeoPandas APIs. That architecture is the replacement path for
+the rejected broad planner shape.
+
 ## Decision
 
 Adopt public physical-plan coverage as a first-class performance target, but

@@ -68,6 +68,7 @@ _get_empty_owned = _segmented_union_cpu_module.get_empty_owned
 _segmented_union_cpu = _segmented_union_cpu_module.segmented_union_cpu
 _segmented_union_pair_cpu = _segmented_union_cpu_module.segmented_union_pair_cpu
 _SEGMENTED_UNION_SERIAL_SMALL_MAX_GROUP_SIZE = 8
+_SEGMENTED_UNION_BATCH_SMALL_MIN_REDUCE_GROUPS = 4
 _SEGMENTED_UNION_ROBUST_SNAP_GRID = 1.0e-9
 _SEGMENTED_UNION_ROBUST_SNAP_PRE_MAX_COORDS = 4096
 _SEGMENTED_UNION_ROBUST_SNAP_RETRY_MAX_PARTS = 128
@@ -419,7 +420,34 @@ def _segmented_union_gpu_impl(
         except Exception:
             return None
 
-    if int(np.diff(group_offsets).max(initial=0)) <= _SEGMENTED_UNION_SERIAL_SMALL_MAX_GROUP_SIZE:
+    group_sizes = np.diff(group_offsets)
+    max_group_size = int(group_sizes.max(initial=0))
+    if max_group_size <= _SEGMENTED_UNION_SERIAL_SMALL_MAX_GROUP_SIZE:
+        reducible_groups = int(np.count_nonzero(group_sizes > 1))
+        if reducible_groups >= _SEGMENTED_UNION_BATCH_SMALL_MIN_REDUCE_GROUPS:
+            grouped = _segmented_union_grouped_overlay_gpu(
+                geometries,
+                group_offsets,
+                n_groups=n_groups,
+                precision_plan=precision_plan,
+            )
+            if grouped is not None:
+                record_dispatch_event(
+                    surface="segmented_union_all",
+                    operation="segmented_union_strategy",
+                    implementation="gpu_grouped_overlay_many_small_groups",
+                    reason=(
+                        "batched grouped overlay avoids per-group GPU dispatch "
+                        "for many small constructive reductions"
+                    ),
+                    detail=(
+                        f"groups={n_groups}, reducible_groups={reducible_groups}, "
+                        f"max_group_size={max_group_size}, total_geoms={int(group_offsets[-1])}"
+                    ),
+                    requested=ExecutionMode.GPU,
+                    selected=ExecutionMode.GPU,
+                )
+                return grouped
         return _segmented_union_serial_gpu(
             geometries,
             group_offsets,

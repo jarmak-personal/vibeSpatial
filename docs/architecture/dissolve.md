@@ -5,7 +5,7 @@ Scope: Grouped dissolve pipeline staging, segmented union, and attribute aggrega
 Read If: You are changing dissolve, grouped union, or segmented attribute aggregation.
 STOP IF: Your task already has the dissolve pipeline open and only needs local implementation detail.
 Source Of Truth: Dissolve pipeline architecture for grouped constructive work.
-Body Budget: 75/220 lines
+Body Budget: 86/220 lines
 Document: docs/architecture/dissolve.md
 
 Section Map (Body Lines)
@@ -19,7 +19,7 @@ Section Map (Body Lines)
 | 29-34 | Risks |
 | 35-44 | Decision |
 | 45-53 | Pipeline |
-| 54-75 | Performance Notes |
+| 54-86 | Performance Notes |
 DOC_HEADER:END -->
 
 ## Intent
@@ -77,8 +77,19 @@ iteration.
 
 - Sorting and group-span discovery are reusable across attribute and geometry
   work, which keeps the eventual GPU path coherent.
+- Numeric and bool `sum`/`count`/`mean`/`min`/`max`/`first`/`last` reducers may consume
+  `NativeGrouped` directly for admitted single-key shapes, including categorical keys with
+  explicit null-group handling.
+- Host metadata columns may use `NativeGrouped` `first`/`last` take-reducers
+  with pandas-compatible skip-null semantics.
+- `as_index=False` assembly should stay a native export-boundary concern:
+  reset-index columns may be represented by deferred `NativeAttributeTable`
+  loader metadata until public materialization or terminal IO requires pandas.
 - Grouped union should be per-group work dispatch, not one global union followed
   by regrouping.
+- Many small polygon groups should still batch when enough groups need real
+  reduction. The reusable shape is `OwnedGeometryArray + dense group offsets ->
+  grouped constructive result`; public `dissolve` is only the first consumer.
 - `o18.x` is allowed to route polygon coverage dissolve groups into a shared-edge
   elimination fast path: cancel duplicate undirected edges inside each group,
   reconstruct grouped boundary linework in bulk, and build the final coverage

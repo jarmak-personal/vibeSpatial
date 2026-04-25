@@ -58,6 +58,7 @@ from vibespatial.api._native_results import (
     native_attribute_table_from_arrow_table,
     to_native_tabular_result,
 )
+from vibespatial.api._native_state import get_native_state
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.geometry_array import to_wkb as array_to_wkb
 from vibespatial.api.testing import assert_geodataframe_equal
@@ -1073,6 +1074,38 @@ def test_read_geoparquet_owned_roundtrips_geoarrow_polygon_file(tmp_path) -> Non
 
     assert owned.row_count == 2
     assert owned.to_shapely()[0].equals(polygon)
+
+
+def test_read_geoparquet_attaches_private_native_state(tmp_path, monkeypatch) -> None:
+    source = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "native_state_read.parquet"
+    source.to_parquet(path, geometry_encoding="geoarrow")
+
+    result = read_geoparquet(path)
+    state = get_native_state(result)
+
+    assert state is not None
+    assert state.row_count == 2
+    assert state.column_order == ("value", "geometry")
+
+    def _fail_geodataframe_export(*_args, **_kwargs):
+        raise AssertionError("native-backed read result should export Arrow from private state")
+
+    monkeypatch.setattr(
+        "vibespatial.io.arrow.geodataframe_to_arrow",
+        _fail_geodataframe_export,
+    )
+
+    table = pa.table(result.to_arrow())
+    assert table.num_rows == 2
+    assert "geometry" in table.column_names
 
 
 def test_read_geoparquet_owned_gpu_backend_uses_shared_capability_gate(monkeypatch) -> None:
@@ -2552,6 +2585,36 @@ def test_read_geoparquet_native_chunked_preserves_secondary_geometry_and_index(t
         assert left.equals(right)
 
 
+def test_read_geoparquet_native_does_not_eager_authoritative_host_view(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gdf = geopandas.GeoDataFrame(
+        {
+            "value": [1, 2],
+            "geometry": [Point(0, 0), Point(1, 1)],
+        },
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "native-read-no-eager-host-view.parquet"
+    gdf.to_parquet(path)
+
+    def _fail_authoritative(payload):
+        raise AssertionError("native read must not force authoritative host view")
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_authoritative_native_tabular_result",
+        _fail_authoritative,
+    )
+
+    payload = read_geoparquet_native(path, backend="cpu")
+
+    assert isinstance(payload, NativeTabularResult)
+    assert payload.geometry.row_count == 2
+    assert list(payload.attributes.to_pandas(copy=False)["value"]) == [1, 2]
+
+
 def test_read_geoparquet_cpu_preserves_reordered_geometry_columns(tmp_path) -> None:
     import pyarrow.parquet as pq
 
@@ -3161,6 +3224,51 @@ def test_native_tabular_to_parquet_records_gpu_dispatch_when_device_writer_succe
     )
 
     path = tmp_path / "native-payload-gpu-dispatch.parquet"
+    payload.to_parquet(path)
+    dispatches = geopandas.get_dispatch_events(clear=True)
+
+    assert path.exists()
+    assert any(
+        event.surface == "geopandas.geodataframe.to_parquet"
+        and event.implementation == "native_payload_device_export"
+        and event.selected == "gpu"
+        for event in dispatches
+    )
+
+
+def test_native_tabular_to_parquet_tries_device_writer_before_authoritative_host_view(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    geopandas.clear_dispatch_events()
+    payload = to_native_tabular_result(
+        GeometryNativeResult.from_owned(
+            from_shapely_geometries([Point(0, 0), Point(1, 1)]),
+            crs="EPSG:4326",
+        )
+    )
+    assert payload is not None
+
+    def _write_success(*args, **kwargs):
+        path = args[2]
+        Path(path).touch()
+        return io_wkb._NativeDeviceWriteStatus(written=True)
+
+    def _fail_authoritative(_payload):
+        raise AssertionError("device payload writer should run before host mirror")
+
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_write_geoparquet_native_device_payload",
+        _write_success,
+    )
+    monkeypatch.setattr(
+        io_geoparquet,
+        "_authoritative_native_tabular_result",
+        _fail_authoritative,
+    )
+
+    path = tmp_path / "native-payload-no-eager-authoritative.parquet"
     payload.to_parquet(path)
     dispatches = geopandas.get_dispatch_events(clear=True)
 

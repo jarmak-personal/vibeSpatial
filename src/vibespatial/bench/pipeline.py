@@ -13,10 +13,16 @@ import shapely
 from shapely.geometry import box
 
 import vibespatial.api as geopandas
+from vibespatial.api._native_grouped import NativeGrouped
+from vibespatial.api._native_relation import NativeRelation
+from vibespatial.api._native_result_core import NativeAttributeTable, NativeTabularResult
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     _grouped_constructive_to_native_tabular_result,
 )
+from vibespatial.api._native_rowset import NativeRowSet
+from vibespatial.api._native_state import NativeFrameState, attach_native_state
+from vibespatial.api.tools.sjoin import _sjoin_export_result
 from vibespatial.constructive.clip_rect import clip_by_rect_owned
 from vibespatial.constructive.linestring import linestring_buffer_owned_array
 from vibespatial.constructive.make_valid_pipeline import make_valid_owned
@@ -33,11 +39,12 @@ from vibespatial.geometry.owned import DiagnosticKind, OwnedGeometryArray, from_
 from vibespatial.io.arrow import (
     geoseries_from_owned,
     has_pylibcudf_support,
-    read_geoparquet,
     read_geoparquet_owned,
     write_geoparquet,
 )
 from vibespatial.io.geojson import read_geojson_owned
+from vibespatial.io.geoparquet import read_geoparquet_native
+from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.kernels.predicates.point_in_polygon import (
     get_last_gpu_substage_timings,
     point_in_polygon,
@@ -54,8 +61,10 @@ from vibespatial.runtime.adaptive import plan_dispatch_selection
 from vibespatial.runtime.dispatch import clear_dispatch_events, get_dispatch_events
 from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
 from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.residency import Residency, TransferTrigger
 from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import query_spatial_index
+from vibespatial.spatial.query_box import _query_point_tree_box_row_positions_device
 from vibespatial.testing.synthetic import (
     SyntheticSpec,
     generate_lines,
@@ -67,6 +76,11 @@ from .profiling import ProfileTrace, StageProfiler, _format_elapsed_compact
 
 PIPELINE_DEFINITIONS = (
     "join-heavy",
+    "relation-semijoin",
+    "relation-bridge-consumer",
+    "grouped-reducer",
+    "small-grouped-constructive-reduce",
+    "relation-attribute-reducer",
     "constructive",
     "predicate-heavy",
     "predicate-heavy-geopandas",
@@ -87,6 +101,7 @@ PIPELINE_DEFINITIONS = (
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / ".benchmark_fixtures"
 _BENCHMARK_OUTPUT_COMPRESSION = None
+_ZERO_TRANSFER_SELECTIVE_BOUND = 400.0
 _PIPELINE_PROFILE_MODE = "lean"
 _PIPELINE_PROFILE_MODES = frozenset({"lean", "audit"})
 _SUPPORTED_COLLECTION_GEOM_TYPES = {
@@ -273,7 +288,7 @@ class _OwnedAudit:
     def __init__(self) -> None:
         self._seen: dict[int, int] = {}
         self.transfer_count = 0
-        self.materialization_count = 0
+        self._owned_materialization_count = 0
         self.transfer_seconds = 0.0
         self.transfer_bytes = 0
         (
@@ -281,6 +296,7 @@ class _OwnedAudit:
             self._runtime_start_bytes,
             self._runtime_start_seconds,
         ) = _runtime_d2h_transfer_stats()
+        self._materialization_event_start_count = _materialization_event_count()
 
     def observe(self, *values) -> None:
         for array in values:
@@ -293,11 +309,24 @@ class _OwnedAudit:
                         self.transfer_seconds += event.elapsed_seconds
                         self.transfer_bytes += event.bytes_transferred
                     elif event.kind is DiagnosticKind.MATERIALIZATION:
-                        self.materialization_count += 1
+                        self._owned_materialization_count += 1
                 self._seen[key] = len(owned.diagnostics)
 
     def snapshot(self) -> tuple[int, int, float, int]:
-        return self.transfer_count, self.materialization_count, self.transfer_seconds, self.transfer_bytes
+        return (
+            self.transfer_count,
+            self.materialization_count,
+            self.transfer_seconds,
+            self.transfer_bytes,
+        )
+
+    @property
+    def materialization_count(self) -> int:
+        return self._owned_materialization_count + self.materialization_event_count
+
+    @property
+    def materialization_event_count(self) -> int:
+        return max(_materialization_event_count() - self._materialization_event_start_count, 0)
 
     @property
     def runtime_d2h_transfer_count(self) -> int:
@@ -337,6 +366,15 @@ def _runtime_d2h_transfer_stats() -> tuple[int, int, float]:
         return int(count), int(bytes_transferred), float(seconds)
     except Exception:
         return 0, 0, 0.0
+
+
+def _materialization_event_count() -> int:
+    try:
+        from vibespatial.runtime.materialization import get_materialization_events
+
+        return len(get_materialization_events())
+    except Exception:
+        return 0
 
 
 class _UnavailableGpuSampler:
@@ -464,6 +502,76 @@ def _regular_polygons_frame(rows: int) -> geopandas.GeoDataFrame:
     )
 
 
+def _relation_bridge_selector_frame(rows: int) -> geopandas.GeoDataFrame:
+    selector_count = max(min(rows // 20, 256), 1)
+    selector = box(
+        0.0,
+        0.0,
+        _ZERO_TRANSFER_SELECTIVE_BOUND,
+        _ZERO_TRANSFER_SELECTIVE_BOUND,
+    )
+    return geopandas.GeoDataFrame(
+        {
+            "zone_id": np.arange(selector_count, dtype=np.int32),
+            "geometry": np.asarray([selector] * selector_count, dtype=object),
+        },
+        geometry="geometry",
+        crs="EPSG:4326",
+    )
+
+
+def _attach_private_native_state_from_public_frame(
+    frame: geopandas.GeoDataFrame,
+) -> NativeFrameState:
+    geometry_name = frame._geometry_column_name
+    attribute_frame = frame.drop(columns=[geometry_name]).copy(deep=False)
+    try:
+        import pyarrow as pa
+
+        arrow_table = pa.Table.from_pandas(attribute_frame, preserve_index=False)
+        if has_gpu_runtime() and has_pylibcudf_support():
+            try:
+                import pylibcudf as plc
+
+                attributes = NativeAttributeTable(
+                    device_table=plc.Table.from_arrow(arrow_table),
+                    index_override=frame.index,
+                    column_override=tuple(attribute_frame.columns),
+                    schema_override=arrow_table.schema,
+                )
+            except Exception:
+                attributes = NativeAttributeTable(
+                    arrow_table=arrow_table,
+                    index_override=frame.index,
+                    column_override=tuple(attribute_frame.columns),
+                )
+        else:
+            attributes = NativeAttributeTable(
+                arrow_table=arrow_table,
+                index_override=frame.index,
+                column_override=tuple(attribute_frame.columns),
+            )
+    except Exception:
+        attributes = NativeAttributeTable(dataframe=attribute_frame)
+    geometry_owned = from_shapely_geometries(list(frame.geometry))
+    if has_gpu_runtime():
+        geometry_owned.move_to(
+            Residency.DEVICE,
+            trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+            reason="relation bridge canary native state seed",
+        )
+    result = NativeTabularResult(
+        attributes=attributes,
+        geometry=GeometryNativeResult.from_owned(geometry_owned, crs=frame.crs),
+        geometry_name=geometry_name,
+        column_order=tuple(frame.columns),
+        attrs=dict(frame.attrs or {}),
+    )
+    state = NativeFrameState.from_native_tabular_result(result)
+    attach_native_state(frame, state)
+    return state
+
+
 def _write_geojson_points(path: Path, rows: int) -> tuple[geopandas.GeoDataFrame, np.ndarray]:
     frame = _regular_points_frame(rows)
     frame.to_file(path, driver="GeoJSON")
@@ -491,6 +599,14 @@ def _take_dga_frame(frame, indices: np.ndarray):
     result._geometry_column_name = geometry_name
     result[geometry_name].array.crs = frame.crs
     return result
+
+
+def _tabular_row_count(value) -> int:
+    geometry = getattr(value, "geometry", None)
+    row_count = getattr(geometry, "row_count", None)
+    if row_count is not None:
+        return int(row_count)
+    return int(len(value))
 
 
 def _trace_to_stage_dict(trace: ProfileTrace) -> dict:
@@ -926,6 +1042,1026 @@ def _profile_join_pipeline(
         peak_device_memory_bytes=memory.peak_bytes,
         stages=(_trace_to_stage_dict(trace),),
         notes="Current join-heavy pipeline uses owned GeoParquet read, GPU regular-grid query when available, and a direct grouped coverage dissolve rail before GeoParquet write.",
+    )
+
+
+def _relation_pair_arrays_from_query_result(query_result) -> tuple[object, object, str]:
+    left_idx = getattr(query_result, "d_left_idx", None)
+    right_idx = getattr(query_result, "d_right_idx", None)
+    if left_idx is not None and right_idx is not None:
+        return left_idx, right_idx, "device"
+
+    if getattr(query_result, "ndim", None) == 1:
+        return (
+            np.empty(0, dtype=np.int32),
+            query_result.astype(np.int32, copy=False),
+            "host",
+        )
+    return (
+        query_result[0].astype(np.int32, copy=False),
+        query_result[1].astype(np.int32, copy=False),
+        "host",
+    )
+
+
+def _profile_relation_semijoin_pipeline(
+    scale: int,
+    *,
+    enable_nvtx: bool = False,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> PipelineBenchmarkResult:
+    if not has_gpu_runtime() or not has_pylibcudf_support():
+        return PipelineBenchmarkResult(
+            pipeline="relation-semijoin",
+            scale=scale,
+            status="deferred",
+            elapsed_seconds=0.0,
+            selected_runtime="deferred",
+            planner_selected_runtime="deferred",
+            output_rows=0,
+            transfer_count=0,
+            materialization_count=0,
+            fallback_event_count=0,
+            peak_device_memory_bytes=None,
+            stages=tuple(),
+            notes="Deferred until both CUDA runtime and pylibcudf are available for the native relation-semijoin rail.",
+        )
+
+    clear_dispatch_events()
+    clear_fallback_events()
+    audit = _OwnedAudit()
+    memory = _DeviceMemoryMonitor()
+
+    with TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        left_path = root / "relation-semijoin-left.parquet"
+        right_path = root / "relation-semijoin-right.parquet"
+        output_path = root / "relation-semijoin-output.parquet"
+        _regular_points_frame(scale).to_parquet(
+            left_path,
+            geometry_encoding="geoarrow",
+        )
+        geopandas.GeoDataFrame(
+            {
+                "zone_id": np.asarray([0], dtype=np.int64),
+                "geometry": [box(0.0, 0.0, _ZERO_TRANSFER_SELECTIVE_BOUND, _ZERO_TRANSFER_SELECTIVE_BOUND)],
+            },
+            geometry="geometry",
+            crs="EPSG:4326",
+        ).to_parquet(right_path, geometry_encoding="geoarrow")
+
+        audit.reset_runtime_baseline()
+        profiler = _stage_profiler(
+            operation="pipeline.relation-semijoin",
+            dataset=f"scale-{scale}",
+            requested_runtime=ExecutionMode.GPU,
+            selected_runtime="gpu",
+            enable_nvtx=enable_nvtx,
+            retain_gpu_trace=retain_gpu_trace,
+            include_gpu_sparklines=include_gpu_sparklines,
+        )
+
+        with profiler.stage(
+            "read_inputs",
+            category="setup",
+            device=ExecutionMode.GPU,
+            rows_in=scale,
+            detail="read left points and right selector polygon as private native payloads",
+        ) as stage:
+            left_payload = read_geoparquet_native(left_path)
+            right_payload = read_geoparquet_native(right_path)
+            left_state = NativeFrameState.from_native_tabular_result(left_payload)
+            right_state = NativeFrameState.from_native_tabular_result(right_payload)
+            stage.rows_out = int(left_state.row_count)
+            stage.metadata["left_rows"] = int(left_state.row_count)
+            stage.metadata["right_rows"] = int(right_state.row_count)
+            stage.metadata["read_surface"] = "read_geoparquet_native"
+            _record_stage_overheads(
+                stage,
+                audit,
+                memory,
+                left_payload,
+                right_payload,
+            )
+
+        with profiler.stage(
+            "build_index",
+            category="sort",
+            device=ExecutionMode.GPU,
+            rows_in=int(right_state.row_count),
+            detail="build the right-side spatial index for the admitted relation semijoin selector",
+        ) as stage:
+            flat_index = build_flat_spatial_index(
+                right_state.geometry.owned,
+                runtime_selection=RuntimeSelection(
+                    requested=ExecutionMode.AUTO,
+                    selected=ExecutionMode.GPU,
+                    reason="relation-semijoin canary right-side selector index",
+                ),
+            )
+            stage.rows_out = int(flat_index.size)
+            stage.metadata["regular_grid_fast_path"] = bool(flat_index.regular_grid is not None)
+            _record_stage_overheads(stage, audit, memory, right_state.geometry.owned)
+
+        with profiler.stage(
+            "sjoin_relation",
+            category="filter",
+            device=ExecutionMode.GPU,
+            rows_in=int(left_state.row_count),
+            detail="produce relation pairs without joined pandas row assembly",
+        ) as stage:
+            query_result, query_execution = query_spatial_index(
+                right_state.geometry.owned,
+                flat_index,
+                left_state.geometry.owned,
+                predicate="intersects",
+                sort=True,
+                output_format="indices",
+                return_device=True,
+                return_metadata=True,
+            )
+            left_idx, right_idx, pair_storage = _relation_pair_arrays_from_query_result(
+                query_result
+            )
+            relation = NativeRelation(
+                left_idx,
+                right_idx,
+                left_token=left_state.lineage_token,
+                right_token=right_state.lineage_token,
+                predicate="intersects",
+                left_row_count=left_state.row_count,
+                right_row_count=right_state.row_count,
+                sorted_by_left=True,
+            )
+            stage.device = query_execution.selected
+            stage.rows_out = len(relation)
+            stage.metadata["pair_storage"] = pair_storage
+            stage.metadata["query_implementation"] = query_execution.implementation
+            stage.metadata["query_reason"] = query_execution.reason
+            _record_stage_overheads(stage, audit, memory, left_state.geometry.owned)
+
+        with profiler.stage(
+            "semijoin_rowset",
+            category="filter",
+            device=ExecutionMode.GPU,
+            rows_in=int(len(relation)),
+            detail="derive unique left-row NativeRowSet from relation pairs",
+        ) as stage:
+            rowset = relation.left_semijoin_rowset()
+            stage.rows_out = len(rowset)
+            stage.metadata["rowset_storage"] = "device" if rowset.is_device else "host"
+            stage.metadata["ordered"] = rowset.ordered
+            stage.metadata["unique"] = rowset.unique
+            _record_stage_overheads(stage, audit, memory)
+
+        with profiler.stage(
+            "subset_rows",
+            category="filter",
+            device=ExecutionMode.GPU,
+            rows_in=int(left_state.row_count),
+            detail="apply the relation semijoin rowset to the left NativeFrameState",
+        ) as stage:
+            filtered = left_state.take(rowset, preserve_index=False).to_native_tabular_result()
+            stage.rows_out = int(filtered.geometry.row_count)
+            stage.metadata["native_rowset_take"] = "take"
+            _record_stage_overheads(stage, audit, memory, filtered)
+
+        with profiler.stage(
+            "write_output",
+            category="emit",
+            device=ExecutionMode.GPU,
+            rows_in=_tabular_row_count(filtered),
+            detail="write the semijoined native payload through the native GeoParquet path",
+        ) as stage:
+            write_geoparquet(
+                filtered,
+                output_path,
+                index=False,
+                geometry_encoding="geoarrow",
+                compression=_BENCHMARK_OUTPUT_COMPRESSION,
+            )
+            stage.rows_out = _tabular_row_count(filtered)
+            stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
+            _record_stage_overheads(stage, audit, memory, filtered)
+
+    transfer_count = audit.runtime_d2h_transfer_count
+    materialization_count = audit.materialization_count
+    stage_devices = [stage.device for stage in profiler._stages]
+    actual_selected_runtime = _pipeline_runtime_from_stage_devices(stage_devices)
+    planner_selected_runtime = ExecutionMode.GPU.value
+    trace = profiler.finish(
+        metadata={
+            "scale": scale,
+            "actual_selected_runtime": actual_selected_runtime,
+            "planner_selected_runtime": planner_selected_runtime,
+            "dispatch_events": len(get_dispatch_events(clear=True)),
+            "fallback_events": len(get_fallback_events(clear=True)),
+            "admissible_shape": "RangeIndex point/polygon intersects semijoin",
+        }
+    )
+    return PipelineBenchmarkResult(
+        pipeline="relation-semijoin",
+        scale=scale,
+        status="ok" if materialization_count == 0 else "failed",
+        elapsed_seconds=trace.total_elapsed_seconds,
+        selected_runtime=actual_selected_runtime,
+        planner_selected_runtime=planner_selected_runtime,
+        output_rows=_tabular_row_count(filtered),
+        transfer_count=transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
+        materialization_count=materialization_count,
+        fallback_event_count=int(trace.metadata["fallback_events"]),
+        peak_device_memory_bytes=memory.peak_bytes,
+        stages=(_trace_to_stage_dict(trace),),
+        notes=(
+            "Private relation-semijoin canary: read_geoparquet_native -> "
+            "NativeRelation -> left NativeRowSet -> NativeFrameState.take -> "
+            "native GeoParquet write."
+        ),
+    )
+
+
+def _profile_relation_bridge_consumer_pipeline(
+    scale: int,
+    *,
+    enable_nvtx: bool = False,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> PipelineBenchmarkResult:
+    """Shape canary for consuming a relation export without joined row assembly.
+
+    This is intentionally not a workflow benchmark. It isolates the reusable
+    public-boundary shape: native-backed public sources, `sjoin` relation export,
+    private semijoin frame consumption, and a public joined-export reference.
+    """
+    from time import perf_counter
+
+    from vibespatial.runtime.materialization import clear_materialization_events
+
+    left_frame = _regular_points_frame(scale)
+    right_frame = _relation_bridge_selector_frame(scale)
+    left_state = _attach_private_native_state_from_public_frame(left_frame)
+    right_state = _attach_private_native_state_from_public_frame(right_frame)
+
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    audit = _OwnedAudit()
+    memory = _DeviceMemoryMonitor()
+    planner_runtime = ExecutionMode.GPU if has_gpu_runtime() else ExecutionMode.CPU
+    profiler = _stage_profiler(
+        operation="pipeline.relation-bridge-consumer",
+        dataset=f"scale-{scale}",
+        requested_runtime=ExecutionMode.AUTO,
+        selected_runtime="hybrid" if has_gpu_runtime() else "cpu",
+        enable_nvtx=enable_nvtx,
+        retain_gpu_trace=retain_gpu_trace,
+        include_gpu_sparklines=include_gpu_sparklines,
+    )
+
+    with profiler.stage(
+        "native_state_seed",
+        category="setup",
+        device="private",
+        rows_in=scale,
+        detail="seed private native state on public GeoDataFrames outside any broad pandas interception",
+    ) as stage:
+        stage.rows_out = int(left_state.row_count)
+        stage.metadata["left_rows"] = int(left_state.row_count)
+        stage.metadata["right_rows"] = int(right_state.row_count)
+        stage.metadata["left_index_kind"] = left_state.index_plan.kind
+        stage.metadata["right_index_kind"] = right_state.index_plan.kind
+        stage.metadata["shape_canary"] = "relation_export_bridge"
+        _record_stage_overheads(stage, audit, memory, left_state, right_state)
+
+    with profiler.stage(
+        "sjoin_relation_export",
+        category="filter",
+        device=ExecutionMode.AUTO,
+        rows_in=int(left_state.row_count),
+        detail="build deferred sjoin relation export without materializing joined rows",
+    ) as stage:
+        export_result, query_implementation, query_execution = _sjoin_export_result(
+            left_frame,
+            right_frame,
+            "inner",
+            "intersects",
+            None,
+            "left",
+            "right",
+            return_device=True,
+        )
+        relation = export_result.to_native_relation()
+        stage.device = (
+            query_execution.selected if query_execution is not None else ExecutionMode.CPU
+        )
+        stage.rows_out = int(len(relation))
+        stage.metadata["query_implementation"] = query_implementation
+        if query_execution is not None:
+            stage.metadata["query_reason"] = query_execution.reason
+        stage.metadata["pair_storage"] = (
+            "device"
+            if hasattr(relation.left_indices, "__cuda_array_interface__")
+            else "host"
+        )
+        stage.metadata["device_pair_request"] = "requested"
+        _record_stage_overheads(stage, audit, memory)
+
+    with profiler.stage(
+        "native_semijoin_consumer",
+        category="filter",
+        device=ExecutionMode.AUTO,
+        rows_in=int(len(relation)),
+        detail=(
+            "consume the relation export as a public-label-preserving native "
+            "semijoin without joined GeoDataFrame export"
+        ),
+    ) as stage:
+        started = perf_counter()
+        native_frame = export_result.left_unique_label_semijoin_native_frame()
+        native_elapsed = perf_counter() - started
+        if native_frame is None:
+            stage.rows_out = 0
+            stage.metadata["bridge_declined"] = True
+        else:
+            stage.rows_out = int(native_frame.row_count)
+            stage.metadata["bridge_declined"] = False
+        stage.metadata["consumer_seconds"] = native_elapsed
+        stage.metadata["native_index_kind"] = (
+            None if native_frame is None else native_frame.index_plan.kind
+        )
+        stage.metadata["admissibility"] = "unique_label_semijoin"
+        stage.metadata["preserve_public_index"] = True
+        _record_stage_overheads(stage, audit, memory, native_frame)
+
+    with profiler.stage(
+        "public_joined_export_consumer",
+        category="emit",
+        device=ExecutionMode.CPU,
+        rows_in=int(len(relation)),
+        detail="reference path: materialize joined rows, unique public labels, then public .loc",
+    ) as stage:
+        started = perf_counter()
+        joined = export_result.to_geodataframe()
+        selected_labels = joined.index.unique()
+        public_selected = left_frame.loc[selected_labels]
+        public_elapsed = perf_counter() - started
+        native_row_count = int(0 if native_frame is None else native_frame.row_count)
+        results_match = native_row_count == int(len(public_selected))
+        stage.rows_out = int(len(public_selected))
+        stage.metadata["joined_rows"] = int(len(joined))
+        stage.metadata["unique_left_rows"] = int(len(public_selected))
+        stage.metadata["consumer_seconds"] = public_elapsed
+        stage.metadata["results_match"] = bool(results_match)
+        stage.metadata["consumer_speedup"] = (
+            public_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+        )
+        _record_stage_overheads(stage, audit, memory, joined, public_selected)
+
+    stage_devices = [stage.device for stage in profiler._stages]
+    actual_selected_runtime = _pipeline_runtime_from_stage_devices(stage_devices)
+    trace = profiler.finish(
+        metadata={
+            "scale": scale,
+            "actual_selected_runtime": actual_selected_runtime,
+            "planner_selected_runtime": planner_runtime.value,
+            "dispatch_events": len(get_dispatch_events(clear=True)),
+            "fallback_events": len(get_fallback_events(clear=True)),
+            "admissible_shape": (
+                "native-backed public relation export -> unique-label "
+                "semijoin native frame"
+            ),
+            "consumer_speedup": (
+                public_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+            ),
+            "results_match": bool(results_match),
+        }
+    )
+    return PipelineBenchmarkResult(
+        pipeline="relation-bridge-consumer",
+        scale=scale,
+        status="ok" if native_frame is not None and results_match else "failed",
+        elapsed_seconds=trace.total_elapsed_seconds,
+        selected_runtime=actual_selected_runtime,
+        planner_selected_runtime=planner_runtime.value,
+        output_rows=int(0 if native_frame is None else native_frame.row_count),
+        transfer_count=audit.runtime_d2h_transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
+        materialization_count=audit.materialization_count,
+        fallback_event_count=int(trace.metadata["fallback_events"]),
+        peak_device_memory_bytes=memory.peak_bytes,
+        stages=(_trace_to_stage_dict(trace),),
+        notes=(
+            "Shape canary, not a workflow target: compares private device "
+            "row-position relation consumption with the public joined-export "
+            "+ index.unique + .loc reference path."
+        ),
+    )
+
+
+def _profile_grouped_reducer_pipeline(
+    scale: int,
+    *,
+    enable_nvtx: bool = False,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> PipelineBenchmarkResult:
+    """Shape canary for dense-code NativeGrouped numeric reducers."""
+    if not has_gpu_runtime():
+        return PipelineBenchmarkResult(
+            pipeline="grouped-reducer",
+            scale=scale,
+            status="deferred",
+            elapsed_seconds=0.0,
+            selected_runtime="deferred",
+            planner_selected_runtime=ExecutionMode.GPU.value,
+            output_rows=0,
+            transfer_count=0,
+            materialization_count=0,
+            fallback_event_count=0,
+            peak_device_memory_bytes=None,
+            stages=tuple(),
+            notes="Deferred until CUDA runtime is available for NativeGrouped reducer canary.",
+        )
+
+    from time import perf_counter
+
+    import cupy as cp
+
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        clear_materialization_events,
+        record_materialization_event,
+    )
+
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    audit = _OwnedAudit()
+    memory = _DeviceMemoryMonitor()
+    group_count = 128
+    profiler = _stage_profiler(
+        operation="pipeline.grouped-reducer",
+        dataset=f"scale-{scale}",
+        requested_runtime=ExecutionMode.GPU,
+        selected_runtime=ExecutionMode.GPU.value,
+        enable_nvtx=enable_nvtx,
+        retain_gpu_trace=retain_gpu_trace,
+        include_gpu_sparklines=include_gpu_sparklines,
+    )
+
+    with profiler.stage(
+        "build_dense_codes",
+        category="setup",
+        device=ExecutionMode.GPU,
+        rows_in=scale,
+        detail="build dense device group codes and numeric values for NativeGrouped",
+    ) as stage:
+        rows = cp.arange(scale, dtype=cp.int32)
+        codes = cp.remainder(rows, group_count).astype(cp.int32, copy=False)
+        codes = cp.where(cp.remainder(rows, 31) == 0, cp.int32(-1), codes)
+        values = (cp.remainder(rows, 17) + 1).astype(cp.float64, copy=False)
+        output_index = pd.RangeIndex(group_count, name="group")
+        grouped = NativeGrouped.from_dense_codes(
+            codes,
+            group_count=group_count,
+            output_index=output_index,
+            source_token="grouped-reducer-canary",
+        )
+        stage.rows_out = int(grouped.resolved_group_count)
+        stage.metadata["group_count"] = group_count
+        stage.metadata["row_count"] = scale
+        stage.metadata["null_key_policy"] = grouped.null_key_policy
+        stage.metadata["group_storage"] = "device" if grouped.is_device else "host"
+        _record_stage_overheads(stage, audit, memory)
+
+    with profiler.stage(
+        "native_sum",
+        category="reduce",
+        device=ExecutionMode.GPU,
+        rows_in=scale,
+        detail="reduce one numeric vector by dense NativeGrouped codes without pandas groupby",
+    ) as stage:
+        started = perf_counter()
+        reduced = grouped.reduce_numeric(values, "sum")
+        native_elapsed = perf_counter() - started
+        stage.rows_out = int(reduced.group_count)
+        stage.metadata["reducer"] = reduced.reducer
+        stage.metadata["result_storage"] = "device" if reduced.is_device else "host"
+        stage.metadata["native_reduce_seconds"] = native_elapsed
+        _record_stage_overheads(stage, audit, memory)
+
+    with profiler.stage(
+        "public_groupby_reference",
+        category="emit",
+        device=ExecutionMode.CPU,
+        rows_in=scale,
+        detail="reference path: export codes and values, then run pandas groupby sum",
+    ) as stage:
+        started = perf_counter()
+        bytes_to_host = int(codes.nbytes + values.nbytes + reduced.values.nbytes)
+        record_materialization_event(
+            surface="pipeline.grouped-reducer.public_groupby_reference",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="grouped_reducer_reference_export",
+            reason="exported grouped reducer inputs and output for pandas reference check",
+            detail=f"rows={scale}, groups={group_count}, bytes={bytes_to_host}",
+            d2h_transfer=True,
+            strict_disallowed=False,
+        )
+        codes_host = cp.asnumpy(codes)
+        values_host = cp.asnumpy(values)
+        actual = cp.asnumpy(reduced.values)
+        observed = codes_host >= 0
+        expected = (
+            pd.Series(values_host[observed])
+            .groupby(codes_host[observed], sort=True)
+            .sum()
+            .reindex(pd.RangeIndex(group_count), fill_value=0.0)
+            .to_numpy()
+        )
+        public_elapsed = perf_counter() - started
+        results_match = bool(np.allclose(actual, expected))
+        stage.rows_out = group_count
+        stage.metadata["results_match"] = results_match
+        stage.metadata["reference_seconds"] = public_elapsed
+        stage.metadata["native_reduce_seconds"] = native_elapsed
+        stage.metadata["consumer_speedup"] = (
+            public_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+        )
+        _record_stage_overheads(stage, audit, memory)
+
+    stage_devices = [stage.device for stage in profiler._stages]
+    actual_selected_runtime = _pipeline_runtime_from_stage_devices(stage_devices)
+    trace = profiler.finish(
+        metadata={
+            "scale": scale,
+            "actual_selected_runtime": actual_selected_runtime,
+            "planner_selected_runtime": ExecutionMode.GPU.value,
+            "dispatch_events": len(get_dispatch_events(clear=True)),
+            "fallback_events": len(get_fallback_events(clear=True)),
+            "admissible_shape": "dense-code NativeGrouped numeric sum",
+            "results_match": results_match,
+            "consumer_speedup": (
+                public_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+            ),
+        }
+    )
+    return PipelineBenchmarkResult(
+        pipeline="grouped-reducer",
+        scale=scale,
+        status="ok" if results_match else "failed",
+        elapsed_seconds=trace.total_elapsed_seconds,
+        selected_runtime=actual_selected_runtime,
+        planner_selected_runtime=ExecutionMode.GPU.value,
+        output_rows=group_count,
+        transfer_count=audit.runtime_d2h_transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
+        materialization_count=audit.materialization_count,
+        fallback_event_count=int(trace.metadata["fallback_events"]),
+        peak_device_memory_bytes=memory.peak_bytes,
+        stages=(_trace_to_stage_dict(trace),),
+        notes=(
+            "Shape canary, not a workflow target: dense device group codes -> "
+            "NativeGrouped.reduce_numeric(sum) with pandas groupby sum only as "
+            "an explicit reference stage."
+        ),
+    )
+
+
+def _small_grouped_constructive_fixture(
+    scale: int,
+) -> tuple[list[object], np.ndarray, int]:
+    pattern = np.asarray([2, 3, 4, 5, 6, 7, 8, 2], dtype=np.int32)
+    group_count = max(8, min(max(scale // 4, 8), 1024))
+    group_sizes = np.resize(pattern, group_count).astype(np.int32, copy=False)
+    group_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(group_sizes, dtype=np.int32)]
+    )
+    values: list[object] = []
+    for group_index, group_size in enumerate(group_sizes):
+        x0 = float(group_index) * 20.0
+        for row in range(int(group_size)):
+            left = x0 + float(row) * 0.45
+            values.append(box(left, 0.0, left + 1.0, 1.0))
+    return values, group_offsets, group_count
+
+
+def _profile_small_grouped_constructive_reduce_pipeline(
+    scale: int,
+    *,
+    enable_nvtx: bool = False,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> PipelineBenchmarkResult:
+    """Shape canary for many small grouped polygon constructive reductions."""
+    if not has_gpu_runtime():
+        return PipelineBenchmarkResult(
+            pipeline="small-grouped-constructive-reduce",
+            scale=scale,
+            status="deferred",
+            elapsed_seconds=0.0,
+            selected_runtime="deferred",
+            planner_selected_runtime=ExecutionMode.GPU.value,
+            output_rows=0,
+            transfer_count=0,
+            materialization_count=0,
+            fallback_event_count=0,
+            peak_device_memory_bytes=None,
+            stages=tuple(),
+            notes="Deferred until CUDA runtime is available for grouped constructive canary.",
+        )
+
+    from time import perf_counter
+
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        clear_materialization_events,
+        record_materialization_event,
+    )
+
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    audit = _OwnedAudit()
+    memory = _DeviceMemoryMonitor()
+    profiler = _stage_profiler(
+        operation="pipeline.small-grouped-constructive-reduce",
+        dataset=f"scale-{scale}",
+        requested_runtime=ExecutionMode.GPU,
+        selected_runtime=ExecutionMode.GPU.value,
+        enable_nvtx=enable_nvtx,
+        retain_gpu_trace=retain_gpu_trace,
+        include_gpu_sparklines=include_gpu_sparklines,
+    )
+
+    with profiler.stage(
+        "build_device_grouped_polygons",
+        category="setup",
+        device=ExecutionMode.GPU,
+        rows_in=scale,
+        detail="build device-resident polygon groups with 2-8 rows per group",
+    ) as stage:
+        values, group_offsets, group_count = _small_grouped_constructive_fixture(scale)
+        owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+        group_sizes = np.diff(group_offsets)
+        stage.rows_out = int(owned.row_count)
+        stage.metadata["group_count"] = group_count
+        stage.metadata["row_count"] = int(owned.row_count)
+        stage.metadata["min_group_size"] = int(group_sizes.min())
+        stage.metadata["max_group_size"] = int(group_sizes.max(initial=0))
+        stage.metadata["geometry_storage"] = "owned:device"
+        _record_stage_overheads(stage, audit, memory, owned)
+
+    with profiler.stage(
+        "native_grouped_union",
+        category="reduce",
+        device=ExecutionMode.GPU,
+        rows_in=int(owned.row_count),
+        detail="batch many tiny grouped polygon unions without per-group dispatch",
+    ) as stage:
+        started = perf_counter()
+        reduced = segmented_union_all(
+            owned,
+            group_offsets,
+            dispatch_mode=ExecutionMode.GPU,
+        )
+        native_elapsed = perf_counter() - started
+        dispatch_events = get_dispatch_events()
+        used_many_small_batch = any(
+            event.surface == "segmented_union_all"
+            and event.operation == "segmented_union_strategy"
+            and event.implementation == "gpu_grouped_overlay_many_small_groups"
+            for event in dispatch_events
+        )
+        stage.rows_out = int(reduced.row_count)
+        stage.metadata["native_reduce_seconds"] = native_elapsed
+        stage.metadata["result_storage"] = (
+            "device" if reduced.residency is Residency.DEVICE else "host"
+        )
+        stage.metadata["used_many_small_batch"] = used_many_small_batch
+        _record_stage_overheads(stage, audit, memory, reduced)
+
+    with profiler.stage(
+        "shapely_reference",
+        category="emit",
+        device=ExecutionMode.CPU,
+        rows_in=int(owned.row_count),
+        detail="explicit reference export for exact grouped union oracle",
+    ) as stage:
+        started = perf_counter()
+        record_materialization_event(
+            surface="pipeline.small-grouped-constructive-reduce.reference",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="grouped_constructive_reference_export",
+            reason="export grouped constructive result for Shapely oracle comparison",
+            detail=f"rows={owned.row_count}, groups={group_count}",
+            d2h_transfer=True,
+            strict_disallowed=False,
+        )
+        actual = np.asarray(reduced.to_shapely(), dtype=object)
+        expected = [
+            shapely.union_all(np.asarray(values[int(start) : int(end)], dtype=object))
+            for start, end in zip(
+                group_offsets[:-1],
+                group_offsets[1:],
+                strict=True,
+            )
+        ]
+        reference_elapsed = perf_counter() - started
+        results_match = all(
+            bool(
+                shapely.normalize(got).equals_exact(
+                    shapely.normalize(want),
+                    tolerance=1.0e-9,
+                )
+            )
+            and float(shapely.area(shapely.symmetric_difference(got, want))) <= 1.0e-9
+            for got, want in zip(actual, expected, strict=True)
+        )
+        stage.rows_out = int(actual.size)
+        stage.metadata["results_match"] = results_match
+        stage.metadata["reference_seconds"] = reference_elapsed
+        stage.metadata["native_reduce_seconds"] = native_elapsed
+        stage.metadata["consumer_speedup"] = (
+            reference_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+        )
+        _record_stage_overheads(stage, audit, memory, reduced)
+
+    stage_devices = [stage.device for stage in profiler._stages]
+    actual_selected_runtime = _pipeline_runtime_from_stage_devices(stage_devices)
+    trace = profiler.finish(
+        metadata={
+            "scale": scale,
+            "actual_selected_runtime": actual_selected_runtime,
+            "planner_selected_runtime": ExecutionMode.GPU.value,
+            "dispatch_events": len(get_dispatch_events(clear=True)),
+            "fallback_events": len(get_fallback_events(clear=True)),
+            "admissible_shape": (
+                "owned device polygons + dense group offsets -> batched grouped constructive reduce"
+            ),
+            "results_match": results_match,
+            "used_many_small_batch": used_many_small_batch,
+            "consumer_speedup": (
+                reference_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+            ),
+        }
+    )
+    return PipelineBenchmarkResult(
+        pipeline="small-grouped-constructive-reduce",
+        scale=scale,
+        status="ok" if results_match and used_many_small_batch else "failed",
+        elapsed_seconds=trace.total_elapsed_seconds,
+        selected_runtime=actual_selected_runtime,
+        planner_selected_runtime=ExecutionMode.GPU.value,
+        output_rows=group_count,
+        transfer_count=audit.runtime_d2h_transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
+        materialization_count=audit.materialization_count,
+        fallback_event_count=int(trace.metadata["fallback_events"]),
+        peak_device_memory_bytes=memory.peak_bytes,
+        stages=(_trace_to_stage_dict(trace),),
+        notes=(
+            "Shape canary, not a workflow target: many small device-resident "
+            "polygon groups reduce through one batched grouped constructive path; "
+            "Shapely is used only as an explicit terminal oracle."
+        ),
+    )
+
+
+def _profile_relation_attribute_reducer_pipeline(
+    scale: int,
+    *,
+    enable_nvtx: bool = False,
+    retain_gpu_trace: bool = False,
+    include_gpu_sparklines: bool = False,
+) -> PipelineBenchmarkResult:
+    """Shape canary for relation-derived grouped attribute reducers."""
+    if not has_gpu_runtime():
+        return PipelineBenchmarkResult(
+            pipeline="relation-attribute-reducer",
+            scale=scale,
+            status="deferred",
+            elapsed_seconds=0.0,
+            selected_runtime="deferred",
+            planner_selected_runtime=ExecutionMode.GPU.value,
+            output_rows=0,
+            transfer_count=0,
+            materialization_count=0,
+            fallback_event_count=0,
+            peak_device_memory_bytes=None,
+            stages=tuple(),
+            notes="Deferred until CUDA runtime is available for relation attribute reducer canary.",
+        )
+
+    from time import perf_counter
+
+    import cupy as cp
+
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        clear_materialization_events,
+        record_materialization_event,
+    )
+
+    clear_materialization_events()
+    clear_dispatch_events()
+    clear_fallback_events()
+    audit = _OwnedAudit()
+    memory = _DeviceMemoryMonitor()
+    pair_count = int(scale)
+    left_row_count = max(pair_count // 4, 1)
+    right_row_count = max(pair_count // 8, 1)
+    profiler = _stage_profiler(
+        operation="pipeline.relation-attribute-reducer",
+        dataset=f"scale-{scale}",
+        requested_runtime=ExecutionMode.GPU,
+        selected_runtime=ExecutionMode.GPU.value,
+        enable_nvtx=enable_nvtx,
+        retain_gpu_trace=retain_gpu_trace,
+        include_gpu_sparklines=include_gpu_sparklines,
+    )
+
+    with profiler.stage(
+        "build_relation_inputs",
+        category="setup",
+        device=ExecutionMode.GPU,
+        rows_in=pair_count,
+        detail="build synthetic device relation pairs and all-valid right-side numeric attributes",
+    ) as stage:
+        pair_rows = cp.arange(pair_count, dtype=cp.int64)
+        right_rows = cp.arange(right_row_count, dtype=cp.int64)
+        left_indices = cp.remainder(pair_rows, left_row_count).astype(cp.int32, copy=False)
+        right_indices = cp.remainder(pair_rows * 7 + 3, right_row_count).astype(
+            cp.int32,
+            copy=False,
+        )
+        right_score = (cp.remainder(right_rows, 23) + 1).astype(cp.float64, copy=False)
+        right_weight = (cp.remainder(right_rows, 5) + 1).astype(cp.float64, copy=False)
+        relation = NativeRelation(
+            left_indices=left_indices,
+            right_indices=right_indices,
+            left_token="left",
+            right_token="right",
+            left_row_count=left_row_count,
+            right_row_count=right_row_count,
+            sorted_by_left=False,
+        )
+        stage.rows_out = int(len(relation))
+        stage.metadata["left_row_count"] = left_row_count
+        stage.metadata["right_row_count"] = right_row_count
+        stage.metadata["pair_storage"] = "device"
+        _record_stage_overheads(stage, audit, memory)
+
+    with profiler.stage(
+        "native_attribute_reduce",
+        category="reduce",
+        device=ExecutionMode.GPU,
+        rows_in=pair_count,
+        detail="reduce right-side attributes into left-row groups without joined row assembly",
+    ) as stage:
+        started = perf_counter()
+        reduced = relation.left_reduce_right_numeric_columns(
+            {
+                "score_sum": right_score,
+                "match_count": right_score,
+                "weight_mean": right_weight,
+            },
+            {
+                "score_sum": "sum",
+                "match_count": "count",
+                "weight_mean": "mean",
+            },
+        )
+        native_elapsed = perf_counter() - started
+        stage.rows_out = int(reduced.group_count)
+        stage.metadata["columns"] = tuple(reduced.columns)
+        stage.metadata["result_storage"] = "device" if reduced.is_device else "host"
+        stage.metadata["native_reduce_seconds"] = native_elapsed
+        _record_stage_overheads(stage, audit, memory)
+
+    with profiler.stage(
+        "public_groupby_reference",
+        category="emit",
+        device=ExecutionMode.CPU,
+        rows_in=pair_count,
+        detail="reference path: export relation pairs and attributes, then run pandas groupby reductions",
+    ) as stage:
+        started = perf_counter()
+        bytes_to_host = int(
+            left_indices.nbytes
+            + right_indices.nbytes
+            + right_score.nbytes
+            + right_weight.nbytes
+            + sum(reduction.values.nbytes for reduction in reduced.columns.values())
+        )
+        record_materialization_event(
+            surface="pipeline.relation-attribute-reducer.public_groupby_reference",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="relation_attribute_reducer_reference_export",
+            reason="exported relation attribute reducer inputs and output for pandas reference check",
+            detail=(
+                f"pairs={pair_count}, left_rows={left_row_count}, "
+                f"right_rows={right_row_count}, bytes={bytes_to_host}"
+            ),
+            d2h_transfer=True,
+            strict_disallowed=False,
+        )
+        left_host = cp.asnumpy(left_indices)
+        right_host = cp.asnumpy(right_indices)
+        score_host = cp.asnumpy(right_score)
+        weight_host = cp.asnumpy(right_weight)
+        actual_score = cp.asnumpy(reduced.columns["score_sum"].values)
+        actual_count = cp.asnumpy(reduced.columns["match_count"].values)
+        actual_weight = cp.asnumpy(reduced.columns["weight_mean"].values)
+        pairs = pd.DataFrame(
+            {
+                "left": left_host,
+                "score": score_host[right_host],
+                "weight": weight_host[right_host],
+            }
+        )
+        grouped = pairs.groupby("left", sort=True)
+        expected = pd.DataFrame(index=pd.RangeIndex(left_row_count))
+        expected["score_sum"] = grouped["score"].sum().reindex(
+            expected.index,
+            fill_value=0.0,
+        )
+        expected["match_count"] = grouped["score"].count().reindex(
+            expected.index,
+            fill_value=0,
+        )
+        expected["weight_mean"] = grouped["weight"].mean().reindex(expected.index)
+        public_elapsed = perf_counter() - started
+        results_match = bool(
+            np.allclose(actual_score, expected["score_sum"].to_numpy())
+            and np.array_equal(actual_count, expected["match_count"].to_numpy())
+            and np.allclose(
+                actual_weight,
+                expected["weight_mean"].to_numpy(),
+                equal_nan=True,
+            )
+        )
+        stage.rows_out = left_row_count
+        stage.metadata["results_match"] = results_match
+        stage.metadata["reference_seconds"] = public_elapsed
+        stage.metadata["native_reduce_seconds"] = native_elapsed
+        stage.metadata["consumer_speedup"] = (
+            public_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+        )
+        _record_stage_overheads(stage, audit, memory)
+
+    stage_devices = [stage.device for stage in profiler._stages]
+    actual_selected_runtime = _pipeline_runtime_from_stage_devices(stage_devices)
+    trace = profiler.finish(
+        metadata={
+            "scale": scale,
+            "actual_selected_runtime": actual_selected_runtime,
+            "planner_selected_runtime": ExecutionMode.GPU.value,
+            "dispatch_events": len(get_dispatch_events(clear=True)),
+            "fallback_events": len(get_fallback_events(clear=True)),
+            "admissible_shape": "device NativeRelation -> grouped right numeric attributes by left rows",
+            "results_match": results_match,
+            "consumer_speedup": (
+                public_elapsed / native_elapsed if native_elapsed > 0.0 else float("inf")
+            ),
+        }
+    )
+    return PipelineBenchmarkResult(
+        pipeline="relation-attribute-reducer",
+        scale=scale,
+        status="ok" if results_match else "failed",
+        elapsed_seconds=trace.total_elapsed_seconds,
+        selected_runtime=actual_selected_runtime,
+        planner_selected_runtime=ExecutionMode.GPU.value,
+        output_rows=left_row_count,
+        transfer_count=audit.runtime_d2h_transfer_count,
+        owned_transfer_count=audit.transfer_count,
+        runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
+        runtime_d2h_transfer_bytes=audit.runtime_d2h_transfer_bytes,
+        runtime_d2h_transfer_seconds=audit.runtime_d2h_transfer_seconds,
+        materialization_count=audit.materialization_count,
+        fallback_event_count=int(trace.metadata["fallback_events"]),
+        peak_device_memory_bytes=memory.peak_bytes,
+        stages=(_trace_to_stage_dict(trace),),
+        notes=(
+            "Shape canary, not a workflow target: device NativeRelation pairs -> "
+            "right-side numeric attributes gathered per pair -> NativeGrouped "
+            "multi-column reductions by left source row."
+        ),
     )
 
 
@@ -1384,59 +2520,105 @@ def _profile_zero_transfer_pipeline(
         )
 
         with profiler.stage("read_input", category="setup", device=ExecutionMode.GPU, rows_in=scale) as stage:
-            frame = read_geoparquet(source_path)
-            stage.rows_out = int(len(frame))
-            stage.metadata["geometry_dtype"] = frame.geometry.dtype.name
-            _record_stage_overheads(stage, audit, memory, frame)
+            native_payload = read_geoparquet_native(source_path)
+            native_state = NativeFrameState.from_native_tabular_result(native_payload)
+            frame = None
+            stage.rows_out = int(native_state.row_count)
+            stage.metadata["geometry_dtype"] = "native_device_geometry"
+            stage.metadata["private_native_state"] = True
+            stage.metadata["read_surface"] = "read_geoparquet_native"
+            _record_stage_overheads(stage, audit, memory, native_payload)
 
         with profiler.stage(
             "predicate_filter",
             category="filter",
             device=ExecutionMode.GPU,
-            rows_in=int(len(frame)),
-            detail="evaluate the DGA-backed point-box predicate directly on the public GeoDataFrame geometry column",
+            rows_in=int(native_state.row_count),
+            detail="evaluate the point-box predicate as a private NativeRowSet over the hidden native frame state",
         ) as stage:
-            indices = np.flatnonzero(
-                np.asarray(
-                    frame.geometry.values.intersects(
-                        box(
-                            0.0,
-                            0.0,
-                            float(max(scale // 250, 1)),
-                            float(max(scale // 250, 1)),
-                        )
-                    ),
-                    dtype=bool,
-                )
+            predicate_bounds = np.asarray(
+                [
+                    0.0,
+                    0.0,
+                    _ZERO_TRANSFER_SELECTIVE_BOUND,
+                    _ZERO_TRANSFER_SELECTIVE_BOUND,
+                ],
+                dtype=np.float64,
             )
-            stage.rows_out = int(indices.size)
-            _record_stage_overheads(stage, audit, memory, frame)
+            stage.metadata["predicate_bounds"] = tuple(float(value) for value in predicate_bounds)
+            rowset = None
+            if native_state is not None and native_state.geometry.owned is not None:
+                positions = _query_point_tree_box_row_positions_device(
+                    native_state.geometry.owned,
+                    predicate="intersects",
+                    box_bounds=predicate_bounds,
+                    force_gpu=True,
+                )
+                if positions is not None:
+                    rowset = NativeRowSet.from_positions(
+                        positions,
+                        source_token=native_state.lineage_token,
+                        source_row_count=native_state.row_count,
+                        ordered=True,
+                        unique=True,
+                    )
+                    stage.metadata["rowset_storage"] = "device" if rowset.is_device else "host"
+            if rowset is None:
+                frame = native_payload.to_geodataframe()
+                indices = np.flatnonzero(
+                    np.asarray(
+                        frame.geometry.values.intersects(box(*predicate_bounds)),
+                        dtype=bool,
+                    )
+                )
+                stage.metadata["rowset_storage"] = "fallback-host"
+                stage.rows_out = int(indices.size)
+            else:
+                indices = None
+                stage.rows_out = len(rowset)
+            _record_stage_overheads(stage, audit, memory, native_payload, frame)
 
         with profiler.stage(
             "subset_rows",
             category="filter",
             device=ExecutionMode.GPU,
-            rows_in=int(len(frame)),
-            detail="subset GeoDataFrame rows while preserving the DGA-backed geometry column",
+            rows_in=int(native_state.row_count),
+            detail="apply the private NativeRowSet to the hidden native frame state",
         ) as stage:
-            filtered = _take_dga_frame(frame, indices)
-            stage.rows_out = int(len(filtered))
-            _record_stage_overheads(stage, audit, memory, frame, filtered)
+            if rowset is not None and native_state is not None:
+                if len(rowset) == native_state.row_count:
+                    filtered = native_state.to_native_tabular_result()
+                    stage.metadata["native_rowset_take"] = "identity"
+                else:
+                    filtered = native_state.take(
+                        rowset,
+                        preserve_index=False,
+                    ).to_native_tabular_result()
+                    stage.metadata["native_rowset_take"] = "take"
+                stage.rows_out = int(filtered.geometry.row_count)
+            else:
+                if frame is None:
+                    frame = native_payload.to_geodataframe()
+                filtered = _take_dga_frame(frame, indices)
+                stage.metadata["native_rowset_take"] = "fallback-public"
+                stage.rows_out = int(len(filtered))
+            _record_stage_overheads(stage, audit, memory, native_payload, frame, filtered)
 
         with profiler.stage(
             "write_output",
             category="emit",
             device=ExecutionMode.GPU,
-            rows_in=int(len(filtered)),
-            detail="write the filtered DGA-backed GeoDataFrame through the native GeoParquet path",
+            rows_in=_tabular_row_count(filtered),
+            detail="write the filtered private native payload through the native GeoParquet path",
         ) as stage:
             write_geoparquet(
                 filtered,
                 output_path,
+                index=False,
                 geometry_encoding="geoarrow",
                 compression=_BENCHMARK_OUTPUT_COMPRESSION,
             )
-            stage.rows_out = int(len(filtered))
+            stage.rows_out = _tabular_row_count(filtered)
             stage.metadata["compression"] = _BENCHMARK_OUTPUT_COMPRESSION
             _record_stage_overheads(stage, audit, memory, filtered)
 
@@ -1463,7 +2645,7 @@ def _profile_zero_transfer_pipeline(
         elapsed_seconds=trace.total_elapsed_seconds,
         selected_runtime=actual_selected_runtime,
         planner_selected_runtime=planner_selected_runtime,
-        output_rows=int(len(filtered)),
+        output_rows=_tabular_row_count(filtered),
         transfer_count=transfer_count,
         owned_transfer_count=owned_transfer_count,
         runtime_d2h_transfer_count=audit.runtime_d2h_transfer_count,
@@ -1473,7 +2655,7 @@ def _profile_zero_transfer_pipeline(
         fallback_event_count=int(trace.metadata["fallback_events"]),
         peak_device_memory_bytes=memory.peak_bytes,
         stages=(_trace_to_stage_dict(trace),),
-        notes="Public read_geoparquet -> DGA point-box predicate -> write_geoparquet zero-transfer scenario.",
+        notes="Private read_geoparquet_native -> NativeFrameState -> point-box NativeRowSet -> native GeoParquet write zero-transfer substrate scenario.",
     )
 
 
@@ -3473,7 +4655,14 @@ def _profile_provenance_rewrite_pipeline(
 def benchmark_pipeline_suite(
     *,
     suite: str = "ci",
-    pipelines: tuple[str, ...] = ("join-heavy", "constructive", "predicate-heavy", "zero-transfer"),
+    pipelines: tuple[str, ...] = (
+        "join-heavy",
+        "relation-semijoin",
+        "small-grouped-constructive-reduce",
+        "constructive",
+        "predicate-heavy",
+        "zero-transfer",
+    ),
     repeat: int = 1,
     enable_nvtx: bool = False,
     retain_gpu_trace: bool = False,
@@ -3502,6 +4691,51 @@ def benchmark_pipeline_suite(
                     if pipeline == "join-heavy":
                         samples.append(
                             _profile_join_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
+                        )
+                    elif pipeline == "relation-semijoin":
+                        samples.append(
+                            _profile_relation_semijoin_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
+                        )
+                    elif pipeline == "relation-bridge-consumer":
+                        samples.append(
+                            _profile_relation_bridge_consumer_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
+                        )
+                    elif pipeline == "grouped-reducer":
+                        samples.append(
+                            _profile_grouped_reducer_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
+                        )
+                    elif pipeline == "small-grouped-constructive-reduce":
+                        samples.append(
+                            _profile_small_grouped_constructive_reduce_pipeline(
+                                scale,
+                                enable_nvtx=enable_nvtx,
+                                retain_gpu_trace=retain_gpu_trace,
+                                include_gpu_sparklines=include_gpu_sparklines,
+                            )
+                        )
+                    elif pipeline == "relation-attribute-reducer":
+                        samples.append(
+                            _profile_relation_attribute_reducer_pipeline(
                                 scale,
                                 enable_nvtx=enable_nvtx,
                                 retain_gpu_trace=retain_gpu_trace,

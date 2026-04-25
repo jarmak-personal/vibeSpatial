@@ -43,6 +43,8 @@ def main(argv: list[str] | None = None) -> int:
 
     pipelines = tuple(args.pipeline) if args.pipeline else (
         "join-heavy",
+        "relation-semijoin",
+        "small-grouped-constructive-reduce",
         "constructive",
         "predicate-heavy",
         "zero-transfer",

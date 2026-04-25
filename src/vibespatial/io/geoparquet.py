@@ -22,6 +22,7 @@ from vibespatial.api._native_results import (
     native_attribute_table_from_arrow_table,
     to_native_tabular_result,
 )
+from vibespatial.api._native_state import attach_native_state_from_native_tabular_result
 from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import (
@@ -472,8 +473,6 @@ def _write_geoparquet_native_tabular_result(
 
     from vibespatial.api.io.arrow import _create_geometry_metadata, _replace_table_schema_metadata
 
-    payload = _authoritative_native_tabular_result(payload)
-
     small_write_detail = _small_terminal_arrow_export_detail(
         row_count=payload.geometry.row_count,
         polygonal_terminal_candidate=_owned_prefers_small_terminal_arrow_export(
@@ -561,6 +560,7 @@ def _write_geoparquet_native_tabular_result(
             row_count=payload.geometry.row_count,
         )
 
+    payload = _authoritative_native_tabular_result(payload)
     geometry_series = _payload_geometry_series(payload)
 
     table, geometry_encoding_dict = native_tabular_to_arrow(
@@ -1313,7 +1313,9 @@ def _pylibcudf_table_to_geopandas(
         to_pandas_kwargs=to_pandas_kwargs,
         df_attrs=df_attrs,
     )
-    return payload.to_geodataframe()
+    frame = payload.to_geodataframe()
+    attach_native_state_from_native_tabular_result(frame, payload)
+    return frame
 
 
 def _geoparquet_table_to_native_tabular_result(
@@ -2333,7 +2335,10 @@ def _read_geoparquet_native_impl(
 
     if len(native_results) == 1:
         payload = native_results[0]
-        payload = NativeTabularResult(
+        # Native reads must not eagerly mirror device geometry buffers to host.
+        # Public GeoDataFrame compatibility export can wrap the device state
+        # directly; host authoritative views belong to explicit export paths.
+        return NativeTabularResult(
             attributes=payload.attributes,
             geometry=payload.geometry,
             geometry_name=payload.geometry_name,
@@ -2342,15 +2347,13 @@ def _read_geoparquet_native_impl(
             secondary_geometry=payload.secondary_geometry,
             provenance=provenance,
         )
-        return _authoritative_native_tabular_result(payload)
 
-    payload = _concat_native_tabular_results(
+    return _concat_native_tabular_results(
         native_results,
         geometry_name=native_results[0].geometry_name,
         crs=native_results[0].geometry.crs,
         provenance=provenance,
     )
-    return _authoritative_native_tabular_result(payload)
 
 
 def read_geoparquet_native(
@@ -2863,7 +2866,7 @@ def read_geoparquet(
     GeoDataFrame
     """
     if has_pyarrow_support():
-        return _read_geoparquet_native_impl(
+        payload = _read_geoparquet_native_impl(
             path,
             columns=columns,
             storage_options=storage_options,
@@ -2874,7 +2877,10 @@ def read_geoparquet(
             surface="geopandas.read_parquet",
             operation="read_parquet",
             **kwargs,
-        ).to_geodataframe()
+        )
+        frame = payload.to_geodataframe()
+        attach_native_state_from_native_tabular_result(frame, payload)
+        return frame
     from vibespatial.api.io.arrow import _read_parquet
 
     return _read_parquet(

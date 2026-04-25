@@ -701,12 +701,42 @@ def _write_geoparquet_native_device_payload(
         )
 
     non_geometry_columns = [column for column in column_order if column != geometry_name]
-    host_table = _build_native_host_attribute_table_from_frame(
-        attribute_frame,
-        non_geometry_columns,
-        index=index,
-        pa=pa,
-    )
+    device_attribute_columns = None
+    host_table = None
+    attribute_schema = None
+    if index is False:
+        try:
+            from vibespatial.api._native_result_core import NativeAttributeTable
+
+            if isinstance(attribute_frame, NativeAttributeTable):
+                device_attribute_columns = dict(
+                    zip(
+                        non_geometry_columns,
+                        attribute_frame.to_pylibcudf_columns(non_geometry_columns),
+                        strict=True,
+                    )
+                )
+                attribute_schema = attribute_frame.arrow_schema_for_columns(non_geometry_columns)
+        except Exception:
+            device_attribute_columns = None
+            attribute_schema = None
+    if device_attribute_columns is None:
+        host_table = _build_native_host_attribute_table_from_frame(
+            attribute_frame,
+            non_geometry_columns,
+            index=index,
+            pa=pa,
+        )
+        attribute_schema = host_table.schema
+    if index is False and attribute_schema.metadata:
+        attribute_schema = attribute_schema.with_metadata(
+            {
+                key: value
+                for key, value in attribute_schema.metadata.items()
+                if key != b"pandas"
+            }
+            or None
+        )
     ordered_column_names = list(column_order)
     table_columns = []
     geometry_encoding_dict = {}
@@ -731,7 +761,10 @@ def _write_geoparquet_native_device_payload(
             table_columns.append(_encode_owned_wkb_column_device(owned))
             geometry_encoding_dict[column_name] = "WKB"
         else:
-            table_columns.append(_attribute_column_to_plc(host_table[column_name], column_name, plc=plc))
+            if device_attribute_columns is not None:
+                table_columns.append(device_attribute_columns[column_name])
+            else:
+                table_columns.append(_attribute_column_to_plc(host_table[column_name], column_name, plc=plc))
 
     bbox_column_names: list[str] = []
     if write_covering_bbox:
@@ -807,7 +840,7 @@ def _write_geoparquet_native_device_payload(
         (key.decode() if isinstance(key, bytes) else str(key)): (
             value.decode() if isinstance(value, bytes) else str(value)
         )
-        for key, value in (host_table.schema.metadata or {}).items()
+        for key, value in (attribute_schema.metadata or {}).items()
     }
     footer_metadata["geo"] = _encode_metadata(geo_metadata).decode()
     if frame_attrs:
@@ -870,7 +903,7 @@ def _write_geoparquet_native_device_payload(
         )
 
     schema_fields = []
-    host_fields = {field.name: field for field in host_table.schema}
+    host_fields = {field.name: field for field in attribute_schema}
     for column_name in all_column_names:
         if column_name == geometry_name:
             schema_fields.append(_geometry_field())
@@ -892,7 +925,7 @@ def _write_geoparquet_native_device_payload(
         else:
             schema_fields.append(host_fields[column_name])
 
-    schema_metadata = dict(host_table.schema.metadata or {})
+    schema_metadata = dict(attribute_schema.metadata or {})
     schema_metadata[b"geo"] = _encode_metadata(geo_metadata)
     if frame_attrs:
         schema_metadata[b"PANDAS_ATTRS"] = json.dumps(frame_attrs).encode()

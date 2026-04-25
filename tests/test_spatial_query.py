@@ -10,8 +10,9 @@ import vibespatial.spatial.query as spatial_query_module
 import vibespatial.spatial.query_utils as spatial_query_utils_module
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.geometry.owned import OwnedGeometryArray, from_shapely_geometries
-from vibespatial.runtime import ExecutionMode, has_gpu_runtime
+from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime
 from vibespatial.runtime.residency import Residency
+from vibespatial.spatial.indexing import build_flat_spatial_index
 from vibespatial.spatial.query import (
     build_owned_spatial_index,
     nearest_spatial_index,
@@ -259,6 +260,81 @@ def test_device_spatial_query_zero_pairs_does_not_signal_cpu_fallback(
 
     assert result.shape == (2, 0)
     assert execution.selected is ExecutionMode.GPU
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device bounds index")
+def test_single_row_device_flat_index_keeps_bounds_device_until_host_boundary() -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_count,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(1.0, 2.0)],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    flat_index = build_flat_spatial_index(
+        owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test single-row device index",
+        ),
+    )
+
+    assert flat_index.device_bounds is not None
+    assert flat_index._host_bounds is None
+    assert flat_index.size == 1
+    assert get_d2h_transfer_count() == 0
+
+    assert flat_index.bounds.tolist() == [[1.0, 2.0, 1.0, 2.0]]
+    assert get_d2h_transfer_count() == 1
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device bounds query")
+def test_single_row_device_rect_flat_index_preserves_regular_grid_query() -> None:
+    from vibespatial.cuda._runtime import get_d2h_transfer_count, reset_d2h_transfer_count
+
+    tree_owned = from_shapely_geometries(
+        [box(0.0, 0.0, 10.0, 10.0)],
+        residency=Residency.DEVICE,
+    )
+    query_owned = from_shapely_geometries(
+        [Point(1.0, 1.0), Point(20.0, 20.0)],
+        residency=Residency.DEVICE,
+    )
+
+    reset_d2h_transfer_count()
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.GPU,
+            selected=ExecutionMode.GPU,
+            reason="test single-row device rectangle index",
+        ),
+    )
+
+    assert flat_index.regular_grid is not None
+    assert flat_index._host_bounds is not None
+    assert flat_index.device_bounds is None
+    assert get_d2h_transfer_count() == 2
+
+    result, execution = query_spatial_index(
+        tree_owned,
+        flat_index,
+        query_owned,
+        predicate="intersects",
+        sort=True,
+        output_format="indices",
+        return_metadata=True,
+        return_device=True,
+    )
+
+    assert execution.selected is ExecutionMode.GPU
+    assert result.size == 1
+    assert flat_index.regular_grid.size == 1
 
 
 def test_query_spatial_index_handles_regular_grid_rectangle_boundaries() -> None:
@@ -1312,6 +1388,49 @@ def test_return_device_true_returns_device_result() -> None:
     else:
         # CPU fallback returns numpy as usual
         assert isinstance(result, np.ndarray)
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")
+def test_return_device_point_region_refine_avoids_pair_d2h() -> None:
+    """Device pair export should not copy refined pair arrays through host."""
+    from vibespatial.cuda._runtime import get_d2h_transfer_stats, reset_d2h_transfer_count
+    from vibespatial.spatial.query_types import DeviceSpatialJoinResult
+
+    tree = np.asarray(
+        [
+            box(0, 0, 5, 5),
+            box(3, 3, 6, 6),
+            box(10, 10, 11, 11),
+        ],
+        dtype=object,
+    )
+    tree_owned, flat = build_owned_spatial_index(tree)
+    query_owned = from_shapely_geometries(
+        [Point(1, 1), Point(4, 4), Point(20, 20)],
+        residency=Residency.DEVICE,
+    )
+
+    tree_owned._ensure_device_state()
+    query_owned._ensure_device_state()
+    reset_d2h_transfer_count()
+    result, execution = query_spatial_index(
+        tree_owned,
+        flat,
+        query_owned,
+        predicate="intersects",
+        sort=True,
+        return_device=True,
+        return_metadata=True,
+    )
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+
+    assert execution.selected is ExecutionMode.GPU
+    assert isinstance(result, DeviceSpatialJoinResult)
+    assert transfer_count <= 2
+    assert transfer_bytes <= 8
+    h_left, h_right = result.to_host()
+    assert h_left.tolist() == [0, 1, 1]
+    assert h_right.tolist() == [0, 0, 1]
 
 
 @pytest.mark.skipif(not has_gpu_runtime(), reason="GPU required")

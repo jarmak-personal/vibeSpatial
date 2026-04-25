@@ -6,6 +6,7 @@ import logging
 import os
 import pathlib
 import threading
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -127,6 +128,35 @@ _d2h_transfer_bytes: int = 0
 _d2h_transfer_seconds: float = 0.0
 
 
+@dataclass(frozen=True)
+class RuntimeD2HTransferEvent:
+    trigger: str
+    reason: str
+    item_count: int
+    bytes_transferred: int
+    elapsed_seconds: float
+    pipeline: str | None = None
+    dataset: str | None = None
+    stage: str | None = None
+    stage_category: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trigger": self.trigger,
+            "reason": self.reason,
+            "item_count": self.item_count,
+            "bytes_transferred": self.bytes_transferred,
+            "elapsed_seconds": self.elapsed_seconds,
+            "pipeline": self.pipeline,
+            "dataset": self.dataset,
+            "stage": self.stage,
+            "stage_category": self.stage_category,
+        }
+
+
+_d2h_transfer_events: deque[RuntimeD2HTransferEvent] = deque(maxlen=1024)
+
+
 def _device_array_size(device_array: Any) -> int:
     size = getattr(device_array, "size", 0)
     try:
@@ -157,6 +187,37 @@ def _increment_d2h_transfer_count(
         _d2h_transfer_seconds += max(float(elapsed_seconds), 0.0)
 
 
+def _record_runtime_d2h_transfer_event(
+    *,
+    trigger: str,
+    reason: str,
+    item_count: int,
+    bytes_transferred: int,
+    elapsed_seconds: float,
+) -> RuntimeD2HTransferEvent:
+    context = None
+    try:
+        from vibespatial.runtime.materialization import current_materialization_context
+
+        context = current_materialization_context()
+    except Exception:
+        context = None
+    event = RuntimeD2HTransferEvent(
+        trigger=trigger,
+        reason=reason,
+        item_count=max(int(item_count), 0),
+        bytes_transferred=max(int(bytes_transferred), 0),
+        elapsed_seconds=max(float(elapsed_seconds), 0.0),
+        pipeline=None if context is None else context.pipeline,
+        dataset=None if context is None else context.dataset,
+        stage=None if context is None else context.stage,
+        stage_category=None if context is None else context.stage_category,
+    )
+    with _d2h_transfer_lock:
+        _d2h_transfer_events.append(event)
+    return event
+
+
 def _notify_runtime_d2h_transfer(
     device_array: Any,
     *,
@@ -166,7 +227,15 @@ def _notify_runtime_d2h_transfer(
     elapsed_seconds: float = 0.0,
 ) -> None:
     bytes_transferred = _device_array_nbytes(device_array, host_array)
+    item_count = _device_array_size(device_array)
     _increment_d2h_transfer_count(bytes_transferred, elapsed_seconds)
+    _record_runtime_d2h_transfer_event(
+        trigger=trigger,
+        reason=reason,
+        item_count=item_count,
+        bytes_transferred=bytes_transferred,
+        elapsed_seconds=elapsed_seconds,
+    )
     try:
         from vibespatial.runtime.execution_trace import notify_transfer
 
@@ -175,7 +244,7 @@ def _notify_runtime_d2h_transfer(
             trigger=trigger,
             reason=reason,
             source="cuda_runtime",
-            item_count=_device_array_size(device_array),
+            item_count=item_count,
             bytes_transferred=bytes_transferred,
             elapsed_seconds=elapsed_seconds,
         )
@@ -214,13 +283,23 @@ def get_d2h_transfer_profile() -> tuple[int, int, float]:
         return _d2h_transfer_count, _d2h_transfer_bytes, _d2h_transfer_seconds
 
 
+def get_d2h_transfer_events(*, clear: bool = False) -> list[RuntimeD2HTransferEvent]:
+    """Return CUDA-runtime D2H transfer events for profile attribution."""
+    with _d2h_transfer_lock:
+        events = list(_d2h_transfer_events)
+        if clear:
+            _d2h_transfer_events.clear()
+        return events
+
+
 def reset_d2h_transfer_count() -> None:
-    """Reset the D2H transfer counter to zero."""
+    """Reset the D2H transfer profile counters and event log to zero."""
     global _d2h_transfer_count, _d2h_transfer_bytes, _d2h_transfer_seconds
     with _d2h_transfer_lock:
         _d2h_transfer_count = 0
         _d2h_transfer_bytes = 0
         _d2h_transfer_seconds = 0.0
+        _d2h_transfer_events.clear()
 
 
 @contextmanager
@@ -842,6 +921,30 @@ class CudaDriverRuntime:
         )
         return host_array
 
+    def copy_device_to_device_async(
+        self,
+        source_array: DeviceArray,
+        destination_array: DeviceArray,
+        stream: Any,
+    ) -> None:
+        """Enqueue an asynchronous device-to-device copy on *stream*."""
+        _require_gpu_arrays()
+        source_nbytes = int(getattr(source_array, "nbytes", 0))
+        destination_nbytes = int(getattr(destination_array, "nbytes", 0))
+        if source_nbytes != destination_nbytes:
+            raise ValueError(
+                "device-to-device copy requires equal byte sizes "
+                f"({source_nbytes} != {destination_nbytes})"
+            )
+        stream_handle = _normalize_stream_handle(stream)
+        with self.activate():
+            _check_driver(cu.cuMemcpyDtoDAsync(
+                int(destination_array.data.ptr),
+                int(source_array.data.ptr),
+                source_nbytes,
+                stream_handle,
+            ))
+
     def copy_host_to_device_async(
         self,
         host_array: np.ndarray,
@@ -1072,15 +1175,20 @@ def count_scatter_total(
 ) -> int:
     """Get total output size from count-scatter arrays.
 
-    Uses a single async transfer of two last-elements on a dedicated
-    stream, replacing two sequential ``.get()`` calls (each of which
-    forces a full context sync) with one stream sync.
+    Packs the final count and final offset into one tiny device buffer,
+    then performs a single D2H copy on a dedicated stream.  This keeps the
+    unavoidable allocation scalar fence to one host transfer event instead
+    of two independent last-element copies.
     """
     dtype = np.dtype(device_counts.dtype)
+    if np.dtype(device_offsets.dtype) != dtype:
+        raise TypeError("count_scatter_total requires counts and offsets with matching dtypes")
     with runtime.stream_context() as xfer:
+        d_buf = runtime.allocate((2,), dtype)
         h_buf = runtime.allocate_pinned((2,), dtype)
-        runtime.copy_device_to_host_async(device_counts[-1:], xfer, h_buf[:1])
-        runtime.copy_device_to_host_async(device_offsets[-1:], xfer, h_buf[1:])
+        runtime.copy_device_to_device_async(device_counts[-1:], d_buf[:1], xfer)
+        runtime.copy_device_to_device_async(device_offsets[-1:], d_buf[1:], xfer)
+        runtime.copy_device_to_host_async(d_buf, xfer, h_buf)
     return int(h_buf[0]) + int(h_buf[1])
 
 
@@ -1090,22 +1198,43 @@ def count_scatter_totals(
 ) -> list[int]:
     """Get multiple count-scatter totals with one transfer-stream sync.
 
-    Each pair still transfers only the final count and final offset, but all
-    copies are issued on one dedicated stream so the host pays a single sync
-    for the whole batch instead of one sync per total.
+    For same-dtype pairs, packs every final count/final offset pair into a
+    compact device buffer and performs one D2H copy for the whole batch.
+    Mixed dtypes fall back to the single-total helper per pair.
     """
     if not count_offset_pairs:
         return []
 
-    host_buffers: list[np.ndarray] = []
+    dtypes = [
+        np.dtype(device_counts.dtype)
+        for device_counts, _device_offsets in count_offset_pairs
+    ]
+    offset_dtypes = [
+        np.dtype(device_offsets.dtype)
+        for _device_counts, device_offsets in count_offset_pairs
+    ]
+    if any(offset_dtype != dtype for dtype, offset_dtype in zip(dtypes, offset_dtypes, strict=True)):
+        raise TypeError("count_scatter_totals requires counts and offsets with matching dtypes")
+    if any(dtype != dtypes[0] for dtype in dtypes):
+        return [
+            count_scatter_total(runtime, device_counts, device_offsets)
+            for device_counts, device_offsets in count_offset_pairs
+        ]
+
+    dtype = dtypes[0]
+    n_pairs = len(count_offset_pairs)
     with runtime.stream_context() as xfer:
-        for device_counts, device_offsets in count_offset_pairs:
-            dtype = np.dtype(device_counts.dtype)
-            h_buf = runtime.allocate_pinned((2,), dtype)
-            runtime.copy_device_to_host_async(device_counts[-1:], xfer, h_buf[:1])
-            runtime.copy_device_to_host_async(device_offsets[-1:], xfer, h_buf[1:])
-            host_buffers.append(h_buf)
-    return [int(h_buf[0]) + int(h_buf[1]) for h_buf in host_buffers]
+        d_buf = runtime.allocate((2 * n_pairs,), dtype)
+        h_buf = runtime.allocate_pinned((2 * n_pairs,), dtype)
+        for pair_index, (device_counts, device_offsets) in enumerate(count_offset_pairs):
+            base = 2 * pair_index
+            runtime.copy_device_to_device_async(device_counts[-1:], d_buf[base:base + 1], xfer)
+            runtime.copy_device_to_device_async(device_offsets[-1:], d_buf[base + 1:base + 2], xfer)
+        runtime.copy_device_to_host_async(d_buf, xfer, h_buf)
+    return [
+        int(h_buf[2 * pair_index]) + int(h_buf[2 * pair_index + 1])
+        for pair_index in range(n_pairs)
+    ]
 
 
 def count_scatter_total_with_transfer(

@@ -248,11 +248,19 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
                 "from vibespatial.runtime.execution_trace import notify_dispatch, notify_transfer",
                 "from vibespatial.runtime.fallbacks import record_fallback_event",
                 "from vibespatial.runtime.hotpath_trace import hotpath_stage",
+                "from vibespatial.runtime.materialization import MaterializationBoundary, record_materialization_event",
                 "notify_dispatch(surface='probe', operation='gpu_step', selected='gpu', implementation='probe_gpu')",
                 "notify_transfer(direction='d2h', trigger='probe', reason='profile probe')",
                 "with hotpath_stage('shootout.profile_probe', category='refine'):",
                 "    value = sum(range(8))",
                 "record_fallback_event(surface='probe.fallback', reason='profile fallback')",
+                "record_materialization_event(",
+                "    surface='probe.materialize',",
+                "    boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,",
+                "    operation='probe_materialize',",
+                "    reason='profile materialization',",
+                "    d2h_transfer=True,",
+                ")",
                 "print(f'SHOOTOUT_FINGERPRINT: rows={value // 28}')",
                 "# --- timed work ends here ---",
             ]
@@ -288,6 +296,15 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
     assert run.profile["runtime_d2h_transfer_bytes"] == 0
     assert run.profile["runtime_d2h_transfer_seconds"] == 0.0
     assert run.profile["owned_transfer_count"] == 0
+    assert run.profile["materialization_count"] == 1
+    assert run.profile["stage_materialization_count"] == 1
+    assert run.profile["stage_materialization_d2h_event_count"] == 1
+    assert run.profile["stage_materialization_counts_by_boundary"][
+        "internal-host-conversion"
+    ] == 1
+    assert run.profile["stage_materialization_counts_by_surface"][
+        "probe.materialize"
+    ] == 1
     assert run.profile["fallback_events"][0]["surface"] == "probe.fallback"
     assert run.profile["top_hotpath"][0]["name"] == "shootout.profile_probe"
     assert run.profile["hotpath_total_seconds"] > 0
@@ -305,6 +322,18 @@ def test_vibespatial_shootout_profile_reports_physical_plan_evidence(tmp_path: P
         stage["fallback_event_count"] == 1
         for stage in run.profile["timed_stages"]
     )
+    materialization_stage = next(
+        stage
+        for stage in run.profile["timed_stages"]
+        if stage["materialization_event_count"] == 1
+    )
+    event = materialization_stage["materialization_events"][0]
+    assert materialization_stage["materialization_d2h_event_count"] == 1
+    assert event["pipeline"] == "shootout"
+    assert event["dataset"] == "profile_probe.py"
+    assert event["stage"] == f"statement_{materialization_stage['index']}"
+    assert event["stage_category"] == ",".join(materialization_stage["tags"])
+    assert event["surface"] == "probe.materialize"
 
 
 @pytest.mark.gpu

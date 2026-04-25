@@ -5,7 +5,7 @@ Scope: Architecture decision log and index of accepted or superseded ADRs.
 Read If: You are resolving, revisiting, or querying a design decision.
 STOP IF: You already have the specific ADR open and do not need the index.
 Source Of Truth: Decision log for architecture choices.
-Body Budget: 84/220 lines
+Body Budget: 85/220 lines
 Document: docs/decisions/index.md
 
 Section Map (Body Lines)
@@ -14,10 +14,10 @@ Section Map (Body Lines)
 | 1-4 | Preamble |
 | 5-8 | Intent |
 | 9-16 | Request Signals |
-| 17-25 | Open First |
-| 26-30 | Verify |
-| 31-35 | Risks |
-| 36-84 | Decisions |
+| 17-26 | Open First |
+| 27-31 | Verify |
+| 32-36 | Risks |
+| 37-85 | Decisions |
 DOC_HEADER:END -->
 
 Use this index to find accepted architecture decisions.
@@ -37,6 +37,7 @@ Track architecture decisions in a stable, agent-discoverable format.
 ## Open First
 
 - docs/decisions/index.md
+- docs/decisions/adr-index.md
 - scripts/new_decision.py
 - docs/architecture/runtime.md
 - docs/decisions/0001-mixed-geometries.md
@@ -54,8 +55,6 @@ Track architecture decisions in a stable, agent-discoverable format.
 - Buried or unindexed ADRs make agents re-litigate settled design choices.
 
 ## Decisions
-
-See also [adr-index.md](adr-index.md) for the Sphinx toctree listing.
 
 | ADR | Status | Date | Title |
 |---|---|---|---|
@@ -97,8 +96,10 @@ See also [adr-index.md](adr-index.md) for the Sphinx toctree listing.
 | `ADR-0035` | deferred | 2026-03-14 | [ADR-0035: Geodesic Distance Kernel and CRS-Aware Dispatch](docs/decisions/0035-geodesic-distance-kernel.md) |
 | `ADR-0037` | deferred | 2026-03-16 | [ADR-0037: GPU Voronoi Diagram Kernel](docs/decisions/0037-gpu-voronoi-diagram-kernel.md) |
 | `ADR-0038` | accepted | 2026-03-17 | [ADR-0038: GPU Byte-Classification GeoJSON Parser](docs/decisions/0038-gpu-byte-classify-geojson-parser.md) |
-| `ADR-0039` | accepted | 2026-03-20 | [ADR-0039: Provenance Tagging and Rewrite System](docs/decisions/0039-provenance-tagging-rewrites.md) |
-| `ADR-0040` | accepted | 2026-03-25 | [ADR-0040: Tiered GPU Memory Pool (RMM)](docs/decisions/0040-tiered-gpu-memory-pool.md) |
+| `ADR-0039` | accepted | 2026-03-20 | [Provenance Tagging and Rewrite System](docs/decisions/0039-provenance-tagging-rewrites.md) |
+| `ADR-0040` | accepted | 2026-03-25 | [Tiered GPU Memory Pool (RMM)](docs/decisions/0040-tiered-gpu-memory-pool.md) |
 | `ADR-0041` | accepted | 2026-03-26 | [ADR-0041: GPU Text Parsing Framework](docs/decisions/0041-gpu-text-parsing-framework.md) |
 | `ADR-0042` | accepted | 2026-04-08 | [Device-Native Result Boundary And Explicit Compatibility Export](docs/decisions/0042-device-native-result-boundary.md) |
 | `ADR-0043` | accepted | 2026-04-21 | [Public API Physical Plan Coverage](docs/decisions/0043-public-api-physical-plan-coverage.md) |
+| `ADR-0044` | accepted | 2026-04-23 | [Private Native Execution Substrate For Public GeoPandas APIs](docs/decisions/0044-private-native-execution-substrate.md) |
+| `ADR-0045` | accepted | 2026-04-25 | [Transient Native Work Budget](docs/decisions/0045-transient-native-work-budget.md) |

@@ -27,6 +27,8 @@ SUITES: dict[str, SuiteDefinition] = {
         ),
         pipelines=(
             "join-heavy",
+            "relation-semijoin",
+            "small-grouped-constructive-reduce",
             "constructive",
         ),
         scales=(1_000,),
@@ -45,6 +47,8 @@ SUITES: dict[str, SuiteDefinition] = {
         ),
         pipelines=(
             "join-heavy",
+            "relation-semijoin",
+            "small-grouped-constructive-reduce",
             "constructive",
             "predicate-heavy",
             "zero-transfer",
@@ -68,6 +72,8 @@ SUITES: dict[str, SuiteDefinition] = {
         ),
         pipelines=(
             "join-heavy",
+            "relation-semijoin",
+            "small-grouped-constructive-reduce",
             "constructive",
             "predicate-heavy",
             "predicate-heavy-geopandas",

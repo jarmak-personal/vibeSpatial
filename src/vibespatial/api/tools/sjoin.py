@@ -21,6 +21,7 @@ from vibespatial.spatial.query import (
     supports_owned_spatial_input,
 )
 
+
 def sjoin(
     left_df,
     right_df,
@@ -197,6 +198,7 @@ def _sjoin_relation_result(
     distance,
     *,
     on_attribute=None,
+    return_device: bool = False,
 ):
     """Build the native relation result before any DataFrame materialization."""
     indices, query_implementation, query_execution = _geom_predicate_query(
@@ -205,6 +207,7 @@ def _sjoin_relation_result(
         predicate,
         distance,
         on_attribute=on_attribute,
+        return_device=return_device,
     )
     return RelationJoinResult(RelationIndexResult(*indices)), query_implementation, query_execution
 
@@ -219,6 +222,7 @@ def _sjoin_export_result(
     rsuffix,
     *,
     on_attribute=None,
+    return_device: bool = False,
 ):
     """Build the deferred public sjoin export result before GeoDataFrame assembly."""
     native_result, query_implementation, query_execution = _sjoin_relation_result(
@@ -227,6 +231,7 @@ def _sjoin_export_result(
         predicate,
         distance,
         on_attribute=on_attribute,
+        return_device=return_device,
     )
     if predicate == "intersects" and distance is None and not on_attribute:
         cache_intersection_pairs(
@@ -244,6 +249,7 @@ def _sjoin_export_result(
             lsuffix=lsuffix,
             rsuffix=rsuffix,
             on_attribute=on_attribute,
+            predicate=predicate,
         ),
         query_implementation,
         query_execution,
@@ -305,7 +311,20 @@ def _basic_checks(left_df, right_df, how, lsuffix, rsuffix, on_attribute=None, a
                 )
 
 
-def _query_with_owned_spatial_index(left_df, right_df, predicate, distance):
+def _query_with_owned_spatial_index(
+    left_df,
+    right_df,
+    predicate,
+    distance,
+    *,
+    return_device: bool = False,
+):
+    """Run the owned spatial query path for sjoin.
+
+    ``return_device`` is intentionally opt-in so public ``sjoin`` preserves
+    the exact GeoPandas-shaped host boundary while private ADR-0044 callers can
+    keep admitted relation-pair exports device-resident.
+    """
     tree_geometry = right_df.geometry
     query_geometry = left_df.geometry
     if hasattr(tree_geometry, "values") and hasattr(tree_geometry.values, "supports_owned_spatial_input"):
@@ -358,7 +377,10 @@ def _query_with_owned_spatial_index(left_df, right_df, predicate, distance):
         distance=distance,
         output_format="indices",
         return_metadata=True,
+        return_device=return_device,
     )
+    if hasattr(indices, "d_left_idx") and hasattr(indices, "d_right_idx"):
+        return (indices.d_left_idx, indices.d_right_idx), execution
     if indices.ndim == 1:
         empty = np.asarray([], dtype=np.intp)
         return (empty, indices.astype(np.intp, copy=False)), execution
@@ -371,6 +393,8 @@ def _geom_predicate_query(
     predicate,
     distance,
     on_attribute=None,
+    *,
+    return_device: bool = False,
 ):
     """Compute geometric comparisons and get matching indices.
 
@@ -442,7 +466,11 @@ def _geom_predicate_query(
     # outer.  The owned engine handles 'within' directly so we pass the
     # current predicate (which may have been rewritten by R2 above).
     owned_result = _query_with_owned_spatial_index(
-        left_df, right_df, predicate, distance
+        left_df,
+        right_df,
+        predicate,
+        distance,
+        return_device=return_device,
     )
     if owned_result is not None:
         (l_idx, r_idx), owned_execution = owned_result
@@ -815,6 +843,7 @@ def _sjoin_nearest_export_result(
             lsuffix=lsuffix,
             rsuffix=rsuffix,
             distance_col=distance_col,
+            predicate="nearest",
         ),
         nearest_selected,
     )

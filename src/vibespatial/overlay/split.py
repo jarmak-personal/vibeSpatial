@@ -21,7 +21,7 @@ import numpy as np
 from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
-    count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_primitives import (
@@ -527,16 +527,14 @@ def build_gpu_split_events(
 
         with hotpath_stage("overlay.split.prefix_pair_events", category="sort"):
             pair_offsets = exclusive_sum(pair_counts)
-            pair_event_count = (
-                count_scatter_total(runtime, pair_counts, pair_offsets)
-                if int(result.count)
-                else 0
-            )
-        extra_source_ids = runtime.allocate((pair_event_count,), np.int32)
-        extra_t = runtime.allocate((pair_event_count,), np.float64)
-        extra_x = runtime.allocate((pair_event_count,), np.float64)
-        extra_y = runtime.allocate((pair_event_count,), np.float64)
-        extra_keys = runtime.allocate((pair_event_count,), np.uint64)
+            pair_event_count = 0
+        extra_source_ids = None
+        extra_t = None
+        extra_x = None
+        extra_y = None
+        extra_keys = None
+        rr_pair_event_count = 0
+        rr_count = 0
         rr_pair_counts = None
         rr_pair_offsets = None
         rr_extra_source_ids_raw = None
@@ -549,71 +547,6 @@ def build_gpu_split_events(
         rr_state = None
 
         try:
-            scatter_params = (
-                (
-                    ptr(device_state.left_lookup),
-                    ptr(device_state.right_lookup),
-                    ptr(device_state.kinds),
-                    ptr(device_state.point_x),
-                    ptr(device_state.point_y),
-                    ptr(device_state.overlap_x0),
-                    ptr(device_state.overlap_y0),
-                    ptr(device_state.overlap_x1),
-                    ptr(device_state.overlap_y1),
-                    ptr(left_x0),
-                    ptr(left_y0),
-                    ptr(left_x1),
-                    ptr(left_y1),
-                    ptr(right_x0),
-                    ptr(right_y0),
-                    ptr(right_x1),
-                    ptr(right_y1),
-                    ptr(pair_offsets),
-                    left_count,
-                    ptr(extra_source_ids),
-                    ptr(extra_t),
-                    ptr(extra_x),
-                    ptr(extra_y),
-                    ptr(extra_keys),
-                    result.count,
-                ),
-                (
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_PTR,
-                    KERNEL_PARAM_I32,
-                ),
-            )
-            scatter_grid, scatter_block = runtime.launch_config(kernels["scatter_pair_split_events"], result.count)
-            with hotpath_stage("overlay.split.scatter_pair_events", category="emit"):
-                runtime.launch(
-                    kernels["scatter_pair_split_events"],
-                    grid=scatter_grid,
-                    block=scatter_block,
-                    params=scatter_params,
-                )
-
             if remapped_right_row_indices is not None:
                 try:
                     with hotpath_stage("overlay.split.classify_right_right_intersections", category="refine"):
@@ -681,94 +614,183 @@ def build_gpu_split_events(
 
                         with hotpath_stage("overlay.split.prefix_right_right_events", category="sort"):
                             rr_pair_offsets = exclusive_sum(rr_pair_counts)
-                            rr_pair_event_count = (
-                                count_scatter_total(runtime, rr_pair_counts, rr_pair_offsets)
-                                if rr_count
-                                else 0
-                            )
-
-                        rr_extra_source_ids_raw = runtime.allocate((rr_pair_event_count,), np.int32)
-                        rr_extra_t = runtime.allocate((rr_pair_event_count,), np.float64)
-                        rr_extra_x = runtime.allocate((rr_pair_event_count,), np.float64)
-                        rr_extra_y = runtime.allocate((rr_pair_event_count,), np.float64)
-                        rr_extra_keys_raw = runtime.allocate((rr_pair_event_count,), np.uint64)
-
-                        rr_scatter_params = (
-                            (
-                                ptr(rr_left_lookup),
-                                ptr(rr_right_lookup),
-                                ptr(rr_kinds),
-                                ptr(rr_point_x),
-                                ptr(rr_point_y),
-                                ptr(rr_overlap_x0),
-                                ptr(rr_overlap_y0),
-                                ptr(rr_overlap_x1),
-                                ptr(rr_overlap_y1),
-                                ptr(right_x0),
-                                ptr(right_y0),
-                                ptr(right_x1),
-                                ptr(right_y1),
-                                ptr(right_x0),
-                                ptr(right_y0),
-                                ptr(right_x1),
-                                ptr(right_y1),
-                                ptr(rr_pair_offsets),
-                                right_count,
-                                ptr(rr_extra_source_ids_raw),
-                                ptr(rr_extra_t),
-                                ptr(rr_extra_x),
-                                ptr(rr_extra_y),
-                                ptr(rr_extra_keys_raw),
-                                rr_count,
-                            ),
-                            (
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_I32,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_PTR,
-                                KERNEL_PARAM_I32,
-                            ),
-                        )
-                        rr_scatter_grid, rr_scatter_block = runtime.launch_config(
-                            kernels["scatter_pair_split_events"], rr_count,
-                        )
-                        with hotpath_stage("overlay.split.scatter_right_right_events", category="emit"):
-                            runtime.launch(
-                                kernels["scatter_pair_split_events"],
-                                grid=rr_scatter_grid,
-                                block=rr_scatter_block,
-                                params=rr_scatter_params,
-                            )
-                            _sync_hotpath(runtime)
-
-                        rr_event_source_ids = (
-                            cp.asarray(rr_extra_source_ids_raw, dtype=cp.int32) % int(right_count)
-                        ).astype(cp.int32, copy=False) + np.int32(left_count)
-                        rr_event_keys = _pack_split_keys(rr_event_source_ids, rr_extra_t)
+                            rr_pair_event_count = 0
                 except Exception as exc:
                     raise RuntimeError(
                         f"overlay split grouped right-right event pipeline failed: {type(exc).__name__}: {exc}"
                     ) from exc
+
+            with hotpath_stage("overlay.split.resolve_pair_event_totals", category="sort"):
+                total_pairs = []
+                pair_total_slot = None
+                rr_total_slot = None
+                if int(result.count):
+                    pair_total_slot = len(total_pairs)
+                    total_pairs.append((pair_counts, pair_offsets))
+                if rr_pair_counts is not None and rr_pair_offsets is not None and rr_count:
+                    rr_total_slot = len(total_pairs)
+                    total_pairs.append((rr_pair_counts, rr_pair_offsets))
+                total_values = count_scatter_totals(runtime, total_pairs)
+                if pair_total_slot is not None:
+                    pair_event_count = total_values[pair_total_slot]
+                if rr_total_slot is not None:
+                    rr_pair_event_count = total_values[rr_total_slot]
+
+            extra_source_ids = runtime.allocate((pair_event_count,), np.int32)
+            extra_t = runtime.allocate((pair_event_count,), np.float64)
+            extra_x = runtime.allocate((pair_event_count,), np.float64)
+            extra_y = runtime.allocate((pair_event_count,), np.float64)
+            extra_keys = runtime.allocate((pair_event_count,), np.uint64)
+
+            scatter_params = (
+                (
+                    ptr(device_state.left_lookup),
+                    ptr(device_state.right_lookup),
+                    ptr(device_state.kinds),
+                    ptr(device_state.point_x),
+                    ptr(device_state.point_y),
+                    ptr(device_state.overlap_x0),
+                    ptr(device_state.overlap_y0),
+                    ptr(device_state.overlap_x1),
+                    ptr(device_state.overlap_y1),
+                    ptr(left_x0),
+                    ptr(left_y0),
+                    ptr(left_x1),
+                    ptr(left_y1),
+                    ptr(right_x0),
+                    ptr(right_y0),
+                    ptr(right_x1),
+                    ptr(right_y1),
+                    ptr(pair_offsets),
+                    left_count,
+                    ptr(extra_source_ids),
+                    ptr(extra_t),
+                    ptr(extra_x),
+                    ptr(extra_y),
+                    ptr(extra_keys),
+                    result.count,
+                ),
+                (
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_PTR,
+                    KERNEL_PARAM_I32,
+                ),
+            )
+            scatter_grid, scatter_block = runtime.launch_config(
+                kernels["scatter_pair_split_events"], result.count,
+            )
+            with hotpath_stage("overlay.split.scatter_pair_events", category="emit"):
+                runtime.launch(
+                    kernels["scatter_pair_split_events"],
+                    grid=scatter_grid,
+                    block=scatter_block,
+                    params=scatter_params,
+                )
+
+            if rr_pair_offsets is not None and rr_count:
+                rr_extra_source_ids_raw = runtime.allocate(
+                    (rr_pair_event_count,), np.int32,
+                )
+                rr_extra_t = runtime.allocate((rr_pair_event_count,), np.float64)
+                rr_extra_x = runtime.allocate((rr_pair_event_count,), np.float64)
+                rr_extra_y = runtime.allocate((rr_pair_event_count,), np.float64)
+                rr_extra_keys_raw = runtime.allocate((rr_pair_event_count,), np.uint64)
+
+                rr_scatter_params = (
+                    (
+                        ptr(rr_left_lookup),
+                        ptr(rr_right_lookup),
+                        ptr(rr_kinds),
+                        ptr(rr_point_x),
+                        ptr(rr_point_y),
+                        ptr(rr_overlap_x0),
+                        ptr(rr_overlap_y0),
+                        ptr(rr_overlap_x1),
+                        ptr(rr_overlap_y1),
+                        ptr(right_x0),
+                        ptr(right_y0),
+                        ptr(right_x1),
+                        ptr(right_y1),
+                        ptr(right_x0),
+                        ptr(right_y0),
+                        ptr(right_x1),
+                        ptr(right_y1),
+                        ptr(rr_pair_offsets),
+                        right_count,
+                        ptr(rr_extra_source_ids_raw),
+                        ptr(rr_extra_t),
+                        ptr(rr_extra_x),
+                        ptr(rr_extra_y),
+                        ptr(rr_extra_keys_raw),
+                        rr_count,
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                    ),
+                )
+                rr_scatter_grid, rr_scatter_block = runtime.launch_config(
+                    kernels["scatter_pair_split_events"], rr_count,
+                )
+                with hotpath_stage("overlay.split.scatter_right_right_events", category="emit"):
+                    runtime.launch(
+                        kernels["scatter_pair_split_events"],
+                        grid=rr_scatter_grid,
+                        block=rr_scatter_block,
+                        params=rr_scatter_params,
+                    )
+                    _sync_hotpath(runtime)
+
+                rr_event_source_ids = (
+                    cp.asarray(rr_extra_source_ids_raw, dtype=cp.int32)
+                    % int(right_count)
+                ).astype(cp.int32, copy=False) + np.int32(left_count)
+                rr_event_keys = _pack_split_keys(rr_event_source_ids, rr_extra_t)
 
             try:
                 with hotpath_stage("overlay.split.concat_events", category="emit"):

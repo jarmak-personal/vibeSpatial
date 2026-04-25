@@ -17,6 +17,7 @@ from vibespatial.bench.pipeline import (
     suite_to_json,
 )
 from vibespatial.bench.runner import _extract_gpu_util
+from vibespatial.runtime import has_gpu_runtime
 
 
 def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
@@ -25,19 +26,63 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
     by_name = {(result.pipeline, result.scale): result for result in results}
 
     assert ("join-heavy", 1000) in by_name
+    assert ("relation-semijoin", 1000) in by_name
     assert ("constructive", 1000) in by_name
     assert ("predicate-heavy", 1000) in by_name
     assert ("zero-transfer", 1000) in by_name
     assert by_name[("join-heavy", 1000)].status == "ok"
+    relation_semijoin = by_name[("relation-semijoin", 1000)]
+    assert relation_semijoin.status in {"ok", "deferred", "failed"}
+    if relation_semijoin.status != "deferred":
+        assert 0 < relation_semijoin.output_rows < 1000
+        relation_stages = {
+            stage["name"]: stage
+            for stage in relation_semijoin.stages[0]["stages"]
+        }
+        assert relation_stages["sjoin_relation"]["metadata"]["pair_storage"] in {
+            "device",
+            "host",
+        }
+        assert (
+            relation_stages["semijoin_rowset"]["metadata"][
+                "runtime_d2h_transfer_count_delta"
+            ]
+            == 0
+        )
+        assert (
+            relation_stages["subset_rows"]["metadata"][
+                "runtime_d2h_transfer_count_delta"
+            ]
+            == 0
+        )
+        assert (
+            relation_stages["subset_rows"]["metadata"]["materialization_count_delta"]
+            == 0
+        )
     assert by_name[("constructive", 1000)].output_rows >= 0
     assert by_name[("predicate-heavy", 1000)].selected_runtime in {"cpu", "hybrid", "gpu"}
     zero_transfer = by_name[("zero-transfer", 1000)]
     assert zero_transfer.status in {"ok", "deferred", "failed"}
+    if zero_transfer.status != "deferred":
+        assert 0 < zero_transfer.output_rows < 1000
+        predicate_stage = next(
+            stage
+            for stage in zero_transfer.stages[0]["stages"]
+            if stage["name"] == "predicate_filter"
+        )
+        assert predicate_stage["metadata"]["predicate_bounds"] == (
+            0.0,
+            0.0,
+            400.0,
+            400.0,
+        )
     if zero_transfer.status == "ok":
         assert zero_transfer.transfer_count == 0
         assert zero_transfer.materialization_count == 0
     elif zero_transfer.status == "failed":
-        assert (zero_transfer.runtime_d2h_transfer_count or 0) > 0
+        assert (zero_transfer.runtime_d2h_transfer_count or 0) > 0 or (
+            zero_transfer.materialization_count > 0
+        )
         assert zero_transfer.owned_transfer_count == 0
         stage_d2h = sum(
             stage["metadata"].get("runtime_d2h_transfer_count_delta", 0)
@@ -73,6 +118,207 @@ def test_pipeline_smoke_suite_runs_active_pipelines() -> None:
     assert "runtime_d2h_transfer_count" in join_payload
     assert "runtime_d2h_transfer_seconds" in join_payload
     assert join_payload["profile_mode"] == "lean"
+
+
+def test_relation_bridge_consumer_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("relation-bridge-consumer",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "relation-bridge-consumer"
+    assert result.scale == 1000
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "native_state_seed",
+        "sjoin_relation_export",
+        "native_semijoin_consumer",
+        "public_joined_export_consumer",
+    }
+    assert (
+        stage_by_name["native_semijoin_consumer"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_semijoin_consumer"]["metadata"]["admissibility"]
+        == "unique_label_semijoin"
+    )
+    assert (
+        stage_by_name["native_semijoin_consumer"]["metadata"][
+            "preserve_public_index"
+        ]
+        is True
+    )
+    expected_index_kinds = {"device-labels"} if has_gpu_runtime() else {
+        "range",
+        "host-labels",
+    }
+    assert (
+        stage_by_name["native_semijoin_consumer"]["metadata"]["native_index_kind"]
+        in expected_index_kinds
+    )
+    expected_pair_storage = "device" if has_gpu_runtime() else "host"
+    assert (
+        stage_by_name["sjoin_relation_export"]["metadata"]["pair_storage"]
+        == expected_pair_storage
+    )
+    assert (
+        stage_by_name["sjoin_relation_export"]["metadata"]["device_pair_request"]
+        == "requested"
+    )
+    assert (
+        stage_by_name["public_joined_export_consumer"]["metadata"][
+            "materialization_count_delta"
+        ]
+        >= 1
+    )
+    assert stage_by_name["public_joined_export_consumer"]["metadata"]["results_match"] is True
+    assert trace["metadata"]["admissible_shape"] == (
+        "native-backed public relation export -> unique-label semijoin native frame"
+    )
+
+
+def test_grouped_reducer_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("grouped-reducer",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "grouped-reducer"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_dense_codes",
+        "native_sum",
+        "public_groupby_reference",
+    }
+    assert stage_by_name["native_sum"]["metadata"]["result_storage"] == "device"
+    assert stage_by_name["native_sum"]["metadata"]["runtime_d2h_transfer_count_delta"] == 0
+    assert stage_by_name["native_sum"]["metadata"]["materialization_count_delta"] == 0
+    assert stage_by_name["public_groupby_reference"]["metadata"]["results_match"] is True
+    assert (
+        stage_by_name["public_groupby_reference"]["metadata"][
+            "materialization_count_delta"
+        ]
+        >= 1
+    )
+    assert trace["metadata"]["admissible_shape"] == "dense-code NativeGrouped numeric sum"
+
+
+def test_small_grouped_constructive_reduce_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("small-grouped-constructive-reduce",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "small-grouped-constructive-reduce"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_device_grouped_polygons",
+        "native_grouped_union",
+        "shapely_reference",
+    }
+    assert (
+        stage_by_name["native_grouped_union"]["metadata"]["result_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_grouped_union"]["metadata"][
+            "used_many_small_batch"
+        ]
+        is True
+    )
+    assert (
+        stage_by_name["native_grouped_union"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_grouped_union"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        <= 3
+    )
+    assert (
+        stage_by_name["native_grouped_union"]["metadata"][
+            "runtime_d2h_transfer_bytes_delta"
+        ]
+        <= 64
+    )
+    assert stage_by_name["shapely_reference"]["metadata"]["results_match"] is True
+    assert (
+        trace["metadata"]["admissible_shape"]
+        == "owned device polygons + dense group offsets -> batched grouped constructive reduce"
+    )
+
+
+def test_relation_attribute_reducer_pipeline_smoke() -> None:
+    results = benchmark_pipeline_suite(
+        suite="smoke",
+        pipelines=("relation-attribute-reducer",),
+    )
+    assert len(results) == 1
+    result = results[0]
+    assert result.pipeline == "relation-attribute-reducer"
+    assert result.scale == 1000
+    if result.status == "deferred":
+        return
+    assert result.status == "ok"
+
+    trace = result.stages[0]
+    stage_by_name = {stage["name"]: stage for stage in trace["stages"]}
+    assert set(stage_by_name) == {
+        "build_relation_inputs",
+        "native_attribute_reduce",
+        "public_groupby_reference",
+    }
+    assert stage_by_name["build_relation_inputs"]["metadata"]["pair_storage"] == "device"
+    assert (
+        stage_by_name["native_attribute_reduce"]["metadata"]["result_storage"]
+        == "device"
+    )
+    assert (
+        stage_by_name["native_attribute_reduce"]["metadata"][
+            "runtime_d2h_transfer_count_delta"
+        ]
+        == 0
+    )
+    assert (
+        stage_by_name["native_attribute_reduce"]["metadata"][
+            "materialization_count_delta"
+        ]
+        == 0
+    )
+    assert stage_by_name["public_groupby_reference"]["metadata"]["results_match"] is True
+    assert (
+        stage_by_name["public_groupby_reference"]["metadata"][
+            "materialization_count_delta"
+        ]
+        >= 1
+    )
+    assert trace["metadata"]["admissible_shape"] == (
+        "device NativeRelation -> grouped right numeric attributes by left rows"
+    )
 
 
 def test_pipeline_profile_mode_controls_expensive_gpu_monitors(
@@ -131,6 +377,114 @@ def test_pipeline_profile_mode_controls_expensive_gpu_monitors(
         pipeline_module._deferred_raster_pipeline(1000, profile_mode="audit").profile_mode
         == "audit"
     )
+
+
+def test_pipeline_audit_counts_runtime_materialization_events() -> None:
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        clear_materialization_events,
+        record_materialization_event,
+    )
+
+    clear_materialization_events()
+    audit = pipeline_module._OwnedAudit()
+
+    record_materialization_event(
+        surface="test.pipeline",
+        boundary=MaterializationBoundary.USER_EXPORT,
+        operation="export",
+        reason="test materialization",
+    )
+
+    assert audit.materialization_count == 1
+    assert audit.snapshot()[1] == 1
+    clear_materialization_events()
+
+
+def test_stage_profiler_attaches_materialization_event_context() -> None:
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        clear_materialization_events,
+        record_materialization_event,
+    )
+
+    clear_materialization_events()
+    profiler = pipeline_module._stage_profiler(
+        operation="pipeline.zero-transfer",
+        dataset="full",
+        requested_runtime="gpu",
+        selected_runtime="gpu",
+    )
+
+    with profiler.stage(
+        "read_input",
+        category="setup",
+        device="gpu",
+    ):
+        record_materialization_event(
+            surface="vibespatial.api.NativeTabularResult.to_geodataframe",
+            boundary=MaterializationBoundary.USER_EXPORT,
+            operation="native_tabular_to_geodataframe",
+            reason="test export",
+        )
+
+    trace = profiler.finish()
+    metadata = trace.stages[0].metadata
+    event = metadata["materialization_events"][0]
+
+    assert metadata["materialization_count_delta"] == 1
+    assert event["pipeline"] == "pipeline.zero-transfer"
+    assert event["dataset"] == "full"
+    assert event["stage"] == "read_input"
+    assert event["stage_category"] == "setup"
+    assert event["surface"] == "vibespatial.api.NativeTabularResult.to_geodataframe"
+    clear_materialization_events()
+
+
+def test_stage_profiler_attaches_runtime_d2h_transfer_context() -> None:
+    import numpy as np
+
+    from vibespatial.cuda._runtime import (
+        _notify_runtime_d2h_transfer,
+        reset_d2h_transfer_count,
+    )
+
+    reset_d2h_transfer_count()
+    profiler = pipeline_module._stage_profiler(
+        operation="pipeline.zero-transfer",
+        dataset="scale-1",
+        requested_runtime="gpu",
+        selected_runtime="gpu",
+    )
+
+    device_like = np.empty(4, dtype=np.int32)
+    with profiler.stage(
+        "read_input",
+        category="setup",
+        device="gpu",
+    ):
+        _notify_runtime_d2h_transfer(
+            device_like,
+            trigger="unit-test",
+            reason="test runtime transfer",
+            elapsed_seconds=0.125,
+        )
+
+    trace = profiler.finish()
+    metadata = trace.stages[0].metadata
+    event = metadata["runtime_d2h_transfer_events"][0]
+
+    assert metadata["runtime_d2h_transfer_count_delta"] == 1
+    assert metadata["runtime_d2h_transfer_bytes_delta"] == device_like.nbytes
+    assert event["pipeline"] == "pipeline.zero-transfer"
+    assert event["dataset"] == "scale-1"
+    assert event["stage"] == "read_input"
+    assert event["stage_category"] == "setup"
+    assert event["trigger"] == "unit-test"
+    assert event["reason"] == "test runtime transfer"
+    assert event["item_count"] == 4
+    assert event["bytes_transferred"] == device_like.nbytes
+    reset_d2h_transfer_count()
 
 
 def test_benchmark_pipeline_suite_precompiles_full_stack(

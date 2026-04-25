@@ -32,6 +32,11 @@ def pair_cache_token(df) -> tuple[str, int, int]:
 
 
 def cache_intersection_pairs(left_df, right_df, left_indices, right_indices) -> None:
+    if hasattr(left_indices, "__cuda_array_interface__") or hasattr(
+        right_indices,
+        "__cuda_array_interface__",
+    ):
+        return
     left_key = (pair_cache_token(left_df), pair_cache_token(right_df))
     right_key = (left_key[1], left_key[0])
     left_index_values = np.asarray(left_df.index.to_numpy(copy=False), dtype=object)

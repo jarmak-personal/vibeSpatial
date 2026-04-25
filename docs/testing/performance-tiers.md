@@ -5,7 +5,7 @@ Scope: Performance tier gates, reference datasets, and benchmark acceptance poli
 Read If: You are defining kernel success criteria, benchmark rails, or performance gates.
 STOP IF: Your task is limited to a single benchmark implementation detail already routed elsewhere.
 Source Of Truth: Phase-0 performance gate policy for GPU kernel work.
-Body Budget: 131/240 lines
+Body Budget: 158/240 lines
 Document: docs/testing/performance-tiers.md
 
 Section Map (Body Lines)
@@ -13,17 +13,18 @@ Section Map (Body Lines)
 |---|---|
 | 1-5 | Preamble |
 | 6-10 | Intent |
-| 11-20 | Request Signals |
-| 21-27 | Open First |
-| 28-32 | Verify |
-| 33-38 | Risks |
-| 39-49 | Denominator |
-| 50-68 | Reference Scale |
-| 69-81 | Tier Table |
-| 82-95 | Tier Rules |
-| 96-107 | Mapping To Roadmap |
-| 108-123 | Acceptance Policy |
-| 124-131 | Verification |
+| 11-22 | Request Signals |
+| 23-29 | Open First |
+| 30-34 | Verify |
+| 35-40 | Risks |
+| 41-51 | Denominator |
+| 52-70 | Reference Scale |
+| 71-83 | Tier Table |
+| 84-108 | Transient Latency Gates |
+| 109-122 | Tier Rules |
+| 123-134 | Mapping To Roadmap |
+| 135-150 | Acceptance Policy |
+| 151-158 | Verification |
 DOC_HEADER:END -->
 
 Define the minimum performance gates for GPU-first kernel work before the
@@ -42,6 +43,8 @@ rules so each kernel can declare success against the same denominator.
 - speedup
 - throughput
 - latency
+- transient native work
+- scalar fence budget
 - kernel tier
 
 ## Open First
@@ -104,6 +107,31 @@ checking in sourced benchmark data.
 
 CRS transforms are out of scope for these tiers because that work is expected
 to route through cuProj policy later in `o17.6.3`.
+
+## Transient Latency Gates
+
+ADR-0045 adds latency budgets for small native work items inside larger
+workflows. These gates complement throughput tiers; they do not replace
+speedup measurements for large kernels.
+
+Every transient-shape canary should report runtime D2H count/bytes,
+materialization count, scalar allocation fences when distinguishable, launch or
+stage count when observable, input/output residency, and the public export
+boundary if one exists.
+
+Default gates for admitted native transient stages:
+
+| Metric | Gate |
+|---|---:|
+| Hidden materialization | 0 |
+| Device output residency | required |
+| Runtime D2H for rowset/filter/export consumers | 0 |
+| Runtime D2H for scalar allocation totals | ratchet, batched, documented |
+| Scalar-only D2H payload | <=64 bytes per native stage unless justified |
+
+Small-shape canaries should run at `10K` and at representative transient
+shapes such as many groups of size 2-8 or 2-16. Workflow shootouts may observe
+impact, but the acceptance gate belongs to the reusable transient shape.
 
 ## Tier Rules
 

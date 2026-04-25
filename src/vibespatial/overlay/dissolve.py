@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import statistics
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from time import perf_counter
@@ -13,6 +14,8 @@ import pandas as pd
 import shapely
 from shapely.geometry import GeometryCollection
 
+from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedAttributeReduction
+from vibespatial.api._native_result_core import NativeAttributeTable
 from vibespatial.api._native_results import (
     GeometryNativeResult,
     NativeTabularResult,
@@ -51,6 +54,10 @@ _BUFFERED_TWO_POINT_SMALL_PARTIAL_UNION_MAX_ROWS = 2
 _BUFFERED_LINE_EXACT_CPU_MAX_ROWS = 2_048
 _COVERAGE_REWRITE_MAX_CANDIDATE_PAIRS = 250_000
 _COVERAGE_REWRITE_NEGATIVE_PROBE_PAIRS = 1
+_NATIVE_GROUPED_ATTRIBUTE_REDUCERS = frozenset(
+    {"sum", "count", "mean", "min", "max", "first", "last"}
+)
+_NATIVE_GROUPED_TAKE_REDUCERS = frozenset({"first", "last"})
 logger = logging.getLogger(__name__)
 
 
@@ -739,6 +746,289 @@ def _build_row_group_codes(
     return np.asarray(codes, dtype=np.int32)
 
 
+def _native_dissolve_group_index_and_codes(
+    frame,
+    *,
+    by,
+    level,
+    observed: bool,
+    sort: bool,
+    dropna: bool,
+) -> tuple[pd.Index, np.ndarray, tuple[Any, ...]] | None:
+    """Build the narrow group contract used by native dissolve reducers."""
+    if level is not None:
+        return None
+    if by is None:
+        return (
+            pd.Index(np.asarray([0], dtype=np.int64)),
+            np.zeros(len(frame), dtype=np.int32),
+            tuple(),
+        )
+    if not isinstance(by, str) or by not in frame.columns or by == frame.geometry.name:
+        return None
+
+    key = frame[by]
+    if not isinstance(key, pd.Series):
+        return None
+    if isinstance(key.dtype, pd.CategoricalDtype):
+        return _native_categorical_group_index_and_codes(
+            key,
+            observed=observed,
+            sort=sort,
+            dropna=dropna,
+        )
+    if not dropna:
+        return None
+    if len(frame) == 0:
+        return pd.Index([], dtype=np.int64), np.asarray([], dtype=np.int32), tuple()
+    if key.hasnans:
+        return None
+    try:
+        unique_values = pd.Index(pd.unique(key.to_numpy(copy=False)), name=key.name)
+        if sort:
+            unique_values = unique_values.sort_values()
+        codes = unique_values.get_indexer(pd.Index(key.to_numpy(copy=False)))
+    except Exception:
+        return None
+    if np.any(codes < 0):
+        return None
+    return unique_values, np.asarray(codes, dtype=np.int32), (by,)
+
+
+def _native_categorical_group_index_and_codes(
+    key: pd.Series,
+    *,
+    observed: bool,
+    sort: bool,
+    dropna: bool,
+) -> tuple[pd.CategoricalIndex, np.ndarray, tuple[Any, ...]]:
+    category = key.array
+    raw_codes = np.asarray(category.codes, dtype=np.int32)
+    category_count = len(category.categories)
+    category_codes = np.arange(category_count, dtype=np.int32)
+    valid_codes = raw_codes[raw_codes >= 0]
+    include_null = bool(not dropna and np.any(raw_codes < 0))
+    if observed:
+        if sort:
+            observed_mask = np.zeros(category_count, dtype=bool)
+            observed_mask[valid_codes] = True
+            output_codes = category_codes[observed_mask]
+            if include_null:
+                output_codes = np.concatenate(
+                    [output_codes, np.asarray([-1], dtype=np.int32)],
+                )
+        elif valid_codes.size:
+            first_seen: list[int] = []
+            seen: set[int] = set()
+            for raw_code in raw_codes:
+                code = int(raw_code)
+                if code < 0 and not include_null:
+                    continue
+                if code not in seen:
+                    seen.add(code)
+                    first_seen.append(code)
+            output_codes = np.asarray(first_seen, dtype=np.int32)
+        elif include_null:
+            output_codes = np.asarray([-1], dtype=np.int32)
+        else:
+            output_codes = np.asarray([], dtype=np.int32)
+    elif sort:
+        output_codes = category_codes
+        if include_null:
+            output_codes = np.concatenate(
+                [output_codes, np.asarray([-1], dtype=np.int32)],
+            )
+    else:
+        observed_mask = np.zeros(category_count, dtype=bool)
+        first_seen = []
+        seen: set[int] = set()
+        for raw_code in raw_codes:
+            code = int(raw_code)
+            if code < 0 and not include_null:
+                continue
+            if code not in seen:
+                seen.add(code)
+                first_seen.append(code)
+                if code >= 0:
+                    observed_mask[code] = True
+        output_codes = np.concatenate(
+            [
+                np.asarray(first_seen, dtype=np.int32),
+                category_codes[~observed_mask],
+            ],
+        ).astype(np.int32, copy=False)
+
+    code_to_position = np.full(category_count, -1, dtype=np.int32)
+    category_output_mask = output_codes >= 0
+    category_output_codes = output_codes[category_output_mask]
+    if category_output_codes.size:
+        code_to_position[category_output_codes] = np.flatnonzero(
+            category_output_mask,
+        ).astype(np.int32, copy=False)
+    null_positions = np.flatnonzero(output_codes < 0)
+    null_position = int(null_positions[0]) if null_positions.size else None
+    row_group_codes = np.full(raw_codes.shape, -1, dtype=np.int32)
+    valid_mask = raw_codes >= 0
+    row_group_codes[valid_mask] = code_to_position[raw_codes[valid_mask]]
+    if null_position is not None:
+        row_group_codes[raw_codes < 0] = null_position
+    output_index = pd.CategoricalIndex(
+        pd.Categorical.from_codes(
+            output_codes.astype(np.int64, copy=False),
+            categories=category.categories,
+            ordered=category.ordered,
+        ),
+        name=key.name,
+    )
+    return output_index, row_group_codes, (key.name,)
+
+
+def _native_dissolve_reducers(
+    *,
+    aggfunc,
+    agg_kwargs: dict[str, Any],
+    data_columns: pd.Index,
+    group_key_columns: tuple[Any, ...],
+) -> dict[Any, str] | None:
+    if agg_kwargs or len(set(data_columns)) != len(data_columns):
+        return None
+    if isinstance(aggfunc, str):
+        reducer = aggfunc.lower()
+        if reducer not in _NATIVE_GROUPED_ATTRIBUTE_REDUCERS:
+            return None
+        return {
+            column: reducer
+            for column in data_columns
+            if column not in group_key_columns
+        }
+    if not isinstance(aggfunc, Mapping):
+        return None
+
+    reducers: dict[Any, str] = {}
+    known_columns = set(data_columns)
+    for column, reducer in aggfunc.items():
+        if column not in known_columns or not isinstance(reducer, str):
+            return None
+        normalized = reducer.lower()
+        if normalized not in _NATIVE_GROUPED_ATTRIBUTE_REDUCERS:
+            return None
+        reducers[column] = normalized
+    return reducers
+
+
+def _native_attribute_table_for_dissolve(frame, data: pd.DataFrame) -> NativeAttributeTable:
+    from vibespatial.api._native_state import get_native_state
+
+    state = get_native_state(frame)
+    if state is not None:
+        return NativeAttributeTable.from_value(state.attributes)
+    return NativeAttributeTable(dataframe=data)
+
+
+def _reduce_native_grouped_dissolve_attributes(
+    attributes: NativeAttributeTable,
+    grouped: NativeGrouped,
+    reducers: Mapping[Any, str],
+) -> tuple[NativeGroupedAttributeReduction, bool] | None:
+    numeric_columns = attributes.numeric_column_arrays(tuple(reducers))
+    if numeric_columns is not None:
+        return grouped.reduce_numeric_columns(numeric_columns, reducers), False
+
+    reduced_columns = {}
+    used_take_reducer = False
+    for column, reducer in reducers.items():
+        numeric_column = attributes.numeric_column_arrays((column,))
+        if numeric_column is not None:
+            reduced_columns[column] = grouped.reduce_numeric(
+                numeric_column[column],
+                reducer,
+            )
+            continue
+        if reducer in _NATIVE_GROUPED_TAKE_REDUCERS:
+            take_column = attributes.host_column_series((column,))
+            if take_column is not None:
+                reduced_columns[column] = grouped.reduce_take(
+                    take_column[column],
+                    reducer,
+                )
+                used_take_reducer = True
+                continue
+        return None
+
+    return (
+        NativeGroupedAttributeReduction(
+            columns=reduced_columns,
+            group_count=grouped.resolved_group_count,
+            output_index_plan=grouped.output_index_plan,
+        ),
+        used_take_reducer,
+    )
+
+
+def _try_prepare_native_grouped_dissolve_attributes(
+    frame,
+    data: pd.DataFrame,
+    *,
+    by,
+    aggfunc,
+    level,
+    observed: bool,
+    sort: bool,
+    dropna: bool,
+    agg_kwargs: dict[str, Any],
+) -> tuple[NativeAttributeTable, np.ndarray] | None:
+    group_contract = _native_dissolve_group_index_and_codes(
+        frame,
+        by=by,
+        level=level,
+        observed=observed,
+        sort=sort,
+        dropna=dropna,
+    )
+    if group_contract is None:
+        return None
+    output_index, row_group_codes, group_key_columns = group_contract
+    reducers = _native_dissolve_reducers(
+        aggfunc=aggfunc,
+        agg_kwargs=agg_kwargs,
+        data_columns=data.columns,
+        group_key_columns=group_key_columns,
+    )
+    if reducers is None:
+        return None
+
+    attributes = _native_attribute_table_for_dissolve(frame, data)
+    grouped = NativeGrouped.from_dense_codes(
+        row_group_codes,
+        group_count=len(output_index),
+        output_index=output_index,
+    )
+    reduced_result = _reduce_native_grouped_dissolve_attributes(
+        attributes,
+        grouped,
+        reducers,
+    )
+    if reduced_result is None:
+        return None
+    reduced, used_take_reducer = reduced_result
+    record_dispatch_event(
+        surface="geopandas.geodataframe.dissolve",
+        operation="dissolve_attribute_aggregation",
+        implementation=(
+            "native_grouped_attribute_reducers"
+            if used_take_reducer
+            else "native_grouped_numeric_reducers"
+        ),
+        reason="admitted dissolve attributes reduced through NativeGrouped",
+        detail=(
+            f"rows={len(frame)}, groups={len(output_index)}, "
+            f"columns={len(reducers)}, reducers={sorted(set(reducers.values()))}"
+        ),
+        selected=ExecutionMode.GPU if reduced.is_device else ExecutionMode.CPU,
+    )
+    return reduced.to_native_attribute_table(), row_group_codes
+
+
 def _group_offsets_from_sorted_codes(sorted_codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if sorted_codes.size == 0:
         return np.asarray([0], dtype=np.int32), np.asarray([], dtype=np.int32)
@@ -763,6 +1053,16 @@ def _group_non_empty_counts(row_group_codes: np.ndarray, group_count: int) -> tu
     counts = np.bincount(observed.astype(np.int32, copy=False), minlength=group_count)
     non_empty = int(np.count_nonzero(counts))
     return non_empty, int(group_count - non_empty)
+
+
+def _row_code_count(row_group_codes: Any) -> int:
+    shape = getattr(row_group_codes, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[0])
+    size = getattr(row_group_codes, "size", None)
+    if size is not None:
+        return int(size)
+    return len(row_group_codes)
 
 
 def _tag_grouped_convex_hull_source(
@@ -797,6 +1097,13 @@ def _group_positions_from_codes(row_group_codes: np.ndarray, group_count: int) -
 def _owned_supports_polygonal_grouped_union(owned: OwnedGeometryArray) -> bool:
     from vibespatial.geometry.buffers import GeometryFamily
     from vibespatial.geometry.owned import FAMILY_TAGS
+
+    polygonal_families = {
+        GeometryFamily.POLYGON,
+        GeometryFamily.MULTIPOLYGON,
+    }
+    if owned.device_state is not None:
+        return set(owned.device_state.families).issubset(polygonal_families)
 
     valid_tags = owned.tags[owned.validity]
     polygon_tags = np.asarray(
@@ -1207,13 +1514,15 @@ def _owned_rectangle_bounds_device(owned: OwnedGeometryArray):
 
 
 def execute_grouped_box_union_gpu_owned_codes(
-    row_group_codes: np.ndarray,
+    row_group_codes: Any,
     *,
     group_count: int,
     owned: OwnedGeometryArray,
 ) -> GroupedUnionResult | None:
     if cp is None:
         return None
+    if _row_code_count(row_group_codes) != int(owned.row_count):
+        raise ValueError("row_group_codes length must match owned geometry row count")
 
     try:
         d_bounds = _owned_rectangle_bounds_device(owned)
@@ -1318,12 +1627,11 @@ def execute_grouped_box_union_gpu_owned_codes(
     d_group_bounds = cp.stack((d_xmin, d_ymin, d_xmax, d_ymax), axis=1)
     reduced = _build_device_boxes_from_bounds(d_group_bounds, row_count=group_count)
 
-    non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
     return GroupedUnionResult(
         geometries=None,
         group_count=group_count,
-        non_empty_groups=non_empty_groups,
-        empty_groups=empty_groups,
+        non_empty_groups=group_count,
+        empty_groups=0,
         method=DissolveUnionMethod.COVERAGE,
         owned=reduced,
     )
@@ -2023,90 +2331,25 @@ def execute_grouped_union_codes(
     if geometry_count != row_group_codes.size:
         raise ValueError("row_group_codes length must match geometries length")
 
-    owned_supports_segmented_union = False
-    if owned is not None:
-        from vibespatial.geometry.buffers import GeometryFamily
-        from vibespatial.geometry.owned import FAMILY_TAGS
-
-        valid_tags = owned.tags[owned.validity]
-        polygon_tags = np.asarray(
-            [
-                FAMILY_TAGS[GeometryFamily.POLYGON],
-                FAMILY_TAGS[GeometryFamily.MULTIPOLYGON],
-            ],
-            dtype=valid_tags.dtype if valid_tags.size else np.int8,
-        )
-        owned_supports_segmented_union = bool(
-            valid_tags.size == 0 or np.all(np.isin(valid_tags, polygon_tags))
-        )
-
     if (
         owned is not None
-        and owned_supports_segmented_union
         and normalized is DissolveUnionMethod.UNARY
         and grid_size is None
+        and _owned_supports_polygonal_grouped_union(owned)
     ):
-        observed_mask = row_group_codes >= 0
-        if not np.any(observed_mask):
-            merged = np.full(group_count, _EMPTY, dtype=object)
-            return GroupedUnionResult(
-                geometries=merged,
-                group_count=group_count,
-                non_empty_groups=0,
-                empty_groups=group_count,
-                method=normalized,
-            )
-        from vibespatial.kernels.constructive.segmented_union import segmented_union_all
-
-        observed_codes = row_group_codes[observed_mask].astype(np.int32, copy=False)
-        observed_rows = np.flatnonzero(observed_mask).astype(np.int64, copy=False)
-        order = np.argsort(observed_codes, kind="stable")
-        sorted_codes = observed_codes[order]
-        sorted_rows = observed_rows[order]
-        offsets, unique_codes = _group_offsets_from_sorted_codes(sorted_codes)
-        ordered_owned = owned.take(sorted_rows)
-        if group_count == 1:
-            from vibespatial.constructive.union_all import (
-                _spatially_localize_polygon_union_inputs,
-            )
-
-            ordered_owned = _spatially_localize_polygon_union_inputs(ordered_owned)
-        reduced = segmented_union_all(ordered_owned, offsets)
-        reduced = _recompute_invalid_grouped_union_owned_rows(
-            reduced,
-            ordered_owned=ordered_owned,
-            offsets=offsets,
-            group_count=int(unique_codes.size),
-        )
-        if unique_codes.size == group_count and np.array_equal(
-            unique_codes,
-            np.arange(group_count, dtype=unique_codes.dtype),
-        ):
-            _tag_grouped_convex_hull_source(
-                reduced,
-                ordered_owned=ordered_owned,
-                offsets=offsets,
-            )
-            non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
-            return GroupedUnionResult(
-                geometries=None,
-                group_count=group_count,
-                non_empty_groups=non_empty_groups,
-                empty_groups=empty_groups,
-                method=normalized,
-                owned=reduced,
-            )
-        reduced_geometries = np.asarray(reduced.to_shapely(), dtype=object)
-        merged = np.full(group_count, _EMPTY, dtype=object)
-        merged[unique_codes.astype(np.intp, copy=False)] = reduced_geometries
-        non_empty_groups, empty_groups = _group_non_empty_counts(row_group_codes, group_count)
-        return GroupedUnionResult(
-            geometries=merged,
+        native_grouped = NativeGrouped.from_dense_codes(
+            row_group_codes,
             group_count=group_count,
-            non_empty_groups=non_empty_groups,
-            empty_groups=empty_groups,
-            method=normalized,
         )
+        accelerated = execute_native_grouped_union(
+            native_grouped,
+            _geometries=geometries,
+            method=normalized,
+            grid_size=grid_size,
+            owned=owned,
+        )
+        if accelerated is not None:
+            return accelerated
 
     if (
         owned is not None
@@ -2195,6 +2438,93 @@ def execute_grouped_union_codes(
             )
         return exact
     return None
+
+
+def execute_native_grouped_union(
+    grouped: NativeGrouped,
+    *,
+    _geometries: Sequence[object | None] | np.ndarray,
+    method: DissolveUnionMethod | str = DissolveUnionMethod.UNARY,
+    grid_size: float | None = None,
+    owned: OwnedGeometryArray | None = None,
+) -> GroupedUnionResult | None:
+    """Execute admitted grouped geometry union from a `NativeGrouped` carrier."""
+    normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
+    if owned is None or grid_size is not None:
+        return None
+    if normalized is DissolveUnionMethod.COVERAGE:
+        return execute_grouped_box_union_gpu_owned_codes(
+            grouped.group_codes,
+            group_count=grouped.resolved_group_count,
+            owned=owned,
+        )
+    if (
+        normalized is not DissolveUnionMethod.UNARY
+        or grouped.is_device
+        or not _owned_supports_polygonal_grouped_union(owned)
+    ):
+        return None
+
+    group_count = grouped.resolved_group_count
+    group_ids = np.asarray(grouped.group_ids, dtype=np.int32)
+    offsets = np.asarray(grouped.group_offsets, dtype=np.int32)
+    if group_ids.size == 0:
+        merged = np.full(group_count, _EMPTY, dtype=object)
+        return GroupedUnionResult(
+            geometries=merged,
+            group_count=group_count,
+            non_empty_groups=0,
+            empty_groups=group_count,
+            method=normalized,
+        )
+
+    from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+
+    sorted_rows = np.asarray(grouped.sorted_order, dtype=np.int64)
+    ordered_owned = owned.take(sorted_rows)
+    if group_count == 1:
+        from vibespatial.constructive.union_all import (
+            _spatially_localize_polygon_union_inputs,
+        )
+
+        ordered_owned = _spatially_localize_polygon_union_inputs(ordered_owned)
+    reduced = segmented_union_all(ordered_owned, offsets)
+    reduced = _recompute_invalid_grouped_union_owned_rows(
+        reduced,
+        ordered_owned=ordered_owned,
+        offsets=offsets,
+        group_count=int(group_ids.size),
+    )
+    non_empty_groups = int(group_ids.size)
+    empty_groups = int(group_count - non_empty_groups)
+    if group_ids.size == group_count and np.array_equal(
+        group_ids,
+        np.arange(group_count, dtype=group_ids.dtype),
+    ):
+        _tag_grouped_convex_hull_source(
+            reduced,
+            ordered_owned=ordered_owned,
+            offsets=offsets,
+        )
+        return GroupedUnionResult(
+            geometries=None,
+            group_count=group_count,
+            non_empty_groups=non_empty_groups,
+            empty_groups=empty_groups,
+            method=normalized,
+            owned=reduced,
+        )
+
+    reduced_geometries = np.asarray(reduced.to_shapely(), dtype=object)
+    merged = np.full(group_count, _EMPTY, dtype=object)
+    merged[group_ids.astype(np.intp, copy=False)] = reduced_geometries
+    return GroupedUnionResult(
+        geometries=merged,
+        group_count=group_count,
+        non_empty_groups=non_empty_groups,
+        empty_groups=empty_groups,
+        method=normalized,
+    )
 
 
 def execute_grouped_union(
@@ -2291,12 +2621,18 @@ def _prepare_grouped_dissolve(
     dropna: bool,
     normalized_method: DissolveUnionMethod,
     agg_kwargs: dict[str, Any],
-) -> tuple[pd.DataFrame, list[np.ndarray], OwnedGeometryArray | None, np.ndarray | None]:
-    if by is None and level is None:
-        by = np.zeros(len(frame), dtype="int64")
+) -> tuple[
+    pd.DataFrame | NativeAttributeTable,
+    list[np.ndarray],
+    OwnedGeometryArray | None,
+    np.ndarray | None,
+]:
+    groupby_by = by
+    if groupby_by is None and level is None:
+        groupby_by = np.zeros(len(frame), dtype="int64")
 
     groupby_kwargs = {
-        "by": by,
+        "by": groupby_by,
         "level": level,
         "sort": sort,
         "observed": observed,
@@ -2304,15 +2640,29 @@ def _prepare_grouped_dissolve(
     }
 
     data = frame.drop(labels=frame.geometry.name, axis=1)
-    aggregated_data = data.groupby(**groupby_kwargs).agg(aggfunc, **agg_kwargs)
-    aggregated_data.columns = aggregated_data.columns.to_flat_index()
-
-    row_group_codes = _build_row_group_codes(
+    native_prepared = _try_prepare_native_grouped_dissolve_attributes(
         frame,
+        data,
         by=by,
+        aggfunc=aggfunc,
         level=level,
-        aggregated_index=aggregated_data.index,
+        observed=observed,
+        sort=sort,
+        dropna=dropna,
+        agg_kwargs=agg_kwargs,
     )
+    if native_prepared is None:
+        aggregated_data = data.groupby(**groupby_kwargs).agg(aggfunc, **agg_kwargs)
+        aggregated_data.columns = aggregated_data.columns.to_flat_index()
+        row_group_codes = _build_row_group_codes(
+            frame,
+            by=groupby_by,
+            level=level,
+            aggregated_index=aggregated_data.index,
+        )
+    else:
+        aggregated_data, row_group_codes = native_prepared
+
     if row_group_codes is None:
         grouped_geometry = frame.groupby(group_keys=False, **groupby_kwargs)[frame.geometry.name]
         indices_items = list(grouped_geometry.indices.items())

@@ -20,13 +20,25 @@ def test_public_dispatch_events_are_observable() -> None:
 
     events = geopandas.get_dispatch_events(clear=True)
 
-    assert [event.surface for event in events[-3:]] == [
-        "geopandas.array.buffer",
-        "geopandas.array.make_valid",
-        "geopandas.geodataframe.dissolve",
-    ]
-    assert events[-3].implementation == "owned_stroke_kernel"
+    buffer_event = next(
+        event
+        for event in events
+        if event.surface == "geopandas.array.buffer"
+        and event.implementation == "owned_stroke_kernel"
+    )
+    make_valid_event = next(
+        event
+        for event in events
+        if event.surface == "geopandas.array.make_valid"
+    )
+    dissolve_event = next(
+        event
+        for event in reversed(events)
+        if event.surface == "geopandas.geodataframe.dissolve"
+    )
+
+    assert events.index(buffer_event) < events.index(make_valid_event) < events.index(dissolve_event)
     # make_valid_owned now records accurate implementation names based on
     # the actual GPU/CPU paths taken (dispatch framework gap 7 fix).
-    assert "make_valid" in events[-2].operation
-    assert events[-1].implementation == "grouped_union_pipeline"
+    assert "make_valid" in make_valid_event.operation
+    assert dissolve_event.implementation == "grouped_union_pipeline"

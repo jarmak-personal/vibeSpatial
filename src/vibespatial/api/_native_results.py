@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
@@ -33,6 +33,16 @@ if TYPE_CHECKING:
     from vibespatial.api.geoseries import GeoSeries
 
 
+def _index_array_size(values: Any) -> int:
+    shape = getattr(values, "shape", None)
+    if shape is not None and len(shape) > 0:
+        return int(shape[0])
+    size = getattr(values, "size", None)
+    if size is not None:
+        return int(size)
+    return len(values)
+
+
 @dataclass(frozen=True)
 class RelationIndexResult:
     """Low-level relation result carrying row-pair indices."""
@@ -48,8 +58,16 @@ class RelationIndexResult:
 
     @property
     def size(self) -> int:
-        left, _right = self.to_host()
-        return int(left.size)
+        left_size = _index_array_size(self.left_indices)
+        right_size = _index_array_size(self.right_indices)
+        if left_size != right_size:
+            raise ValueError(
+                f"RelationIndexResult pair length mismatch: {left_size} != {right_size}"
+            )
+        return left_size
+
+    def __len__(self) -> int:
+        return self.size
 
 
 @dataclass(frozen=True)
@@ -285,6 +303,27 @@ def _drop_private_attribute_columns(attributes: pd.DataFrame) -> pd.DataFrame:
     if not private_columns:
         return attributes
     return attributes.drop(columns=private_columns)
+
+
+def _reduction_source_column_map(columns) -> dict[Any, Any]:
+    if isinstance(columns, Mapping):
+        return dict(columns)
+    return {column: column for column in columns}
+
+
+def _mapped_native_state_numeric_columns(
+    state,
+    columns,
+) -> dict[Any, Any] | None:
+    column_map = _reduction_source_column_map(columns)
+    table = NativeAttributeTable.from_value(state.attributes)
+    source_values = table.numeric_column_arrays(column_map.values())
+    if source_values is None:
+        return None
+    return {
+        output_name: source_values[source_name]
+        for output_name, source_name in column_map.items()
+    }
 
 
 def _native_attribute_table_from_projected_frames(
@@ -1060,6 +1099,30 @@ class RelationJoinResult:
     relation: RelationIndexResult
     distances: Any | None = None
 
+    def __len__(self) -> int:
+        return len(self.relation)
+
+    def to_native_relation(
+        self,
+        *,
+        left_token: str | None = None,
+        right_token: str | None = None,
+        predicate: str | None = None,
+        left_row_count: int | None = None,
+        right_row_count: int | None = None,
+    ):
+        from vibespatial.api._native_relation import NativeRelation
+
+        return NativeRelation.from_relation_index_result(
+            self.relation,
+            left_token=left_token,
+            right_token=right_token,
+            predicate=predicate,
+            distances=self.distances,
+            left_row_count=left_row_count,
+            right_row_count=right_row_count,
+        )
+
     def to_host_distances(self) -> np.ndarray | None:
         if self.distances is None:
             return None
@@ -1124,6 +1187,7 @@ class RelationJoinExportResult:
     rsuffix: str
     on_attribute: list | None = None
     distance_col: str | None = None
+    predicate: str | None = None
 
     def materialize(self) -> tuple[GeoDataFrame, np.ndarray | None]:
         return self.relation_result.materialize(
@@ -1140,6 +1204,157 @@ class RelationJoinExportResult:
             self,
             attribute_storage="pandas",
         ).to_geodataframe()
+
+    def to_native_relation(self):
+        from vibespatial.api._native_state import get_native_state
+
+        left_state = get_native_state(self.left_df)
+        right_state = get_native_state(self.right_df)
+        return self.relation_result.to_native_relation(
+            left_token=(
+                left_state.lineage_token
+                if left_state is not None
+                else f"gdf:{id(self.left_df)}"
+            ),
+            right_token=(
+                right_state.lineage_token
+                if right_state is not None
+                else f"gdf:{id(self.right_df)}"
+            ),
+            predicate=self.predicate,
+            left_row_count=(
+                left_state.row_count if left_state is not None else len(self.left_df)
+            ),
+            right_row_count=(
+                right_state.row_count if right_state is not None else len(self.right_df)
+            ),
+        )
+
+    def left_semijoin_native_frame(
+        self,
+        *,
+        order: str = "sorted",
+        preserve_index: bool = False,
+    ):
+        """Return matched left rows as private native state when admissible."""
+        from vibespatial.api._native_state import get_native_state
+
+        left_state = get_native_state(self.left_df)
+        if left_state is None:
+            return None
+        rowset = self.to_native_relation().left_semijoin_rowset(order=order)
+        return left_state.take(rowset, preserve_index=preserve_index)
+
+    def left_unique_label_semijoin_native_frame(self):
+        """Return matched left rows for public unique-label semijoin shapes.
+
+        This is the private admitted equivalent of:
+        ``joined = sjoin(left, right); left.loc[joined.index.unique()]``.
+        It deliberately declines duplicate-label and MultiIndex sources because
+        public `.loc` expands duplicate labels and has level-specific semantics.
+        """
+        from vibespatial.api._native_state import get_native_state
+
+        left_state = get_native_state(self.left_df)
+        if left_state is None:
+            return None
+        if not left_state.index_plan.admits_unique_label_selection:
+            return None
+        rowset = self.to_native_relation().left_semijoin_rowset(order="first")
+        return left_state.take(rowset, preserve_index=True)
+
+    def left_antijoin_native_frame(
+        self,
+        *,
+        preserve_index: bool = False,
+    ):
+        """Return unmatched left rows as private native state when admissible."""
+        from vibespatial.api._native_state import get_native_state
+
+        left_state = get_native_state(self.left_df)
+        if left_state is None:
+            return None
+        rowset = self.to_native_relation().left_antijoin_rowset()
+        return left_state.take(rowset, preserve_index=preserve_index)
+
+    def right_semijoin_native_frame(
+        self,
+        *,
+        order: str = "sorted",
+        preserve_index: bool = False,
+    ):
+        """Return matched right rows as private native state when admissible."""
+        from vibespatial.api._native_state import get_native_state
+
+        right_state = get_native_state(self.right_df)
+        if right_state is None:
+            return None
+        rowset = self.to_native_relation().right_semijoin_rowset(order=order)
+        return right_state.take(rowset, preserve_index=preserve_index)
+
+    def right_antijoin_native_frame(
+        self,
+        *,
+        preserve_index: bool = False,
+    ):
+        """Return unmatched right rows as private native state when admissible."""
+        from vibespatial.api._native_state import get_native_state
+
+        right_state = get_native_state(self.right_df)
+        if right_state is None:
+            return None
+        rowset = self.to_native_relation().right_antijoin_rowset()
+        return right_state.take(rowset, preserve_index=preserve_index)
+
+    def left_reduce_right_numeric_columns(
+        self,
+        right_columns,
+        reducers,
+        *,
+        left_row_count: int | None = None,
+    ):
+        """Reduce attached right-source numeric attributes by left relation rows."""
+        from vibespatial.api._native_state import get_native_state
+
+        right_state = get_native_state(self.right_df)
+        if right_state is None:
+            return None
+        mapped_columns = _mapped_native_state_numeric_columns(
+            right_state,
+            right_columns,
+        )
+        if mapped_columns is None:
+            return None
+        return self.to_native_relation().left_reduce_right_numeric_columns(
+            mapped_columns,
+            reducers,
+            left_row_count=left_row_count,
+        )
+
+    def right_reduce_left_numeric_columns(
+        self,
+        left_columns,
+        reducers,
+        *,
+        right_row_count: int | None = None,
+    ):
+        """Reduce attached left-source numeric attributes by right relation rows."""
+        from vibespatial.api._native_state import get_native_state
+
+        left_state = get_native_state(self.left_df)
+        if left_state is None:
+            return None
+        mapped_columns = _mapped_native_state_numeric_columns(
+            left_state,
+            left_columns,
+        )
+        if mapped_columns is None:
+            return None
+        return self.to_native_relation().right_reduce_left_numeric_columns(
+            mapped_columns,
+            reducers,
+            right_row_count=right_row_count,
+        )
 
 
 @dataclass(frozen=True)
@@ -1205,7 +1420,7 @@ class GroupedConstructiveResult:
     """Grouped constructive result that exports to GeoPandas only at the boundary."""
 
     geometry: GeometryNativeResult
-    attributes: pd.DataFrame
+    attributes: NativeAttributeTable | pd.DataFrame
     geometry_name: str
     as_index: bool
     frame_type: type | None = None
@@ -1304,18 +1519,17 @@ def _grouped_constructive_result_to_native_tabular_result(
 def _grouped_constructive_to_native_tabular_result(
     *,
     geometry: GeometryNativeResult,
-    attributes: pd.DataFrame,
+    attributes: NativeAttributeTable | pd.DataFrame,
     geometry_name: str,
     as_index: bool,
 ) -> NativeTabularResult:
-    attributes = attributes.copy(deep=False)
+    attributes = NativeAttributeTable.from_value(attributes)
     leading_columns: list[str] = []
     trailing_columns = list(attributes.columns)
     if not as_index:
-        attributes = attributes.reset_index()
-        leading_count = len(attributes.columns) - len(trailing_columns)
-        leading_columns = list(attributes.columns[:leading_count])
-        trailing_columns = list(attributes.columns[leading_count:])
+        attributes, reset_leading, reset_trailing = attributes.reset_index_deferred()
+        leading_columns = list(reset_leading)
+        trailing_columns = list(reset_trailing)
     return NativeTabularResult(
         attributes=attributes,
         geometry=geometry,

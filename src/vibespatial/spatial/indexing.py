@@ -28,6 +28,7 @@ from vibespatial.geometry.buffers import GeometryFamily  # noqa: E402
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray  # noqa: E402
 from vibespatial.kernels.core.geometry_analysis import (  # noqa: E402
     compute_geometry_bounds,
+    compute_geometry_bounds_device,
     compute_morton_keys,
 )
 from vibespatial.runtime import ExecutionMode, RuntimeSelection, has_gpu_runtime  # noqa: E402
@@ -411,11 +412,27 @@ class FlatSpatialIndex:
     geometry_array: OwnedGeometryArray
     _host_order: object  # np.ndarray or None (lazy from device_order)
     _host_morton_keys: object  # np.ndarray or None (lazy from device_morton_keys)
-    bounds: np.ndarray
+    _host_bounds: object  # np.ndarray or None (lazy from device_bounds)
     total_bounds: tuple[float, float, float, float]
     regular_grid: RegularGridRectIndex | None = None
     device_morton_keys: object = None  # CuPy device array or None
     device_order: object = None  # CuPy device array or None
+    device_bounds: object = None  # CuPy device array or None
+
+    @property
+    def bounds(self) -> np.ndarray:
+        """Lazily materialise host bounds for CPU/public compatibility paths."""
+        if self._host_bounds is not None:
+            return self._host_bounds
+        if self.device_bounds is None:
+            raise ValueError("FlatSpatialIndex has neither host nor device bounds")
+        runtime = get_cuda_runtime()
+        host_bounds = runtime.copy_device_to_host(self.device_bounds).astype(
+            np.float64,
+            copy=False,
+        )
+        object.__setattr__(self, "_host_bounds", host_bounds)
+        return host_bounds
 
     @property
     def order(self) -> np.ndarray:
@@ -441,6 +458,10 @@ class FlatSpatialIndex:
             return int(self._host_order.size)
         if self.device_order is not None:
             return int(self.device_order.size)
+        if self._host_bounds is not None:
+            return int(self._host_bounds.shape[0])
+        if self.device_bounds is not None:
+            return int(self.device_bounds.shape[0])
         # Avoid D→H just for size — use bounds row count.
         return int(self.bounds.shape[0])
 
@@ -512,6 +533,76 @@ class RegularGridRectIndex:
     cols: int
     rows: int
     size: int
+
+
+def _coords_form_axis_aligned_box(
+    xs: np.ndarray,
+    ys: np.ndarray,
+) -> tuple[float, float, float, float] | None:
+    if xs.size != 5 or ys.size != 5:
+        return None
+    minx = float(xs.min())
+    miny = float(ys.min())
+    maxx = float(xs.max())
+    maxy = float(ys.max())
+    if minx >= maxx or miny >= maxy:
+        return None
+    tol = 1e-9 * max(abs(maxx - minx), abs(maxy - miny), 1.0)
+    if abs(xs[0] - xs[-1]) > tol or abs(ys[0] - ys[-1]) > tol:
+        return None
+    x_matches = (np.abs(xs - minx) <= tol) | (np.abs(xs - maxx) <= tol)
+    y_matches = (np.abs(ys - miny) <= tol) | (np.abs(ys - maxy) <= tol)
+    if not bool(np.all(x_matches) and np.all(y_matches)):
+        return None
+    edge_same_x = np.abs(xs[1:] - xs[:-1]) <= tol
+    edge_same_y = np.abs(ys[1:] - ys[:-1]) <= tol
+    if not bool(np.all(np.logical_xor(edge_same_x, edge_same_y))):
+        return None
+    return minx, miny, maxx, maxy
+
+
+def _detect_single_row_device_rect_index(
+    geometry_array: OwnedGeometryArray,
+) -> tuple[RegularGridRectIndex, np.ndarray] | None:
+    """Validate a one-row device polygon rectangle with minimal D2H."""
+    if (
+        cp is None
+        or geometry_array.row_count != 1
+        or GeometryFamily.POLYGON not in geometry_array.families
+        or len(geometry_array.families) != 1
+        or geometry_array.residency is not Residency.DEVICE
+    ):
+        return None
+    state = geometry_array._ensure_device_state()
+    device_buffer = state.families.get(GeometryFamily.POLYGON)
+    if device_buffer is None:
+        return None
+    if int(getattr(device_buffer.x, "size", 0)) != 5 or int(
+        getattr(device_buffer.y, "size", 0)
+    ) != 5:
+        return None
+
+    runtime = get_cuda_runtime()
+    xs = runtime.copy_device_to_host(device_buffer.x).astype(np.float64, copy=False)
+    ys = runtime.copy_device_to_host(device_buffer.y).astype(np.float64, copy=False)
+    bounds_tuple = _coords_form_axis_aligned_box(xs, ys)
+    if bounds_tuple is None:
+        return None
+
+    minx, miny, maxx, maxy = bounds_tuple
+    bounds = np.asarray([[minx, miny, maxx, maxy]], dtype=np.float64)
+    return (
+        RegularGridRectIndex(
+            origin_x=minx,
+            origin_y=miny,
+            cell_width=maxx - minx,
+            cell_height=maxy - miny,
+            cols=1,
+            rows=1,
+            size=1,
+        ),
+        bounds,
+    )
 
 
 def _sample_regular_grid_polygon_vertices(
@@ -803,6 +894,47 @@ def build_flat_spatial_index(
         if geometry_array.residency is Residency.DEVICE and has_gpu_runtime()
         else ExecutionMode.CPU
     )
+
+    if (
+        selection.selected is ExecutionMode.GPU
+        and geometry_array.residency is Residency.DEVICE
+        and geometry_array.row_count <= 1
+        and has_gpu_runtime()
+    ):
+        if geometry_array.row_count == 0:
+            bounds = np.empty((0, 4), dtype=np.float64)
+            device_bounds = None
+            regular_grid = None
+        else:
+            single_rect = _detect_single_row_device_rect_index(geometry_array)
+            if single_rect is None:
+                bounds = None
+                device_bounds = compute_geometry_bounds_device(geometry_array)
+                regular_grid = None
+            else:
+                regular_grid, bounds = single_rect
+                device_bounds = None
+        order = np.arange(geometry_array.row_count, dtype=np.int32)
+        morton_keys = order.astype(np.uint64, copy=False)
+        if bounds is not None and bounds.shape[0] > 0:
+            total_bounds = (
+                float(bounds[:, 0].min()),
+                float(bounds[:, 1].min()),
+                float(bounds[:, 2].max()),
+                float(bounds[:, 3].max()),
+            )
+        else:
+            total_bounds = (float("nan"),) * 4
+        return FlatSpatialIndex(
+            geometry_array=geometry_array,
+            _host_order=order,
+            _host_morton_keys=morton_keys,
+            _host_bounds=bounds,
+            total_bounds=total_bounds,
+            regular_grid=regular_grid,
+            device_bounds=device_bounds,
+        )
+
     bounds = compute_geometry_bounds(geometry_array, dispatch_mode=bounds_dispatch)
     regular_grid = _detect_regular_grid_rect_index(geometry_array, bounds)
     d_morton_keys = None
@@ -853,7 +985,7 @@ def build_flat_spatial_index(
         geometry_array=geometry_array,
         _host_order=order,
         _host_morton_keys=morton_keys,
-        bounds=bounds,
+        _host_bounds=bounds,
         total_bounds=total_bounds,
         regular_grid=regular_grid,
         device_morton_keys=d_morton_keys,

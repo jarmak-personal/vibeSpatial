@@ -108,6 +108,29 @@ def _prepare_query_bounds_device(
     return device_bounds, device_bounds
 
 
+def _prepare_tree_bounds_device(
+    flat_index,
+    runtime,
+):
+    """Return `(device_bounds_flat, temp_allocation)` for indexed tree bounds."""
+    device_bounds = getattr(flat_index, "device_bounds", None)
+    if device_bounds is not None:
+        if cp is None:  # pragma: no cover - exercised on CPU-only installs
+            raise RuntimeError("CuPy is not installed; device bounds are unavailable")
+        base = cp.asarray(device_bounds)
+        prepared = base
+        if prepared.dtype != cp.float64:
+            prepared = prepared.astype(cp.float64, copy=True)
+        if not prepared.flags.c_contiguous:
+            prepared = cp.ascontiguousarray(prepared)
+        return prepared.ravel(), None if prepared is base else prepared
+
+    d_bounds = runtime.from_host(
+        np.ascontiguousarray(flat_index.bounds, dtype=np.float64).ravel()
+    )
+    return d_bounds, d_bounds
+
+
 def spatial_index_device_query(
     flat_index,
     query_bounds,
@@ -286,11 +309,8 @@ def _brute_force_scalar(
     import cupy as cp
 
     runtime = get_cuda_runtime()
-    tree_bounds = flat_index.bounds
     tree_count = flat_index.size
-    d_tree_bounds = runtime.from_host(
-        np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
-    )
+    d_tree_bounds, temp_tree_bounds = _prepare_tree_bounds_device(flat_index, runtime)
     d_mask = runtime.allocate((tree_count,), cp.uint8)
     try:
         kernels = _spatial_query_kernels()
@@ -330,7 +350,7 @@ def _brute_force_scalar(
             total_pairs=int(d_right.size),
         )
     finally:
-        runtime.free(d_tree_bounds)
+        runtime.free(temp_tree_bounds)
         runtime.free(d_mask)
 
 
@@ -342,14 +362,11 @@ def _brute_force_multi(
     import cupy as cp
 
     runtime = get_cuda_runtime()
-    tree_bounds = flat_index.bounds
     query_count = int(query_bounds.shape[0])
     tree_count = flat_index.size
 
     d_query_bounds, temp_query_bounds = _prepare_query_bounds_device(query_bounds, runtime)
-    d_tree_bounds = runtime.from_host(
-        np.ascontiguousarray(tree_bounds, dtype=np.float64).ravel()
-    )
+    d_tree_bounds, temp_tree_bounds = _prepare_tree_bounds_device(flat_index, runtime)
     d_counts = runtime.allocate((query_count,), cp.int32)
     d_offsets = None
     try:
@@ -437,7 +454,7 @@ def _brute_force_multi(
         )
     finally:
         runtime.free(temp_query_bounds)
-        runtime.free(d_tree_bounds)
+        runtime.free(temp_tree_bounds)
         runtime.free(d_counts)
         runtime.free(d_offsets)
 

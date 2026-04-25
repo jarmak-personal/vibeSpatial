@@ -36,6 +36,14 @@ from vibespatial.runtime.fallbacks import (
     get_fallback_events,
     record_fallback_event,
 )
+from vibespatial.runtime.materialization import (
+    MaterializationBoundary,
+    MaterializationEvent,
+    StrictNativeMaterializationError,
+    clear_materialization_events,
+    get_materialization_events,
+    record_materialization_event,
+)
 from vibespatial._version import __version__
 
 def get_runtime_selection(

@@ -201,16 +201,35 @@ def _compile_timed_statements(script_path, timed_source, timed_line_offset):
 def _summarize_statement_profile(stages):
     totals_by_tag = {}
     totals_by_backend = {}
+    materializations_by_boundary = {}
+    materializations_by_surface = {}
+    materialization_count = 0
+    materialization_d2h_count = 0
     for stage in stages:
         elapsed = float(stage.get("elapsed_seconds", 0.0))
         backend = stage.get("actual_backend", "unknown")
         totals_by_backend[backend] = totals_by_backend.get(backend, 0.0) + elapsed
         for tag in stage.get("tags", []):
             totals_by_tag[tag] = totals_by_tag.get(tag, 0.0) + elapsed
+        materialization_count += int(stage.get("materialization_event_count", 0) or 0)
+        materialization_d2h_count += int(stage.get("materialization_d2h_event_count", 0) or 0)
+        for event in stage.get("materialization_events", []):
+            boundary = event.get("boundary", "")
+            surface = event.get("surface", "")
+            materializations_by_boundary[boundary] = materializations_by_boundary.get(boundary, 0) + 1
+            materializations_by_surface[surface] = materializations_by_surface.get(surface, 0) + 1
     return {
         "stage_total_seconds": sum(float(stage.get("elapsed_seconds", 0.0)) for stage in stages),
         "stage_totals_by_tag": dict(sorted(totals_by_tag.items(), key=lambda item: (-item[1], item[0]))),
         "stage_totals_by_backend": dict(sorted(totals_by_backend.items(), key=lambda item: (-item[1], item[0]))),
+        "stage_materialization_count": materialization_count,
+        "stage_materialization_d2h_event_count": materialization_d2h_count,
+        "stage_materialization_counts_by_boundary": dict(
+            sorted(materializations_by_boundary.items(), key=lambda item: (-item[1], item[0]))
+        ),
+        "stage_materialization_counts_by_surface": dict(
+            sorted(materializations_by_surface.items(), key=lambda item: (-item[1], item[0]))
+        ),
     }
 
 
@@ -306,6 +325,8 @@ def _execute_profiled_timed_sections(
     trace,
     *,
     get_fallback_events,
+    get_materialization_events,
+    materialization_context,
     get_d2h_transfer_stats,
 ):
     _preamble_code, timed_code, _postamble_code, timed_source, timed_line_offset = sections
@@ -321,13 +342,22 @@ def _execute_profiled_timed_sections(
         before_steps = len(getattr(trace, "steps", []))
         before_transfers = len(getattr(trace, "transfers", []))
         before_fallbacks = len(get_fallback_events(clear=False))
+        before_materializations = len(get_materialization_events(clear=False))
         before_d2h, before_d2h_bytes, before_d2h_seconds = _read_d2h_transfer_stats(
             get_d2h_transfer_stats
         )
         start = time.perf_counter()
-        exec(stmt["code"], globals_dict)
+        with materialization_context(
+            pipeline="shootout",
+            dataset=os.path.basename(script_path),
+            stage=f"statement_{stmt['index']}",
+            stage_category=",".join(stmt["tags"]),
+        ):
+            exec(stmt["code"], globals_dict)
         elapsed = time.perf_counter() - start
         after_fallbacks = len(get_fallback_events(clear=False))
+        materialization_events = get_materialization_events(clear=False)
+        stage_materialization_events = materialization_events[before_materializations:]
         after_d2h, after_d2h_bytes, after_d2h_seconds = _read_d2h_transfer_stats(
             get_d2h_transfer_stats
         )
@@ -339,6 +369,14 @@ def _execute_profiled_timed_sections(
         stage.update(_profile_execution_deltas(trace, before_steps, before_transfers))
         stage["elapsed_seconds"] = elapsed
         stage["fallback_event_count"] = max(after_fallbacks - before_fallbacks, 0)
+        stage["materialization_event_count"] = len(stage_materialization_events)
+        stage["materialization_d2h_event_count"] = sum(
+            1 for event in stage_materialization_events if getattr(event, "d2h_transfer", False)
+        )
+        if stage_materialization_events:
+            stage["materialization_events"] = [
+                _as_dict_event(event) for event in stage_materialization_events[:10]
+            ]
         if before_d2h is not None and after_d2h is not None:
             stage["d2h_transfer_count_delta"] = max(after_d2h - before_d2h, 0)
             stage["runtime_d2h_transfer_count_delta"] = stage["d2h_transfer_count_delta"]
@@ -369,6 +407,11 @@ def _profile_timed_sections(script_path, sections):
         from vibespatial.runtime.execution_trace import execution_trace
         from vibespatial.runtime.fallbacks import clear_fallback_events, get_fallback_events
         from vibespatial.runtime.hotpath_trace import reset_hotpath_trace, summarize_hotpath_trace
+        from vibespatial.runtime.materialization import (
+            clear_materialization_events,
+            get_materialization_events,
+            materialization_context,
+        )
         try:
             from vibespatial.cuda._runtime import get_d2h_transfer_profile as get_d2h_transfer_stats, reset_d2h_transfer_count
         except Exception:
@@ -380,6 +423,7 @@ def _profile_timed_sections(script_path, sections):
 
         os.environ["VIBESPATIAL_HOTPATH_TRACE"] = "1"
         clear_fallback_events()
+        clear_materialization_events()
         reset_hotpath_trace()
         if reset_d2h_transfer_count is not None:
             reset_d2h_transfer_count()
@@ -406,6 +450,7 @@ def _profile_timed_sections(script_path, sections):
                 preamble_code, _timed_code, _postamble_code, _timed_source, _timed_line_offset = sections
                 exec(preamble_code, globals_dict)
                 clear_fallback_events()
+                clear_materialization_events()
                 reset_hotpath_trace()
                 if reset_d2h_transfer_count is not None:
                     reset_d2h_transfer_count()
@@ -416,6 +461,8 @@ def _profile_timed_sections(script_path, sections):
                         globals_dict,
                         trace,
                         get_fallback_events=get_fallback_events,
+                        get_materialization_events=get_materialization_events,
+                        materialization_context=materialization_context,
                         get_d2h_transfer_stats=get_d2h_transfer_stats,
                     )
         except Exception as exc:

@@ -50,6 +50,13 @@
       "sourceOfTruth": "Program plan for making NativeTabularResult the canonical constructive boundary and using planner-selected workload families for acceleration.",
       "maxBodyLines": 900
     },
+    "docs/dev/private-native-execution-substrate-plan.md": {
+      "scope": "Execution plan for building the private GPU-native substrate beneath exact GeoPandas-compatible public APIs.",
+      "readIf": "You are planning or implementing native frame state, rowsets, relations, grouped reducers, native export boundaries, or performance generalization work.",
+      "stopIf": "You only need operation-local kernel detail already routed by intake.",
+      "sourceOfTruth": "Program plan for implementing ADR-0044 without reviving a broad public lazy planner.",
+      "maxBodyLines": 860
+    },
     "docs/dev/io-zero-execution-plan.md": {
       "scope": "Execution plan for removing avoidable host-side churn from public read paths and making GPU-first IO the default shape.",
       "readIf": "You are planning or executing the next IO read push, public read_file acceleration work, or GPU-first ingest cleanup.",

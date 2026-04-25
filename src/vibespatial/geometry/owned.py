@@ -1465,12 +1465,21 @@ class OwnedGeometryArray:
         if len(d_state.families) == 1:
             family, device_buffer = next(iter(d_state.families.items()))
             family_tag = np.int8(FAMILY_TAGS[family])
-            if n_indices == 0 or bool(cp.all(d_new_tags == family_tag)):
+            host_family = self.families.get(family)
+            single_family_all_rows = (
+                host_family is not None
+                and int(host_family.row_count) == self.row_count
+            )
+            if n_indices == 0 or single_family_all_rows or bool(cp.all(d_new_tags == family_tag)):
                 source_family_rows = d_state.family_row_offsets[d_indices].astype(
                     cp.int64, copy=False,
                 )
-                if int(source_family_rows.size) and not bool(
-                    cp.all(source_family_rows >= 0)
+                if (
+                    not single_family_all_rows
+                    and int(source_family_rows.size)
+                    and not bool(
+                        cp.all(source_family_rows >= 0)
+                    )
                 ):
                     return self._physical_device_take_mixed(
                         d_state,
@@ -2341,6 +2350,23 @@ def _device_take_family_buffer(
     """
     new_empty_mask = device_buffer.empty_mask[family_rows]
     new_bounds = device_buffer.bounds[family_rows] if device_buffer.bounds is not None else None
+
+    if (
+        family is GeometryFamily.POINT
+        and host_buffer is not None
+        and int(host_buffer.row_count) == int(device_buffer.x.size)
+        and int(host_buffer.row_count) == int(device_buffer.y.size)
+    ):
+        point_rows = family_rows.astype(cp.int64, copy=False)
+        row_count = int(point_rows.size)
+        return DeviceFamilyGeometryBuffer(
+            family=family,
+            x=device_buffer.x[point_rows],
+            y=device_buffer.y[point_rows],
+            geometry_offsets=cp.arange(row_count + 1, dtype=cp.int32),
+            empty_mask=cp.zeros(row_count, dtype=cp.bool_),
+            bounds=new_bounds,
+        )
 
     if family in (GeometryFamily.POINT, GeometryFamily.LINESTRING, GeometryFamily.MULTIPOINT):
         new_x, new_y, new_geom_offsets = _device_gather_xy_offset_slices(

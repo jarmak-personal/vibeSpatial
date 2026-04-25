@@ -36,6 +36,75 @@ def _multipoint_relation_kernels():
     return compile_kernel_group("multipoint-binary-relations", _MULTIPOINT_BINARY_RELATIONS_KERNEL_SOURCE, _MULTIPOINT_KERNEL_NAMES)
 
 
+def _is_device_array(value) -> bool:
+    return hasattr(value, "__cuda_array_interface__")
+
+
+def _identity_rows(count: int, *, device: bool):
+    if device:
+        import cupy as cp
+
+        return cp.arange(count, dtype=cp.int32)
+    return np.arange(count, dtype=np.int32)
+
+
+def _false_like_bool(reference):
+    if _is_device_array(reference):
+        import cupy as cp
+
+        return cp.zeros(reference.shape[0], dtype=cp.bool_)
+    return np.zeros(reference.shape[0], dtype=bool)
+
+
+def _point_relation_to_predicate_array(
+    predicate: str,
+    relation,
+    *,
+    point_on_left: bool,
+):
+    outside = relation == POINT_LOCATION_OUTSIDE
+    boundary = relation == POINT_LOCATION_BOUNDARY
+    interior = relation == POINT_LOCATION_INTERIOR
+    if predicate == "intersects":
+        return ~outside
+    if predicate == "disjoint":
+        return outside
+    if predicate == "touches":
+        return boundary
+    if predicate in {"crosses", "overlaps"}:
+        return _false_like_bool(relation)
+    if point_on_left:
+        if predicate == "within":
+            return interior
+        if predicate == "covered_by":
+            return ~outside
+        return _false_like_bool(relation)
+    if predicate == "contains":
+        return interior
+    if predicate == "covers":
+        return ~outside
+    if predicate == "contains_properly":
+        return interior
+    return _false_like_bool(relation)
+
+
+def _point_equals_to_predicate_array(predicate: str, relation):
+    equal = relation == POINT_LOCATION_INTERIOR
+    if predicate in {
+        "intersects",
+        "contains",
+        "within",
+        "covers",
+        "covered_by",
+        "contains_properly",
+        "equals",
+    }:
+        return equal
+    if predicate == "disjoint":
+        return ~equal
+    return _false_like_bool(relation)
+
+
 # ---------------------------------------------------------------------------
 # Unified kernel launch -- replaces the three nearly-identical functions
 # _launch_rows_kernel, _launch_indexed_kernel, _launch_indexed_mp_kernel.
@@ -49,6 +118,7 @@ def _launch_kernel(
     arg_types: tuple[object, ...],
     *,
     extra_device_allocs: list | None = None,
+    return_device: bool = False,
 ) -> np.ndarray:
     """Launch a point or multipoint binary-relation kernel.
 
@@ -66,12 +136,24 @@ def _launch_kernel(
         KERNEL_PARAM_* type tags matching *args*.
     extra_device_allocs : list or None
         Additional device allocations to free after launch (e.g. uploaded
-        mapped FRO arrays).  The device_rows and device_out are always freed.
+        mapped FRO arrays).  With ``return_device=True``, ownership of
+        ``device_out`` transfers to the caller as a CuPy array.
     """
-    n_items = candidate_rows.size
+    n_items = int(candidate_rows.size)
     runtime = get_cuda_runtime()
     ptr = runtime.pointer
-    device_rows = runtime.from_host(candidate_rows.astype(np.int32, copy=False))
+    returning_device = False
+    device_rows_temp = None
+    if _is_device_array(candidate_rows):
+        import cupy as cp
+
+        device_rows = cp.asarray(candidate_rows)
+        if device_rows.dtype != cp.int32:
+            device_rows = device_rows.astype(cp.int32, copy=False)
+            device_rows_temp = device_rows
+    else:
+        device_rows = runtime.from_host(candidate_rows.astype(np.int32, copy=False))
+        device_rows_temp = device_rows
     device_out = runtime.allocate((n_items,), np.uint8)
     try:
         kernel = kernel_dict_fn()[kernel_name]
@@ -82,12 +164,16 @@ def _launch_kernel(
         grid, block = runtime.launch_config(kernel, n_items)
         runtime.launch(kernel, grid=grid, block=block, params=params)
         runtime.synchronize()
+        if return_device:
+            returning_device = True
+            return device_out
         out = np.empty(n_items, dtype=np.uint8)
         runtime.copy_device_to_host(device_out, out)
         return out
     finally:
-        runtime.free(device_rows)
-        runtime.free(device_out)
+        runtime.free(device_rows_temp)
+        if not returning_device:
+            runtime.free(device_out)
         if extra_device_allocs:
             for alloc in extra_device_allocs:
                 runtime.free(alloc)
@@ -230,7 +316,12 @@ _REGION_TAGS_INDEXED = tuple(FAMILY_TAGS[f] for f in _REGION_FAMILIES_INDEXED)
 
 
 def _prepare_indexed_fro(owned, indices, runtime):
-    """Map indices through family_row_offsets and upload to device."""
+    """Map indices through family_row_offsets and return a device array."""
+    if _is_device_array(indices):
+        import cupy as cp
+
+        state = owned._ensure_device_state()
+        return state.family_row_offsets[indices].astype(cp.int32, copy=False)
     mapped = owned.family_row_offsets[indices].astype(np.int32, copy=False)
     return runtime.from_host(mapped)
 
@@ -240,8 +331,10 @@ def _classify_indexed_point_equals(
     right_owned: OwnedGeometryArray,
     left_indices: np.ndarray,
     right_indices: np.ndarray,
+    *,
+    return_device: bool = False,
 ) -> np.ndarray:
-    n = left_indices.size
+    n = int(left_indices.size)
     left_state = left_owned._ensure_device_state()
     right_state = right_owned._ensure_device_state()
     left_buffer = left_state.families[GeometryFamily.POINT]
@@ -251,7 +344,7 @@ def _classify_indexed_point_equals(
 
     device_left_fro = _prepare_indexed_fro(left_owned, left_indices, runtime)
     device_right_fro = _prepare_indexed_fro(right_owned, right_indices, runtime)
-    identity_rows = np.arange(n, dtype=np.int32)
+    identity_rows = _identity_rows(n, device=return_device)
     return _launch_kernel(
         _point_binary_relation_kernels,
         "point_equals_compacted", identity_rows,
@@ -269,6 +362,7 @@ def _classify_indexed_point_equals(
         ),
         (KERNEL_PARAM_PTR,) * 10,
         extra_device_allocs=[device_left_fro, device_right_fro],
+        return_device=return_device,
     )
 
 
@@ -279,8 +373,9 @@ def _classify_indexed_point_line(
     line_indices: np.ndarray,
     *,
     line_family: GeometryFamily,
+    return_device: bool = False,
 ) -> np.ndarray:
-    n = point_indices.size
+    n = int(point_indices.size)
     point_state = point_owned._ensure_device_state()
     line_state = line_owned._ensure_device_state()
     point_buffer = point_state.families[GeometryFamily.POINT]
@@ -290,7 +385,7 @@ def _classify_indexed_point_line(
 
     device_point_fro = _prepare_indexed_fro(point_owned, point_indices, runtime)
     device_line_fro = _prepare_indexed_fro(line_owned, line_indices, runtime)
-    identity_rows = np.arange(n, dtype=np.int32)
+    identity_rows = _identity_rows(n, device=return_device)
     kernel_name = (
         "point_on_linestring_compacted"
         if line_family is GeometryFamily.LINESTRING
@@ -316,6 +411,7 @@ def _classify_indexed_point_line(
         _point_binary_relation_kernels, kernel_name,
         identity_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_point_fro, device_line_fro],
+        return_device=return_device,
     )
 
 
@@ -326,8 +422,9 @@ def _classify_indexed_point_region(
     region_indices: np.ndarray,
     *,
     region_family: GeometryFamily,
+    return_device: bool = False,
 ) -> np.ndarray:
-    n = point_indices.size
+    n = int(point_indices.size)
     point_state = point_owned._ensure_device_state()
     region_state = region_owned._ensure_device_state()
     point_buffer = point_state.families[GeometryFamily.POINT]
@@ -337,7 +434,7 @@ def _classify_indexed_point_region(
 
     device_point_fro = _prepare_indexed_fro(point_owned, point_indices, runtime)
     device_region_fro = _prepare_indexed_fro(region_owned, region_indices, runtime)
-    identity_rows = np.arange(n, dtype=np.int32)
+    identity_rows = _identity_rows(n, device=return_device)
     kernel_name = (
         "point_in_polygon_polygon_compacted_state"
         if region_family is GeometryFamily.POLYGON
@@ -364,6 +461,7 @@ def _classify_indexed_point_region(
         _point_binary_relation_kernels, kernel_name,
         identity_rows, tuple(args), (KERNEL_PARAM_PTR,) * len(args),
         extra_device_allocs=[device_point_fro, device_region_fro],
+        return_device=return_device,
     )
 
 
@@ -458,6 +556,138 @@ def classify_point_predicates_indexed(
             mp_left_mask, mp_right_mask,
             _apply_relation_rows,
         )
+
+    return out
+
+
+def classify_point_predicates_indexed_device(
+    predicate: str,
+    left_owned: OwnedGeometryArray,
+    right_owned: OwnedGeometryArray,
+    left_indices,
+    right_indices,
+    *,
+    left_tags=None,
+    right_tags=None,
+):
+    """Evaluate point-vs-point/line/region indexed predicates on device.
+
+    This is the device-resident companion to
+    :func:`classify_point_predicates_indexed`.  It intentionally excludes
+    multipoint rows for now because those kernels need subset-style reverse
+    checks that still compose through host masks.  Callers must route batches
+    containing multipoints through the existing host-returning path.
+    """
+    import cupy as cp
+
+    left_indices = cp.asarray(left_indices, dtype=cp.int32)
+    right_indices = cp.asarray(right_indices, dtype=cp.int32)
+    n = int(left_indices.size)
+    if n == 0:
+        return cp.empty(0, dtype=cp.bool_)
+
+    left_state = left_owned._ensure_device_state()
+    right_state = right_owned._ensure_device_state()
+    left_tags = (
+        cp.asarray(left_tags, dtype=cp.int8)
+        if left_tags is not None
+        else left_state.tags[left_indices]
+    )
+    right_tags = (
+        cp.asarray(right_tags, dtype=cp.int8)
+        if right_tags is not None
+        else right_state.tags[right_indices]
+    )
+
+    mp_tag = FAMILY_TAGS[GeometryFamily.MULTIPOINT]
+    if bool(cp.any((left_tags == mp_tag) | (right_tags == mp_tag))):
+        raise ValueError(
+            "device indexed point predicate classification does not support multipoint rows"
+        )
+
+    out = cp.zeros(n, dtype=cp.bool_)
+
+    pp_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == _POINT_TAG_INDEXED)
+    if bool(cp.any(pp_mask)):
+        idx = cp.flatnonzero(pp_mask).astype(cp.int32, copy=False)
+        relation = _classify_indexed_point_equals(
+            left_owned,
+            right_owned,
+            left_indices[idx],
+            right_indices[idx],
+            return_device=True,
+        )
+        out[idx] = _point_equals_to_predicate_array(predicate, relation)
+
+    for line_family, line_tag in zip(_LINE_FAMILIES_INDEXED, _LINE_TAGS_INDEXED, strict=True):
+        pl_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == line_tag)
+        if bool(cp.any(pl_mask)):
+            idx = cp.flatnonzero(pl_mask).astype(cp.int32, copy=False)
+            relation = _classify_indexed_point_line(
+                left_owned,
+                right_owned,
+                left_indices[idx],
+                right_indices[idx],
+                line_family=line_family,
+                return_device=True,
+            )
+            out[idx] = _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=True,
+            )
+
+        lp_mask = (left_tags == line_tag) & (right_tags == _POINT_TAG_INDEXED)
+        if bool(cp.any(lp_mask)):
+            idx = cp.flatnonzero(lp_mask).astype(cp.int32, copy=False)
+            relation = _classify_indexed_point_line(
+                right_owned,
+                left_owned,
+                right_indices[idx],
+                left_indices[idx],
+                line_family=line_family,
+                return_device=True,
+            )
+            out[idx] = _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=False,
+            )
+
+    for region_family, region_tag in zip(_REGION_FAMILIES_INDEXED, _REGION_TAGS_INDEXED, strict=True):
+        pr_mask = (left_tags == _POINT_TAG_INDEXED) & (right_tags == region_tag)
+        if bool(cp.any(pr_mask)):
+            idx = cp.flatnonzero(pr_mask).astype(cp.int32, copy=False)
+            relation = _classify_indexed_point_region(
+                left_owned,
+                right_owned,
+                left_indices[idx],
+                right_indices[idx],
+                region_family=region_family,
+                return_device=True,
+            )
+            out[idx] = _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=True,
+            )
+
+        rp_mask = (left_tags == region_tag) & (right_tags == _POINT_TAG_INDEXED)
+        if bool(cp.any(rp_mask)):
+            idx = cp.flatnonzero(rp_mask).astype(cp.int32, copy=False)
+            relation = _classify_indexed_point_region(
+                right_owned,
+                left_owned,
+                right_indices[idx],
+                left_indices[idx],
+                region_family=region_family,
+                return_device=True,
+            )
+            out[idx] = _point_relation_to_predicate_array(
+                predicate,
+                relation,
+                point_on_left=False,
+            )
 
     return out
 

@@ -453,27 +453,6 @@ def _extract_segments_gpu(
     runtime = get_cuda_runtime()
     d_state = geometry_array._ensure_device_state()
 
-    # Determine valid rows for segment-producing families
-    tags = geometry_array.tags
-    validity = geometry_array.validity
-    seg_families = {_FAMILY_LINESTRING, _FAMILY_POLYGON,
-                    _FAMILY_MULTILINESTRING, _FAMILY_MULTIPOLYGON}
-    valid_mask = validity & np.isin(tags, list(seg_families))
-    valid_rows_host = np.flatnonzero(valid_mask).astype(np.int32, copy=False)
-
-    if valid_rows_host.size == 0:
-        return DeviceSegmentTable(
-            row_indices=runtime.allocate((0,), np.int32),
-            segment_indices=runtime.allocate((0,), np.int32),
-            x0=runtime.allocate((0,), np.float64),
-            y0=runtime.allocate((0,), np.float64),
-            x1=runtime.allocate((0,), np.float64),
-            y1=runtime.allocate((0,), np.float64),
-            count=0,
-            part_indices=runtime.allocate((0,), np.int32),
-            ring_indices=runtime.allocate((0,), np.int32),
-        )
-
     # The count_segments / scatter_segments kernels declare family_codes as
     # ``const int*`` (int32), but d_state.tags is int8.  Passing an int8
     # pointer to a kernel that reads 4-byte ints causes every thread to read
@@ -532,53 +511,63 @@ def _extract_segments_gpu(
             continue
         d_buf = d_state.families[family_enum]
 
-        # Valid rows for this family
-        fam_valid_mask = validity & (tags == family_tag)
-        fam_valid_rows = np.flatnonzero(fam_valid_mask).astype(np.int32, copy=False)
-        if fam_valid_rows.size == 0:
+        # Valid rows for this family. Keep the mask and selected row ids on
+        # device; segment extraction is a hot overlay primitive and must not
+        # materialize row metadata just to decide per-family launch spans.
+        fam_valid_mask = d_state.validity & (d_state.tags == family_tag)
+        d_fam_valid = cp.flatnonzero(fam_valid_mask).astype(cp.int32, copy=False)
+        n_fam = int(d_fam_valid.size)
+        if n_fam == 0:
             continue
 
-        n_fam = fam_valid_rows.size
-
-        # Build empty_mask on device: upload host empty_mask, gather on device.
-        d_fam_valid = runtime.from_host(fam_valid_rows)
-        if family_enum in geometry_array.families:
-            host_buf = geometry_array.families[family_enum]
-            fam_row_offsets = geometry_array.family_row_offsets[fam_valid_rows]
-            d_empty_mask = cp.asarray(host_buf.empty_mask.astype(np.uint8))
-            d_fam_row_off = cp.asarray(fam_row_offsets)
-            # Clamp indices and gather on device
-            d_valid_fr = d_fam_row_off < d_empty_mask.size
+        d_fam_row_off = d_family_row_offsets[d_fam_valid].astype(cp.int64, copy=False)
+        dense_polygon_width = (
+            family_enum is GeometryFamily.POLYGON
+            and d_buf.dense_single_ring_width is not None
+            and int(d_buf.dense_single_ring_width) > 1
+        )
+        if dense_polygon_width:
             d_fam_empty = cp.zeros(n_fam, dtype=cp.uint8)
-            d_safe_idx = cp.minimum(d_fam_row_off, max(d_empty_mask.size - 1, 0))
-            d_fam_empty[d_valid_fr] = d_empty_mask[d_safe_idx[d_valid_fr]]
         else:
-            d_fam_empty = cp.zeros(n_fam, dtype=cp.uint8)
+            d_fam_empty = d_buf.empty_mask[d_fam_row_off].astype(cp.uint8, copy=True)
 
         # Part and ring offsets (use zeros if not available)
         d_geom_off = d_buf.geometry_offsets
         d_part_off = d_buf.part_offsets if d_buf.part_offsets is not None else d_buf.geometry_offsets
         d_ring_off = d_buf.ring_offsets if d_buf.ring_offsets is not None else d_buf.geometry_offsets
 
-        # Step 1: Count segments
-        d_seg_counts = runtime.allocate((n_fam,), np.int32, zero=True)
-        count_kernel = kernels["count_segments"]
         ptr = runtime.pointer
 
-        count_params = (
-            (ptr(d_fam_valid), ptr(d_family_codes), ptr(d_family_row_offsets),
-             ptr(d_geom_off), ptr(d_part_off), ptr(d_ring_off),
-             ptr(d_fam_empty), ptr(d_seg_counts), n_fam),
-            (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
-             KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
-        )
-        grid, block = runtime.launch_config(count_kernel, n_fam)
-        runtime.launch(count_kernel, grid=grid, block=block, params=count_params)
+        if dense_polygon_width:
+            # Fixed-width one-ring polygons prove their segment count from
+            # metadata: a closed ring with W coords has W - 1 edges. Avoid the
+            # count kernel and scalar total-size D2H fence for this common
+            # rectangle/buffer-like shape.
+            segments_per_row = int(d_buf.dense_single_ring_width) - 1
+            fam_total = n_fam * segments_per_row
+            d_seg_counts = None
+            d_seg_offsets = cp.arange(n_fam, dtype=cp.int32) * np.int32(
+                segments_per_row,
+            )
+        else:
+            # Step 1: Count segments
+            d_seg_counts = runtime.allocate((n_fam,), np.int32, zero=True)
+            count_kernel = kernels["count_segments"]
 
-        # Step 2: Exclusive prefix sum for write offsets
-        d_seg_offsets = exclusive_sum(d_seg_counts, synchronize=False)
-        fam_total = count_scatter_total(runtime, d_seg_counts, d_seg_offsets)
+            count_params = (
+                (ptr(d_fam_valid), ptr(d_family_codes), ptr(d_family_row_offsets),
+                 ptr(d_geom_off), ptr(d_part_off), ptr(d_ring_off),
+                 ptr(d_fam_empty), ptr(d_seg_counts), n_fam),
+                (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_PTR,
+                 KERNEL_PARAM_PTR, KERNEL_PARAM_PTR, KERNEL_PARAM_I32),
+            )
+            grid, block = runtime.launch_config(count_kernel, n_fam)
+            runtime.launch(count_kernel, grid=grid, block=block, params=count_params)
+
+            # Step 2: Exclusive prefix sum for write offsets
+            d_seg_offsets = exclusive_sum(d_seg_counts, synchronize=False)
+            fam_total = count_scatter_total(runtime, d_seg_counts, d_seg_offsets)
 
         if fam_total == 0:
             runtime.free(d_fam_valid)

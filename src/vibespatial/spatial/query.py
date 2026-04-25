@@ -499,9 +499,18 @@ def query_spatial_index(
         query_bounds = _shapely_query_bounds
     else:
         if (
-            predicate == "dwithin"
-            and query_owned.residency is Residency.DEVICE
-            and has_gpu_runtime()
+            has_gpu_runtime()
+            and (
+                (
+                    predicate == "dwithin"
+                    and query_owned.residency is Residency.DEVICE
+                )
+                or (
+                    return_device
+                    and not scalar
+                    and output_format == "indices"
+                )
+            )
         ):
             query_bounds = compute_geometry_bounds_device(query_owned)
             query_bounds_on_device = True
@@ -510,7 +519,6 @@ def query_spatial_index(
                 query_owned,
                 dispatch_mode=_gpu_bounds_dispatch_mode(query_owned),
             )
-    tree_bounds = flat_index.bounds
     query_size = len(query_values) if query_values is not None else query_owned.row_count
 
     # Shapely arrays for predicate refinement fallback.  GPU DE-9IM and dwithin
@@ -554,7 +562,7 @@ def query_spatial_index(
             )
             left_idx, right_idx = _generate_distance_pairs(
                 host_query_bounds,
-                tree_bounds,
+                flat_index.bounds,
                 per_row_distance,
             )
 
@@ -642,7 +650,7 @@ def query_spatial_index(
         # higher overhead at moderate N*M products (100K x 10K) where
         # the brute-force count kernel is 20-30x faster.
         if output_format == "count":
-            gpu_count = _count_candidates_gpu(query_bounds, tree_bounds)
+            gpu_count = _count_candidates_gpu(query_bounds, flat_index.bounds)
             if gpu_count is not None:
                 execution = SpatialQueryExecution(
                     requested=ExecutionMode.AUTO, selected=ExecutionMode.GPU,
@@ -689,6 +697,7 @@ def query_spatial_index(
                 query_shapely=_query_shapely,
                 tree_shapely=_tree_shapely,
                 device_candidates=device_cands,
+                return_device=return_device,
             )
         else:
             # CPU fallback for candidate generation.

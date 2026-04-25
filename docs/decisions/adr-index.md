@@ -48,4 +48,6 @@ context, the decision made, consequences, and alternatives considered.
 0041-gpu-text-parsing-framework
 0042-device-native-result-boundary
 0043-public-api-physical-plan-coverage
+0044-private-native-execution-substrate
+0045-transient-native-work-budget
 ```

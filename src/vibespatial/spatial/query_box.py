@@ -663,3 +663,88 @@ def _query_point_tree_box_index(
         empty = np.empty(0, dtype=np.int32)
         return empty, empty
     return np.concatenate(left_out), np.concatenate(right_out)
+
+
+def _query_point_tree_box_row_positions_device(
+    tree_owned: OwnedGeometryArray,
+    *,
+    predicate: str | None,
+    box_bounds: np.ndarray,
+    force_gpu: bool = False,
+):
+    """Return device row positions for one point-tree vs box predicate query."""
+    predicate_mode = _point_box_predicate_mode(predicate)
+    if predicate_mode is None:
+        return None
+    if GeometryFamily.POINT not in tree_owned.families or len(tree_owned.families) != 1:
+        return None
+    bounds = np.asarray(box_bounds, dtype=np.float64)
+    if bounds.shape == (1, 4):
+        bounds = bounds[0]
+    if bounds.shape != (4,) or np.isnan(bounds).any():
+        return None
+
+    try:
+        selection = plan_dispatch_selection(
+            kernel_name="point_box_query",
+            kernel_class=KernelClass.COARSE,
+            row_count=tree_owned.row_count,
+            requested_mode=ExecutionMode.GPU if force_gpu else ExecutionMode.AUTO,
+            gpu_available=has_gpu_runtime(),
+            current_residency=tree_owned.residency,
+        )
+    except RuntimeError:
+        return None
+    if selection.selected is not ExecutionMode.GPU:
+        return None
+
+    tree_owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="query_spatial_index selected GPU point-tree box execution",
+    )
+    runtime = get_cuda_runtime()
+    state = tree_owned._ensure_device_state()
+    point_buffer = state.families[GeometryFamily.POINT]
+    kernel = _spatial_query_kernels()["point_box_query_mask"]
+    ptr = runtime.pointer
+    grid, block = runtime.launch_config(kernel, tree_owned.row_count)
+    device_mask = runtime.allocate((tree_owned.row_count,), np.uint8)
+    try:
+        params = (
+            (
+                ptr(state.family_row_offsets),
+                ptr(point_buffer.geometry_offsets),
+                ptr(point_buffer.empty_mask),
+                ptr(point_buffer.x),
+                ptr(point_buffer.y),
+                float(bounds[0]),
+                float(bounds[1]),
+                float(bounds[2]),
+                float(bounds[3]),
+                predicate_mode,
+                ptr(device_mask),
+                tree_owned.row_count,
+            ),
+            (
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_F64,
+                KERNEL_PARAM_I32,
+                KERNEL_PARAM_PTR,
+                KERNEL_PARAM_I32,
+            ),
+        )
+        runtime.launch(kernel, grid=grid, block=block, params=params)
+        positions = compact_indices(device_mask).values
+        # Keep the temporary mask alive until compaction has consumed it.
+        runtime.synchronize()
+        return positions
+    finally:
+        runtime.free(device_mask)

@@ -18,13 +18,19 @@ from vibespatial import (
     has_gpu_runtime,
     plan_dissolve_pipeline,
 )
+from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedAttributeReduction
 from vibespatial.api._native_results import NativeTabularResult
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.bench.pipeline import _dissolve_join_heavy_groups, _regular_polygons_frame
 from vibespatial.geometry.device_array import DeviceGeometryArray
 from vibespatial.geometry.owned import from_shapely_geometries
-from vibespatial.overlay.dissolve import evaluate_geopandas_dissolve, execute_grouped_union
+from vibespatial.kernels.constructive.segmented_union import segmented_union_all
+from vibespatial.overlay.dissolve import (
+    evaluate_geopandas_dissolve,
+    evaluate_geopandas_dissolve_native,
+    execute_grouped_union,
+)
 from vibespatial.runtime import ExecutionMode
 from vibespatial.runtime.fallbacks import StrictNativeFallbackError
 from vibespatial.runtime.fusion import IntermediateDisposition
@@ -91,7 +97,9 @@ def test_execute_grouped_union_owned_coverage_avoids_geometry_materialization() 
 
 
 @pytest.mark.gpu
-def test_execute_grouped_union_codes_owned_coverage_avoids_geometry_materialization() -> None:
+def test_execute_grouped_union_codes_owned_coverage_avoids_geometry_materialization(
+    monkeypatch,
+) -> None:
     if not has_gpu_runtime():
         pytest.skip("CUDA runtime not available")
 
@@ -99,7 +107,19 @@ def test_execute_grouped_union_codes_owned_coverage_avoids_geometry_materializat
         def __array__(self, dtype=None):
             raise AssertionError("owned coverage dissolve codes path materialized geometry objects")
 
-    owned = from_shapely_geometries([box(0, 0, 1, 1), box(2, 0, 3, 1)])
+    owned = from_shapely_geometries(
+        [box(0, 0, 1, 1), box(2, 0, 3, 1)],
+        residency=Residency.DEVICE,
+    )
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+
+    def _fail_host_metadata(*_args, **_kwargs):
+        raise AssertionError("device-owned coverage path should not materialize host metadata")
+
+    monkeypatch.setattr(type(owned), "_ensure_host_metadata", _fail_host_metadata)
+
     grouped = dissolve_module.execute_grouped_union_codes(
         ExplodingGeometries(),
         np.asarray([0, 1], dtype=np.int32),
@@ -194,6 +214,525 @@ def test_evaluate_geopandas_dissolve_can_use_dense_group_codes_without_group_pos
 
     assert calls == 1
     assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_uses_native_grouped_numeric_reducers(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": [2, 1, 2, 1],
+            "value": [1, 2, 3, 4],
+            "flag": [True, False, True, True],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+    expected = frame.dissolve(
+        by="group",
+        aggfunc={"value": "sum", "flag": "sum"},
+        sort=True,
+        method="unary",
+    )
+
+    real_reduce = NativeGrouped.reduce_numeric_columns
+    reducer_calls = []
+
+    def _record_reduce(self, columns, reducers):
+        reducer_calls.append((tuple(columns), dict(reducers)))
+        return real_reduce(self, columns, reducers)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("admitted native numeric dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    geopandas.clear_dispatch_events()
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc={"value": "sum", "flag": "sum"},
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert reducer_calls == [
+        (("value", "flag"), {"value": "sum", "flag": "sum"})
+    ]
+    assert any(
+        event.implementation == "native_grouped_numeric_reducers"
+        for event in events
+    )
+    assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_uses_native_categorical_numeric_reducers(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", "a", "b", "a"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "weight": [1.5, 2.0, 2.5, 4.0],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+    expected = frame.dissolve(
+        by="group",
+        aggfunc={"value": "sum", "weight": "mean"},
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+    )
+
+    real_reduce = NativeGrouped.reduce_numeric_columns
+    reducer_calls = []
+
+    def _record_reduce(self, columns, reducers):
+        reducer_calls.append(
+            (
+                tuple(columns),
+                dict(reducers),
+                self.output_index_plan.index.copy(),
+                self.group_codes.copy(),
+            )
+        )
+        return real_reduce(self, columns, reducers)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("admitted categorical dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc={"value": "sum", "weight": "mean"},
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert len(reducer_calls) == 1
+    reduced_columns, reducers, output_index, group_codes = reducer_calls[0]
+    assert reduced_columns == ("value", "weight")
+    assert reducers == {"value": "sum", "weight": "mean"}
+    assert output_index.tolist() == ["b", "a", "c"]
+    assert group_codes.tolist() == [0, 1, 0, 1]
+    assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_uses_native_grouped_min_max_reducers(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", "a", "b", "a"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "flag": [True, False, True, True],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+    expected = frame.dissolve(
+        by="group",
+        aggfunc={"value": "min", "flag": "max"},
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+    )
+
+    real_reduce = NativeGrouped.reduce_numeric_columns
+    reducer_calls = []
+
+    def _record_reduce(self, columns, reducers):
+        reducer_calls.append((tuple(columns), dict(reducers), self.output_index_plan.index.copy()))
+        return real_reduce(self, columns, reducers)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("admitted categorical min/max dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc={"value": "min", "flag": "max"},
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert len(reducer_calls) == 1
+    reduced_columns, reducers, output_index = reducer_calls[0]
+    assert reduced_columns == ("value", "flag")
+    assert reducers == {"value": "min", "flag": "max"}
+    assert output_index.tolist() == ["b", "a", "c"]
+    assert result.index.tolist() == ["b", "a", "c"]
+    assert result["value"].tolist()[:2] == [1.0, 2.0]
+    assert result["flag"].tolist()[:2] == [1.0, 1.0]
+    assert np.isnan(result["value"].iloc[2])
+    assert np.isnan(result["flag"].iloc[2])
+    assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_default_first_uses_native_grouped_reducer(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", "a", "b", "a"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "flag": [True, False, True, True],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+    expected = frame.dissolve(
+        by="group",
+        aggfunc="first",
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+    )
+
+    real_reduce = NativeGrouped.reduce_numeric_columns
+    reducer_calls = []
+
+    def _record_reduce(self, columns, reducers):
+        reducer_calls.append((tuple(columns), dict(reducers), self.output_index_plan.index.copy()))
+        return real_reduce(self, columns, reducers)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("admitted default-first dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert len(reducer_calls) == 1
+    reduced_columns, reducers, output_index = reducer_calls[0]
+    assert reduced_columns == ("value", "flag")
+    assert reducers == {"value": "first", "flag": "first"}
+    assert output_index.tolist() == ["b", "a", "c"]
+    assert result["value"].tolist()[:2] == [1.0, 2.0]
+    assert result["flag"].tolist()[:2] == [1.0, 0.0]
+    assert np.isnan(result["value"].iloc[2])
+    assert np.isnan(result["flag"].iloc[2])
+    assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_default_first_uses_native_take_reducers(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", "a", "b", "a"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "label": pd.Series(
+                [None, "right", "last-left", "last-right"],
+                dtype=object,
+            ),
+            "category": pd.Categorical(
+                [None, "y", "z", "w"],
+                categories=["w", "x", "y", "z"],
+            ),
+            "text": pd.array([pd.NA, "bb", "cc", "dd"], dtype="string"),
+            "nullable": pd.array([pd.NA, 2, 3, pd.NA], dtype="Int64"),
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+    expected = frame.dissolve(
+        by="group",
+        aggfunc="first",
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+    )
+
+    real_take = NativeGrouped.reduce_take
+    take_calls = []
+
+    def _record_take(self, values, reducer):
+        take_calls.append((getattr(values, "name", None), reducer))
+        return real_take(self, values, reducer)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("admitted label-column dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_take", _record_take)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert take_calls == [
+        ("label", "first"),
+        ("category", "first"),
+        ("text", "first"),
+        ("nullable", "first"),
+    ]
+    assert result["label"].tolist() == ["last-left", "right", None]
+    assert result["category"].tolist() == ["z", "y", np.nan]
+    assert isinstance(result["category"].dtype, pd.CategoricalDtype)
+    assert result["text"].tolist()[:2] == ["cc", "bb"]
+    assert pd.isna(result["text"].iloc[2])
+    assert result["nullable"].tolist()[:2] == [3, 2]
+    assert pd.isna(result["nullable"].iloc[2])
+    assert_geodataframe_equal(result, expected)
+
+
+def test_evaluate_geopandas_dissolve_categorical_observed_true_uses_observed_codes(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", None, "a", "b"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+    expected = frame.dissolve(
+        by="group",
+        aggfunc={"value": "count"},
+        sort=True,
+        observed=True,
+        dropna=True,
+        method="unary",
+    )
+
+    real_reduce = NativeGrouped.reduce_numeric_columns
+    reducer_calls = []
+
+    def _record_reduce(self, columns, reducers):
+        reducer_calls.append((self.output_index_plan.index.copy(), self.group_codes.copy()))
+        return real_reduce(self, columns, reducers)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("observed categorical dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc={"value": "count"},
+        as_index=True,
+        level=None,
+        sort=True,
+        observed=True,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert len(reducer_calls) == 1
+    output_index, group_codes = reducer_calls[0]
+    assert output_index.tolist() == ["a", "b"]
+    assert group_codes.tolist() == [1, -1, 0, 1]
+    assert_geodataframe_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    ("observed", "sort", "expected_index", "expected_values", "expected_codes"),
+    [
+        (False, False, ["b", np.nan, "a", "c"], [5, 2, 3, 0], [0, 1, 2, 0]),
+        (False, True, ["a", "b", "c", np.nan], [3, 5, 0, 2], [1, 3, 0, 1]),
+        (True, False, ["b", np.nan, "a"], [5, 2, 3], [0, 1, 2, 0]),
+        (True, True, ["a", "b", np.nan], [3, 5, 2], [1, 2, 0, 1]),
+    ],
+)
+def test_evaluate_geopandas_dissolve_categorical_dropna_false_uses_native_null_group(
+    monkeypatch,
+    observed: bool,
+    sort: bool,
+    expected_index: list[object],
+    expected_values: list[int],
+    expected_codes: list[int],
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": pd.Categorical(["b", None, "a", "b"], categories=["a", "b", "c"]),
+            "value": [1, 2, 3, 4],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+
+    real_reduce = NativeGrouped.reduce_numeric_columns
+    reducer_calls = []
+
+    def _record_reduce(self, columns, reducers):
+        reducer_calls.append((self.output_index_plan.index.copy(), self.group_codes.copy()))
+        return real_reduce(self, columns, reducers)
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("categorical null-group dissolve should not call pandas groupby")
+
+    monkeypatch.setattr(NativeGrouped, "reduce_numeric_columns", _record_reduce)
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+
+    result = evaluate_geopandas_dissolve(
+        frame,
+        by="group",
+        aggfunc={"value": "sum"},
+        as_index=True,
+        level=None,
+        sort=sort,
+        observed=observed,
+        dropna=False,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert len(reducer_calls) == 1
+    output_index, group_codes = reducer_calls[0]
+    assert output_index.tolist() == expected_index
+    assert group_codes.tolist() == expected_codes
+    assert result.index.tolist() == expected_index
+    assert result["value"].tolist() == expected_values
+
+
+def test_evaluate_geopandas_dissolve_native_as_index_false_defers_attribute_export(
+    monkeypatch,
+) -> None:
+    frame = geopandas.GeoDataFrame(
+        {
+            "group": ["b", "a", "b", "a"],
+            "value": [1, 2, 3, 4],
+            "geometry": geopandas.array.from_wkt(
+                [
+                    "POINT (0 0)",
+                    "POINT (1 1)",
+                    "POINT (2 2)",
+                    "POINT (3 3)",
+                ]
+            ),
+        }
+    )
+
+    def _fail_groupby(*_args, **_kwargs):
+        raise AssertionError("admitted as_index=False dissolve should not call pandas groupby")
+
+    def _fail_to_pandas(*_args, **_kwargs):
+        raise AssertionError("grouped reductions should not export before terminal materialization")
+
+    monkeypatch.setattr(pd.DataFrame, "groupby", _fail_groupby)
+    monkeypatch.setattr(NativeGroupedAttributeReduction, "to_pandas", _fail_to_pandas)
+
+    native_result = evaluate_geopandas_dissolve_native(
+        frame,
+        by="group",
+        aggfunc={"value": "sum"},
+        as_index=False,
+        level=None,
+        sort=True,
+        observed=False,
+        dropna=True,
+        method="unary",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert native_result.attributes.loader is not None
+    assert tuple(native_result.attributes.columns) == ("group", "value")
+    assert native_result.column_order == ("group", "geometry", "value")
 
 
 @pytest.mark.gpu
@@ -412,6 +951,93 @@ def test_execute_grouped_union_codes_avoids_geometry_array_materialization_for_o
     assert grouped.geometries is None
 
 
+def test_execute_native_grouped_union_consumes_native_grouped_offsets_for_owned_unary(
+    monkeypatch,
+) -> None:
+    geometry_array = GeometryArray.from_owned(
+        from_shapely_geometries(
+            [
+                box(0, 0, 1, 1),
+                box(1, 1, 2, 2),
+                box(5, 0, 6, 1),
+            ]
+        )
+    )
+    owned = getattr(geometry_array, "_owned", None)
+    assert owned is not None
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("native grouped union should not materialize geometries")
+
+    monkeypatch.setattr(GeometryArray, "__array__", _fail, raising=False)
+    grouped = NativeGrouped.from_dense_codes(
+        pd.Index([0, 0, 1], dtype="int32").to_numpy(),
+        group_count=2,
+    )
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=geometry_array,
+        method="unary",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.group_count == 2
+    assert result.non_empty_groups == 2
+    assert result.empty_groups == 0
+    assert result.owned is not None
+    assert result.geometries is None
+
+
+def test_execute_native_grouped_union_consumes_device_codes_for_owned_coverage(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for NativeGrouped coverage box reducer")
+    cp = pytest.importorskip("cupy")
+
+    owned = from_shapely_geometries(
+        [
+            box(0, 0, 1, 1),
+            box(1, 0, 2, 1),
+            box(10, 10, 11, 11),
+            box(11, 10, 12, 11),
+        ],
+        residency=Residency.DEVICE,
+    )
+    grouped = NativeGrouped.from_dense_codes(
+        cp.asarray([0, 0, 1, 1], dtype=cp.int32),
+        group_count=2,
+    )
+
+    def _fail(*_args, **_kwargs):
+        raise AssertionError("device NativeGrouped coverage union should not host-normalize group codes")
+
+    monkeypatch.setattr(dissolve_module, "_group_non_empty_counts", _fail)
+
+    result = dissolve_module.execute_native_grouped_union(
+        grouped,
+        _geometries=(),
+        method="coverage",
+        owned=owned,
+    )
+
+    assert result is not None
+    assert result.group_count == 2
+    assert result.non_empty_groups == 2
+    assert result.empty_groups == 0
+    assert result.owned is not None
+    assert result.geometries is None
+    assert result.owned.residency is Residency.DEVICE
+    actual = np.asarray(result.owned.to_shapely(), dtype=object)
+    expected = np.asarray([box(0, 0, 2, 1), box(10, 10, 12, 11)], dtype=object)
+    assert shapely.equals(actual, expected).tolist() == [
+        True,
+        True,
+    ]
+
+
 @pytest.mark.gpu
 def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
     monkeypatch,
@@ -470,6 +1096,67 @@ def test_execute_grouped_union_codes_batches_multi_group_unary_on_gpu(
     ]
     assert bool(shapely.equals(actual[0], expected[0]))
     assert bool(shapely.equals(actual[1], expected[1]))
+
+
+@pytest.mark.gpu
+def test_small_grouped_constructive_reduce_batches_many_tiny_groups_on_gpu(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import vibespatial.kernels.constructive.segmented_union as segmented_union_module
+
+    group_sizes = np.asarray([2, 3, 4, 5, 6, 7, 8, 2], dtype=np.int32)
+    group_offsets = np.concatenate(
+        [np.asarray([0], dtype=np.int32), np.cumsum(group_sizes, dtype=np.int32)]
+    )
+    values = []
+    for group_index, group_size in enumerate(group_sizes):
+        x0 = float(group_index) * 20.0
+        for row in range(int(group_size)):
+            left = x0 + float(row) * 0.45
+            values.append(box(left, 0.0, left + 1.0, 1.0))
+
+    owned = from_shapely_geometries(values, residency=Residency.DEVICE)
+
+    def _fail_serial(*_args, **_kwargs):
+        raise AssertionError("many small grouped reductions should batch, not dispatch per group")
+
+    monkeypatch.setattr(segmented_union_module, "_segmented_union_serial_gpu", _fail_serial)
+
+    geopandas.clear_dispatch_events()
+    result = segmented_union_all(
+        owned,
+        group_offsets,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+    events = geopandas.get_dispatch_events(clear=True)
+
+    assert result.residency is Residency.DEVICE
+    assert result.row_count == len(group_sizes)
+    assert any(
+        event.surface == "segmented_union_all"
+        and event.operation == "segmented_union_strategy"
+        and event.implementation == "gpu_grouped_overlay_many_small_groups"
+        for event in events
+    )
+
+    actual = np.asarray(result.to_shapely(), dtype=object)
+    expected = [
+        shapely.union_all(
+            np.asarray(values[int(start) : int(end)], dtype=object)
+        )
+        for start, end in zip(group_offsets[:-1], group_offsets[1:], strict=True)
+    ]
+    for got, want in zip(actual, expected, strict=True):
+        got_norm = shapely.normalize(got)
+        want_norm = shapely.normalize(want)
+        assert bool(got_norm.equals_exact(want_norm, tolerance=1.0e-9))
+        assert shapely.area(shapely.symmetric_difference(got, want)) == pytest.approx(
+            0.0,
+            abs=1.0e-9,
+        )
 
 
 @pytest.mark.gpu
