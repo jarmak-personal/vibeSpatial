@@ -398,8 +398,16 @@ def test_clip_by_rect_gpu_dense_linestring_path_builds_mixed_outputs_without_gen
     def _fail_generic(*_args, **_kwargs):
         raise AssertionError("dense LineString rectangle clip should not use generic regroup/scatter")
 
+    total_calls: list[int] = []
+    original_totals = clip_rect_mod.count_scatter_totals
+
+    def _record_count_scatter_totals(runtime, count_offset_pairs):
+        total_calls.append(len(count_offset_pairs))
+        return original_totals(runtime, count_offset_pairs)
+
     monkeypatch.setattr(clip_rect_mod, "_build_line_clip_device_result", _fail_generic)
     monkeypatch.setattr(clip_rect_mod, "concat_owned_scatter", _fail_generic)
+    monkeypatch.setattr(clip_rect_mod, "count_scatter_totals", _record_count_scatter_totals)
 
     result = clip_by_rect_owned(
         owned,
@@ -417,6 +425,7 @@ def test_clip_by_rect_gpu_dense_linestring_path_builds_mixed_outputs_without_gen
     }
     assert result.fallback_rows.size == 0
     assert result.owned_result_rows.tolist() == [0, 1]
+    assert total_calls == [3]
 
     expected = shapely.clip_by_rect(np.asarray(values, dtype=object), 0.0, 0.0, 2.0, 1.0)
     expected_compact = [

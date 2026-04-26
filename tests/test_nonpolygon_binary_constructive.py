@@ -403,7 +403,9 @@ class TestLineStringPolygonDifference:
         assert result_geoms[0] is not None and not result_geoms[0].is_empty
 
     @requires_gpu
-    def test_crossing_line_splits_into_multiline_outside_pieces(self):
+    def test_crossing_line_splits_into_multiline_outside_pieces(self, monkeypatch: pytest.MonkeyPatch):
+        import vibespatial.kernels.constructive.nonpolygon_binary as nonpoly_mod
+
         left_geoms = [
             LineString([(2, 0), (2, 4), (6, 4)]),
             LineString([(0, 3), (6, 3)]),
@@ -414,6 +416,18 @@ class TestLineStringPolygonDifference:
         ]
         left = _make_owned(left_geoms)
         right = _make_owned(right_geoms)
+        total_calls: list[int] = []
+        original_totals = nonpoly_mod.count_scatter_totals
+
+        def _record_count_scatter_totals(runtime, count_offset_pairs):
+            total_calls.append(len(count_offset_pairs))
+            return original_totals(runtime, count_offset_pairs)
+
+        monkeypatch.setattr(
+            nonpoly_mod,
+            "count_scatter_totals",
+            _record_count_scatter_totals,
+        )
 
         from vibespatial.constructive.binary_constructive import binary_constructive_owned
         result = binary_constructive_owned("difference", left, right, dispatch_mode=ExecutionMode.GPU)
@@ -421,6 +435,7 @@ class TestLineStringPolygonDifference:
         ref_geoms = _shapely_op("difference", left_geoms, right_geoms)
 
         assert len(result_geoms) == 2
+        assert total_calls == [2]
         _assert_geom_close(result_geoms[0], ref_geoms[0], msg="row 0 split outside fragments")
         _assert_geom_close(result_geoms[1], ref_geoms[1], msg="row 1 boundary overlap fragments")
 

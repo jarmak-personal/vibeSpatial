@@ -1520,12 +1520,24 @@ def coverage_union_all_gpu_owned(
 
     precision_plan = selection.precision_plan
 
-    # Filter nulls.
-    keep = np.flatnonzero(owned.validity)
-    if keep.size == 0:
-        return empty_owned()
-    if keep.size < owned.row_count:
-        owned = owned.take(keep)
+    # Filter nulls without forcing a full device validity mask to host.
+    if (
+        cp is not None
+        and owned.residency is Residency.DEVICE
+        and owned.device_state is not None
+    ):
+        d_validity = cp.asarray(owned.device_state.validity, dtype=cp.bool_)
+        keep_count = int(cp.count_nonzero(d_validity))
+        if keep_count == 0:
+            return empty_owned()
+        if keep_count < owned.row_count:
+            owned = owned.take(cp.flatnonzero(d_validity).astype(cp.int64, copy=False))
+    else:
+        keep = np.flatnonzero(owned.validity)
+        if keep.size == 0:
+            return empty_owned()
+        if keep.size < owned.row_count:
+            owned = owned.take(keep)
 
     if owned.row_count == 1:
         record_dispatch_event(

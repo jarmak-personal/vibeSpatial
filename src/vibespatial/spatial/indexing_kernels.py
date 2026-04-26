@@ -46,6 +46,589 @@ extern "C" __global__ void morton_keys_from_bounds(
   out_keys[row] = spread_bits_32(norm_x) | (spread_bits_32(norm_y) << 1);
 }
 
+extern "C" __global__ void __launch_bounds__(256, 4)
+regular_rect_grid_certify(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int*    __restrict__ geometry_offsets,
+    const int*    __restrict__ ring_offsets,
+    const bool*   __restrict__ empty_mask,
+    const bool*   __restrict__ validity,
+    const signed char* __restrict__ tags,
+    int           row_count,
+    int           coord_count,
+    int           polygon_tag,
+    double*       out_bounds,
+    double*       out_summary
+) {
+  __shared__ double s_minx[256];
+  __shared__ double s_miny[256];
+  __shared__ double s_maxx[256];
+  __shared__ double s_maxy[256];
+  __shared__ double s_max_left_x[256];
+  __shared__ double s_max_bottom_y[256];
+  __shared__ int s_valid[256];
+  __shared__ int s_grid_valid[256];
+  __shared__ double origin_x;
+  __shared__ double origin_y;
+  __shared__ double cell_width;
+  __shared__ double cell_height;
+  __shared__ double tol;
+  __shared__ long long grid_cols;
+  __shared__ long long grid_rows;
+
+  const int tid = threadIdx.x;
+  const double inf = 1.0e300;
+
+  if (tid == 0) {
+    double fx0 = 0.0;
+    double fy0 = 0.0;
+    double fx1 = 0.0;
+    double fy1 = 0.0;
+    if (row_count > 0 && coord_count >= 5 && ring_offsets[0] >= 0 && ring_offsets[0] + 4 < coord_count) {
+      const int c0 = ring_offsets[0];
+      fx0 = fmin(fmin(fmin(fmin(x[c0 + 0], x[c0 + 1]), x[c0 + 2]), x[c0 + 3]), x[c0 + 4]);
+      fy0 = fmin(fmin(fmin(fmin(y[c0 + 0], y[c0 + 1]), y[c0 + 2]), y[c0 + 3]), y[c0 + 4]);
+      fx1 = fmax(fmax(fmax(fmax(x[c0 + 0], x[c0 + 1]), x[c0 + 2]), x[c0 + 3]), x[c0 + 4]);
+      fy1 = fmax(fmax(fmax(fmax(y[c0 + 0], y[c0 + 1]), y[c0 + 2]), y[c0 + 3]), y[c0 + 4]);
+    }
+    origin_x = fx0;
+    origin_y = fy0;
+    cell_width = fx1 - fx0;
+    cell_height = fy1 - fy0;
+    tol = 1e-9 * fmax(fmax(fabs(cell_width), fabs(cell_height)), 1.0);
+    grid_cols = 0;
+    grid_rows = 0;
+  }
+  __syncthreads();
+
+  double local_minx = inf;
+  double local_miny = inf;
+  double local_maxx = -inf;
+  double local_maxy = -inf;
+  double local_max_left_x = -inf;
+  double local_max_bottom_y = -inf;
+  int local_valid = 1;
+
+  for (int row = tid; row < row_count; row += blockDim.x) {
+    int row_valid = 1;
+    if (!validity[row] || tags[row] != (signed char)polygon_tag || empty_mask[row]) {
+      row_valid = 0;
+    }
+    if (geometry_offsets[row] != row || geometry_offsets[row + 1] != row + 1) {
+      row_valid = 0;
+    }
+
+    const int c0 = ring_offsets[row];
+    const int c1 = ring_offsets[row + 1];
+    if (c0 < 0 || c1 != c0 + 5 || c1 > coord_count) {
+      row_valid = 0;
+    }
+
+    double xs[5];
+    double ys[5];
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+      int coord = c0 + k;
+      if (coord < 0) {
+        coord = 0;
+      }
+      const int max_coord = coord_count - 1;
+      if (coord > max_coord) {
+        coord = max_coord;
+      }
+      xs[k] = x[coord];
+      ys[k] = y[coord];
+    }
+
+    double bx0 = xs[0];
+    double by0 = ys[0];
+    double bx1 = xs[0];
+    double by1 = ys[0];
+    #pragma unroll
+    for (int k = 1; k < 5; k++) {
+      bx0 = fmin(bx0, xs[k]);
+      by0 = fmin(by0, ys[k]);
+      bx1 = fmax(bx1, xs[k]);
+      by1 = fmax(by1, ys[k]);
+    }
+
+    if (!isfinite(bx0) || !isfinite(by0) || !isfinite(bx1) || !isfinite(by1)) {
+      row_valid = 0;
+    }
+    const double width = bx1 - bx0;
+    const double height = by1 - by0;
+    if (width <= 0.0 || height <= 0.0) {
+      row_valid = 0;
+    }
+    if (fabs(width - cell_width) > tol || fabs(height - cell_height) > tol) {
+      row_valid = 0;
+    }
+    if (fabs(xs[0] - xs[4]) > tol || fabs(ys[0] - ys[4]) > tol) {
+      row_valid = 0;
+    }
+
+    int x_min_count = 0;
+    int x_max_count = 0;
+    int y_min_count = 0;
+    int y_max_count = 0;
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+      const bool x_is_min = fabs(xs[k] - bx0) <= tol;
+      const bool x_is_max = fabs(xs[k] - bx1) <= tol;
+      const bool y_is_min = fabs(ys[k] - by0) <= tol;
+      const bool y_is_max = fabs(ys[k] - by1) <= tol;
+      if (!(x_is_min || x_is_max) || !(y_is_min || y_is_max)) {
+        row_valid = 0;
+      }
+      if (k < 4) {
+        x_min_count += x_is_min ? 1 : 0;
+        x_max_count += x_is_max ? 1 : 0;
+        y_min_count += y_is_min ? 1 : 0;
+        y_max_count += y_is_max ? 1 : 0;
+      }
+    }
+    if (x_min_count != 2 || x_max_count != 2 || y_min_count != 2 || y_max_count != 2) {
+      row_valid = 0;
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+      const bool same_x = fabs(xs[k + 1] - xs[k]) <= tol;
+      const bool same_y = fabs(ys[k + 1] - ys[k]) <= tol;
+      if (same_x == same_y) {
+        row_valid = 0;
+      }
+    }
+
+    const int base = row * 4;
+    out_bounds[base + 0] = bx0;
+    out_bounds[base + 1] = by0;
+    out_bounds[base + 2] = bx1;
+    out_bounds[base + 3] = by1;
+
+    if (row_valid) {
+      local_minx = fmin(local_minx, bx0);
+      local_miny = fmin(local_miny, by0);
+      local_maxx = fmax(local_maxx, bx1);
+      local_maxy = fmax(local_maxy, by1);
+      local_max_left_x = fmax(local_max_left_x, bx0);
+      local_max_bottom_y = fmax(local_max_bottom_y, by0);
+    } else {
+      local_valid = 0;
+    }
+  }
+
+  s_minx[tid] = local_minx;
+  s_miny[tid] = local_miny;
+  s_maxx[tid] = local_maxx;
+  s_maxy[tid] = local_maxy;
+  s_max_left_x[tid] = local_max_left_x;
+  s_max_bottom_y[tid] = local_max_bottom_y;
+  s_valid[tid] = local_valid;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_minx[tid] = fmin(s_minx[tid], s_minx[tid + stride]);
+      s_miny[tid] = fmin(s_miny[tid], s_miny[tid + stride]);
+      s_maxx[tid] = fmax(s_maxx[tid], s_maxx[tid + stride]);
+      s_maxy[tid] = fmax(s_maxy[tid], s_maxy[tid + stride]);
+      s_max_left_x[tid] = fmax(s_max_left_x[tid], s_max_left_x[tid + stride]);
+      s_max_bottom_y[tid] = fmax(s_max_bottom_y[tid], s_max_bottom_y[tid + stride]);
+      s_valid[tid] = s_valid[tid] && s_valid[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    if (s_valid[0] && cell_width > 0.0 && cell_height > 0.0) {
+      grid_cols = llround((s_max_left_x[0] - origin_x) / cell_width) + 1LL;
+      grid_rows = llround((s_max_bottom_y[0] - origin_y) / cell_height) + 1LL;
+    }
+    if (grid_cols <= 0 || grid_rows <= 0 || grid_cols * grid_rows < (long long)row_count) {
+      s_valid[0] = 0;
+    }
+  }
+  __syncthreads();
+
+  int local_grid_valid = 1;
+  for (int row = tid; row < row_count; row += blockDim.x) {
+    if (!s_valid[0] || grid_cols <= 0 || grid_rows <= 0 || cell_width <= 0.0 || cell_height <= 0.0) {
+      local_grid_valid = 0;
+      continue;
+    }
+    const int base = row * 4;
+    const double bx0 = out_bounds[base + 0];
+    const double by0 = out_bounds[base + 1];
+    const long long col = llround((bx0 - origin_x) / cell_width);
+    const long long grid_row = llround((by0 - origin_y) / cell_height);
+    if (
+        col < 0 || col >= grid_cols ||
+        grid_row < 0 || grid_row >= grid_rows ||
+        grid_row * grid_cols + col != (long long)row ||
+        fabs((origin_x + (double)col * cell_width) - bx0) > tol ||
+        fabs((origin_y + (double)grid_row * cell_height) - by0) > tol
+    ) {
+      local_grid_valid = 0;
+    }
+  }
+
+  s_grid_valid[tid] = local_grid_valid;
+  __syncthreads();
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_grid_valid[tid] = s_grid_valid[tid] && s_grid_valid[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const int valid = s_valid[0] && s_grid_valid[0];
+    out_summary[0] = s_minx[0];
+    out_summary[1] = s_miny[0];
+    out_summary[2] = s_maxx[0];
+    out_summary[3] = s_maxy[0];
+    out_summary[4] = cell_width;
+    out_summary[5] = cell_height;
+    out_summary[6] = valid ? (double)grid_cols : 0.0;
+    out_summary[7] = valid ? (double)grid_rows : 0.0;
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+regular_rect_grid_certify_blocks(
+    const double* __restrict__ x,
+    const double* __restrict__ y,
+    const int*    __restrict__ geometry_offsets,
+    const int*    __restrict__ ring_offsets,
+    const bool*   __restrict__ empty_mask,
+    const bool*   __restrict__ validity,
+    const signed char* __restrict__ tags,
+    int           row_count,
+    int           coord_count,
+    int           polygon_tag,
+    double*       out_bounds,
+    double*       block_summaries
+) {
+  __shared__ double s_minx[256];
+  __shared__ double s_miny[256];
+  __shared__ double s_maxx[256];
+  __shared__ double s_maxy[256];
+  __shared__ double s_max_left_x[256];
+  __shared__ double s_max_bottom_y[256];
+  __shared__ int s_valid[256];
+  __shared__ double origin_x;
+  __shared__ double origin_y;
+  __shared__ double cell_width;
+  __shared__ double cell_height;
+  __shared__ double tol;
+
+  const int tid = threadIdx.x;
+  const double inf = 1.0e300;
+
+  if (tid == 0) {
+    double fx0 = 0.0;
+    double fy0 = 0.0;
+    double fx1 = 0.0;
+    double fy1 = 0.0;
+    if (row_count > 0 && coord_count >= 5 && ring_offsets[0] >= 0 && ring_offsets[0] + 4 < coord_count) {
+      const int c0 = ring_offsets[0];
+      fx0 = fmin(fmin(fmin(fmin(x[c0 + 0], x[c0 + 1]), x[c0 + 2]), x[c0 + 3]), x[c0 + 4]);
+      fy0 = fmin(fmin(fmin(fmin(y[c0 + 0], y[c0 + 1]), y[c0 + 2]), y[c0 + 3]), y[c0 + 4]);
+      fx1 = fmax(fmax(fmax(fmax(x[c0 + 0], x[c0 + 1]), x[c0 + 2]), x[c0 + 3]), x[c0 + 4]);
+      fy1 = fmax(fmax(fmax(fmax(y[c0 + 0], y[c0 + 1]), y[c0 + 2]), y[c0 + 3]), y[c0 + 4]);
+    }
+    origin_x = fx0;
+    origin_y = fy0;
+    cell_width = fx1 - fx0;
+    cell_height = fy1 - fy0;
+    tol = 1e-9 * fmax(fmax(fabs(cell_width), fabs(cell_height)), 1.0);
+  }
+  __syncthreads();
+
+  double local_minx = inf;
+  double local_miny = inf;
+  double local_maxx = -inf;
+  double local_maxy = -inf;
+  double local_max_left_x = -inf;
+  double local_max_bottom_y = -inf;
+  int local_valid = 1;
+
+  for (int row = blockIdx.x * blockDim.x + tid; row < row_count; row += blockDim.x * gridDim.x) {
+    int row_valid = 1;
+    if (!validity[row] || tags[row] != (signed char)polygon_tag || empty_mask[row]) {
+      row_valid = 0;
+    }
+    if (geometry_offsets[row] != row || geometry_offsets[row + 1] != row + 1) {
+      row_valid = 0;
+    }
+
+    const int c0 = ring_offsets[row];
+    const int c1 = ring_offsets[row + 1];
+    if (c0 < 0 || c1 != c0 + 5 || c1 > coord_count) {
+      row_valid = 0;
+    }
+
+    double xs[5];
+    double ys[5];
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+      int coord = c0 + k;
+      if (coord < 0) {
+        coord = 0;
+      }
+      const int max_coord = coord_count - 1;
+      if (coord > max_coord) {
+        coord = max_coord;
+      }
+      xs[k] = x[coord];
+      ys[k] = y[coord];
+    }
+
+    double bx0 = xs[0];
+    double by0 = ys[0];
+    double bx1 = xs[0];
+    double by1 = ys[0];
+    #pragma unroll
+    for (int k = 1; k < 5; k++) {
+      bx0 = fmin(bx0, xs[k]);
+      by0 = fmin(by0, ys[k]);
+      bx1 = fmax(bx1, xs[k]);
+      by1 = fmax(by1, ys[k]);
+    }
+
+    if (!isfinite(bx0) || !isfinite(by0) || !isfinite(bx1) || !isfinite(by1)) {
+      row_valid = 0;
+    }
+    const double width = bx1 - bx0;
+    const double height = by1 - by0;
+    if (width <= 0.0 || height <= 0.0) {
+      row_valid = 0;
+    }
+    if (fabs(width - cell_width) > tol || fabs(height - cell_height) > tol) {
+      row_valid = 0;
+    }
+    if (fabs(xs[0] - xs[4]) > tol || fabs(ys[0] - ys[4]) > tol) {
+      row_valid = 0;
+    }
+
+    int x_min_count = 0;
+    int x_max_count = 0;
+    int y_min_count = 0;
+    int y_max_count = 0;
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+      const bool x_is_min = fabs(xs[k] - bx0) <= tol;
+      const bool x_is_max = fabs(xs[k] - bx1) <= tol;
+      const bool y_is_min = fabs(ys[k] - by0) <= tol;
+      const bool y_is_max = fabs(ys[k] - by1) <= tol;
+      if (!(x_is_min || x_is_max) || !(y_is_min || y_is_max)) {
+        row_valid = 0;
+      }
+      if (k < 4) {
+        x_min_count += x_is_min ? 1 : 0;
+        x_max_count += x_is_max ? 1 : 0;
+        y_min_count += y_is_min ? 1 : 0;
+        y_max_count += y_is_max ? 1 : 0;
+      }
+    }
+    if (x_min_count != 2 || x_max_count != 2 || y_min_count != 2 || y_max_count != 2) {
+      row_valid = 0;
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; k++) {
+      const bool same_x = fabs(xs[k + 1] - xs[k]) <= tol;
+      const bool same_y = fabs(ys[k + 1] - ys[k]) <= tol;
+      if (same_x == same_y) {
+        row_valid = 0;
+      }
+    }
+
+    const int base = row * 4;
+    out_bounds[base + 0] = bx0;
+    out_bounds[base + 1] = by0;
+    out_bounds[base + 2] = bx1;
+    out_bounds[base + 3] = by1;
+
+    if (row_valid) {
+      local_minx = fmin(local_minx, bx0);
+      local_miny = fmin(local_miny, by0);
+      local_maxx = fmax(local_maxx, bx1);
+      local_maxy = fmax(local_maxy, by1);
+      local_max_left_x = fmax(local_max_left_x, bx0);
+      local_max_bottom_y = fmax(local_max_bottom_y, by0);
+    } else {
+      local_valid = 0;
+    }
+  }
+
+  s_minx[tid] = local_minx;
+  s_miny[tid] = local_miny;
+  s_maxx[tid] = local_maxx;
+  s_maxy[tid] = local_maxy;
+  s_max_left_x[tid] = local_max_left_x;
+  s_max_bottom_y[tid] = local_max_bottom_y;
+  s_valid[tid] = local_valid;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_minx[tid] = fmin(s_minx[tid], s_minx[tid + stride]);
+      s_miny[tid] = fmin(s_miny[tid], s_miny[tid + stride]);
+      s_maxx[tid] = fmax(s_maxx[tid], s_maxx[tid + stride]);
+      s_maxy[tid] = fmax(s_maxy[tid], s_maxy[tid + stride]);
+      s_max_left_x[tid] = fmax(s_max_left_x[tid], s_max_left_x[tid + stride]);
+      s_max_bottom_y[tid] = fmax(s_max_bottom_y[tid], s_max_bottom_y[tid + stride]);
+      s_valid[tid] = s_valid[tid] && s_valid[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const int base = blockIdx.x * 8;
+    block_summaries[base + 0] = s_minx[0];
+    block_summaries[base + 1] = s_miny[0];
+    block_summaries[base + 2] = s_maxx[0];
+    block_summaries[base + 3] = s_maxy[0];
+    block_summaries[base + 4] = s_max_left_x[0];
+    block_summaries[base + 5] = s_max_bottom_y[0];
+    block_summaries[base + 6] = (double)s_valid[0];
+    block_summaries[base + 7] = 0.0;
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+regular_rect_grid_finalize(
+    const double* __restrict__ out_bounds,
+    const double* __restrict__ block_summaries,
+    int block_count,
+    int row_count,
+    double* out_summary
+) {
+  __shared__ double s_minx[256];
+  __shared__ double s_miny[256];
+  __shared__ double s_maxx[256];
+  __shared__ double s_maxy[256];
+  __shared__ double s_max_left_x[256];
+  __shared__ double s_max_bottom_y[256];
+  __shared__ int s_valid[256];
+
+  const int tid = threadIdx.x;
+  const double inf = 1.0e300;
+  double local_minx = inf;
+  double local_miny = inf;
+  double local_maxx = -inf;
+  double local_maxy = -inf;
+  double local_max_left_x = -inf;
+  double local_max_bottom_y = -inf;
+  int local_valid = row_count > 0 ? 1 : 0;
+
+  for (int block = tid; block < block_count; block += blockDim.x) {
+    const int base = block * 8;
+    local_minx = fmin(local_minx, block_summaries[base + 0]);
+    local_miny = fmin(local_miny, block_summaries[base + 1]);
+    local_maxx = fmax(local_maxx, block_summaries[base + 2]);
+    local_maxy = fmax(local_maxy, block_summaries[base + 3]);
+    local_max_left_x = fmax(local_max_left_x, block_summaries[base + 4]);
+    local_max_bottom_y = fmax(local_max_bottom_y, block_summaries[base + 5]);
+    local_valid = local_valid && ((int)block_summaries[base + 6]);
+  }
+
+  s_minx[tid] = local_minx;
+  s_miny[tid] = local_miny;
+  s_maxx[tid] = local_maxx;
+  s_maxy[tid] = local_maxy;
+  s_max_left_x[tid] = local_max_left_x;
+  s_max_bottom_y[tid] = local_max_bottom_y;
+  s_valid[tid] = local_valid;
+  __syncthreads();
+
+  for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      s_minx[tid] = fmin(s_minx[tid], s_minx[tid + stride]);
+      s_miny[tid] = fmin(s_miny[tid], s_miny[tid + stride]);
+      s_maxx[tid] = fmax(s_maxx[tid], s_maxx[tid + stride]);
+      s_maxy[tid] = fmax(s_maxy[tid], s_maxy[tid + stride]);
+      s_max_left_x[tid] = fmax(s_max_left_x[tid], s_max_left_x[tid + stride]);
+      s_max_bottom_y[tid] = fmax(s_max_bottom_y[tid], s_max_bottom_y[tid + stride]);
+      s_valid[tid] = s_valid[tid] && s_valid[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    const double origin_x = out_bounds[0];
+    const double origin_y = out_bounds[1];
+    const double cell_width = out_bounds[2] - out_bounds[0];
+    const double cell_height = out_bounds[3] - out_bounds[1];
+    long long grid_cols = 0;
+    long long grid_rows = 0;
+    int valid = s_valid[0] && cell_width > 0.0 && cell_height > 0.0;
+    if (valid) {
+      grid_cols = llround((s_max_left_x[0] - origin_x) / cell_width) + 1LL;
+      grid_rows = llround((s_max_bottom_y[0] - origin_y) / cell_height) + 1LL;
+      if (grid_cols <= 0 || grid_rows <= 0 || grid_cols * grid_rows < (long long)row_count) {
+        valid = 0;
+      }
+    }
+    out_summary[0] = s_minx[0];
+    out_summary[1] = s_miny[0];
+    out_summary[2] = s_maxx[0];
+    out_summary[3] = s_maxy[0];
+    out_summary[4] = cell_width;
+    out_summary[5] = cell_height;
+    out_summary[6] = valid ? (double)grid_cols : 0.0;
+    out_summary[7] = valid ? (double)grid_rows : 0.0;
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256, 4)
+regular_rect_grid_validate_positions(
+    const double* __restrict__ out_bounds,
+    int row_count,
+    double* out_summary,
+    int* valid_flag
+) {
+  const double origin_x = out_summary[0];
+  const double origin_y = out_summary[1];
+  const double cell_width = out_summary[4];
+  const double cell_height = out_summary[5];
+  const long long grid_cols = llround(out_summary[6]);
+  const long long grid_rows = llround(out_summary[7]);
+  const double tol = 1e-9 * fmax(fmax(fabs(cell_width), fabs(cell_height)), 1.0);
+
+  for (int row = blockIdx.x * blockDim.x + threadIdx.x; row < row_count; row += blockDim.x * gridDim.x) {
+    if (grid_cols <= 0 || grid_rows <= 0 || cell_width <= 0.0 || cell_height <= 0.0) {
+      atomicExch(valid_flag, 0);
+      continue;
+    }
+    const int base = row * 4;
+    const double bx0 = out_bounds[base + 0];
+    const double by0 = out_bounds[base + 1];
+    const long long col = llround((bx0 - origin_x) / cell_width);
+    const long long grid_row = llround((by0 - origin_y) / cell_height);
+    if (
+        col < 0 || col >= grid_cols ||
+        grid_row < 0 || grid_row >= grid_rows ||
+        grid_row * grid_cols + col != (long long)row ||
+        fabs((origin_x + (double)col * cell_width) - bx0) > tol ||
+        fabs((origin_y + (double)grid_row * cell_height) - by0) > tol
+    ) {
+      atomicExch(valid_flag, 0);
+    }
+  }
+}
+
+extern "C" __global__ void regular_rect_grid_apply_valid(
+    const int* valid_flag,
+    double* out_summary
+) {
+  if (threadIdx.x == 0 && blockIdx.x == 0 && valid_flag[0] == 0) {
+    out_summary[6] = 0.0;
+    out_summary[7] = 0.0;
+  }
+}
+
 /* Sort-and-sweep MBR overlap test.
  *
  * Operates on a concatenated array of geometries, sorted by minx.
@@ -154,7 +737,15 @@ extern "C" __global__ void sweep_sorted_mbr_overlap(
 }
 """
 
-_INDEXING_KERNEL_NAMES = ("morton_keys_from_bounds", "sweep_sorted_mbr_overlap")
+_INDEXING_KERNEL_NAMES = (
+    "morton_keys_from_bounds",
+    "regular_rect_grid_certify",
+    "regular_rect_grid_certify_blocks",
+    "regular_rect_grid_finalize",
+    "regular_rect_grid_validate_positions",
+    "regular_rect_grid_apply_valid",
+    "sweep_sorted_mbr_overlap",
+)
 
 # ---------------------------------------------------------------------------
 # Segment MBR extraction kernels (Tier 1: geometry-specific inner loops)

@@ -303,3 +303,41 @@ def test_return_device_strategies_stay_device_resident(
         assert bool(device_last.item()) is False
     finally:
         runtime.synchronize = original_sync
+
+
+@pytest.mark.gpu
+def test_public_return_device_path_does_not_materialize_lazy_device_metadata() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+
+    import cupy as cp
+
+    from vibespatial.cuda._runtime import assert_zero_d2h_transfers
+
+    polygons = from_shapely_geometries(
+        [box(0, 0, 2, 2), box(10, 10, 12, 12), None],
+        residency=Residency.DEVICE,
+    )
+    points = from_shapely_geometries(
+        [Point(1, 1), Point(11, 11), Point(5, 5)],
+        residency=Residency.DEVICE,
+    )
+
+    # Simulate device-native IO/import surfaces: routing metadata exists on
+    # device, but host metadata has not crossed the compatibility boundary.
+    for owned in (points, polygons):
+        assert owned.device_state is not None
+        owned._validity = None
+        owned._tags = None
+        owned._family_row_offsets = None
+
+    with assert_zero_d2h_transfers():
+        result = point_in_polygon(
+            points,
+            polygons,
+            dispatch_mode=ExecutionMode.GPU,
+            _return_device=True,
+        )
+        assert hasattr(result, "__cuda_array_interface__")
+
+    assert cp.asnumpy(result).tolist() == [True, True, False]

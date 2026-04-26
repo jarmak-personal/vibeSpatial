@@ -120,6 +120,7 @@ def load_decisions(root: Path) -> list[DecisionRecord]:
 def render_index(decisions: list[DecisionRecord]) -> str:
     open_first = [
         "- docs/decisions/index.md",
+        "- docs/decisions/adr-index.md",
         "- scripts/new_decision.py",
         "- docs/architecture/runtime.md",
     ]

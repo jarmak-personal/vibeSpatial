@@ -45,6 +45,7 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_PTR,
     compile_kernel_group,
     count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
@@ -1507,10 +1508,29 @@ def _clip_linestring_rows_gpu_fast_path(
     device_families: dict[GeometryFamily, DeviceFamilyGeometryBuffer] = {}
 
     single_count = int(d_single_rows.size)
+    total_pairs = []
     if single_count > 0:
         d_single_counts_i64 = d_output_coord_counts[d_single_mask].astype(cp.int64, copy=False)
         d_single_offsets_i64 = exclusive_sum(d_single_counts_i64, synchronize=False)
-        total_single_coords = count_scatter_total(runtime, d_single_counts_i64, d_single_offsets_i64)
+        total_pairs.append((d_single_counts_i64, d_single_offsets_i64))
+
+    multi_count = int(d_multi_rows.size)
+    if multi_count > 0:
+        d_multi_part_counts_i64 = d_output_run_counts[d_multi_mask].astype(cp.int64, copy=False)
+        d_multi_geom_offsets_i64 = exclusive_sum(d_multi_part_counts_i64, synchronize=False)
+        d_multi_coord_counts_i64 = d_output_coord_counts[d_multi_mask].astype(cp.int64, copy=False)
+        d_multi_coord_offsets_i64 = exclusive_sum(d_multi_coord_counts_i64, synchronize=False)
+        total_pairs.extend([
+            (d_multi_part_counts_i64, d_multi_geom_offsets_i64),
+            (d_multi_coord_counts_i64, d_multi_coord_offsets_i64),
+        ])
+
+    total_values = count_scatter_totals(runtime, total_pairs) if total_pairs else []
+    total_cursor = 0
+
+    if single_count > 0:
+        total_single_coords = total_values[total_cursor]
+        total_cursor += 1
         d_single_geom_offsets = cp.empty(single_count + 1, dtype=cp.int32)
         d_single_geom_offsets[:single_count] = d_single_offsets_i64.astype(cp.int32, copy=False)
         d_single_geom_offsets[single_count] = total_single_coords
@@ -1563,18 +1583,12 @@ def _clip_linestring_rows_gpu_fast_path(
             bounds=None,
         )
 
-    multi_count = int(d_multi_rows.size)
     if multi_count > 0:
-        d_multi_part_counts_i64 = d_output_run_counts[d_multi_mask].astype(cp.int64, copy=False)
-        d_multi_geom_offsets_i64 = exclusive_sum(d_multi_part_counts_i64, synchronize=False)
-        total_multi_parts = count_scatter_total(runtime, d_multi_part_counts_i64, d_multi_geom_offsets_i64)
+        total_multi_parts, total_multi_coords = total_values[total_cursor:total_cursor + 2]
         d_multi_geom_offsets = cp.empty(multi_count + 1, dtype=cp.int32)
         d_multi_geom_offsets[:multi_count] = d_multi_geom_offsets_i64.astype(cp.int32, copy=False)
-        d_multi_geom_offsets[multi_count] = total_multi_parts
 
-        d_multi_coord_counts_i64 = d_output_coord_counts[d_multi_mask].astype(cp.int64, copy=False)
-        d_multi_coord_offsets_i64 = exclusive_sum(d_multi_coord_counts_i64, synchronize=False)
-        total_multi_coords = count_scatter_total(runtime, d_multi_coord_counts_i64, d_multi_coord_offsets_i64)
+        d_multi_geom_offsets[multi_count] = total_multi_parts
         d_multi_coord_offsets = cp.empty(multi_count + 1, dtype=cp.int32)
         d_multi_coord_offsets[:multi_count] = d_multi_coord_offsets_i64.astype(cp.int32, copy=False)
         d_multi_coord_offsets[multi_count] = total_multi_coords

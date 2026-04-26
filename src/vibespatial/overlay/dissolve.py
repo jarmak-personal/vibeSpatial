@@ -1065,6 +1065,32 @@ def _row_code_count(row_group_codes: Any) -> int:
     return len(row_group_codes)
 
 
+def _is_device_array(value: Any) -> bool:
+    return hasattr(value, "__cuda_array_interface__")
+
+
+def _materialize_device_group_codes(row_group_codes: Any) -> np.ndarray:
+    from vibespatial.runtime.materialization import (
+        MaterializationBoundary,
+        record_materialization_event,
+    )
+
+    rows = _row_code_count(row_group_codes)
+    itemsize = int(getattr(getattr(row_group_codes, "dtype", None), "itemsize", 0))
+    record_materialization_event(
+        surface="vibespatial.overlay.dissolve.execute_grouped_union_codes",
+        boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+        operation="device_group_codes_to_host",
+        reason="device dense group codes were materialized for host-only grouped union fallback",
+        detail=f"rows={rows}, bytes={rows * itemsize}",
+        d2h_transfer=True,
+        strict_disallowed=True,
+    )
+    if cp is None:
+        raise RuntimeError("CuPy is required to materialize device group codes")
+    return cp.asnumpy(row_group_codes).astype(np.int32, copy=False)
+
+
 def _tag_grouped_convex_hull_source(
     reduced: OwnedGeometryArray,
     *,
@@ -1550,8 +1576,6 @@ def execute_grouped_box_union_gpu_owned_codes(
     d_counts = cp.bincount(d_observed_codes, minlength=group_count)
     if not bool(cp.all(d_counts[:group_count] > 0)):
         return None
-    if d_observed_codes.size > 1 and not bool(cp.all(d_observed_codes[1:] >= d_observed_codes[:-1])):
-        return None
 
     d_xmin = cp.full(group_count, cp.inf, dtype=cp.float64)
     d_ymin = cp.full(group_count, cp.inf, dtype=cp.float64)
@@ -1596,24 +1620,45 @@ def execute_grouped_box_union_gpu_owned_codes(
         rtol=1.0e-12,
         atol=SPATIAL_EPSILON,
     )
-    same_group = d_observed_codes[1:] == d_observed_codes[:-1]
+    x_order = cp.lexsort(
+        cp.stack(
+            [
+                d_observed_bounds[:, 0],
+                d_observed_codes.astype(cp.float64, copy=False),
+            ],
+        ),
+    )
+    x_sorted_codes = d_observed_codes[x_order]
+    x_sorted_bounds = d_observed_bounds[x_order]
+    same_group = x_sorted_codes[1:] == x_sorted_codes[:-1]
     x_contiguous = bool(
         cp.all(
             (~same_group)
             | cp.isclose(
-                d_observed_bounds[:-1, 2],
-                d_observed_bounds[1:, 0],
+                x_sorted_bounds[:-1, 2],
+                x_sorted_bounds[1:, 0],
                 rtol=1.0e-12,
                 atol=SPATIAL_EPSILON,
             )
         )
     )
+    y_order = cp.lexsort(
+        cp.stack(
+            [
+                d_observed_bounds[:, 1],
+                d_observed_codes.astype(cp.float64, copy=False),
+            ],
+        ),
+    )
+    y_sorted_codes = d_observed_codes[y_order]
+    y_sorted_bounds = d_observed_bounds[y_order]
+    same_group = y_sorted_codes[1:] == y_sorted_codes[:-1]
     y_contiguous = bool(
         cp.all(
             (~same_group)
             | cp.isclose(
-                d_observed_bounds[:-1, 3],
-                d_observed_bounds[1:, 1],
+                y_sorted_bounds[:-1, 3],
+                y_sorted_bounds[1:, 1],
                 rtol=1.0e-12,
                 atol=SPATIAL_EPSILON,
             )
@@ -1633,6 +1678,155 @@ def execute_grouped_box_union_gpu_owned_codes(
         non_empty_groups=group_count,
         empty_groups=0,
         method=DissolveUnionMethod.COVERAGE,
+        owned=reduced,
+    )
+
+
+def execute_grouped_disjoint_subset_union_gpu_owned_codes(
+    row_group_codes: Any,
+    *,
+    group_count: int,
+    owned: OwnedGeometryArray,
+    method: DissolveUnionMethod = DissolveUnionMethod.DISJOINT_SUBSET,
+) -> GroupedUnionResult | None:
+    """Assemble strictly disjoint polygon groups into MultiPolygon rows.
+
+    This path performs no topology union.  It is exact only when every group is
+    already valid and every pair of polygons in a group has strictly separated
+    bounding boxes.  Touching or overlapping groups decline to the exact
+    fallback instead of returning adjacent parts as an invalid MultiPolygon.
+    """
+    if cp is None:
+        return None
+    if _row_code_count(row_group_codes) != int(owned.row_count):
+        raise ValueError("row_group_codes length must match owned geometry row count")
+    if owned.device_state is None:
+        return None
+
+    from vibespatial.geometry.buffers import GeometryFamily
+    from vibespatial.geometry.owned import (
+        FAMILY_TAGS,
+        DeviceFamilyGeometryBuffer,
+        build_device_resident_owned,
+        seed_homogeneous_host_metadata,
+    )
+
+    device_state = owned._ensure_device_state()
+    if set(device_state.families) != {GeometryFamily.POLYGON}:
+        return None
+    cached_validity = getattr(owned, "_cached_is_valid_mask", None)
+    if (
+        cached_validity is None
+        or int(getattr(cached_validity, "size", 0)) != int(owned.row_count)
+        or not bool(np.all(cached_validity))
+    ):
+        return None
+
+    polygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.POLYGON])
+    d_validity = cp.asarray(device_state.validity).astype(cp.bool_, copy=False)
+    d_tags = cp.asarray(device_state.tags).astype(cp.int8, copy=False)
+
+    polygon_buffer = device_state.families[GeometryFamily.POLYGON]
+    if polygon_buffer.ring_offsets is None:
+        return None
+
+    d_codes = cp.asarray(row_group_codes, dtype=cp.int32)
+    d_observed_mask = (d_codes >= 0) & (d_codes < int(group_count))
+
+    d_rows = cp.arange(int(owned.row_count), dtype=cp.int64)
+    d_observed_rows = d_rows[d_observed_mask]
+    d_observed_codes = d_codes[d_observed_mask]
+    d_counts = cp.bincount(d_observed_codes, minlength=int(group_count))[
+        : int(group_count)
+    ].astype(cp.int32, copy=False)
+    # Preserve exact GeoPandas geometry typing by declining singleton or empty
+    # groups for now.  Mixed Polygon/MultiPolygon grouped output is a separate
+    # scatter problem; this bulk path owns only multi-member groups.
+    d_admissible = cp.all(d_validity) & cp.all(d_tags == polygon_tag)
+    if polygon_buffer.empty_mask is not None:
+        d_admissible &= ~cp.any(polygon_buffer.empty_mask)
+    d_admissible &= cp.any(d_observed_mask)
+    d_admissible &= cp.all(d_counts > 1)
+    d_admissible &= cp.all(d_counts <= 8)
+    if not bool(d_admissible):
+        return None
+
+    order = cp.lexsort(
+        cp.stack(
+            [
+                d_observed_rows,
+                d_observed_codes.astype(cp.int64, copy=False),
+            ],
+        ),
+    )
+    d_sorted_rows = d_observed_rows[order].astype(cp.int64, copy=False)
+    sorted_owned = owned.take(d_sorted_rows)
+    sorted_state = sorted_owned._ensure_device_state()
+    sorted_polygon = sorted_state.families.get(GeometryFamily.POLYGON)
+    if sorted_polygon is None or sorted_polygon.ring_offsets is None:
+        return None
+
+    d_group_offsets = cp.concatenate(
+        [
+            cp.asarray([0], dtype=cp.int32),
+            cp.cumsum(d_counts, dtype=cp.int32),
+        ],
+    )
+    from vibespatial.kernels.core.geometry_analysis import compute_geometry_bounds_device
+
+    sorted_bounds = cp.asarray(compute_geometry_bounds_device(sorted_owned), dtype=cp.float64)
+    max_group_size = 8
+    slot_ids = cp.arange(max_group_size, dtype=cp.int32)
+    slot_valid = slot_ids[None, :] < d_counts[:, None]
+    slot_positions = d_group_offsets[:-1, None] + slot_ids[None, :]
+    slot_positions = cp.minimum(
+        slot_positions,
+        cp.asarray(max(int(sorted_owned.row_count) - 1, 0), dtype=cp.int32),
+    )
+    slot_bounds = sorted_bounds[slot_positions]
+    a = slot_bounds[:, :, None, :]
+    b = slot_bounds[:, None, :, :]
+    pair_valid = (
+        slot_valid[:, :, None]
+        & slot_valid[:, None, :]
+        & (slot_ids[None, :, None] < slot_ids[None, None, :])
+    )
+    separated = (
+        (a[..., 2] < b[..., 0])
+        | (b[..., 2] < a[..., 0])
+        | (a[..., 3] < b[..., 1])
+        | (b[..., 3] < a[..., 1])
+    )
+    if not bool(cp.all((~pair_valid) | separated)):
+        return None
+
+    d_empty_mask = cp.zeros(int(group_count), dtype=cp.bool_)
+    d_multipolygon = DeviceFamilyGeometryBuffer(
+        family=GeometryFamily.MULTIPOLYGON,
+        x=sorted_polygon.x,
+        y=sorted_polygon.y,
+        geometry_offsets=d_group_offsets,
+        empty_mask=d_empty_mask,
+        part_offsets=sorted_polygon.geometry_offsets,
+        ring_offsets=sorted_polygon.ring_offsets,
+    )
+    multipolygon_tag = np.int8(FAMILY_TAGS[GeometryFamily.MULTIPOLYGON])
+    reduced = build_device_resident_owned(
+        device_families={GeometryFamily.MULTIPOLYGON: d_multipolygon},
+        row_count=int(group_count),
+        tags=cp.full(int(group_count), multipolygon_tag, dtype=cp.int8),
+        validity=cp.ones(int(group_count), dtype=cp.bool_),
+        family_row_offsets=cp.arange(int(group_count), dtype=cp.int32),
+        execution_mode="gpu",
+    )
+    seed_homogeneous_host_metadata(reduced, GeometryFamily.MULTIPOLYGON)
+
+    return GroupedUnionResult(
+        geometries=None,
+        group_count=int(group_count),
+        non_empty_groups=int(group_count),
+        empty_groups=0,
+        method=method,
         owned=reduced,
     )
 
@@ -2319,6 +2513,7 @@ def execute_grouped_union_codes(
     owned: OwnedGeometryArray | None = None,
 ) -> GroupedUnionResult | None:
     normalized = method if isinstance(method, DissolveUnionMethod) else DissolveUnionMethod(method)
+    row_group_codes_device = _is_device_array(row_group_codes)
     values: np.ndarray | None = None
 
     def _values() -> np.ndarray:
@@ -2363,6 +2558,27 @@ def execute_grouped_union_codes(
         )
         if accelerated is not None:
             return accelerated
+
+    if (
+        owned is not None
+        and normalized
+        in {
+            DissolveUnionMethod.COVERAGE,
+            DissolveUnionMethod.DISJOINT_SUBSET,
+        }
+        and grid_size is None
+    ):
+        accelerated = execute_grouped_disjoint_subset_union_gpu_owned_codes(
+            row_group_codes,
+            group_count=group_count,
+            owned=owned,
+            method=normalized,
+        )
+        if accelerated is not None:
+            return accelerated
+
+    if row_group_codes_device:
+        row_group_codes = _materialize_device_group_codes(row_group_codes)
 
     if (
         normalized is DissolveUnionMethod.COVERAGE

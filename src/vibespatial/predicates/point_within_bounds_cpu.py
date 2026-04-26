@@ -54,7 +54,7 @@ def normalize_right_input(
                 f"got {expected_len} points and {array.row_count} bounds rows"
             )
         return NormalizedBoundsInput(
-            bounds=compute_geometry_bounds(array),
+            bounds=compute_geometry_bounds(array, dispatch_mode=ExecutionMode.CPU),
             null_mask=~array.validity,
             empty_mask=extract_empty_rows(array),
             geometry_array=array,
@@ -75,7 +75,7 @@ def normalize_right_input(
             expected_families=(GeometryFamily.POLYGON, GeometryFamily.MULTIPOLYGON),
         )
         return NormalizedBoundsInput(
-            bounds=compute_geometry_bounds(array),
+            bounds=compute_geometry_bounds(array, dispatch_mode=ExecutionMode.CPU),
             null_mask=~array.validity,
             empty_mask=extract_empty_rows(array),
             geometry_array=array,

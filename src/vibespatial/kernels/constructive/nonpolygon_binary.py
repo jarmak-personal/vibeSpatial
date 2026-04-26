@@ -34,6 +34,7 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_PTR,
     compile_kernel_group,
     count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
@@ -857,8 +858,13 @@ def _linestring_polygon_constructive(
 
     d_coord_offsets = exclusive_sum(d_coord_counts, synchronize=False)
     d_part_offsets = exclusive_sum(d_part_counts, synchronize=False)
-    total_verts = count_scatter_total(runtime, d_coord_counts, d_coord_offsets)
-    total_parts = count_scatter_total(runtime, d_part_counts, d_part_offsets)
+    total_verts, total_parts = count_scatter_totals(
+        runtime,
+        [
+            (d_coord_counts, d_coord_offsets),
+            (d_part_counts, d_part_offsets),
+        ],
+    )
 
     d_coord_counts_cp = cp.asarray(d_coord_counts)
     d_part_counts_cp = cp.asarray(d_part_counts)

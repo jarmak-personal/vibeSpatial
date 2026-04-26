@@ -752,9 +752,13 @@ def _join_heavy_group_categories(scale: int) -> np.ndarray:
     return np.arange(max(min(scale, 128), 1), dtype=np.int32)
 
 
+def _is_device_array(value) -> bool:
+    return hasattr(value, "__cuda_array_interface__")
+
+
 def _dissolve_join_heavy_groups(
     joined_geometry,
-    unique_right_index: np.ndarray,
+    unique_right_index,
     *,
     scale: int,
 ):
@@ -765,13 +769,25 @@ def _dissolve_join_heavy_groups(
 
     geometry_name = "geometry"
     group_categories = _join_heavy_group_categories(scale)
-    group_labels = np.remainder(
-        np.asarray(unique_right_index, dtype=np.int64),
-        int(group_categories.size),
-    )
-    row_group_codes = group_labels.astype(np.int32, copy=False)
-    observed_codes = np.unique(row_group_codes).astype(np.int32, copy=False)
-    observed_labels = np.unique(group_labels)
+    group_count = int(group_categories.size)
+    group_labels = None
+    observed_codes = None
+    observed_labels = None
+    observed_codes_device = None
+    if _is_device_array(unique_right_index):
+        import cupy as cp
+
+        d_unique_right_index = cp.asarray(unique_right_index, dtype=cp.int64)
+        d_group_labels = cp.remainder(d_unique_right_index, group_count)
+        row_group_codes = d_group_labels.astype(cp.int32, copy=False)
+    else:
+        group_labels = np.remainder(
+            np.asarray(unique_right_index, dtype=np.int64),
+            group_count,
+        )
+        row_group_codes = group_labels.astype(np.int32, copy=False)
+        observed_codes = np.unique(row_group_codes).astype(np.int32, copy=False)
+        observed_labels = np.unique(group_labels)
     joined_owned = geometry_result.owned
     if joined_owned is None:
         joined_series = geometry_result.to_geoseries(
@@ -789,17 +805,48 @@ def _dissolve_join_heavy_groups(
     grouped_union = execute_grouped_union_codes(
         geometry_values,
         row_group_codes,
-        group_count=int(group_categories.size),
+        group_count=group_count,
         method=DissolveUnionMethod.COVERAGE,
         owned=joined_owned,
     )
     if grouped_union is not None:
+        if observed_codes is None:
+            if (
+                grouped_union.owned is not None
+                and grouped_union.non_empty_groups == grouped_union.group_count
+            ):
+                observed_codes = np.arange(group_count, dtype=np.int32)
+                observed_labels = observed_codes.astype(np.int64, copy=False)
+            else:
+                import cupy as cp
+
+                observed_codes_device = cp.unique(row_group_codes).astype(
+                    cp.int64,
+                    copy=False,
+                )
+                observed_codes = cp.asnumpy(observed_codes_device).astype(
+                    np.int32,
+                    copy=False,
+                )
+                observed_labels = observed_codes.astype(np.int64, copy=False)
         group_index = pd.CategoricalIndex(pd.Categorical(observed_labels), name="group")
         if grouped_union.owned is not None:
-            geometry_result = GeometryNativeResult.from_owned(
-                grouped_union.owned.take(observed_codes.astype(np.int64, copy=False)),
-                crs=geometry_result.crs,
-            )
+            if (
+                observed_codes.size == grouped_union.group_count
+                and np.array_equal(
+                    observed_codes,
+                    np.arange(grouped_union.group_count, dtype=np.int32),
+                )
+            ):
+                selected_owned = grouped_union.owned
+            else:
+                take_codes = (
+                    observed_codes_device
+                    if observed_codes_device is not None
+                    else observed_codes.astype(np.int64, copy=False)
+                )
+                selected_owned = grouped_union.owned.take(take_codes)
+            geometry_result = GeometryNativeResult.from_owned(selected_owned, crs=geometry_result.crs)
         else:
             geometry_result = GeometryNativeResult.from_geoseries(
                 geopandas.GeoSeries(
@@ -814,6 +861,27 @@ def _dissolve_join_heavy_groups(
             geometry_name=geometry_name,
             as_index=True,
         ), True
+
+    if group_labels is None:
+        from vibespatial.runtime.materialization import (
+            MaterializationBoundary,
+            record_materialization_event,
+        )
+
+        rows = int(getattr(d_group_labels, "size", 0))
+        itemsize = int(getattr(getattr(d_group_labels, "dtype", None), "itemsize", 0))
+        record_materialization_event(
+            surface="vibespatial.bench.pipeline._dissolve_join_heavy_groups",
+            boundary=MaterializationBoundary.INTERNAL_HOST_CONVERSION,
+            operation="device_group_labels_to_host",
+            reason="device group labels were materialized for public dissolve fallback",
+            detail=f"rows={rows}, bytes={rows * itemsize}",
+            d2h_transfer=True,
+            strict_disallowed=True,
+        )
+        import cupy as cp
+
+        group_labels = cp.asnumpy(d_group_labels).astype(np.int64, copy=False)
 
     joined_frame = geopandas.GeoDataFrame(
         {"group": pd.Categorical(group_labels)},
@@ -923,22 +991,35 @@ def _profile_join_pipeline(
             category="filter",
             device=query_runtime,
             rows_in=scale,
-            detail="query candidate polygons for each point through the repo-owned spatial query path",
+            detail="query candidate polygons as relation pairs without host pair export",
         ) as stage:
-            indices = query_spatial_index(
+            query_result, query_execution = query_spatial_index(
                 right_owned,
                 flat_index,
                 left_owned,
                 predicate="intersects",
                 sort=True,
                 output_format="indices",
+                return_device=True,
+                return_metadata=True,
             )
-            if indices.ndim == 1:
-                right_index = indices.astype(np.int64, copy=False)
-            else:
-                right_index = indices[1].astype(np.int64, copy=False)
-            stage.rows_out = int(right_index.size)
-            stage.metadata["pairs_examined"] = int(right_index.size)
+            left_idx, right_idx, pair_storage = _relation_pair_arrays_from_query_result(
+                query_result
+            )
+            relation = NativeRelation(
+                left_idx,
+                right_idx,
+                predicate="intersects",
+                left_row_count=left_owned.row_count,
+                right_row_count=right_owned.row_count,
+                sorted_by_left=True,
+            )
+            stage.device = query_execution.selected
+            stage.rows_out = len(relation)
+            stage.metadata["pairs_examined"] = len(relation)
+            stage.metadata["pair_storage"] = pair_storage
+            stage.metadata["query_implementation"] = query_execution.implementation
+            stage.metadata["query_reason"] = query_execution.reason
             stage.metadata["regular_grid_fast_path"] = bool(flat_index.regular_grid is not None)
             _record_stage_overheads(stage, audit, memory, left_owned, right_owned)
 
@@ -946,10 +1027,11 @@ def _profile_join_pipeline(
             "assemble_join_rows",
             category="refine",
             device="auto",
-            rows_in=int(right_index.size),
-            detail="assemble polygon rows selected by the spatial query before dissolve",
+            rows_in=int(len(relation)),
+            detail="derive matched right-row NativeRowSet and gather polygons before dissolve",
         ) as stage:
-            unique_right_index = np.unique(right_index)
+            right_rowset = relation.right_semijoin_rowset()
+            unique_right_index = right_rowset.positions
             joined_geometry = (
                 GeometryNativeResult.from_owned(
                     right_owned.take(unique_right_index),
@@ -962,7 +1044,12 @@ def _profile_join_pipeline(
             )
             stage.device = _selected_runtime_from_history(joined_geometry) or "cpu"
             stage.rows_out = int(joined_geometry.row_count)
-            stage.metadata["deduped_candidate_rows"] = int(unique_right_index.size)
+            stage.metadata["deduped_candidate_rows"] = int(len(right_rowset))
+            stage.metadata["rowset_storage"] = (
+                "device" if right_rowset.is_device else "host"
+            )
+            stage.metadata["ordered"] = right_rowset.ordered
+            stage.metadata["unique"] = right_rowset.unique
             _record_stage_overheads(stage, audit, memory, joined_geometry)
 
         with profiler.stage(
@@ -2291,7 +2378,8 @@ def _profile_predicate_pipeline(
         ) as stage:
             history_before = len(batch.geometry.runtime_history)
             mask = point_in_polygon(batch.geometry, polygon_owned, _return_device=True)
-            stage.rows_out = int(mask.sum())
+            stage.rows_out = int(getattr(mask, "shape", (batch.geometry.row_count,))[0])
+            stage.metadata["true_count"] = "deferred_device_mask"
             runtime_selection = batch.geometry.runtime_history[history_before:] or batch.geometry.runtime_history[-1:]
             if runtime_selection:
                 stage.device = runtime_selection[-1].selected.value

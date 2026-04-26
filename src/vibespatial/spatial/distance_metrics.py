@@ -25,7 +25,7 @@ from vibespatial.geometry.buffers import GeometryFamily
 from vibespatial.geometry.owned import FAMILY_TAGS, OwnedGeometryArray, tile_single_row
 from vibespatial.runtime import ExecutionMode, combined_residency
 from vibespatial.runtime.adaptive import plan_dispatch_selection
-from vibespatial.runtime.precision import KernelClass
+from vibespatial.runtime.precision import CoordinateStats, KernelClass, PrecisionMode
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +307,66 @@ def _compile_distance_kernel(name_prefix, fp64_source, fp32_source,
     )
 
 
+def _fp32_center_coords_for_pair(
+    owned_a: OwnedGeometryArray,
+    owned_b: OwnedGeometryArray,
+) -> tuple[float, float]:
+    """Return a combined coordinate center for staged fp32 pair metrics."""
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    device_scalars: list = []
+
+    for owned in (owned_a, owned_b):
+        device_state = owned.device_state
+        for fam, buf in owned.families.items():
+            if buf.row_count == 0:
+                continue
+            if device_state is not None and fam in device_state.families and cp is not None:
+                d_buf = device_state.families[fam]
+                if int(d_buf.x.size) > 0:
+                    d_x = cp.asarray(d_buf.x)
+                    d_y = cp.asarray(d_buf.y)
+                    device_scalars.extend([
+                        cp.min(d_x), cp.max(d_x),
+                        cp.min(d_y), cp.max(d_y),
+                    ])
+                continue
+            if buf.x.size > 0:
+                min_x = min(min_x, float(buf.x.min()))
+                max_x = max(max_x, float(buf.x.max()))
+                min_y = min(min_y, float(buf.y.min()))
+                max_y = max(max_y, float(buf.y.max()))
+
+    if device_scalars:
+        stats = cp.array(device_scalars).get()
+        for idx in range(0, len(stats), 4):
+            min_x = min(min_x, float(stats[idx]))
+            max_x = max(max_x, float(stats[idx + 1]))
+            min_y = min(min_y, float(stats[idx + 2]))
+            max_y = max(max_y, float(stats[idx + 3]))
+
+    if not np.isfinite(min_x) or not np.isfinite(min_y):
+        return 0.0, 0.0
+    return (min_x + max_x) * 0.5, (min_y + max_y) * 0.5
+
+
+def _coord_stats_for_pair(
+    owned_a: OwnedGeometryArray,
+    owned_b: OwnedGeometryArray,
+) -> CoordinateStats:
+    from vibespatial.constructive.measurement import _coord_stats_from_owned
+
+    a_max_abs, a_min, a_max = _coord_stats_from_owned(owned_a)
+    b_max_abs, b_min, b_max = _coord_stats_from_owned(owned_b)
+    coord_min = min(a_min, b_min)
+    coord_max = max(a_max, b_max)
+    span = coord_max - coord_min if np.isfinite(coord_min) else 0.0
+    return CoordinateStats(
+        max_abs_coord=max(a_max_abs, b_max_abs),
+        span=span,
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPU dispatch: Hausdorff distance
 # ---------------------------------------------------------------------------
@@ -321,7 +381,7 @@ def _compile_distance_kernel(name_prefix, fp64_source, fp32_source,
     supports_mixed=False,
     tags=("cuda-python", "metric", "hausdorff"),
 )
-def _hausdorff_gpu(owned_a, owned_b):
+def _hausdorff_gpu(owned_a, owned_b, precision_plan=None):
     """GPU Hausdorff distance.  Returns ``np.ndarray`` of shape ``(n,)``."""
     runtime = get_cuda_runtime()
     d_state_a = owned_a._ensure_device_state()
@@ -361,9 +421,12 @@ def _hausdorff_gpu(owned_a, owned_b):
         d_bcast_x = cp.tile(cp.asarray(buf_b.x), n)
         d_bcast_y = cp.tile(cp.asarray(buf_b.y), n)
 
-    # Precision plan: METRIC class, default fp64 (wire for observability)
     compute_type = "double"
     center_x, center_y = 0.0, 0.0
+    if precision_plan is not None and precision_plan.compute_precision is PrecisionMode.FP32:
+        compute_type = "float"
+        if precision_plan.center_coordinates:
+            center_x, center_y = _fp32_center_coords_for_pair(owned_a, owned_b)
 
     d_result = runtime.allocate((n,), np.float64)
 
@@ -604,6 +667,8 @@ def hausdorff_distance_owned(
     owned_a: OwnedGeometryArray,
     owned_b: OwnedGeometryArray,
     densify: float | None = None,
+    *,
+    precision: PrecisionMode | str = PrecisionMode.AUTO,
 ) -> np.ndarray:
     """Per-pair Hausdorff distance between two OwnedGeometryArrays.
 
@@ -629,17 +694,23 @@ def hausdorff_distance_owned(
     if n == 0:
         return np.empty(0, dtype=np.float64)
 
+    if isinstance(precision, str):
+        precision = PrecisionMode(precision)
+
     selection = plan_dispatch_selection(
         kernel_name="hausdorff_distance",
         kernel_class=KernelClass.METRIC,
         row_count=n,
         requested_mode=ExecutionMode.AUTO,
+        requested_precision=precision,
+        coordinate_stats=_coord_stats_for_pair(owned_a, owned_b),
         current_residency=combined_residency(owned_a, owned_b),
     )
 
     if selection.selected is ExecutionMode.GPU:
+        precision_plan = selection.precision_plan
         try:
-            result = _hausdorff_gpu(owned_a, owned_b)
+            result = _hausdorff_gpu(owned_a, owned_b, precision_plan=precision_plan)
         except (NotImplementedError, RuntimeError) as exc:
             logger.debug("Hausdorff GPU dispatch failed, falling back to CPU: %s", exc)
         else:
@@ -648,7 +719,10 @@ def hausdorff_distance_owned(
                 operation="hausdorff_distance",
                 implementation="hausdorff_gpu_nvrtc",
                 reason=selection.reason,
-                detail=f"rows={n}, workload={workload.value}",
+                detail=(
+                    f"rows={n}, workload={workload.value}, "
+                    f"precision={precision_plan.compute_precision.value}"
+                ),
                 requested=selection.requested,
                 selected=ExecutionMode.GPU,
             )

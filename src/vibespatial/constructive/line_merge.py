@@ -22,7 +22,7 @@ Supports:
 - Disconnected components: output MultiLineString with multiple parts
 - Rings (closed chains): detected via unvisited segments after open chains
 
-Zero D2H transfers during computation.
+One batched D2H scalar fence sizes coordinate and part outputs.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from vibespatial.cuda._runtime import (
     KERNEL_PARAM_I32,
     KERNEL_PARAM_PTR,
     compile_kernel_group,
-    count_scatter_total,
+    count_scatter_totals,
     get_cuda_runtime,
 )
 from vibespatial.cuda.cccl_precompile import request_warmup
@@ -219,8 +219,13 @@ def _line_merge_gpu(
     d_coord_offsets = exclusive_sum(d_coord_counts, synchronize=False)
     d_part_offsets = exclusive_sum(d_part_counts, synchronize=False)
 
-    total_coords = count_scatter_total(runtime, d_coord_counts, d_coord_offsets)
-    total_parts = count_scatter_total(runtime, d_part_counts, d_part_offsets)
+    total_coords, total_parts = count_scatter_totals(
+        runtime,
+        [
+            (d_coord_counts, d_coord_offsets),
+            (d_part_counts, d_part_offsets),
+        ],
+    )
 
     if total_coords == 0:
         return _build_empty_output(row_count, validity, tags)

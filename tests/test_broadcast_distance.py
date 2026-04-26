@@ -8,11 +8,15 @@ Covers nsf.4: distance and metric broadcast-right support.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import shapely
 from shapely.geometry import LineString, Point, box
 
 from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.runtime import ExecutionMode
+from vibespatial.runtime.precision import PrecisionMode
 from vibespatial.spatial.distance_metrics import frechet_distance_owned, hausdorff_distance_owned
 from vibespatial.spatial.distance_owned import distance_owned, dwithin_owned
 
@@ -253,6 +257,52 @@ def test_hausdorff_broadcast_tiling_equivalence() -> None:
     )
 
     np.testing.assert_allclose(result_broadcast, result_tiled, rtol=1e-10)
+
+
+def test_hausdorff_dispatch_forwards_precision_plan(monkeypatch) -> None:
+    import vibespatial.spatial.distance_metrics as distance_metrics
+
+    left_owned = from_shapely_geometries([
+        LineString([(1_000_000.0, 1_000_000.0), (1_000_001.0, 1_000_000.0)]),
+        LineString([(1_000_002.0, 1_000_000.0), (1_000_003.0, 1_000_000.0)]),
+    ])
+    right_owned = from_shapely_geometries([
+        LineString([(1_000_000.0, 1_000_001.0), (1_000_001.0, 1_000_001.0)])
+    ])
+
+    precision_plan = SimpleNamespace(
+        compute_precision=PrecisionMode.FP32,
+        center_coordinates=True,
+    )
+    selection = SimpleNamespace(
+        selected=ExecutionMode.GPU,
+        precision_plan=precision_plan,
+        reason="test gpu",
+        requested=ExecutionMode.GPU,
+    )
+    captured = {}
+
+    def fake_plan_dispatch_selection(**kwargs):
+        captured["selection_kwargs"] = kwargs
+        return selection
+
+    def fake_hausdorff_gpu(owned_a, owned_b, *, precision_plan=None):
+        captured["precision_plan"] = precision_plan
+        return np.full(owned_a.row_count, 4.0, dtype=np.float64)
+
+    monkeypatch.setattr(
+        distance_metrics, "plan_dispatch_selection", fake_plan_dispatch_selection,
+    )
+    monkeypatch.setattr(distance_metrics, "_hausdorff_gpu", fake_hausdorff_gpu)
+
+    result = hausdorff_distance_owned(
+        left_owned, right_owned, precision=PrecisionMode.FP32,
+    )
+
+    assert captured["selection_kwargs"]["requested_precision"] is PrecisionMode.FP32
+    assert captured["selection_kwargs"]["coordinate_stats"].max_abs_coord >= 1_000_003.0
+    assert captured["precision_plan"] is precision_plan
+    np.testing.assert_allclose(result, [4.0, 4.0])
 
 
 # ---------------------------------------------------------------------------

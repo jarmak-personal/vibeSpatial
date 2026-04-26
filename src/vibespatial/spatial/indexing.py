@@ -45,6 +45,9 @@ from vibespatial.spatial.indexing_cpu import iter_geometry_parts  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+_REGULAR_GRID_SINGLE_BLOCK_CERTIFY_LIMIT = 256
+_REGULAR_GRID_MAX_CERTIFY_BLOCKS = 65535
+
 
 def _default_index_runtime_selection() -> RuntimeSelection:
     return plan_dispatch_selection(
@@ -605,6 +608,192 @@ def _detect_single_row_device_rect_index(
     )
 
 
+def _detect_regular_grid_rect_index_device(
+    geometry_array: OwnedGeometryArray,
+) -> tuple[RegularGridRectIndex, object, tuple[float, float, float, float]] | None:
+    """Detect a device-resident regular rectangle grid without host metadata."""
+    if (
+        cp is None
+        or geometry_array.row_count <= 1
+        or GeometryFamily.POLYGON not in geometry_array.families
+        or len(geometry_array.families) != 1
+        or geometry_array.residency is not Residency.DEVICE
+    ):
+        return None
+
+    state = geometry_array._ensure_device_state()
+    polygon_buffer = state.families.get(GeometryFamily.POLYGON)
+    if polygon_buffer is None or polygon_buffer.ring_offsets is None:
+        return None
+    host_polygon_buffer = geometry_array.families.get(GeometryFamily.POLYGON)
+    if (
+        host_polygon_buffer is not None
+        and host_polygon_buffer.host_materialized
+        and geometry_array._validity is not None
+        and geometry_array._tags is not None
+        and geometry_array._family_row_offsets is not None
+    ):
+        return None
+
+    row_count = int(geometry_array.row_count)
+    if (
+        int(getattr(polygon_buffer.geometry_offsets, "size", 0)) != row_count + 1
+        or int(getattr(polygon_buffer.ring_offsets, "size", 0)) != row_count + 1
+    ):
+        return None
+
+    x_count = int(getattr(polygon_buffer.x, "size", 0))
+    y_count = int(getattr(polygon_buffer.y, "size", 0))
+    if x_count < 5 or y_count != x_count:
+        return None
+
+    runtime = get_cuda_runtime()
+    ptr = runtime.pointer
+    d_bounds = runtime.allocate((row_count, 4), cp.float64)
+    d_summary = runtime.allocate((8,), cp.float64)
+    d_block_summaries = None
+    d_valid_flag = None
+    try:
+        kernels = _indexing_kernels()
+        certify_kernel = kernels["regular_rect_grid_certify"]
+        block_size = min(runtime.optimal_block_size(certify_kernel), 256)
+        block_size = max(32, 1 << (block_size.bit_length() - 1))
+        certify_values = (
+            ptr(polygon_buffer.x),
+            ptr(polygon_buffer.y),
+            ptr(polygon_buffer.geometry_offsets),
+            ptr(polygon_buffer.ring_offsets),
+            ptr(polygon_buffer.empty_mask),
+            ptr(state.validity),
+            ptr(state.tags),
+            row_count,
+            x_count,
+            int(FAMILY_TAGS[GeometryFamily.POLYGON]),
+            ptr(d_bounds),
+        )
+        certify_types = (
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_PTR,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_I32,
+            KERNEL_PARAM_PTR,
+        )
+        if row_count <= _REGULAR_GRID_SINGLE_BLOCK_CERTIFY_LIMIT:
+            runtime.launch(
+                certify_kernel,
+                grid=(1, 1, 1),
+                block=(block_size, 1, 1),
+                params=(
+                    certify_values + (ptr(d_summary),),
+                    certify_types + (KERNEL_PARAM_PTR,),
+                ),
+            )
+        else:
+            # Row-shaped certification: each CTA validates a strided row chunk,
+            # then one tiny finalize pass reduces summaries for the host scalar.
+            block_count = min(
+                _REGULAR_GRID_MAX_CERTIFY_BLOCKS,
+                max(1, (row_count + block_size - 1) // block_size),
+            )
+            d_block_summaries = runtime.allocate((block_count, 8), cp.float64)
+            d_valid_flag = runtime.allocate((1,), cp.int32, zero=True)
+            d_valid_flag[...] = 1
+            runtime.launch(
+                kernels["regular_rect_grid_certify_blocks"],
+                grid=(block_count, 1, 1),
+                block=(block_size, 1, 1),
+                params=(
+                    certify_values + (ptr(d_block_summaries),),
+                    certify_types + (KERNEL_PARAM_PTR,),
+                ),
+            )
+            runtime.launch(
+                kernels["regular_rect_grid_finalize"],
+                grid=(1, 1, 1),
+                block=(block_size, 1, 1),
+                params=(
+                    (
+                        ptr(d_bounds),
+                        ptr(d_block_summaries),
+                        block_count,
+                        row_count,
+                        ptr(d_summary),
+                    ),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                    ),
+                ),
+            )
+            runtime.launch(
+                kernels["regular_rect_grid_validate_positions"],
+                grid=(block_count, 1, 1),
+                block=(block_size, 1, 1),
+                params=(
+                    (ptr(d_bounds), row_count, ptr(d_summary), ptr(d_valid_flag)),
+                    (
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_I32,
+                        KERNEL_PARAM_PTR,
+                        KERNEL_PARAM_PTR,
+                    ),
+                ),
+            )
+            runtime.launch(
+                kernels["regular_rect_grid_apply_valid"],
+                grid=(1, 1, 1),
+                block=(1, 1, 1),
+                params=(
+                    (ptr(d_valid_flag), ptr(d_summary)),
+                    (KERNEL_PARAM_PTR, KERNEL_PARAM_PTR),
+                ),
+            )
+        host_summary = runtime.copy_device_to_host(d_summary)
+    except Exception:
+        runtime.free(d_bounds)
+        raise
+    finally:
+        runtime.free(d_block_summaries)
+        runtime.free(d_valid_flag)
+        runtime.free(d_summary)
+    (
+        h_minx,
+        h_miny,
+        h_maxx,
+        h_maxy,
+        h_cell_width,
+        h_cell_height,
+        h_cols,
+        h_rows,
+    ) = host_summary.tolist()
+    if h_cols <= 0.0 or h_rows <= 0.0:
+        runtime.free(d_bounds)
+        return None
+    state.row_bounds = d_bounds
+    return (
+        RegularGridRectIndex(
+            origin_x=float(h_minx),
+            origin_y=float(h_miny),
+            cell_width=float(h_cell_width),
+            cell_height=float(h_cell_height),
+            cols=int(h_cols),
+            rows=int(h_rows),
+            size=row_count,
+        ),
+        d_bounds,
+        (float(h_minx), float(h_miny), float(h_maxx), float(h_maxy)),
+    )
+
+
 def _sample_regular_grid_polygon_vertices(
     geometry_array: OwnedGeometryArray,
     sample_indices: np.ndarray,
@@ -930,6 +1119,21 @@ def build_flat_spatial_index(
             _host_order=order,
             _host_morton_keys=morton_keys,
             _host_bounds=bounds,
+            total_bounds=total_bounds,
+            regular_grid=regular_grid,
+            device_bounds=device_bounds,
+        )
+
+    device_regular_grid = _detect_regular_grid_rect_index_device(geometry_array)
+    if device_regular_grid is not None:
+        regular_grid, device_bounds, total_bounds = device_regular_grid
+        order = np.arange(geometry_array.row_count, dtype=np.int32)
+        morton_keys = order.astype(np.uint64, copy=False)
+        return FlatSpatialIndex(
+            geometry_array=geometry_array,
+            _host_order=order,
+            _host_morton_keys=morton_keys,
+            _host_bounds=None,
             total_bounds=total_bounds,
             regular_grid=regular_grid,
             device_bounds=device_bounds,

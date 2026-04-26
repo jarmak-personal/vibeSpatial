@@ -45,6 +45,19 @@ def test_overlay_keep_geom_type_prioritizes_public_overlay_surface() -> None:
     _assert_rank(files, "tests/test_overlay_api.py", 3)
 
 
+def test_specific_kernel_symbol_match_beats_generic_gpu_docs() -> None:
+    files = _file_paths("hausdorff distance GPU implementation")
+
+    _assert_rank(files, "src/vibespatial/spatial/distance_metrics.py", 3)
+    _assert_rank(files, "src/vibespatial/spatial/distance_metrics_kernels.py", 3)
+
+
+def test_specific_markdown_match_promotes_adr_doc() -> None:
+    docs = _doc_paths("GPU physical workload shape contracts")
+
+    assert docs[0] == "docs/decisions/0046-gpu-physical-workload-shape-contracts.md"
+
+
 def test_adr_precision_request_keeps_workflow_and_topic_docs() -> None:
     query = "add a new ADR for precision dispatch"
     docs = _doc_paths(query)

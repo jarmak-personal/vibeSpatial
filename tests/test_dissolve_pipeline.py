@@ -19,12 +19,12 @@ from vibespatial import (
     plan_dissolve_pipeline,
 )
 from vibespatial.api._native_grouped import NativeGrouped, NativeGroupedAttributeReduction
-from vibespatial.api._native_results import NativeTabularResult
+from vibespatial.api._native_results import GeometryNativeResult, NativeTabularResult
 from vibespatial.api.geometry_array import GeometryArray
 from vibespatial.api.testing import assert_geodataframe_equal
 from vibespatial.bench.pipeline import _dissolve_join_heavy_groups, _regular_polygons_frame
 from vibespatial.geometry.device_array import DeviceGeometryArray
-from vibespatial.geometry.owned import from_shapely_geometries
+from vibespatial.geometry.owned import from_shapely_geometries, seed_all_validity_cache
 from vibespatial.kernels.constructive.segmented_union import segmented_union_all
 from vibespatial.overlay.dissolve import (
     evaluate_geopandas_dissolve,
@@ -132,6 +132,118 @@ def test_execute_grouped_union_codes_owned_coverage_avoids_geometry_materializat
     assert grouped.geometries is None
     assert grouped.owned is not None
     assert grouped.owned.row_count == 2
+
+
+@pytest.mark.gpu
+def test_execute_grouped_union_codes_device_codes_reports_host_fallback_materialization() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    owned = from_shapely_geometries(
+        [
+            LineString([(0.0, 0.0), (1.0, 0.0)]),
+            LineString([(1.0, 0.0), (2.0, 0.0)]),
+        ],
+        residency=Residency.DEVICE,
+    )
+    row_group_codes = cp.asarray([0, 0], dtype=cp.int32)
+    clear_materialization_events()
+
+    grouped = dissolve_module.execute_grouped_union_codes(
+        (),
+        row_group_codes,
+        group_count=1,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=owned,
+    )
+
+    assert grouped is None
+    events = get_materialization_events(clear=True)
+    assert len(events) == 1
+    assert events[0].operation == "device_group_codes_to_host"
+    assert events[0].d2h_transfer is True
+    assert events[0].detail == "rows=2, bytes=8"
+
+
+@pytest.mark.gpu
+def test_execute_grouped_union_codes_device_codes_bulk_disjoint_coverage_stays_native() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+    from vibespatial.runtime.materialization import (
+        clear_materialization_events,
+        get_materialization_events,
+    )
+
+    geoms = [
+        box(0.0, 0.0, 1.0, 1.0),
+        box(10.0, 0.0, 11.0, 1.0),
+        box(0.0, 10.0, 1.0, 11.0),
+        box(10.0, 10.0, 11.0, 11.0),
+    ]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    row_group_codes = cp.asarray([0, 1, 0, 1], dtype=cp.int32)
+    clear_materialization_events()
+    reset_d2h_transfer_count()
+
+    with assert_zero_d2h_transfers():
+        grouped = dissolve_module.execute_grouped_union_codes(
+            (),
+            row_group_codes,
+            group_count=2,
+            method=DissolveUnionMethod.COVERAGE,
+            owned=owned,
+        )
+
+    assert grouped is not None
+    assert grouped.geometries is None
+    assert grouped.owned is not None
+    assert grouped.owned.row_count == 2
+    assert get_materialization_events(clear=True) == []
+    actual = grouped.owned.to_shapely()
+    expected = [
+        shapely.coverage_union_all(np.asarray([geoms[0], geoms[2]], dtype=object)),
+        shapely.coverage_union_all(np.asarray([geoms[1], geoms[3]], dtype=object)),
+    ]
+    assert shapely.equals(actual[0], expected[0])
+    assert shapely.equals(actual[1], expected[1])
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "geoms",
+    [
+        [box(0.0, 0.0, 1.0, 1.0), box(1.0, 0.0, 2.0, 1.0)],
+        [box(0.0, 0.0, 2.0, 2.0), box(1.0, 1.0, 3.0, 3.0)],
+    ],
+)
+def test_grouped_disjoint_subset_union_declines_touching_or_overlapping_groups(
+    geoms,
+) -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    grouped = dissolve_module.execute_grouped_disjoint_subset_union_gpu_owned_codes(
+        cp.asarray([0, 0], dtype=cp.int32),
+        group_count=1,
+        method=DissolveUnionMethod.COVERAGE,
+        owned=owned,
+    )
+
+    assert grouped is None
 
 
 def test_evaluate_geopandas_dissolve_matches_current_categorical_semantics() -> None:
@@ -2055,6 +2167,49 @@ def test_execute_grouped_box_union_gpu_owned_codes_accepts_fractional_rectangles
     assert grouped.geometries is None
 
 
+def test_execute_grouped_box_union_gpu_owned_codes_accepts_unsorted_codes(
+    monkeypatch,
+) -> None:
+    if not has_gpu_runtime():
+        return
+
+    cp = pytest.importorskip("cupy")
+    owned = from_shapely_geometries(
+        [
+            box(0, 0, 1, 1),
+            box(10, 10, 11, 11),
+            box(1, 0, 2, 1),
+            box(11, 10, 12, 11),
+        ],
+        residency=Residency.DEVICE,
+    )
+    owned._validity = None
+    owned._tags = None
+    owned._family_row_offsets = None
+
+    def _fail_host_metadata(*_args, **_kwargs):
+        raise AssertionError("unsorted owned coverage reducer should stay device-native")
+
+    monkeypatch.setattr(type(owned), "_ensure_host_metadata", _fail_host_metadata)
+
+    grouped = dissolve_module.execute_grouped_box_union_gpu_owned_codes(
+        cp.asarray([0, 1, 0, 1], dtype=cp.int32),
+        group_count=2,
+        owned=owned,
+    )
+
+    assert grouped is not None
+    assert grouped.owned is not None
+    assert grouped.geometries is None
+    assert grouped.owned._validity is None
+    assert grouped.owned._tags is None
+    assert grouped.owned._family_row_offsets is None
+    monkeypatch.undo()
+    actual = np.asarray(grouped.owned.to_shapely(), dtype=object)
+    expected = np.asarray([box(0, 0, 2, 1), box(10, 10, 12, 11)], dtype=object)
+    assert shapely.equals(actual, expected).tolist() == [True, True]
+
+
 def test_execute_grouped_box_union_gpu_owned_codes_rejects_gapped_groups() -> None:
     if not has_gpu_runtime():
         return
@@ -2191,5 +2346,47 @@ def test_join_heavy_direct_grouped_dissolve_matches_public_coverage_dissolve(
 
     assert used_direct is True
     assert calls == [DissolveUnionMethod.COVERAGE]
+    assert isinstance(dissolved, NativeTabularResult)
+    assert_geodataframe_equal(dissolved.to_geodataframe(), expected)
+
+
+@pytest.mark.gpu
+def test_join_heavy_device_grouped_dissolve_matches_public_coverage_dissolve() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("CUDA runtime not available")
+    cp = pytest.importorskip("cupy")
+
+    frame = _regular_polygons_frame(256)
+    owned = from_shapely_geometries(list(frame.geometry), residency=Residency.DEVICE)
+    seed_all_validity_cache(owned)
+    unique_right_index = cp.arange(len(frame), dtype=cp.int64)
+
+    dissolved, used_direct = _dissolve_join_heavy_groups(
+        GeometryNativeResult.from_owned(owned, crs=frame.crs),
+        unique_right_index,
+        scale=len(frame),
+    )
+    expected = evaluate_geopandas_dissolve(
+        geopandas.GeoDataFrame(
+            {
+                "group": pd.Categorical(np.arange(len(frame), dtype=np.int64) % 128),
+                "geometry": frame.geometry,
+            },
+            geometry="geometry",
+            crs=frame.crs,
+        ),
+        by="group",
+        aggfunc="first",
+        as_index=True,
+        level=None,
+        sort=False,
+        observed=False,
+        dropna=True,
+        method="coverage",
+        grid_size=None,
+        agg_kwargs={},
+    )
+
+    assert used_direct is True
     assert isinstance(dissolved, NativeTabularResult)
     assert_geodataframe_equal(dissolved.to_geodataframe(), expected)

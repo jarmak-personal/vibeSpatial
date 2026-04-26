@@ -860,6 +860,45 @@ def test_native_relation_first_order_semijoin_stays_on_device() -> None:
     assert cp.asnumpy(right_rowset.positions).tolist() == [1, 0]
 
 
+def test_native_relation_right_semijoin_rowset_feeds_owned_take_without_runtime_d2h() -> None:
+    if not has_gpu_runtime():
+        pytest.skip("GPU runtime required for device relation rowset take probe")
+    cp = pytest.importorskip("cupy")
+    from vibespatial.cuda._runtime import (
+        assert_zero_d2h_transfers,
+        reset_d2h_transfer_count,
+    )
+
+    owned = from_shapely_geometries(
+        [Point(0, 0), Point(1, 1), Point(2, 2), Point(3, 3)]
+    )
+    owned.move_to(
+        Residency.DEVICE,
+        trigger=TransferTrigger.EXPLICIT_RUNTIME_REQUEST,
+        reason="unit test relation right-rowset device take",
+    )
+    relation = NativeRelation(
+        left_indices=cp.asarray([0, 1, 2, 3, 4], dtype=cp.int32),
+        right_indices=cp.asarray([2, 0, 2, 1, 0], dtype=cp.int32),
+        left_row_count=5,
+        right_row_count=4,
+    )
+    reset_d2h_transfer_count()
+    clear_materialization_events()
+
+    with assert_zero_d2h_transfers():
+        rowset = relation.right_semijoin_rowset()
+        taken = owned.take(rowset.positions)
+
+    assert rowset.is_device
+    assert rowset.unique
+    assert rowset.ordered
+    assert taken.row_count == 3
+    assert get_materialization_events(clear=True) == []
+    assert cp.asnumpy(rowset.positions).tolist() == [0, 1, 2]
+    reset_d2h_transfer_count()
+
+
 def test_native_relation_device_grouped_reduction_stays_device_without_runtime_d2h() -> None:
     if not has_gpu_runtime():
         pytest.skip("GPU runtime required for device relation grouped reducer probe")

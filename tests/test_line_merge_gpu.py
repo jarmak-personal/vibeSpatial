@@ -132,6 +132,38 @@ def test_line_merge_stays_device_resident(strict_device_guard):
     assert result.residency == Residency.DEVICE
 
 
+@requires_gpu
+def test_line_merge_batches_output_size_scalar_fence(monkeypatch: pytest.MonkeyPatch):
+    """Coordinate and part output sizes share one D2H scalar fence."""
+    import vibespatial.constructive.line_merge as line_merge_mod
+    from vibespatial.runtime import ExecutionMode
+    from vibespatial.runtime.residency import Residency
+
+    geoms = [_three_segment_chain(), _disconnected_mls()]
+    owned = from_shapely_geometries(geoms, residency=Residency.DEVICE)
+    calls: list[int] = []
+    original = line_merge_mod.count_scatter_totals
+
+    def _record_count_scatter_totals(runtime, count_offset_pairs):
+        calls.append(len(count_offset_pairs))
+        return original(runtime, count_offset_pairs)
+
+    monkeypatch.setattr(
+        line_merge_mod,
+        "count_scatter_totals",
+        _record_count_scatter_totals,
+    )
+
+    result = line_merge_mod.line_merge_owned(
+        owned,
+        directed=False,
+        dispatch_mode=ExecutionMode.GPU,
+    )
+
+    assert calls == [2]
+    _compare_line_merge(result.to_shapely(), geoms, directed=False)
+
+
 def _disconnected_mls():
     """Two disconnected components."""
     return MultiLineString([

@@ -337,6 +337,131 @@ def test_single_row_device_rect_flat_index_preserves_regular_grid_query() -> Non
     assert flat_index.regular_grid.size == 1
 
 
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
+def test_multi_row_device_regular_grid_index_avoids_host_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+
+    tree_owned = from_shapely_geometries(
+        [
+            box(0.0, 0.0, 1.0, 1.0),
+            box(1.0, 0.0, 2.0, 1.0),
+            box(2.0, 0.0, 3.0, 1.0),
+            box(0.0, 1.0, 1.0, 2.0),
+            box(1.0, 1.0, 2.0, 2.0),
+        ],
+        residency=Residency.DEVICE,
+    )
+    tree_owned._validity = None
+    tree_owned._tags = None
+    tree_owned._family_row_offsets = None
+
+    def _fail_host_metadata(*_args, **_kwargs):
+        raise AssertionError("device regular-grid index should not host-normalize metadata")
+
+    monkeypatch.setattr(type(tree_owned), "_ensure_host_metadata", _fail_host_metadata)
+    monkeypatch.setattr(
+        type(tree_owned),
+        "_ensure_host_family_structure",
+        _fail_host_metadata,
+    )
+    reset_d2h_transfer_count()
+
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test device regular-grid index with CPU-compatible order",
+        ),
+    )
+
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    assert flat_index.regular_grid is not None
+    assert flat_index.regular_grid.size == 5
+    assert flat_index._host_bounds is None
+    assert flat_index.device_bounds is not None
+    assert flat_index.total_bounds == (0.0, 0.0, 3.0, 2.0)
+    assert transfer_count <= 1
+    assert transfer_bytes <= 64
+
+    monkeypatch.undo()
+    assert flat_index.bounds.tolist() == [
+        [0.0, 0.0, 1.0, 1.0],
+        [1.0, 0.0, 2.0, 1.0],
+        [2.0, 0.0, 3.0, 1.0],
+        [0.0, 1.0, 1.0, 2.0],
+        [1.0, 1.0, 2.0, 2.0],
+    ]
+
+
+@pytest.mark.skipif(not has_gpu_runtime(), reason="GPU runtime required for device grid index")
+def test_large_device_regular_grid_index_uses_parallel_certification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vibespatial.cuda._runtime import (
+        get_d2h_transfer_stats,
+        reset_d2h_transfer_count,
+    )
+
+    cols = 32
+    rows = 16
+    tree_owned = from_shapely_geometries(
+        [
+            box(float(col), float(row), float(col + 1), float(row + 1))
+            for row in range(rows)
+            for col in range(cols)
+        ],
+        residency=Residency.DEVICE,
+    )
+    tree_owned._validity = None
+    tree_owned._tags = None
+    tree_owned._family_row_offsets = None
+
+    def _fail_host_metadata(*_args, **_kwargs):
+        raise AssertionError("large device regular-grid index should not host-normalize metadata")
+
+    monkeypatch.setattr(type(tree_owned), "_ensure_host_metadata", _fail_host_metadata)
+    monkeypatch.setattr(
+        type(tree_owned),
+        "_ensure_host_family_structure",
+        _fail_host_metadata,
+    )
+    reset_d2h_transfer_count()
+
+    flat_index = build_flat_spatial_index(
+        tree_owned,
+        runtime_selection=RuntimeSelection(
+            requested=ExecutionMode.CPU,
+            selected=ExecutionMode.CPU,
+            reason="test large device regular-grid index with CPU-compatible order",
+        ),
+    )
+
+    transfer_count, transfer_bytes = get_d2h_transfer_stats()
+    assert flat_index.regular_grid is not None
+    assert flat_index.regular_grid.size == cols * rows
+    assert flat_index.regular_grid.cols == cols
+    assert flat_index.regular_grid.rows == rows
+    assert flat_index._host_bounds is None
+    assert flat_index.device_bounds is not None
+    assert flat_index.total_bounds == (0.0, 0.0, float(cols), float(rows))
+    assert transfer_count <= 1
+    assert transfer_bytes <= 64
+
+    monkeypatch.undo()
+    bounds = flat_index.bounds
+    np.testing.assert_allclose(bounds[0], [0.0, 0.0, 1.0, 1.0])
+    np.testing.assert_allclose(
+        bounds[-1],
+        [float(cols - 1), float(rows - 1), float(cols), float(rows)],
+    )
+
+
 def test_query_spatial_index_handles_regular_grid_rectangle_boundaries() -> None:
     tree = np.asarray(
         [

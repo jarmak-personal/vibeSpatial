@@ -1135,6 +1135,19 @@ def _compute_pip_center(
     return _compute_pip_center_host(points, right_array)
 
 
+def _initialize_host_coarse_result(
+    points: OwnedGeometryArray,
+    right: NormalizedBoundsInput,
+):
+    """Build the public object-dtype coarse result at an explicit host boundary."""
+    return initialize_coarse_result(points, ~points.validity | right.null_mask)
+
+
+def _empty_device_bool_result(row_count: int):
+    runtime = get_cuda_runtime()
+    return runtime.allocate((int(row_count),), cp.bool_, zero=True)
+
+
 def _evaluate_point_in_polygon_gpu(
     points: OwnedGeometryArray,
     right: NormalizedBoundsInput,
@@ -1147,7 +1160,6 @@ def _evaluate_point_in_polygon_gpu(
 
     right_array = right.geometry_array
     assert right_array is not None
-    coarse = initialize_coarse_result(points, ~points.validity | right.null_mask)
 
     # Determine compute precision from device profile.
     from vibespatial.runtime.adaptive import get_cached_snapshot
@@ -1278,6 +1290,9 @@ def _evaluate_point_in_polygon_gpu(
 
         if candidate_rows.count == 0:
             _last_gpu_substage_timings = timings
+            if return_device:
+                return _empty_device_bool_result(points.row_count)
+            coarse = _initialize_host_coarse_result(points, right)
             return coarse
 
         runtime = get_cuda_runtime()
@@ -1351,6 +1366,7 @@ def _evaluate_point_in_polygon_gpu(
             if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
+        coarse = _initialize_host_coarse_result(points, right)
         coarse[dense_true_mask(dense_out)] = True
     elif selected_strategy == "binned":
         # Binned: bounds filter first, then dispatch PIP in work-balanced bins
@@ -1382,6 +1398,9 @@ def _evaluate_point_in_polygon_gpu(
 
         if candidate_rows.count == 0:
             _last_gpu_substage_timings = timings
+            if return_device:
+                return _empty_device_bool_result(points.row_count)
+            coarse = _initialize_host_coarse_result(points, right)
             return coarse
 
         # Compute per-candidate work estimates on device from the cached
@@ -1469,6 +1488,7 @@ def _evaluate_point_in_polygon_gpu(
             if not _returned:
                 runtime.free(device_dense_out)
                 runtime.free(candidate_rows.values)
+        coarse = _initialize_host_coarse_result(points, right)
         coarse[dense_true_mask(dense_out)] = True
     else:
         # Fused: single kernel does bounds check + PIP in one launch.
@@ -1488,9 +1508,9 @@ def _evaluate_point_in_polygon_gpu(
             dense_out = runtime.copy_device_to_host(device_out)
         finally:
             runtime.free(device_out)
+        coarse = _initialize_host_coarse_result(points, right)
         null_mask = ~points.validity | right.null_mask
         # Normalize to object-dtype ndarray matching dense/compacted paths.
-        coarse = initialize_coarse_result(points, null_mask)
         coarse[dense_true_mask(dense_out)] = True
         coarse[null_mask] = None
 
@@ -1569,10 +1589,19 @@ def point_in_polygon(
     )
     if context.runtime_selection.selected is ExecutionMode.GPU:
         # Build lightweight NormalizedBoundsInput without CPU bounds.
+        if _return_device:
+            # Device-return consumers use the fused/compacted result directly;
+            # host null/empty masks are only needed when exporting public
+            # object-dtype predicate results.
+            null_mask = empty_bool_mask_like(empty_gpu_bounds_placeholder())
+            empty_mask = null_mask
+        else:
+            null_mask = ~right_array.validity
+            empty_mask = empty_bool_mask_like(right_array.validity)
         right = NormalizedBoundsInput(
             bounds=empty_gpu_bounds_placeholder(),
-            null_mask=~right_array.validity,
-            empty_mask=empty_bool_mask_like(right_array.validity),
+            null_mask=null_mask,
+            empty_mask=empty_mask,
             geometry_array=right_array,
         )
         t0 = perf_counter()

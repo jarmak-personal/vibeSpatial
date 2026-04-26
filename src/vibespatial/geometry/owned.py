@@ -105,6 +105,25 @@ def seed_all_validity_cache(owned: OwnedGeometryArray | None) -> None:
     owned._cached_is_valid_mask = np.ones(owned.row_count, dtype=bool)
 
 
+def seed_homogeneous_host_metadata(
+    owned: OwnedGeometryArray | None,
+    family: GeometryFamily,
+) -> None:
+    """Attach lightweight host routing metadata for a homogeneous owned output.
+
+    GPU builders often know that every output row is valid and belongs to one
+    family.  In that case validity/tags/family offsets can be synthesized on
+    host without materializing any coordinate payload or copying metadata back
+    from device state.
+    """
+    if owned is None:
+        return
+    row_count = int(owned.row_count)
+    owned._validity = np.ones(row_count, dtype=np.bool_)
+    owned._tags = np.full(row_count, FAMILY_TAGS[family], dtype=np.int8)
+    owned._family_row_offsets = np.arange(row_count, dtype=np.int32)
+
+
 def _concat_validity_caches(arrays: list[OwnedGeometryArray]) -> np.ndarray | None:
     """Concatenate per-row validity caches when every input cache is complete."""
     caches: list[np.ndarray] = []

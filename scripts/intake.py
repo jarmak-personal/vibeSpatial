@@ -224,6 +224,28 @@ def _confidence(top_score: int) -> str:
 MAX_EXPLICIT_FILE_SEEDS = 8
 HIGH_DIRECT_FILE_SCORE = 8
 MAX_HIGH_DIRECT_FILE_SEEDS = 3
+MAX_DIRECT_MARKDOWN_DOCS = 2
+SPECIFIC_DIRECT_FILE_SCORE = 5
+MIN_SPECIFIC_DIRECT_MATCHES = 2
+
+
+def _specific_direct_match_count(file_score: dict[str, Any]) -> int:
+    return len(set(file_score["matches"]) - COMMON_ROUTE_TOKENS)
+
+
+def _is_high_direct_file_seed(
+    file_score: dict[str, Any],
+    *,
+    allow_specific_promotion: bool = True,
+) -> bool:
+    if file_score["direct_score"] >= HIGH_DIRECT_FILE_SCORE:
+        return True
+    if not allow_specific_promotion:
+        return False
+    return (
+        file_score["direct_score"] >= SPECIFIC_DIRECT_FILE_SCORE
+        and _specific_direct_match_count(file_score) >= MIN_SPECIFIC_DIRECT_MATCHES
+    )
 
 
 def plan_request(request: str) -> dict[str, Any]:
@@ -281,7 +303,43 @@ def plan_request(request: str) -> dict[str, Any]:
             }
         )
     related_docs.sort(key=lambda item: (-item["score"], item["path"]))
-    selected_docs = [*selected_docs, *related_docs[:2]]
+    related_doc_paths = {doc["path"] for doc in related_docs}
+
+    direct_markdown_docs: list[dict[str, Any]] = []
+    for entry in index["files"]:
+        if not entry["path"].endswith(".md"):
+            continue
+        if entry["path"] in selected_doc_scores or entry["path"] in related_doc_paths:
+            continue
+        scored = _score_file(request_text, request_tokens, entry, selected_doc_scores)
+        if not _is_high_direct_file_seed(scored):
+            continue
+        title = Path(entry["path"]).stem.replace("-", " ").replace("_", " ").title()
+        direct_markdown_docs.append(
+            {
+                "path": entry["path"],
+                "title": title,
+                "score": scored["score"],
+                "matches": scored["matches"],
+                "score_details": scored["score_details"],
+                "open_first": [],
+                "verify": [],
+                "risks": [],
+            }
+        )
+    direct_markdown_docs.sort(
+        key=lambda item: (
+            -len(set(item["matches"]) - COMMON_ROUTE_TOKENS),
+            -item["score"],
+            item["path"],
+        )
+    )
+    promoted_markdown_docs = direct_markdown_docs[:MAX_DIRECT_MARKDOWN_DOCS]
+    if intent_boosts:
+        selected_docs = [*selected_docs, *related_docs[:2], *promoted_markdown_docs]
+    else:
+        selected_docs = [*promoted_markdown_docs, *selected_docs, *related_docs[:2]]
+        selected_docs.sort(key=lambda item: (-item["score"], item["path"]))
 
     file_lookup = {entry["path"]: entry for entry in index["files"]}
     file_scores: list[dict[str, Any]] = []
@@ -306,17 +364,37 @@ def plan_request(request: str) -> dict[str, Any]:
 
     seen_paths: set[str] = set()
     selected_files: list[dict[str, Any]] = []
+    # Workflow-intent queries should keep their doc-provided seed files first.
+    allow_specific_promotion = not intent_boosts
     high_direct_match_paths = [
         entry["path"]
         for entry in sorted(
-            (entry for entry in file_scores if entry["direct_score"] >= HIGH_DIRECT_FILE_SCORE),
-            key=lambda item: (-item["direct_score"], -item["score"], item["path"]),
+            (
+                entry
+                for entry in file_scores
+                if _is_high_direct_file_seed(
+                    entry, allow_specific_promotion=allow_specific_promotion,
+                )
+            ),
+            key=lambda item: (
+                -_specific_direct_match_count(item),
+                -item["direct_score"],
+                -item["score"],
+                item["path"],
+            ),
         )
     ][:MAX_HIGH_DIRECT_FILE_SEEDS]
     remaining_direct_match_paths = [
         entry["path"]
         for entry in sorted(
-            (entry for entry in file_scores if 0 < entry["direct_score"] < HIGH_DIRECT_FILE_SCORE),
+            (
+                entry
+                for entry in file_scores
+                if 0 < entry["direct_score"]
+                and not _is_high_direct_file_seed(
+                    entry, allow_specific_promotion=allow_specific_promotion,
+                )
+            ),
             key=lambda item: (-item["direct_score"], -item["score"], item["path"]),
         )
     ]
