@@ -1,4 +1,4 @@
 interface:
   display_name: "Dispatch Wiring"
-  short_description: "Help with Dispatch Wiring tasks"
-  default_prompt: "Use $dispatch-wiring to map a new operation through the Python dispatch stack and CPU/GPU fallback layers."
+  short_description: "Wire public APIs to native carriers and fallback boundaries."
+  default_prompt: "Use $dispatch-wiring to map a public API or owned helper through dispatch while preserving ADR-0044 native carriers, ADR-0046 shape estimates, and observable fallback/export boundaries."

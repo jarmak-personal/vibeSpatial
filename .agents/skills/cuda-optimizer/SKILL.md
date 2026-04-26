@@ -1,6 +1,6 @@
 ---
 name: cuda-optimizer
-description: "Use this skill to optimize existing CUDA/NVRTC kernel code, CuPy operations, CCCL primitive usage, or GPU dispatch logic in src/vibespatial/. Unlike gpu-code-review (which flags issues) and cuda-writing (which guides new code), this skill reads existing code and produces concrete rewrites with measured justification. Invoke on pre-existing kernel files to bring them up to NVIDIA best-practice performance standards."
+description: "Use this skill to optimize existing CUDA/NVRTC kernel code, CuPy operations, CCCL primitive usage, or GPU dispatch logic in src/vibespatial/. It must first check ADR-0046 physical workload shape and ADR-0044 native carriers, then optimize host/device boundaries, synchronization, launch configuration, memory access, precision, and warmup. Invoke for wrong-physical-shape findings, row-shaped kernels that should be segment/ring/candidate/relation shaped, pandas/materialization regressions, NativeRelation/NativeRowSet/NativeSpatialIndex/NativeGeometryMetadata reuse, and concrete performance rewrites."
 ---
 
 # CUDA Optimizer — vibeSpatial
@@ -32,7 +32,31 @@ Identify:
   `copy_device_to_host()`)
 - All synchronization points (`runtime.synchronize()`, `stream.synchronize()`)
 
-### Step 1: Host-Device Boundary (CRITICAL — highest impact)
+### Step 1: Physical Workload Shape (CRITICAL — highest impact)
+
+Before micro-optimizing, decide whether the file has the right GPU execution
+shape under ADR-0046. Produce a `wrong-physical-shape` finding when the code:
+
+- maps one public row, row pair, or geometry object to one thread even though
+  the real work is vertex, segment, ring, tile, candidate-pair, group, relation,
+  or output-byte shaped
+- rebuilds spatial indexes, bounds, geometry metadata, relation pairs, grouped
+  offsets, or rowsets across adjacent native stages instead of preserving
+  `NativeSpatialIndex`, `NativeGeometryMetadata`, `NativeRelation`,
+  `NativeGrouped`, or `NativeRowSet`
+- launches per-geometry kernels or Python loops instead of batching primitive
+  work queues
+- turns device-native results into pandas/Shapely-shaped intermediates before a
+  required public export boundary
+- relies on fixed row-count thresholds when coordinates, vertices, segments,
+  candidate pairs, groups, relation pairs, output bytes, or temporary bytes
+  dominate cost
+
+For this category, the rewrite may be a new native carrier or staged pipeline
+rather than a local kernel edit. Say that plainly and rank it above lower-level
+launch, memory, or source tweaks.
+
+### Step 2: Host-Device Boundary (CRITICAL — highest impact)
 
 Scan for these patterns and produce rewrites:
 
@@ -77,7 +101,7 @@ count_total = d_counts[-1].get() + d_offsets[-1].get()
 total = count_scatter_total(runtime, d_counts, d_offsets)
 ```
 
-### Step 2: Synchronization Elimination (HIGH impact)
+### Step 3: Synchronization Elimination (HIGH impact)
 
 **2a. Unnecessary `runtime.synchronize()` between same-stream ops**
 
@@ -110,7 +134,7 @@ keep scalars on device until pipeline end.
 
 Each is a device-wide implicit sync. Pre-allocate or use pool.
 
-### Step 3: Kernel Source Optimization (HIGH impact)
+### Step 4: Kernel Source Optimization (HIGH impact)
 
 Read every NVRTC kernel source string and check:
 
@@ -239,7 +263,7 @@ conversion. Use explicit casts: `(compute_t)0.0` or `0.0f`.
 Integer div/mod compiles to up to 20 instructions. Use bitwise ops
 when the divisor is a power of 2.
 
-### Step 4: Launch Configuration (MEDIUM impact)
+### Step 5: Launch Configuration (MEDIUM impact)
 
 **4a. Hardcoded block sizes**
 
@@ -265,7 +289,7 @@ grid_size = min(
 Flag any kernel launched with < 32 threads of real work, or launched
 per-geometry in a Python loop. Propose batched alternatives.
 
-### Step 5: Memory Access Patterns (MEDIUM impact)
+### Step 6: Memory Access Patterns (MEDIUM impact)
 
 **5a. AoS layout**
 
@@ -296,7 +320,7 @@ __pipeline_wait_prior(0);
 __syncthreads();
 ```
 
-### Step 6: CCCL/CuPy Tier Optimization (MEDIUM impact)
+### Step 7: CCCL/CuPy Tier Optimization (MEDIUM impact)
 
 Check every CuPy operation against the ADR-0033 tier system:
 
@@ -315,7 +339,7 @@ Also check:
 - Are CCCL specs declared in `request_warmup()` at module scope?
 - Are NVRTC kernels declared in `request_nvrtc_warmup()` at module scope?
 
-### Step 7: Precision Dispatch (MEDIUM impact)
+### Step 8: Precision Dispatch (MEDIUM impact)
 
 Check if the kernel is ADR-0002 compliant:
 
@@ -329,7 +353,7 @@ Check if the kernel is ADR-0002 compliant:
 If non-compliant, refer to the `precision-compliance` skill for the
 full implementation procedure.
 
-### Step 8: Precompilation (LOW impact, cold-start only)
+### Step 9: Precompilation (LOW impact, cold-start only)
 
 - Does the module call `request_warmup()` for its CCCL specs?
 - Does the module call `request_nvrtc_warmup()` for its kernel sources?
@@ -347,7 +371,7 @@ For each finding, produce:
 
 **File:** `path/to/file.py:LINE`
 **Impact:** Brief explanation of why this matters and expected improvement
-**Category:** (host-device | sync | kernel-source | launch-config | memory-access | tier | precision | warmup)
+**Category:** (wrong-physical-shape | host-device | sync | kernel-source | launch-config | memory-access | tier | precision | warmup)
 
 **Before:**
 \```python (or c)
@@ -377,6 +401,9 @@ At the end, produce a summary table:
   haven't read. Always quote the exact current code in "Before."
 - **Concrete rewrites only.** Every finding must have a "Before" and
   "After" block. No vague advice like "consider optimizing."
+- **Shape before tuning.** If the physical workload shape is wrong, say so
+  before spending the review on micro-optimizations. Do not make row-shaped
+  execution look acceptable by polishing block sizes.
 - **Verify tier compliance.** Check ADR-0033 before suggesting a CuPy
   -> CCCL migration — some operations were intentionally reverted.
 - **Don't break correctness.** Precision changes must go through

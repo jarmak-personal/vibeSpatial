@@ -14,6 +14,15 @@ tags:
 
 # Private Native Execution Substrate For Public GeoPandas APIs
 
+## Amendment Note
+
+Amended on 2026-04-26 by ADR-0046. The original decision remains accepted,
+but the native substrate is clarified as a set of device execution carriers for
+physical workload shapes, not only row/frame convenience objects. This
+amendment adds explicit spatial-index and geometry-metadata carriers and states
+that native carriers must preserve primitive-level work shape instead of forcing
+row-shaped execution.
+
 ## Context
 
 vibeSpatial can now make individual GPU operations fast when a benchmark focuses
@@ -75,6 +84,15 @@ The canonical internal carriers are:
   grouped offsets
 - `NativeGrouped`: dense group codes, sorted order, offsets/spans, null-key
   policy, output-index plan, and segmented reducer metadata
+- `NativeSpatialIndex`: reusable device-resident index state, including index
+  parameters, sorted or partitioned row order, node or bin metadata, bounds,
+  admissibility limits, stream readiness, and invalidation lineage. A spatial
+  index is execution state, not merely an index-construction plan.
+- `NativeGeometryMetadata`: device-resident bounds, geometry-family flags,
+  dimensional flags, validity or emptiness masks, row-to-part/ring/segment
+  offsets, and other compact classification data that downstream kernels use as
+  hot inputs. Metadata tables are native execution currency, not disposable
+  debug summaries.
 - `NativeIndexPlan`: explicit index semantics for row-position to public-label
   mapping. RangeIndex labels may remain device-resident as private label
   vectors until explicit public export; duplicate-label and MultiIndex
@@ -129,6 +147,8 @@ Every native fast path must define:
 - index semantics
 - attribute projection semantics
 - geometry family and dimensional behavior
+- physical work-unit semantics, including whether execution is row, pair,
+  vertex, segment, ring, tile, candidate, group, or output-byte shaped
 - CRS and active-geometry behavior
 - ordering and duplicate behavior
 - fallback and export behavior
@@ -157,6 +177,11 @@ rows. Semijoin, anti-join, unique left rows, grouped counts, and relation-based
 projection should consume the same pair arrays and grouped offsets without
 repeated host export.
 
+Spatial queries and repeated predicate workflows should preserve
+`NativeSpatialIndex` when index parameters, geometry buffers, row order, and
+lineage remain valid. Rebuilding an index because the public API boundary
+changed shape is a materialization smell.
+
 Overlay and clip should produce `NativeFrameState` with geometry and provenance
 that can feed native row selection, area filtering, and terminal export before a
 GeoDataFrame is materialized.
@@ -170,6 +195,11 @@ Terminal IO should prefer native export. `to_arrow`, `to_parquet`, and
 `to_feather` should consume native frame state directly when present instead of
 first materializing a full GeoDataFrame.
 
+Native carriers must not force the public row to be the physical execution
+unit. A row-aligned public result may still be computed through vertex, segment,
+ring, tile, candidate-pair, grouped, or output-byte work units and then reduced
+or compacted back to the public shape.
+
 ## Consequences
 
 - Public compatibility remains the external contract while private native state
@@ -180,6 +210,10 @@ first materializing a full GeoDataFrame.
   accidental pandas assembly are correctness and performance bugs.
 - Some current helper APIs that accept host row positions or pandas attribute
   frames will need to be split into native and export variants.
+- Existing dispatch helpers that describe only public input cardinality are
+  transitional. Native execution needs shape-level work estimates and carriers
+  for spatial-index state, metadata tables, primitive work units, and dynamic
+  output assembly.
 - Attribute execution remains a known risk. Arrow-backed attributes are a useful
   compatibility/export boundary, and all-valid numeric/bool device attributes
   are admissible for private reducers. Nullable, string, categorical, datetime,
@@ -195,7 +229,8 @@ row selection or expression lowering.
 
 1. Apply ADR-0045 transient native work budgets to every admitted shape.
 2. Add materialization firewalls and stale-state detection.
-3. Introduce private native carriers behind existing native result objects.
+3. Introduce private native carriers behind existing native result objects,
+   including spatial-index state and geometry metadata tables.
 4. Make terminal exports native-aware.
 5. Rework relation-preserving spatial join shapes.
 6. Add native rowset selection only for explicit native selectors.

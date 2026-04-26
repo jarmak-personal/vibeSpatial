@@ -1,17 +1,49 @@
 ---
 name: cuda-writing
-description: "PROACTIVELY USE THIS SKILL when writing, modifying, or reviewing GPU kernels, CUDA/NVRTC kernel source, CCCL primitive usage, device memory management, stream-based pipelining, or any GPU dispatch logic in src/vibespatial/. Covers kernel lifecycle, ADR-0033 tier system, stream overlap patterns, warp-level intrinsics, count-scatter patterns, precompilation (ADR-0034), precision dispatch (ADR-0002), and GPU saturation techniques."
+description: "PROACTIVELY USE THIS SKILL when writing, modifying, or reviewing GPU kernels, CUDA/NVRTC kernel source, CCCL primitive usage, device memory management, stream-based pipelining, or any GPU dispatch logic in src/vibespatial/. Use it for ADR-0046 physical workload shape contracts, ADR-0044 native carriers (NativeFrameState, NativeRowSet, NativeRelation, NativeGrouped, NativeSpatialIndex, NativeGeometryMetadata, NativeExpression), shape-level work estimates, kernel lifecycle, ADR-0033 tier selection, count/scan/scatter pipelines, precompilation (ADR-0034), precision dispatch (ADR-0002), and GPU saturation."
 ---
 
 # GPU Kernel Development Guide — vibeSpatial
 
 You are writing GPU code for vibeSpatial. Follow these rules strictly.
-All GPU primitive dispatch decisions are governed by ADR-0033. Precision
-dispatch is governed by ADR-0002. Precompilation is governed by ADR-0034.
+Physical workload shape is governed by ADR-0046. Native carriers are governed
+by ADR-0044. GPU primitive dispatch decisions are governed by ADR-0033.
+Precision dispatch is governed by ADR-0002. Precompilation is governed by
+ADR-0034.
+
+## 0. ADR-0046 Physical Shape Gate
+
+Before writing GPU code, declare the physical workload shape. Do this before
+choosing CuPy, CCCL, NVRTC, launch thresholds, or public dispatch wiring.
+
+Record:
+
+- public semantics and admissibility boundary
+- physical shape family: aligned pairwise, broadcast, matrix, candidate-refine,
+  rowset take, relation consume, segmented grouped reduction, dynamic-output
+  assembly, terminal native export, or another named reusable shape
+- work units: rows, coordinates, vertices, segments, rings, tiles, candidate
+  pairs, relation pairs, groups, output rows, output bytes, temporary bytes
+- native input and output carriers: `NativeFrameState`, `NativeRowSet`,
+  `NativeRelation`, `NativeGrouped`, `NativeSpatialIndex`,
+  `NativeGeometryMetadata`, `NativeExpression`, or owned geometry/scalar arrays
+- temporary execution layout: CSR/COO pairs, dense tiles, sorted partitions,
+  grouped offsets, primitive work queues, transposed coordinate views, centered
+  fp32 buffers, or scratch arenas
+- saturation plan for large-single, many-small, sparse, dense, and skewed cases
+- precision plan, transfer/sync/export boundary, and shape canary or benchmark
+
+If the public result is row-aligned, do not assume row-shaped execution. The
+right GPU shape may be vertex, segment, ring, tile, candidate-pair, group,
+relation, or output-byte shaped before reducing back to public rows.
+
+If no reusable physical shape can be stated, stop and draft the shape contract
+or ADR amendment first. Do not hide a weak shape behind a polished kernel.
 
 ## 1. ADR-0033 Tier Decision Tree
 
-Before writing any GPU code, classify your operation:
+After the ADR-0046 shape gate, classify the implementation primitive for that
+shape:
 
 ```
 Is the inner loop geometry-specific (ring traversal, winding, segment intersection)?
@@ -794,6 +826,11 @@ selection = plan_dispatch_selection(
     kernel_name="my_kernel",
     kernel_class=KernelClass.COARSE,
     row_count=n,
+    # Prefer shape-level estimates when the dispatch API supports them:
+    # vertex_count=vertex_count,
+    # segment_count=segment_count,
+    # candidate_pair_count=candidate_pair_count,
+    # output_byte_estimate=output_byte_estimate,
     requested_mode=dispatch_mode,
 )
 if selection.selected is ExecutionMode.GPU:

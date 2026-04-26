@@ -50,4 +50,5 @@ context, the decision made, consequences, and alternatives considered.
 0043-public-api-physical-plan-coverage
 0044-private-native-execution-substrate
 0045-transient-native-work-budget
+0046-gpu-physical-workload-shape-contracts
 ```

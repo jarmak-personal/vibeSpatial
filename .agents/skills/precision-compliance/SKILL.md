@@ -1,6 +1,6 @@
 ---
 name: precision-compliance
-description: "PROACTIVELY USE THIS SKILL whenever you are writing, modifying, reviewing, or adding a GPU kernel, CUDA kernel, NVRTC kernel source, or any computation in src/vibespatial/ that touches coordinate data on the GPU. This includes work on bounds, distance, point-in-polygon, binary predicates, segment intersection, spatial indexing, overlay, clip, buffer, constructive ops, dissolve, or any new kernel. ADR-0002 requires dual-precision dispatch (fp32/fp64) via PrecisionPlan. This skill contains the full compliance procedure, the precision infrastructure API, kernel-class-specific implementation patterns, and the current compliance status of every kernel file."
+description: "PROACTIVELY USE THIS SKILL whenever writing, modifying, reviewing, or adding a GPU kernel, CUDA/NVRTC source, CuPy/CCCL computation, or GPU dispatch path in src/vibespatial/ that touches coordinate data. Use it for ADR-0002 PrecisionPlan compliance, fp32/fp64 dual precision, coordinate centering, Kahan compensation, predicate refinement, bounds/indexing precision, ADR-0046 shape-aware precision policy, NativeGeometryMetadata/CoordinateStats reuse, and avoiding host coordinate scans. Applies to distance, metrics, bounds, point-in-polygon, binary predicates, segment intersection, spatial indexing, overlay, clip, buffer, dissolve, constructive ops, and new kernels."
 ---
 
 # Precision Compliance: Wire ADR-0002 Dual-Precision Dispatch Into a Kernel
@@ -31,10 +31,25 @@ Read the target file. Determine:
    source use `double` exclusively? Is there any fp32 path?
 
 3. **ADR-0002 policy for this kernel class on consumer GPUs**:
-   - COARSE: staged fp32 with coordinate centering when large absolute magnitudes
+   - COARSE: staged fp32 with coordinate centering only when it cannot create
+     false negatives; bounds stay fp64 or use conservative outward rounding
    - METRIC: staged fp32 with Kahan-compensated accumulation
    - PREDICATE: staged fp32 for coarse pass, selective fp64 refinement for ambiguous results
    - CONSTRUCTIVE: stay on native fp64 (no change needed — but still wire the plan through for observability)
+
+4. **ADR-0046 physical shape**:
+   - Is the work aligned pairwise, broadcast/matrix, candidate-refine,
+     segmented grouped, relation consume, rowset take, dynamic-output assembly,
+     or terminal export?
+   - What are the primitive work units: coordinates, vertices, segments, rings,
+     candidate pairs, relation pairs, groups, output rows, output bytes?
+   - Which native carriers already provide coordinate statistics or metadata:
+     `NativeGeometryMetadata`, `NativeFrameState`, `NativeSpatialIndex`, or
+     `NativeRelation`?
+
+Precision policy is shape-aware. The same public operation may need different
+centering, compensation, or refinement behavior for dense matrix, compact
+relation, segmented reduction, and candidate-refine shapes.
 
 ## Step 2: Read the Precision Infrastructure
 
@@ -43,6 +58,10 @@ Read these files to understand the API you must use:
 - `src/vibespatial/runtime/precision.py` — `PrecisionPlan`, `select_precision_plan()`, `KernelClass`, `PrecisionMode`, `CompensationMode`, `CoordinateStats`
 - `src/vibespatial/runtime/kernel_registry.py` — `register_kernel_variant()` decorator and `KernelVariantSpec`
 - `src/vibespatial/runtime/robustness.py` — `select_robustness_plan()` (takes a PrecisionPlan)
+- `docs/decisions/0046-gpu-physical-workload-shape-contracts.md` — shape
+  contract and work-unit requirements
+- `docs/decisions/0044-private-native-execution-substrate.md` — native carriers
+  and export boundaries
 
 ## Step 3: Implement the Precision-Aware Kernel
 
@@ -50,13 +69,12 @@ Follow the pattern appropriate to the kernel class:
 
 ### Pattern A: COARSE Kernels (bounds, indexing, filters)
 
-These are pure min/max or comparison operations. fp32 is trivially safe
-**EXCEPT for bounds kernels**: bounds outputs are used as spatial filter
-inputs, and fp32 rounding can shrink bounds, causing false negatives in
-candidate generation. Bounds kernels should stay fp64 or use conservative
-rounding (round min DOWN, max UP in fp32). Prefer fp64 for bounds since
-they are memory-bound, not compute-bound — fp32 provides no throughput
-advantage.
+These are filters, sort keys, index helpers, or cheap geometry-local work.
+fp32 is often useful for comparisons, but not automatically safe. Bounds
+outputs feed candidate generation; fp32 rounding can shrink bounds and cause
+false negatives. Bounds kernels should stay fp64 or use conservative outward
+rounding (round min DOWN, max UP in fp32). Prefer fp64 for bounds until
+profiling proves compute precision, not memory bandwidth, is the bottleneck.
 
 1. **Template the CUDA source** on a precision typedef:
    ```c
@@ -67,8 +85,11 @@ advantage.
    ```
 
 2. **Add coordinate centering** when `plan.center_coordinates is True`:
-   - Compute centroid of the coordinate extent on host
-   - Pass `center_x`, `center_y` as kernel parameters
+   - Prefer existing `CoordinateStats`, `NativeGeometryMetadata`, or other
+     device-native metadata produced by the current shape.
+   - If a host coordinate scan is required, treat it as an explicit admitted
+     boundary and record the transfer/materialization cost.
+   - Pass `center_x`, `center_y` as kernel parameters.
    - In kernel: `compute_t lx = (compute_t)(x[i] - center_x);`
 
 3. **Format the source** based on the plan:
@@ -223,8 +244,9 @@ uv run pytest tests/test_pipeline_benchmarks.py -q
 
 ## Step 8: Update Compliance Status
 
-After completing the work, you MUST update the compliance ledger in this
-skill file so the next session has an accurate starting point.
+After completing the work, verify the current source before trusting the
+compliance ledger below. It is a navigation aid, not the source of truth.
+Then update the ledger so the next session has an accurate starting point.
 
 Edit the "Current Compliance Status" section below:
 - Move the file you just fixed from a non-compliant category to the
@@ -265,10 +287,11 @@ The compliance ledger file is at:
 
 ### Priority order (highest performance impact first)
 
-1. COARSE kernels (bounds, indexing) — trivial fp32 safety, pure min/max
+1. COARSE non-bounds filters and index helpers — usually safe staged fp32
 2. METRIC kernels (distance) — fp32 + Kahan is well-understood
 3. PREDICATE kernels (point-in-polygon, binary predicates) — needs two-pass architecture
-4. CONSTRUCTIVE kernels — wire plan through for observability only
+4. Bounds producers — keep fp64 or prove conservative outward rounding
+5. CONSTRUCTIVE kernels — wire plan through for observability only
 
 ## Key Rules
 
@@ -276,6 +299,9 @@ The compliance ledger file is at:
 - Compute precision is selected at dispatch time via `PrecisionPlan`.
 - Kernel cache keys MUST include precision so fp32/fp64 compile separately.
 - Coordinate centering is an execution-local artifact, not a buffer change.
+- Prefer device-native coordinate stats and `NativeGeometryMetadata`; host
+  coordinate scans are explicit boundaries, not helper details.
+- Precision is selected for the physical shape, not just the public method.
 - On datacenter GPUs (fp64:fp32 >= 0.25), the plan will select fp64 for everything — the fp32 path only activates on consumer hardware.
 - Never add ad-hoc precision booleans. Always go through `PrecisionPlan`.
 - Per ADR-0033, custom NVRTC kernels (Tier 1) are the right tool for geometry-specific compute. The precision parameterization goes into these kernel source strings.

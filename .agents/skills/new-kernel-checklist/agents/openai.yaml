@@ -1,4 +1,4 @@
 interface:
   display_name: "New Kernel Checklist"
-  short_description: "Help with New Kernel Checklist tasks"
-  default_prompt: "Use $new-kernel-checklist to scaffold and verify every required step for adding a new GPU-dispatched operation."
+  short_description: "Checklist for new shape-first GPU operations."
+  default_prompt: "Use $new-kernel-checklist to declare the physical workload shape and verify every required carrier, precision, dispatch, warmup, test, benchmark, and docs step for a new GPU operation."

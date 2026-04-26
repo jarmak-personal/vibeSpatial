@@ -1,13 +1,14 @@
 ---
 name: new-kernel-checklist
-description: "PROACTIVELY USE THIS SKILL when adding a new GPU kernel, NVRTC kernel, CCCL primitive wrapper, or any new GPU-dispatched operation to src/vibespatial/. This checklist ensures every registration, warmup, caching, precision, dispatch, test, benchmark, and documentation step is completed. The CUDA-focused worker sub-agent and gpu-code-review skill should reference this checklist. Trigger on: \"new kernel\", \"add kernel\", \"implement kernel\", \"write kernel\", \"create kernel\", \"new GPU operation\", \"add GPU\", \"scaffold kernel\"."
+description: "PROACTIVELY USE THIS SKILL when adding a new GPU kernel, NVRTC kernel, CCCL primitive wrapper, CuPy GPU path, native carrier, or any new GPU-dispatched operation to src/vibespatial/. This is the new GPU operation checklist: ADR-0046 physical workload shape contract, ADR-0044 native output carrier, ADR-0033 primitive tier, ADR-0002 precision, dispatch wiring, warmup, caching, tests, benchmarks, docs, and quality gates. Trigger on: \"new kernel\", \"add kernel\", \"implement kernel\", \"write kernel\", \"create kernel\", \"new GPU operation\", \"add GPU\", \"scaffold kernel\", \"physical workload shape\", \"NativeRelation\", \"NativeRowSet\", \"NativeSpatialIndex\", \"NativeGeometryMetadata\"."
 ---
 
-# New Kernel Checklist — vibeSpatial
+# New GPU Operation Checklist — vibeSpatial
 
-You are adding a new GPU kernel or GPU-dispatched operation. This checklist
-ensures nothing is missed. Work through each section in order — every item
-marked **[REQUIRED]** must be completed before the kernel can land.
+You are adding a new GPU kernel, primitive wrapper, native carrier, or
+GPU-dispatched operation. This checklist ensures nothing is missed. Work
+through each section in order — every item marked **[REQUIRED]** must be
+completed before the operation can land.
 
 Target kernel: **$ARGUMENTS**
 
@@ -15,9 +16,40 @@ Target kernel: **$ARGUMENTS**
 
 ## Phase 1: Classification and Design
 
+### 1.0 Physical Workload Shape (ADR-0046) [REQUIRED]
+
+Declare the reusable physical shape before choosing a primitive or writing a
+kernel.
+
+Record:
+
+- `public_contract`: method/API behavior and admissibility boundary
+- `physical_shape_family`: aligned pairwise, broadcast, matrix,
+  candidate-refine, rowset take, relation consume, segmented grouped
+  reduction, dynamic-output assembly, terminal native export, or another named
+  reusable shape
+- `work_units`: rows, coordinates, vertices, segments, rings, tiles, candidate
+  pairs, relation pairs, groups, output rows, output bytes, temp bytes
+- `native_inputs`: `NativeFrameState`, `NativeRowSet`, `NativeRelation`,
+  `NativeGrouped`, `NativeSpatialIndex`, `NativeGeometryMetadata`,
+  `NativeExpression`, or owned geometry/scalar arrays
+- `native_output`: the carrier returned to the next native consumer
+- `staging_layout`: CSR/COO pairs, dense tiles, sorted partitions, grouped
+  offsets, primitive work queues, centered buffers, or scratch arenas
+- `export_boundary`: where public GeoPandas/pandas/Shapely materialization is
+  allowed
+- `saturation_plan`: large-single, many-small, sparse, dense, and skewed cases
+- `shape_canary`: benchmark or profiling rail proving the reusable shape
+
+If the public result is row-aligned, still record the primitive work units. A
+row result may be computed by segment, ring, tile, candidate-pair, group,
+relation, or output-byte work.
+
 ### 1.1 Tier Classification (ADR-0033) [REQUIRED]
 
-Run the decision tree to determine the correct tier:
+After the ADR-0046 shape is declared, run the decision tree to determine the
+implementation primitive:
+
 
 ```
 Is the inner loop geometry-specific (ring traversal, winding, segment intersection)?
@@ -223,7 +255,10 @@ it falls into this category.
 
 ### 5.1 Kernel Variant Registration [REQUIRED]
 
-Register both GPU and CPU variants using `@register_kernel_variant()`:
+Register GPU variants using `@register_kernel_variant()` when the operation is
+a public dispatchable kernel. Public operations also need an observable CPU
+fallback or explicit strict-native failure. Private substrate primitives may be
+native-only when they are consumed only behind an admitted native contract.
 
 ```python
 from vibespatial.runtime.kernel_registry import register_kernel_variant
@@ -260,7 +295,8 @@ def _my_kernel_cpu(owned):
 
 - [ ] GPU variant has `preferred_residency=Residency.DEVICE`
 - [ ] GPU variant lists all three `precision_modes`
-- [ ] CPU variant exists as Shapely fallback
+- [ ] Public operation has a CPU variant, observable fallback boundary, or
+      explicit strict-native failure
 - [ ] `kernel_class` matches your classification from Phase 1
 - [ ] `geometry_families` matches your list from Phase 1
 
@@ -276,6 +312,11 @@ selection = plan_dispatch_selection(
     kernel_name="my_kernel",
     kernel_class=KernelClass.THE_CLASS,
     row_count=n,
+    # Prefer shape-level estimates when supported:
+    # vertex_count=vertex_count,
+    # segment_count=segment_count,
+    # candidate_pair_count=candidate_pair_count,
+    # output_byte_estimate=output_byte_estimate,
     requested_mode=dispatch_mode,
 )
 precision_plan = select_precision_plan(
@@ -412,6 +453,7 @@ from .my_kernel import my_kernel
 ### 9.1 Run $cuda-optimizer [REQUIRED]
 
 Invoke the `cuda-optimizer` skill on your kernel file to verify:
+- Physical workload shape is credible before micro-optimization
 - No unnecessary host round-trips
 - No redundant synchronizations
 - Efficient memory access patterns

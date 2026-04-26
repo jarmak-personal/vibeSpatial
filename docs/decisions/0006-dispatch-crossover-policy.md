@@ -30,6 +30,19 @@ Use fixed per-kernel-class crossover thresholds until adaptive runtime lands.
 - the initial thresholds are `1K`, `5K`, `10K`, and `50K` rows for coarse,
   metric, predicate, and constructive kernels respectively
 
+## Amendment (2026-04-26)
+
+ADR-0046 amends this decision. Fixed row-count thresholds are now only a
+bootstrap fallback for paths that do not yet expose shape-level estimates.
+They are not the steady-state dispatch abstraction.
+
+GPU dispatch must move toward physical workload estimates: coordinate count,
+vertex count, segment count, candidate-pair count, relation-pair count, group
+count, expected output rows, expected output bytes, temporary bytes, device
+residency, launch count, and export cost. Public row count may contribute to
+that estimate, but it must not be treated as the primary signal once a shape
+contract exists.
+
 ## Consequences
 
 - Kernel dispatch code can rely on one shared threshold policy instead of ad hoc size checks.

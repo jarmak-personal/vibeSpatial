@@ -30,6 +30,19 @@ Use a lightweight staged operator DAG as the default fusion mechanism.
 - keep user-facing APIs unchanged
 - allow specialized fused kernels as an optimization inside the staged model, not as the only strategy
 
+## Amendment (2026-04-26)
+
+ADR-0043 and ADR-0046 amend how this decision should be applied. Staged fusion
+is not authority for broad public lazy planning or speculative interception of
+GeoPandas method chains. The failed planner experiment documented in ADR-0043
+showed that this shape can improve a narrow timing signal while breaking public
+workflow correctness.
+
+Future fusion work must start from an explicit physical workload shape contract:
+admissible semantics, native carriers, work units, transient budget, result
+shape, and export boundary. Fusion is an implementation technique inside that
+declared shape, not a substitute for the shape contract.
+
 ## Consequences
 
 - The runtime planner has a clear place to choose stage shapes at dispatch time.

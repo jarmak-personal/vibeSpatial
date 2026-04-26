@@ -26,6 +26,18 @@ sort-partition by coarse geometry family for truly mixed execution paths.
 Near-homogeneous inputs can stay on the tagged path without permanent
 family-split storage.
 
+## Amendment (2026-04-26)
+
+ADR-0046 amends this decision by separating canonical storage from physical
+execution shape. Dense tagged mixed storage remains the stable owned geometry
+contract, but GPU plans may create operation-local layouts such as sorted family
+partitions, grouped offsets, pair lists, dense matrices, or scratch buffers when
+those layouts better fit the selected workload shape.
+
+Do not read this ADR as requiring kernels to execute directly over the canonical
+mixed layout when a different temporary device layout improves coherence,
+saturation, or output assembly.
+
 ## Consequences
 
 - Owned geometry buffers can target one canonical mixed layout.

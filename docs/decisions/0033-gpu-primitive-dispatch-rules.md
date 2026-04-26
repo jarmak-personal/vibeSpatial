@@ -88,6 +88,16 @@ for any kernel authoring.
 
 ## Decision
 
+### Amendment (2026-04-26)
+
+ADR-0046 amends the entry point for this decision procedure. Choose the
+physical workload shape before choosing the primitive tier. The tiers below
+still govern implementation once the shape is known, but they must not be used
+to design from a primitive outward.
+
+The required order is: admissibility, residency, work-unit estimate, physical
+shape and variant, then NVRTC/CCCL/CuPy primitive selection.
+
 ### Tier 1: Custom NVRTC kernels (geometry-specific compute)
 
 **Use for:** Any operation whose inner loop is geometry-specific —

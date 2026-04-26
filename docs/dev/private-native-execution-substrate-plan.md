@@ -5,7 +5,7 @@ Scope: Execution plan for building the private GPU-native substrate beneath exac
 Read If: You are planning or implementing native frame state, rowsets, relations, grouped reducers, native export boundaries, or performance generalization work.
 STOP IF: You only need operation-local kernel detail already routed by intake.
 Source Of Truth: Program plan for implementing ADR-0044 without reviving a broad public lazy planner.
-Body Budget: 860/860 lines
+Body Budget: 856/860 lines
 Document: docs/dev/private-native-execution-substrate-plan.md
 
 Section Map (Body Lines)
@@ -13,18 +13,18 @@ Section Map (Body Lines)
 |---|---|
 | 1-2 | Preamble |
 | 3-12 | Intent |
-| 13-37 | Request Signals |
-| 38-55 | Open First |
-| 56-67 | Verify |
-| 68-84 | Risks |
-| 85-100 | Mission |
-| 101-131 | Target Shape |
-| 132-144 | Non-Goals |
-| 145-165 | Working Principles |
-| 166-178 | Tracking |
-| 179-188 | P0 Transient Native Work |
-| 189-328 | Current Branch Slice |
-| 329-347 | Implementation Packages |
+| 13-35 | Request Signals |
+| 36-53 | Open First |
+| 54-65 | Verify |
+| 66-82 | Risks |
+| 83-98 | Mission |
+| 99-126 | Target Shape |
+| 127-139 | Non-Goals |
+| 140-162 | Working Principles |
+| 163-175 | Tracking |
+| 176-185 | P0 Transient Native Work |
+| 186-324 | Current Branch Slice |
+| 325-343 | Implementation Packages |
 | ... | (16 additional sections omitted; open document body for full map) |
 DOC_HEADER:END -->
 
@@ -43,11 +43,9 @@ boundaries, and strict invalidation rules.
 - private native execution
 - native substrate
 - public performance generalization
-- `NativeFrameState`
-- `NativeRowSet`
-- `NativeRelation`
-- `NativeGrouped`
-- native export boundary
+- native carriers (`NativeFrameState`, `NativeRowSet`, `NativeRelation`,
+  `NativeGrouped`, `NativeSpatialIndex`, `NativeGeometryMetadata`,
+  `NativeIndexPlan`, `NativeExpression`, `NativeExportBoundary`)
 - materialization firewall
 - strict native
 - stale sidecar
@@ -120,38 +118,35 @@ The plan is successful only if all of the following are true:
 
 - public users keep normal GeoPandas APIs and return types
 - native state is private, validated, and aggressively invalidated
-- sanctioned vibeSpatial methods can consume native frame, rowset, relation,
-  grouped, and export state without rebuilding pandas intermediates
+- sanctioned vibeSpatial methods can consume native carriers without rebuilding
+  pandas intermediates
 - strict-native mode catches hidden materialization and stale native state
 - public shootout canaries improve through reusable physical shapes rather than
   workflow-specific shortcuts
 
 ## Target Shape
 
-The target substrate has six private execution carriers.
+The target substrate has nine private execution carriers:
 
-`NativeFrameState` owns logical frame state: geometry columns, attribute
-storage, active geometry name, CRS, column order, row count, attrs, provenance,
-lineage token, residency flags, and stream/event readiness.
-
-`NativeRowSet` owns row flow. Device row positions are canonical. Boolean masks
-are cached producer or consumer artifacts, not the universal representation.
-
-`NativeRelation` owns pair flow. It stores left and right row-position arrays,
-optional distances, predicate metadata, source lineage, sortedness, duplicate
-policy, and a cached left-grouped representation for semijoin, anti-join,
-unique-left, and grouped-count consumers.
-
-`NativeGrouped` owns grouped execution. It stores dense group codes, sorted
-order, offsets/spans, null-key policy, output index plan, and reducer metadata.
-
-`NativeIndexPlan` owns public index semantics. It maps device row positions to
-public labels and records duplicate, name, level, ordering, and materialization
-policy.
-
-`NativeExportBoundary` owns compatibility export. GeoDataFrame, pandas, Arrow,
-GeoParquet, Feather, Shapely, repr, and debug materialization pass through this
-surface and record transfer or fallback metadata.
+- `NativeFrameState`: geometry columns, attributes, active geometry, CRS,
+  column order, row count, attrs, provenance, lineage, residency, and readiness.
+- `NativeRowSet`: device row positions as canonical row flow; masks are cached
+  producer or consumer artifacts.
+- `NativeRelation`: left/right row-position arrays, optional distances,
+  predicate metadata, source lineage, sortedness, duplicate policy, and grouped
+  offsets.
+- `NativeGrouped`: dense group codes, sorted order, offsets/spans, null-key
+  policy, output index plan, and reducer metadata.
+- `NativeSpatialIndex`: reusable device index state with parameters, sorted or
+  partitioned row order, node/bin metadata, bounds, lineage, and readiness.
+- `NativeGeometryMetadata`: compact bounds, geometry-family and dimensional
+  flags, validity/emptiness masks, and row-to-part/ring/segment offsets.
+- `NativeIndexPlan`: public index semantics for mapping device row positions to
+  labels, including duplicate, name, level, ordering, and materialization policy.
+- `NativeExpression`: private device scalar vectors and predicates consumed by
+  sanctioned native operations, not a public `pd.Series` replacement.
+- `NativeExportBoundary`: compatibility export to GeoDataFrame, pandas, Arrow,
+  GeoParquet, Feather, Shapely, repr, and debug materialization surfaces.
 
 The public layer may attach native state only through sanctioned routes. Unknown
 pandas operations clear native state or force explicit export. Full native
@@ -183,6 +178,8 @@ This plan is not about:
   `NativeIndexPlan`.
 - Relation consumers should share pair arrays and grouped offsets instead of
   repeatedly sorting or exporting.
+- Reusable spatial indexes and geometry metadata are execution carriers, and
+  public row alignment does not imply row-shaped execution.
 - CCCL fits compaction, scans, sort-by-key, run-length offsets, and segmented
   numeric reductions; grouped geometry union needs family-specific kernels.
 - Every persistent device object carries stream or event readiness metadata.
@@ -257,12 +254,9 @@ Completed in the slice:
   consistently rebases host, Arrow, loader, and device gathers to a RangeIndex.
 - WP5 probe: the point-tree/box predicate now has a private device-rowset
   helper that returns device row positions without CUDA-runtime D2H copies.
-- WP5 probe: the zero-transfer canary now consumes hidden
-  `NativeFrameState` plus private point-box `NativeRowSet` directly instead of
-  rebuilding a public boolean mask before the row-take stage.
-- The zero-transfer canary uses a fixed 400x400 point-box at every scale so
-  the 1M run remains a selective row-take signal instead of degenerating into
-  an identity take.
+- WP5/zero-transfer canary consumes private native reads, hidden
+  `NativeFrameState`, and private point-box `NativeRowSet` directly, with fixed
+  400x400 selectivity instead of public mask rebuilds or identity takes.
 - Native GeoParquet payload writes now try the device-native writer before
   constructing an authoritative host geometry view.
 - WP8 probe: index-free private `NativeAttributeTable` takes can gather
@@ -276,20 +270,26 @@ Completed in the slice:
   `x[rows]`/`y[rows]` gather and synthetic offsets instead of the generic
   offset-slice path, avoiding scalar output-size probes for this common
   rowset-take case.
-- The zero-transfer canary now starts from `read_geoparquet_native()` so it
-  measures the private substrate directly instead of counting the public
-  GeoDataFrame compatibility export as a canary failure.
+- P0 transient predicate probe: `point_in_polygon(..., _return_device=True)`
+  keeps lazy device metadata through fused PIP without host null/coarse masks.
 - WP4 early signal rail: `relation-semijoin` now measures the first
   relation-first vertical slice: private native reads, right-side spatial
   index, device relation pairs, `NativeRelation.left_semijoin_rowset()`,
   `NativeFrameState.take()`, and native GeoParquet export.
-- Single-row device `FlatSpatialIndex` builds now keep point bounds device-lazy
-  and validate rectangle rows with only two coordinate reads before preserving
-  the regular-grid query fast path.
+- Device `FlatSpatialIndex` builds now keep regular-grid rectangle bounds
+  device-lazy: single-row uses two coordinate reads; multi-row host-cold grids use one fused certification kernel plus one 64B summary D2H.
 - `RelationJoinExportResult.to_native_relation()` now uses attached
   `NativeFrameState` lineage tokens when they are available, so relation-derived
   rowsets can validate against the original native frames instead of only
   carrying `gdf:id(...)` fallback tokens.
+- Join-heavy uses the generic `NativeRelation.right_semijoin_rowset()` plus
+  `OwnedGeometryArray.take()` relation row-flow shape instead of host pair export.
+- Device dense group codes materialize only with an explicit event when grouped
+  geometry falls through to host-only exact fallback.
+- Bulk grouped disjoint polygon assembly now admits all-device, all-Polygon,
+  all-observed, multi-member dense-code groups into validated grouped
+  MultiPolygon rows for native coverage/disjoint-subset reducers, with
+  homogeneous host metadata synthesized without coordinate materialization.
 - WP6 early signal: grouped, relation-side, export-bridge, and public dissolve numeric/bool `sum`/`count`/`mean`/`min`/`max`/`first`/`last` reducers plus host `first`/`last` metadata take-reducers with pandas-compatible skip-null semantics avoid pandas group assembly.
 - Grouped constructive results now defer `as_index=False` reset-index assembly through `NativeAttributeTable` loader metadata instead of forcing grouped reducers through pandas before terminal export.
 
@@ -298,8 +298,6 @@ Not completed in the slice:
 - strict-native does not yet fatal every hidden host conversion automatically;
   the event surfaces are in place, but hot-path strictness still needs
   admitted-path context.
-- WP0b canary baselines are only partially captured until full GPU health and
-  full profile gates finish without hangs.
 - Most WP4/WP5 relation probes remain private. Public boolean filters admit only
   exact RangeIndex masks; `.loc`, duplicate, and MultiIndex selection are out of scope.
 - WP6 is still not full public dissolve. It has narrow numeric/bool attribute
@@ -318,18 +316,10 @@ Current verification artifacts:
   workflow canaries classify hidden exports without becoming the design target.
 - Current 1M zero-transfer timings: `read_input=21.75ms`,
   `predicate_filter=404us`, `subset_rows=1.61ms`, `write_output=5.08ms`.
-- The 1M relation-semijoin rail reports `status=ok`, selects 160,000 rows, has
-  zero materialization, and keeps `semijoin_rowset`, `subset_rows`, and
-  `write_output` at zero runtime D2H.
-- Current 1M relation-semijoin timings: `read_inputs=22.32ms`,
-  `build_index=212us`, `sjoin_relation=672us`, `semijoin_rowset=441us`,
-  `subset_rows=1.65ms`, `write_output=4.76ms`.
-- The formal `relation-bridge-consumer` smoke canary reports `status=ok`:
-  8,450 relation rows collapse to 169 unique left rows, the native consumer
-  preserves RangeIndex labels through `device-labels` with zero
-  materializations and zero D2H in the consumer stage. Relation export still
-  reports fixed-size runtime D2H from query refinement; the latest smoke run
-  reported 6 transfers totaling 1,908 bytes.
+- The 1M relation-semijoin rail reports `status=ok`, 160,000 selected rows,
+  zero materialization, and zero runtime D2H in semijoin/subset/export stages.
+- The `relation-bridge-consumer` canary preserves RangeIndex `device-labels`
+  through native takes with zero consumer-stage materialization or D2H.
 - The relation-semijoin rail now reports 3 fixed-size runtime D2H transfers
   totaling 88 bytes; the 2-transfer/8B device-bounds probe slowed `sjoin_relation`.
 - WP6 canaries report `status=ok` at 1M: grouped `native_sum=609us` and
@@ -337,13 +327,19 @@ Current verification artifacts:
   D2H/materialization and decline unsupported reducer states.
 - `small-grouped-constructive-reduce` reports `status=ok`: size-2-8 device
   polygon groups, exact oracle, no materialization, 3 D2H / 48 bytes.
-- Materialization event detail reports row-position payload size when a device
-  rowset does cross to host. Before the index-free device attribute gather, the
-  selective 1M zero-transfer `subset_rows` materialization detail was
-  `rows=160000, bytes=1280000`. The current artifact no longer reports that
-  `_host_row_positions` event in `subset_rows`.
-- GPU health is blocked by the upstream native-coverage sweep timing out after
-  600 seconds in `uv run pytest -q tests/upstream/geopandas`.
+- Materialization events now report payload size; the selective 1M zero-transfer
+  path no longer reports `_host_row_positions` in `subset_rows`.
+- After the P0 PIP metadata and fused grid-index slices, 1M predicate-heavy
+  reports zero runtime D2H/materialization; PIP moved from 6 D2H / 12MB /
+  ~3.3ms to 272us wall, and join-heavy grid indexing is 1 D2H / 64B.
+- After the relation right-rowset slice, 1M join-heavy `sjoin_query` moved from
+  16.76ms / 7,954,976 D2H bytes to 770us / 8 D2H bytes; `assemble_join_rows` moved from 17.74ms to 828us with zero D2H.
+- Bulk grouped-disjoint assembly moved 1M join-heavy `dissolve_groups` from
+  46.97ms / 8 D2H / 9,500,008 bytes / 1 materialization to 5.92ms / zero runtime D2H / zero materialization; overall join-heavy is 39.28ms / 2 D2H / 72 bytes.
+- A per-group GPU disjoint loop was killed: it avoided geometry materialization
+  but measured ~0.42s and 1,280 tiny D2H reads at the 100K grouped-polygon scale.
+- Constructive output-size fences now batch adjacent coordinate/part scalar reads
+  in line merge, LineString-Polygon difference, and clipped line assembly; line merge reports one 16B runtime D2H for two output sizes.
 
 Current next signal:
 
@@ -351,8 +347,8 @@ Current next signal:
   MultiIndex remain out of scope until strictness and export canaries exist.
 - Do not expand device attributes beyond all-valid numeric/bool until a canary
   proves attributes dominate.
-- Grouped geometry has seams, but broader coverage still needs true grouped
-  kernels; a coverage-edge probe cut D2H but slowed 62ms->2.88s.
+- Bulk grouped assembly is useful but not true topology; broader coverage still needs grouped kernels. Coverage-edge/exact probes cut D2H but slowed 62ms->2.88s and ~50ms->21s+, so early signal killed that path.
+- The remaining regular-grid build-index 64B read is an admissibility fence, not just a metadata leak; removing it cleanly needs a deferred dual-plan index contract, not a local hostless-candidate patch.
 
 ## Implementation Packages
 

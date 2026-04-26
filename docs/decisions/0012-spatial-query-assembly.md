@@ -43,6 +43,19 @@ Current host benchmarks show the owned query path is not yet competitive with
 STRtree, so the vendored `sindex` adapter remains on STRtree for default host
 execution today.
 
+## Amendment (2026-04-26)
+
+ADR-0042, ADR-0044, and ADR-0046 amend this decision. Keeping pandas/DataFrame
+join assembly in vendored helpers was a transitional compatibility boundary,
+not the desired steady state for GPU-selected workflows.
+
+Spatial query kernels may still produce typed integer pair arrays, but hot
+native relation work should flow through `NativeRelation`, `NativeRowSet`, and
+device-resident relation consumers before explicit public export. Pandas
+assembly remains part of GeoPandas compatibility, debugging, and fallback
+surfaces. It must not be treated as the internal execution currency for new GPU
+join or relation shapes.
+
 ## Consequences
 
 - targeted upstream `sindex` and `sjoin` tests keep assembly semantics stable

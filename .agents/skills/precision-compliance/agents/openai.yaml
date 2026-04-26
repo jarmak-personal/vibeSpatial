@@ -1,4 +1,4 @@
 interface:
   display_name: "Precision Compliance"
-  short_description: "Help with Precision Compliance tasks"
-  default_prompt: "Use $precision-compliance to wire or verify ADR-0002 precision planning for a GPU kernel or dispatch path."
+  short_description: "Verify shape-aware ADR-0002 precision planning."
+  default_prompt: "Use $precision-compliance to wire or verify ADR-0002 PrecisionPlan behavior, coordinate centering, compensation, predicate refinement, and NativeGeometryMetadata/CoordinateStats reuse."

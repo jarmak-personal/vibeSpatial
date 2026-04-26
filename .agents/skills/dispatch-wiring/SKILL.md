@@ -1,6 +1,6 @@
 ---
 name: dispatch-wiring
-description: "PROACTIVELY USE THIS SKILL when wiring a new operation into the vibeSpatial Python dispatch stack — adding a public API method, connecting to GeometryArray, writing or updating the owned dispatch helper, handling CPU fallback observability, coercing GeometryArray or OwnedGeometryArray inputs, or extending DeviceGeometryArray surfaces. This is the Python-side complement to $new-kernel-checklist (which covers the kernel itself). Trigger on: \"wire dispatch\", \"add API\", \"add method\", \"GeometryArray\", \"DGA method\", \"CPU fallback\", \"dispatch wrapper\", \"public API\", \"coerce\", \"OwnedGeometryArray\"."
+description: "PROACTIVELY USE THIS SKILL when wiring a new operation into the vibeSpatial Python dispatch stack: public GeoPandas APIs, GeometryArray, GeoBase, DeviceGeometryArray, OwnedGeometryArray helpers, CPU fallback observability, strict-native behavior, and dispatch wrappers. Also use it for ADR-0044 private native substrate and ADR-0046 physical workload shape wiring: NativeFrameState, NativeRowSet, NativeRelation, NativeGrouped, NativeSpatialIndex, NativeGeometryMetadata, NativeExpression, export boundaries, shape-level work estimates, and avoiding pandas-shaped hot paths. Trigger on: \"wire dispatch\", \"add API\", \"add method\", \"GeometryArray\", \"DGA method\", \"CPU fallback\", \"dispatch wrapper\", \"public API\", \"coerce\", \"OwnedGeometryArray\", \"NativeRelation\", \"NativeRowSet\", \"NativeSpatialIndex\", \"physical workload shape\"."
 ---
 
 # Dispatch Wiring — vibeSpatial
@@ -16,6 +16,8 @@ Target task: **$ARGUMENTS**
 - `src/vibespatial/runtime/dispatch.py`
 - `src/vibespatial/runtime/fallbacks.py`
 - `docs/architecture/api-dispatch.md`
+- `docs/decisions/0044-private-native-execution-substrate.md`
+- `docs/decisions/0046-gpu-physical-workload-shape-contracts.md`
 - the nearest current implementation for the operation family
 
 Start from the closest existing operation. Do not invent a new dispatch shape
@@ -34,6 +36,16 @@ public API helper
 -> observable dispatch / fallback event
 ```
 
+Native substrate flow:
+
+```text
+public compatibility ingress
+-> admitted local lowering
+-> private native carrier(s)
+-> sanctioned native consumer(s)
+-> explicit public export boundary
+```
+
 Current repo truth:
 
 - `plan_dispatch_selection()` returns an `AdaptivePlan`, not a bare
@@ -42,6 +54,28 @@ Current repo truth:
   the plan already owns it.
 - Dispatch-event ownership belongs at the layer that actually decides GPU vs
   CPU. Do not double-log.
+- Public dispatch shape and physical workload shape are different. Preserve the
+  public API shape, but choose or reuse a device-native physical shape from
+  ADR-0046.
+
+## Physical Shape and Native Carrier Rules
+
+- Before wiring, name the physical workload shape and native output carrier.
+- `WorkloadShape` cardinality helpers are not the ADR-0046 taxonomy. Do not
+  treat pairwise/broadcast/scalar as sufficient physical-shape proof.
+- Preserve `NativeFrameState`, `NativeRowSet`, `NativeRelation`,
+  `NativeGrouped`, `NativeSpatialIndex`, `NativeGeometryMetadata`, and
+  `NativeExpression` when lineage, index semantics, and admissibility remain
+  valid.
+- Spatial indexes and geometry metadata are execution state. Rebuilding them
+  because a public object boundary changed is a performance bug unless the
+  lineage or parameters changed.
+- Feed shape-level estimates into dispatch when available: coordinates,
+  vertices, segments, candidate pairs, relation pairs, groups, output rows,
+  output bytes, and expected temporary bytes.
+- Public GeoDataFrame, GeoSeries, pandas, and Shapely objects are ingress,
+  fallback, debug, or export surfaces. They are not the hot internal execution
+  currency for GPU-selected native paths.
 
 ## Decision Tree
 
@@ -81,7 +115,8 @@ Current repo truth:
 - Accept `dispatch_mode` and `precision` when the public surface already
   supports them.
 - Call `plan_dispatch_selection()` with the best residency/workload/coordinate
-  information available.
+  information available. Prefer shape-level work estimates over row count when
+  the API supports them.
 - Use `selection.runtime_selection` and `selection.precision_plan` from the
   returned `AdaptivePlan`.
 - Record a dispatch event in the helper only if the helper owns the runtime
@@ -118,7 +153,8 @@ an explicit design reason.
 
 - No silent CPU fallback across an advertised native boundary.
 - No duplicate dispatch events.
-- No new dispatch shape when an existing local pattern already fits.
+- No new public dispatch shape when an existing local pattern already fits.
+- No pandas-shaped internal execution when an admissible native carrier exists.
 - No generic coercion abstraction unless at least two families truly need it.
 - Start from the nearest current operation, not from stale skill examples.
 

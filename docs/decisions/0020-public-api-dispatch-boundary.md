@@ -35,6 +35,17 @@ Use one shared API-dispatch boundary:
 This keeps the hot path leaner while making public routing observable without
 forcing slower host prototypes into default execution.
 
+## Amendment (2026-04-26)
+
+ADR-0046 amends this decision. The public API dispatch boundary remains the
+right place for observability, owned-buffer reuse, strict-native behavior, and
+fallback visibility, but it is not the GPU execution model.
+
+When a public method enters native execution, it should lower into an explicit
+physical workload shape where one exists. The public method name and return
+type define semantics; the physical shape defines work units, carriers, result
+residency, precision, and export behavior.
+
 ## Consequences
 
 - Public methods can report whether they used a repo-owned path or Shapely host

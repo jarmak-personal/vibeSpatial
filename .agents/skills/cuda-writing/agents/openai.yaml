@@ -1,4 +1,4 @@
 interface:
   display_name: "Cuda Writing"
-  short_description: "Help with Cuda Writing tasks"
-  default_prompt: "Use $cuda-writing to guide GPU kernel design, tier selection, and launch/runtime patterns for this change."
+  short_description: "Design GPU code from workload shape to kernel launch."
+  default_prompt: "Use $cuda-writing to declare the ADR-0046 physical workload shape, choose ADR-0044 native carriers, then select CUDA/CuPy/CCCL primitives and launch/runtime patterns."

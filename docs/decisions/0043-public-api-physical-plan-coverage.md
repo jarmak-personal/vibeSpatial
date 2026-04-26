@@ -64,6 +64,18 @@ ADR-0044 defines the follow-up architecture: private native execution state
 under exact public GeoPandas APIs. That architecture is the replacement path for
 the rejected broad planner shape.
 
+## Amendment (2026-04-26)
+
+ADR-0046 amends this ADR by moving the positive design contract for physical
+planning into a separate decision.
+
+Read this ADR primarily as a warning note. The staged-planner experiment was
+the wrong implementation of the physical-plan idea because it rewrote broad
+public execution before the repo had reusable workload-shape contracts and
+admissibility boundaries. ADR-0046 supplies the positive rule: define the
+physical workload shape first, then lower only admitted public execution into
+that shape.
+
 ## Decision
 
 Adopt public physical-plan coverage as a first-class performance target, but

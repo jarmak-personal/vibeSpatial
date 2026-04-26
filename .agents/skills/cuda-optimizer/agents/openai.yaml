@@ -1,4 +1,4 @@
 interface:
   display_name: "Cuda Optimizer"
-  short_description: "Help with Cuda Optimizer tasks"
-  default_prompt: "Use $cuda-optimizer to review an existing GPU module and propose the highest-impact performance rewrites."
+  short_description: "Optimize GPU code, starting with physical workload shape."
+  default_prompt: "Use $cuda-optimizer to review an existing GPU module for ADR-0046 physical-shape failures, native-carrier reuse, host/device boundaries, and concrete performance rewrites."
